@@ -1220,13 +1220,6 @@
         return html;
       }
 
-      function renderReportToolIssue(name, args, result, ctx) {
-        const pathHtml = args.tool ? '<span class="tool-badge">' + escapeHtml(String(args.tool)) + '</span>' : '';
-        let html = toolHead('report_tool_issue', pathHtml);
-        if (args.report) html += '<div class="tool-output"><div>' + escapeHtml(String(args.report)) + '</div></div>';
-        return html;
-      }
-
       function renderCalc(name, args, result, ctx) {
         let html = toolHead('calc');
         const exprs = args.expressions || (args.expression ? [args.expression] : []);
@@ -1557,7 +1550,6 @@
         render_mermaid: renderMermaid,
         yield: renderYield,
         report_finding: renderReportFinding,
-        report_tool_issue: renderReportToolIssue,
         calc: renderCalc,
         calculator: renderCalc,
         await: renderJob,

@@ -288,12 +288,6 @@ describe("createTools", () => {
 	});
 
 	it("HIDDEN_TOOLS contains review tools and goal", () => {
-		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual([
-			"goal",
-			"report_finding",
-			"report_tool_issue",
-			"resolve",
-			"yield",
-		]);
+		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["goal", "report_finding", "resolve", "yield"]);
 	});
 });

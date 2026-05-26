@@ -43,7 +43,6 @@ import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
 import { RenderMermaidTool } from "./render-mermaid";
-import { createReportToolIssueTool, isAutoQaEnabled } from "./report-tool-issue";
 import { ResolveTool } from "./resolve";
 import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
@@ -80,7 +79,6 @@ export * from "./job";
 export * from "./read";
 export * from "./recipe";
 export * from "./render-mermaid";
-export * from "./report-tool-issue";
 export * from "./resolve";
 export * from "./review";
 export * from "./search";
@@ -312,7 +310,6 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	yield: s => new YieldTool(s),
 	report_finding: () => reportFindingTool,
-	report_tool_issue: s => createReportToolIssueTool(s),
 	resolve: s => new ResolveTool(s),
 	goal: s => new GoalTool(s),
 };
@@ -503,23 +500,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		const resolveTool = await logger.time("createTools:resolve", HIDDEN_TOOLS.resolve, session);
 		if (resolveTool) {
 			tools.push(wrapToolWithMetaNotice(resolveTool));
-		}
-	}
-
-	// Auto-inject report_tool_issue when autoqa is enabled (env or setting).
-	// Injected unconditionally into every agent, regardless of requested tool list.
-	const autoQA = isAutoQaEnabled(session.settings);
-	if (autoQA && !tools.some(t => t.name === "report_tool_issue")) {
-		// Build the enum from tools we just constructed via BUILTIN_TOOLS / HIDDEN_TOOLS.
-		// Extension overrides (e.g. a user's custom `bash`) get added later by
-		// other code paths, so they're absent here — exactly what we want; MCP /
-		// extension tools never end up in the report enum.
-		const activeBuiltinNames = tools
-			.map(t => t.name)
-			.filter(name => (name in BUILTIN_TOOLS || name in HIDDEN_TOOLS) && name !== "report_tool_issue");
-		const qaTool = createReportToolIssueTool(session, activeBuiltinNames);
-		if (qaTool) {
-			tools.push(wrapToolWithMetaNotice(qaTool));
 		}
 	}
 

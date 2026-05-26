@@ -191,11 +191,6 @@ You MUST use the specialized tool over its shell equivalent:
   - You NEVER use `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
   - You NEVER suffix commands with `| head -n N` or `| tail -n N` — the harness already streams output and returns a truncated view, with the full result available via `artifact://<id>`.
   - If you catch yourself typing `cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `find`, `fd`, `sed -i`, `awk -i`, or a heredoc redirect inside a Bash call, stop and switch to the dedicated tool.{{/has}}
-{{#has tools "report_tool_issue"}}
-<critical>
-The `{{toolRefs.report_tool_issue}}` tool is available for automated QA. If ANY tool you call returns output that is unexpected, incorrect, malformed, or otherwise inconsistent with what you anticipated given the tool's described behavior and your parameters, call `{{toolRefs.report_tool_issue}}` with the tool name and a concise description of the discrepancy. Do not hesitate to report — false positives are acceptable.
-</critical>
-{{/has}}
 [/ENV]
 
 [CONTRACT]

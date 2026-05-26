@@ -110,7 +110,7 @@
 - Corpus composition is session-dependent and excludes already-active tools:
   - MCP entries come from `#discoverableMCPTools`, filtered to names not currently active, mapped with `summary = description`.
   - Built-in entries appear only in `"all"` mode and only for registry tools whose `loadMode === "discoverable"` and are not currently active.
-  - Hidden/internal built-ins are intentionally excluded from the built-in corpus: `resolve`, `yield`, `report_finding`, `report_tool_issue` are called out in the `#collectDiscoverableBuiltinTools()` comment.
+  - Hidden/internal built-ins are intentionally excluded from the built-in corpus: `resolve`, `yield`, `report_finding` are called out in the `#collectDiscoverableBuiltinTools()` comment.
 - `DiscoverableToolSource` includes `"extension"` and `"custom"`, but `AgentSession.getDiscoverableTools()` currently assembles only built-in and MCP sources.
 - On startup, `packages/coding-agent/src/sdk.ts` hides non-essential discoverable built-ins in `tools.discoveryMode = "all"`; defaults are `read`, `bash`, and `edit` unless `tools.essentialOverride` changes them.
 - Query tokenization is simple and deterministic: camelCase is split, non-alphanumerics become spaces, tokens are lowercased, and only non-empty alphanumeric tokens survive.

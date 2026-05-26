@@ -2738,52 +2738,6 @@ export const SETTINGS_SCHEMA = {
 
 	"commit.changelogMaxDiffChars": { type: "number", default: 120000 },
 
-	"dev.autoqa": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tools",
-			label: "Auto QA",
-			description: "Enable automated tool issue reporting (report_tool_issue) for all agents",
-		},
-	},
-
-	"dev.autoqaPush.endpoint": {
-		type: "string",
-		// Bundled QA collector — runs `the configured gajae-code Auto QA collector` behind qa.gajae-code.local.
-		// Override via `PI_AUTO_QA_PUSH_URL` or `dev.autoqaPush.endpoint`
-		// in `config.yml` to point at a self-hosted instance.
-		default: "https://qa.gajae-code.local/v1/grievances" as const,
-		ui: {
-			tab: "tools",
-			label: "Auto QA Push Endpoint",
-			description:
-				"Full URL that receives the JSON payload (default ships to https://qa.gajae-code.local/v1/grievances)",
-		},
-	},
-
-	"dev.autoqaPush.token": {
-		type: "string",
-		default: undefined,
-	},
-
-	/**
-	 * User decision on sharing automatic `report_tool_issue` grievances.
-	 *
-	 *   - `"unset"`  — never asked; the first `report_tool_issue` invocation
-	 *                  pops a consent dialog and persists the answer here.
-	 *   - `"granted"` — record and (when push is configured) ship grievances.
-	 *   - `"denied"`  — silently no-op every `report_tool_issue` call.
-	 *
-	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
-	 * process-global consent handler registered by `InteractiveMode`.
-	 */
-	"dev.autoqa.consent": {
-		type: "enum",
-		values: ["unset", "granted", "denied"] as const,
-		default: "unset" as const,
-	},
-
 	"thinkingBudgets.minimal": { type: "number", default: 1024 },
 
 	"thinkingBudgets.low": { type: "number", default: 2048 },

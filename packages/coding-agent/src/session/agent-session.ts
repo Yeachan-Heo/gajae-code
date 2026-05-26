@@ -177,7 +177,6 @@ import { assertEditableFile } from "../tools/auto-generated-guard";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
-import { isAutoQaEnabled } from "../tools/report-tool-issue";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -3083,8 +3082,8 @@ export class AgentSession {
 
 	/** Collect built-in tools the model can discover via search_tool_bm25. Restricted to tool
 	 *  definitions whose `loadMode === "discoverable"`. This keeps hidden/internal tools
-	 *  (resolve, yield, report_finding, report_tool_issue) out of the index
-	 *  and avoids mislabeling extension/custom default-inactive tools as built-ins. */
+	 *  (resolve, yield, report_finding) out of the index and avoids mislabeling
+	 *  extension/custom default-inactive tools as built-ins. */
 	#collectDiscoverableBuiltinTools(): DiscoverableTool[] {
 		const activeNames = new Set(this.getActiveToolNames());
 		const result: DiscoverableTool[] = [];
@@ -3263,14 +3262,6 @@ export class AgentSession {
 			if (tool) {
 				tools.push(this.#wrapToolForAcpPermission(tool));
 				validToolNames.push(name);
-			}
-		}
-		// Auto-QA tool must survive any runtime tool-set mutation.
-		if (isAutoQaEnabled(this.settings) && !validToolNames.includes("report_tool_issue")) {
-			const qaTool = this.#toolRegistry.get("report_tool_issue");
-			if (qaTool) {
-				tools.push(this.#wrapToolForAcpPermission(qaTool));
-				validToolNames.push("report_tool_issue");
 			}
 		}
 		if (this.#mcpDiscoveryEnabled) {

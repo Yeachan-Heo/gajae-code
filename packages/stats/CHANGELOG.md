@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Bound the stats dashboard server explicitly to `127.0.0.1` so the local usage dashboard remains loopback-only by default.
+
 ## [15.1.6] - 2026-05-19
 
 ### Fixed

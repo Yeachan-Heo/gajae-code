@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 
-// Regression for grievances #208 (find) and #209 (search): a multi-path call
+// Regression for tool reports #208 (find) and #209 (search): a multi-path call
 // that includes an entry which does not exist on disk must not abort the whole
 // lookup. The tool should skip the missing entry and return matches from the
 // surviving entries, with a non-fatal "skipped missing paths" notice.
