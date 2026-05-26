@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-05-26T06:59:00.104Z",
-  "updatedAt": "2026-05-26T09:01:18.907Z",
+  "updatedAt": "2026-05-26T13:59:49.394Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -96,6 +96,18 @@
       "updatedAt": "2026-05-26T09:01:18.907Z",
       "evidence": "G008-final-verification-review complete: final review blockers resolved through HEAD 65251bc; code reviewer APPROVE and architect CLEAR; bun scripts/verify-g002-gates.ts, bun scripts/check-visible-definitions.ts, focused tests (168 pass), manual import/symbol probes, and bun run check all passed.",
       "completedAt": "2026-05-26T09:01:18.907Z"
+    },
+    {
+      "id": "G009-integrate-native-gjc-team-runtime",
+      "title": "Integrate native gjc team runtime",
+      "objective": "Replace deferred gjc team bridge behavior with a native, GJC-scoped tmux team runtime and telemetry path adapted from /Users/bellman/Documents/Workspace/oh-my-codex, using .gjc state paths where possible while keeping only the public team workflow visible; verify help/tests and open a PR targeting dev.",
+      "status": "complete",
+      "attempt": 1,
+      "createdAt": "2026-05-26T13:38:36.354Z",
+      "updatedAt": "2026-05-26T13:59:49.394Z",
+      "evidence": "Native gjc team runtime integrated: packages/coding-agent/src/commands/team.ts now routes to packages/coding-agent/src/gjc-runtime/team-runtime.ts instead of runBridgedRuntimeEndpoint('team'); state defaults to .gjc/state/team with config/manifest/phase/tasks/mailboxes/events/telemetry; tmux worker launch records panes and worker identity; targeted tests, visible definitions, package check, smoke, and full bun run check passed; PR preparation follows.",
+      "startedAt": "2026-05-26T13:38:40.414Z",
+      "completedAt": "2026-05-26T13:59:49.394Z"
     }
   ],
   "codexObjective": "Complete the durable gajae-code OMP/OMX runtime plan in .omx/ultragoal/goals.json under the approved RALPLAN constraints; use .omx/ultragoal/ledger.jsonl as audit trail."

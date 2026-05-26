@@ -34,10 +34,10 @@ describe("gjc runtime bridge", () => {
 	});
 
 	it("returns an actionable error when no runtime is available", () => {
-		const result = runGjcRuntimeBridge("team", ["api"], { PATH: "" });
+		const result = runGjcRuntimeBridge("ralplan", ["status"], { PATH: "" });
 
 		expect(result.status).toBe(1);
-		expect(result.error).toContain("gjc team requires the private OMX runtime endpoint implementation");
+		expect(result.error).toContain("gjc ralplan requires the private OMX runtime endpoint implementation");
 		expect(result.error).toContain("GJC_OMX_RUNTIME_BINARY");
 	});
 });
