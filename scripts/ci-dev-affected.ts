@@ -187,9 +187,14 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 
 	if (fullWorkspace) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
+		addNativeBuild(tasks);
 		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
 	} else if (!ciOnly) {
-		for (const workspacePackage of expandWithDependents(touchedPackages, packages)) {
+		const affectedPackages = expandWithDependents(touchedPackages, packages);
+		if (affectedPackages.some(workspacePackage => workspacePackage.manifest.scripts?.test)) {
+			addNativeBuild(tasks);
+		}
+		for (const workspacePackage of affectedPackages) {
 			if (workspacePackage.manifest.scripts?.check) {
 				add(tasks, `check:${workspacePackage.name}`, `Check ${workspacePackage.name}`, ["bun", "--cwd", workspacePackage.dir, "run", "check"]);
 			}
@@ -232,6 +237,11 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 	}
 
 	return Array.from(tasks.values());
+}
+
+
+function addNativeBuild(tasks: Map<string, Task>): void {
+	add(tasks, "native-linux-x64", "Build linux x64 native addons", ["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 }
 
 function add(tasks: Map<string, Task>, key: string, description: string, command: readonly string[]): void {
