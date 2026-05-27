@@ -375,7 +375,10 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			expect(resumedSession.thinkingLevel).toBe(ThinkingLevel.Off);
 			expect(resumedSession.serviceTier).toBe("priority");
-			expect(resumedSession.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue", "mcp__slack_post_message"]);
+			expect(resumedSession.getSelectedMCPToolNames()).toEqual([
+				"mcp__github_create_issue",
+				"mcp__slack_post_message",
+			]);
 			expect(resumedSession.getActiveToolNames()).toEqual(
 				expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue", "mcp__slack_post_message"]),
 			);
