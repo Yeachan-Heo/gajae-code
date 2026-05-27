@@ -106,6 +106,34 @@ const GH_PR_CHECKOUT_FIELDS = [
 	"title",
 	"url",
 ];
+
+const PR_CHECKOUT_BRANCH_CONFIG = {
+	headRef: "gjcPrHeadRef",
+	url: "gjcPrUrl",
+	isCrossRepository: "gjcPrIsCrossRepository",
+	maintainerCanModify: "gjcPrMaintainerCanModify",
+} as const;
+
+const LEGACY_PR_CHECKOUT_BRANCH_CONFIG = {
+	headRef: "ompPrHeadRef",
+	url: "ompPrUrl",
+	isCrossRepository: "ompPrIsCrossRepository",
+	maintainerCanModify: "ompPrMaintainerCanModify",
+} as const;
+
+type PrCheckoutBranchConfigKey = keyof typeof PR_CHECKOUT_BRANCH_CONFIG;
+
+async function getPrCheckoutBranchConfig(
+	repoRoot: string,
+	localBranch: string,
+	key: PrCheckoutBranchConfigKey,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	return (
+		(await git.config.getBranch(repoRoot, localBranch, PR_CHECKOUT_BRANCH_CONFIG[key], signal)) ??
+		(await git.config.getBranch(repoRoot, localBranch, LEGACY_PR_CHECKOUT_BRANCH_CONFIG[key], signal))
+	);
+}
 // /search/<endpoint> API response shapes (subset). Used when projecting raw
 // REST results into the normalized `GhSearch*Result` shapes the formatters
 // consume. We talk to the API directly because `gh search prs`/`issues`
@@ -1023,21 +1051,21 @@ async function resolvePrBranchPushTarget(
 	maintainerCanModify?: boolean;
 	isCrossRepository: boolean;
 }> {
-	const headRef = await git.config.getBranch(repoRoot, localBranch, "ompPrHeadRef", signal);
+	const headRef = await getPrCheckoutBranchConfig(repoRoot, localBranch, "headRef", signal);
 	if (!headRef) {
 		throw new ToolError(`branch ${localBranch} has no PR push metadata; check it out via op: pr_checkout first`);
 	}
 
 	const pushRemote = await git.config.getBranch(repoRoot, localBranch, "pushRemote", signal);
 	const remote = await git.config.getBranch(repoRoot, localBranch, "remote", signal);
-	const prUrl = await git.config.getBranch(repoRoot, localBranch, "ompPrUrl", signal);
-	const maintainerCanModifyValue = await git.config.getBranch(
+	const prUrl = await getPrCheckoutBranchConfig(repoRoot, localBranch, "url", signal);
+	const maintainerCanModifyValue = await getPrCheckoutBranchConfig(
 		repoRoot,
 		localBranch,
-		"ompPrMaintainerCanModify",
+		"maintainerCanModify",
 		signal,
 	);
-	const isCrossRepositoryValue = await git.config.getBranch(repoRoot, localBranch, "ompPrIsCrossRepository", signal);
+	const isCrossRepositoryValue = await getPrCheckoutBranchConfig(repoRoot, localBranch, "isCrossRepository", signal);
 
 	const remoteName = pushRemote ?? remote;
 	if (!remoteName) {
@@ -2989,19 +3017,19 @@ async function checkoutPullRequest(
 			await git.config.setBranch(repoRoot, localBranch, "remote", remote.name, signal);
 			await git.config.setBranch(repoRoot, localBranch, "merge", `refs/heads/${headRefName}`, signal);
 			await git.config.setBranch(repoRoot, localBranch, "pushRemote", remote.name, signal);
-			await git.config.setBranch(repoRoot, localBranch, "ompPrHeadRef", headRefName, signal);
-			await git.config.setBranch(repoRoot, localBranch, "ompPrUrl", data.url ?? "", signal);
+			await git.config.setBranch(repoRoot, localBranch, PR_CHECKOUT_BRANCH_CONFIG.headRef, headRefName, signal);
+			await git.config.setBranch(repoRoot, localBranch, PR_CHECKOUT_BRANCH_CONFIG.url, data.url ?? "", signal);
 			await git.config.setBranch(
 				repoRoot,
 				localBranch,
-				"ompPrIsCrossRepository",
+				PR_CHECKOUT_BRANCH_CONFIG.isCrossRepository,
 				String(Boolean(data.isCrossRepository)),
 				signal,
 			);
 			await git.config.setBranch(
 				repoRoot,
 				localBranch,
-				"ompPrMaintainerCanModify",
+				PR_CHECKOUT_BRANCH_CONFIG.maintainerCanModify,
 				String(Boolean(data.maintainerCanModify)),
 				signal,
 			);

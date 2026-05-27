@@ -888,6 +888,37 @@ describe("github tool", () => {
 		}
 	});
 
+	it("pushes PR branches using legacy checkout metadata from pre-rebrand branches", async () => {
+		const fixture = await createPrFixture();
+		try {
+			runGit(fixture.repoRoot, ["branch", "pr-123", fixture.headRefOid]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.remote", "forksrc"]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.pushRemote", "forksrc"]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.merge", `refs/heads/${fixture.headRefName}`]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.ompPrHeadRef", fixture.headRefName]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.ompPrUrl", "https://github.com/base/repo/pull/123"]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.ompPrIsCrossRepository", "true"]);
+			runGit(fixture.repoRoot, ["config", "branch.pr-123.ompPrMaintainerCanModify", "true"]);
+			const pushSpy = vi.spyOn(git, "push").mockResolvedValue(undefined);
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const result = await tool.execute("pr-push", { op: "pr_push", branch: "pr-123" });
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+			expect(text).toContain("# Pushed Pull Request Branch");
+			expect(text).toContain("PR: https://github.com/base/repo/pull/123");
+			expect(pushSpy).toHaveBeenCalledWith(
+				fixture.repoRoot,
+				expect.objectContaining({
+					remote: "forksrc",
+					refspec: `refs/heads/pr-123:refs/heads/${fixture.headRefName}`,
+				}),
+			);
+		} finally {
+			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+		}
+	});
+
 	it("exposes a flat op-based schema without legacy run_watch parameters", () => {
 		const tool = new GithubTool(createSession());
 		const wire = z.toJSONSchema(tool.parameters, { target: "draft-2020-12" }) as Record<string, unknown>;
