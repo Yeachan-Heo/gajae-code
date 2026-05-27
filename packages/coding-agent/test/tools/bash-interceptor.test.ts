@@ -78,6 +78,8 @@ describe("BashTool head/tail stripping", () => {
 	function createBashToolWithStrip(stripEnabled: boolean): BashTool {
 		const session = {
 			cwd: process.cwd(),
+			getSessionFile: () => null,
+			getSessionId: () => undefined,
 			settings: {
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
