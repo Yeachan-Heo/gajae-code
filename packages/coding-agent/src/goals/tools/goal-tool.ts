@@ -135,7 +135,7 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
 	readonly label = "Goal";
-	readonly loadMode = "essential";
+	readonly loadMode = "essential" as const;
 	readonly description = prompt.render(goalDescription);
 	readonly parameters = goalSchema;
 	readonly strict = true;
@@ -161,7 +161,7 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 export class GetGoalTool implements AgentTool<typeof getGoalSchema, GoalToolDetails> {
 	readonly name = "get_goal";
 	readonly label = "Get Goal";
-	readonly loadMode = "essential";
+	readonly loadMode = "essential" as const;
 	readonly description = prompt.render(getGoalDescription);
 	readonly parameters = getGoalSchema;
 	readonly strict = true;
@@ -191,7 +191,7 @@ export class GetGoalTool implements AgentTool<typeof getGoalSchema, GoalToolDeta
 export class CreateGoalTool implements AgentTool<typeof createGoalSchema, GoalToolDetails> {
 	readonly name = "create_goal";
 	readonly label = "Create Goal";
-	readonly loadMode = "essential";
+	readonly loadMode = "essential" as const;
 	readonly description = prompt.render(createGoalDescription);
 	readonly parameters = createGoalSchema;
 	readonly strict = true;
@@ -225,7 +225,7 @@ export class CreateGoalTool implements AgentTool<typeof createGoalSchema, GoalTo
 export class UpdateGoalTool implements AgentTool<typeof updateGoalSchema, GoalToolDetails> {
 	readonly name = "update_goal";
 	readonly label = "Update Goal";
-	readonly loadMode = "essential";
+	readonly loadMode = "essential" as const;
 	readonly description = prompt.render(updateGoalDescription);
 	readonly parameters = updateGoalSchema;
 	readonly strict = true;

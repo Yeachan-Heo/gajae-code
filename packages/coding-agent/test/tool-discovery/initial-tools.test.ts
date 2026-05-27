@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Settings } from "../../src/config/settings";
+import { type GoalModeState, GoalRuntime } from "../../src/goals";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
 import type { ToolSession } from "../../src/tools/index";
 import {
@@ -33,6 +34,31 @@ const allToolsSettings = Settings.isolated({
 	"todo.enabled": true,
 	"memory.backend": "hindsight",
 	"tools.discoveryMode": "all",
+	"goal.enabled": true,
+});
+
+const activeGoalState: GoalModeState = {
+	enabled: true,
+	mode: "active",
+	goal: {
+		id: "goal-1",
+		objective: "Verify tool metadata",
+		status: "active",
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: 1,
+		updatedAt: 1,
+	},
+};
+
+const goalRuntime = new GoalRuntime({
+	getState: () => activeGoalState,
+	setState: () => {},
+	getCurrentUsage: () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+	emit: () => {},
+	persist: () => {},
+	sendHiddenMessage: async () => {},
+	now: () => 1,
 });
 
 const toolSession: ToolSession = {
@@ -44,6 +70,8 @@ const toolSession: ToolSession = {
 	isToolDiscoveryEnabled: () => true,
 	getSelectedDiscoveredToolNames: () => [],
 	activateDiscoveredTools: async names => names,
+	getGoalModeState: () => activeGoalState,
+	getGoalRuntime: () => goalRuntime,
 };
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {
