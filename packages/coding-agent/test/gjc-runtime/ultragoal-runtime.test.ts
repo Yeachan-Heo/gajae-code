@@ -344,6 +344,64 @@ describe("native GJC ultragoal runtime", () => {
 		expect(result.stderr).toContain("requires --quality-gate-json");
 		expect(status.goals[0]?.status).toBe("active");
 	});
+	it("blocks complete checkpoints without a clean architect review gate", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
+			}),
+		).rejects.toThrow("requires --quality-gate-json");
+
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
+				qualityGateJson: JSON.stringify({
+					verification: { status: "passed" },
+					codeReview: { recommendation: "APPROVE", architectStatus: "WATCH" },
+				}),
+			}),
+		).rejects.toThrow("requires architect review approval");
+
+		const status = await getUltragoalStatus(root);
+		expect(status.goals[0]?.status).toBe("active");
+	});
+
+	it("blocks complete checkpoint commands without a clean architect review gate", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				JSON.stringify({ goal: { status: "complete" } }),
+			],
+			root,
+		);
+		const status = await getUltragoalStatus(root);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("requires --quality-gate-json");
+		expect(status.goals[0]?.status).toBe("active");
+	});
 
 	it("rejects mistyped checkpoint statuses instead of silently changing state", async () => {
 		const root = await tempDir();
