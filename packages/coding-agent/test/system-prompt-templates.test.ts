@@ -249,11 +249,10 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt[1].indexOf("</workspace-tree>")).toBeLessThan(systemPrompt[1].indexOf("Today is "));
 		});
 	});
-	test("buildSystemPrompt includes SYSTEM.md customization without replacing default soul", async () => {
+	test("buildSystemPrompt wires SYSTEM.md customization without replacing the base prompt", async () => {
 		await withTempDir(async dir => {
-			const configDir = path.join(dir, ".agent");
-			await fs.mkdir(configDir, { recursive: true });
-			await fs.writeFile(path.join(configDir, "SYSTEM.md"), "Local system customization");
+			await fs.mkdir(path.join(dir, ".gjc"), { recursive: true });
+			await fs.writeFile(path.join(dir, ".gjc", "SYSTEM.md"), "Project system sentinel.");
 
 			const { systemPrompt } = await buildSystemPrompt({
 				cwd: dir,
@@ -275,9 +274,10 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt[0]).toContain("<soul>");
 			expect(systemPrompt[0]).toContain("The Boss’s Orders = Absolute Obedience");
 			expect(systemPrompt[0]).toContain("<system-prompt-customization>");
-			expect(systemPrompt[0]).toContain("Local system customization");
+			expect(systemPrompt[0]).toContain("Project system sentinel.");
 		});
 	});
+
 	test("buildSystemPrompt renders workspace tree after directory context in project prompt", async () => {
 		await withTempDir(async dir => {
 			const { systemPrompt } = await buildSystemPrompt({
