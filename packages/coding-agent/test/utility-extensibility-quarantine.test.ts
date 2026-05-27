@@ -32,7 +32,6 @@ describe("GJC utility extensibility quarantine", () => {
 			"marketplace",
 			"plugins",
 			"reload-plugins",
-			"loop",
 			"plan",
 			"share",
 			"browser",
@@ -48,6 +47,7 @@ describe("GJC utility extensibility quarantine", () => {
 		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
+		expect(registry).toContain(`name: "loop"`);
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);

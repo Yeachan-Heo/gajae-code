@@ -112,6 +112,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "loop",
+		description:
+			"Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Esc cancels the current iteration; /loop again to disable.",
+		inlineHint: "[count|duration]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleLoopCommand(command.args);
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "goal",
 		description: "Toggle goal mode (persistent autonomous objective for this session)",
 		subcommands: [

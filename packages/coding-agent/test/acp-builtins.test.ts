@@ -309,7 +309,7 @@ describe("ACP builtin slash commands", () => {
 
 	// TUI-only and dropped commands fall through as false
 	it("TUI-only and dropped commands return false (fall through to model)", async () => {
-		const removedCommands = [
+		const fallthroughCommands = [
 			"/login",
 			"/logout",
 			"/resume",
@@ -334,7 +334,7 @@ describe("ACP builtin slash commands", () => {
 			"/handoff",
 			"/fork",
 		];
-		for (const cmd of removedCommands) {
+		for (const cmd of fallthroughCommands) {
 			const { runtime } = createRuntime();
 			const result = await executeAcpBuiltinSlashCommand(cmd, runtime);
 			expect(result).toBe(false);
