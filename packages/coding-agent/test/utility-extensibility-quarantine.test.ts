@@ -18,18 +18,20 @@ function extractSetValues(sourceText: string, name: string): string[] {
 }
 
 describe("GJC utility extensibility quarantine", () => {
-	it("removes product-facing utility slash commands from the active registry", async () => {
+	it("removes only non-ambiguous product-facing utility slash commands from the active registry", async () => {
 		const registry = await source("slash-commands", "builtin-registry.ts");
-		expect(extractSetValues(registry, "QUARANTINED_UTILITY_SLASH_COMMANDS")).toEqual([
-			"agents",
-			"extensions",
-			"marketplace",
-			"plugins",
-			"reload-plugins",
-			"ssh",
-		]);
+		expect(extractSetValues(registry, "QUARANTINED_UTILITY_SLASH_COMMANDS")).toEqual(["agents", "ssh"]);
 		expect(registry).toContain("ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY");
 		expect(registry).toContain("BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command)");
+	});
+
+	it("deletes obvious plugin, marketplace, and extension slash command implementations", async () => {
+		const registry = await source("slash-commands", "builtin-registry.ts");
+		for (const removedCommand of ["extensions", "marketplace", "plugins", "reload-plugins"]) {
+			expect(registry).not.toContain(`name: "${removedCommand}"`);
+		}
+		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);
+		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});
 
 	it("does not parse CLI plugin, extension, hook, or skill-loading flags", async () => {

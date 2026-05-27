@@ -3,6 +3,7 @@ import { Settings } from "../src/config/settings";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
+import * as sshConfig from "../src/ssh/config-writer";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -573,91 +574,23 @@ describe("wave 4 commands", () => {
 		}
 	});
 
-	// /ssh
-	it("/ssh (no args): outputs help text containing list and remove", async () => {
+	it("/ssh commands remain preserved but quarantined from ACP", async () => {
 		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/ssh", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("list");
-		expect(output[0]).toContain("remove");
-	});
-
-	it("/ssh help: outputs help text containing list and remove", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/ssh help", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("list");
-		expect(output[0]).toContain("remove");
-	});
-
-	it("/ssh add (no args): returns usage", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/ssh add", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Usage");
-	});
-
-	it("/ssh unknown-verb: returns unknown subcommand message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/ssh frobnicate", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Unknown");
-	});
-
-	// /marketplace
-	it("/marketplace help: outputs help text", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/marketplace help", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Marketplace commands");
-		expect(output[0]).toContain("install");
-	});
-
-	it("/marketplace install (no args): returns interactive picker usage", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/marketplace install", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("TUI-only");
-	});
-
-	it("/marketplace uninstall (no args): returns interactive picker usage", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/marketplace uninstall", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("TUI-only");
-	});
-
-	// /plugins
-	it("/plugins list: outputs without throwing when registries are empty", async () => {
-		const { MarketplaceManager } = await import("../src/extensibility/plugins/marketplace");
-		const { PluginManager } = await import("../src/extensibility/plugins");
-		const listInstalledSpy = spyOn(MarketplaceManager.prototype, "listInstalledPlugins").mockResolvedValue([]);
-		const npmListSpy = spyOn(PluginManager.prototype, "list").mockResolvedValue([]);
-		try {
-			const { output, runtime } = createRuntime();
-			const result = await executeAcpBuiltinSlashCommand("/plugins list", runtime);
-			expect(result).toEqual({ consumed: true });
-			expect(output.length).toBeGreaterThan(0);
-		} finally {
-			listInstalledSpy.mockRestore();
-			npmListSpy.mockRestore();
+		for (const command of ["/ssh", "/ssh help", "/ssh add", "/ssh frobnicate"]) {
+			const result = await executeAcpBuiltinSlashCommand(command, runtime);
+			expect(result).toBe(false);
 		}
+		expect(output).toEqual([]);
 	});
 
-	it("/plugins (no args): defaults to list", async () => {
-		const { MarketplaceManager } = await import("../src/extensibility/plugins/marketplace");
-		const { PluginManager } = await import("../src/extensibility/plugins");
-		const listInstalledSpy = spyOn(MarketplaceManager.prototype, "listInstalledPlugins").mockResolvedValue([]);
-		const npmListSpy = spyOn(PluginManager.prototype, "list").mockResolvedValue([]);
-		try {
-			const { output, runtime } = createRuntime();
-			const result = await executeAcpBuiltinSlashCommand("/plugins", runtime);
-			expect(result).toEqual({ consumed: true });
-			expect(output.length).toBeGreaterThan(0);
-		} finally {
-			listInstalledSpy.mockRestore();
-			npmListSpy.mockRestore();
+	it("removed plugin and marketplace commands fall through", async () => {
+		const { output, runtime } = createRuntime();
+
+		for (const command of ["/marketplace help", "/marketplace install", "/plugins list", "/reload-plugins"]) {
+			const result = await executeAcpBuiltinSlashCommand(command, runtime);
+			expect(result).toBe(false);
 		}
+		expect(output).toEqual([]);
 	});
 
 	// /todo start with in_progress status in fuzzy list
@@ -705,22 +638,14 @@ describe("wave 5 — adapters and polish", () => {
 		expect(output).toEqual([]);
 	});
 
-	// /ssh add — spy on addSSHHost
-	it("/ssh add foo --host x --user y --scope user: calls addSSHHost", async () => {
-		const sshModule = await import("../src/ssh/config-writer");
-		const spy = spyOn(sshModule, "addSSHHost").mockResolvedValue(undefined);
+	it("/ssh add remains quarantined and does not call addSSHHost", async () => {
+		const spy = spyOn(sshConfig, "addSSHHost").mockResolvedValue(undefined);
 		try {
 			const { output, runtime } = createRuntime();
 			const result = await executeAcpBuiltinSlashCommand("/ssh add foo --host x --user y --scope user", runtime);
-			expect(result).toEqual({ consumed: true });
-			expect(output[0]).toContain('Added SSH host "foo" (user).');
-			// Without this assertion, the command could succeed via a side-effect-free
-			// path that prints the success message without writing the host config.
-			expect(spy).toHaveBeenCalledTimes(1);
-			const [configPath, name, hostConfig] = spy.mock.calls[0]!;
-			expect(typeof configPath).toBe("string");
-			expect(name).toBe("foo");
-			expect(hostConfig).toMatchObject({ host: "x", username: "y" });
+			expect(result).toBe(false);
+			expect(output).toEqual([]);
+			expect(spy).not.toHaveBeenCalled();
 		} finally {
 			spy.mockRestore();
 		}
@@ -813,21 +738,10 @@ describe("wave 5 — adapters and polish", () => {
 		expect(output[0]).toContain("background jobs");
 	});
 
-	// /marketplace discover bulleted list
-	it("/marketplace discover: output is bulleted with '  - ' token", async () => {
-		const { MarketplaceManager } = await import("../src/extensibility/plugins/marketplace");
-		const discoverSpy = spyOn(MarketplaceManager.prototype, "listAvailablePlugins").mockResolvedValue([
-			{ name: "hello", version: "1.0.0", description: "A greeting plugin" } as never,
-			{ name: "world", version: "2.0.0", description: undefined } as never,
-		]);
-		try {
-			const { output, runtime } = createRuntime();
-			const result = await executeAcpBuiltinSlashCommand("/marketplace discover", runtime);
-			expect(result).toEqual({ consumed: true });
-			expect(output[0]).toContain("  - ");
-			expect(output[0]).toContain("hello@1.0.0");
-		} finally {
-			discoverSpy.mockRestore();
-		}
+	it("/marketplace discover falls through after marketplace slash deletion", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/marketplace discover", runtime);
+		expect(result).toBe(false);
+		expect(output).toEqual([]);
 	});
 });

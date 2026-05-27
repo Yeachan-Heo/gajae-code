@@ -19,6 +19,10 @@ So I made Gajae-Code as a minimal harness that can work with any model. The harn
 
 No more default skills. No more default role agents. The product gets better by improving the harness methodology around the same four skills and four subagents.
 
+## Default TUI identity
+
+The default dark TUI identity is the GJC red-claw theme: a red/orange crustacean look for Gajae-Code terminals. Explicit user theme settings still win.
+
 ## The four skills
 
 | Skill | Purpose |

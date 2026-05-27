@@ -13,6 +13,7 @@ import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
 
 const tempRoots: string[] = [];
 const roleAgentNames = ["architect", "critic", "executor", "planner"] as const;
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 
 async function makeTempRoot(): Promise<string> {
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-definitions-"));
@@ -146,8 +147,12 @@ Project executor override body.
 	});
 
 	it("documents role-agent delegation in system and ultragoal prompts", async () => {
-		const systemPrompt = await Bun.file("packages/coding-agent/src/prompts/system/system-prompt.md").text();
-		const ultragoal = await Bun.file("packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md").text();
+		const systemPrompt = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
+		).text();
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
 
 		for (const name of roleAgentNames) {
 			expect(systemPrompt).toContain(name);
