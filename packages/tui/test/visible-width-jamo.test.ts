@@ -62,6 +62,14 @@ describe("visibleWidth — Hangul Compatibility Jamo correction", () => {
 		expect(visibleWidth("\uac00")).toBe(2); // 가
 		expect(visibleWidth("\ud7a3")).toBe(2); // 힣
 	});
+	it("conjoining jamo sequences use NFC terminal width", () => {
+		// Some macOS input paths deliver Hangul syllables as conjoining jamo
+		// (NFD). Terminals render them as the composed syllable, so width must
+		// match NFC or the hardware cursor drifts one cell per syllable.
+		expect(visibleWidth("하")).toBe(2);
+		expect(visibleWidth("한")).toBe(2);
+		expect(visibleWidth("한글")).toBe(4);
+	});
 
 	it("mixed ASCII + syllable + jamo strings add correctly", () => {
 		// a (1) + 안 (2) + ㅂ (1) + b (1) = 5

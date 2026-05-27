@@ -90,7 +90,10 @@ const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 export function getSegmenter(): Intl.Segmenter {
 	return segmenter;
 }
-
+function normalizeForWidth(str: string): string {
+	const normalized = str.normalize("NFC");
+	return normalized === str ? str : normalized;
+}
 export function visibleWidthRaw(str: string): number {
 	if (!str) {
 		return 0;
@@ -127,7 +130,7 @@ export function visibleWidthRaw(str: string): number {
 	if (isPureAscii) {
 		return str.length + tabLength;
 	}
-	return Bun.stringWidth(str) - jamoOvercount + tabLength;
+	return Bun.stringWidth(normalizeForWidth(str)) - jamoOvercount + tabLength;
 }
 
 /**

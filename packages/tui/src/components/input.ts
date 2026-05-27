@@ -20,7 +20,15 @@ interface InputState {
 	value: string;
 	cursor: number;
 }
-
+function insertTextNfcAt(value: string, cursor: number, text: string): { value: string; cursor: number } {
+	const before = value.slice(0, cursor);
+	const after = value.slice(cursor);
+	const beforeWithInsert = (before + text).normalize("NFC");
+	return {
+		value: (beforeWithInsert + after).normalize("NFC"),
+		cursor: beforeWithInsert.length,
+	};
+}
 /**
  * Input component - single-line text input with horizontal scrolling
  */
@@ -48,8 +56,9 @@ export class Input implements Component, Focusable {
 	}
 
 	setValue(value: string): void {
-		this.#value = value;
-		this.#cursor = Math.min(this.#cursor, value.length);
+		const normalized = value.normalize("NFC");
+		this.#value = normalized;
+		this.#cursor = Math.min(this.#cursor, normalized.length);
 	}
 
 	handleInput(data: string): void {
@@ -186,8 +195,9 @@ export class Input implements Component, Focusable {
 		}
 		this.#lastAction = "type-word";
 
-		this.#value = this.#value.slice(0, this.#cursor) + text + this.#value.slice(this.#cursor);
-		this.#cursor += text.length;
+		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
+		this.#value = inserted.value;
+		this.#cursor = inserted.cursor;
 	}
 
 	#handleBackspace(): void {
@@ -300,8 +310,9 @@ export class Input implements Component, Focusable {
 		}
 
 		this.#pushUndo();
-		this.#value = this.#value.slice(0, this.#cursor) + text + this.#value.slice(this.#cursor);
-		this.#cursor += text.length;
+		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
+		this.#value = inserted.value;
+		this.#cursor = inserted.cursor;
 		this.#lastAction = "yank";
 	}
 
@@ -318,8 +329,9 @@ export class Input implements Component, Focusable {
 
 		this.#killRing.rotate();
 		const text = this.#killRing.peek() ?? "";
-		this.#value = this.#value.slice(0, this.#cursor) + text + this.#value.slice(this.#cursor);
-		this.#cursor += text.length;
+		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
+		this.#value = inserted.value;
+		this.#cursor = inserted.cursor;
 		this.#lastAction = "yank";
 	}
 
@@ -374,8 +386,9 @@ export class Input implements Component, Focusable {
 		);
 
 		// Insert at cursor position
-		this.#value = this.#value.slice(0, this.#cursor) + cleanText + this.#value.slice(this.#cursor);
-		this.#cursor += cleanText.length;
+		const inserted = insertTextNfcAt(this.#value, this.#cursor, cleanText);
+		this.#value = inserted.value;
+		this.#cursor = inserted.cursor;
 	}
 
 	invalidate(): void {

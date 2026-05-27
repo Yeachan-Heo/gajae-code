@@ -690,6 +690,40 @@ describe("Editor component", () => {
 			// Last line has cursor (|) which we need to strip
 			expect(contentLines[1]?.replace("|", "")).toBe("ト"); // 1 char = 2 columns (+ cursor + padding)
 		});
+		it("normalizes typed NFD Hangul so backspace removes one visible syllable", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			for (const char of "한") {
+				editor.handleInput(char);
+			}
+
+			expect(editor.getText()).toBe("한");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+
+			editor.handleInput("\x7f");
+
+			expect(editor.getText()).toBe("");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+		});
+
+		it("places terminal cursor after typed NFD Hangul at the NFC cell width", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setPromptGutter("> ");
+			editor.setUseTerminalCursor(true);
+			editor.focused = true;
+
+			for (const char of "한글") {
+				editor.handleInput(char);
+			}
+
+			const [line] = editor.render(20);
+			const markerIndex = line!.indexOf(CURSOR_MARKER);
+
+			expect(editor.getText()).toBe("한글");
+			expect(markerIndex).toBeGreaterThanOrEqual(0);
+			expect(visibleWidth(line!.slice(0, markerIndex))).toBe(2 + visibleWidth("한글"));
+		});
 
 		it("handles mixed ASCII and wide characters in wrapping", () => {
 			const editor = new Editor(defaultEditorTheme);

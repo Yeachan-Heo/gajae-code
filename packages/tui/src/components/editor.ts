@@ -26,7 +26,19 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 
 function sanitizeLoadedText(text: string): string {
 	// Normalize CRLF/CR → LF, then strip C0 control chars except \n.
-	return replaceTabs(text.replace(/\r\n?/g, "\n")).replace(/[\x00-\x09\x0b-\x1f]/g, "");
+	return replaceTabs(text.replace(/\r\n?/g, "\n"))
+		.replace(/[\x00-\x09\x0b-\x1f]/g, "")
+		.normalize("NFC");
+}
+
+function insertTextNfcAt(line: string, cursorCol: number, text: string): { line: string; cursorCol: number } {
+	const before = line.slice(0, cursorCol);
+	const after = line.slice(cursorCol);
+	const beforeWithInsert = (before + text).normalize("NFC");
+	return {
+		line: (beforeWithInsert + after).normalize("NFC"),
+		cursorCol: beforeWithInsert.length,
+	};
 }
 
 const segmenter = getSegmenter();
@@ -1466,11 +1478,10 @@ export class Editor implements Component, Focusable {
 		this.#recordUndoState();
 
 		const line = this.#state.lines[this.#state.cursorLine] || "";
-		const before = line.slice(0, this.#state.cursorCol);
-		const after = line.slice(this.#state.cursorCol);
+		const inserted = insertTextNfcAt(line, this.#state.cursorCol, text);
 
-		this.#state.lines[this.#state.cursorLine] = before + text + after;
-		this.#setCursorCol(this.#state.cursorCol + text.length);
+		this.#state.lines[this.#state.cursorLine] = inserted.line;
+		this.#setCursorCol(inserted.cursorCol);
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -1484,12 +1495,10 @@ export class Editor implements Component, Focusable {
 		this.#recordUndoState();
 
 		const line = this.#state.lines[this.#state.cursorLine] || "";
+		const inserted = insertTextNfcAt(line, this.#state.cursorCol, char);
 
-		const before = line.slice(0, this.#state.cursorCol);
-		const after = line.slice(this.#state.cursorCol);
-
-		this.#state.lines[this.#state.cursorLine] = before + char + after;
-		this.#setCursorCol(this.#state.cursorCol + char.length);
+		this.#state.lines[this.#state.cursorLine] = inserted.line;
+		this.#setCursorCol(inserted.cursorCol);
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -1939,15 +1948,14 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 		this.#recordUndoState();
 
-		const normalized = text.replace(/\r\n?/g, "\n");
+		const normalized = text.replace(/\r\n?/g, "\n").normalize("NFC");
 		const lines = normalized.split("\n");
 
 		if (lines.length === 1) {
 			const line = this.#state.lines[this.#state.cursorLine] || "";
-			const before = line.slice(0, this.#state.cursorCol);
-			const after = line.slice(this.#state.cursorCol);
-			this.#state.lines[this.#state.cursorLine] = before + normalized + after;
-			this.#setCursorCol(this.#state.cursorCol + normalized.length);
+			const inserted = insertTextNfcAt(line, this.#state.cursorCol, normalized);
+			this.#state.lines[this.#state.cursorLine] = inserted.line;
+			this.#setCursorCol(inserted.cursorCol);
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
@@ -1958,11 +1966,12 @@ export class Editor implements Component, Focusable {
 				newLines.push(this.#state.lines[i] || "");
 			}
 
-			newLines.push(beforeCursor + (lines[0] || ""));
+			newLines.push((beforeCursor + (lines[0] || "")).normalize("NFC"));
 			for (let i = 1; i < lines.length - 1; i++) {
 				newLines.push(lines[i] || "");
 			}
-			newLines.push((lines[lines.length - 1] || "") + afterCursor);
+			const finalLineBeforeAfter = (lines[lines.length - 1] || "").normalize("NFC");
+			newLines.push((finalLineBeforeAfter + afterCursor).normalize("NFC"));
 
 			for (let i = this.#state.cursorLine + 1; i < this.#state.lines.length; i++) {
 				newLines.push(this.#state.lines[i] || "");
@@ -1970,7 +1979,7 @@ export class Editor implements Component, Focusable {
 
 			this.#state.lines = newLines;
 			this.#state.cursorLine += lines.length - 1;
-			this.#setCursorCol((lines[lines.length - 1] || "").length);
+			this.#setCursorCol(finalLineBeforeAfter.length);
 		}
 
 		if (this.onChange) {

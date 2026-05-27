@@ -197,6 +197,19 @@ describe("Input component", () => {
 		// Stored value must be NFC — no more NFD characters in the buffer.
 		expect(input.getValue()).toBe(nfcPath);
 	});
+	it("normalizes typed NFD Korean so backspace removes one visible syllable", () => {
+		const input = new Input();
+
+		for (const char of "한") {
+			input.handleInput(char);
+		}
+
+		expect(input.getValue()).toBe("한");
+
+		input.handleInput("\x7f");
+
+		expect(input.getValue()).toBe("");
+	});
 
 	it("NFC paste: cursor column matches visible cells (no displacement)", () => {
 		// Regression guard for the "cursor floats past the filename" bug.
