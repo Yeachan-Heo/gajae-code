@@ -189,7 +189,7 @@ export interface ModelTagsSettings {
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
-const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
+const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [

@@ -14,7 +14,7 @@ import {
 	visibleWidth,
 } from "@gajae-code/tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS, MODEL_ROLES } from "../../config/model-registry";
+import { getRoleInfo } from "../../config/model-registry";
 import { resolveModelRoleValue } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
@@ -44,16 +44,7 @@ function getAlphaSearchTokens(query: string): string[] {
 }
 
 function computeModelRank(model: Model, roles: Record<string, RoleAssignment | undefined>): number {
-	let i = 0;
-	while (i < MODEL_ROLE_IDS.length) {
-		const role = MODEL_ROLE_IDS[i];
-		const assigned = roles[role];
-		if (assigned && modelsAreEqual(assigned.model, model)) {
-			break;
-		}
-		i++;
-	}
-	return i;
+	return roles.default && modelsAreEqual(roles.default.model, model) ? 0 : 1;
 }
 
 interface ModelItem {
@@ -243,20 +234,15 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#buildMenuRoleActions(): void {
-		this.#menuRoleActions = getKnownRoleIds(this.#settings).map(role => {
-			const roleInfo = getRoleInfo(role, this.#settings);
-			const roleLabel = roleInfo.tag ? `${roleInfo.tag} (${roleInfo.name})` : roleInfo.name;
-			return {
-				label: `Set as ${roleLabel}`,
-				role,
-			};
-		});
+		const roleInfo = getRoleInfo("default", this.#settings);
+		const roleLabel = roleInfo.tag ? `${roleInfo.tag} (${roleInfo.name})` : roleInfo.name;
+		this.#menuRoleActions = [{ label: `Set as ${roleLabel}`, role: "default" }];
 	}
 
 	#loadRoleModels(): void {
 		const allModels = this.#modelRegistry.getAll();
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
-		for (const role of getKnownRoleIds(this.#settings)) {
+		for (const role of ["default"]) {
 			const roleValue = this.#settings.getModelRole(role);
 			if (!roleValue) continue;
 
@@ -278,7 +264,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#sortModels(models: ModelItem[]): void {
-		// Sort: tagged models (default/smol/slow/plan) first, then MRU, then alphabetical
+		// Sort: default-tagged model first, then MRU, then alphabetical
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
 
@@ -664,22 +650,11 @@ export class ModelSelectorComponent extends Container {
 
 			// Build role badges (inverted: color as background, black text)
 			const roleBadgeTokens: string[] = [];
-			for (const role of MODEL_ROLE_IDS) {
-				const { tag, color } = getRoleInfo(role, this.#settings);
-				const assigned = this.#roles[role];
-				if (!tag || !assigned || !modelsAreEqual(assigned.model, item.model)) continue;
-
-				const badge = makeInvertedBadge(tag, color ?? "success");
-				const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
-				roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}`);
-			}
-			// Custom role badges
-			for (const [role, assigned] of Object.entries(this.#roles)) {
-				if (role in MODEL_ROLES || !assigned || !modelsAreEqual(assigned.model, item.model)) continue;
-				const roleInfo = getRoleInfo(role, this.#settings);
-				const badgeLabel = roleInfo.tag ?? roleInfo.name;
-				const badge = makeInvertedBadge(badgeLabel, roleInfo.color ?? "muted");
-				const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
+			const defaultRoleInfo = getRoleInfo("default", this.#settings);
+			const defaultAssigned = this.#roles.default;
+			if (defaultRoleInfo.tag && defaultAssigned && modelsAreEqual(defaultAssigned.model, item.model)) {
+				const badge = makeInvertedBadge(defaultRoleInfo.tag, defaultRoleInfo.color ?? "success");
+				const thinkingLabel = getThinkingLevelMetadata(defaultAssigned.thinkingLevel).label;
 				roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}`);
 			}
 			const badgeText = roleBadgeTokens.length > 0 ? ` ${roleBadgeTokens.join(" ")}` : "";

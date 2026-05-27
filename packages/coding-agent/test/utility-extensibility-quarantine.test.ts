@@ -20,16 +20,36 @@ function extractSetValues(sourceText: string, name: string): string[] {
 describe("GJC utility extensibility quarantine", () => {
 	it("removes only non-ambiguous product-facing utility slash commands from the active registry", async () => {
 		const registry = await source("slash-commands", "builtin-registry.ts");
-		expect(extractSetValues(registry, "QUARANTINED_UTILITY_SLASH_COMMANDS")).toEqual(["agents", "ssh"]);
+		expect(extractSetValues(registry, "QUARANTINED_UTILITY_SLASH_COMMANDS")).toEqual(["agents"]);
 		expect(registry).toContain("ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY");
 		expect(registry).toContain("BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command)");
 	});
 
-	it("deletes obvious plugin, marketplace, and extension slash command implementations", async () => {
+	it("deletes approved non-critical slash command implementations", async () => {
 		const registry = await source("slash-commands", "builtin-registry.ts");
-		for (const removedCommand of ["extensions", "marketplace", "plugins", "reload-plugins"]) {
+		for (const removedCommand of [
+			"extensions",
+			"marketplace",
+			"plugins",
+			"reload-plugins",
+			"loop",
+			"plan",
+			"share",
+			"browser",
+			"copy",
+			"todo",
+			"changelog",
+			"context",
+			"branch",
+			"fork",
+			"handoff",
+			"force",
+			"quit",
+		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
+		expect(registry).toContain(`name: "ssh"`);
+		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);
 		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});

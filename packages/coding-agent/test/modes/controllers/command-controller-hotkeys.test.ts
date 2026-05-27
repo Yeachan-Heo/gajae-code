@@ -35,7 +35,7 @@ describe("buildHotkeysMarkdown", () => {
 		expect(lines[0]).toBe("**Navigation**");
 		expect(markdown).toContain("| `Ctrl+Shift+P` | Copy whole prompt |");
 		expect(markdown).toContain("| `Ctrl+Shift+L` | Select model (temporary) |");
-		expect(markdown).toContain("| `Ctrl+L` | Select model (set roles) |");
+		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 		expect(markdown).toContain("| `Alt+M` | Toggle plan mode |");
 		expect(markdown).toContain("| `#` | Open prompt actions |");
 		for (const line of lines) {
@@ -61,6 +61,6 @@ describe("buildHotkeysMarkdown", () => {
 		});
 
 		expect(markdown).toContain("| `Disabled` | Select model (temporary) |");
-		expect(markdown).toContain("| `Ctrl+L` | Select model (set roles) |");
+		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 	});
 });

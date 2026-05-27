@@ -70,7 +70,7 @@ describe("ModelSelector role badge thinking display", () => {
 		}
 	});
 
-	test("shows custom roles from cycleOrder/modelRoles and honors built-in metadata overrides", async () => {
+	test("uses canonical default-only model assignment even when legacy roles are configured", async () => {
 		installTestTheme();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
@@ -78,8 +78,8 @@ describe("ModelSelector role badge thinking display", () => {
 		const settings = Settings.isolated({
 			cycleOrder: ["smol", "custom-fast", "default"],
 			modelRoles: {
-				default: `${model.provider}/${model.id}`,
-				"custom-fast": `${model.provider}/${model.id}:low`,
+				default: `${model.provider}/${model.id}:low`,
+				"custom-fast": `${model.provider}/${model.id}:high`,
 				smol: `${model.provider}/${model.id}`,
 			},
 			modelTags: {
@@ -92,14 +92,16 @@ describe("ModelSelector role badge thinking display", () => {
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered).toContain("custom-fast (low)");
-		expect(rendered).toContain("SMOL (inherit)");
+		expect(rendered).toContain("DEFAULT (low)");
+		expect(rendered).not.toContain("custom-fast");
+		expect(rendered).not.toContain("SMOL");
 
 		selector.handleInput("\n");
 		installTestTheme();
 		const menuRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(menuRendered).toContain("Set as custom-fast");
-		expect(menuRendered).toContain("Set as SMOL (Quick)");
+		expect(menuRendered).toContain("Set as DEFAULT (Default)");
+		expect(menuRendered).not.toContain("Set as custom-fast");
+		expect(menuRendered).not.toContain("Set as SMOL");
 	});
 
 	test("refreshes Ollama Cloud using provider id instead of tab label", async () => {

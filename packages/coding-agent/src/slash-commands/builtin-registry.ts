@@ -1,11 +1,7 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { Snowflake, setProjectDir } from "@gajae-code/utils";
-import { $ } from "bun";
-import type { SettingPath, SettingValue } from "../config/settings";
-import { settings } from "../config/settings";
+import { setProjectDir } from "@gajae-code/utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { InteractiveModeContext } from "../modes/types";
@@ -14,12 +10,9 @@ import {
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
-import { getChangelogPath, parseChangelog } from "../utils/changelog";
-import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
-import { handleTodoAcp } from "./helpers/todo";
 import { buildUsageReportText } from "./helpers/usage-report";
 import type {
 	BuiltinSlashCommand,
@@ -119,25 +112,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "plan",
-		description: "Toggle plan mode (agent plans before executing)",
-		inlineHint: "[prompt]",
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
-			// Capture state BEFORE the call: when plan mode is already active,
-			// handlePlanModeCommand may exit it (on confirmed exit) or leave it on (on cancel
-			// or warning). In every "already active" case the typed args are NOT consumed,
-			// so preserve them in history regardless of the user's confirm/cancel choice.
-			const wasPlanModeEnabled = runtime.ctx.planModeEnabled;
-			await runtime.ctx.handlePlanModeCommand(command.args || undefined);
-			if (hadArgs && wasPlanModeEnabled) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
 		name: "goal",
 		description: "Toggle goal mode (persistent autonomous objective for this session)",
 		subcommands: [
@@ -158,17 +132,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (hadArgs && wasGoalModeEnabled) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "loop",
-		description:
-			"Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Esc cancels the current iteration; /loop again to disable.",
-		inlineHint: "[count|duration]",
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			await runtime.ctx.handleLoopCommand(command.args);
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -321,154 +284,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "share",
-		description: "Share session as a secret GitHub gist",
-		handle: async (_command, runtime) => {
-			const tmpFile = path.join(os.tmpdir(), `${Snowflake.next()}.html`);
-			try {
-				try {
-					await runtime.session.exportToHtml(tmpFile);
-				} catch (err) {
-					return usage(`Failed to export session: ${errorMessage(err)}`, runtime);
-				}
-				const result = await $`gh gist create --public=false ${tmpFile}`.quiet().nothrow();
-				if (result.exitCode !== 0) {
-					return usage(
-						`Failed to create gist: ${result.stderr.toString("utf-8").trim() || "unknown error"}`,
-						runtime,
-					);
-				}
-				const gistUrl = result.stdout.toString("utf-8").trim();
-				const gistId = gistUrl.split("/").pop();
-				if (!gistId) return usage("Failed to parse gist ID from gh output", runtime);
-				await runtime.output(`Share URL: https://gistpreview.github.io/?${gistId}\nGist: ${gistUrl}`);
-				return commandConsumed();
-			} catch {
-				return usage("GitHub CLI (gh) is required for /share. Install it from https://cli.github.com/.", runtime);
-			} finally {
-				await fs.rm(tmpFile, { force: true }).catch(() => {});
-			}
-		},
-		handleTui: async (_command, runtime) => {
-			await runtime.ctx.handleShareCommand();
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "browser",
-		description: "Toggle browser headless vs visible mode",
-		acpInputHint: "[headless|visible]",
-		subcommands: [
-			{ name: "headless", description: "Switch to headless mode" },
-			{ name: "visible", description: "Switch to visible mode" },
-		],
-		allowArgs: true,
-		handle: async (command, runtime) => {
-			const arg = command.args.toLowerCase();
-			const enabled = runtime.settings.get("browser.enabled" as SettingPath) as boolean;
-			if (!enabled) return usage("Browser tool is disabled (enable in settings).", runtime);
-			const current = runtime.settings.get("browser.headless" as SettingPath) as boolean;
-			let next = current;
-			if (!arg) next = !current;
-			else if (arg === "headless" || arg === "hidden") next = true;
-			else if (arg === "visible" || arg === "show" || arg === "headful") next = false;
-			else return usage("Usage: /browser [headless|visible]", runtime);
-			runtime.settings.set("browser.headless" as SettingPath, next as SettingValue<SettingPath>);
-			const tool = runtime.session.getToolByName("browser");
-			if (tool && "restartForModeChange" in tool) {
-				try {
-					await (tool as { restartForModeChange: () => Promise<void> }).restartForModeChange();
-				} catch (err) {
-					// Setting was already mutated; surface the restart failure so the
-					// user knows the browser is in an inconsistent state.
-					await runtime.output(
-						`Browser mode set to ${next ? "headless" : "visible"}, but restart failed: ${errorMessage(err)}`,
-					);
-					return commandConsumed();
-				}
-			}
-			await runtime.output(`Browser mode: ${next ? "headless" : "visible"}`);
-			return commandConsumed();
-		},
-		handleTui: async (command, runtime) => {
-			const arg = command.args.toLowerCase();
-			const current = settings.get("browser.headless" as SettingPath) as boolean;
-			let next = current;
-			if (!(settings.get("browser.enabled" as SettingPath) as boolean)) {
-				runtime.ctx.showWarning("Browser tool is disabled (enable in settings)");
-				runtime.ctx.editor.setText("");
-				return;
-			}
-			if (!arg) {
-				next = !current;
-			} else if (arg === "headless" || arg === "hidden") {
-				next = true;
-			} else if (arg === "visible" || arg === "show" || arg === "headful") {
-				next = false;
-			} else {
-				runtime.ctx.showStatus("Usage: /browser [headless|visible]");
-				runtime.ctx.editor.setText("");
-				return;
-			}
-			settings.set("browser.headless" as SettingPath, next as SettingValue<SettingPath>);
-			const tool = runtime.ctx.session.getToolByName("browser");
-			if (tool && "restartForModeChange" in tool) {
-				try {
-					await (tool as { restartForModeChange: () => Promise<void> }).restartForModeChange();
-				} catch (error) {
-					runtime.ctx.showWarning(`Failed to restart browser: ${errorMessage(error)}`);
-					runtime.ctx.editor.setText("");
-					return;
-				}
-			}
-			runtime.ctx.showStatus(`Browser mode: ${next ? "headless" : "visible"}`);
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "copy",
-		description: "Copy last agent message to clipboard",
-		subcommands: [
-			{ name: "last", description: "Copy full last agent message" },
-			{ name: "code", description: "Copy last code block" },
-			{ name: "all", description: "Copy all code blocks from last message" },
-			{ name: "cmd", description: "Copy last bash/python command" },
-		],
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			const sub = command.args.trim().toLowerCase() || undefined;
-			await runtime.ctx.handleCopyCommand(sub);
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "todo",
-		description: "View or modify the agent's todo list",
-		acpDescription: "Manage todos",
-		acpInputHint: "<subcommand>",
-		subcommands: [
-			{ name: "edit", description: "Open todos in $EDITOR (Markdown round-trip)" },
-			{ name: "copy", description: "Copy todos as Markdown to clipboard" },
-			{ name: "export", description: "Write todos as Markdown to a file (default: TODO.md)", usage: "[<path>]" },
-			{ name: "import", description: "Replace todos from a Markdown file (default: TODO.md)", usage: "[<path>]" },
-			{
-				name: "append",
-				description: "Append a task; phase fuzzy-matched or auto-created",
-				usage: "[<phase>] <task...>",
-			},
-			{ name: "start", description: "Mark task in_progress (fuzzy-matched)", usage: "<task>" },
-			{ name: "done", description: "Mark task/phase/all completed (fuzzy-matched)", usage: "[<task|phase>]" },
-			{ name: "drop", description: "Mark task/phase/all abandoned (fuzzy-matched)", usage: "[<task|phase>]" },
-			{ name: "rm", description: "Remove task/phase/all (fuzzy-matched)", usage: "[<task|phase>]" },
-		],
-		allowArgs: true,
-		handle: handleTodoAcp,
-		handleTui: async (command, runtime) => {
-			await runtime.ctx.handleTodoCommand(command.args);
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
 		name: "session",
 		description: "Session management commands",
 		acpDescription: "Show session information",
@@ -572,36 +387,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "changelog",
-		description: "Show changelog entries",
-		acpDescription: "Show changelog",
-		acpInputHint: "[full]",
-		subcommands: [{ name: "full", description: "Show complete changelog" }],
-		allowArgs: true,
-		handle: async (command, runtime) => {
-			const changelogPath = getChangelogPath();
-			const allEntries = await parseChangelog(changelogPath);
-			const showFull = command.args.trim().toLowerCase() === "full";
-			const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);
-			if (entriesToShow.length === 0) {
-				await runtime.output("No changelog entries found.");
-				return commandConsumed();
-			}
-			await runtime.output(
-				[...entriesToShow]
-					.reverse()
-					.map(entry => entry.content)
-					.join("\n\n"),
-			);
-			return commandConsumed();
-		},
-		handleTui: async (command, runtime) => {
-			const showFull = command.args.split(/\s+/).filter(Boolean).includes("full");
-			await runtime.ctx.handleChangelogCommand(showFull);
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
 		name: "hotkeys",
 		description: "Show all keyboard shortcuts",
 		handleTui: (_command, runtime) => {
@@ -629,44 +414,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "context",
-		description: "Show estimated context usage breakdown",
-		acpDescription: "Show context usage",
-		handle: async (_command, runtime) => {
-			await runtime.output(buildContextReportText(runtime));
-			return commandConsumed();
-		},
-		handleTui: (_command, runtime) => {
-			runtime.ctx.handleContextCommand();
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
 		name: "agents",
 		description: "Open Agent Control Center dashboard",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showAgentsDashboard();
 			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "branch",
-		description: "Create a new branch from a previous message",
-		handleTui: (_command, runtime) => {
-			if (settings.get("doubleEscapeAction") === "tree") {
-				runtime.ctx.showTreeSelector();
-			} else {
-				runtime.ctx.showUserMessageSelector();
-			}
-			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "fork",
-		description: "Create a new fork from a previous message",
-		handleTui: async (_command, runtime) => {
-			runtime.ctx.editor.setText("");
-			await runtime.ctx.handleForkCommand();
 		},
 	},
 	{
@@ -883,17 +635,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "handoff",
-		description: "Hand off session context to a new session",
-		inlineHint: "[focus instructions]",
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			const customInstructions = command.args || undefined;
-			runtime.ctx.editor.setText("");
-			await runtime.ctx.handleHandoffCommand(customInstructions);
-		},
-	},
-	{
 		name: "resume",
 		description: "Resume a different session",
 		handleTui: (_command, runtime) => {
@@ -1077,59 +818,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Exit the application",
 		handleTui: shutdownHandlerTui,
 	},
-	{
-		name: "force",
-		description: "Force next turn to use a specific tool",
-		aliases: ["force:"],
-		inlineHint: "<tool-name> [prompt]",
-		allowArgs: true,
-		handle: async (command, runtime) => {
-			const spaceIdx = command.args.indexOf(" ");
-			const toolName = spaceIdx === -1 ? command.args : command.args.slice(0, spaceIdx);
-			const prompt = spaceIdx === -1 ? "" : command.args.slice(spaceIdx + 1).trim();
-			if (!toolName) return usage("Usage: /force:<tool-name> [prompt]", runtime);
-			try {
-				runtime.session.setForcedToolChoice(toolName);
-			} catch (err) {
-				return usage(errorMessage(err), runtime);
-			}
-			await runtime.output(`Next turn forced to use ${toolName}.`);
-			return prompt ? { prompt } : commandConsumed();
-		},
-		handleTui: (command, runtime) => {
-			const spaceIdx = command.args.indexOf(" ");
-			const toolName = spaceIdx === -1 ? command.args : command.args.slice(0, spaceIdx);
-			const prompt = spaceIdx === -1 ? "" : command.args.slice(spaceIdx + 1).trim();
-
-			if (!toolName) {
-				runtime.ctx.showError("Usage: /force:<tool-name> [prompt]");
-				runtime.ctx.editor.setText("");
-				return;
-			}
-
-			try {
-				runtime.ctx.session.setForcedToolChoice(toolName);
-				runtime.ctx.showStatus(`Next turn forced to use ${toolName}.`);
-			} catch (error) {
-				runtime.ctx.showError(errorMessage(error));
-				runtime.ctx.editor.setText("");
-				return;
-			}
-
-			runtime.ctx.editor.setText("");
-
-			// If a prompt was provided, pass it through as input
-			if (prompt) return { prompt };
-		},
-	},
-	{
-		name: "quit",
-		description: "Quit the application",
-		handleTui: shutdownHandlerTui,
-	},
 ];
 
-const QUARANTINED_UTILITY_SLASH_COMMANDS = new Set(["agents", "ssh"]);
+const QUARANTINED_UTILITY_SLASH_COMMANDS = new Set(["agents"]);
 
 const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = BUILTIN_SLASH_COMMAND_REGISTRY.filter(
 	command => !QUARANTINED_UTILITY_SLASH_COMMANDS.has(command.name),

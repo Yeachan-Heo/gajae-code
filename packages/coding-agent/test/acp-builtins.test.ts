@@ -162,16 +162,6 @@ describe("ACP builtin slash commands", () => {
 		expect(output).toEqual(["Fast mode is off."]);
 	});
 
-	it("forces a tool and returns remaining prompt text", async () => {
-		const { output, runtime } = createRuntime();
-
-		const result = await executeAcpBuiltinSlashCommand("/force read inspect package.json", runtime);
-
-		expect(result).toEqual({ prompt: "inspect package.json" });
-		expect(runtime.session.forcedToolChoice).toBe("read");
-		expect(output).toEqual(["Next turn forced to use read."]);
-	});
-
 	it("renders provider usage reports when the session can fetch them", async () => {
 		const { output, runtime } = createRuntime();
 		runtime.session.fetchUsageReports = async () => [
@@ -317,20 +307,27 @@ describe("ACP builtin slash commands", () => {
 		expect(configNotified).toBe(0);
 	});
 
-	// Removed TUI-only and dropped commands fall through as false
-	it("removed commands return false (fall through to model)", async () => {
+	// TUI-only and dropped commands fall through as false
+	it("TUI-only and dropped commands return false (fall through to model)", async () => {
 		const removedCommands = [
 			"/login",
 			"/logout",
 			"/resume",
 			"/tree",
 			"/branch",
+			"/browser",
+			"/changelog",
+			"/context",
 			"/plan",
 			"/loop",
+			"/share",
 			"/hotkeys",
 			"/extensions",
 			"/agents",
 			"/copy",
+			"/todo",
+			"/force read file.ts",
+			"/quit",
 			"/btw hi",
 			"/new",
 			"/drop",
@@ -437,39 +434,6 @@ describe("wave 3 commands", () => {
 		expect(output[0]).toContain("Failed to export session: disk full");
 	});
 
-	// /todo
-	it("/todo no-args: outputs empty state message when no todos", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/todo", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toBe("No todos. Use /todo append <task> to start one.");
-	});
-
-	it("/todo append: stores phases and records custom entry", async () => {
-		const { session, fakeSessionManager, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand('/todo append "Build" "Wire setup"', runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(session._todoPhases).toHaveLength(1);
-		expect(session._todoPhases[0]?.name).toBe("Build");
-		expect(session._todoPhases[0]?.tasks[0]?.content).toBe("Wire setup");
-		expect(fakeSessionManager._customEntries).toHaveLength(1);
-		expect(fakeSessionManager._customEntries[0]?.customType).toBe("user_todo_edit");
-	});
-
-	it("/todo edit: returns TUI-only usage message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/todo edit", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("TUI editor");
-	});
-
-	it("/todo unknown: returns usage message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/todo foobar", runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Unknown /todo subcommand");
-	});
-
 	// /move
 	it("/move: returns usage when no arg", async () => {
 		const { output, runtime } = createRuntime();
@@ -507,40 +471,6 @@ describe("wave 3 commands", () => {
 		expect(output.length).toBeGreaterThan(0);
 	});
 
-	// /todo start fuzzy match
-	it("/todo start: finds pending task by substring and starts it", async () => {
-		const { output, session, runtime } = createRuntime();
-		session._todoPhases = [{ name: "Setup", tasks: [{ content: "Wire up router", status: "pending" }] }];
-		const result = await executeAcpBuiltinSlashCommand('/todo start "wire"', runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Wire up router");
-		expect(session._todoPhases[0]?.tasks[0]?.status).toBe("in_progress");
-	});
-
-	// /browser
-	it("/browser visible: sets headless=false; second call is idempotent", async () => {
-		const { runtime } = createRuntime();
-		runtime.settings.set("browser.enabled" as never, true as never);
-		runtime.settings.set("browser.headless" as never, true as never);
-		const r1 = await executeAcpBuiltinSlashCommand("/browser visible", runtime);
-		expect(r1).toEqual({ consumed: true });
-		expect(runtime.settings.get("browser.headless" as never)).toBe(false);
-		const r2 = await executeAcpBuiltinSlashCommand("/browser visible", runtime);
-		expect(r2).toEqual({ consumed: true });
-		expect(runtime.settings.get("browser.headless" as never)).toBe(false);
-	});
-
-	it("/browser no-arg after /browser visible toggles to headless", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.settings.set("browser.enabled" as never, true as never);
-		runtime.settings.set("browser.headless" as never, true as never);
-		await executeAcpBuiltinSlashCommand("/browser visible", runtime);
-		const r = await executeAcpBuiltinSlashCommand("/browser", runtime);
-		expect(r).toEqual({ consumed: true });
-		expect(output[output.length - 1]).toContain("headless");
-		expect(runtime.settings.get("browser.headless" as never)).toBe(true);
-	});
-
 	// /compact
 	it("/compact: reports Compaction complete. after session.compact resolves", async () => {
 		const { output, session, runtime } = createRuntime();
@@ -574,13 +504,12 @@ describe("wave 4 commands", () => {
 		}
 	});
 
-	it("/ssh commands remain preserved but quarantined from ACP", async () => {
+	it("/ssh commands remain preserved in ACP", async () => {
 		const { output, runtime } = createRuntime();
-		for (const command of ["/ssh", "/ssh help", "/ssh add", "/ssh frobnicate"]) {
-			const result = await executeAcpBuiltinSlashCommand(command, runtime);
-			expect(result).toBe(false);
-		}
-		expect(output).toEqual([]);
+		const result = await executeAcpBuiltinSlashCommand("/ssh", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("list");
+		expect(output[0]).toContain("remove");
 	});
 
 	it("removed plugin and marketplace commands fall through", async () => {
@@ -591,23 +520,6 @@ describe("wave 4 commands", () => {
 			expect(result).toBe(false);
 		}
 		expect(output).toEqual([]);
-	});
-
-	// /todo start with in_progress status in fuzzy list
-	it("/todo start: resolves ambiguous matches by preferring active tasks", async () => {
-		const { output, session, runtime } = createRuntime();
-		session._todoPhases = [
-			{
-				name: "Phase 1",
-				tasks: [
-					{ content: "Wire auth middleware", status: "pending" },
-					{ content: "Wire session store", status: "completed" },
-				],
-			},
-		];
-		const result = await executeAcpBuiltinSlashCommand('/todo start "wire"', runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Wire auth middleware");
 	});
 });
 
@@ -638,14 +550,18 @@ describe("wave 5 — adapters and polish", () => {
 		expect(output).toEqual([]);
 	});
 
-	it("/ssh add remains quarantined and does not call addSSHHost", async () => {
+	it("/ssh add remains preserved and calls addSSHHost", async () => {
 		const spy = spyOn(sshConfig, "addSSHHost").mockResolvedValue(undefined);
 		try {
 			const { output, runtime } = createRuntime();
 			const result = await executeAcpBuiltinSlashCommand("/ssh add foo --host x --user y --scope user", runtime);
-			expect(result).toBe(false);
-			expect(output).toEqual([]);
-			expect(spy).not.toHaveBeenCalled();
+			expect(result).toEqual({ consumed: true });
+			expect(output[0]).toContain('Added SSH host "foo" (user).');
+			expect(spy).toHaveBeenCalledTimes(1);
+			const [configPath, name, hostConfig] = spy.mock.calls[0]!;
+			expect(typeof configPath).toBe("string");
+			expect(name).toBe("foo");
+			expect(hostConfig).toMatchObject({ host: "x", username: "y" });
 		} finally {
 			spy.mockRestore();
 		}
@@ -698,31 +614,6 @@ describe("wave 5 — adapters and polish", () => {
 	});
 
 	// /context breakdown
-	it("/context: lists more than one breakdown line for session with messages", async () => {
-		const { output, session, runtime } = createRuntime();
-		// computeContextBreakdown needs model.contextWindow; fake session falls back gracefully
-		(session as unknown as Record<string, unknown>).model = {
-			provider: "anthropic",
-			id: "claude-test",
-			contextWindow: 200_000,
-		};
-		(session as unknown as Record<string, unknown>).skills = [];
-		(session as unknown as Record<string, unknown>).agent = { state: { tools: [] } };
-		(session as unknown as Record<string, unknown>).systemPrompt = ["You are a helpful assistant."];
-		(session as unknown as Record<string, unknown>).settings = {
-			getGroup: () => ({ enabled: false, strategy: "off" }),
-		};
-		session.messages = [
-			{ role: "user", content: "Hello, how are you?" },
-			{ role: "assistant", content: "I am doing well." },
-		];
-		const result = await executeAcpBuiltinSlashCommand("/context", runtime);
-		expect(result).toEqual({ consumed: true });
-		// Should show the breakdown with multiple lines (Messages category visible)
-		const text = output[0] ?? "";
-		expect(text).toContain("tokens");
-		expect(text.split("\n").length).toBeGreaterThan(1);
-	});
 
 	// /jobs empty state
 	it("/jobs: empty-state output mentions background jobs definition", async () => {
