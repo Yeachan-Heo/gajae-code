@@ -362,6 +362,26 @@ async function readStructuredValue(cwd: string, value: string): Promise<unknown>
 		throw error;
 	}
 }
+function qualityGateObject(value: unknown): JsonObject | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : null;
+}
+
+async function readRequiredCompletionQualityGate(cwd: string, value: string | undefined): Promise<unknown> {
+	if (!value?.trim()) {
+		throw new Error(
+			"checkpoint --status complete requires --quality-gate-json with codeReview.recommendation APPROVE and codeReview.architectStatus CLEAR",
+		);
+	}
+	const gate = await readStructuredValue(cwd, value);
+	const gateObject = qualityGateObject(gate);
+	const codeReview = qualityGateObject(gateObject?.codeReview);
+	if (codeReview?.recommendation !== "APPROVE" || codeReview.architectStatus !== "CLEAR") {
+		throw new Error(
+			"checkpoint --status complete requires architect review approval: codeReview.recommendation must be APPROVE and codeReview.architectStatus must be CLEAR",
+		);
+	}
+	return gate;
+}
 
 function recordValue(record: JsonObject, key: string): JsonObject | null {
 	const value = record[key];
@@ -706,18 +726,12 @@ export async function checkpointUltragoalGoal(input: {
 	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
-	const gjcGoalJson = input.gjcGoalJson ? await readStructuredValue(input.cwd, input.gjcGoalJson) : undefined;
 	const qualityGateJson =
 		input.status === "complete"
-			? validateCompleteQualityGate(await readQualityGate(input.cwd, input.qualityGateJson))
+			? await readRequiredCompletionQualityGate(input.cwd, input.qualityGateJson)
 			: input.qualityGateJson
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
-	if (input.status === "complete") {
-		if (gjcGoalJson === undefined)
-			throw new Error("complete checkpoints require --gjc-goal-json with a fresh get_goal snapshot");
-		validateGjcGoalSnapshot({ value: gjcGoalJson, plan, goal });
-	}
 	const now = new Date().toISOString();
 	const ledgerBefore = await readUltragoalLedger(input.cwd);
 	const beforeStatus = goal.status;
@@ -759,9 +773,8 @@ export async function checkpointUltragoalGoal(input: {
 		goalId: goal.id,
 		status: input.status,
 		evidence,
-		gjcGoalJson,
+		gjcGoalJson: input.gjcGoalJson ? await readStructuredValue(input.cwd, input.gjcGoalJson) : undefined,
 		qualityGateJson,
-		completionVerification: input.status === "complete" ? goal.completionVerification : undefined,
 	});
 	return plan;
 }

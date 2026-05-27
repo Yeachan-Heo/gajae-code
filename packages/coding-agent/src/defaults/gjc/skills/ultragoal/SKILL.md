@@ -64,12 +64,11 @@ Loop until `gjc ultragoal status` reports all goals complete:
 3. Call `get_goal({})`.
 4. If no active GJC goal exists, call `create_goal({"objective":"<printed payload objective>"})` with the printed payload. In aggregate mode, if the same aggregate objective is already active, continue the current GJC story without creating a new GJC goal.
 5. Complete the current GJC story only.
-6. Run the mandatory blocking verification loop for this story: architect review (architecture-side, product-side, and code-side), executor QA (e2e plus red-team suite build/run), and steering/iteration until every verifier is clean.
-7. Do **not** checkpoint `complete` from self-verification, summary confidence, or partial tests. If any verifier reports a finding, checkpoint `review_blocked` / record blocker work instead of completing the story.
-8. In aggregate mode, do **not** call `update_goal` for intermediate stories. Checkpoint each story with a fresh `get_goal({})` snapshot whose aggregate objective is still `active`. On the final story, run the strict complete checkpoint first; that accepted checkpoint creates a fresh final aggregate receipt. Only after that receipt exists may `update_goal({"status":"complete"})` reconcile the inline GJC goal.
-9. Checkpoint the durable ledger with that snapshot and a structured quality gate for every complete story:
-   `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <get-goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>`
-10. If blocked or failed, checkpoint failure:
+6. Run a completion audit against the story objective and real artifacts/tests.
+7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `update_goal` for intermediate stories; checkpoint with a fresh `get_goal({})` snapshot whose aggregate objective is still `active`. On the final story only, call `update_goal({"status":"complete"})` after the gate is clean, then call `get_goal({})` again for a fresh `complete` snapshot.
+8. Checkpoint the durable ledger with that snapshot. Complete checkpoints require `--quality-gate-json`; the runtime hook rejects closure without a clean architect review:
+   `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <get_goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>`
+9. If blocked or failed, checkpoint failure:
    `gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
 11. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
    `gjc ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy GJC goal blocks create_goal in this thread>" --gjc-goal-json <get_goal-json-or-path>`
@@ -135,9 +134,15 @@ gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evid
 
 Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
 
-## Mandatory blocking verification loop
+## Mandatory completion cleanup and review gate
 
-No ultragoal story is complete until the active agent has obtained independent verification and every verifier is clean:
+An ultragoal story cannot be checkpointed `complete` until the active agent has run the quality gate:
+
+1. Run targeted verification for the story.
+2. Run a cleanup/refactor review pass on changed files only; if there are no relevant edits, the cleaner still runs and records a passed/no-op report.
+3. Rerun verification after the cleaner pass.
+4. Run a final code review pass. Clean means `codeReview.recommendation: "APPROVE"` and `codeReview.architectStatus: "CLEAR"`; `COMMENT`, `WATCH`, `REQUEST CHANGES`, and `BLOCK` are non-clean.
+5. If review is non-clean, do **not** call `update_goal`. Record durable blocker work instead:
 
 1. Run targeted implementation verification for the story.
 2. Delegate an `architect` review covering all three lanes:
