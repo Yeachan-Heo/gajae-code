@@ -68,7 +68,7 @@ RUN cat > /repo/scripts/publish-local.sh <<'SCRIPT'
 set -e
 
 REGISTRY="http://localhost:4873"
-PACKAGES=(utils natives ai agent tui stats coding-agent)
+PACKAGES=(utils natives ai agent tui stats coding-agent gajae-code)
 
 # Build version map from all package.json files
 declare -A VERSION_MAP
@@ -127,7 +127,7 @@ RUN verdaccio --config /root/.config/verdaccio/config.yaml &>/dev/null & \
 WORKDIR /test
 RUN verdaccio --config /root/.config/verdaccio/config.yaml &>/dev/null & \
     sleep 3 && \
-    bun add @gajae-code/coding-agent --registry http://localhost:4873 && \
+    bun add gajae-code --registry http://localhost:4873 && \
     pkill -f verdaccio
 
 # Verify the installed package works

@@ -83,6 +83,10 @@
 		"CHANGELOG.md"
 	],
 	"exports": {
+		"./cli": {
+			"types": "./src/cli.ts",
+			"import": "./src/cli.ts"
+		},
 		".": {
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
