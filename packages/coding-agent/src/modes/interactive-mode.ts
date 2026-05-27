@@ -39,6 +39,7 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import { consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
 import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
@@ -1122,6 +1123,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.#exitGoalMode({ reason: "dropped", silent: true });
 				return;
 			}
+			if (event.state?.enabled === true && !this.#goalModePreviousTools) {
+				this.#goalModePreviousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
+			}
 			this.goalModeEnabled = event.state?.enabled === true;
 			this.goalModePaused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
 			if (!event.state?.enabled) {
@@ -1217,6 +1221,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
 			this.#updateGoalModeStatus();
+			return;
+		}
+		const pendingGoal = goalEnabled ? await consumePendingGoalModeRequest(this.sessionManager.getCwd()) : null;
+		if (pendingGoal) {
+			await this.#enterGoalMode({ objective: pendingGoal.objective, silent: true });
+			this.#scheduleGoalContinuation();
 			return;
 		}
 		if (!this.session.settings.get("plan.enabled")) {

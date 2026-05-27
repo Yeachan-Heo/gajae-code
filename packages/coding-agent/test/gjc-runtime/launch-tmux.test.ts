@@ -20,10 +20,26 @@ function args(overrides: Partial<Args> = {}): Args {
 const interactiveTty = { stdin: true, stdout: true };
 
 describe("default GJC tmux launch", () => {
-	it("plans an interactive root launch inside the gajae_code tmux session", () => {
+	it("does not plan tmux for interactive root launch without --tmux", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"] }),
 			rawArgs: ["hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan).toBeUndefined();
+	});
+
+	it("plans an interactive --tmux root launch inside the gajae_code tmux session", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -37,7 +53,9 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.tmuxCommand).toBe("tmux");
 		expect(plan?.newSessionArgs.slice(0, 5)).toEqual(["new-session", "-s", "gajae_code", "-c", "/repo"]);
 		expect(plan?.innerCommand).toContain(`${GJC_TMUX_LAUNCHED_ENV}=1`);
-		expect(plan?.innerCommand).toContain("'/bin/bun' '/repo/packages/coding-agent/src/cli.ts' 'hello world'");
+		expect(plan?.innerCommand).toContain(
+			"'/bin/bun' '/repo/packages/coding-agent/src/cli.ts' '--tmux' 'hello world'",
+		);
 	});
 
 	it("does not wrap non-interactive or already wrapped launches", () => {
@@ -53,16 +71,22 @@ describe("default GJC tmux launch", () => {
 
 		expect(buildDefaultTmuxLaunchPlan({ ...common, parsed: args({ print: true }), env: {} })).toBeUndefined();
 		expect(buildDefaultTmuxLaunchPlan({ ...common, parsed: args({ mode: "json" }), env: {} })).toBeUndefined();
-		expect(buildDefaultTmuxLaunchPlan({ ...common, parsed: args(), env: { TMUX: "/tmp/tmux" } })).toBeUndefined();
 		expect(
-			buildDefaultTmuxLaunchPlan({ ...common, parsed: args(), env: { [GJC_TMUX_LAUNCHED_ENV]: "1" } }),
+			buildDefaultTmuxLaunchPlan({ ...common, parsed: args({ tmux: true }), env: { TMUX: "/tmp/tmux" } }),
+		).toBeUndefined();
+		expect(
+			buildDefaultTmuxLaunchPlan({
+				...common,
+				parsed: args({ tmux: true }),
+				env: { [GJC_TMUX_LAUNCHED_ENV]: "1" },
+			}),
 		).toBeUndefined();
 	});
 
 	it("attaches an existing gajae_code session when creation fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args(),
+			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
 			env: {},
@@ -85,7 +109,7 @@ describe("default GJC tmux launch", () => {
 
 	it("falls through to direct launch when tmux is unavailable", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
-			parsed: args(),
+			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
 			env: {},

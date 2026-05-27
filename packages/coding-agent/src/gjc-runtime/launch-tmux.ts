@@ -6,7 +6,7 @@ export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
 
-type LaunchPolicy = "auto" | "direct" | "tmux";
+type LaunchPolicy = "direct" | "tmux";
 
 interface TtyState {
 	stdin: boolean;
@@ -59,9 +59,9 @@ interface CommandResolutionContext {
 
 function parseLaunchPolicy(env: NodeJS.ProcessEnv): LaunchPolicy {
 	const raw = env[GJC_LAUNCH_POLICY_ENV]?.trim().toLowerCase();
-	if (raw === "direct" || raw === "tmux" || raw === "auto") return raw;
+	if (raw === "direct" || raw === "tmux") return raw;
 	if (env.GJC_NO_TMUX === "1" || env.GJC_NO_TMUX === "true") return "direct";
-	return "auto";
+	return "tmux";
 }
 
 function isInteractiveRootLaunch(parsed: Args, tty: TtyState): boolean {
@@ -101,13 +101,12 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaunchPlan | undefined {
 	const env = context.env ?? process.env;
 	const policy = parseLaunchPolicy(env);
-	if (policy === "direct") return undefined;
+	if (!context.parsed.tmux || policy === "direct") return undefined;
 	if (env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return undefined;
 	const platform = context.platform ?? process.platform;
 	if (platform === "win32") return undefined;
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
-	if (policy === "auto" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
-	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, { stdin: true, stdout: true })) return undefined;
+	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
 	const cwd = context.cwd ?? process.cwd();
 	const sessionName = env.GJC_TMUX_SESSION?.trim() || GJC_DEFAULT_TMUX_SESSION;

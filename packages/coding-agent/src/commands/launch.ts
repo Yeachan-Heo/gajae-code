@@ -84,6 +84,9 @@ export default class Index extends Command {
 		"no-pty": Flags.boolean({
 			description: "Disable PTY-based interactive bash execution",
 		}),
+		tmux: Flags.boolean({
+			description: "Launch interactive startup inside tmux",
+		}),
 		tools: Flags.string({
 			description: "Comma-separated list of tools to enable (default: all)",
 		}),

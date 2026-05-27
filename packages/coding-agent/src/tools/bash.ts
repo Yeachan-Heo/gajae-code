@@ -7,6 +7,7 @@ import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
@@ -518,7 +519,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
+		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
@@ -532,6 +533,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					),
 				)
 			: undefined;
+		const resolvedEnv = {
+			...buildGjcRuntimeSessionEnv({
+				sessionFile: this.session.getSessionFile(),
+				sessionId: this.session.getSessionId?.(),
+				cwd: this.session.cwd,
+			}),
+			...expandedEnv,
+		};
 
 		// Resolve protocol URLs (agent://, artifact://, etc.) in extracted cwd.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {

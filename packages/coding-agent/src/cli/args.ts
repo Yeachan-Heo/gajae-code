@@ -35,6 +35,7 @@ export interface Args {
 	noTools?: boolean;
 	noLsp?: boolean;
 	noPty?: boolean;
+	tmux?: boolean;
 	/** Retained for runtime/test compatibility; extension loading flags are no longer parsed. */
 	hooks?: string[];
 	extensions?: string[];
@@ -125,6 +126,8 @@ export function parseArgs(args: string[]): Args {
 			result.noLsp = true;
 		} else if (arg === "--no-pty") {
 			result.noPty = true;
+		} else if (arg === "--tmux") {
+			result.tmux = true;
 		} else if (arg === "--tools" && i + 1 < args.length) {
 			const toolNames = args[++i]
 				.split(",")
@@ -228,7 +231,8 @@ export function getExtraHelpText(): string {
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
   GJC_NO_PTY                  - Disable PTY-based interactive bash execution
-  GJC_LAUNCH_POLICY           - Launch policy for interactive startup: auto, tmux, or direct
+  --tmux                       - Launch interactive startup inside tmux
+  GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - tmux session name for default interactive startup (default: gajae_code)
 
   For complete environment variable reference, see:
