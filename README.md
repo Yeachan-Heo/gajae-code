@@ -14,6 +14,10 @@
   <img src="assets/character.png" alt="Gajae-Code character mascot" width="360" />
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/sj4exxQ9v">Join the Discord community</a>
+</p>
+
 ## Story
 
 I created an earlier OpenAI code harness and `an earlier Anthropic-code harness`. After living with those harnesses, I felt the same thing kept happening: the harness got bloated, but the work still collapsed into one useful loop.
