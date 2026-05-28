@@ -6,8 +6,10 @@ function createProvider() {
 	return createPromptActionAutocompleteProvider({
 		commands: [
 			{ name: "fast", description: "Built-in fast mode" },
+			{ name: "model", description: "Select model" },
 			{ name: "skill:deep-interview", description: "Deep interview" },
 			{ name: "skill:fast", description: "Colliding skill" },
+			{ name: "skill:mode", description: "Mode skill" },
 		],
 		basePath: "/tmp",
 		keybindings: { getKeys: () => [] } as unknown as KeybindingsManager,
@@ -44,6 +46,15 @@ describe("prompt action skill autocomplete", () => {
 	it("does not let direct-name normalization shadow an exact non-skill command", async () => {
 		const provider = createProvider();
 		const suggestions = await provider.getSuggestions(["/fast"], 0, 5);
+		expect(suggestions?.items.some(item => item.value === "fast")).toBe(true);
 		expect(suggestions?.items.some(item => item.value === "skill:fast")).toBe(false);
+	});
+
+	it("keeps fuzzy builtin slash candidates when a skill command also matches", async () => {
+		const provider = createProvider();
+		const suggestions = await provider.getSuggestions(["/mode"], 0, 5);
+		expect(suggestions?.prefix).toBe("/mode");
+		expect(suggestions?.items.some(item => item.value === "model")).toBe(true);
+		expect(suggestions?.items.some(item => item.value === "skill:mode")).toBe(true);
 	});
 });

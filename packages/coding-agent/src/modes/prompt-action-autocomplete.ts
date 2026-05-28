@@ -84,6 +84,34 @@ function isSkillCommandAutocompleteItem(item: AutocompleteItem): item is SkillCo
 	return "normalizedSkillCommand" in item && item.normalizedSkillCommand === true;
 }
 
+function mergeAutocompleteSuggestions(
+	primary: { items: AutocompleteItem[]; prefix: string } | null,
+	secondary: { items: AutocompleteItem[]; prefix: string } | null,
+): { items: AutocompleteItem[]; prefix: string } | null {
+	if (!primary) return secondary;
+	if (!secondary) return primary;
+	if (primary.prefix !== secondary.prefix) return primary;
+
+	const seen = new Set<string>();
+	const items: AutocompleteItem[] = [];
+	for (const item of [...primary.items, ...secondary.items]) {
+		const key = `${item.value}\0${item.label}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		items.push(item);
+	}
+
+	return { items, prefix: primary.prefix };
+}
+
+function withoutSkillCommandSuggestions(
+	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
+): { items: AutocompleteItem[]; prefix: string } | null {
+	if (!suggestions) return null;
+	const items = suggestions.items.filter(item => !item.value.startsWith("skill:"));
+	return items.length > 0 ? { ...suggestions, items } : null;
+}
+
 function getPromptActionPrefix(textBeforeCursor: string): string | null {
 	const hashIndex = textBeforeCursor.lastIndexOf("#");
 	if (hashIndex === -1) return null;
@@ -148,8 +176,14 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			}
 		}
 
-		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
-		if (skillCommandSuggestions) return skillCommandSuggestions;
+		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
+		if (slashPrefix) {
+			const baseSuggestions = withoutSkillCommandSuggestions(
+				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
+			);
+			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
+			return mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions);
+		}
 
 		if (!isSettingsInitialized() || settings.get("emojiAutocomplete")) {
 			const emojiSuggestions = getEmojiSuggestions(textBeforeCursor);
@@ -215,9 +249,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		return this.#baseProvider.getInlineHint?.(lines, cursorLine, cursorCol) ?? null;
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
+		const baseSuggestions = withoutSkillCommandSuggestions(
+			this.#baseProvider.trySyncSlashCompletion?.(textBeforeCursor) ?? null,
+		);
 		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
-		if (skillCommandSuggestions) return skillCommandSuggestions;
-		return this.#baseProvider.trySyncSlashCompletion?.(textBeforeCursor) ?? null;
+		return mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions);
 	}
 	trySyncInlineReplace(textBeforeCursor: string): { replaceLen: number; insert: string } | null {
 		if (isSettingsInitialized() && !settings.get("emojiAutocomplete")) return null;
@@ -233,17 +269,6 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		const exactNonSkillCommand = this.#commands.some(
 			command => command.name === query && !command.name.startsWith("skill:"),
 		);
-		if (exactNonSkillCommand) {
-			const command = this.#commands.find(
-				candidate => candidate.name === query && !candidate.name.startsWith("skill:"),
-			);
-			if (command) {
-				return {
-					items: [{ value: command.name, label: command.name, description: command.description }],
-					prefix,
-				};
-			}
-		}
 		const items = this.#commands
 			.filter(command => command.name.startsWith("skill:"))
 			.map(command => {
