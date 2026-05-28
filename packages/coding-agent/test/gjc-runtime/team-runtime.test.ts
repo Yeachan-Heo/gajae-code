@@ -10,10 +10,13 @@ import {
 	monitorGjcTeam,
 	parseTeamLaunchArgs,
 	readGjcTeamSnapshot,
+	resolveGjcTeamWorkerCli,
+	resolveGjcTeamWorkerCliPlan,
 	resolveGjcWorkerCommand,
 	shutdownGjcTeam,
 	startGjcTeam,
 	transitionGjcTeamTask,
+	translateGjcWorkerLaunchArgsForCli,
 } from "../../src/gjc-runtime/team-runtime";
 
 let cleanupRoot: string | undefined;
@@ -179,6 +182,55 @@ describe("native gjc team runtime", () => {
 		expect(manifest.worker_command).toBe("bun ./packages/coding-agent/src/cli.ts");
 		expect(telemetry).toContain("bun ./packages/coding-agent/src/cli.ts");
 		expect(resolveGjcWorkerCommand(cleanupRoot, { GJC_TEAM_WORKER_COMMAND: "gjc-dev" })).toBe("gjc-dev");
+	});
+
+	it("keeps worker CLI selection limited to GJC teammate sessions", async () => {
+		expect(resolveGjcTeamWorkerCli({})).toBe("gjc");
+		expect(resolveGjcTeamWorkerCli({ GJC_TEAM_WORKER_CLI: "auto" })).toBe("gjc");
+		expect(resolveGjcTeamWorkerCli({ GJC_TEAM_WORKER_CLI: "gjc" })).toBe("gjc");
+		expect(resolveGjcTeamWorkerCliPlan(3, { GJC_TEAM_WORKER_CLI_MAP: "auto" })).toEqual(["gjc", "gjc", "gjc"]);
+		expect(resolveGjcTeamWorkerCliPlan(2, { GJC_TEAM_WORKER_CLI_MAP: "gjc,auto" })).toEqual(["gjc", "gjc"]);
+		expect(translateGjcWorkerLaunchArgsForCli("gjc", ["--model", "frontier"])).toEqual(["--model", "frontier"]);
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Launch GJC teammate sessions",
+			teamName: "gjc-worker-cli-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "", GJC_TEAM_WORKER_CLI_MAP: "gjc,auto" },
+		});
+		const config = await Bun.file(path.join(snapshot.state_dir, "config.json")).json();
+		const manifest = await Bun.file(path.join(snapshot.state_dir, "manifest.v2.json")).json();
+		const telemetry = await Bun.file(path.join(snapshot.state_dir, "telemetry.jsonl")).text();
+		expect(config.worker_cli_plan).toEqual(["gjc", "gjc"]);
+		expect(manifest.worker_cli_plan).toEqual(["gjc", "gjc"]);
+		expect(telemetry).toContain('"worker_cli_plan":["gjc","gjc"]');
+
+		for (const provider of ["codex", "claude", "gemini"]) {
+			expect(() => resolveGjcTeamWorkerCli({ GJC_TEAM_WORKER_CLI: provider })).toThrow(
+				/GJC team launches GJC teammate sessions only/,
+			);
+			expect(() => resolveGjcTeamWorkerCliPlan(1, { GJC_TEAM_WORKER_CLI_MAP: provider })).toThrow(
+				/GJC team launches GJC teammate sessions only/,
+			);
+			expect(() =>
+				resolveGjcTeamWorkerCliPlan(1, { GJC_TEAM_WORKER_CLI: provider, GJC_TEAM_WORKER_CLI_MAP: "gjc" }),
+			).toThrow(/GJC team launches GJC teammate sessions only/);
+			if (!cleanupRoot) cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+			await expect(
+				startGjcTeam({
+					workerCount: 1,
+					agentType: "executor",
+					task: "Do not launch external teammate providers",
+					teamName: `unsupported-${provider}`,
+					cwd: cleanupRoot,
+					dryRun: true,
+					env: { PATH: "", GJC_TEAM_WORKER_CLI: provider },
+				}),
+			).rejects.toThrow(/GJC team launches GJC teammate sessions only/);
+		}
 	});
 
 	it("parses team starts with automatic detached worktrees and legacy --worktree stripping", () => {

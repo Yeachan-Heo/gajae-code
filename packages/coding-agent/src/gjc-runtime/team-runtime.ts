@@ -8,6 +8,11 @@ export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "fa
 
 export const GJC_TEAM_DEFAULT_WORKERS = 3;
 export const GJC_TEAM_MAX_WORKERS = 20;
+const GJC_TEAM_WORKER_CLI_ENV = "GJC_TEAM_WORKER_CLI";
+const GJC_TEAM_WORKER_CLI_MAP_ENV = "GJC_TEAM_WORKER_CLI_MAP";
+
+export type GjcTeamWorkerCli = "gjc";
+type GjcTeamWorkerCliMode = "auto" | GjcTeamWorkerCli;
 
 export interface GjcTeamLeader {
 	session_id: string;
@@ -75,6 +80,7 @@ export interface GjcTeamConfig {
 	max_workers: number;
 	state_root: string;
 	worker_command: string;
+	worker_cli_plan: GjcTeamWorkerCli[];
 	tmux_command: string;
 	tmux_session: string;
 	tmux_session_name: string;
@@ -159,6 +165,70 @@ export interface GjcTeamMailboxMessage {
 interface FsError {
 	code?: string;
 }
+
+function normalizeGjcTeamWorkerCliMode(
+	raw: string | undefined,
+	sourceEnv = GJC_TEAM_WORKER_CLI_ENV,
+): GjcTeamWorkerCliMode {
+	const normalized = String(raw ?? "auto")
+		.trim()
+		.toLowerCase();
+	if (normalized === "" || normalized === "auto") return "auto";
+	if (normalized === "gjc") return "gjc";
+	if (normalized === "codex" || normalized === "claude" || normalized === "gemini") {
+		throw new Error(`Unsupported ${sourceEnv} value "${raw}". GJC team launches GJC teammate sessions only.`);
+	}
+	throw new Error(`Invalid ${sourceEnv} value "${raw}". Expected: auto or gjc`);
+}
+
+export function resolveGjcTeamWorkerCli(env: NodeJS.ProcessEnv = process.env): GjcTeamWorkerCli {
+	const mode = normalizeGjcTeamWorkerCliMode(env[GJC_TEAM_WORKER_CLI_ENV]);
+	return mode === "auto" ? "gjc" : mode;
+}
+
+export function resolveGjcTeamWorkerCliPlan(
+	workerCount: number,
+	env: NodeJS.ProcessEnv = process.env,
+): GjcTeamWorkerCli[] {
+	if (!Number.isInteger(workerCount) || workerCount < 1) {
+		throw new Error(`workerCount must be >= 1 (got ${workerCount})`);
+	}
+	normalizeGjcTeamWorkerCliMode(env[GJC_TEAM_WORKER_CLI_ENV]);
+	const rawMap = String(env[GJC_TEAM_WORKER_CLI_MAP_ENV] ?? "").trim();
+	if (rawMap === "") {
+		const cli = resolveGjcTeamWorkerCli(env);
+		return Array.from({ length: workerCount }, () => cli);
+	}
+	const entries = rawMap.split(",").map(entry => entry.trim());
+	if (entries.length === 0 || entries.every(entry => entry.length === 0)) {
+		throw new Error(
+			`Invalid ${GJC_TEAM_WORKER_CLI_MAP_ENV} value "${env[GJC_TEAM_WORKER_CLI_MAP_ENV]}". Expected: auto or gjc`,
+		);
+	}
+	if (entries.some(entry => entry.length === 0)) {
+		throw new Error(
+			`Invalid ${GJC_TEAM_WORKER_CLI_MAP_ENV} value "${env[GJC_TEAM_WORKER_CLI_MAP_ENV]}". Empty entries are not allowed.`,
+		);
+	}
+	if (entries.length !== 1 && entries.length !== workerCount) {
+		throw new Error(
+			`Invalid ${GJC_TEAM_WORKER_CLI_MAP_ENV} length ${entries.length}; expected 1 or ${workerCount} comma-separated values.`,
+		);
+	}
+	const expanded = entries.length === 1 ? Array.from({ length: workerCount }, () => entries[0] ?? "") : entries;
+	return expanded.map(entry => {
+		const mode = normalizeGjcTeamWorkerCliMode(entry, GJC_TEAM_WORKER_CLI_MAP_ENV);
+		return mode === "auto" ? "gjc" : mode;
+	});
+}
+
+export function translateGjcWorkerLaunchArgsForCli(workerCli: GjcTeamWorkerCli, args: string[]): string[] {
+	if (workerCli !== "gjc") {
+		throw new Error(`Unsupported team worker CLI "${workerCli}". GJC team launches GJC teammate sessions only.`);
+	}
+	return [...args];
+}
+
 interface GjcTmuxLeaderContext {
 	sessionName: string;
 	windowIndex: string;
@@ -341,6 +411,7 @@ async function readConfig(dir: string): Promise<GjcTeamConfig> {
 		tmux_target: config.tmux_target ?? config.tmux_session ?? tmuxSessionName,
 		leader_cwd: config.leader_cwd ?? config.leader.cwd,
 		team_state_root: config.team_state_root ?? config.state_root,
+		worker_cli_plan: config.worker_cli_plan ?? Array.from({ length: config.worker_count }, () => "gjc"),
 	};
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
@@ -1227,6 +1298,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const env = options.env ?? process.env;
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
+	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
 	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
 	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
 	const displayName = sanitizeName(options.teamName ?? options.task).slice(0, 30) || teamName;
@@ -1256,6 +1328,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		max_workers: GJC_TEAM_MAX_WORKERS,
 		state_root: stateRoot,
 		worker_command: resolveGjcWorkerCommand(cwd, env),
+		worker_cli_plan: workerCliPlan,
 		tmux_command: tmuxCommand,
 		tmux_session: tmuxContext.sessionName,
 		tmux_session_name: tmuxContext.sessionName,
@@ -1279,6 +1352,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		tmux_session_name: config.tmux_session_name,
 		tmux_target: config.tmux_target,
 		worker_command: config.worker_command,
+		worker_cli_plan: config.worker_cli_plan,
 		tmux_command: config.tmux_command,
 		leader: config.leader,
 		workers: config.workers,
@@ -1296,7 +1370,12 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	await appendTelemetry(dir, {
 		type: "team_runtime",
 		message: "Native gjc team runtime initialized",
-		data: { state_root: stateRoot, worker_command: config.worker_command, workspace_mode: config.workspace_mode },
+		data: {
+			state_root: stateRoot,
+			worker_command: config.worker_command,
+			worker_cli_plan: workerCliPlan,
+			workspace_mode: config.workspace_mode,
+		},
 	});
 	let tmuxWorkers: GjcTeamWorker[];
 	try {

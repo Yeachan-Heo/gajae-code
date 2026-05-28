@@ -155,6 +155,7 @@ Important:
 
 - Leader remains in the existing left pane.
 - Worker panes are independent full GJC worker CLI sessions on the right side of a leader-left/worker-right split.
+- Worker CLI selection is teammate-only: `GJC_TEAM_WORKER_CLI` and `GJC_TEAM_WORKER_CLI_MAP` accept only `auto` or `gjc`; legacy/provider values such as `codex`, `claude`, or `gemini` are rejected before launch.
 - The worker may run in a dedicated git worktree (`gjc team --worktree[=<name>]`) while sharing the team state root.
 - `shutdown` kills only the recorded worker pane after confirming it still belongs to the stored tmux target and is not the leader pane. It never kills the tmux session.
 
