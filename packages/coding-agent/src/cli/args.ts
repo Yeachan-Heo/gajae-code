@@ -55,6 +55,15 @@ export interface Args {
 	unknownFlags: Map<string, boolean | string>;
 }
 
+function isStartupSlashCommandArg(arg: string | undefined): boolean {
+	return (
+		arg === "/provider" ||
+		arg?.startsWith("/provider:") === true ||
+		arg === "/provicer" ||
+		arg?.startsWith("/provicer:") === true
+	);
+}
+
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
@@ -64,6 +73,11 @@ export function parseArgs(args: string[]): Args {
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
+
+		if (isStartupSlashCommandArg(arg)) {
+			result.messages.push(args.slice(i).join(" "));
+			break;
+		}
 
 		// Support --flag=value syntax (e.g. --tools=ask,read)
 		if (arg.startsWith("--") && arg.includes("=")) {

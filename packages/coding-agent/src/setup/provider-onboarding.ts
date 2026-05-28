@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -131,6 +132,7 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Prom
 		const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 		throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 	}
+	await fs.mkdir(path.dirname(modelsPath), { recursive: true });
 	await Bun.write(modelsPath, YAML.stringify(checked.data, null, 2));
 }
 

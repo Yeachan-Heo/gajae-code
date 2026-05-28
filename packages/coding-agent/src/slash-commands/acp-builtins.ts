@@ -1,5 +1,9 @@
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
-import { BUILTIN_SLASH_COMMANDS_INTERNAL, lookupBuiltinSlashCommand } from "./builtin-registry";
+import {
+	BUILTIN_SLASH_COMMANDS_INTERNAL,
+	formatUnknownBuiltinSlashCommandDiagnostic,
+	lookupBuiltinSlashCommand,
+} from "./builtin-registry";
 import { parseSlashCommand } from "./helpers/parse";
 import type { AcpBuiltinCommandRuntime, AcpBuiltinSlashCommandResult } from "./types";
 
@@ -39,7 +43,12 @@ export async function executeAcpBuiltinSlashCommand(
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return false;
 	const command = lookupBuiltinSlashCommand(parsed.name);
-	if (!command?.handle) return false;
+	if (!command?.handle) {
+		const diagnostic = formatUnknownBuiltinSlashCommandDiagnostic(parsed.name);
+		if (!diagnostic) return false;
+		await runtime.output(diagnostic);
+		return { consumed: true };
+	}
 	const result = await command.handle(parsed, runtime);
 	if (result === undefined) return { consumed: true };
 	return result;

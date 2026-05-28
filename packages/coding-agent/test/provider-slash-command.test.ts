@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "../src/slash-commands/builtin-registry";
+import { BUILTIN_SLASH_COMMANDS_INTERNAL, executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "../src/slash-commands/types";
 
 let tempAgentDir: string | undefined;
@@ -24,6 +24,21 @@ describe("provider slash command", () => {
 		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
 		expect(command?.description).toContain("providers");
 		expect(command?.allowArgs).toBe(true);
+	});
+
+	it("reports the /provicer typo without falling through to model bootstrap", async () => {
+		const errors: string[] = [];
+		const result = await executeBuiltinSlashCommand("/provicer add --compat anthropic", {
+			ctx: {
+				showError: (text: string) => errors.push(text),
+				editor: { setText: () => undefined },
+			},
+			handleBackgroundCommand: () => undefined,
+		} as unknown as Parameters<typeof executeBuiltinSlashCommand>[1]);
+
+		expect(result).toBe(true);
+		expect(errors.join("\n")).toContain("Unknown slash command: /provicer");
+		expect(errors.join("\n")).toContain("Did you mean /provider?");
 	});
 
 	it("adds API-compatible providers through the shared onboarding core", async () => {

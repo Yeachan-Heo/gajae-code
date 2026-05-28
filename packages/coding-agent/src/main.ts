@@ -46,6 +46,7 @@ import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
 import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
+import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
 import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, getNewEntries, parseChangelog } from "./utils/changelog";
@@ -295,7 +296,14 @@ async function runInteractiveMode(
 
 	for (const message of initialMessages) {
 		try {
-			await session.prompt(message);
+			let text = message;
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: mode,
+				handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+			});
+			if (slashResult === true) continue;
+			if (typeof slashResult === "string") text = slashResult;
+			await session.prompt(text);
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);

@@ -993,6 +993,15 @@ for (const command of ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY) {
 	}
 }
 
+export function formatUnknownBuiltinSlashCommandDiagnostic(commandName: string): string | undefined {
+	if (commandName !== "provicer") return undefined;
+	return [
+		"Unknown slash command: /provicer.",
+		"Did you mean /provider?",
+		"Run: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model>",
+	].join("\n");
+}
+
 /** Builtin command metadata used for slash-command autocomplete and help text. */
 export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.map(
 	command => ({
@@ -1025,7 +1034,13 @@ export async function executeBuiltinSlashCommand(
 	if (!parsed) return false;
 
 	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
-	if (!command) return false;
+	if (!command) {
+		const diagnostic = formatUnknownBuiltinSlashCommandDiagnostic(parsed.name);
+		if (!diagnostic) return false;
+		runtime.ctx.showError(diagnostic);
+		runtime.ctx.editor.setText("");
+		return true;
+	}
 	if (parsed.args.length > 0 && !command.allowArgs) {
 		return false;
 	}

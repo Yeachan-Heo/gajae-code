@@ -53,6 +53,28 @@ describe("provider onboarding setup core", () => {
 		expect(parsed.providers["my-oai"]?.models.map(model => model.id)).toEqual(["gpt-example", "gpt-second"]);
 	});
 
+	it("creates the models.yml parent directory on first provider add", async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-onboarding-"));
+		const modelsPath = path.join(tempRoot, "Users", "example", ".gjc", "agent", "models.yml");
+
+		await addApiCompatibleProvider({
+			compatibility: "anthropic",
+			providerId: "minimax",
+			baseUrl: "https://api.minimax.io/anthropic",
+			apiKeyEnv: "MINIMAX_APIKEY",
+			models: ["MiniMax-M2.7-highspeed"],
+			modelsPath,
+		});
+
+		expect(await Bun.file(modelsPath).exists()).toBe(true);
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { api: string; apiKeyEnv?: string; models: Array<{ id: string }> }>;
+		};
+		expect(parsed.providers.minimax?.api).toBe("anthropic-messages");
+		expect(parsed.providers.minimax?.apiKeyEnv).toBe("MINIMAX_APIKEY");
+		expect(parsed.providers.minimax?.models.map(model => model.id)).toEqual(["MiniMax-M2.7-highspeed"]);
+	});
+
 	it("adds an Anthropic-compatible provider without deleting unrelated providers", async () => {
 		const modelsPath = await tempModelsPath();
 		await Bun.write(

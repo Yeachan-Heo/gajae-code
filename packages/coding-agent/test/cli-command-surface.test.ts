@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -25,6 +26,59 @@ describe("GJC public CLI command surface", () => {
 			"ralplan",
 			"deep-interview",
 			"launch",
+		]);
+	});
+
+	it("does not capture absolute-path prompts as startup slash commands", () => {
+		const parsed = parseArgs(["/tmp/request.md", "--model", "opus", "summarize"]);
+
+		expect(parsed.model).toBe("opus");
+		expect(parsed.messages).toEqual(["/tmp/request.md", "summarize"]);
+	});
+
+	it("keeps startup slash payload intact after normal CLI flags", () => {
+		const parsed = parseArgs([
+			"--no-lsp",
+			"/provider",
+			"add",
+			"--compat",
+			"anthropic",
+			"--provider",
+			"minimax",
+			"--base-url",
+			"https://api.minimax.io/anthropic",
+			"--api-key-env",
+			"MINIMAX_APIKEY",
+			"--model",
+			"MiniMax-M2.7-highspeed",
+		]);
+
+		expect(parsed.noLsp).toBe(true);
+		expect(parsed.provider).toBeUndefined();
+		expect(parsed.model).toBeUndefined();
+		expect(parsed.messages).toEqual([
+			"/provider add --compat anthropic --provider minimax --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_APIKEY --model MiniMax-M2.7-highspeed",
+		]);
+	});
+
+	it("keeps CLI slash-command invocations as one initial message", () => {
+		const parsed = parseArgs([
+			"/provider",
+			"add",
+			"--compat",
+			"anthropic",
+			"--provider",
+			"minimax",
+			"--base-url",
+			"https://api.minimax.io/anthropic",
+			"--api-key-env",
+			"MINIMAX_APIKEY",
+			"--model",
+			"MiniMax-M2.7-highspeed",
+		]);
+
+		expect(parsed.messages).toEqual([
+			"/provider add --compat anthropic --provider minimax --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_APIKEY --model MiniMax-M2.7-highspeed",
 		]);
 	});
 
