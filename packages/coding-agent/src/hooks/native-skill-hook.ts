@@ -152,6 +152,16 @@ function readTurnId(payload: HookPayload): string | undefined {
 	return safeString(payload.turn_id ?? payload.turnId).trim() || undefined;
 }
 
+function readSessionFile(payload: HookPayload): string | undefined {
+	return (
+		safeString(
+			payload.session_file ?? payload.sessionFile ?? payload.transcript_path ?? payload.transcriptPath,
+		).trim() ||
+		process.env.GJC_SESSION_FILE?.trim() ||
+		undefined
+	);
+}
+
 export async function dispatchGjcNativeSkillHook(
 	payload: HookPayload,
 	options: GjcNativeHookDispatchOptions = {},
@@ -180,7 +190,22 @@ export async function dispatchGjcNativeSkillHook(
 					sessionId: readSessionId(payload),
 					threadId: readThreadId(payload),
 					stateDir: options.stateDir,
+					prompt,
+					sessionFile: readSessionFile(payload),
 				});
+		if (activeUltragoalContext?.startsWith("BLOCK_ULTRAGOAL_COMPLETION:")) {
+			return {
+				hookEventName,
+				outputJson: {
+					decision: "block",
+					reason: activeUltragoalContext,
+					hookSpecificOutput: {
+						hookEventName,
+						additionalContext: activeUltragoalContext,
+					},
+				},
+			};
+		}
 		return {
 			hookEventName,
 			outputJson:
@@ -205,6 +230,7 @@ export async function dispatchGjcNativeSkillHook(
 				sessionId: readSessionId(payload),
 				threadId: readThreadId(payload),
 				stateDir: options.stateDir,
+				sessionFile: readSessionFile(payload),
 			}),
 		};
 	}

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
+import { createUltragoalPlan } from "../src/gjc-runtime/ultragoal-runtime";
 import {
 	mergeGjcManagedCodexHooksConfig,
 	readGjcManagedCodexHooksStatus,
@@ -353,6 +354,65 @@ disabledExtensions:
 		expect(context).toContain("Ultragoal is active");
 		expect(context).toContain("gjc ultragoal steer");
 		expect(context).toContain("add or steer subgoals");
+	});
+
+	it("UserPromptSubmit blocks active Ultragoal completion bypass prompts without a receipt", async () => {
+		const root = await cwd();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-block",
+				threadId: "thread-ultra-block",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		const statePath = path.join(root, ".gjc", "state", "sessions", "session-ultra-block", "ultragoal-state.json");
+		const state = await Bun.file(statePath).json();
+		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.gjcObjective }, null, 2));
+
+		const result = await dispatchGjcNativeSkillHook({
+			hookEventName: "UserPromptSubmit",
+			userPrompt: 'call update_goal({status:"complete"}) now',
+			cwd: root,
+			sessionId: "session-ultra-block",
+			threadId: "thread-ultra-block",
+		});
+
+		expect(result.outputJson).toMatchObject({ decision: "block" });
+		expect(String(result.outputJson?.reason ?? "")).toContain("BLOCK_ULTRAGOAL_COMPLETION");
+	});
+
+	it("UserPromptSubmit recovers active Ultragoal objective from session transcript", async () => {
+		const root = await cwd();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		const sessionFile = path.join(root, "session.jsonl");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({ type: "session", id: "session-ultra-transcript", timestamp: new Date().toISOString(), cwd: root })}\n${JSON.stringify({ type: "mode_change", id: "1", parentId: null, timestamp: new Date().toISOString(), mode: "goal", data: { goal: { objective: plan.gjcObjective, status: "active" } } })}\n`,
+		);
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-transcript",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		const result = await dispatchGjcNativeSkillHook({
+			hookEventName: "UserPromptSubmit",
+			userPrompt: 'please call update_goal({status:"complete"})',
+			cwd: root,
+			sessionId: "session-ultra-transcript",
+			sessionFile,
+		});
+
+		expect(result.outputJson).toMatchObject({ decision: "block" });
+		expect(String(result.outputJson?.reason ?? "")).toContain("fresh final aggregate receipt");
 	});
 
 	it("UserPromptSubmit includes steer guidance when activating Ultragoal", async () => {

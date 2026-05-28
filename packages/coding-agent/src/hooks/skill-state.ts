@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
+import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
+import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
@@ -124,6 +126,7 @@ export interface StopHookInput {
 	sessionId?: string;
 	threadId?: string;
 	stateDir?: string;
+	sessionFile?: string;
 }
 
 export interface UserPromptSubmitStateInput {
@@ -131,6 +134,8 @@ export interface UserPromptSubmitStateInput {
 	sessionId?: string;
 	threadId?: string;
 	stateDir?: string;
+	prompt?: string;
+	sessionFile?: string;
 }
 
 function escapeRegex(value: string): string {
@@ -361,6 +366,19 @@ function stateMatchesContext(state: ModeState, sessionId?: string, threadId?: st
 	return true;
 }
 
+async function readCurrentGoalObjectiveFromSessionFile(sessionFile: string | undefined): Promise<string | null> {
+	const trimmed = sessionFile?.trim();
+	if (!trimmed) return null;
+	const entries = (await loadEntriesFromFile(trimmed)).filter(
+		(entry): entry is SessionEntry => entry.type !== "session",
+	);
+	const context = buildSessionContext(entries);
+	const goal = context.modeData?.goal;
+	if (typeof goal !== "object" || goal === null) return null;
+	const objective = (goal as { objective?: unknown }).objective;
+	return typeof objective === "string" && objective.trim().length > 0 ? objective.trim() : null;
+}
+
 export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitStateInput): Promise<string | null> {
 	const visibleModeState = await readVisibleModeState(input.cwd, "ultragoal", input.sessionId, input.stateDir);
 	if (!visibleModeState) return null;
@@ -368,6 +386,22 @@ export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitS
 	if (!stateMatchesContext(visibleModeState.state, input.sessionId, input.threadId)) return null;
 
 	const phase = String(visibleModeState.state.current_phase ?? "active");
+	const objective =
+		(await readCurrentGoalObjectiveFromSessionFile(input.sessionFile)) ??
+		(typeof visibleModeState.state.objective === "string"
+			? visibleModeState.state.objective
+			: typeof visibleModeState.state.gjcObjective === "string"
+				? visibleModeState.state.gjcObjective
+				: "");
+	if (input.prompt && isUltragoalBypassPrompt(input.prompt) && objective) {
+		const diagnostic = await readUltragoalVerificationState({
+			cwd: input.cwd,
+			currentGoal: { objective },
+		});
+		if (!["inactive", "unrelated_goal", "active_verified_complete"].includes(diagnostic.state)) {
+			return `BLOCK_ULTRAGOAL_COMPLETION: ${diagnostic.message} Use durable blocker work or run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>\` before completion.`;
+		}
+	}
 	return `Ultragoal is active (phase: ${phase}; state: ${visibleModeState.statePath}). If the user prompt is a steering request, use \`gjc ultragoal steer\` to add or steer subgoals. Normal prose should not mutate Ultragoal state.`;
 }
 
@@ -384,6 +418,31 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 		if (isTerminalModeState(modeState)) continue;
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);
+		if (entry.skill === "ultragoal") {
+			const objective =
+				(await readCurrentGoalObjectiveFromSessionFile(input.sessionFile)) ??
+				(typeof modeState?.objective === "string"
+					? modeState.objective
+					: typeof modeState?.gjcObjective === "string"
+						? modeState.gjcObjective
+						: "");
+			if (objective) {
+				const diagnostic = await readUltragoalVerificationState({
+					cwd: input.cwd,
+					currentGoal: { objective },
+				});
+				if (diagnostic.state === "active_verified_complete") continue;
+				if (!["inactive", "unrelated_goal"].includes(diagnostic.state)) {
+					const ultragoalMessage = `GJC ultragoal verification is blocking stop: ${diagnostic.message} Run strict checkpoint verification or record review blockers before stopping.`;
+					return {
+						decision: "block",
+						reason: ultragoalMessage,
+						stopReason: `gjc_ultragoal_verification_${diagnostic.state}`,
+						systemMessage: ultragoalMessage,
+					};
+				}
+			}
+		}
 		const systemMessage = `GJC skill "${entry.skill}" is still active (phase: ${phase}; state: ${statePath}). Continue or explicitly finish/cancel the skill before stopping.`;
 		return {
 			decision: "block",

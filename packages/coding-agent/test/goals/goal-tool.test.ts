@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { createUltragoalPlan, startNextUltragoalGoal } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { completionBudgetReport, GoalRuntime } from "@gajae-code/coding-agent/goals/runtime";
 import type { Goal, GoalModeState, GoalTokenUsage } from "@gajae-code/coding-agent/goals/state";
 import { CreateGoalTool, GetGoalTool, GoalTool, UpdateGoalTool } from "@gajae-code/coding-agent/goals/tools/goal-tool";
@@ -239,6 +243,33 @@ describe("GoalTool", () => {
 		const result = await tool.execute("call-complete", { op: "complete" });
 		expect(result.details?.goal?.status).toBe("complete");
 		expect(harness.getState()?.goal.status).toBe("complete");
+	});
+
+	it("blocks direct update_goal completion for active ultragoal objectives without verification receipt", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-goal-ultragoal-"));
+		try {
+			const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+			await startNextUltragoalGoal({ cwd: root });
+			const harness = createRuntimeHarness({
+				enabled: true,
+				mode: "active",
+				goal: createGoal({ objective: plan.gjcObjective }),
+			});
+			const tool = new UpdateGoalTool(
+				createToolSession({
+					cwd: root,
+					getGoalRuntime: () => harness.runtime,
+					getGoalModeState: () => harness.getState(),
+				}),
+			);
+
+			await expect(tool.execute("call-complete", { status: "complete" })).rejects.toThrow(
+				"Ultragoal aggregate completion requires a fresh final aggregate receipt",
+			);
+			expect(harness.getState()?.goal.status).toBe("active");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("allows create after previous goal is complete", async () => {

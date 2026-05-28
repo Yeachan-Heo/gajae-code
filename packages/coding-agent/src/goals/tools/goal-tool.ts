@@ -4,6 +4,7 @@ import { Text } from "@gajae-code/tui";
 import { formatNumber, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
+import { assertCanCompleteCurrentGoal } from "../../gjc-runtime/ultragoal-guard";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import createGoalDescription from "../../prompts/tools/create-goal.md" with { type: "text" };
 import getGoalDescription from "../../prompts/tools/get-goal.md" with { type: "text" };
@@ -127,6 +128,11 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 	if (params.op === "drop") {
 		const dropped = await runtime.dropGoal();
 		return buildGoalToolResponse(dropped ?? null);
+	}
+	try {
+		await assertCanCompleteCurrentGoal({ cwd: session.cwd, currentGoal: session.getGoalModeState?.()?.goal ?? null });
+	} catch (error) {
+		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}
 	const completed = await runtime.completeGoalFromTool();
 	return buildGoalToolResponse(completed, { includeCompletionReport: true });
