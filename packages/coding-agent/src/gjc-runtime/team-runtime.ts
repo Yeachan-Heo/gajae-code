@@ -866,6 +866,41 @@ function listConflictFiles(cwd: string): string[] {
 		.map(line => line.trim())
 		.filter(Boolean);
 }
+
+export type GjcWorkerCheckpointClassification =
+	| { kind: "clean"; files: string[] }
+	| { kind: "eligible"; files: string[] }
+	| { kind: "conflicted"; files: string[] }
+	| { kind: "git_error"; files: string[]; detail: string };
+
+const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+
+function parsePorcelainStatusFiles(stdout: string): string[] {
+	return stdout
+		.split(/\r?\n/)
+		.map(line => line.trimEnd())
+		.filter(Boolean)
+		.map(line => line.slice(3).trim())
+		.filter(Boolean);
+}
+
+export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpointClassification {
+	const status = runGitResult(cwd, ["status", "--porcelain"]);
+	if (!status.ok) {
+		return { kind: "git_error", files: [], detail: status.stderr || status.stdout || "git status failed" };
+	}
+	if (!status.stdout.trim()) return { kind: "clean", files: [] };
+	const files = parsePorcelainStatusFiles(status.stdout);
+	const hasUnmergedStatus = status.stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const conflictFiles = listConflictFiles(cwd);
+	if (hasUnmergedStatus || conflictFiles.length > 0) {
+		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
+	}
+	return { kind: "eligible", files };
+}
 async function appendIntegrationEvent(
 	dir: string,
 	type: string,
@@ -891,9 +926,9 @@ async function notifyLeader(
 }
 function autoCommitDirtyWorker(worker: GjcTeamWorker): { committed: boolean; commit: string | null } {
 	if (!worker.worktree_path) return { committed: false, commit: null };
-	const status = runGitResult(worker.worktree_path, ["status", "--porcelain"]);
-	if (!status.ok || !status.stdout.trim()) return { committed: false, commit: null };
-	if (!runGitResult(worker.worktree_path, ["add", "-A"]).ok) return { committed: false, commit: null };
+	const classification = classifyWorkerCheckpointStatus(worker.worktree_path);
+	if (classification.kind !== "eligible") return { committed: false, commit: null };
+	if (!runGitResult(worker.worktree_path, ["add", "--", ...classification.files]).ok) return { committed: false, commit: null };
 	const message = `gjc(team): auto-checkpoint ${worker.id} [${worker.assigned_tasks[0] ?? "unknown"}]`;
 	if (!runGitResult(worker.worktree_path, ["commit", "--no-verify", "-m", message]).ok)
 		return { committed: false, commit: null };
@@ -965,8 +1000,6 @@ async function integrateGjcWorkerCommits(
 			const merge = runGitResult(leaderCwd, [
 				"merge",
 				"--no-ff",
-				"-X",
-				"theirs",
 				"-m",
 				`gjc(team): merge ${worker.id}`,
 				mergeRef,
@@ -1052,7 +1085,7 @@ async function integrateGjcWorkerCommits(
 					worker: worker.id,
 					operation: "merge",
 					files: conflictFiles,
-					detail: `merge --no-ff -X theirs failed and was aborted: ${(merge.stderr || merge.stdout).slice(0, 200)}`,
+					detail: `merge --no-ff failed and was aborted: ${(merge.stderr || merge.stdout).slice(0, 200)}`,
 				});
 				await notifyLeader(
 					config,
@@ -1084,7 +1117,7 @@ async function integrateGjcWorkerCommits(
 				: leaderHead;
 		const commits = listCommitRange(worker.worktree_path, baseline, workerHead);
 		for (const commit of commits) {
-			const pick = runGitResult(leaderCwd, ["cherry-pick", "--allow-empty", "-X", "theirs", commit]);
+			const pick = runGitResult(leaderCwd, ["cherry-pick", "--allow-empty", commit]);
 			if (!pick.ok) {
 				const conflictFiles = listConflictFiles(leaderCwd);
 				runGitResult(leaderCwd, ["cherry-pick", "--abort"]);
@@ -1105,7 +1138,7 @@ async function integrateGjcWorkerCommits(
 					worker: worker.id,
 					operation: "cherry-pick",
 					files: conflictFiles,
-					detail: `cherry-pick -X theirs failed and was aborted: ${(pick.stderr || pick.stdout).slice(0, 200)}`,
+					detail: `cherry-pick failed and was aborted: ${(pick.stderr || pick.stdout).slice(0, 200)}`,
 				});
 				await notifyLeader(
 					config,
@@ -1222,7 +1255,7 @@ async function integrateGjcWorkerCommits(
 				continue;
 			}
 			const before = resolveHead(worker.worktree_path);
-			const rebase = runGitResult(worker.worktree_path, ["rebase", "-X", "ours", newLeaderHead]);
+			const rebase = runGitResult(worker.worktree_path, ["rebase", newLeaderHead]);
 			if (rebase.ok) {
 				const after = resolveHead(worker.worktree_path);
 				integrationByWorker[worker.id] = {
@@ -1271,7 +1304,7 @@ async function integrateGjcWorkerCommits(
 					worker: worker.id,
 					operation: "rebase",
 					files: conflictFiles,
-					detail: `rebase -X ours failed and was aborted: ${(rebase.stderr || rebase.stdout).slice(0, 200)}`,
+					detail: `rebase failed and was aborted: ${(rebase.stderr || rebase.stdout).slice(0, 200)}`,
 				});
 				await notifyLeader(
 					config,
