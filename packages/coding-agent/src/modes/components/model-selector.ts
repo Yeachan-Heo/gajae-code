@@ -53,6 +53,7 @@ interface ModelItem {
 	id: string;
 	model: Model;
 	selector: string;
+	thinkingLevel?: ThinkingLevel;
 }
 
 interface CanonicalModelItem {
@@ -64,11 +65,12 @@ interface CanonicalModelItem {
 	searchText: string;
 	normalizedSearchText: string;
 	compactSearchText: string;
+	thinkingLevel?: ThinkingLevel;
 }
 
 interface ScopedModelItem {
 	model: Model;
-	thinkingLevel?: string;
+	thinkingLevel?: ThinkingLevel;
 }
 
 interface RoleAssignment {
@@ -346,6 +348,7 @@ export class ModelSelectorComponent extends Container {
 				id: scoped.model.id,
 				model: scoped.model,
 				selector: `${scoped.model.provider}/${scoped.model.id}`,
+				thinkingLevel: scoped.thinkingLevel,
 			}));
 		} else {
 			// Reload config and cached discovery state without blocking on live provider refresh
@@ -379,17 +382,20 @@ export class ModelSelectorComponent extends Container {
 			}
 		}
 
+		const candidateModels = models.map(item => item.model);
 		const canonicalRecords = this.#modelRegistry.getCanonicalModels({
 			availableOnly: this.#scopedModels.length === 0,
-			candidates: models.map(item => item.model),
+			candidates: candidateModels,
 		});
+		const scopedThinkingBySelector = new Map(models.map(item => [item.selector, item.thinkingLevel]));
 		const canonicalModels = canonicalRecords
-			.map(record => {
+			.map((record): CanonicalModelItem | undefined => {
 				const selectedModel = this.#modelRegistry.resolveCanonicalModel(record.id, {
 					availableOnly: this.#scopedModels.length === 0,
-					candidates: models.map(item => item.model),
+					candidates: candidateModels,
 				});
 				if (!selectedModel) return undefined;
+				const selectedSelector = `${selectedModel.provider}/${selectedModel.id}`;
 				const searchText = [
 					record.id,
 					record.name,
@@ -398,8 +404,8 @@ export class ModelSelectorComponent extends Container {
 					selectedModel.name,
 					...record.variants.flatMap(variant => [variant.selector, variant.model.name]),
 				].join(" ");
-				return {
-					kind: "canonical" as const,
+				const item: CanonicalModelItem = {
+					kind: "canonical",
 					id: record.id,
 					model: selectedModel,
 					selector: record.id,
@@ -408,6 +414,11 @@ export class ModelSelectorComponent extends Container {
 					normalizedSearchText: normalizeSearchText(searchText),
 					compactSearchText: compactSearchText(searchText),
 				};
+				const scopedThinkingLevel = scopedThinkingBySelector.get(selectedSelector);
+				if (scopedThinkingLevel !== undefined) {
+					item.thinkingLevel = scopedThinkingLevel;
+				}
+				return item;
 			})
 			.filter((item): item is CanonicalModelItem => item !== undefined);
 
@@ -833,13 +844,15 @@ export class ModelSelectorComponent extends Container {
 		role: GjcModelAssignmentTargetId | null,
 		thinkingLevel?: ThinkingLevel,
 	): void {
+		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
+
 		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
-			this.#onSelectCallback(item.model, null, undefined, item.selector);
+			this.#onSelectCallback(item.model, null, itemThinkingLevel, item.selector);
 			return;
 		}
 
-		const selectedThinkingLevel = thinkingLevel ?? this.#getCurrentRoleThinkingLevel(role);
+		const selectedThinkingLevel = itemThinkingLevel ?? this.#getCurrentRoleThinkingLevel(role);
 		const selectorValue =
 			role === "default" ? item.selector : formatModelSelectorValue(item.selector, selectedThinkingLevel);
 

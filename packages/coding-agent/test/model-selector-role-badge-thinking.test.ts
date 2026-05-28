@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getBundledModel, type Model } from "@gajae-code/ai";
-import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -19,9 +20,15 @@ function normalizeRenderedText(text: string): string {
 
 interface SelectionCapture {
 	model: Model;
-	role: string | null;
-	thinkingLevel: unknown;
+	role: GjcModelAssignmentTargetId | null;
+	thinkingLevel: ThinkingLevel | undefined;
 	selector: string | undefined;
+}
+
+interface CreateSelectorOptions {
+	modelRegistry?: ModelRegistry;
+	temporaryOnly?: boolean;
+	thinkingLevel?: ThinkingLevel;
 }
 
 function createSelector(
@@ -29,17 +36,20 @@ function createSelector(
 	settings: Settings,
 	onSelect: (
 		model: Model,
-		role: string | null,
-		thinkingLevel: unknown,
+		role: GjcModelAssignmentTargetId | null,
+		thinkingLevel: ThinkingLevel | undefined,
 		selector: string | undefined,
 	) => void = () => {},
+	options: CreateSelectorOptions = {},
 ): ModelSelectorComponent {
-	const modelRegistry = {
-		getAll: () => [model],
-		getDiscoverableProviders: () => [],
-		getCanonicalModels: () => [],
-		resolveCanonicalModel: () => undefined,
-	} as unknown as ModelRegistry;
+	const modelRegistry =
+		options.modelRegistry ??
+		({
+			getAll: () => [model],
+			getDiscoverableProviders: () => [],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+		} as unknown as ModelRegistry);
 	const ui = {
 		requestRender: vi.fn(),
 	} as unknown as TUI;
@@ -49,9 +59,10 @@ function createSelector(
 		model,
 		settings,
 		modelRegistry,
-		[{ model, thinkingLevel: "off" }],
+		[{ model, thinkingLevel: options.thinkingLevel ?? ThinkingLevel.Off }],
 		onSelect,
 		() => {},
+		{ temporaryOnly: options.temporaryOnly },
 	);
 }
 
@@ -138,6 +149,7 @@ describe("ModelSelector canonical model selection", () => {
 		if (!selectedAfterEnter) throw new Error("Expected Enter to select a model");
 		expect(selectedAfterEnter.model).toBe(model);
 		expect(selectedAfterEnter.role).toBe("default");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
@@ -149,6 +161,9 @@ describe("ModelSelector canonical model selection", () => {
 		const settings = Settings.isolated({
 			modelRoles: {
 				default: `${model.provider}/${model.id}:medium`,
+			},
+			"task.agentModelOverrides": {
+				executor: `${model.provider}/${model.id}:high`,
 			},
 		});
 
@@ -166,7 +181,88 @@ describe("ModelSelector canonical model selection", () => {
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected role-agent selection");
 		expect(selectedAfterEnter.role).toBe("executor");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+	});
+
+	test("temporary scoped model selection carries selected reasoning", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: `${model.provider}/${model.id}:high`,
+			},
+		});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ temporaryOnly: true, thinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected temporary selection");
+		expect(selectedAfterEnter.role).toBeNull();
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("canonical scoped model assignment preserves selected reasoning", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: `${model.provider}/${model.id}:high`,
+			},
+		});
+		const selectorValue = `${model.provider}/${model.id}`;
+		const modelRegistry = {
+			getAll: () => [model],
+			getDiscoverableProviders: () => [],
+			getCanonicalModels: () => [
+				{
+					id: "claude-sonnet",
+					name: "Claude Sonnet",
+					variants: [{ canonicalId: "claude-sonnet", selector: selectorValue, model, source: "bundled" }],
+				},
+			],
+			resolveCanonicalModel: () => model,
+		} as unknown as ModelRegistry;
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectedSelector) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectedSelector };
+			},
+			{ modelRegistry, thinkingLevel: ThinkingLevel.Medium },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\t");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected canonical role-agent selection");
+		expect(selectedAfterEnter.role).toBe("executor");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(selectedAfterEnter.selector).toBe("claude-sonnet:medium");
 	});
 
 	test("refreshes Ollama Cloud using provider id instead of tab label", async () => {

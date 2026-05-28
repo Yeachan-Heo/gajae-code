@@ -435,7 +435,7 @@ export class SelectorController {
 					try {
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
-							await this.ctx.session.setModelTemporary(model);
+							await this.ctx.session.setModelTemporary(model, thinkingLevel);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Temporary model: ${selector ?? model.id}`);
