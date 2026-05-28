@@ -1,12 +1,17 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import {
+	buildTeamHudSummary,
 	executeGjcTeamApiOperation,
+	type GjcTeamSnapshot,
 	listGjcTeams,
 	monitorGjcTeam,
 	parseTeamLaunchArgs,
+	readGjcTeamEvents,
+	readGjcTeamSnapshot,
 	shutdownGjcTeam,
 	startGjcTeam,
 } from "../gjc-runtime/team-runtime";
+import { syncSkillActiveState } from "../skill-state/active-state";
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -14,6 +19,21 @@ function writeJson(value: unknown): void {
 
 function writeText(lines: string[]): void {
 	process.stdout.write(`${lines.join("\n")}\n`);
+}
+async function syncTeamHud(snapshot: GjcTeamSnapshot): Promise<void> {
+	try {
+		const events = await readGjcTeamEvents(snapshot.team_name);
+		await syncSkillActiveState({
+			cwd: process.cwd(),
+			skill: "team",
+			active: snapshot.phase !== "complete" && snapshot.phase !== "cancelled",
+			phase: snapshot.phase,
+			hud: await buildTeamHudSummary(snapshot, events.at(-1)),
+			source: "gjc-team",
+		});
+	} catch {
+		// HUD sync is best-effort and must not change command semantics.
+	}
 }
 
 function formatTaskCounts(counts: Record<string, number>): string {
@@ -86,6 +106,7 @@ export default class Team extends Command {
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
 			const snapshot = await monitorGjcTeam(teamName);
+			await syncTeamHud(snapshot);
 			if (json) {
 				writeJson(snapshot);
 				return;
@@ -106,6 +127,7 @@ export default class Team extends Command {
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
 			const snapshot = await shutdownGjcTeam(teamName);
+			await syncTeamHud(snapshot);
 			if (json) {
 				writeJson(snapshot);
 				return;
@@ -127,13 +149,23 @@ export default class Team extends Command {
 				return;
 			}
 			const input = parseInputFlag(rest);
-			writeJson(await executeGjcTeamApiOperation(operation, input));
+			const result = await executeGjcTeamApiOperation(operation, input);
+			const teamName = String(input.team_name ?? input.teamName ?? "").trim();
+			if (teamName) {
+				try {
+					await syncTeamHud(await readGjcTeamSnapshot(teamName));
+				} catch {
+					// API operations without a resolvable snapshot leave HUD state unchanged.
+				}
+			}
+			writeJson(result);
 			return;
 		}
 
 		const startArgs = action === "start" ? rest : this.argv;
 		const options = parseTeamLaunchArgs(startArgs);
 		const snapshot = await startGjcTeam({ ...options, dryRun });
+		await syncTeamHud(snapshot);
 		if (json) {
 			writeJson(snapshot);
 			return;

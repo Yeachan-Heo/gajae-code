@@ -100,7 +100,7 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
-	it("suppresses stale visible entries left by crashed sessions", async () => {
+	it("keeps stale active entries visible with derived stale metadata", async () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
@@ -110,7 +110,38 @@ describe("GJC skill-active state", () => {
 				nowIso: "2000-01-01T00:00:00.000Z",
 			});
 
-			expect(await readVisibleSkillActiveState(cwd, "sess-old")).toBeNull();
+			const visible = await readVisibleSkillActiveState(cwd, "sess-old");
+			expect(visible?.active_skills?.[0]).toEqual(expect.objectContaining({ skill: "team", stale: true }));
+		});
+	});
+
+	it("normalizes and preserves HUD summaries during root/session merge", async () => {
+		await withTempCwd(async cwd => {
+			await syncSkillActiveState({
+				cwd,
+				skill: "deep-interview",
+				active: true,
+				phase: "interviewing",
+				sessionId: "sess-hud",
+				nowIso: new Date().toISOString(),
+				hud: {
+					version: 1,
+					summary: "round\tone",
+					chips: [{ label: "ambiguity\n", value: "15%", priority: 10, severity: "success" }],
+					details: Array.from({ length: 20 }, (_, index) => ({ label: `d${index}`, value: "x" })),
+				},
+			});
+
+			const visible = await readVisibleSkillActiveState(cwd, "sess-hud");
+			const entry = visible?.active_skills?.[0];
+			expect(entry?.hud?.summary).toBe("round one");
+			expect(entry?.hud?.chips?.[0]).toEqual({
+				label: "ambiguity",
+				value: "15%",
+				priority: 10,
+				severity: "success",
+			});
+			expect(entry?.hud?.details?.length).toBe(12);
 		});
 	});
 

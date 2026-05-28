@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
+import type { SkillActiveEntry as CanonicalSkillActiveEntry, WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
@@ -72,7 +73,7 @@ export interface SkillKeywordMatch {
 	priority: number;
 }
 
-export interface SkillActiveEntry {
+export interface SkillActiveEntry extends Omit<CanonicalSkillActiveEntry, "skill"> {
 	skill: GjcWorkflowSkill;
 	phase?: string;
 	active?: boolean;
@@ -81,6 +82,8 @@ export interface SkillActiveEntry {
 	session_id?: string;
 	thread_id?: string;
 	turn_id?: string;
+	hud?: WorkflowHudSummary;
+	stale?: boolean;
 }
 
 export interface SkillActiveState {

@@ -1,4 +1,4 @@
-import type { SkillActiveEntry } from "../../../skill-state/active-state";
+import type { SkillActiveEntry, WorkflowHudChip } from "../../../skill-state/active-state";
 
 const ANSI_RESET_FG = "\x1b[39m";
 const ANSI_RESET_BOLD = "\x1b[22m";
@@ -31,16 +31,43 @@ function compareEntries(a: SkillActiveEntry, b: SkillActiveEntry): number {
 	return a.skill.localeCompare(b.skill) || (a.phase ?? "").localeCompare(b.phase ?? "");
 }
 
+function compareChips(a: WorkflowHudChip, b: WorkflowHudChip): number {
+	return (a.priority ?? 50) - (b.priority ?? 50) || a.label.localeCompare(b.label);
+}
+
+function chipPrefix(chip: WorkflowHudChip): string {
+	if (chip.severity === "error") return "!";
+	if (chip.severity === "blocked") return "block";
+	if (chip.severity === "warning") return "warn";
+	return "";
+}
+
+function formatChip(chip: WorkflowHudChip): string | null {
+	const label = sanitizeHudPart(chip.label);
+	const value = sanitizeHudPart(chip.value);
+	if (!label) return null;
+	const body = value ? `${label}=${value}` : label;
+	const prefix = chipPrefix(chip);
+	return prefix ? `${prefix}:${body}` : body;
+}
+
+function formatEntry(entry: SkillActiveEntry): string {
+	const skill = sanitizeHudPart(entry.skill);
+	const phase = sanitizeHudPart(entry.phase);
+	const base = phase ? `${skill}:${phase}` : skill;
+	const chips = [...(entry.hud?.chips ?? [])]
+		.sort(compareChips)
+		.map(formatChip)
+		.filter((chip): chip is string => Boolean(chip));
+	if (entry.stale === true) chips.unshift("warn:stale");
+	const summary = sanitizeHudPart(entry.hud?.summary);
+	return [base, summary, ...chips].filter(Boolean).join(" ");
+}
+
 export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: number): string | null {
 	const active = entries.filter(entry => entry.active !== false && sanitizeHudPart(entry.skill)).sort(compareEntries);
 	if (active.length === 0 || width <= 0) return null;
-	const body = active
-		.map(entry => {
-			const skill = sanitizeHudPart(entry.skill);
-			const phase = sanitizeHudPart(entry.phase);
-			return phase ? `${skill}:${phase}` : skill;
-		})
-		.join(" + ");
+	const body = active.map(formatEntry).join(" + ");
 	const prefix = `${ANSI_BORDER}◆${ANSI_RESET_FG} ${ANSI_BOLD}${ANSI_ACCENT}hud${ANSI_RESET_FG}${ANSI_RESET_BOLD} `;
 	const budget = Math.max(1, width - visibleWidth(prefix));
 	return truncateToWidth(`${prefix}${ANSI_DIM}${truncateToWidth(body, budget)}${ANSI_RESET_BOLD}`, width);

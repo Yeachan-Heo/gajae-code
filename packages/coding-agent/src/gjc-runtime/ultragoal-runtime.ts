@@ -1,6 +1,8 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { WorkflowHudSummary } from "../skill-state/active-state";
+import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
@@ -447,6 +449,19 @@ export async function getUltragoalStatus(cwd: string): Promise<UltragoalStatusSu
 		counts,
 		goals: plan.goals,
 	};
+}
+export function buildUltragoalHudSummary(
+	summary: UltragoalStatusSummary,
+	latestLedger?: UltragoalLedgerEvent,
+): WorkflowHudSummary {
+	return buildWorkflowUltragoalHudSummary({
+		status: summary.status,
+		currentGoal: summary.currentGoal,
+		counts: summary.counts,
+		goals: summary.goals,
+		latestLedgerEvent: latestLedger,
+		updatedAt: new Date().toISOString(),
+	});
 }
 
 function titleFromBrief(brief: string): string {

@@ -7,6 +7,23 @@ export const SKILL_ACTIVE_STALE_MS = 24 * 60 * 60 * 1000;
 export const CANONICAL_GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
 
 export type CanonicalGjcWorkflowSkill = (typeof CANONICAL_GJC_WORKFLOW_SKILLS)[number];
+export type WorkflowHudSeverity = "info" | "warning" | "blocked" | "error" | "success";
+
+export interface WorkflowHudChip {
+	label: string;
+	value?: string;
+	priority?: number;
+	severity?: WorkflowHudSeverity;
+}
+
+export interface WorkflowHudSummary {
+	version: 1;
+	summary?: string;
+	chips?: WorkflowHudChip[];
+	details?: WorkflowHudChip[];
+	severity?: WorkflowHudSeverity;
+	updated_at?: string;
+}
 
 export interface SkillActiveEntry {
 	skill: string;
@@ -17,6 +34,8 @@ export interface SkillActiveEntry {
 	session_id?: string;
 	thread_id?: string;
 	turn_id?: string;
+	hud?: WorkflowHudSummary;
+	stale?: boolean;
 }
 
 export interface SkillActiveState {
@@ -50,10 +69,77 @@ export interface SyncSkillActiveStateOptions {
 	turnId?: string;
 	nowIso?: string;
 	source?: string;
+	hud?: WorkflowHudSummary;
 }
+
+const HUD_TEXT_LIMIT = 80;
+const HUD_CHIP_LIMIT = 6;
+const HUD_DETAIL_LIMIT = 12;
+const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const HUD_SEVERITIES = new Set<WorkflowHudSeverity>(["info", "warning", "blocked", "error", "success"]);
 
 function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
+}
+
+function sanitizeHudString(value: unknown, limit = HUD_TEXT_LIMIT): string | undefined {
+	const normalized = safeString(value)
+		.replace(ANSI_PATTERN, "")
+		.replace(/[\r\n\t]+/g, " ")
+		.trim();
+	if (!normalized) return undefined;
+	return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+}
+
+function normalizeSeverity(value: unknown): WorkflowHudSeverity | undefined {
+	return typeof value === "string" && HUD_SEVERITIES.has(value as WorkflowHudSeverity)
+		? (value as WorkflowHudSeverity)
+		: undefined;
+}
+
+function normalizeHudChip(raw: unknown): WorkflowHudChip | null {
+	if (!raw || typeof raw !== "object") return null;
+	const record = raw as Record<string, unknown>;
+	const label = sanitizeHudString(record.label, 32);
+	if (!label) return null;
+	const value = sanitizeHudString(record.value, HUD_TEXT_LIMIT);
+	const priority =
+		typeof record.priority === "number" && Number.isFinite(record.priority) ? record.priority : undefined;
+	const severity = normalizeSeverity(record.severity);
+	return {
+		label,
+		...(value ? { value } : {}),
+		...(priority !== undefined ? { priority } : {}),
+		...(severity ? { severity } : {}),
+	};
+}
+
+function normalizeHudChips(raw: unknown, limit: number): WorkflowHudChip[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	const chips = raw
+		.map(normalizeHudChip)
+		.filter((chip): chip is WorkflowHudChip => chip !== null)
+		.slice(0, limit);
+	return chips.length > 0 ? chips : undefined;
+}
+
+export function normalizeWorkflowHudSummary(raw: unknown): WorkflowHudSummary | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const record = raw as Record<string, unknown>;
+	if (record.version !== 1) return undefined;
+	const summary = sanitizeHudString(record.summary);
+	const chips = normalizeHudChips(record.chips, HUD_CHIP_LIMIT);
+	const details = normalizeHudChips(record.details, HUD_DETAIL_LIMIT);
+	const severity = normalizeSeverity(record.severity);
+	const updatedAt = sanitizeHudString(record.updated_at, 40);
+	return {
+		version: 1,
+		...(summary ? { summary } : {}),
+		...(chips ? { chips } : {}),
+		...(details ? { details } : {}),
+		...(severity ? { severity } : {}),
+		...(updatedAt ? { updated_at: updatedAt } : {}),
+	};
 }
 
 function encodePathSegment(value: string): string {
@@ -70,9 +156,17 @@ function timestampMs(value: string | undefined): number | null {
 	return Number.isFinite(ms) ? ms : null;
 }
 
+function entryTimestampMs(entry: SkillActiveEntry): number | null {
+	return timestampMs(entry.hud?.updated_at) ?? timestampMs(entry.updated_at) ?? timestampMs(entry.activated_at);
+}
+
 function isFreshEntry(entry: SkillActiveEntry, nowMs = Date.now()): boolean {
-	const ms = timestampMs(entry.updated_at) ?? timestampMs(entry.activated_at);
+	const ms = entryTimestampMs(entry);
 	return ms === null || nowMs - ms <= SKILL_ACTIVE_STALE_MS;
+}
+
+function withDerivedStale(entry: SkillActiveEntry, nowMs = Date.now()): SkillActiveEntry {
+	return { ...entry, stale: !isFreshEntry(entry, nowMs) };
 }
 
 function normalizeEntry(raw: unknown): SkillActiveEntry | null {
@@ -80,6 +174,7 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 	const record = raw as Record<string, unknown>;
 	const skill = safeString(record.skill).trim();
 	if (!skill) return null;
+	const hud = normalizeWorkflowHudSummary(record.hud);
 	return {
 		...record,
 		skill,
@@ -90,6 +185,8 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 		session_id: safeString(record.session_id).trim() || undefined,
 		thread_id: safeString(record.thread_id).trim() || undefined,
 		turn_id: safeString(record.turn_id).trim() || undefined,
+		...(hud ? { hud } : {}),
+		stale: undefined,
 	};
 }
 
@@ -185,11 +282,12 @@ function mergeVisibleEntries(
 	rootState: SkillActiveState | null,
 	sessionId?: string,
 ): SkillActiveEntry[] {
-	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId).filter(entry =>
-		isFreshEntry(entry),
+	const nowMs = Date.now();
+	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId).map(entry =>
+		withDerivedStale(entry, nowMs),
 	);
 	const merged = new Map(rootEntries.map(entry => [entryKey(entry), entry]));
-	for (const entry of listActiveSkills(sessionState).filter(entry => isFreshEntry(entry))) {
+	for (const entry of listActiveSkills(sessionState).map(candidate => withDerivedStale(candidate, nowMs))) {
 		merged.set(entryKey(entry), entry);
 	}
 	return [...merged.values()];
@@ -229,6 +327,7 @@ function upsertEntry(entries: SkillActiveEntry[], entry: SkillActiveEntry, activ
 
 export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
 	const nowIso = options.nowIso ?? new Date().toISOString();
+	const hud = normalizeWorkflowHudSummary(options.hud);
 	const entry: SkillActiveEntry = {
 		skill: options.skill,
 		phase: options.phase,
@@ -238,6 +337,7 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		session_id: options.sessionId,
 		thread_id: options.threadId,
 		turn_id: options.turnId,
+		...(hud ? { hud } : {}),
 	};
 	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, options.sessionId);
 	const rootState = (await readStateFile(rootPath)) ?? { version: 1, active_skills: [] };
