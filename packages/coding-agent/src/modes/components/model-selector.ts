@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { type Model, modelsAreEqual } from "@gajae-code/ai";
+import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
 import {
 	Container,
 	fuzzyFilter,
@@ -18,7 +18,7 @@ import { formatModelSelectorValue, resolveModelRoleValue } from "../../config/mo
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
-import { getThinkingLevelMetadata } from "../../thinking";
+import { getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -78,6 +78,12 @@ interface RoleAssignment {
 	thinkingLevel: ThinkingLevel;
 }
 
+interface PendingThinkingChoice {
+	item: ModelItem | CanonicalModelItem;
+	role: GjcModelAssignmentTargetId | null;
+	levels: ThinkingLevel[];
+}
+
 type RoleSelectCallback = (
 	model: Model,
 	role: GjcModelAssignmentTargetId | null,
@@ -134,6 +140,8 @@ export class ModelSelectorComponent extends Container {
 	#temporaryOnly: boolean;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
+	#pendingThinkingChoice?: PendingThinkingChoice;
+	#selectedThinkingIndex: number = 0;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -722,11 +730,14 @@ export class ModelSelectorComponent extends Container {
 			this.#listContainer.addChild(
 				new Text(theme.fg("muted", `  Model Name: ${selected.model.name}${suffix}`), 0, 0),
 			);
-			if (this.#pendingActionItem) {
+			if (this.#pendingThinkingChoice) {
+				this.#renderThinkingMenu(this.#pendingThinkingChoice);
+			} else if (this.#pendingActionItem) {
 				this.#renderActionMenu(this.#pendingActionItem);
 			}
 		}
 	}
+
 	#renderActionMenu(item: ModelItem | CanonicalModelItem): void {
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(new Text(theme.fg("muted", `  Action for: ${item.model.id}`), 0, 0));
@@ -742,6 +753,24 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	#renderThinkingMenu(choice: PendingThinkingChoice): void {
+		const targetLabel = choice.role === null ? "temporary model" : GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(
+			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${choice.item.model.id}`), 0, 0),
+		);
+		this.#listContainer.addChild(new Spacer(1));
+		for (let i = 0; i < choice.levels.length; i++) {
+			const level = choice.levels[i];
+			const metadata = getThinkingLevelMetadata(level);
+			const prefix = i === this.#selectedThinkingIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			const label = `${metadata.label} — ${metadata.description}`;
+			this.#listContainer.addChild(
+				new Text(`${prefix}${i === this.#selectedThinkingIndex ? theme.fg("accent", label) : label}`, 0, 0),
+			);
+		}
+	}
+
 	#getCurrentRoleThinkingLevel(role: string): ThinkingLevel {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
 	}
@@ -753,6 +782,10 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#pendingThinkingChoice) {
+			this.#handleThinkingMenuInput(keyData);
+			return;
+		}
 		if (this.#pendingActionItem) {
 			this.#handleActionMenuInput(keyData);
 			return;
@@ -839,12 +872,49 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	#handleThinkingMenuInput(keyData: string): void {
+		const choice = this.#pendingThinkingChoice;
+		if (!choice) return;
+		if (matchesKey(keyData, "up")) {
+			this.#selectedThinkingIndex =
+				this.#selectedThinkingIndex === 0 ? choice.levels.length - 1 : this.#selectedThinkingIndex - 1;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "down")) {
+			this.#selectedThinkingIndex = (this.#selectedThinkingIndex + 1) % choice.levels.length;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			const level = choice.levels[this.#selectedThinkingIndex];
+			if (!level) return;
+			this.#pendingThinkingChoice = undefined;
+			this.#handleSelect(choice.item, choice.role, level);
+			return;
+		}
+		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+			this.#pendingThinkingChoice = undefined;
+			if (choice.role !== null) {
+				this.#pendingActionItem = choice.item;
+				this.#selectedActionIndex = Math.max(0, GJC_MODEL_ASSIGNMENT_TARGET_IDS.indexOf(choice.role));
+			}
+			this.#updateList();
+		}
+	}
+
 	#handleSelect(
 		item: ModelItem | CanonicalModelItem,
 		role: GjcModelAssignmentTargetId | null,
 		thinkingLevel?: ThinkingLevel,
 	): void {
 		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
+		if (itemThinkingLevel === undefined && requiresExplicitThinkingChoice(item.model)) {
+			this.#pendingThinkingChoice = { item, role, levels: getSelectableThinkingLevels(item.model) };
+			this.#selectedThinkingIndex = 0;
+			this.#updateList();
+			return;
+		}
 
 		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
@@ -869,6 +939,33 @@ export class ModelSelectorComponent extends Container {
 	getSearchInput(): Input {
 		return this.#searchInput;
 	}
+}
+
+function requiresExplicitThinkingChoice(model: Model): boolean {
+	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
+}
+
+function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
+	const levels: ThinkingLevel[] = [ThinkingLevel.Off];
+	try {
+		for (const effort of getSupportedEfforts(model)) {
+			const level = parseThinkingLevel(effort);
+			if (level && !levels.includes(level)) {
+				levels.push(level);
+			}
+		}
+	} catch {
+		for (const level of [
+			ThinkingLevel.Minimal,
+			ThinkingLevel.Low,
+			ThinkingLevel.Medium,
+			ThinkingLevel.High,
+			ThinkingLevel.XHigh,
+		]) {
+			levels.push(level);
+		}
+	}
+	return levels;
 }
 
 /** Extract the first version number from a model ID (e.g. "gemini-2.5-pro" → 2.5, "Anthropic model-sonnet-4-6" → 4.6). */

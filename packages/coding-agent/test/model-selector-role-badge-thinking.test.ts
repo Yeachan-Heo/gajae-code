@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getBundledModel, type Model } from "@gajae-code/ai";
+import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import type { GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
@@ -28,7 +28,7 @@ interface SelectionCapture {
 interface CreateSelectorOptions {
 	modelRegistry?: ModelRegistry;
 	temporaryOnly?: boolean;
-	thinkingLevel?: ThinkingLevel;
+	thinkingLevel?: ThinkingLevel | null;
 }
 
 function createSelector(
@@ -53,17 +53,35 @@ function createSelector(
 	const ui = {
 		requestRender: vi.fn(),
 	} as unknown as TUI;
+	const scopedModel =
+		options.thinkingLevel === null ? { model } : { model, thinkingLevel: options.thinkingLevel ?? ThinkingLevel.Off };
 
-	return new ModelSelectorComponent(
-		ui,
-		model,
-		settings,
-		modelRegistry,
-		[{ model, thinkingLevel: options.thinkingLevel ?? ThinkingLevel.Off }],
-		onSelect,
-		() => {},
-		{ temporaryOnly: options.temporaryOnly },
-	);
+	return new ModelSelectorComponent(ui, model, settings, modelRegistry, [scopedModel], onSelect, () => {}, {
+		temporaryOnly: options.temporaryOnly,
+	});
+}
+
+function createOpenAIModel(provider: "openai" | "openai-codex", id: string, reasoning = true): Model {
+	return {
+		id,
+		name: id,
+		api: provider === "openai-codex" ? "openai-codex-responses" : "openai-responses",
+		provider,
+		baseUrl: provider === "openai-codex" ? "https://chatgpt.com/backend-api" : "https://api.openai.com/v1",
+		reasoning,
+		thinking: reasoning
+			? {
+					minLevel: Effort.Low,
+					maxLevel: Effort.High,
+					defaultLevel: Effort.Medium,
+					mode: "effort",
+				}
+			: undefined,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 8192,
+	};
 }
 
 function createOllamaCloudModel(id: string): Model {
@@ -320,5 +338,136 @@ describe("ModelSelector canonical model selection", () => {
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("deepseek-v4-pro");
 		expect(rendered).not.toContain("Provider has not been refreshed yet");
+	});
+
+	test("prompts for reasoning before assigning OpenAI reasoning default models", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai", "gpt-reasoning-test");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default");
+		expect(thinkingRendered).toContain("off");
+		expect(thinkingRendered).toContain("high");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after reasoning choice");
+		expect(selectedAfterThinking.model).toBe(model);
+		expect(selectedAfterThinking.role).toBe("default");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("can explicitly choose off for OpenAI reasoning default models", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai", "gpt-reasoning-off-test");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after off choice");
+		expect(selectedAfterThinking.role).toBe("default");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("prompts for reasoning before assigning OpenAI Codex role-agent models", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai-codex", "gpt-codex-reasoning-test");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Executor");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected OpenAI Codex selection after reasoning choice");
+		expect(selectedAfterThinking.role).toBe("executor");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}:high`);
+	});
+
+	test("does not prompt for non-reasoning OpenAI models", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai", "gpt-non-reasoning-test", false);
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected direct non-reasoning selection");
+		expect(selectedAfterEnter.role).toBe("default");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Inherit);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
 	});
 });
