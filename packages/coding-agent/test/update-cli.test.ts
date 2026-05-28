@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { replaceBinaryForUpdate, resolveUpdateMethodForTest } from "../src/cli/update-cli";
+import { getLatestReleaseForTest, replaceBinaryForUpdate, resolveUpdateMethodForTest } from "../src/cli/update-cli";
 
 const tempDirs: string[] = [];
 
@@ -16,6 +16,24 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 describe("update-cli install target detection", () => {
+	it("checks the public wrapper package published in the documented install path", async () => {
+		const originalFetch = globalThis.fetch;
+		const fetchMock = mock(async () =>
+			Response.json({
+				version: "0.1.2",
+				dist: { tarball: "https://registry.npmjs.org/gajae-code/-/gajae-code-0.1.2.tgz" },
+			}),
+		);
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+		try {
+			await getLatestReleaseForTest();
+
+			expect(fetchMock).toHaveBeenCalledWith("https://registry.npmjs.org/gajae-code/latest");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it("uses bun update when prioritized gjc is inside bun global bin", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.bun/bin/gjc", "/Users/test/.bun/bin");
 

@@ -13,7 +13,7 @@ import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 
 const REPO = "can1357/gajae-code";
-const PACKAGE = "@gajae-code/coding-agent";
+const PACKAGE = "gajae-code";
 
 interface ReleaseInfo {
 	tag: string;
@@ -129,7 +129,7 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
  * Get the latest release info from the npm registry.
  * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
  */
-async function getLatestRelease(): Promise<ReleaseInfo> {
+export async function getLatestReleaseForTest(): Promise<ReleaseInfo> {
 	const response = await fetch(`https://registry.npmjs.org/${PACKAGE}/latest`);
 	if (!response.ok) {
 		throw new Error(`Failed to fetch release info: ${response.statusText}`);
@@ -144,6 +144,8 @@ async function getLatestRelease(): Promise<ReleaseInfo> {
 		version,
 	};
 }
+
+const getLatestRelease = getLatestReleaseForTest;
 
 /**
  * Compare semver versions. Returns:
