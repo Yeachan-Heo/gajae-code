@@ -5,6 +5,8 @@ export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
 export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
+export const GJC_TMUX_PROFILE_ENV = "GJC_TMUX_PROFILE";
+export const GJC_TMUX_MOUSE_ENV = "GJC_MOUSE";
 
 type LaunchPolicy = "direct" | "tmux";
 
@@ -51,6 +53,25 @@ export interface TmuxLaunchPlan {
 	attachSessionArgs: string[];
 }
 
+export interface GjcTmuxProfileCommand {
+	description: string;
+	args: string[];
+}
+
+export interface GjcTmuxProfileResult {
+	skipped: boolean;
+	commands: GjcTmuxProfileCommand[];
+	failures: Array<{ command: GjcTmuxProfileCommand; stderr?: string }>;
+}
+
+export interface GjcTmuxProfileContext {
+	tmuxCommand: string;
+	target: string;
+	cwd?: string;
+	env?: NodeJS.ProcessEnv;
+	spawnSync?: TmuxSpawnSync;
+}
+
 interface CommandResolutionContext {
 	cwd: string;
 	argv: string[];
@@ -80,6 +101,44 @@ function isInteractiveRootLaunch(parsed: Args, tty: TtyState): boolean {
 function shellQuote(value: string): string {
 	if (value.length === 0) return "''";
 	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function envDisabled(value: string | undefined): boolean {
+	const normalized = value?.trim().toLowerCase();
+	return normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no";
+}
+
+export function buildGjcTmuxProfileCommands(
+	target: string,
+	env: NodeJS.ProcessEnv = process.env,
+): GjcTmuxProfileCommand[] {
+	if (envDisabled(env[GJC_TMUX_PROFILE_ENV])) return [];
+	const commands: GjcTmuxProfileCommand[] = [
+		{ description: "mark GJC tmux ownership", args: ["set-option", "-t", target, "@gjc-profile", "1"] },
+		{ description: "enable tmux clipboard integration", args: ["set-option", "-t", target, "set-clipboard", "on"] },
+		{
+			description: "make copy-mode selection readable",
+			args: ["set-window-option", "-t", target, "mode-style", "fg=colour231,bg=colour60"],
+		},
+	];
+	if (!envDisabled(env[GJC_TMUX_MOUSE_ENV]))
+		commands.unshift({ description: "enable tmux mouse scrolling", args: ["set-option", "-t", target, "mouse", "on"] });
+	return commands;
+}
+
+export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
+	const env = context.env ?? process.env;
+	const commands = buildGjcTmuxProfileCommands(context.target, env);
+	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
+	const spawnSync = context.spawnSync ?? defaultSpawnSync;
+	const cwd = context.cwd ?? process.cwd();
+	const options: TmuxSpawnOptions = { cwd, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" };
+	const failures: GjcTmuxProfileResult["failures"] = [];
+	for (const command of commands) {
+		const result = spawnSync(context.tmuxCommand, command.args, options);
+		if (result.exitCode !== 0) failures.push({ command, stderr: result.stderr });
+	}
+	return { skipped: false, commands, failures };
 }
 
 function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
@@ -126,7 +185,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		sessionName,
 		cwd,
 		innerCommand,
-		newSessionArgs: ["new-session", "-s", sessionName, "-c", cwd, innerCommand],
+		newSessionArgs: ["new-session", "-d", "-s", sessionName, "-c", cwd, innerCommand],
 		attachSessionArgs: ["attach-session", "-t", sessionName],
 	};
 }
@@ -156,7 +215,14 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stderr: "inherit",
 	};
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
-	if (created.exitCode === 0) return true;
+	applyGjcTmuxProfile({
+		tmuxCommand: plan.tmuxCommand,
+		target: plan.sessionName,
+		cwd: plan.cwd,
+		env,
+		spawnSync,
+	});
 	const attached = spawnSync(plan.tmuxCommand, plan.attachSessionArgs, options);
+	if (created.exitCode === 0) return attached.exitCode === 0;
 	return attached.exitCode === 0;
 }

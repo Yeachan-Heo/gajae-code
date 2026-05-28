@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { applyGjcTmuxProfile } from "./launch-tmux";
 
 export type GjcTeamPhase = "starting" | "running" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
@@ -679,7 +680,12 @@ function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[
 	}));
 }
 
-async function startTmuxSession(config: GjcTeamConfig, dir: string, dryRun: boolean): Promise<GjcTeamWorker[]> {
+async function startTmuxSession(
+	config: GjcTeamConfig,
+	dir: string,
+	dryRun: boolean,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcTeamWorker[]> {
 	if (dryRun) return config.workers.map(worker => ({ ...worker, pane_id: `%dry-run-${worker.id}` }));
 	const rollbackPaneIds: string[] = [];
 	try {
@@ -740,6 +746,23 @@ async function startTmuxSession(config: GjcTeamConfig, dir: string, dryRun: bool
 				stderr: "ignore",
 			});
 		}
+		const profileResult = applyGjcTmuxProfile({
+			tmuxCommand: config.tmux_command,
+			target: config.tmux_target,
+			cwd: config.leader.cwd,
+			env,
+		});
+		await appendTelemetry(dir, {
+			type: "tmux_profile_applied",
+			message: profileResult.skipped
+				? "Skipped GJC scoped tmux profile"
+				: "Applied GJC scoped tmux profile to team tmux target",
+			data: {
+				tmux_target: config.tmux_target,
+				command_count: profileResult.commands.length,
+				failure_count: profileResult.failures.length,
+			},
+		});
 		await appendTelemetry(dir, {
 			type: "tmux_started",
 			message: "Started gjc team worker panes in current tmux window",
@@ -1379,7 +1402,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	});
 	let tmuxWorkers: GjcTeamWorker[];
 	try {
-		tmuxWorkers = await startTmuxSession(config, dir, options.dryRun ?? false);
+		tmuxWorkers = await startTmuxSession(config, dir, options.dryRun ?? false, env);
 	} catch (error) {
 		await writePhase(dir, "failed");
 		await appendEvent(dir, {
