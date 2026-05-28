@@ -264,7 +264,12 @@ interface GitResult {
 }
 interface GjcTeamCommitHygieneEntry {
 	recorded_at: string;
-	operation: "auto_checkpoint" | "integration_merge" | "integration_cherry_pick" | "cross_rebase";
+	operation:
+		| "auto_checkpoint"
+		| "leader_integration_attempt"
+		| "integration_merge"
+		| "integration_cherry_pick"
+		| "cross_rebase";
 	worker_name: string;
 	task_id?: string;
 	status: "applied" | "skipped" | "conflict" | "failed";
@@ -276,6 +281,23 @@ interface GjcTeamCommitHygieneEntry {
 	worker_head_after?: string | null;
 	worktree_path?: string;
 	detail: string;
+}
+
+interface GjcWorkerIntegrationDedupeState {
+	last_requested_fingerprint?: string;
+	last_requested_head?: string | null;
+	last_requested_status?: GjcWorkerCheckpointClassification["kind"];
+	last_requested_at?: string;
+}
+
+export interface GjcWorkerIntegrationAttemptRequestResult {
+	requested: boolean;
+	reason: "requested" | "not_worker" | "missing_worktree" | "no_changes" | "deduped" | "git_error";
+	worker?: string;
+	team_name?: string;
+	fingerprint?: string;
+	head?: string | null;
+	status?: GjcWorkerCheckpointClassification["kind"];
 }
 
 function isGjcTeamTaskStatus(value: string): value is GjcTeamTaskStatus {
@@ -364,6 +386,9 @@ function mailboxPath(dir: string, worker: string): string {
 }
 function workerDir(dir: string, worker: string): string {
 	return path.join(dir, "workers", worker);
+}
+function workerIntegrationDedupePath(dir: string, worker: string): string {
+	return path.join(workerDir(dir, worker), "posttooluse-dedupe.json");
 }
 
 export function resolveGjcTeamStateRoot(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
@@ -953,6 +978,19 @@ async function integrateGjcWorkerCommits(
 	const leaderCwd = config.leader_cwd || cwd;
 	const cycleLeaderHead = resolveHead(leaderCwd);
 	for (const worker of config.workers) {
+		hygieneEntries.push({
+			recorded_at: now(),
+			operation: "leader_integration_attempt",
+			worker_name: worker.id,
+			task_id: worker.assigned_tasks[0],
+			status: "skipped",
+			leader_head_before: cycleLeaderHead,
+			worktree_path: worker.worktree_path,
+			detail: "Leader monitor inspected worker integration eligibility for this cycle.",
+		});
+	}
+
+	for (const worker of config.workers) {
 		if (!worker.worktree_path || !worker.worktree_repo_root || !(await pathExists(worker.worktree_path))) continue;
 		const { committed, commit } = autoCommitDirtyWorker(worker);
 		if (!committed) continue;
@@ -1489,6 +1527,59 @@ export async function readGjcTeamSnapshot(
 		updated_at: config.updated_at,
 	};
 }
+function workerIntegrationFingerprint(head: string | null, classification: GjcWorkerCheckpointClassification): string {
+	return `${head ?? "no-head"}:${classification.kind}:${classification.files.join("\0")}`;
+}
+
+export async function requestGjcWorkerIntegrationAttempt(
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcWorkerIntegrationAttemptRequestResult> {
+	const teamName = env.GJC_TEAM_NAME?.trim();
+	const worker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
+	if (!teamName || !worker) return { requested: false, reason: "not_worker" };
+	const dir = await findTeamDir(teamName, cwd, env);
+	const config = await readConfig(dir);
+	const configuredWorker = config.workers.find(candidate => candidate.id === worker);
+	const worktreePath = env.GJC_TEAM_WORKTREE_PATH?.trim() || configuredWorker?.worktree_path;
+	if (!worktreePath || !(await pathExists(worktreePath))) return { requested: false, reason: "missing_worktree", worker, team_name: teamName };
+	const classification = classifyWorkerCheckpointStatus(worktreePath);
+	const head = resolveHead(worktreePath);
+	if (classification.kind === "git_error") {
+		return { requested: false, reason: "git_error", worker, team_name: teamName, head, status: classification.kind };
+	}
+	if (classification.kind === "clean" && configuredWorker?.worktree_base_ref === head) {
+		return { requested: false, reason: "no_changes", worker, team_name: teamName, head, status: classification.kind };
+	}
+	const fingerprint = workerIntegrationFingerprint(head, classification);
+	const dedupePath = workerIntegrationDedupePath(dir, worker);
+	const dedupe = (await readJsonFile<GjcWorkerIntegrationDedupeState>(dedupePath)) ?? {};
+	if (dedupe.last_requested_fingerprint === fingerprint) {
+		return { requested: false, reason: "deduped", worker, team_name: teamName, fingerprint, head, status: classification.kind };
+	}
+	await writeJsonFile(dedupePath, {
+		last_requested_fingerprint: fingerprint,
+		last_requested_head: head,
+		last_requested_status: classification.kind,
+		last_requested_at: now(),
+	} satisfies GjcWorkerIntegrationDedupeState);
+	await appendEvent(dir, {
+		type: "worker_integration_attempt_requested",
+		worker,
+		message: `Worker ${worker} requested leader integration attempt`,
+		data: { worker_name: worker, worker_head: head, status: classification.kind, files: classification.files },
+	});
+	await sendGjcTeamMessage(
+		teamName,
+		worker,
+		"leader-fixed",
+		`INTEGRATION REQUESTED: ${worker} has ${classification.kind} git changes at ${head?.slice(0, 12) ?? "unknown-head"}.`,
+		cwd,
+		env,
+	).catch(() => undefined);
+	return { requested: true, reason: "requested", worker, team_name: teamName, fingerprint, head, status: classification.kind };
+}
+
 export async function monitorGjcTeam(
 	teamName: string,
 	cwd = process.cwd(),
