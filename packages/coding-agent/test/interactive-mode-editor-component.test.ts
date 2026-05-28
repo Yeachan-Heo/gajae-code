@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -57,6 +58,36 @@ describe("InteractiveMode.setEditorComponent", () => {
 		authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
+	});
+
+	it("renders the default composer as a closed square input box", () => {
+		const lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+
+		expect(lines[0]).toStartWith("┌");
+		expect(lines[0]).toEndWith("┐");
+		expect(lines.at(-1)).toStartWith("└");
+		expect(lines.at(-1)).toEndWith("┘");
+		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
+		expect(lines.join("\n")).toContain("Type your message...");
+		expect(lines.join("\n")).not.toContain("›");
+	});
+
+	it("keeps closed square composer chrome for one-line, multiline, and narrow prompts", () => {
+		for (const [width, text] of [
+			[48, "Ask gjc to improve the composer"],
+			[48, "first line\nsecond line"],
+			[28, "narrow terminal composer"],
+		] as const) {
+			mode.editor.setText(text);
+			const lines = mode.editor.render(width).map(line => stripVTControlCharacters(line));
+
+			expect(lines[0]).toStartWith("┌");
+			expect(lines[0]).toEndWith("┐");
+			expect(lines.at(-1)).toStartWith("└");
+			expect(lines.at(-1)).toEndWith("┘");
+			expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
+			expect(lines.join("\n")).not.toContain("Type your message...");
+		}
 	});
 
 	it("replaces the editor and rebinds interactive handlers", () => {

@@ -121,9 +121,14 @@ const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 };
 
 function configureDefaultComposerChrome(editor: CustomEditor): void {
-	editor.setBorderVisible(false);
-	editor.setPromptGutter(`${theme.fg("accent", "›")} `);
+	editor.setBorderVisible(true);
+	editor.setBorderStyle("sharp");
+	editor.setClosedBorderBox(true);
+	editor.setPromptGutter(undefined);
+	editor.setInputPrefix(`${theme.fg("accent", ">")} `);
+	editor.setPlaceholder("Type your message...");
 	editor.setPaddingX(1);
+	editor.setTopBorder(undefined);
 }
 
 interface WorkingMessageAccent {
@@ -376,7 +381,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncEditorMaxHeight();
 		this.#resizeHandler = () => {
 			this.#syncEditorMaxHeight();
-			this.updateEditorTopBorder();
+			this.updateEditorChrome();
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		try {
@@ -500,7 +505,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.statusContainer);
 		this.ui.addChild(this.todoContainer);
 		this.ui.addChild(this.btwContainer);
-		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer stays borderless.
+		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer chrome is rendered by the editor.
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
@@ -526,7 +531,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.start();
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
-		this.updateEditorBorderColor();
+		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
 		this.ui.requestRender(true);
@@ -544,7 +549,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const draft = await this.sessionManager.consumeDraft();
 			if (draft && !this.editor.getText()) {
 				this.editor.setText(draft);
-				this.updateEditorBorderColor();
+				this.updateEditorChrome();
 				this.ui.requestRender();
 			}
 		} catch (err) {
@@ -564,7 +569,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearRenderCache();
 			configureDefaultComposerChrome(this.editor);
 			this.ui.invalidate();
-			this.updateEditorBorderColor();
+			this.updateEditorChrome();
 			this.ui.requestRender();
 		});
 
@@ -577,12 +582,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Set up git branch watcher
 		this.statusLine.watchBranch(() => {
-			this.updateEditorTopBorder();
+			this.updateEditorChrome();
 			this.ui.requestRender();
 		});
 
 		// Initial top border update
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */
@@ -749,7 +754,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopLimit = undefined;
 		this.#cancelLoopAutoSubmit();
 		this.statusLine.setLoopModeStatus(undefined);
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 		if (wasEnabled) {
 			this.showStatus(message);
@@ -780,7 +785,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopPrompt = undefined;
 		this.loopLimit = createLoopLimitRuntime(parsedLimit);
 		this.statusLine.setLoopModeStatus({ enabled: true });
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 		const limitSuffix = parsedLimit ? ` Limited to ${describeLoopLimit(parsedLimit)}.` : "";
 		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
@@ -874,7 +879,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.rebuildChatFromMessages();
 			this.editor.setText(submission.text);
 		}
-		this.updateEditorBorderColor();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 		return true;
 	}
@@ -921,7 +926,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
 
-	updateEditorBorderColor(): void {
+	updateEditorChrome(): void {
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else if (this.isPythonMode) {
@@ -938,13 +943,21 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.editor.borderColor = theme.getThinkingBorderColor(level);
 			}
 		}
-		this.updateEditorTopBorder();
+		this.#setComposerTopBorder();
 		this.ui.requestRender();
 	}
 
+	updateEditorBorderColor(): void {
+		this.updateEditorChrome();
+	}
+
 	updateEditorTopBorder(): void {
-		// The opencode-style composer is intentionally borderless. Keep status-line
-		// rendering out of the input area so the prompt remains a simple gutter + body.
+		this.#setComposerTopBorder();
+	}
+
+	#setComposerTopBorder(): void {
+		// Keep the composer as a plain closed input rectangle; status-line
+		// rendering stays outside the input area.
 		this.editor.setTopBorder(undefined);
 	}
 
@@ -1048,7 +1061,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					}
 				: undefined;
 		this.statusLine.setPlanModeStatus(status);
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 	}
 
@@ -1058,7 +1071,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				? { enabled: this.goalModeEnabled, paused: this.goalModePaused }
 				: undefined;
 		this.statusLine.setGoalModeStatus(status);
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 	}
 
@@ -1650,7 +1663,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const applied = await this.sessionManager.setSessionName(seededName, "auto");
 			if (applied) {
 				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
-				this.updateEditorBorderColor();
+				this.updateEditorChrome();
 			}
 		}
 
@@ -2121,8 +2134,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			logger.warn("Failed to refresh slash command state for custom editor", { error: String(error) });
 		});
 
-		this.updateEditorBorderColor();
-		this.updateEditorTopBorder();
+		this.updateEditorChrome();
 		this.ui.requestRender();
 	}
 
@@ -2417,7 +2429,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				} else {
 					this.#cleanupMicAnimation();
 				}
-				this.updateEditorTopBorder();
+				this.updateEditorChrome();
 				this.ui.requestRender();
 			},
 		});
