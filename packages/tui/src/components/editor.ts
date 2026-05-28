@@ -772,7 +772,7 @@ export class Editor implements Component, Focusable {
 			let displayWidth = visibleWidth(layoutLine.text);
 			let cursorInPadding = false;
 			const absoluteVisibleIndex = this.#scrollOffset + visibleIndex;
-			const showPromptGutter = promptGutter !== undefined && absoluteVisibleIndex === 0;
+			const showPromptGutter = promptGutter !== undefined && visibleIndex === 0;
 			const gutterText =
 				promptGutter === undefined ? "" : showPromptGutter ? promptGutter.firstLine : promptGutter.continuation;
 			const inputPrefix = absoluteVisibleIndex === 0 ? (this.#inputPrefix ?? "") : padding(inputPrefixWidth);
