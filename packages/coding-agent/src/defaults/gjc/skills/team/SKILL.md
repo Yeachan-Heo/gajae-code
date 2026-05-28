@@ -63,7 +63,7 @@ requiring a separate linked execution loop up front. GJC team supports current-w
 
 Use `$ultragoal` for durable leader-owned goal/ledger tracking and `$team` for parallel visible tmux execution lanes. When Team is launched with an active `.gjc/ultragoal/goals.json`, worker task/status context may include leader-owned Ultragoal context: `.gjc/ultragoal/goals.json`, `.gjc/ultragoal/ledger.jsonl`, the active goal id, GJC goal mode, and the `fresh_leader_get_goal_required` checkpoint policy.
 
-Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `.gjc/ultragoal`, auto-launch Team from Ultragoal, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Ultragoal does not auto-launch Team and performs no hidden goal mutation. The leader uses terminal Team evidence plus a fresh `get_goal` snapshot to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/ultragoal and <id>>" --gjc-goal-json <fresh-get_goal-json-or-path>`.
+Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `.gjc/ultragoal`, auto-launch Team from Ultragoal, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Ultragoal does not auto-launch Team and performs no hidden goal mutation. The leader uses terminal Team evidence plus a fresh `get_goal` snapshot and strict quality gate to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/ultragoal and <id>>" --gjc-goal-json <fresh-get_goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>`.
 
 ### Worker command override
 
@@ -170,7 +170,7 @@ Follow this exact lifecycle when running `$team`:
    - `in_progress=0`
    - `failed=0` (or explicitly acknowledged failure path)
 4. Only then run `gjc team shutdown <team>`.
-5. Verify shutdown evidence and preserved state (`phase=complete`, worker status `stopped`).
+5. Verify shutdown evidence and preserved state (`phase=complete`, worker status `stopped`). If shutdown is forced before task completion, expect `phase=cancelled` or `phase=failed`, not `complete`.
 
 Do not run `shutdown` while the worker is actively writing updates unless user explicitly requested abort/cancel. Do not treat ad-hoc pane typing as primary control flow when runtime/state evidence is available.
 
@@ -198,7 +198,7 @@ Semantics:
 - `resume`: mutating monitor path; performs the same integration-aware live snapshot for reconnect/inspection flows.
 - `list`: pure read path; lists known teams without integrating worker commits.
 - API/read-only snapshot operations are pure unless explicitly documented as a monitor/status path.
-- `shutdown`: kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker stopped, and marks phase complete. It preserves `.gjc/state/team/<team>` as evidence.
+- `shutdown`: kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker stopped, and sets phase from task state: `complete` only when all tasks completed, `failed` when tasks failed/blocked, and `cancelled` when work remains pending or in progress. It preserves `.gjc/state/team/<team>` as evidence.
 
 ## Data Plane and Control Plane
 
@@ -328,7 +328,7 @@ When operating this skill, provide concrete progress evidence:
 1. Team started line (`Team started: <name>`)
 2. tmux target and worker pane id
 3. task state from `gjc team status <team>` or `.gjc/state/team/<team>/tasks/task-1.json`
-4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal
+4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete shutdowns must report `phase=cancelled`/`failed`
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.

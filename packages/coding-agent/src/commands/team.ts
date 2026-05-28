@@ -16,6 +16,23 @@ function writeText(lines: string[]): void {
 	process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+function formatTaskCounts(counts: Record<string, number>): string {
+	return Object.entries(counts)
+		.map(([status, count]) => `${status}=${count}`)
+		.join(" ");
+}
+
+function formatIntegrationSummary(snapshot: {
+	integration_by_worker?: Record<string, { status?: string; conflict_files?: string[] }>;
+}): string[] {
+	const entries = Object.entries(snapshot.integration_by_worker ?? {});
+	if (entries.length === 0) return ["integration: no attempts recorded"];
+	return entries.map(([worker, state]) => {
+		const files = state.conflict_files?.length ? ` files=${state.conflict_files.join(",")}` : "";
+		return `integration: ${worker} ${state.status ?? "unknown"}${files}`;
+	});
+}
+
 function parseInputFlag(argv: string[]): Record<string, unknown> {
 	const index = argv.indexOf("--input");
 	if (index < 0) return {};
@@ -76,9 +93,11 @@ export default class Team extends Command {
 			writeText([
 				`team: ${snapshot.team_name}`,
 				`phase: ${snapshot.phase}`,
-				`tmux: ${snapshot.tmux_session}`,
+				`tmux: ${snapshot.tmux_target || snapshot.tmux_session}`,
 				`state: ${snapshot.state_dir}`,
-				`tasks: ${snapshot.task_total}`,
+				`tasks: ${snapshot.task_total} (${formatTaskCounts(snapshot.task_counts)})`,
+				`workers: ${snapshot.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")}`,
+				...formatIntegrationSummary(snapshot),
 			]);
 			return;
 		}

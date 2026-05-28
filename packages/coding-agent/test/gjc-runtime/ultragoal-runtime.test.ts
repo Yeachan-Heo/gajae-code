@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { validateCompletionReceipt } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
+import {
+	assertCanCompleteCurrentGoal,
+	validateCompletionReceipt,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
@@ -53,6 +56,34 @@ function passingQualityGate(): string {
 	});
 }
 
+function goalSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
+	return JSON.stringify({
+		goal: {
+			threadId: "test-thread",
+			objective,
+			status,
+			createdAt: updatedAt,
+			updatedAt,
+		},
+	});
+}
+
+function goalToolSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
+	return JSON.stringify({
+		content: [{ type: "text", text: `Goal: ${objective}` }],
+		details: {
+			op: "get",
+			goal: {
+				threadId: "test-thread",
+				objective,
+				status,
+				createdAt: updatedAt,
+				updatedAt,
+			},
+		},
+	});
+}
+
 describe("native GJC ultragoal runtime", () => {
 	it("reports missing status without requiring a private runtime binary", async () => {
 		const root = await tempDir();
@@ -93,22 +124,64 @@ describe("native GJC ultragoal runtime", () => {
 			goalId: "G001",
 			status: "complete",
 			evidence: "tests passed",
-			gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-			qualityGateJson: JSON.stringify({
-				verification: { status: "passed" },
-				codeReview: { recommendation: "APPROVE", architectStatus: "CLEAR" },
-			}),
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
+			qualityGateJson: passingQualityGate(),
 		});
 		const status = await getUltragoalStatus(root);
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
 
 		expect(plan.goals[0]?.status).toBe("complete");
 		expect(status.status).toBe("complete");
 		expect(status.counts.complete).toBe(1);
+		expect(diagnostic.state).toBe("active_verified_complete");
 		expect(plan.goals[0]?.completionVerification).toMatchObject({
 			schemaVersion: 1,
 			goalId: "G001",
 			receiptKind: "final-aggregate",
 		});
+	});
+
+	it("accepts full get_goal tool result snapshots with millisecond timestamps", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			gjcGoalJson: goalToolSnapshot(created.gjcObjective),
+			qualityGateJson: passingQualityGate(),
+		});
+
+		expect(plan.goals[0]?.status).toBe("complete");
+		expect(plan.goals[0]?.completionVerification?.gjcGoalSnapshotHash).toBeTruthy();
+	});
+
+	it("accepts per-story get_goal snapshots for per-story plans", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix", gjcGoalMode: "per-story" });
+		await startNextUltragoalGoal({ cwd: root });
+		const storyObjective = created.goals[0]?.objective;
+		if (!storyObjective) throw new Error("missing story objective");
+
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			gjcGoalJson: goalSnapshot(storyObjective),
+			qualityGateJson: passingQualityGate(),
+		});
+
+		expect(plan.goals[0]?.status).toBe("complete");
+		expect(plan.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
 	});
 
 	it("treats receipts as stale after target goal mutation", async () => {
@@ -120,7 +193,7 @@ describe("native GJC ultragoal runtime", () => {
 			goalId: "G001",
 			status: "complete",
 			evidence: "tests passed",
-			gjcGoalJson: JSON.stringify({ goal: { objective: created.gjcObjective, status: "active" } }),
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
 			qualityGateJson: passingQualityGate(),
 		});
 		const goal = plan.goals[0];
@@ -135,6 +208,34 @@ describe("native GJC ultragoal runtime", () => {
 		});
 
 		expect(diagnostic.state).toBe("active_stale_receipt");
+	});
+
+	it("treats receipts as stale after get_goal snapshot ledger mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
+			qualityGateJson: passingQualityGate(),
+		});
+		const ledger = await readUltragoalLedger(root);
+		const checkpointEvent = ledger.find(event => event.event === "goal_checkpointed");
+		if (!checkpointEvent) throw new Error("missing checkpoint event");
+		checkpointEvent.gjcGoalJson = { goal: { objective: created.gjcObjective, status: "active", updatedAt: 1 } };
+
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger,
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
+
+		expect(diagnostic.state).toBe("active_stale_receipt");
+		expect(diagnostic.message).toContain("snapshot hash");
 	});
 
 	it("blocks complete checkpoints without full architect and executor verification", async () => {
@@ -224,6 +325,59 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
 	});
 
+	it("rejects complete gates with missing evidence or dirty blockers before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+		const beforeLedger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+		const missingEvidenceGate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+		missingEvidenceGate.architectReview!.evidence = "";
+		const dirtyBlockersGate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
+		dirtyBlockersGate.executorQa!.blockers = ["regression remains"];
+		const snapshot = goalSnapshot(created.gjcObjective);
+
+		const missingEvidence = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				snapshot,
+				"--quality-gate-json",
+				JSON.stringify(missingEvidenceGate),
+			],
+			root,
+		);
+		const dirtyBlockers = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				snapshot,
+				"--quality-gate-json",
+				JSON.stringify(dirtyBlockersGate),
+			],
+			root,
+		);
+
+		expect(missingEvidence.status).toBe(1);
+		expect(missingEvidence.stderr).toContain("architectReview.evidence");
+		expect(dirtyBlockers.status).toBe(1);
+		expect(dirtyBlockers.stderr).toContain("executorQa.blockers");
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
+	});
+
 	it("requires a fresh get_goal snapshot for complete checkpoints", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
@@ -250,6 +404,133 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
 	});
 
+	it("fails closed when an active Ultragoal objective has no durable plan", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await fs.rm(path.join(root, ".gjc", "ultragoal", "goals.json"));
+
+		await expect(
+			assertCanCompleteCurrentGoal({
+				cwd: root,
+				currentGoal: { objective: created.gjcObjective, status: "active" },
+			}),
+		).rejects.toThrow("missing durable .gjc/ultragoal/goals.json");
+	});
+
+	it("fails closed for per-story Ultragoal objectives when the durable plan is missing", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix", gjcGoalMode: "per-story" });
+		const storyObjective = created.goals[0]?.objective;
+		if (!storyObjective) throw new Error("missing story objective");
+		await fs.rm(path.join(root, ".gjc", "ultragoal", "goals.json"));
+
+		await expect(
+			assertCanCompleteCurrentGoal({
+				cwd: root,
+				currentGoal: { objective: storyObjective, status: "active" },
+			}),
+		).rejects.toThrow("missing durable .gjc/ultragoal/goals.json");
+	});
+
+	it("rejects unrelated or stale get_goal snapshots before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+		const beforeLedger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+		const baseArgs = [
+			"checkpoint",
+			"--goal-id",
+			"G001",
+			"--status",
+			"complete",
+			"--evidence",
+			"tests passed",
+			"--quality-gate-json",
+			passingQualityGate(),
+			"--gjc-goal-json",
+		];
+
+		const bogus = await runNativeUltragoalCommand([...baseArgs, JSON.stringify({ nope: true })], root);
+		const wrongObjective = await runNativeUltragoalCommand([...baseArgs, goalSnapshot("other goal")], root);
+		const staleStatus = await runNativeUltragoalCommand(
+			[...baseArgs, goalSnapshot(created.gjcObjective, "complete")],
+			root,
+		);
+		const staleSnapshot = await runNativeUltragoalCommand(
+			[...baseArgs, goalSnapshot(created.gjcObjective, "active", 1)],
+			root,
+		);
+
+		expect(bogus.status).toBe(1);
+		expect(bogus.stderr).toContain("goal object");
+		expect(wrongObjective.status).toBe(1);
+		expect(wrongObjective.stderr).toContain("objective");
+		expect(staleStatus.status).toBe(1);
+		expect(staleStatus.stderr).toContain("goal.status to be active");
+		expect(staleSnapshot.status).toBe(1);
+		expect(staleSnapshot.stderr).toContain("fresh");
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
+	});
+
+	it("allows completed legacy goal snapshots for blocked checkpoints", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"blocked",
+				"--evidence",
+				"legacy completed GJC goal blocks create_goal in this thread",
+				"--gjc-goal-json",
+				goalSnapshot("legacy completed unrelated goal", "complete"),
+			],
+			root,
+		);
+		const status = await getUltragoalStatus(root);
+		const ledgerRaw = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+
+		expect(result.status).toBe(0);
+		expect(status.goals[0]?.status).toBe("blocked");
+		expect(ledgerRaw).toContain("legacy completed GJC goal blocks");
+	});
+
+	it("rejects unrelated review-blocker snapshots before mutation", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+		const beforeLedger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"record-review-blockers",
+				"--goal-id",
+				"G001",
+				"--title",
+				"Resolve verification blockers",
+				"--objective",
+				"Fix architect and executor QA findings.",
+				"--evidence",
+				"architect found product regression",
+				"--gjc-goal-json",
+				goalSnapshot("unrelated", "complete"),
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("objective");
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
+	});
+
 	it("unblocks plans after verification blocker stories complete cleanly", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
@@ -266,6 +547,8 @@ describe("native GJC ultragoal runtime", () => {
 				"Fix architect and executor QA findings.",
 				"--evidence",
 				"architect found product regression",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
 			],
 			root,
 		);
@@ -275,7 +558,7 @@ describe("native GJC ultragoal runtime", () => {
 			goalId: "G002",
 			status: "complete",
 			evidence: "fixed regression and reran full verification",
-			gjcGoalJson: JSON.stringify({ goal: { objective: created.gjcObjective, status: "active" } }),
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
 			qualityGateJson: passingQualityGate(),
 		});
 		const status = await getUltragoalStatus(root);
@@ -286,9 +569,35 @@ describe("native GJC ultragoal runtime", () => {
 		expect(status.status).toBe("complete");
 		expect(completedBlocker.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
 	});
-	it("blocks complete checkpoints without a clean architect review gate", async () => {
+
+	it("requires review blockers to include a fresh active get_goal snapshot", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"record-review-blockers",
+				"--goal-id",
+				"G001",
+				"--title",
+				"Resolve verification blockers",
+				"--objective",
+				"Fix architect and executor QA findings.",
+				"--evidence",
+				"architect found product regression",
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("record-review-blockers require --gjc-goal-json");
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+	});
+	it("blocks complete checkpoints without the strict architect/executor/iteration quality gate", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		await expect(
@@ -297,9 +606,9 @@ describe("native GJC ultragoal runtime", () => {
 				goalId: "G001",
 				status: "complete",
 				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
+				gjcGoalJson: goalSnapshot(created.gjcObjective),
 			}),
-		).rejects.toThrow("requires --quality-gate-json");
+		).rejects.toThrow("require --quality-gate-json");
 
 		await expect(
 			checkpointUltragoalGoal({
@@ -307,21 +616,21 @@ describe("native GJC ultragoal runtime", () => {
 				goalId: "G001",
 				status: "complete",
 				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
+				gjcGoalJson: goalSnapshot(created.gjcObjective),
 				qualityGateJson: JSON.stringify({
 					verification: { status: "passed" },
 					codeReview: { recommendation: "APPROVE", architectStatus: "WATCH" },
 				}),
 			}),
-		).rejects.toThrow("requires architect review approval");
+		).rejects.toThrow("legacy codeReview-only gates are not sufficient");
 
 		const status = await getUltragoalStatus(root);
 		expect(status.goals[0]?.status).toBe("active");
 	});
 
-	it("blocks complete checkpoint commands without a clean architect review gate", async () => {
+	it("blocks complete checkpoint commands without the strict quality gate", async () => {
 		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const result = await runNativeUltragoalCommand(
@@ -334,188 +643,14 @@ describe("native GJC ultragoal runtime", () => {
 				"--evidence",
 				"tests passed",
 				"--gjc-goal-json",
-				JSON.stringify({ goal: { status: "complete" } }),
+				goalSnapshot(created.gjcObjective),
 			],
 			root,
 		);
 		const status = await getUltragoalStatus(root);
 
 		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("requires --quality-gate-json");
-		expect(status.goals[0]?.status).toBe("active");
-	});
-	it("blocks complete checkpoints without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-			}),
-		).rejects.toThrow("requires --quality-gate-json");
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-				qualityGateJson: JSON.stringify({
-					verification: { status: "passed" },
-					codeReview: { recommendation: "APPROVE", architectStatus: "WATCH" },
-				}),
-			}),
-		).rejects.toThrow("requires architect review approval");
-
-		const status = await getUltragoalStatus(root);
-		expect(status.goals[0]?.status).toBe("active");
-	});
-
-	it("blocks complete checkpoint commands without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		const result = await runNativeUltragoalCommand(
-			[
-				"checkpoint",
-				"--goal-id",
-				"G001",
-				"--status",
-				"complete",
-				"--evidence",
-				"tests passed",
-				"--gjc-goal-json",
-				JSON.stringify({ goal: { status: "complete" } }),
-			],
-			root,
-		);
-		const status = await getUltragoalStatus(root);
-
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("requires --quality-gate-json");
-		expect(status.goals[0]?.status).toBe("active");
-	});
-	it("blocks complete checkpoints without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-			}),
-		).rejects.toThrow("requires --quality-gate-json");
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-				qualityGateJson: JSON.stringify({
-					verification: { status: "passed" },
-					codeReview: { recommendation: "APPROVE", architectStatus: "WATCH" },
-				}),
-			}),
-		).rejects.toThrow("requires architect review approval");
-
-		const status = await getUltragoalStatus(root);
-		expect(status.goals[0]?.status).toBe("active");
-	});
-
-	it("blocks complete checkpoint commands without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		const result = await runNativeUltragoalCommand(
-			[
-				"checkpoint",
-				"--goal-id",
-				"G001",
-				"--status",
-				"complete",
-				"--evidence",
-				"tests passed",
-				"--gjc-goal-json",
-				JSON.stringify({ goal: { status: "complete" } }),
-			],
-			root,
-		);
-		const status = await getUltragoalStatus(root);
-
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("requires --quality-gate-json");
-		expect(status.goals[0]?.status).toBe("active");
-	});
-	it("blocks complete checkpoints without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-			}),
-		).rejects.toThrow("requires --quality-gate-json");
-
-		await expect(
-			checkpointUltragoalGoal({
-				cwd: root,
-				goalId: "G001",
-				status: "complete",
-				evidence: "tests passed",
-				gjcGoalJson: JSON.stringify({ goal: { status: "complete" } }),
-				qualityGateJson: JSON.stringify({
-					verification: { status: "passed" },
-					codeReview: { recommendation: "APPROVE", architectStatus: "WATCH" },
-				}),
-			}),
-		).rejects.toThrow("requires architect review approval");
-
-		const status = await getUltragoalStatus(root);
-		expect(status.goals[0]?.status).toBe("active");
-	});
-
-	it("blocks complete checkpoint commands without a clean architect review gate", async () => {
-		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-
-		const result = await runNativeUltragoalCommand(
-			[
-				"checkpoint",
-				"--goal-id",
-				"G001",
-				"--status",
-				"complete",
-				"--evidence",
-				"tests passed",
-				"--gjc-goal-json",
-				JSON.stringify({ goal: { status: "complete" } }),
-			],
-			root,
-		);
-		const status = await getUltragoalStatus(root);
-
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("requires --quality-gate-json");
+		expect(result.stderr).toContain("require --quality-gate-json");
 		expect(status.goals[0]?.status).toBe("active");
 	});
 

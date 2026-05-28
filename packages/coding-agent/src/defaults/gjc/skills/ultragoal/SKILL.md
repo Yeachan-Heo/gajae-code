@@ -30,7 +30,7 @@ gjc ultragoal create-goals --brief "<brief>"
 gjc ultragoal create-goals --brief-file <path>
 gjc ultragoal complete-goals
 gjc ultragoal complete-goals --retry-failed
-gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <get-goal-json-or-path>
+gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <get-goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>
 gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"
 gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve final review blockers" --objective "<blocker-resolution objective>" --evidence "<review findings>" --gjc-goal-json <active-get-goal-json-or-path>
 ```
@@ -65,8 +65,8 @@ Loop until `gjc ultragoal status` reports all goals complete:
 4. If no active GJC goal exists, call `create_goal({"objective":"<printed payload objective>"})` with the printed payload. In aggregate mode, if the same aggregate objective is already active, continue the current GJC story without creating a new GJC goal.
 5. Complete the current GJC story only.
 6. Run a completion audit against the story objective and real artifacts/tests.
-7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `update_goal` for intermediate stories; checkpoint with a fresh `get_goal({})` snapshot whose aggregate objective is still `active`. On the final story only, call `update_goal({"status":"complete"})` after the gate is clean, then call `get_goal({})` again for a fresh `complete` snapshot.
-8. Checkpoint the durable ledger with that snapshot. Complete checkpoints require `--quality-gate-json`; the runtime hook rejects closure without a clean architect review:
+7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `update_goal` for intermediate stories; checkpoint each story with a fresh `get_goal({})` snapshot whose aggregate objective is still `active`. On the final story, use the same fresh active snapshot to create the final aggregate receipt first; only after that receipt exists may `update_goal({"status":"complete"})` run.
+8. Checkpoint the durable ledger with that fresh active snapshot. Complete checkpoints require `--quality-gate-json`; the runtime hook rejects closure without a clean architect review:
    `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <get_goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>`
 9. If blocked or failed, checkpoint failure:
    `gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
@@ -129,7 +129,7 @@ Use ultragoal and team together for a durable Ultragoal story that benefits from
 The leader checkpoints Ultragoal from Team evidence with a fresh `get_goal` snapshot:
 
 ```sh
-gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/ultragoal and <id>>" --gjc-goal-json <fresh-get_goal-json-or-path>
+gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/ultragoal and <id>>" --gjc-goal-json <fresh-get_goal-json-or-path> --quality-gate-json <quality-gate-json-or-path>
 ```
 
 Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
@@ -141,7 +141,7 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
 1. Run targeted verification for the story.
 2. Run a cleanup/refactor review pass on changed files only; if there are no relevant edits, the cleaner still runs and records a passed/no-op report.
 3. Rerun verification after the cleaner pass.
-4. Run a final code review pass. Clean means `codeReview.recommendation: "APPROVE"` and `codeReview.architectStatus: "CLEAR"`; `COMMENT`, `WATCH`, `REQUEST CHANGES`, and `BLOCK` are non-clean.
+4. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, or non-empty blockers are non-clean.
 5. If review is non-clean, do **not** call `update_goal`. Record durable blocker work instead:
 
 1. Run targeted implementation verification for the story.
@@ -155,7 +155,7 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
    gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<architect/executor findings>" --gjc-goal-json <active-get-goal-json-or-path>
    ```
 5. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
-6. Only after the loop is clean, checkpoint the story as complete with a structured quality gate. The checkpoint creates a receipt; `goals.json.status` alone is not proof. Aggregate direct completion requires a fresh final aggregate receipt covering the full required-goal set before `update_goal({"status":"complete"})` is allowed.
+6. Only after the loop is clean, checkpoint the story as complete with a structured quality gate and a fresh active `get_goal` snapshot. The checkpoint creates a receipt; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before `update_goal({"status":"complete"})` is allowed.
 
 The native `checkpoint --status complete` command rejects missing or shallow gates. `--quality-gate-json` must include:
 
@@ -201,6 +201,6 @@ Receipts are freshness-scoped:
 - After a completed aggregate ultragoal run, clear the goal manually with `/goal clear` before starting another ultragoal run in the same session/thread.
 - Never call `create_goal` when `get_goal` reports a different active goal.
 - Never call `update_goal` unless the aggregate run or legacy per-story goal is actually complete.
-- In aggregate mode, intermediate story checkpoints require a matching `active` GJC goal snapshot; final story checkpoint also uses the active snapshot and creates the final aggregate receipt. Only after that receipt exists may `update_goal({"status":"complete"})` reconcile the inline goal state.
+- In aggregate mode, intermediate and final story checkpoints require a matching `active` GJC goal snapshot; the final story checkpoint creates the final aggregate receipt before `update_goal({"status":"complete"})` may reconcile the inline goal state.
 - Completion checkpoints require read-only goal snapshot reconciliation: pass fresh `get_goal` JSON/path with `--gjc-goal-json`; shell commands and hooks must not mutate goal state.
 - Treat `ledger.jsonl` as the durable audit trail; checkpoint after every success or failure.

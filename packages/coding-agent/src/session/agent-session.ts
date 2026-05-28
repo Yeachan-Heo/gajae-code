@@ -137,6 +137,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -2577,6 +2578,11 @@ export class AgentSession {
 
 	/** Emit extension events based on session events */
 	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "turn_end") {
+			await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {
+				logger.warn("GJC team worker integration request failed", { error: String(error) });
+			});
+		}
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;

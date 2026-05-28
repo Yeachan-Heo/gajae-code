@@ -1,6 +1,8 @@
+import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
 	computeUltragoalPlanGeneration,
+	getUltragoalPaths,
 	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
@@ -40,6 +42,31 @@ function objectiveMatches(currentObjective: string, plan: UltragoalPlan): boolea
 	if (normalized === plan.gjcObjective || normalized === DEFAULT_ULTRAGOAL_OBJECTIVE) return true;
 	if (plan.gjcObjectiveAliases?.some(alias => alias === normalized)) return true;
 	return plan.goals.some(goal => goal.objective === normalized);
+}
+
+function isKnownUltragoalObjective(currentObjective: string): boolean {
+	const normalized = currentObjective.trim();
+	return (
+		normalized === DEFAULT_ULTRAGOAL_OBJECTIVE ||
+		(normalized.includes(".gjc/ultragoal/goals.json") && normalized.includes(".gjc/ultragoal/ledger.jsonl"))
+	);
+}
+
+async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
+	try {
+		await fs.stat(getUltragoalPaths(cwd).dir);
+		return true;
+	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			(error as { code?: unknown }).code === "ENOENT"
+		) {
+			return false;
+		}
+		throw error;
+	}
 }
 
 function requiredGoals(plan: UltragoalPlan): UltragoalGoal[] {
@@ -141,6 +168,13 @@ export function validateCompletionReceipt(input: {
 			goalId: input.goal.id,
 		};
 	}
+	if (hashStructuredValue(event.gjcGoalJson) !== receipt.gjcGoalSnapshotHash) {
+		return {
+			state: "active_stale_receipt",
+			message: `Ultragoal ${input.goal.id} receipt get_goal snapshot hash does not match ledger.`,
+			goalId: input.goal.id,
+		};
+	}
 	if (input.goal.updatedAt !== receipt.verifiedAt) {
 		return {
 			state: "active_stale_receipt",
@@ -195,7 +229,15 @@ export async function readUltragoalVerificationState(input: {
 		}
 		return { state: "unrelated_goal", message: "Current goal is not an active Ultragoal objective." };
 	}
-	if (!plan) return { state: "inactive", message: "No Ultragoal plan exists." };
+	if (!plan) {
+		if (isKnownUltragoalObjective(currentObjective) || (await hasDurableUltragoalState(input.cwd))) {
+			return {
+				state: "unreadable_fail_closed",
+				message: "Active Ultragoal objective is missing durable .gjc/ultragoal/goals.json state.",
+			};
+		}
+		return { state: "inactive", message: "No Ultragoal plan exists." };
+	}
 	if (!objectiveMatches(currentObjective, plan))
 		return { state: "unrelated_goal", message: "Current goal is not an active Ultragoal objective." };
 	if (plan.goals.some(goal => goal.status === "review_blocked")) {

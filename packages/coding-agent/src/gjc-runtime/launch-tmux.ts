@@ -122,7 +122,10 @@ export function buildGjcTmuxProfileCommands(
 		},
 	];
 	if (!envDisabled(env[GJC_TMUX_MOUSE_ENV]))
-		commands.unshift({ description: "enable tmux mouse scrolling", args: ["set-option", "-t", target, "mouse", "on"] });
+		commands.unshift({
+			description: "enable tmux mouse scrolling",
+			args: ["set-option", "-t", target, "mouse", "on"],
+		});
 	return commands;
 }
 
@@ -215,13 +218,15 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stderr: "inherit",
 	};
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
-	applyGjcTmuxProfile({
-		tmuxCommand: plan.tmuxCommand,
-		target: plan.sessionName,
-		cwd: plan.cwd,
-		env,
-		spawnSync,
-	});
+	if (created.exitCode === 0) {
+		applyGjcTmuxProfile({
+			tmuxCommand: plan.tmuxCommand,
+			target: plan.sessionName,
+			cwd: plan.cwd,
+			env,
+			spawnSync,
+		});
+	}
 	const attached = spawnSync(plan.tmuxCommand, plan.attachSessionArgs, options);
 	if (created.exitCode === 0) return attached.exitCode === 0;
 	return attached.exitCode === 0;
