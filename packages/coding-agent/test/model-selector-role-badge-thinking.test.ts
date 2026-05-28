@@ -557,4 +557,140 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Inherit);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
 	});
+
+	test("falls back to scoped provider models when canonical tab has no records", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+
+		const settings = Settings.isolated({});
+		const modelRegistry = {
+			getAll: () => [model],
+			getDiscoverableProviders: () => [],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+		} as unknown as ModelRegistry;
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			{ modelRegistry, temporaryOnly: true, thinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\t");
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain(model.id);
+		expect(rendered).not.toContain("No matching models");
+
+		selector.handleInput("\n");
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected scoped fallback model selection");
+		expect(selectedAfterEnter.role).toBeNull();
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("shows unavailable provider catalog setup items and starts provider login", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({});
+		const model = createOpenAIModel("openai", "gpt-needs-setup", false);
+		const loginProvider = vi.fn();
+		const modelRegistry = {
+			getAll: () => [model],
+			getAvailable: () => [],
+			refresh: vi.fn(async () => {}),
+			getError: () => undefined,
+			getDiscoverableProviders: () => ["openai"],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+			hasConfiguredAuth: () => false,
+			getProviderDiscoveryState: () => ({
+				provider: "openai",
+				status: "unauthenticated",
+				optional: false,
+				stale: false,
+				models: [],
+			}),
+		} as unknown as ModelRegistry;
+		const ui = {
+			requestRender: vi.fn(),
+		} as unknown as TUI;
+
+		let selected: SelectionCapture | undefined;
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			settings,
+			modelRegistry,
+			[],
+			(selectedModel, role, thinkingLevel, selectorValue) => {
+				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			},
+			() => {},
+			{ temporaryOnly: true, onLoginProvider: loginProvider },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\t");
+		selector.handleInput("\t");
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("OPENAI");
+		expect(rendered).toContain(model.id);
+		expect(rendered).toContain("Configure openai credentials");
+
+		selector.handleInput("\n");
+		expect(selected).toBeUndefined();
+		expect(loginProvider).toHaveBeenCalledWith("openai");
+	});
+
+	test("keeps discoverable provider error tabs visible without catalog models", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({});
+		const modelRegistry = {
+			getAll: () => [],
+			getAvailable: () => [],
+			refresh: vi.fn(async () => {}),
+			getError: () => undefined,
+			getDiscoverableProviders: () => ["custom-provider"],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+			getProviderDiscoveryState: () => ({
+				provider: "custom-provider",
+				status: "unavailable",
+				optional: false,
+				stale: true,
+				error: "HTTP 404 from https://example.invalid/models",
+				models: [],
+			}),
+		} as unknown as ModelRegistry;
+		const ui = {
+			requestRender: vi.fn(),
+		} as unknown as TUI;
+
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			settings,
+			modelRegistry,
+			[],
+			() => {},
+			() => {},
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\t");
+		selector.handleInput("\t");
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CUSTOM PROVIDER");
+		expect(rendered).toContain("Discovery endpoint https://example.invalid/models returned 404");
+		expect(rendered).not.toContain("No matching models");
+	});
 });
