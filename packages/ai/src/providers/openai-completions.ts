@@ -66,6 +66,11 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { detectOpenAICompat, type ResolvedOpenAICompat, resolveOpenAICompat } from "./openai-completions-compat";
+import {
+	applyOpenAIRequestTransformBody,
+	applyOpenAIRequestTransformHeaders,
+	wrapFetchForOpenAIRequestTransform,
+} from "./openai-request-transform";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
@@ -956,6 +961,7 @@ async function createClient(
 	if (model.provider === "kimi-code") {
 		headers = { ...getKimiCommonHeaders(), ...headers };
 	}
+	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
@@ -1013,7 +1019,14 @@ async function createClient(
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
-	const debugFetch = onSseEvent ? wrapFetchForSseDebug(wrappedFetch, event => onSseEvent(event, model)) : wrappedFetch;
+	const transformedFetch = wrapFetchForOpenAIRequestTransform(
+		wrappedFetch,
+		model.requestTransform,
+		`Gajae-Code/${packageJson.version}`,
+	);
+	const debugFetch = onSseEvent
+		? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
+		: transformedFetch;
 	// Bound HTTP request timeout to roughly the first-event watchdog window.
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which
 	// turns a stalled-before-headers fetch into a multi-minute hang invisible
@@ -1078,11 +1091,12 @@ function buildParams(
 	const effectiveMaxTokens = options?.maxTokens ?? (isKimi ? model.maxTokens : undefined);
 
 	const requestModelId =
-		model.provider === "fireworks"
+		model.wireModelId ??
+		(model.provider === "fireworks"
 			? toFireworksWireModelId(model.id)
 			: model.provider === "firepass"
 				? toFirepassWireModelId(model.id)
-				: model.id;
+				: model.id);
 	const params: OpenAICompletionsParams = {
 		model: requestModelId,
 		messages,
@@ -1260,6 +1274,7 @@ function buildParams(
 	if (compat.extraBody) {
 		Object.assign(params, compat.extraBody);
 	}
+	applyOpenAIRequestTransformBody(params, model.requestTransform);
 
 	return { params, toolStrictMode };
 }

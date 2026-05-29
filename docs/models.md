@@ -76,6 +76,19 @@ providers:
         maxTokens: 16384
         headers:
           X-Model: value
+        wireModelId: upstream-model-id
+        requestTransform:
+          profile: openai-proxy
+          setHeaders:
+            X-Proxy-Route: default
+          extraBody:
+            gateway: default
+        thinking:
+          minLevel: low
+          maxLevel: xhigh
+          mode: effort
+          defaultLevel: high
+          levels: [low, medium, high, xhigh]
         compat:
           supportsStore: true
           supportsDeveloperRole: true
@@ -88,13 +101,18 @@ providers:
           extraBody:
             gateway: m1-01
             controller: mlx
+modelBindings:
+  modelRoles:
+    default: my-provider/some-model-id:high
+  agentModelOverrides:
+    executor: my-provider/some-model-id
 ```
 
 ### Allowed provider/model `api` values
 
 - `openai-completions`
 - `openai-responses`
-- `openai-code-responses`
+- `openai-codex-responses`
 - `azure-openai-responses`
 - `anthropic-messages`
 - `google-generative-ai`
@@ -104,6 +122,74 @@ providers:
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
+
+## OpenAI-compatible proxy request shaping
+
+OpenAI-compatible proxy providers can declare request shaping without hardcoding a provider name:
+
+```yaml
+providers:
+  proxy-provider:
+    baseUrl: https://api.proxy.example/v1
+    apiKey: PROXY_API_KEY
+    api: openai-completions
+    requestTransform:
+      profile: openai-proxy
+      setHeaders:
+        X-Proxy-Route: default
+      extraBody:
+        gateway: default
+    models:
+      - id: local-gpt
+        wireModelId: upstream/gpt-5.5
+        name: Local GPT
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 400000
+        maxTokens: 128000
+```
+
+`requestTransform.profile: openai-proxy` strips OpenAI SDK/Stainless telemetry headers at final fetch time and sets a generic GJC user agent. Explicit config wins over the preset:
+
+- `stripHeaders` replaces the preset strip list when provided.
+- `setHeaders` is applied after stripping; use `null` to remove a header.
+- `extraBody` is shallow-merged into the JSON request body after provider compatibility fields; core transport keys such as `model`, `messages`/`input`, `stream`, `tools`, and `tool_choice` are protected and ignored.
+- Model-level `requestTransform` overrides provider-level fields and shallow-merges `setHeaders`/`extraBody`.
+- `wireModelId` changes only the upstream request body model id; local selection still uses `provider/id`.
+
+### Layofflabs-style proxy example
+
+```yaml
+providers:
+  layofflabs:
+    baseUrl: https://api.layofflabs.com/v1
+    apiKeyEnv: LAYOFFLABS_API_KEY
+    api: openai-completions
+    requestTransform:
+      profile: openai-proxy
+    models:
+      - id: gpt-5.5
+        wireModelId: gpt-5.5
+        name: GPT 5.5 via Layofflabs
+        reasoning: true
+        thinking:
+          minLevel: low
+          maxLevel: xhigh
+          mode: effort
+          defaultLevel: high
+          levels: [low, medium, high, xhigh]
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 400000
+        maxTokens: 128000
+
+modelBindings:
+  modelRoles:
+    default: layofflabs/gpt-5.5:high
+  agentModelOverrides:
+    executor: layofflabs/gpt-5.5:high
+```
 
 ## Validation rules (current)
 
@@ -122,6 +208,7 @@ Must define at least one of:
 - `baseUrl`
 - `headers`
 - `compat`
+- `requestTransform`
 - `disableStrictTools`
 - `modelOverrides`
 - `discovery`
@@ -141,7 +228,7 @@ ModelRegistry pipeline (on refresh):
 
 1. Load built-in providers/models from `@gajae-code/ai`.
 2. Load `models.yml` custom config.
-3. Apply provider overrides (`baseUrl`, `headers`, `disableStrictTools`) to built-in models.
+3. Apply provider overrides (`baseUrl`, `headers`, `requestTransform`, `disableStrictTools`) to built-in models.
 4. Apply `modelOverrides` (per provider + model id).
 5. Merge custom `models`:
    - same `provider + id` replaces existing
@@ -178,7 +265,7 @@ providers:
   zenmux:
     baseUrl: https://api.zenmux.example/v1
     apiKey: ZENMUX_API_KEY
-    api: openai-code-responses
+    api: openai-codex-responses
     models:
       - id: openai-code
         name: Zenmux OpenAI code
@@ -445,7 +532,7 @@ Candidates are ignored unless credentials resolve (`ModelRegistry.getApiKey(...)
 
 ### OpenAI code provider websocket handoff
 
-If switching from/to `openai-code-responses`, session provider state key `openai-code-responses` is closed before model switch. This drops websocket transport state so the next turn starts clean on the promoted model.
+If switching from/to `openai-codex-responses`, session provider state key `openai-codex-responses` is closed before model switch. This drops websocket transport state so the next turn starts clean on the promoted model.
 
 ### Persistence behavior
 

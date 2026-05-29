@@ -5,6 +5,7 @@ import type {
 	ResponseCreateParamsStreaming,
 	ResponseInput,
 } from "openai/resources/responses/responses";
+import packageJson from "../../package.json" with { type: "json" };
 import { getEnvApiKey } from "../stream";
 import type {
 	AssistantMessage,
@@ -50,6 +51,11 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { compactGrammarDefinition } from "./grammar";
+import {
+	applyOpenAIRequestTransformBody,
+	applyOpenAIRequestTransformHeaders,
+	wrapFetchForOpenAIRequestTransform,
+} from "./openai-request-transform";
 import {
 	appendResponsesToolResultMessages,
 	applyCommonResponsesSamplingParams,
@@ -363,7 +369,11 @@ function createClient(
 	}
 	const rawApiKey = apiKey;
 
-	const headers = { ...(model.headers ?? {}), ...(extraHeaders ?? {}) };
+	const headers = applyOpenAIRequestTransformHeaders(
+		{ ...(model.headers ?? {}), ...(extraHeaders ?? {}) },
+		model.requestTransform,
+		`Gajae-Code/${packageJson.version}`,
+	);
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
@@ -390,6 +400,11 @@ function createClient(
 		headers["x-client-request-id"] ??= sessionId;
 	}
 	const baseFetch = fetchOverride ?? fetch;
+	const transformedFetch = wrapFetchForOpenAIRequestTransform(
+		baseFetch,
+		model.requestTransform,
+		`Gajae-Code/${packageJson.version}`,
+	);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -397,7 +412,9 @@ function createClient(
 			dangerouslyAllowBrowser: true,
 			maxRetries: 5,
 			defaultHeaders: headers,
-			fetch: onSseEvent ? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model)) : baseFetch,
+			fetch: onSseEvent
+				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
+				: transformedFetch,
 		}),
 		copilotPremiumRequests,
 		baseUrl,
@@ -453,7 +470,7 @@ function buildParams(
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const promptCacheKey = getOpenAIResponsesCacheSessionId(options);
 	const params: OpenAIResponsesSamplingParams = {
-		model: model.id,
+		model: model.wireModelId ?? model.id,
 		input: messages,
 		instructions: systemInstructions,
 		stream: true,
@@ -490,6 +507,7 @@ function buildParams(
 	applyResponsesReasoningParams(params, model, options, messages, effort =>
 		mapReasoningEffort(effort as NonNullable<OpenAIResponsesOptions["reasoning"]>, model.compat?.reasoningEffortMap),
 	);
+	applyOpenAIRequestTransformBody(params, model.requestTransform);
 
 	return { conversationMessages, params };
 }

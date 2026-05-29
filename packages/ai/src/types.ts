@@ -823,6 +823,18 @@ export interface VercelGatewayRouting {
 }
 
 // Model interface for the unified model system
+
+export interface ModelRequestTransform {
+	/** Named request-shaping preset. `openai-proxy` removes OpenAI SDK telemetry headers and uses a generic Gajae-Code User-Agent. */
+	profile?: "openai-proxy";
+	/** Header names to remove from the final outbound request. Case-insensitive. */
+	stripHeaders?: string[];
+	/** Headers to set after stripping; use null to remove a header explicitly. */
+	setHeaders?: Record<string, string | null>;
+	/** Extra request body fields merged after provider defaults; protected core request keys are ignored. */
+	extraBody?: Record<string, unknown>;
+}
+
 export interface Model<TApi extends Api = any> {
 	id: string;
 	name: string;
@@ -861,6 +873,10 @@ export interface Model<TApi extends Api = any> {
 	preferWebsockets?: boolean;
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */
 	contextPromotionTarget?: string;
+	/** Provider-facing model id when it differs from the local selector id. */
+	wireModelId?: string;
+	/** Declarative request shaping for OpenAI-compatible proxy providers. */
+	requestTransform?: ModelRequestTransform;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */

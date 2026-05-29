@@ -12,6 +12,7 @@ import {
 	type Model,
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
+	type ModelRequestTransform,
 	openaiCodexModelManagerOptions,
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
@@ -170,11 +171,60 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 
 type ProviderValidationMode = "models-config" | "runtime-register";
 
+const OPENAI_REQUEST_TRANSFORM_APIS = new Set<Api>(["openai-completions", "openai-responses"]);
+
+function getKnownProviderApis(providerName: string): Set<Api> {
+	const apis = new Set<Api>();
+	for (const model of getBundledModels(providerName as Parameters<typeof getBundledModels>[0])) {
+		apis.add((model as Model<Api>).api);
+	}
+	return apis;
+}
+
+function isRequestTransformApi(api: Api): boolean {
+	return OPENAI_REQUEST_TRANSFORM_APIS.has(api);
+}
+
+function assertRequestTransformSupportedForKnownProvider(providerName: string, source: string): void {
+	const apis = getKnownProviderApis(providerName);
+	if (apis.size === 0) {
+		throw new Error(
+			`Provider ${providerName}: ${source} requires an OpenAI-compatible "api" when the provider is not built in.`,
+		);
+	}
+	for (const api of apis) {
+		if (!isRequestTransformApi(api)) {
+			throw new Error(
+				`Provider ${providerName}: ${source} is only supported with openai-completions or openai-responses APIs.`,
+			);
+		}
+	}
+}
+
+function assertRequestTransformSupportedForModelApi(
+	providerName: string,
+	modelId: string,
+	api: Api,
+	source: string,
+): void {
+	if (!isRequestTransformApi(api)) {
+		throw new Error(
+			`Provider ${providerName}, model ${modelId}: ${source} is only supported with openai-completions or openai-responses APIs.`,
+		);
+	}
+}
+
+function getKnownProviderModelApi(providerName: string, modelId: string): Api | undefined {
+	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(model => model.id === modelId)
+		?.api as Api | undefined;
+}
+
 interface ProviderValidationModel {
 	id: string;
 	api?: Api;
 	contextWindow?: number;
 	maxTokens?: number;
+	requestTransform?: ModelRequestTransform;
 }
 
 interface ProviderValidationConfig {
@@ -187,6 +237,7 @@ interface ProviderValidationConfig {
 	oauthConfigured?: boolean;
 	discovery?: ProviderDiscovery;
 	compat?: Model<Api>["compat"];
+	requestTransform?: ModelRequestTransform;
 	disableStrictTools?: boolean;
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
@@ -210,11 +261,12 @@ function validateProviderConfiguration(
 				!config.apiKey &&
 				!config.apiKeyEnv &&
 				!config.disableStrictTools &&
+				!config.requestTransform &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
 				);
 			}
 		}
@@ -238,6 +290,34 @@ function validateProviderConfiguration(
 	if (mode === "models-config" && config.discovery && !config.api) {
 		throw new Error(`Provider ${providerName}: "api" is required when discovery is enabled at provider level.`);
 	}
+	for (const [modelId, rawOverride] of Object.entries(config.modelOverrides ?? {})) {
+		const override = rawOverride as ModelOverride;
+		if (!override.requestTransform) continue;
+		const effectiveApi =
+			models.find(model => model.id === modelId)?.api ??
+			config.api ??
+			getKnownProviderModelApi(providerName, modelId);
+		if (effectiveApi) {
+			assertRequestTransformSupportedForModelApi(
+				providerName,
+				modelId,
+				effectiveApi,
+				'modelOverrides "requestTransform"',
+			);
+		} else {
+			assertRequestTransformSupportedForKnownProvider(providerName, 'modelOverrides "requestTransform"');
+		}
+	}
+	if (config.requestTransform) {
+		if (config.api && !isRequestTransformApi(config.api)) {
+			throw new Error(
+				`Provider ${providerName}: "requestTransform" is only supported with openai-completions or openai-responses APIs.`,
+			);
+		}
+		if (!config.api && models.length === 0) {
+			assertRequestTransformSupportedForKnownProvider(providerName, '"requestTransform"');
+		}
+	}
 
 	for (const modelDef of models) {
 		if (!hasProviderApi && !modelDef.api) {
@@ -249,6 +329,23 @@ function validateProviderConfiguration(
 		}
 		if (!modelDef.id) {
 			throw new Error(`Provider ${providerName}: model missing "id"`);
+		}
+		const effectiveApi = modelDef.api ?? config.api;
+		if (config.requestTransform && effectiveApi) {
+			assertRequestTransformSupportedForModelApi(
+				providerName,
+				modelDef.id,
+				effectiveApi,
+				'provider "requestTransform"',
+			);
+		}
+		if (modelDef.requestTransform && effectiveApi) {
+			assertRequestTransformSupportedForModelApi(
+				providerName,
+				modelDef.id,
+				effectiveApi,
+				'model "requestTransform"',
+			);
 		}
 		if (mode === "models-config") {
 			if (modelDef.contextWindow !== undefined && modelDef.contextWindow <= 0) {
@@ -276,6 +373,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
 					discovery: providerConfig.discovery as ProviderDiscovery | undefined,
 					compat: providerConfig.compat,
+					requestTransform: providerConfig.requestTransform,
 					disableStrictTools: providerConfig.disableStrictTools,
 					modelOverrides: providerConfig.modelOverrides,
 					models: (providerConfig.models ?? []) as ProviderValidationModel[],
@@ -294,6 +392,7 @@ interface ProviderOverride {
 	authHeader?: boolean;
 	compat?: Model<Api>["compat"];
 	transport?: Model<Api>["transport"];
+	requestTransform?: ModelRequestTransform;
 }
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -341,13 +440,17 @@ function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
 export function mergeDiscoveredModel<TApi extends Api>(
 	model: Model<TApi>,
 	existing: Model<Api> | undefined,
-	providerOverride?: Pick<ProviderOverride, "baseUrl" | "headers" | "transport">,
+	providerOverride?: Pick<ProviderOverride, "baseUrl" | "headers" | "transport" | "requestTransform">,
 ): Model<TApi> {
 	if (existing) {
 		return {
 			...model,
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
 			headers: existing.headers ? { ...existing.headers, ...model.headers } : model.headers,
+			requestTransform: mergeRequestTransform(
+				mergeRequestTransform(existing.requestTransform, model.requestTransform),
+				providerOverride?.requestTransform,
+			),
 		};
 	}
 	if (providerOverride) {
@@ -356,6 +459,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 			headers: providerOverride.headers ? { ...model.headers, ...providerOverride.headers } : model.headers,
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
+			requestTransform: mergeRequestTransform(model.requestTransform, providerOverride.requestTransform),
 		};
 	}
 	return model;
@@ -367,6 +471,7 @@ interface DiscoveryProviderConfig {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	compat?: Model<Api>["compat"];
+	requestTransform?: ModelRequestTransform;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }
@@ -397,6 +502,7 @@ interface CustomModelsResult {
 	discoverableProviders?: DiscoveryProviderConfig[];
 	configuredProviders?: Set<string>;
 	equivalence?: ModelEquivalenceConfig;
+	modelBindings?: NonNullable<ModelsConfig["modelBindings"]>;
 	error?: ConfigError;
 	found: boolean;
 }
@@ -538,6 +644,24 @@ function mergeCompat<TBase extends object, TOverride extends object>(
 	return merged as TBase & TOverride;
 }
 
+function mergeRequestTransform(
+	base: ModelRequestTransform | undefined,
+	override: ModelRequestTransform | undefined,
+): ModelRequestTransform | undefined {
+	if (!base) return override ? { ...override } : undefined;
+	if (!override) return { ...base };
+	return {
+		...base,
+		...override,
+		stripHeaders: override.stripHeaders ?? base.stripHeaders,
+		setHeaders: override.setHeaders ? { ...(base.setHeaders ?? {}), ...override.setHeaders } : base.setHeaders,
+		extraBody:
+			base.extraBody || override.extraBody
+				? { ...(base.extraBody ?? {}), ...(override.extraBody ?? {}) }
+				: undefined,
+	};
+}
+
 function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<Api> {
 	const result = { ...model };
 	if (override.name !== undefined) result.name = override.name;
@@ -547,6 +671,8 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
+	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
+	result.requestTransform = mergeRequestTransform(model.requestTransform, override.requestTransform);
 	if (override.premiumMultiplier !== undefined) result.premiumMultiplier = override.premiumMultiplier;
 	if (override.cost) {
 		result.cost = {
@@ -578,6 +704,8 @@ interface CustomModelDefinitionLike {
 	compat?: Model<Api>["compat"];
 	contextPromotionTarget?: string;
 	premiumMultiplier?: number;
+	wireModelId?: string;
+	requestTransform?: ModelRequestTransform;
 }
 
 interface CustomModelBuildOptions {
@@ -600,6 +728,8 @@ type CustomModelOverlay = {
 	compat?: Model<Api>["compat"];
 	contextPromotionTarget?: string;
 	premiumMultiplier?: number;
+	wireModelId?: string;
+	requestTransform?: ModelRequestTransform;
 	isOAuth?: boolean;
 };
 
@@ -649,6 +779,7 @@ function buildCustomModelOverlay(
 	providerApiKey: string | undefined,
 	authHeader: boolean | undefined,
 	providerCompat: Model<Api>["compat"] | undefined,
+	providerRequestTransform: ModelRequestTransform | undefined,
 	providerAuth: ProviderAuthMode | undefined,
 	modelDef: CustomModelDefinitionLike,
 ): CustomModelOverlay | undefined {
@@ -668,6 +799,8 @@ function buildCustomModelOverlay(
 		maxTokens: modelDef.maxTokens,
 		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
 		compat: mergeCompat(providerCompat, modelDef.compat),
+		requestTransform: mergeRequestTransform(providerRequestTransform, modelDef.requestTransform),
+		wireModelId: modelDef.wireModelId,
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		premiumMultiplier: modelDef.premiumMultiplier,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
@@ -768,6 +901,8 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		headers: resolvedModel.headers,
 		compat: mergeCompat(reference?.compat, resolvedModel.compat),
 		contextPromotionTarget: resolvedModel.contextPromotionTarget,
+		wireModelId: resolvedModel.wireModelId,
+		requestTransform: resolvedModel.requestTransform,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
 	} as Model<Api>);
@@ -810,6 +945,14 @@ export class ModelRegistry {
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
+	#configuredModelBindings: NonNullable<ModelsConfig["modelBindings"]> | undefined;
+	#modelBindingsTargetSettings: Settings | undefined;
+	#appliedModelBindingRoles = new Set<string>();
+	#appliedAgentModelBindingOverrides = new Set<string>();
+	#modelBindingRoleBaselines = new Map<string, string | undefined>();
+	#agentModelBindingBaselines = new Map<string, string | undefined>();
+	#lastAppliedModelBindingRoles = new Map<string, string>();
+	#lastAppliedAgentModelBindingOverrides = new Map<string, string>();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#lastStaticLoadMtime: number | null = null;
@@ -856,6 +999,7 @@ export class ModelRegistry {
 			this.#reloadStaticModels();
 			this.#suppressedSelectors.clear();
 			await this.#refreshRuntimeDiscoveries(strategy);
+			this.#applyConfiguredModelBindingsToTarget();
 		} finally {
 			this.#resumeRebuild();
 		}
@@ -889,6 +1033,7 @@ export class ModelRegistry {
 				}
 			}
 			await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
+			this.#applyConfiguredModelBindingsToTarget();
 		} finally {
 			this.#resumeRebuild();
 		}
@@ -916,6 +1061,7 @@ export class ModelRegistry {
 		this.#providerOverrides.clear();
 		this.#modelOverrides.clear();
 		this.#equivalenceConfig = undefined;
+		this.#configuredModelBindings = undefined;
 		this.#configError = undefined;
 		this.#providerDiscoveryStates.clear();
 		this.#loadModels();
@@ -938,6 +1084,7 @@ export class ModelRegistry {
 			discoverableProviders = [],
 			configuredProviders = new Set(),
 			equivalence,
+			modelBindings,
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#configError = configError;
@@ -947,6 +1094,7 @@ export class ModelRegistry {
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
 		this.#equivalenceConfig = equivalence;
+		this.#configuredModelBindings = modelBindings;
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
@@ -1044,6 +1192,8 @@ export class ModelRegistry {
 					headers: customModel.headers,
 					compat: customModel.compat,
 					contextPromotionTarget: customModel.contextPromotionTarget ?? existingModel.contextPromotionTarget,
+					wireModelId: customModel.wireModelId,
+					requestTransform: customModel.requestTransform,
 					premiumMultiplier: customModel.premiumMultiplier ?? existingModel.premiumMultiplier,
 				} as Model<Api>);
 			} else {
@@ -1120,11 +1270,20 @@ export class ModelRegistry {
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		if (providerConfig.provider !== "ollama" || providerConfig.api !== "openai-responses") {
-			return models;
-		}
-
-		return models.map(model => (model.api === "openai-completions" ? { ...model, api: "openai-responses" } : model));
+		return models.map(model => {
+			const normalized =
+				providerConfig.provider === "ollama" &&
+				providerConfig.api === "openai-responses" &&
+				model.api === "openai-completions"
+					? ({ ...model, api: "openai-responses" } as Model<Api>)
+					: model;
+			return {
+				...normalized,
+				requestTransform: providerConfig.requestTransform
+					? mergeRequestTransform(undefined, providerConfig.requestTransform)
+					: undefined,
+			};
+		});
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
@@ -1208,6 +1367,7 @@ export class ModelRegistry {
 				providerConfig.authHeader !== undefined ||
 				providerConfig.compat ||
 				providerConfig.disableStrictTools ||
+				providerConfig.requestTransform ||
 				providerConfig.transport
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
@@ -1218,6 +1378,7 @@ export class ModelRegistry {
 					authHeader: providerConfig.authHeader,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					transport: providerConfig.transport,
+					requestTransform: providerConfig.requestTransform,
 				});
 			}
 
@@ -1233,6 +1394,7 @@ export class ModelRegistry {
 					baseUrl: providerConfig.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName),
 					headers: providerConfig.headers,
 					compat: providerConfig.compat,
+					requestTransform: providerConfig.requestTransform,
 					discovery: providerConfig.discovery,
 					optional: false,
 				});
@@ -1270,8 +1432,81 @@ export class ModelRegistry {
 			discoverableProviders,
 			configuredProviders,
 			equivalence: value.equivalence,
+			modelBindings: value.modelBindings,
 			found: true,
 		};
+	}
+
+	applyConfiguredModelBindings(targetSettings: Settings): void {
+		this.#modelBindingsTargetSettings = targetSettings;
+		this.#applyConfiguredModelBindingsToTarget();
+	}
+
+	#applyConfiguredModelBindingsToTarget(): void {
+		const targetSettings = this.#modelBindingsTargetSettings;
+		if (!targetSettings) return;
+		const bindings = this.#configuredModelBindings;
+		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const configuredModelRoles = bindings?.modelRoles ?? {};
+		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
+		for (const role of this.#appliedModelBindingRoles) {
+			if (configuredModelRoleKeys.has(role)) continue;
+			const lastApplied = this.#lastAppliedModelBindingRoles.get(role);
+			if (lastApplied !== undefined && nextModelRoles[role] === lastApplied) {
+				const baseline = this.#modelBindingRoleBaselines.get(role);
+				if (baseline === undefined) {
+					delete nextModelRoles[role];
+				} else {
+					nextModelRoles[role] = baseline;
+				}
+			}
+			this.#modelBindingRoleBaselines.delete(role);
+			this.#lastAppliedModelBindingRoles.delete(role);
+		}
+		for (const [role, modelId] of Object.entries(configuredModelRoles)) {
+			if (!modelId) continue;
+			const previousApplied = this.#lastAppliedModelBindingRoles.get(role);
+			if (!this.#modelBindingRoleBaselines.has(role)) {
+				this.#modelBindingRoleBaselines.set(role, nextModelRoles[role]);
+			}
+			if (previousApplied === undefined || nextModelRoles[role] === previousApplied) {
+				nextModelRoles[role] = modelId;
+				this.#lastAppliedModelBindingRoles.set(role, modelId);
+			}
+		}
+		targetSettings.override("modelRoles", nextModelRoles);
+		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
+
+		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
+		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
+		for (const agentName of this.#appliedAgentModelBindingOverrides) {
+			if (configuredAgentModelOverrideKeys.has(agentName)) continue;
+			const lastApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
+			if (lastApplied !== undefined && nextAgentModelOverrides[agentName] === lastApplied) {
+				const baseline = this.#agentModelBindingBaselines.get(agentName);
+				if (baseline === undefined) {
+					delete nextAgentModelOverrides[agentName];
+				} else {
+					nextAgentModelOverrides[agentName] = baseline;
+				}
+			}
+			this.#agentModelBindingBaselines.delete(agentName);
+			this.#lastAppliedAgentModelBindingOverrides.delete(agentName);
+		}
+		for (const [agentName, modelId] of Object.entries(configuredAgentModelOverrides)) {
+			if (!modelId) continue;
+			const previousApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
+			if (!this.#agentModelBindingBaselines.has(agentName)) {
+				this.#agentModelBindingBaselines.set(agentName, nextAgentModelOverrides[agentName]);
+			}
+			if (previousApplied === undefined || nextAgentModelOverrides[agentName] === previousApplied) {
+				nextAgentModelOverrides[agentName] = modelId;
+				this.#lastAppliedAgentModelBindingOverrides.set(agentName, modelId);
+			}
+		}
+		targetSettings.override("task.agentModelOverrides", nextAgentModelOverrides);
+		this.#appliedAgentModelBindingOverrides = new Set(Object.keys(configuredAgentModelOverrides));
 	}
 
 	async #refreshRuntimeDiscoveries(
@@ -1838,11 +2073,15 @@ export class ModelRegistry {
 			headers: override.headers ? { ...(baseOverride?.headers ?? {}), ...override.headers } : baseOverride?.headers,
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
 			transport: override.transport ?? baseOverride?.transport,
+			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
 		};
 	}
 	#applyProviderTransportOverride<T extends { baseUrl?: string; headers?: Record<string, string> }>(
 		entry: T,
-		override: Pick<ProviderOverride, "baseUrl" | "headers" | "authHeader" | "apiKey" | "transport">,
+		override: Pick<
+			ProviderOverride,
+			"baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "requestTransform"
+		>,
 	): T {
 		const headers = mergeAuthHeader(
 			override.headers ? { ...entry.headers, ...override.headers } : entry.headers,
@@ -1856,6 +2095,10 @@ export class ModelRegistry {
 			// Preserve the model's existing transport when the override omits one;
 			// providers without a `transport` field keep the default per-API dispatch.
 			...(override.transport !== undefined ? { transport: override.transport } : {}),
+			requestTransform: mergeRequestTransform(
+				(entry as { requestTransform?: ModelRequestTransform }).requestTransform,
+				override.requestTransform,
+			),
 		};
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
@@ -1942,6 +2185,7 @@ export class ModelRegistry {
 					providerConfig.apiKeyEnv ? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv) : providerConfig.apiKey,
 					providerConfig.authHeader,
 					providerCompat,
+					providerConfig.requestTransform,
 					(providerConfig.auth as ProviderAuthMode | undefined) ?? undefined,
 					modelDef as CustomModelDefinitionLike,
 				);
@@ -2239,6 +2483,7 @@ export class ModelRegistry {
 				apiKey: config.apiKey,
 				api: config.api,
 				oauthConfigured: Boolean(config.oauth),
+				requestTransform: config.requestTransform,
 				models: (config.models ?? []) as ProviderValidationModel[],
 			},
 			"runtime-register",
@@ -2302,6 +2547,7 @@ export class ModelRegistry {
 					config.apiKey,
 					config.authHeader,
 					config.compat,
+					config.requestTransform,
 					undefined,
 					modelDef as CustomModelDefinitionLike,
 				);
@@ -2346,6 +2592,7 @@ export class ModelRegistry {
 			config.headers ||
 			config.apiKey ||
 			config.authHeader !== undefined ||
+			config.requestTransform !== undefined ||
 			config.transport !== undefined
 		) {
 			const transportOverride = {
@@ -2353,6 +2600,7 @@ export class ModelRegistry {
 				headers: config.headers,
 				apiKey: config.apiKey,
 				authHeader: config.authHeader,
+				requestTransform: config.requestTransform,
 				transport: config.transport,
 			};
 			const nextRuntimeOverride = this.#mergeProviderOverride(
@@ -2400,6 +2648,7 @@ export interface ProviderConfigInput {
 	streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
 	headers?: Record<string, string>;
 	compat?: Model<Api>["compat"];
+	requestTransform?: ModelRequestTransform;
 	authHeader?: boolean;
 	/** Streaming transport override — see {@link Model.transport}. */
 	transport?: Model<Api>["transport"];
@@ -2423,6 +2672,8 @@ export interface ProviderConfigInput {
 		maxTokens: number;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
+		requestTransform?: ModelRequestTransform;
+		wireModelId?: string;
 		contextPromotionTarget?: string;
 		premiumMultiplier?: number;
 	}>;

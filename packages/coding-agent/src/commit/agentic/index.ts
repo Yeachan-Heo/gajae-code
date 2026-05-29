@@ -31,6 +31,7 @@ export async function runAgenticCommit(args: CommitCommandArgs): Promise<void> {
 	process.stdout.write("● Resolving model...\n");
 	const modelRegistry = new ModelRegistry(authStorage);
 	await modelRegistry.refresh();
+	modelRegistry.applyConfiguredModelBindings(settings);
 	const stagedFilesPromise = (async () => {
 		let stagedFiles = await git.diff.changedFiles(cwd, { cached: true });
 		if (stagedFiles.length === 0) {

@@ -63,6 +63,18 @@ const ModelThinkingSchema = z.object({
 	levels: z.array(EffortSchema).optional(),
 });
 
+const RequestTransformSchema = z.object({
+	profile: z.enum(["openai-proxy"]).optional(),
+	stripHeaders: z.array(z.string().min(1)).optional(),
+	setHeaders: z.record(z.string(), z.string().nullable()).optional(),
+	extraBody: z.record(z.string(), z.unknown()).optional(),
+});
+
+const ModelBindingsSchema = z.object({
+	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
+	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
+});
+
 const ModelDefinitionSchema = z.object({
 	id: z.string().min(1),
 	name: z.string().min(1).optional(),
@@ -95,6 +107,8 @@ const ModelDefinitionSchema = z.object({
 	headers: z.record(z.string(), z.string()).optional(),
 	compat: OpenAICompatSchema.optional(),
 	contextPromotionTarget: z.string().min(1).optional(),
+	wireModelId: z.string().min(1).optional(),
+	requestTransform: RequestTransformSchema.optional(),
 });
 
 export const ModelOverrideSchema = z.object({
@@ -116,6 +130,8 @@ export const ModelOverrideSchema = z.object({
 	headers: z.record(z.string(), z.string()).optional(),
 	compat: OpenAICompatSchema.optional(),
 	contextPromotionTarget: z.string().min(1).optional(),
+	wireModelId: z.string().min(1).optional(),
+	requestTransform: RequestTransformSchema.optional(),
 });
 
 export type ModelOverride = z.infer<typeof ModelOverrideSchema>;
@@ -149,6 +165,7 @@ const ProviderConfigSchema = z.object({
 	authHeader: z.boolean().optional(),
 	auth: ProviderAuthSchema.optional(),
 	discovery: ProviderDiscoverySchema.optional(),
+	requestTransform: RequestTransformSchema.optional(),
 	models: z.array(ModelDefinitionSchema).optional(),
 	modelOverrides: z.record(z.string(), ModelOverrideSchema).optional(),
 	disableStrictTools: z.boolean().optional(),
@@ -169,6 +186,7 @@ const EquivalenceConfigSchema = z.object({
 
 export const ModelsConfigSchema = z.object({
 	providers: z.record(z.string(), ProviderConfigSchema).optional(),
+	modelBindings: ModelBindingsSchema.optional(),
 	equivalence: EquivalenceConfigSchema.optional(),
 });
 

@@ -2365,4 +2365,450 @@ describe("ModelRegistry", () => {
 
 		expect(registry.find("ollama-cloud", "deepseek-v4-pro")?.maxTokens).toBe(384_000);
 	});
+
+	test("preserves request shaping and wire aliases when replacing a built-in model", () => {
+		writeRawModelsJson({
+			openai: {
+				baseUrl: "https://proxy.example/v1",
+				apiKey: "TEST_KEY",
+				api: "openai-completions",
+				requestTransform: { setHeaders: { "x-provider": "provider" } },
+				models: [
+					{
+						id: "gpt-4o-mini",
+						wireModelId: "proxy-gpt-4o-mini",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128000,
+						maxTokens: 16384,
+						requestTransform: { extraBody: { routed: true } },
+					},
+				],
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const model = registry.find("openai", "gpt-4o-mini");
+
+		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
+		expect(model?.requestTransform).toEqual({
+			setHeaders: { "x-provider": "provider" },
+			extraBody: { routed: true },
+		});
+	});
+
+	test("loads request shaping, wire aliases, thinking metadata, and model bindings from models config", async () => {
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				modelRoles: { default: "openai/gpt-4o-mini" },
+				"task.agentModelOverrides": { executor: "openai/gpt-4o-mini" },
+			},
+		});
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/local-selector:high" },
+				agentModelOverrides: { executor: "proxy/executor-selector" },
+			},
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					requestTransform: {
+						profile: "openai-proxy",
+						stripHeaders: ["x-provider-strip"],
+						setHeaders: { "x-provider": "provider" },
+						extraBody: { providerBody: true },
+					},
+					models: [
+						{
+							id: "local-selector",
+							wireModelId: "upstream-wire-id",
+							name: "Local Selector",
+							reasoning: true,
+							thinking: {
+								minLevel: "low",
+								maxLevel: "xhigh",
+								mode: "effort",
+								defaultLevel: "high",
+								levels: ["low", "high", "xhigh"],
+							},
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+							requestTransform: {
+								setHeaders: { "x-model": "model" },
+								extraBody: { providerBody: false, modelBody: "yes" },
+							},
+						},
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(Settings.instance);
+		const model = registry.find("proxy", "local-selector");
+
+		expect(model?.wireModelId).toBe("upstream-wire-id");
+		expect(model?.thinking?.defaultLevel).toBe(Effort.High);
+		expect(model?.thinking?.levels).toEqual([Effort.Low, Effort.High, Effort.XHigh]);
+		expect(model?.requestTransform).toEqual({
+			profile: "openai-proxy",
+			stripHeaders: ["x-provider-strip"],
+			setHeaders: { "x-provider": "provider", "x-model": "model" },
+			extraBody: { providerBody: false, modelBody: "yes" },
+		});
+		expect(Settings.instance.getModelRole("default")).toBe("proxy/local-selector:high");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
+	});
+
+	test("defers model bindings until settings are initialized", () => {
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/local-selector:high" },
+			},
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+
+		expect(() => new ModelRegistry(authStorage, modelsJsonPath)).not.toThrow();
+	});
+
+	test("removes stale model bindings after config removal or partial replacement", async () => {
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				modelRoles: { default: "openai/gpt-4o-mini", smol: "openai/gpt-4o-mini" },
+				"task.agentModelOverrides": { executor: "openai/gpt-4o-mini", architect: "openai/gpt-4o-mini" },
+			},
+		});
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/local-selector:high", smol: "proxy/local-selector:low" },
+				agentModelOverrides: { executor: "proxy/executor-selector", architect: "proxy/architect-selector" },
+			},
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(Settings.instance);
+		expect(Settings.instance.getModelRole("default")).toBe("proxy/local-selector:high");
+		expect(Settings.instance.getModelRole("smol")).toBe("proxy/local-selector:low");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
+		expect(Settings.instance.get("task.agentModelOverrides").architect).toBe("proxy/architect-selector");
+
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { smol: "proxy/local-selector:medium" },
+				agentModelOverrides: { architect: "proxy/architect-selector-v2" },
+			},
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+		await Bun.sleep(5);
+		await registry.refresh("online-if-uncached");
+		expect(Settings.instance.getModelRole("default")).toBe("openai/gpt-4o-mini");
+		expect(Settings.instance.getModelRole("smol")).toBe("proxy/local-selector:medium");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("openai/gpt-4o-mini");
+		expect(Settings.instance.get("task.agentModelOverrides").architect).toBe("proxy/architect-selector-v2");
+
+		writeRawModelsConfig({
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+		await Bun.sleep(5);
+		await registry.refresh("online-if-uncached");
+		expect(Settings.instance.getModelRole("default")).toBe("openai/gpt-4o-mini");
+		expect(Settings.instance.getModelRole("smol")).toBe("openai/gpt-4o-mini");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("openai/gpt-4o-mini");
+		expect(Settings.instance.get("task.agentModelOverrides").architect).toBe("openai/gpt-4o-mini");
+	});
+
+	test("preserves user model binding changes across refresh and config removal", async () => {
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				modelRoles: { default: "openai/gpt-4o-mini" },
+				"task.agentModelOverrides": { executor: "openai/gpt-4o-mini" },
+			},
+		});
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/local-selector:high" },
+				agentModelOverrides: { executor: "proxy/executor-selector" },
+			},
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(Settings.instance);
+		expect(Settings.instance.getModelRole("default")).toBe("proxy/local-selector:high");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
+
+		Settings.instance.override("modelRoles", { default: "user/default-choice" });
+		Settings.instance.override("task.agentModelOverrides", { executor: "user/executor-choice" });
+		await registry.refresh("online-if-uncached");
+		expect(Settings.instance.getModelRole("default")).toBe("user/default-choice");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("user/executor-choice");
+
+		writeRawModelsConfig({
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+		await Bun.sleep(5);
+		await registry.refresh("online-if-uncached");
+		expect(Settings.instance.getModelRole("default")).toBe("user/default-choice");
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("user/executor-choice");
+	});
+
+	test("applies provider request shaping to discovered and cached models", async () => {
+		writeRawModelsJson({
+			proxy: {
+				baseUrl: "https://proxy.example/v1",
+				apiKey: "TEST_KEY",
+				api: "openai-completions",
+				discovery: { type: "openai-models-list" },
+				requestTransform: {
+					profile: "openai-proxy",
+					setHeaders: { "x-proxy": "enabled" },
+					extraBody: { proxy: true },
+				},
+			},
+		});
+		using _hook = mockOpenAiCompatibleModels("https://proxy.example/v1/models", ["proxy-model"]);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh("online");
+
+		expect(registry.find("proxy", "proxy-model")?.requestTransform).toEqual({
+			profile: "openai-proxy",
+			setHeaders: { "x-proxy": "enabled" },
+			extraBody: { proxy: true },
+		});
+
+		writeModelCache<"openai-completions">(
+			"proxy",
+			Date.now(),
+			[
+				{
+					id: "cached-proxy-model",
+					name: "cached-proxy-model",
+					api: "openai-completions",
+					provider: "proxy",
+					baseUrl: "https://proxy.example/v1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+					requestTransform: { setHeaders: { "x-stale": "old" } },
+				},
+			],
+			true,
+			"",
+			cacheDbPath,
+		);
+
+		const cachedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(cachedRegistry.find("proxy", "cached-proxy-model")?.requestTransform).toEqual({
+			profile: "openai-proxy",
+			setHeaders: { "x-proxy": "enabled" },
+			extraBody: { proxy: true },
+		});
+
+		writeRawModelsJson({
+			proxy: {
+				baseUrl: "https://proxy.example/v1",
+				apiKey: "TEST_KEY",
+				api: "openai-completions",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const unshapedCachedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(unshapedCachedRegistry.find("proxy", "cached-proxy-model")?.requestTransform).toBeUndefined();
+	});
+
+	test("rejects request shaping on non-OpenAI-compatible APIs", () => {
+		writeRawModelsConfig({
+			providers: {
+				bad: {
+					baseUrl: "https://bad.example/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					requestTransform: { extraBody: { proxy: true } },
+					models: [
+						{
+							id: "anthropic-model",
+							name: "Anthropic Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"requestTransform" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("rejects model-level request shaping on non-OpenAI-compatible APIs", () => {
+		writeRawModelsConfig({
+			providers: {
+				bad: {
+					baseUrl: "https://bad.example/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					models: [
+						{
+							id: "anthropic-model",
+							name: "Anthropic Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+							requestTransform: { extraBody: { proxy: true } },
+						},
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'model "requestTransform" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("rejects provider-only request shaping on non-OpenAI-compatible built-ins", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					requestTransform: { extraBody: { proxy: true } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"requestTransform" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("rejects runtime provider-only request shaping without an OpenAI-compatible API", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(() =>
+			registry.registerProvider("anthropic", {
+				baseUrl: "https://proxy.example/v1",
+				apiKey: "TEST_KEY",
+				requestTransform: { extraBody: { proxy: true } },
+			}),
+		).toThrow('"requestTransform" is only supported with openai-completions or openai-responses APIs');
+	});
+
+	test("rejects model override request shaping on non-OpenAI-compatible models", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					modelOverrides: {
+						"claude-sonnet-4-5": {
+							requestTransform: { extraBody: { proxy: true } },
+						},
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "requestTransform" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("applies provider-only request shaping overrides without models", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					requestTransform: {
+						profile: "openai-proxy",
+						setHeaders: { "x-proxy": "enabled" },
+						extraBody: { proxy: true },
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const model = registry.find("openai", "gpt-4o-mini");
+
+		expect(model?.requestTransform).toEqual({
+			profile: "openai-proxy",
+			setHeaders: { "x-proxy": "enabled" },
+			extraBody: { proxy: true },
+		});
+	});
+
+	test("applies model override request shaping on OpenAI-compatible models", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					modelOverrides: {
+						"gpt-4o-mini": {
+							wireModelId: "proxy-gpt-4o-mini",
+							requestTransform: { extraBody: { routed: true } },
+						},
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const model = registry.find("openai", "gpt-4o-mini");
+
+		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
+		expect(model?.requestTransform).toEqual({ extraBody: { routed: true } });
+	});
 });

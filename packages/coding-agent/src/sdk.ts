@@ -811,6 +811,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	});
 	const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+	modelRegistry.applyConfiguredModelBindings(settings);
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
