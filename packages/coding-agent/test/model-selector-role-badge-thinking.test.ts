@@ -21,9 +21,26 @@ function normalizeRenderedText(text: string): string {
 interface SelectionCapture {
 	model: Model;
 	role: GjcModelAssignmentTargetId | null;
-	thinkingLevel: ThinkingLevel | undefined;
-	selector: string | undefined;
+	thinkingLevel?: ThinkingLevel;
+	selector?: string;
 }
+
+interface PresetCapture {
+	kind: "preset";
+	model: Model;
+	selector: string;
+	assignments: Record<GjcModelAssignmentTargetId, ThinkingLevel>;
+}
+
+type TestModelSelectorSelection =
+	| {
+			kind: "assignment";
+			model: Model;
+			role: GjcModelAssignmentTargetId | null;
+			thinkingLevel?: ThinkingLevel;
+			selector?: string;
+	  }
+	| PresetCapture;
 
 interface CreateSelectorOptions {
 	modelRegistry?: ModelRegistry;
@@ -35,12 +52,7 @@ interface CreateSelectorOptions {
 function createSelector(
 	model: Model,
 	settings: Settings,
-	onSelect: (
-		model: Model,
-		role: GjcModelAssignmentTargetId | null,
-		thinkingLevel: ThinkingLevel | undefined,
-		selector: string | undefined,
-	) => void = () => {},
+	onSelect: (selection: TestModelSelectorSelection) => void = () => {},
 	options: CreateSelectorOptions = {},
 ): ModelSelectorComponent {
 	const modelRegistry =
@@ -63,9 +75,18 @@ function createSelector(
 					explicitThinkingLevel: options.explicitThinkingLevel,
 				};
 
-	return new ModelSelectorComponent(ui, model, settings, modelRegistry, [scopedModel], onSelect, () => {}, {
-		temporaryOnly: options.temporaryOnly,
-	});
+	return new ModelSelectorComponent(
+		ui,
+		model,
+		settings,
+		modelRegistry,
+		[scopedModel],
+		selection => onSelect(selection as TestModelSelectorSelection),
+		() => {},
+		{
+			temporaryOnly: options.temporaryOnly,
+		},
+	);
 }
 
 function createOpenAIModel(provider: "openai" | "openai-codex", id: string, reasoning = true): Model {
@@ -143,8 +164,8 @@ describe("ModelSelector canonical model selection", () => {
 		});
 
 		let selected: SelectionCapture | undefined;
-		const selector = createSelector(model, settings, (selectedModel, role, thinkingLevel, selectorValue) => {
-			selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+		const selector = createSelector(model, settings, selection => {
+			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
 		installTestTheme();
@@ -193,8 +214,8 @@ describe("ModelSelector canonical model selection", () => {
 		});
 
 		let selected: SelectionCapture | undefined;
-		const selector = createSelector(model, settings, (selectedModel, role, thinkingLevel, selectorValue) => {
-			selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+		const selector = createSelector(model, settings, selection => {
+			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
 		installTestTheme();
@@ -225,8 +246,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ temporaryOnly: true, thinkingLevel: ThinkingLevel.Low },
 		);
@@ -270,8 +291,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectedSelector) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectedSelector };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ modelRegistry, thinkingLevel: ThinkingLevel.Medium },
 		);
@@ -356,8 +377,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: null },
 		);
@@ -395,8 +416,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: null },
 		);
@@ -423,8 +444,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: null },
 		);
@@ -451,6 +472,88 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}:high`);
 	});
 
+	test("shows OpenAI Codex role preset action with requested reasoning map", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai-codex", "gpt-codex-preset-test");
+		model.thinking = {
+			minLevel: Effort.Low,
+			maxLevel: Effort.XHigh,
+			defaultLevel: Effort.Medium,
+			mode: "effort",
+		};
+		const settings = Settings.isolated({});
+
+		let selected: PresetCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "preset") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		const actionRendered = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(actionRendered).toContain("Apply OpenAI Codex role preset");
+		expect(actionRendered).toContain("Default medium, Executor low, Architect xhigh, Planner medium, Critic high");
+
+		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterPreset = selected;
+		if (!selectedAfterPreset) throw new Error("Expected OpenAI Codex preset selection");
+		expect(selectedAfterPreset.kind).toBe("preset");
+		expect(selectedAfterPreset.selector).toBe(`${model.provider}/${model.id}`);
+		expect(selectedAfterPreset.assignments).toEqual({
+			default: ThinkingLevel.Medium,
+			executor: ThinkingLevel.Low,
+			architect: ThinkingLevel.XHigh,
+			planner: ThinkingLevel.Medium,
+			critic: ThinkingLevel.High,
+		});
+	});
+
+	test("clamps OpenAI Codex role preset to selected model supported reasoning", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai-codex", "gpt-codex-clamped-preset-test");
+		model.thinking = {
+			minLevel: Effort.Medium,
+			maxLevel: Effort.High,
+			defaultLevel: Effort.Medium,
+			mode: "effort",
+		};
+		const settings = Settings.isolated({});
+
+		let selected: PresetCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "preset") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterPreset = selected;
+		if (!selectedAfterPreset) throw new Error("Expected OpenAI Codex preset selection");
+		expect(selectedAfterPreset.assignments).toEqual({
+			default: ThinkingLevel.Medium,
+			executor: ThinkingLevel.Medium,
+			architect: ThinkingLevel.High,
+			planner: ThinkingLevel.Medium,
+			critic: ThinkingLevel.High,
+		});
+	});
+
 	test("prompts for reasoning when scoped OpenAI thinking came from defaults", async () => {
 		installTestTheme();
 		const model = createOpenAIModel("openai", "gpt-defaulted-scope-test");
@@ -460,8 +563,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: ThinkingLevel.High, explicitThinkingLevel: false },
 		);
@@ -493,8 +596,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: ThinkingLevel.High, explicitThinkingLevel: true },
 		);
@@ -540,8 +643,8 @@ describe("ModelSelector canonical model selection", () => {
 		const selector = createSelector(
 			model,
 			settings,
-			(selectedModel, role, thinkingLevel, selectorValue) => {
-				selected = { model: selectedModel, role, thinkingLevel, selector: selectorValue };
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
 			},
 			{ thinkingLevel: null },
 		);

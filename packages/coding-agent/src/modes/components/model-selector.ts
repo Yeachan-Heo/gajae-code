@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
 import {
 	Container,
 	fuzzyFilter,
@@ -81,18 +81,36 @@ interface RoleAssignment {
 	thinkingLevel: ThinkingLevel;
 }
 
+export interface ModelAssignmentPreset {
+	id: "openai-codex";
+	label: string;
+	description: string;
+	assignments: Partial<Record<GjcModelAssignmentTargetId, ThinkingLevel>>;
+}
+
+export type ModelSelectorSelection =
+	| {
+			kind: "assignment";
+			model: Model;
+			role: GjcModelAssignmentTargetId | null;
+			thinkingLevel?: ThinkingLevel;
+			selector?: string;
+	  }
+	| {
+			kind: "preset";
+			model: Model;
+			selector: string;
+			preset: ModelAssignmentPreset;
+			assignments: Record<GjcModelAssignmentTargetId, ThinkingLevel>;
+	  };
+
 interface PendingThinkingChoice {
 	item: ModelItem | CanonicalModelItem;
 	role: GjcModelAssignmentTargetId | null;
 	levels: ThinkingLevel[];
 }
 
-type RoleSelectCallback = (
-	model: Model,
-	role: GjcModelAssignmentTargetId | null,
-	thinkingLevel?: ThinkingLevel,
-	selector?: string,
-) => void;
+type RoleSelectCallback = (selection: ModelSelectorSelection) => void;
 type CancelCallback = () => void;
 
 interface ProviderTabState {
@@ -107,6 +125,18 @@ const STATIC_PROVIDER_TABS: ProviderTabState[] = [
 	{ id: ALL_TAB, label: ALL_TAB },
 	{ id: CANONICAL_TAB, label: CANONICAL_TAB },
 ];
+const OPENAI_CODE_PROFILE_PRESET: ModelAssignmentPreset = {
+	id: "openai-codex",
+	label: "Apply OpenAI Codex role preset",
+	description: "Default medium, Executor low, Architect xhigh, Planner medium, Critic high",
+	assignments: {
+		default: ThinkingLevel.Medium,
+		executor: ThinkingLevel.Low,
+		architect: ThinkingLevel.XHigh,
+		planner: ThinkingLevel.Medium,
+		critic: ThinkingLevel.High,
+	},
+};
 
 function formatProviderTabLabel(providerId: string): string {
 	return providerId.replace(/[-_]+/g, " ").toUpperCase();
@@ -156,12 +186,7 @@ export class ModelSelectorComponent extends Container {
 		settings: Settings,
 		modelRegistry: ModelRegistry,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
-		onSelect: (
-			model: Model,
-			role: GjcModelAssignmentTargetId | null,
-			thinkingLevel?: ThinkingLevel,
-			selector?: string,
-		) => void,
+		onSelect: RoleSelectCallback,
 		onCancel: () => void,
 		options?: { temporaryOnly?: boolean; initialSearchInput?: string },
 	) {
@@ -750,11 +775,13 @@ export class ModelSelectorComponent extends Container {
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(new Text(theme.fg("muted", `  Action for: ${item.model.id}`), 0, 0));
 		this.#listContainer.addChild(new Spacer(1));
-		for (let i = 0; i < GJC_MODEL_ASSIGNMENT_TARGET_IDS.length; i++) {
-			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
-			const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+		const actionCount = this.#getActionCount(item.model);
+		for (let i = 0; i < actionCount; i++) {
 			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
-			const label = `Set as ${target.tag ?? role.toUpperCase()} (${target.name})`;
+			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
+			const label = role
+				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
+				: `${OPENAI_CODE_PROFILE_PRESET.label} (${OPENAI_CODE_PROFILE_PRESET.description})`;
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
@@ -781,6 +808,9 @@ export class ModelSelectorComponent extends Container {
 
 	#getCurrentRoleThinkingLevel(role: string): ThinkingLevel {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
+	}
+	#getActionCount(model: Model): number {
+		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (supportsOpenAICodexPreset(model) ? 1 : 0);
 	}
 
 	#getSelectedItem(): ModelItem | CanonicalModelItem | undefined {
@@ -853,25 +883,27 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#handleActionMenuInput(keyData: string): void {
+		const item = this.#pendingActionItem;
+		if (!item) return;
+		const actionCount = this.#getActionCount(item.model);
 		if (matchesKey(keyData, "up")) {
-			this.#selectedActionIndex =
-				this.#selectedActionIndex === 0
-					? GJC_MODEL_ASSIGNMENT_TARGET_IDS.length - 1
-					: this.#selectedActionIndex - 1;
+			this.#selectedActionIndex = this.#selectedActionIndex === 0 ? actionCount - 1 : this.#selectedActionIndex - 1;
 			this.#updateList();
 			return;
 		}
 		if (matchesKey(keyData, "down")) {
-			this.#selectedActionIndex = (this.#selectedActionIndex + 1) % GJC_MODEL_ASSIGNMENT_TARGET_IDS.length;
+			this.#selectedActionIndex = (this.#selectedActionIndex + 1) % actionCount;
 			this.#updateList();
 			return;
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
-			const item = this.#pendingActionItem;
-			if (!item) return;
-			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
 			this.#pendingActionItem = undefined;
-			this.#handleSelect(item, role);
+			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
+			if (role) {
+				this.#handleSelect(item, role);
+			} else {
+				this.#handlePresetSelect(item, OPENAI_CODE_PROFILE_PRESET);
+			}
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
@@ -910,6 +942,18 @@ export class ModelSelectorComponent extends Container {
 			this.#updateList();
 		}
 	}
+	#handlePresetSelect(item: ModelItem | CanonicalModelItem, preset: ModelAssignmentPreset): void {
+		const selectorValue = item.selector;
+		const assignments = resolvePresetAssignments(item.model, preset);
+		for (const [role, thinkingLevel] of Object.entries(assignments) as [
+			GjcModelAssignmentTargetId,
+			ThinkingLevel,
+		][]) {
+			this.#roles[role] = { model: item.model, thinkingLevel };
+		}
+		this.#onSelectCallback({ kind: "preset", model: item.model, selector: selectorValue, preset, assignments });
+		this.#updateList();
+	}
 
 	#handleSelect(
 		item: ModelItem | CanonicalModelItem,
@@ -927,7 +971,13 @@ export class ModelSelectorComponent extends Container {
 
 		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
-			this.#onSelectCallback(item.model, null, itemThinkingLevel, item.selector);
+			this.#onSelectCallback({
+				kind: "assignment",
+				model: item.model,
+				role: null,
+				thinkingLevel: itemThinkingLevel,
+				selector: item.selector,
+			});
 			return;
 		}
 
@@ -939,7 +989,13 @@ export class ModelSelectorComponent extends Container {
 		this.#roles[role] = { model: item.model, thinkingLevel: selectedThinkingLevel };
 
 		// Notify caller (for updating agent state if needed)
-		this.#onSelectCallback(item.model, role, selectedThinkingLevel, selectorValue);
+		this.#onSelectCallback({
+			kind: "assignment",
+			model: item.model,
+			role,
+			thinkingLevel: selectedThinkingLevel,
+			selector: selectorValue,
+		});
 
 		// Update list to show new badges
 		this.#updateList();
@@ -952,6 +1008,31 @@ export class ModelSelectorComponent extends Container {
 
 function requiresExplicitThinkingChoice(model: Model): boolean {
 	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
+}
+
+function supportsOpenAICodexPreset(model: Model): boolean {
+	return model.provider === "openai-codex" && model.reasoning === true;
+}
+
+function resolvePresetAssignments(
+	model: Model,
+	preset: ModelAssignmentPreset,
+): Record<GjcModelAssignmentTargetId, ThinkingLevel> {
+	const resolved = {} as Record<GjcModelAssignmentTargetId, ThinkingLevel>;
+	for (const [role, requestedLevel] of Object.entries(preset.assignments) as [
+		GjcModelAssignmentTargetId,
+		ThinkingLevel,
+	][]) {
+		const clampedLevel =
+			requestedLevel === ThinkingLevel.Off || requestedLevel === ThinkingLevel.Inherit
+				? requestedLevel
+				: clampThinkingLevelForModel(model, requestedLevel);
+		if (!clampedLevel) {
+			throw new Error(`Model ${model.provider}/${model.id} does not support ${requestedLevel} reasoning`);
+		}
+		resolved[role] = clampedLevel;
+	}
+	return resolved;
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

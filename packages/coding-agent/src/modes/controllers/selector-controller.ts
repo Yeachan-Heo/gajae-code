@@ -37,7 +37,7 @@ import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
-import { ModelSelectorComponent } from "../components/model-selector";
+import { ModelSelectorComponent, type ModelSelectorSelection } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
@@ -431,8 +431,15 @@ export class SelectorController {
 				this.ctx.settings,
 				this.ctx.session.modelRegistry,
 				this.ctx.session.scopedModels,
-				async (model, role, thinkingLevel, selector) => {
+				async selection => {
 					try {
+						if (selection.kind === "preset") {
+							await this.#applyModelAssignmentPreset(selection);
+							done();
+							this.ctx.ui.requestRender();
+							return;
+						}
+						const { model, role, thinkingLevel, selector } = selection;
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
 							await this.ctx.session.setModelTemporary(model, thinkingLevel);
@@ -481,6 +488,39 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	async #applyModelAssignmentPreset(selection: Extract<ModelSelectorSelection, { kind: "preset" }>): Promise<void> {
+		const { assignments, model, preset, selector } = selection;
+		const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+		if (!apiKey) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const defaultThinkingLevel = assignments.default;
+		await this.ctx.session.setModel(model, "default", {
+			selector,
+			thinkingLevel: defaultThinkingLevel,
+		});
+		if (defaultThinkingLevel && defaultThinkingLevel !== ThinkingLevel.Inherit) {
+			this.ctx.session.setThinkingLevel(defaultThinkingLevel);
+		}
+
+		const overrides = this.ctx.settings.get("task.agentModelOverrides");
+		const nextOverrides = { ...overrides };
+		for (const [targetRole, presetThinkingLevel] of Object.entries(assignments) as [
+			keyof Extract<ModelSelectorSelection, { kind: "preset" }>["assignments"],
+			ThinkingLevel,
+		][]) {
+			if (!targetRole || targetRole === "default") continue;
+			nextOverrides[targetRole] =
+				presetThinkingLevel === ThinkingLevel.Inherit ? selector : `${selector}:${presetThinkingLevel}`;
+		}
+		this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
+		this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		this.ctx.showStatus(`${preset.label}: ${selector}`);
 	}
 
 	async showPluginSelector(mode: "install" | "uninstall" = "install"): Promise<void> {
