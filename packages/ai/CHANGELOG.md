@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped assigning `gpt-5.5` a built-in context promotion target of `gpt-5.4`, so explicit `gpt-5.5` sessions compact on overflow instead of switching to a lower-version GPT-5 model.
+
 ## [0.2.0] - 2026-05-28
 
 ### Fixed

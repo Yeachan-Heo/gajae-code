@@ -458,6 +458,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"anthropic.claude-opus-4-8": {
+			"id": "anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"au.anthropic.claude-haiku-4-5-20251001-v1:0": {
 			"id": "au.anthropic.claude-haiku-4-5-20251001-v1:0",
 			"name": "Anthropic Haiku 4.5 (AU)",
@@ -497,6 +522,31 @@
 			"cost": {
 				"input": 16.5,
 				"output": 82.5,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"au.anthropic.claude-opus-4-8": {
+			"id": "au.anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (AU)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
 				"cacheRead": 0.5,
 				"cacheWrite": 6.25
 			},
@@ -958,6 +1008,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"eu.anthropic.claude-opus-4-8": {
+			"id": "eu.anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (EU)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"eu.anthropic.claude-sonnet-4-20250514-v1:0": {
 			"id": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
 			"name": "Anthropic Sonnet 4 (EU)",
@@ -1055,7 +1130,7 @@
 		},
 		"global.anthropic.claude-haiku-4-5-20251001-v1:0": {
 			"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-			"name": "Anthropic Haiku 4.5 (Global)",
+			"name": "Anthropic Haiku 4.5",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1153,6 +1228,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"global.anthropic.claude-opus-4-8": {
+			"id": "global.anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"global.anthropic.claude-sonnet-4-20250514-v1:0": {
 			"id": "global.anthropic.claude-sonnet-4-20250514-v1:0",
 			"name": "Anthropic Sonnet 4 (Global)",
@@ -1180,7 +1280,7 @@
 		},
 		"global.anthropic.claude-sonnet-4-5-20250929-v1:0": {
 			"id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-			"name": "Anthropic Sonnet 4.5 (Global)",
+			"name": "Anthropic Sonnet 4.5",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1205,7 +1305,7 @@
 		},
 		"global.anthropic.claude-sonnet-4-6": {
 			"id": "global.anthropic.claude-sonnet-4-6",
-			"name": "Anthropic Sonnet 4.6",
+			"name": "Anthropic Sonnet 4.6 (Global)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1271,6 +1371,31 @@
 		"jp.anthropic.claude-opus-4-7": {
 			"id": "jp.anthropic.claude-opus-4-7",
 			"name": "Anthropic Opus 4.7 (JP)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"jp.anthropic.claude-opus-4-8": {
+			"id": "jp.anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (JP)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2281,6 +2406,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"us.anthropic.claude-opus-4-8": {
+			"id": "us.anthropic.claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"us.anthropic.claude-sonnet-4-20250514-v1:0": {
 			"id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
 			"name": "Anthropic Sonnet 4 (US)",
@@ -2927,6 +3077,31 @@
 		"claude-opus-4-7": {
 			"id": "claude-opus-4-7",
 			"name": "Anthropic Opus 4.7",
+			"api": "anthropic-messages",
+			"provider": "anthropic",
+			"baseUrl": "https://api.anthropic.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"claude-opus-4-8": {
+			"id": "claude-opus-4-8",
+			"name": "Anthropic Opus 4.8",
 			"api": "anthropic-messages",
 			"provider": "anthropic",
 			"baseUrl": "https://api.anthropic.com",
@@ -4045,9 +4220,47 @@
 		}
 	},
 	"cursor": {
+		"claude-4-sonnet": {
+			"id": "claude-4-sonnet",
+			"name": "Sonnet 4",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-4-sonnet-thinking": {
+			"id": "claude-4-sonnet-thinking",
+			"name": "Sonnet 4 Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
 		"claude-4.5-opus-high": {
 			"id": "claude-4.5-opus-high",
-			"name": "Anthropic 4.5 Opus",
+			"name": "Opus 4.5",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4067,7 +4280,7 @@
 		},
 		"claude-4.5-opus-high-thinking": {
 			"id": "claude-4.5-opus-high-thinking",
-			"name": "Anthropic 4.5 Opus (Thinking)",
+			"name": "Opus 4.5 Thinking",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4092,7 +4305,7 @@
 		},
 		"claude-4.5-sonnet": {
 			"id": "claude-4.5-sonnet",
-			"name": "Anthropic 4.5 Sonnet",
+			"name": "Sonnet 4.5",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4112,7 +4325,7 @@
 		},
 		"claude-4.5-sonnet-thinking": {
 			"id": "claude-4.5-sonnet-thinking",
-			"name": "Anthropic 4.5 Sonnet (Thinking)",
+			"name": "Sonnet 4.5 Thinking",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4137,7 +4350,7 @@
 		},
 		"claude-4.6-opus-high": {
 			"id": "claude-4.6-opus-high",
-			"name": "Anthropic 4.6 Opus",
+			"name": "Opus 4.6 1M",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4156,7 +4369,83 @@
 		},
 		"claude-4.6-opus-high-thinking": {
 			"id": "claude-4.6-opus-high-thinking",
-			"name": "Anthropic 4.6 Opus (Thinking)",
+			"name": "Opus 4.6 1M Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-4.6-opus-high-thinking-fast": {
+			"id": "claude-4.6-opus-high-thinking-fast",
+			"name": "Opus 4.6 1M Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-4.6-opus-max": {
+			"id": "claude-4.6-opus-max",
+			"name": "Opus 4.6 1M Max",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-4.6-opus-max-thinking": {
+			"id": "claude-4.6-opus-max-thinking",
+			"name": "Opus 4.6 1M Max Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-4.6-opus-max-thinking-fast": {
+			"id": "claude-4.6-opus-max-thinking-fast",
+			"name": "Opus 4.6 1M Max Thinking Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4175,7 +4464,7 @@
 		},
 		"claude-4.6-sonnet-medium": {
 			"id": "claude-4.6-sonnet-medium",
-			"name": "Anthropic 4.6 Sonnet",
+			"name": "Sonnet 4.6 1M",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4194,7 +4483,767 @@
 		},
 		"claude-4.6-sonnet-medium-thinking": {
 			"id": "claude-4.6-sonnet-medium-thinking",
-			"name": "Anthropic 4.6 Sonnet (Thinking)",
+			"name": "Sonnet 4.6 1M Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-high": {
+			"id": "claude-opus-4-7-high",
+			"name": "Opus 4.7 1M High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-high-fast": {
+			"id": "claude-opus-4-7-high-fast",
+			"name": "Opus 4.7 1M High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-low": {
+			"id": "claude-opus-4-7-low",
+			"name": "Opus 4.7 1M Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-low-fast": {
+			"id": "claude-opus-4-7-low-fast",
+			"name": "Opus 4.7 1M Low Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-max": {
+			"id": "claude-opus-4-7-max",
+			"name": "Opus 4.7 1M Max",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-max-fast": {
+			"id": "claude-opus-4-7-max-fast",
+			"name": "Opus 4.7 1M Max Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-medium": {
+			"id": "claude-opus-4-7-medium",
+			"name": "Opus 4.7 1M Medium",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-medium-fast": {
+			"id": "claude-opus-4-7-medium-fast",
+			"name": "Opus 4.7 1M Medium Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-high": {
+			"id": "claude-opus-4-7-thinking-high",
+			"name": "Opus 4.7 1M High Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-high-fast": {
+			"id": "claude-opus-4-7-thinking-high-fast",
+			"name": "Opus 4.7 1M High Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-low": {
+			"id": "claude-opus-4-7-thinking-low",
+			"name": "Opus 4.7 1M Low Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-low-fast": {
+			"id": "claude-opus-4-7-thinking-low-fast",
+			"name": "Opus 4.7 1M Low Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-max": {
+			"id": "claude-opus-4-7-thinking-max",
+			"name": "Opus 4.7 1M Max Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-max-fast": {
+			"id": "claude-opus-4-7-thinking-max-fast",
+			"name": "Opus 4.7 1M Max Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-medium": {
+			"id": "claude-opus-4-7-thinking-medium",
+			"name": "Opus 4.7 1M Medium Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-medium-fast": {
+			"id": "claude-opus-4-7-thinking-medium-fast",
+			"name": "Opus 4.7 1M Medium Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-xhigh": {
+			"id": "claude-opus-4-7-thinking-xhigh",
+			"name": "Opus 4.7 1M Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-thinking-xhigh-fast": {
+			"id": "claude-opus-4-7-thinking-xhigh-fast",
+			"name": "Opus 4.7 1M Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-xhigh": {
+			"id": "claude-opus-4-7-xhigh",
+			"name": "Opus 4.7 1M",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-7-xhigh-fast": {
+			"id": "claude-opus-4-7-xhigh-fast",
+			"name": "Opus 4.7 1M Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-high": {
+			"id": "claude-opus-4-8-high",
+			"name": "Opus 4.8 1M",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-high-fast": {
+			"id": "claude-opus-4-8-high-fast",
+			"name": "Opus 4.8 1M Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-low": {
+			"id": "claude-opus-4-8-low",
+			"name": "Opus 4.8 1M Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-low-fast": {
+			"id": "claude-opus-4-8-low-fast",
+			"name": "Opus 4.8 1M Low Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-max": {
+			"id": "claude-opus-4-8-max",
+			"name": "Opus 4.8 1M Max",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-max-fast": {
+			"id": "claude-opus-4-8-max-fast",
+			"name": "Opus 4.8 1M Max Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-medium": {
+			"id": "claude-opus-4-8-medium",
+			"name": "Opus 4.8 1M Medium",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-medium-fast": {
+			"id": "claude-opus-4-8-medium-fast",
+			"name": "Opus 4.8 1M Medium Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-high": {
+			"id": "claude-opus-4-8-thinking-high",
+			"name": "Opus 4.8 1M Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-high-fast": {
+			"id": "claude-opus-4-8-thinking-high-fast",
+			"name": "Opus 4.8 1M Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-low": {
+			"id": "claude-opus-4-8-thinking-low",
+			"name": "Opus 4.8 1M Low Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-low-fast": {
+			"id": "claude-opus-4-8-thinking-low-fast",
+			"name": "Opus 4.8 1M Low Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-max": {
+			"id": "claude-opus-4-8-thinking-max",
+			"name": "Opus 4.8 1M Max Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-max-fast": {
+			"id": "claude-opus-4-8-thinking-max-fast",
+			"name": "Opus 4.8 1M Max Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-medium": {
+			"id": "claude-opus-4-8-thinking-medium",
+			"name": "Opus 4.8 1M Medium Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-medium-fast": {
+			"id": "claude-opus-4-8-thinking-medium-fast",
+			"name": "Opus 4.8 1M Medium Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-xhigh": {
+			"id": "claude-opus-4-8-thinking-xhigh",
+			"name": "Opus 4.8 1M Extra High Thinking",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-thinking-xhigh-fast": {
+			"id": "claude-opus-4-8-thinking-xhigh-fast",
+			"name": "Opus 4.8 1M Extra High Thinking Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-xhigh": {
+			"id": "claude-opus-4-8-xhigh",
+			"name": "Opus 4.8 1M Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"claude-opus-4-8-xhigh-fast": {
+			"id": "claude-opus-4-8-xhigh-fast",
+			"name": "Opus 4.8 1M Extra High Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4233,6 +5282,44 @@
 		"composer-1.5": {
 			"id": "composer-1.5",
 			"name": "Composer 1.5",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"composer-2.5": {
+			"id": "composer-2.5",
+			"name": "Composer 2.5",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"composer-2.5-fast": {
+			"id": "composer-2.5-fast",
+			"name": "Composer 2.5 Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4352,6 +5439,81 @@
 				]
 			}
 		},
+		"gemini-3.5-flash": {
+			"id": "gemini-3.5-flash",
+			"name": "Gemini 3.5 Flash",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gpt-5-mini": {
+			"id": "gpt-5-mini",
+			"name": "GPT-5 Mini",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gpt-5.1": {
+			"id": "gpt-5.1",
+			"name": "GPT-5.1",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"gpt-5.1-codex-max": {
 			"id": "gpt-5.1-codex-max",
 			"name": "GPT-5.1 OpenAI code Max",
@@ -4379,7 +5541,7 @@
 		},
 		"gpt-5.1-codex-max-high": {
 			"id": "gpt-5.1-codex-max-high",
-			"name": "GPT-5.1 OpenAI code Max High",
+			"name": "OpenAI code 5.1 Max High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4401,6 +5563,139 @@
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
+		},
+		"gpt-5.1-codex-max-high-fast": {
+			"id": "gpt-5.1-codex-max-high-fast",
+			"name": "OpenAI code 5.1 Max High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-low": {
+			"id": "gpt-5.1-codex-max-low",
+			"name": "OpenAI code 5.1 Max Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-low-fast": {
+			"id": "gpt-5.1-codex-max-low-fast",
+			"name": "OpenAI code 5.1 Max Low Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-medium": {
+			"id": "gpt-5.1-codex-max-medium",
+			"name": "OpenAI code 5.1 Max",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-medium-fast": {
+			"id": "gpt-5.1-codex-max-medium-fast",
+			"name": "OpenAI code 5.1 Max Medium Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-xhigh": {
+			"id": "gpt-5.1-codex-max-xhigh",
+			"name": "OpenAI code 5.1 Max Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-max-xhigh-fast": {
+			"id": "gpt-5.1-codex-max-xhigh-fast",
+			"name": "OpenAI code 5.1 Max Extra High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
 		},
 		"gpt-5.1-codex-mini": {
 			"id": "gpt-5.1-codex-mini",
@@ -4427,9 +5722,66 @@
 				"maxLevel": "high"
 			}
 		},
+		"gpt-5.1-codex-mini-high": {
+			"id": "gpt-5.1-codex-mini-high",
+			"name": "OpenAI code 5.1 Mini High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-codex-mini-low": {
+			"id": "gpt-5.1-codex-mini-low",
+			"name": "OpenAI code 5.1 Mini Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
 		"gpt-5.1-high": {
 			"id": "gpt-5.1-high",
 			"name": "GPT-5.1 High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.1-low": {
+			"id": "gpt-5.1-low",
+			"name": "GPT-5.1 Low",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4498,7 +5850,7 @@
 		},
 		"gpt-5.2-codex-fast": {
 			"id": "gpt-5.2-codex-fast",
-			"name": "GPT-5.2 OpenAI code Fast",
+			"name": "OpenAI code 5.2 Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4517,7 +5869,7 @@
 		},
 		"gpt-5.2-codex-high": {
 			"id": "gpt-5.2-codex-high",
-			"name": "GPT-5.2 OpenAI code High",
+			"name": "OpenAI code 5.2 High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4536,7 +5888,7 @@
 		},
 		"gpt-5.2-codex-high-fast": {
 			"id": "gpt-5.2-codex-high-fast",
-			"name": "GPT-5.2 OpenAI code High Fast",
+			"name": "OpenAI code 5.2 High Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4555,7 +5907,7 @@
 		},
 		"gpt-5.2-codex-low": {
 			"id": "gpt-5.2-codex-low",
-			"name": "GPT-5.2 OpenAI code Low",
+			"name": "OpenAI code 5.2 Low",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4574,7 +5926,7 @@
 		},
 		"gpt-5.2-codex-low-fast": {
 			"id": "gpt-5.2-codex-low-fast",
-			"name": "GPT-5.2 OpenAI code Low Fast",
+			"name": "OpenAI code 5.2 Low Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4593,7 +5945,7 @@
 		},
 		"gpt-5.2-codex-xhigh": {
 			"id": "gpt-5.2-codex-xhigh",
-			"name": "GPT-5.2 OpenAI code Extra High",
+			"name": "OpenAI code 5.2 Extra High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4612,7 +5964,7 @@
 		},
 		"gpt-5.2-codex-xhigh-fast": {
 			"id": "gpt-5.2-codex-xhigh-fast",
-			"name": "GPT-5.2 OpenAI code Extra High Fast",
+			"name": "OpenAI code 5.2 Extra High Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4627,6 +5979,25 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 272000,
+			"maxTokens": 64000
+		},
+		"gpt-5.2-fast": {
+			"id": "gpt-5.2-fast",
+			"name": "GPT-5.2 Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
 			"maxTokens": 64000
 		},
 		"gpt-5.2-high": {
@@ -4653,6 +6024,101 @@
 				"minLevel": "low",
 				"maxLevel": "xhigh"
 			}
+		},
+		"gpt-5.2-high-fast": {
+			"id": "gpt-5.2-high-fast",
+			"name": "GPT-5.2 High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.2-low": {
+			"id": "gpt-5.2-low",
+			"name": "GPT-5.2 Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.2-low-fast": {
+			"id": "gpt-5.2-low-fast",
+			"name": "GPT-5.2 Low Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.2-xhigh": {
+			"id": "gpt-5.2-xhigh",
+			"name": "GPT-5.2 Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.2-xhigh-fast": {
+			"id": "gpt-5.2-xhigh-fast",
+			"name": "GPT-5.2 Extra High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
 		},
 		"gpt-5.3-codex": {
 			"id": "gpt-5.3-codex",
@@ -4681,7 +6147,7 @@
 		},
 		"gpt-5.3-codex-fast": {
 			"id": "gpt-5.3-codex-fast",
-			"name": "GPT-5.3 OpenAI code Fast",
+			"name": "OpenAI code 5.3 Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4700,7 +6166,7 @@
 		},
 		"gpt-5.3-codex-high": {
 			"id": "gpt-5.3-codex-high",
-			"name": "GPT-5.3 OpenAI code High",
+			"name": "OpenAI code 5.3 High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4719,7 +6185,7 @@
 		},
 		"gpt-5.3-codex-high-fast": {
 			"id": "gpt-5.3-codex-high-fast",
-			"name": "GPT-5.3 OpenAI code High Fast",
+			"name": "OpenAI code 5.3 High Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4738,7 +6204,7 @@
 		},
 		"gpt-5.3-codex-low": {
 			"id": "gpt-5.3-codex-low",
-			"name": "GPT-5.3 OpenAI code Low",
+			"name": "OpenAI code 5.3 Low",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4757,7 +6223,7 @@
 		},
 		"gpt-5.3-codex-low-fast": {
 			"id": "gpt-5.3-codex-low-fast",
-			"name": "GPT-5.3 OpenAI code Low Fast",
+			"name": "OpenAI code 5.3 Low Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4795,7 +6261,7 @@
 		},
 		"gpt-5.3-codex-xhigh": {
 			"id": "gpt-5.3-codex-xhigh",
-			"name": "GPT-5.3 OpenAI code Extra High",
+			"name": "OpenAI code 5.3 Extra High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4814,7 +6280,7 @@
 		},
 		"gpt-5.3-codex-xhigh-fast": {
 			"id": "gpt-5.3-codex-xhigh-fast",
-			"name": "GPT-5.3 OpenAI code Extra High Fast",
+			"name": "OpenAI code 5.3 Extra High Fast",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4833,7 +6299,7 @@
 		},
 		"gpt-5.4-high": {
 			"id": "gpt-5.4-high",
-			"name": "GPT-5.4 High",
+			"name": "GPT-5.4 1M High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4871,7 +6337,7 @@
 		},
 		"gpt-5.4-low": {
 			"id": "gpt-5.4-low",
-			"name": "GPT-5.4 Low",
+			"name": "GPT-5.4 1M Low",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4890,7 +6356,7 @@
 		},
 		"gpt-5.4-medium": {
 			"id": "gpt-5.4-medium",
-			"name": "GPT-5.4",
+			"name": "GPT-5.4 1M",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4926,9 +6392,199 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000
 		},
+		"gpt-5.4-mini-high": {
+			"id": "gpt-5.4-mini-high",
+			"name": "GPT-5.4 Mini High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-mini-low": {
+			"id": "gpt-5.4-mini-low",
+			"name": "GPT-5.4 Mini Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-mini-medium": {
+			"id": "gpt-5.4-mini-medium",
+			"name": "GPT-5.4 Mini",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-mini-none": {
+			"id": "gpt-5.4-mini-none",
+			"name": "GPT-5.4 Mini None",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-mini-xhigh": {
+			"id": "gpt-5.4-mini-xhigh",
+			"name": "GPT-5.4 Mini Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-nano-high": {
+			"id": "gpt-5.4-nano-high",
+			"name": "GPT-5.4 Nano High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-nano-low": {
+			"id": "gpt-5.4-nano-low",
+			"name": "GPT-5.4 Nano Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-nano-medium": {
+			"id": "gpt-5.4-nano-medium",
+			"name": "GPT-5.4 Nano",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-nano-none": {
+			"id": "gpt-5.4-nano-none",
+			"name": "GPT-5.4 Nano None",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.4-nano-xhigh": {
+			"id": "gpt-5.4-nano-xhigh",
+			"name": "GPT-5.4 Nano Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
 		"gpt-5.4-xhigh": {
 			"id": "gpt-5.4-xhigh",
-			"name": "GPT-5.4 Extra High",
+			"name": "GPT-5.4 1M Extra High",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -4963,6 +6619,246 @@
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000
+		},
+		"gpt-5.5-extra-high": {
+			"id": "gpt-5.5-extra-high",
+			"name": "GPT-5.5 1M Extra High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-extra-high-fast": {
+			"id": "gpt-5.5-extra-high-fast",
+			"name": "GPT-5.5 Extra High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-high": {
+			"id": "gpt-5.5-high",
+			"name": "GPT-5.5 1M High",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-high-fast": {
+			"id": "gpt-5.5-high-fast",
+			"name": "GPT-5.5 High Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-low": {
+			"id": "gpt-5.5-low",
+			"name": "GPT-5.5 1M Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-low-fast": {
+			"id": "gpt-5.5-low-fast",
+			"name": "GPT-5.5 Low Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-medium": {
+			"id": "gpt-5.5-medium",
+			"name": "GPT-5.5 1M",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-medium-fast": {
+			"id": "gpt-5.5-medium-fast",
+			"name": "GPT-5.5 Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-none": {
+			"id": "gpt-5.5-none",
+			"name": "GPT-5.5 1M None",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gpt-5.5-none-fast": {
+			"id": "gpt-5.5-none-fast",
+			"name": "GPT-5.5 None Fast",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"grok-4.3": {
+			"id": "grok-4.3",
+			"name": "Grok 4.3",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"grok-build-0.1": {
+			"id": "grok-build-0.1",
+			"name": "Grok Build 0.1",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"grok-code-fast-1": {
 			"id": "grok-code-fast-1",
@@ -5344,8 +7240,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 144000,
-			"maxTokens": 32000,
+			"contextWindow": 200000,
+			"maxTokens": 64000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
 			},
@@ -5373,7 +7269,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 160000,
+			"contextWindow": 200000,
 			"maxTokens": 32000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
@@ -5430,7 +7326,35 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 144000,
+			"contextWindow": 200000,
+			"maxTokens": 32000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"claude-opus-4.8": {
+			"id": "claude-opus-4.8",
+			"name": "Anthropic Opus 4.8",
+			"api": "anthropic-messages",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
@@ -5486,7 +7410,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 144000,
+			"contextWindow": 200000,
 			"maxTokens": 32000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
@@ -5640,7 +7564,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
+			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
@@ -5677,7 +7601,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
+			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"headers": {
 				"User-Agent": "opencode/1.3.15"
@@ -6085,8 +8009,7 @@
 				"mode": "effort",
 				"minLevel": "low",
 				"maxLevel": "xhigh"
-			},
-			"contextPromotionTarget": "github-copilot/gpt-5.4"
+			}
 		},
 		"grok-code-fast-1": {
 			"id": "grok-code-fast-1",
@@ -9506,6 +11429,44 @@
 			"contextWindow": 222222,
 			"maxTokens": 8888
 		},
+		"anthropic/claude-opus-4.8": {
+			"id": "anthropic/claude-opus-4.8",
+			"name": "Anthropic: Anthropic Opus 4.8 (new)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
+		"anthropic/claude-opus-4.8-fast": {
+			"id": "anthropic/claude-opus-4.8-fast",
+			"name": "Anthropic: Anthropic Opus 4.8 (Fast) ($$$$)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
 		"anthropic/claude-sonnet-4": {
 			"id": "anthropic/claude-sonnet-4",
 			"name": "Anthropic Sonnet 4",
@@ -10394,6 +12355,25 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"deepseek/deepseek-v4-flash:discounted": {
+			"id": "deepseek/deepseek-v4-flash:discounted",
+			"name": "DeepSeek: DeepSeek V4 Flash (>40% off)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
 		"deepseek/deepseek-v4-flash:free": {
 			"id": "deepseek/deepseek-v4-flash:free",
 			"name": "DeepSeek: DeepSeek V4 Flash (free)",
@@ -10436,6 +12416,25 @@
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
 			}
+		},
+		"deepseek/deepseek-v4-pro:discounted": {
+			"id": "deepseek/deepseek-v4-pro:discounted",
+			"name": "DeepSeek: DeepSeek V4 Pro (>80% off)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
 		},
 		"eleutherai/llemma_7b": {
 			"id": "eleutherai/llemma_7b",
@@ -10515,7 +12514,7 @@
 		},
 		"google/gemini-2.0-flash-001": {
 			"id": "google/gemini-2.0-flash-001",
-			"name": "Google: Gemini 2.0 Flash",
+			"name": "Google: Gemini 2.0 Flash (retires Jun 1)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -10534,7 +12533,7 @@
 		},
 		"google/gemini-2.0-flash-lite-001": {
 			"id": "google/gemini-2.0-flash-lite-001",
-			"name": "Google: Gemini 2.0 Flash Lite",
+			"name": "Google: Gemini 2.0 Flash Lite (retires Jun 1)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -12333,7 +14332,7 @@
 		},
 		"mistralai/mistral-7b-instruct-v0.1": {
 			"id": "mistralai/mistral-7b-instruct-v0.1",
-			"name": "Mistral: Mistral 7B Instruct v0.1",
+			"name": "Mistral: Mistral 7B Instruct v0.1 (retires May 30)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -12996,7 +14995,7 @@
 		},
 		"nousresearch/hermes-2-pro-llama-3-8b": {
 			"id": "nousresearch/hermes-2-pro-llama-3-8b",
-			"name": "NousResearch: Hermes 2 Pro - Llama-3 8B",
+			"name": "NousResearch: Hermes 2 Pro - Llama-3 8B (retires Jun 5)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -13391,7 +15390,7 @@
 		},
 		"openai/gpt-4-1106-preview": {
 			"id": "openai/gpt-4-1106-preview",
-			"name": "OpenAI: GPT-4 Turbo (older v1106)",
+			"name": "OpenAI: GPT-4 Turbo (older v1106) ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -13430,7 +15429,7 @@
 		},
 		"openai/gpt-4-turbo-preview": {
 			"id": "openai/gpt-4-turbo-preview",
-			"name": "OpenAI: GPT-4 Turbo Preview",
+			"name": "OpenAI: GPT-4 Turbo Preview ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -13767,7 +15766,7 @@
 		},
 		"openai/gpt-5-image": {
 			"id": "openai/gpt-5-image",
-			"name": "OpenAI: GPT-5 Image",
+			"name": "OpenAI: GPT-5 Image ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -13843,7 +15842,7 @@
 		},
 		"openai/gpt-5-pro": {
 			"id": "openai/gpt-5-pro",
-			"name": "OpenAI: GPT-5 Pro",
+			"name": "OpenAI: GPT-5 Pro ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -14001,7 +16000,7 @@
 		},
 		"openai/gpt-5.2-chat": {
 			"id": "openai/gpt-5.2-chat",
-			"name": "OpenAI: GPT-5.2 Chat",
+			"name": "OpenAI: GPT-5.2 Chat (retires Aug 10)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -14488,7 +16487,7 @@
 		},
 		"openai/o3-deep-research": {
 			"id": "openai/o3-deep-research",
-			"name": "OpenAI: o3 Deep Research",
+			"name": "OpenAI: o3 Deep Research ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -15327,7 +17326,7 @@
 		},
 		"qwen/qwen3-30b-a3b": {
 			"id": "qwen/qwen3-30b-a3b",
-			"name": "Qwen: Qwen3 30B A3B",
+			"name": "Qwen: Qwen3 30B A3B (retires Jun 5)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -16214,7 +18213,7 @@
 		},
 		"sao10k/l3-euryale-70b": {
 			"id": "sao10k/l3-euryale-70b",
-			"name": "Sao10k: Llama 3 Euryale 70B v2.1",
+			"name": "Sao10k: Llama 3 Euryale 70B v2.1 (retires Jun 5)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -16364,6 +18363,25 @@
 			"contextWindow": 222222,
 			"maxTokens": 8888
 		},
+		"stealth/qwen3.6-plus": {
+			"id": "stealth/qwen3.6-plus",
+			"name": "Stealth: Qwen3.6 Plus (50% off)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
 		"stepfun/step-3.5-flash": {
 			"id": "stepfun/step-3.5-flash",
 			"name": "Step 3.5 Flash",
@@ -16386,6 +18404,25 @@
 		"stepfun/step-3.5-flash:free": {
 			"id": "stepfun/step-3.5-flash:free",
 			"name": "StepFun: Step 3.5 Flash (free)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
+		"stepfun/step-3.7-flash": {
+			"id": "stepfun/step-3.7-flash",
+			"name": "StepFun: Step 3.7 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -50967,6 +53004,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"stepfun-ai/step-3.7-flash": {
+			"id": "stepfun-ai/step-3.7-flash",
+			"name": "Step 3.7 Flash",
+			"api": "openai-completions",
+			"provider": "nvidia",
+			"baseUrl": "https://integrate.api.nvidia.com/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 256000,
+			"maxTokens": 16384,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"upstage/solar-10_7b-instruct": {
 			"id": "upstage/solar-10_7b-instruct",
 			"name": "solar-10.7b-instruct",
@@ -51970,8 +54032,7 @@
 				"minLevel": "low",
 				"maxLevel": "xhigh"
 			},
-			"applyPatchToolType": "freeform",
-			"contextPromotionTarget": "openai/gpt-5.4"
+			"applyPatchToolType": "freeform"
 		},
 		"gpt-5.5-pro": {
 			"id": "gpt-5.5-pro",
@@ -51997,8 +54058,7 @@
 				"minLevel": "low",
 				"maxLevel": "xhigh"
 			},
-			"applyPatchToolType": "freeform",
-			"contextPromotionTarget": "openai/gpt-5.4"
+			"applyPatchToolType": "freeform"
 		},
 		"o1": {
 			"id": "o1",
@@ -52645,8 +54705,7 @@
 				"minLevel": "low",
 				"maxLevel": "xhigh"
 			},
-			"applyPatchToolType": "freeform",
-			"contextPromotionTarget": "openai-codex/gpt-5.4"
+			"applyPatchToolType": "freeform"
 		}
 	},
 	"opencode": {
@@ -53300,6 +55359,31 @@
 		"claude-opus-4-7": {
 			"id": "claude-opus-4-7",
 			"name": "Anthropic Opus 4.7",
+			"api": "anthropic-messages",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"claude-opus-4-8": {
+			"id": "claude-opus-4-8",
+			"name": "Anthropic Opus 4.8",
 			"api": "anthropic-messages",
 			"provider": "opencode-zen",
 			"baseUrl": "https://opencode.ai/zen",
@@ -54023,8 +56107,7 @@
 				"mode": "effort",
 				"minLevel": "low",
 				"maxLevel": "xhigh"
-			},
-			"contextPromotionTarget": "opencode-zen/gpt-5.4"
+			}
 		},
 		"gpt-5.5-pro": {
 			"id": "gpt-5.5-pro",
@@ -54049,8 +56132,7 @@
 				"mode": "effort",
 				"minLevel": "low",
 				"maxLevel": "xhigh"
-			},
-			"contextPromotionTarget": "opencode-zen/gpt-5.4"
+			}
 		},
 		"grok-build-0.1": {
 			"id": "grok-build-0.1",
@@ -54687,13 +56769,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.73,
-				"output": 3.49,
-				"cacheRead": 0.25,
+				"input": 0.684,
+				"output": 3.42,
+				"cacheRead": 0.144,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 262142,
+			"maxTokens": 262144,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -55224,6 +57306,56 @@
 				"output": 150,
 				"cacheRead": 3,
 				"cacheWrite": 37.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"anthropic/claude-opus-4.8": {
+			"id": "anthropic/claude-opus-4.8",
+			"name": "Anthropic: Anthropic Opus 4.8",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"anthropic/claude-opus-4.8-fast": {
+			"id": "anthropic/claude-opus-4.8-fast",
+			"name": "Anthropic: Anthropic Opus 4.8 (Fast)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 10,
+				"output": 50,
+				"cacheRead": 1,
+				"cacheWrite": 12.5
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
@@ -55923,13 +58055,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.09999999999999999,
-				"output": 0.19999999999999998,
-				"cacheRead": 0.02,
+				"input": 0.0983,
+				"output": 0.1966,
+				"cacheRead": 0.019700000000000002,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 16384,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -56020,7 +58152,7 @@
 				"cacheRead": 0.024999999999999998,
 				"cacheWrite": 0.08333333333333334
 			},
-			"contextWindow": 1000000,
+			"contextWindow": 1048576,
 			"maxTokens": 8192
 		},
 		"google/gemini-2.0-flash-lite-001": {
@@ -57088,7 +59220,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 262144,
+			"contextWindow": 204800,
 			"maxTokens": 8192,
 			"compat": {
 				"supportsToolChoice": false
@@ -57757,13 +59889,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.73,
-				"output": 3.49,
-				"cacheRead": 0.25,
+				"input": 0.684,
+				"output": 3.42,
+				"cacheRead": 0.144,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 262142,
+			"maxTokens": 262144,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -61085,6 +63217,34 @@
 				"maxLevel": "high"
 			}
 		},
+		"stepfun/step-3.7-flash": {
+			"id": "stepfun/step-3.7-flash",
+			"name": "StepFun: Step 3.7 Flash",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.19999999999999998,
+				"output": 1.15,
+				"cacheRead": 0.04,
+				"cacheWrite": 0
+			},
+			"contextWindow": 256000,
+			"maxTokens": 256000,
+			"compat": {
+				"supportsToolChoice": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"tencent/hy3-preview": {
 			"id": "tencent/hy3-preview",
 			"name": "Hy3 preview",
@@ -61729,8 +63889,8 @@
 			],
 			"cost": {
 				"input": 0.125,
-				"output": 0.84,
-				"cacheRead": 0.024999999999999998,
+				"output": 0.85,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
@@ -62829,6 +64989,56 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
+		"claude-opus-4-8": {
+			"id": "claude-opus-4-8",
+			"name": "Anthropic Opus 4.8",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"compat": {
+				"supportsUsageInStreaming": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"claude-opus-4-8-fast": {
+			"id": "claude-opus-4-8-fast",
+			"name": "anthropic-opus-4-8-fast",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
 			"maxTokens": 8888,
 			"compat": {
 				"supportsUsageInStreaming": false
@@ -65642,6 +67852,31 @@
 		"anthropic/claude-opus-4.7": {
 			"id": "anthropic/claude-opus-4.7",
 			"name": "Anthropic Opus 4.7",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 25,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"anthropic/claude-opus-4.8": {
+			"id": "anthropic/claude-opus-4.8",
+			"name": "Anthropic Opus 4.8",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",

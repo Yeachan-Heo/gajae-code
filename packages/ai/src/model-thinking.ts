@@ -176,20 +176,19 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
  * When a model's context is exhausted, the agent can promote to a sibling
  * model with a larger context window on the same provider:
  * - `OpenAI code backend-spark` variants promote to `gpt-5.5`.
- * - `gpt-5.5` (270K input) promotes to `gpt-5.4` (1M input).
+ *
+ * Do not promote `gpt-5.5` to lower-version GPT-5 variants. Users who select
+ * `gpt-5.5` explicitly should stay on that model and use compaction on overflow.
  */
 export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
 	for (const candidate of models) {
 		const parsedCandidate = parseKnownModel(candidate.id);
 		if (parsedCandidate.family !== "openai") continue;
 		let targetId: string | undefined;
-		if (parsedCandidate.variant === "codex-spark") {
-			targetId = "gpt-5.5";
-		} else if (parsedCandidate.variant === "base" && semverEqual(parsedCandidate.version, "5.5")) {
-			targetId = "gpt-5.4";
-		} else {
+		if (parsedCandidate.variant !== "codex-spark") {
 			continue;
 		}
+		targetId = "gpt-5.5";
 		const fallback = models.find(
 			model => model.provider === candidate.provider && model.api === candidate.api && model.id === targetId,
 		);
