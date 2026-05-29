@@ -1,6 +1,6 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import { $env, logger } from "@gajae-code/utils";
+import { $env } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 
@@ -67,6 +67,9 @@ export interface Terminal {
 	// Write output to terminal
 	write(data: string): void;
 
+	// Whether terminal output is still writable
+	get available(): boolean;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -121,7 +124,9 @@ export class ProcessTerminal implements Terminal {
 	#stdinDataHandler?: (data: string) => void;
 	#dead = false;
 	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
+	#detachLogPath = $env.PI_TUI_TERMINAL_DETACH_LOG || "";
 	#windowsVTInputRestore?: () => void;
+	#stdoutErrorHandler?: (err: Error) => void;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
@@ -166,6 +171,10 @@ export class ProcessTerminal implements Terminal {
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
+		this.#stdoutErrorHandler = (err: Error) => {
+			this.#markUnavailable(err, "stdout-error");
+		};
+		process.stdout.on("error", this.#stdoutErrorHandler);
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only.
@@ -611,6 +620,10 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
 		}
+		if (this.#stdoutErrorHandler) {
+			process.stdout.removeListener("error", this.#stdoutErrorHandler);
+			this.#stdoutErrorHandler = undefined;
+		}
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
@@ -639,13 +652,59 @@ export class ProcessTerminal implements Terminal {
 		// Skip control sequences when stdout isn't a TTY (piped output, tests, log
 		// files). They serve no purpose there and would surface as visible noise.
 		if (!process.stdout.isTTY) return;
+		if (
+			!process.stdout.writable ||
+			process.stdout.destroyed ||
+			process.stdout.closed ||
+			process.stdout.writableEnded
+		) {
+			this.#markUnavailable(undefined, "stdout-closed");
+			return;
+		}
 		try {
 			process.stdout.write(data);
 		} catch (err) {
-			// Any write failure means terminal is dead - no recovery possible
-			this.#dead = true;
-			logger.warn("terminal is dead - no recovery possible", { error: err, data });
+			this.#markUnavailable(err, "write");
 		}
+	}
+
+	#markUnavailable(err: unknown, operation: string): void {
+		if (this.#dead) return;
+		this.#dead = true;
+		this.#clearProgressTimer();
+		this.#stopOsc11Poll();
+		if (this.#mode2031DebounceTimer) {
+			clearTimeout(this.#mode2031DebounceTimer);
+			this.#mode2031DebounceTimer = undefined;
+		}
+		if (this.#modifyOtherKeysTimeout) {
+			clearTimeout(this.#modifyOtherKeysTimeout);
+			this.#modifyOtherKeysTimeout = undefined;
+		}
+		this.#appendDetachDebugEvent(operation, err);
+	}
+
+	#appendDetachDebugEvent(operation: string, err: unknown): void {
+		if (!this.#detachLogPath) return;
+		const error = err instanceof Error ? err : undefined;
+		const code =
+			typeof (err as { code?: unknown } | undefined)?.code === "string" ? (err as { code: string }).code : undefined;
+		const line = JSON.stringify({
+			at: new Date().toISOString(),
+			operation,
+			code,
+			name: error?.name,
+			message: error?.message,
+		});
+		try {
+			fs.appendFileSync(this.#detachLogPath, `${line}\n`, { encoding: "utf8" });
+		} catch {
+			// Ignore debug logging errors; the terminal is already unavailable.
+		}
+	}
+
+	get available(): boolean {
+		return !this.#dead;
 	}
 
 	get columns(): number {

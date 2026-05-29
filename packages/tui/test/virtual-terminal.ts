@@ -78,6 +78,10 @@ export class VirtualTerminal implements Terminal {
 		return undefined;
 	}
 
+	get available(): boolean {
+		return true;
+	}
+
 	onAppearanceChange(_callback: (appearance: TerminalAppearance) => void): void {
 		// No-op for virtual terminal
 	}

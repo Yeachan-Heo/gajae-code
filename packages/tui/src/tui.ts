@@ -256,6 +256,7 @@ export class TUI extends Container {
 	#maxLinesRendered = 0; // Line count from last render, used for viewport calculation
 	#fullRedrawCount = 0;
 	#stopped = false;
+	#terminalUnavailable = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	overlayStack: {
@@ -285,7 +286,7 @@ export class TUI extends Container {
 		if (this.#showHardwareCursor === enabled) return;
 		this.#showHardwareCursor = enabled;
 		if (!enabled) {
-			this.terminal.hideCursor();
+			this.#hideCursor();
 		}
 		this.requestRender();
 	}
@@ -328,7 +329,7 @@ export class TUI extends Container {
 		if (this.#isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
-		this.terminal.hideCursor();
+		this.#hideCursor();
 		this.requestRender();
 
 		// Return handle for controlling this overlay
@@ -342,7 +343,7 @@ export class TUI extends Container {
 						const topVisible = this.#getTopmostVisibleOverlay();
 						this.setFocus(topVisible?.component ?? entry.preFocus);
 					}
-					if (this.overlayStack.length === 0) this.terminal.hideCursor();
+					if (this.overlayStack.length === 0) this.#hideCursor();
 					this.requestRender();
 				}
 			},
@@ -375,7 +376,7 @@ export class TUI extends Container {
 		// Find topmost visible overlay, or fall back to preFocus
 		const topVisible = this.#getTopmostVisibleOverlay();
 		this.setFocus(topVisible?.component ?? overlay.preFocus);
-		if (this.overlayStack.length === 0) this.terminal.hideCursor();
+		if (this.overlayStack.length === 0) this.#hideCursor();
 		this.requestRender();
 	}
 
@@ -410,14 +411,60 @@ export class TUI extends Container {
 
 	start(): void {
 		this.#stopped = false;
+		this.#terminalUnavailable = false;
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => this.requestRender(),
 		);
-		this.terminal.hideCursor();
+		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
 		this.requestRender(true);
+	}
+
+	get terminalAvailable(): boolean {
+		return !this.#terminalUnavailable && this.terminal.available;
+	}
+
+	#markTerminalUnavailable(): void {
+		this.#terminalUnavailable = true;
+		this.#stopped = true;
+		this.#renderRequested = false;
+		if (this.#renderTimer) {
+			clearTimeout(this.#renderTimer);
+			this.#renderTimer = undefined;
+		}
+		this.#clearSixelProbeState();
+	}
+
+	#writeTerminal(data: string): boolean {
+		return this.#guardTerminalOperation(() => this.terminal.write(data));
+	}
+
+	#hideCursor(): boolean {
+		return this.#guardTerminalOperation(() => this.terminal.hideCursor());
+	}
+
+	#showCursor(): boolean {
+		return this.#guardTerminalOperation(() => this.terminal.showCursor());
+	}
+
+	#guardTerminalOperation(operation: () => void): boolean {
+		if (!this.terminalAvailable) {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		try {
+			operation();
+		} catch {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		if (!this.terminal.available) {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		return true;
 	}
 
 	addInputListener(listener: InputListener): () => void {
@@ -441,8 +488,8 @@ export class TUI extends Container {
 		this.#sixelProbePendingDa = true;
 		this.#sixelProbePendingGraphics = true;
 		this.#sixelProbeUnsubscribe = this.addInputListener(data => this.#handleSixelProbeInput(data));
-		this.terminal.write("\x1b[c");
-		this.terminal.write("\x1b[?2;1;0S");
+		if (!this.#writeTerminal("\x1b[c")) return;
+		if (!this.#writeTerminal("\x1b[?2;1;0S")) return;
 		this.#sixelProbeTimeout = setTimeout(() => {
 			this.#finishSixelProbe(false);
 		}, 250);
@@ -563,7 +610,7 @@ export class TUI extends Container {
 		}
 		// Query terminal for cell size in pixels: CSI 16 t
 		// Response format: CSI 6 ; height ; width t
-		this.terminal.write("\x1b[16t");
+		this.#writeTerminal("\x1b[16t");
 	}
 
 	stop(): void {
@@ -578,18 +625,26 @@ export class TUI extends Container {
 			const targetRow = this.#previousLines.length; // Line after the last content
 			const lineDiff = targetRow - this.#hardwareCursorRow;
 			if (lineDiff > 0) {
-				this.terminal.write(`\x1b[${lineDiff}B`);
+				this.#writeTerminal(`\x1b[${lineDiff}B`);
 			} else if (lineDiff < 0) {
-				this.terminal.write(`\x1b[${-lineDiff}A`);
+				this.#writeTerminal(`\x1b[${-lineDiff}A`);
 			}
-			this.terminal.write("\r\n");
+			this.#writeTerminal("\r\n");
 		}
 
-		this.terminal.showCursor();
-		this.terminal.stop();
+		this.#showCursor();
+		try {
+			this.terminal.stop();
+		} catch {
+			this.#markTerminalUnavailable();
+		}
 	}
 
 	requestRender(force = false): void {
+		if (!this.terminalAvailable) {
+			this.#markTerminalUnavailable();
+			return;
+		}
 		if (force) {
 			this.#previousLines = [];
 			this.#previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
@@ -1040,7 +1095,7 @@ export class TUI extends Container {
 	}
 
 	#doRender(): void {
-		if (this.#stopped) return;
+		if (this.#stopped || !this.terminalAvailable) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
 		let viewportTop = Math.max(0, this.#maxLinesRendered - height);
@@ -1091,7 +1146,7 @@ export class TUI extends Container {
 			this.#hardwareCursorRow = toRow;
 			buffer += seq;
 			buffer += "\x1b[?2026l"; // End synchronized output
-			this.terminal.write(buffer);
+			if (!this.#writeTerminal(buffer)) return;
 			// Reset max lines when clearing, otherwise track growth
 			if (clear) {
 				this.#maxLinesRendered = newLines.length;
@@ -1140,7 +1195,7 @@ export class TUI extends Container {
 			this.#hardwareCursorRow = cursorToRow;
 			buffer += cursorSeq;
 			buffer += "\x1b[?2026l";
-			this.terminal.write(buffer);
+			if (!this.#writeTerminal(buffer)) return;
 
 			if ($flag("PI_DEBUG_REDRAW")) {
 				const logPath = getDebugLogPath();
@@ -1274,7 +1329,7 @@ export class TUI extends Container {
 				this.#hardwareCursorRow = toRow;
 				buffer += seq;
 				buffer += "\x1b[?2026l";
-				this.terminal.write(buffer);
+				if (!this.#writeTerminal(buffer)) return;
 			}
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
@@ -1415,7 +1470,7 @@ export class TUI extends Container {
 		}
 
 		// Write entire buffer at once
-		this.terminal.write(buffer);
+		if (!this.#writeTerminal(buffer)) return;
 
 		// Track cursor position for next render.
 		// cursorRow tracks end of content (for viewport calculation).
@@ -1471,11 +1526,11 @@ export class TUI extends Container {
 	 */
 	#writeCursorPosition(cursorPos: { row: number; col: number } | null, totalLines: number): void {
 		if (!cursorPos || totalLines <= 0) {
-			this.terminal.hideCursor();
+			this.#hideCursor();
 			return;
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		this.#hardwareCursorRow = toRow;
-		this.terminal.write(`\x1b[?2026h${seq}\x1b[?2026l`);
+		this.#writeTerminal(`\x1b[?2026h${seq}\x1b[?2026l`);
 	}
 }
