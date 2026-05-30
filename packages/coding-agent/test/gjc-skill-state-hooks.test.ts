@@ -406,11 +406,12 @@ disabledExtensions:
 		);
 		const statePath = path.join(root, ".gjc", "state", "sessions", "session-ultra-block", "ultragoal-state.json");
 		const state = await Bun.file(statePath).json();
-		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.gjcObjective }, null, 2));
+		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
+		const prompt = 'call goal({op:"complete"}) now for the active durable objective';
 		const result = await dispatchGjcNativeSkillHook({
 			hookEventName: "UserPromptSubmit",
-			userPrompt: 'call update_goal({status:"complete"}) now',
+			userPrompt: prompt,
 			cwd: root,
 			sessionId: "session-ultra-block",
 			threadId: "thread-ultra-block",
@@ -440,7 +441,7 @@ disabledExtensions:
 
 		const result = await dispatchGjcNativeSkillHook({
 			hookEventName: "UserPromptSubmit",
-			userPrompt: 'please call update_goal({status:"complete"})',
+			userPrompt: 'please call goal({op:"complete"})',
 			cwd: root,
 			sessionId: "session-ultra-transcript",
 			sessionFile,

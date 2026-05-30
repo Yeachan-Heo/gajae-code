@@ -6,92 +6,50 @@ import * as z from "zod/v4";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { assertCanCompleteCurrentGoal } from "../../gjc-runtime/ultragoal-guard";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
-import createGoalDescription from "../../prompts/tools/create-goal.md" with { type: "text" };
-import getGoalDescription from "../../prompts/tools/get-goal.md" with { type: "text" };
 import goalDescription from "../../prompts/tools/goal.md" with { type: "text" };
-import updateGoalDescription from "../../prompts/tools/update-goal.md" with { type: "text" };
 import { formatDuration } from "../../slash-commands/helpers/format";
 import type { ToolSession } from "../../tools";
 import { formatErrorMessage, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { renderStatusLine, truncateToWidth } from "../../tui";
-import { completionBudgetReport, remainingTokens, validateGoalObjective } from "../runtime";
+import { validateGoalObjective } from "../runtime";
 import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = z.object({
 	op: z.enum(["create", "get", "complete", "resume", "drop"]).describe("goal operation"),
 	objective: z.string().describe("goal objective").optional(),
-	token_budget: z.number().int().describe("token budget").optional(),
-});
-
-const getGoalSchema = z.object({});
-
-const createGoalSchema = z.object({
-	objective: z.string().describe("goal objective"),
-	token_budget: z.number().int().describe("token budget").optional(),
-});
-
-const updateGoalSchema = z.object({
-	status: z.enum(["complete", "dropped"]).describe("new goal status"),
 });
 
 export type GoalToolInput = z.infer<typeof goalSchema>;
-export type GetGoalToolInput = z.infer<typeof getGoalSchema>;
-export type CreateGoalToolInput = z.infer<typeof createGoalSchema>;
-export type UpdateGoalToolInput = z.infer<typeof updateGoalSchema>;
 
 export interface GoalToolResponse {
 	goal: Goal | null;
-	remainingTokens: number | null;
-	completionBudgetReport: string | null;
 }
 
-export function buildGoalToolResponse(
-	goal: Goal | null | undefined,
-	options?: { includeCompletionReport?: boolean },
-): GoalToolResponse {
-	const resolvedGoal = goal ?? null;
-	return {
-		goal: resolvedGoal,
-		remainingTokens: remainingTokens(resolvedGoal),
-		completionBudgetReport:
-			options?.includeCompletionReport && resolvedGoal?.status === "complete"
-				? completionBudgetReport(resolvedGoal)
-				: null,
-	};
+export function buildGoalToolResponse(goal: Goal | null | undefined): GoalToolResponse {
+	return { goal: goal ?? null };
 }
 
-function validateCreateParams(params: { objective?: string; token_budget?: number }): {
-	objective: string;
-	tokenBudget?: number;
-} {
+function rejectUnsupportedGoalArgs(params: Record<string, unknown>): void {
+	if ("token_budget" in params || "tokenBudget" in params) {
+		throw new ToolError("token_budget is not supported for goals");
+	}
+}
+
+function validateCreateParams(params: { objective?: string }): { objective: string } {
 	let objective: string;
 	try {
 		objective = validateGoalObjective(params.objective ?? "", "create");
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}
-	const tokenBudget = params.token_budget;
-	if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
-		throw new ToolError("token_budget must be a positive integer when provided");
-	}
-	return { objective, tokenBudget };
+	return { objective };
 }
 
 function renderGoalToolResponse(response: GoalToolResponse): string {
 	if (!response.goal) return "No active goal.";
 
-	let text = `Goal: ${response.goal.objective}\nStatus: ${response.goal.status}\nTokens: ${response.goal.tokensUsed} used`;
-	if (response.goal.tokenBudget !== undefined) {
-		text += ` / ${response.goal.tokenBudget} budget`;
-	}
-	if (response.remainingTokens !== null) {
-		text += `\nRemaining tokens: ${response.remainingTokens}`;
-	}
-	if (response.completionBudgetReport) {
-		text += `\n\n${response.completionBudgetReport}`;
-	}
-	return text;
+	return `Goal: ${response.goal.objective}\nStatus: ${response.goal.status}\nTokens used: ${response.goal.tokensUsed}`;
 }
 
 function buildGoalToolResult(op: GoalToolDetails["op"], response: GoalToolResponse): AgentToolResult<GoalToolDetails> {
@@ -100,13 +58,12 @@ function buildGoalToolResult(op: GoalToolDetails["op"], response: GoalToolRespon
 		details: {
 			op,
 			goal: response.goal,
-			remainingTokens: response.remainingTokens,
-			completionBudgetReport: response.completionBudgetReport,
 		},
 	};
 }
 
 async function executeGoalOperation(session: ToolSession, params: GoalToolInput): Promise<GoalToolResponse> {
+	rejectUnsupportedGoalArgs(params as Record<string, unknown>);
 	if (params.op === "get") {
 		const state = session.getGoalModeState?.();
 		return buildGoalToolResponse(state?.goal ?? null);
@@ -135,7 +92,7 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}
 	const completed = await runtime.completeGoalFromTool();
-	return buildGoalToolResponse(completed, { includeCompletionReport: true });
+	return buildGoalToolResponse(completed);
 }
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
@@ -164,102 +121,6 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	}
 }
 
-export class GetGoalTool implements AgentTool<typeof getGoalSchema, GoalToolDetails> {
-	readonly name = "get_goal";
-	readonly label = "Get Goal";
-	readonly loadMode = "essential" as const;
-	readonly description = prompt.render(getGoalDescription);
-	readonly parameters = getGoalSchema;
-	readonly strict = true;
-	readonly intent = "omit" as const;
-	readonly #session: ToolSession;
-
-	static createIf(session: ToolSession): GetGoalTool | null {
-		return session.getGoalModeState || session.getGoalRuntime ? new GetGoalTool(session) : null;
-	}
-
-	constructor(session: ToolSession) {
-		this.#session = session;
-	}
-
-	async execute(
-		_toolCallId: string,
-		_params: GetGoalToolInput,
-		_signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<GoalToolDetails>,
-		_context?: AgentToolContext,
-	): Promise<AgentToolResult<GoalToolDetails>> {
-		const response = await executeGoalOperation(this.#session, { op: "get" });
-		return buildGoalToolResult("get", response);
-	}
-}
-
-export class CreateGoalTool implements AgentTool<typeof createGoalSchema, GoalToolDetails> {
-	readonly name = "create_goal";
-	readonly label = "Create Goal";
-	readonly loadMode = "essential" as const;
-	readonly description = prompt.render(createGoalDescription);
-	readonly parameters = createGoalSchema;
-	readonly strict = true;
-	readonly intent = "omit" as const;
-	readonly #session: ToolSession;
-
-	static createIf(session: ToolSession): CreateGoalTool | null {
-		return session.getGoalRuntime ? new CreateGoalTool(session) : null;
-	}
-
-	constructor(session: ToolSession) {
-		this.#session = session;
-	}
-
-	async execute(
-		_toolCallId: string,
-		params: CreateGoalToolInput,
-		_signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<GoalToolDetails>,
-		_context?: AgentToolContext,
-	): Promise<AgentToolResult<GoalToolDetails>> {
-		const response = await executeGoalOperation(this.#session, {
-			op: "create",
-			objective: params.objective,
-			token_budget: params.token_budget,
-		});
-		return buildGoalToolResult("create", response);
-	}
-}
-
-export class UpdateGoalTool implements AgentTool<typeof updateGoalSchema, GoalToolDetails> {
-	readonly name = "update_goal";
-	readonly label = "Update Goal";
-	readonly loadMode = "essential" as const;
-	readonly description = prompt.render(updateGoalDescription);
-	readonly parameters = updateGoalSchema;
-	readonly strict = true;
-	readonly intent = "omit" as const;
-	readonly #session: ToolSession;
-
-	static createIf(session: ToolSession): UpdateGoalTool | null {
-		return session.getGoalRuntime ? new UpdateGoalTool(session) : null;
-	}
-
-	constructor(session: ToolSession) {
-		this.#session = session;
-	}
-
-	async execute(
-		_toolCallId: string,
-		params: UpdateGoalToolInput,
-		_signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<GoalToolDetails>,
-		_context?: AgentToolContext,
-	): Promise<AgentToolResult<GoalToolDetails>> {
-		const response = await executeGoalOperation(this.#session, {
-			op: params.status === "dropped" ? "drop" : "complete",
-		});
-		return buildGoalToolResult(params.status === "dropped" ? "drop" : "complete", response);
-	}
-}
-
 function describeOp(op: string | undefined): string {
 	switch (op) {
 		case "create":
@@ -281,8 +142,6 @@ function goalBadgeColor(status: GoalStatus): ThemeColor {
 	switch (status) {
 		case "complete":
 			return "success";
-		case "budget-limited":
-			return "warning";
 		case "paused":
 		case "dropped":
 			return "muted";
@@ -294,7 +153,6 @@ function goalBadgeColor(status: GoalStatus): ThemeColor {
 interface GoalRenderArgs {
 	op?: GoalToolInput["op"];
 	objective?: string;
-	token_budget?: number;
 }
 
 export const goalToolRenderer = {
@@ -305,9 +163,6 @@ export const goalToolRenderer = {
 		if (args.op === "create" && trimmedObjective) {
 			const objective = truncateToWidth(trimmedObjective, TRUNCATE_LENGTHS.TITLE);
 			meta.push(uiTheme.italic(uiTheme.fg("muted", `"${objective}"`)));
-		}
-		if (args.op === "create" && args.token_budget !== undefined) {
-			meta.push(`budget ${formatNumber(args.token_budget)}`);
 		}
 		const text = renderStatusLine({ icon: "pending", title: "Goal", description, meta }, uiTheme);
 		return new Text(text, 0, 0);
@@ -352,22 +207,10 @@ export const goalToolRenderer = {
 
 		const objectiveText = truncateToWidth(goal.objective.trim(), TRUNCATE_LENGTHS.LONG);
 		lines.push(`  ${uiTheme.italic(uiTheme.fg("muted", `"${objectiveText}"`))}`);
-
-		const used = formatNumber(goal.tokensUsed);
-		const tokensLine =
-			goal.tokenBudget !== undefined
-				? `${used} / ${formatNumber(goal.tokenBudget)} tokens (${formatNumber(Math.max(0, goal.tokenBudget - goal.tokensUsed))} left)`
-				: `${used} tokens`;
-		lines.push(`  ${uiTheme.fg("dim", tokensLine)}`);
+		lines.push(`  ${uiTheme.fg("dim", `${formatNumber(goal.tokensUsed)} tokens used`)}`);
 
 		if (goal.timeUsedSeconds > 0) {
 			lines.push(`  ${uiTheme.fg("dim", `${formatDuration(goal.timeUsedSeconds * 1000)} elapsed`)}`);
-		}
-
-		const report = details?.completionBudgetReport;
-		if (report) {
-			lines.push("");
-			lines.push(uiTheme.italic(uiTheme.fg("muted", report)));
 		}
 
 		return new Text(lines.join("\n"), 0, 0);

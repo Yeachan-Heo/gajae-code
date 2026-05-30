@@ -7,7 +7,7 @@ import { EditTool } from "../edit";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
-import { CreateGoalTool, GetGoalTool, GoalTool, UpdateGoalTool } from "../goals/tools/goal-tool";
+import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
@@ -309,12 +309,9 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
 	goal: s => new GoalTool(s),
-	get_goal: GetGoalTool.createIf,
-	create_goal: CreateGoalTool.createIf,
-	update_goal: UpdateGoalTool.createIf,
 };
 
-const GOAL_MODE_TOOL_NAMES = ["get_goal", "create_goal", "update_goal"] as const;
+const GOAL_MODE_TOOL_NAMES = [] as const;
 
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	yield: s => new YieldTool(s),

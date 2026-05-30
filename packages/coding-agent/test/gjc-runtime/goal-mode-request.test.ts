@@ -137,6 +137,47 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(after).toBe(before);
 	});
 
+	it("normalizes legacy budget-limited session goals", async () => {
+		const root = await tempDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const timestamp = new Date().toISOString();
+		const existingGoal = {
+			id: "goal-1",
+			objective: "Existing goal",
+			status: "budget-limited",
+			tokenBudget: 10,
+			tokensUsed: 12,
+			timeUsedSeconds: 0,
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		await Bun.write(
+			sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp, cwd: root }),
+				JSON.stringify({
+					type: "mode_change",
+					id: "mode-1",
+					parentId: null,
+					timestamp,
+					mode: "goal",
+					data: { goal: existingGoal },
+				}),
+				"",
+			].join("\n"),
+		);
+
+		const result = await writeCurrentSessionGoalModeState({
+			sessionFile,
+			objective: "New ultragoal objective",
+		});
+
+		expect(result.status).toBe("existing_goal");
+		if (result.status !== "existing_goal") throw new Error("expected existing goal");
+		expect(result.goal).toMatchObject({ status: "active", tokensUsed: 12 });
+		expect("tokenBudget" in result.goal).toBe(false);
+	});
+
 	it("queues a pending activation request even when the session file already has an active goal", async () => {
 		const root = await tempDir();
 		const sessionFile = path.join(root, "session.jsonl");

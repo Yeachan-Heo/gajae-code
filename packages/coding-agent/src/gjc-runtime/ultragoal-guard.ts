@@ -171,7 +171,7 @@ export function validateCompletionReceipt(input: {
 	if (hashStructuredValue(event.gjcGoalJson) !== receipt.gjcGoalSnapshotHash) {
 		return {
 			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} receipt get_goal snapshot hash does not match ledger.`,
+			message: `Ultragoal ${input.goal.id} receipt goal({"op":"get"}) snapshot hash does not match ledger.`,
 			goalId: input.goal.id,
 		};
 	}
@@ -275,7 +275,10 @@ export async function assertCanCompleteCurrentGoal(input: {
 }
 
 export function isUltragoalBypassPrompt(prompt: string): boolean {
-	return /update_goal\s*\(|goal\s+complete|checkpoint[^\n]+--status\s+complete|skip\s+verification|weaken\s+verification|mark\s+.*complete/i.test(
-		prompt,
+	const normalized = prompt.replace(/\\?"/g, '"');
+	return (
+		/update_goal\s*\(|goal\s+complete|checkpoint[^\n]+--status\s+complete|skip\s+verification|weaken\s+verification|mark\s+.*complete/i.test(
+			normalized,
+		) || /goal[\s\S]{0,80}complete/i.test(normalized)
 	);
 }

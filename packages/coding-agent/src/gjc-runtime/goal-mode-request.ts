@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Snowflake } from "@gajae-code/utils";
-import type { Goal, GoalModeState } from "../goals/state";
+import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
@@ -94,24 +94,7 @@ export async function writePendingGoalModeRequest(input: {
 }
 
 function goalFromModeData(modeData: Record<string, unknown> | undefined): Goal | null {
-	const candidate = modeData?.goal;
-	if (typeof candidate !== "object" || candidate === null) return null;
-	const goal = candidate as Partial<Goal>;
-	if (
-		typeof goal.id !== "string" ||
-		typeof goal.objective !== "string" ||
-		typeof goal.status !== "string" ||
-		typeof goal.tokensUsed !== "number" ||
-		typeof goal.timeUsedSeconds !== "number" ||
-		typeof goal.createdAt !== "number" ||
-		typeof goal.updatedAt !== "number"
-	) {
-		return null;
-	}
-	if (!["active", "paused", "budget-limited", "complete", "dropped"].includes(goal.status)) {
-		return null;
-	}
-	return goal as Goal;
+	return normalizeGoal(modeData?.goal);
 }
 
 function isNonTerminalGoal(goal: Goal | null): goal is Goal {

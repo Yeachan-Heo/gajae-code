@@ -389,20 +389,34 @@ export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitS
 	if (!stateMatchesContext(visibleModeState.state, input.sessionId, input.threadId)) return null;
 
 	const phase = String(visibleModeState.state.current_phase ?? "active");
-	const objective =
-		(await readCurrentGoalObjectiveFromSessionFile(input.sessionFile)) ??
-		(typeof visibleModeState.state.objective === "string"
+	const stateObjective =
+		typeof visibleModeState.state.objective === "string"
 			? visibleModeState.state.objective
 			: typeof visibleModeState.state.gjcObjective === "string"
 				? visibleModeState.state.gjcObjective
-				: "");
-	if (input.prompt && isUltragoalBypassPrompt(input.prompt) && objective) {
-		const diagnostic = await readUltragoalVerificationState({
-			cwd: input.cwd,
-			currentGoal: { objective },
-		});
-		if (!["inactive", "unrelated_goal", "active_verified_complete"].includes(diagnostic.state)) {
-			return `BLOCK_ULTRAGOAL_COMPLETION: ${diagnostic.message} Use durable blocker work or run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>\` before completion.`;
+				: "";
+	const sessionObjective = await readCurrentGoalObjectiveFromSessionFile(input.sessionFile);
+	const normalizedPrompt = input.prompt?.replace(/\\?"/g, '"');
+	const isBypassPrompt = Boolean(
+		(normalizedPrompt && isUltragoalBypassPrompt(normalizedPrompt)) ||
+			(input.prompt && /goal[\s\S]{0,80}complete/i.test(input.prompt)),
+	);
+	if (isBypassPrompt) {
+		const objectives = [sessionObjective, stateObjective].filter(
+			(value): value is string => typeof value === "string" && value.trim().length > 0,
+		);
+		if (objectives.length === 0) {
+			return "BLOCK_ULTRAGOAL_COMPLETION: Active Ultragoal completion is blocked until a current GJC goal objective can be verified. Use durable blocker work or run strict `gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>` before completion.";
+		}
+		for (const objective of objectives) {
+			const diagnostic = await readUltragoalVerificationState({
+				cwd: input.cwd,
+				currentGoal: { objective },
+			});
+			if (diagnostic.state === "unrelated_goal") continue;
+			if (!["inactive", "active_verified_complete"].includes(diagnostic.state)) {
+				return `BLOCK_ULTRAGOAL_COMPLETION: ${diagnostic.message} Use durable blocker work or run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>\` before completion.`;
+			}
 		}
 	}
 	return `Ultragoal is active (phase: ${phase}; state: ${visibleModeState.statePath}). If the user prompt is a steering request, use \`gjc ultragoal steer\` to add or steer subgoals. Normal prose should not mutate Ultragoal state.`;

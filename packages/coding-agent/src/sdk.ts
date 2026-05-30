@@ -1422,7 +1422,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		for (const tool of builtinTools) {
 			toolRegistry.set(tool.name, tool);
 		}
-		const goalStateToolNames = ["goal", "get_goal", "create_goal", "update_goal"] as const;
+		const goalStateToolNames = ["goal"] as const;
 		if (settings.get("goal.enabled")) {
 			for (const name of goalStateToolNames) {
 				if (toolRegistry.has(name)) continue;

@@ -2207,7 +2207,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tasks",
 			label: "Goal Status In Footer",
-			description: "Show token budget alongside the goal indicator in the status line",
+			description: "Show goal usage alongside the goal indicator in the status line",
 		},
 	},
 

@@ -645,7 +645,7 @@ async function readGjcGoalSnapshot(input: {
 }): Promise<unknown> {
 	if (!input.value?.trim()) {
 		if (!input.required) return undefined;
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json from a fresh active get_goal snapshot`);
+		throw new Error(`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot`);
 	}
 	const snapshot = await readStructuredValue(input.cwd, input.value);
 	const snapshotObject = qualityGateObject(snapshot);
@@ -653,7 +653,8 @@ async function readGjcGoalSnapshot(input: {
 	const goalObject = qualityGateObject(snapshotObject?.goal) ?? qualityGateObject(detailsObject?.goal);
 	if (!goalObject) throw new Error(`${input.errorPrefix} require --gjc-goal-json with a goal object`);
 	const updatedAt = typeof goalObject.updatedAt === "number" ? goalObject.updatedAt : null;
-	if (!updatedAt) throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.updatedAt from get_goal`);
+	if (!updatedAt)
+		throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.updatedAt from goal({"op":"get"})`);
 	const nowMilliseconds = Date.now();
 	if (updatedAt < nowMilliseconds - GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS) {
 		throw new Error(`${input.errorPrefix} require a fresh --gjc-goal-json snapshot`);
@@ -817,7 +818,7 @@ export async function recordUltragoalReviewBlockers(input: {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("record-review-blockers --objective is required");
 	if (!input.gjcGoalJson?.trim()) {
-		throw new Error("record-review-blockers require --gjc-goal-json from a fresh active get_goal snapshot");
+		throw new Error('record-review-blockers require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot');
 	}
 	const plan = await checkpointUltragoalGoal({
 		cwd: input.cwd,
@@ -913,7 +914,7 @@ function renderCompleteHandoff(
 		`Ultragoal handoff: ${result.goal.id} — ${result.goal.title}`,
 		`Objective: ${result.goal.objective}`,
 		`GJC objective: ${result.plan.gjcObjective}`,
-		"Call get_goal({}); create_goal only if no active GJC goal exists, then complete this GJC story.",
+		'Call goal({"op":"get"}); call goal({"op":"create","objective":"<printed objective>"}) only if no active GJC goal exists, then complete this GJC story with goal({"op":"complete"}) after verification.',
 		"Before checkpointing complete, obtain a passing architectReview (architecture/product/code CLEAR + APPROVE) and executorQa (e2e/red-team passed); record blockers instead of completing on any finding.",
 		"",
 	].join("\n");

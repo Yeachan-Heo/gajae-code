@@ -31,7 +31,6 @@ function createActiveGoalState() {
 			id: "goal-1",
 			objective: "Ship the release",
 			status: "active" as const,
-			tokenBudget: 25,
 			tokensUsed: 5,
 			timeUsedSeconds: 0,
 			createdAt: 1,
@@ -261,7 +260,7 @@ describe("createTools", () => {
 		const requestedTools = await createTools(session, ["read"]);
 		expect(requestedTools.map(t => t.name)).toEqual(["read", "resolve"]);
 	});
-	it("auto-includes goal tools when goal mode is enabled", async () => {
+	it("auto-includes the unified goal tool when goal mode is enabled", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
@@ -273,10 +272,10 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "goal", "get_goal", "create_goal", "update_goal", "resolve"]);
+		expect(names).toEqual(["read", "goal", "resolve"]);
 	});
 
-	it("exposes legacy goal even when no goal is active", async () => {
+	it("exposes the unified goal tool even when no goal is active", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
@@ -287,7 +286,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "goal", "get_goal", "create_goal", "update_goal", "resolve"]);
+		expect(names).toEqual(["read", "goal", "resolve"]);
 	});
 
 	it("includes search_tool_bm25 when MCP tool discovery is enabled and executable", async () => {
@@ -303,10 +302,11 @@ describe("createTools", () => {
 		expect(names).toContain("search_tool_bm25");
 	});
 
-	it("exposes all goal tools as builtins", () => {
+	it("exposes only the unified goal tool as a builtin goal surface", () => {
 		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["report_finding", "resolve", "yield"]);
-		expect(Object.keys(BUILTIN_TOOLS)).toEqual(
-			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+		expect(Object.keys(BUILTIN_TOOLS)).toContain("goal");
+		expect(Object.keys(BUILTIN_TOOLS)).not.toEqual(
+			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
 	});
 });

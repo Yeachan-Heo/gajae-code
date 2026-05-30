@@ -193,7 +193,7 @@ Project executor override body.
 		).text();
 
 		for (const content of [team, ultragoal]) {
-			expect(content).toContain("fresh `get_goal` snapshot");
+			expect(content).toContain('fresh `goal({"op":"get"})` snapshot');
 			expect(content).toContain("Workers must not run `gjc ultragoal checkpoint`");
 			expect(content).toContain("checkpoint authority stays with the leader");
 			expect(content).toContain("Ultragoal does not auto-launch Team");

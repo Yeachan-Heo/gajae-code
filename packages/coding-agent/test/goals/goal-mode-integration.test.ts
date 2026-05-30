@@ -112,9 +112,10 @@ describe("InteractiveMode goal mode integration", () => {
 		await harness.cleanup();
 	});
 
-	it("keeps goal tools exposed across inactive, active, and paused states", async () => {
-		expect(await toolNamesFor(harness)).toEqual(
-			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+	it("keeps the unified goal tool exposed across inactive, active, and paused states", async () => {
+		expect(await toolNamesFor(harness)).toContain("goal");
+		expect(await toolNamesFor(harness)).not.toEqual(
+			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
 
 		await harness.mode.handleGoalModeCommand("Ship the release");
@@ -129,8 +130,9 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("paused");
-		expect(await toolNamesFor(harness)).toEqual(
-			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+		expect(await toolNamesFor(harness)).toContain("goal");
+		expect(await toolNamesFor(harness)).not.toEqual(
+			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
 	});
 
@@ -205,44 +207,16 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await toolNamesFor(harness)).toContain("goal");
 	});
 
-	it("mutates the goal token budget via /goal budget without resetting accumulated usage", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		// Seed accumulated usage by driving the runtime directly — equivalent to a turn's flush.
-		const goal = harness.session.getGoalModeState()?.goal;
-		if (!goal) throw new Error("expected active goal");
-		goal.tokensUsed = 42;
-		goal.timeUsedSeconds = 5;
-
+	it("treats budget as objective text instead of a goal budget command", async () => {
 		await harness.mode.handleGoalModeCommand("budget 123");
 
-		const after = harness.session.getGoalModeState();
-		expect(after?.goal.tokenBudget).toBe(123);
-		// Accumulated counters are preserved across the mutation.
-		expect(after?.goal.tokensUsed).toBe(42);
-		expect(after?.goal.timeUsedSeconds).toBe(5);
-
-		await harness.mode.handleGoalModeCommand("budget off");
-		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
-		expect(harness.session.getGoalModeState()?.goal.tokensUsed).toBe(42);
+		const goal = harness.session.getGoalModeState()?.goal;
+		expect(goal?.objective).toBe("budget 123");
+		expect("tokenBudget" in (goal ?? {})).toBe(false);
 	});
 
-	it("refuses /goal budget while only a paused goal exists (fix #5)", async () => {
+	it("returns completion usage from the goal tool and exits goal mode before the next turn rebuild", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
-		vi.spyOn(harness.mode, "showHookSelector").mockResolvedValue("Pause");
-		await harness.mode.handleGoalModeCommand();
-		expect(harness.mode.goalModePaused).toBe(true);
-		const showWarning = vi.spyOn(harness.mode, "showWarning");
-
-		await harness.mode.handleGoalModeCommand("budget 99");
-
-		expect(showWarning).toHaveBeenCalledWith("Resume the goal before adjusting the budget.");
-		// Mutation must not have run while the goal is paused.
-		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
-	});
-
-	it("returns the completion report from the goal tool and exits goal mode before the next turn rebuild", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		await harness.mode.handleGoalModeCommand("budget 50");
 		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
 		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
 			tool => tool.name === "goal",
@@ -254,34 +228,36 @@ describe("InteractiveMode goal mode integration", () => {
 		const result = await goalTool.execute("call-1", { op: "complete" });
 		const completionText = JSON.stringify(result.content);
 
-		expect(result.details?.completionBudgetReport).toBe(
-			"Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.",
-		);
-		expect(completionText).toContain("Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.");
+		expect(result.details).not.toHaveProperty("completionBudgetReport");
+		expect(completionText.toLowerCase()).not.toContain("budget");
 		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
-		// Goal tools stay exposed after completion so the next turn can inspect or create the next goal.
 		expect(harness.session.getGoalModeState()?.enabled).toBe(false);
-		expect(await toolNamesFor(harness)).toEqual(
-			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+		expect(await toolNamesFor(harness)).toContain("goal");
+		expect(await toolNamesFor(harness)).not.toEqual(
+			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
 
 		const nextTurn = harness.mode.getUserInput();
-		// getUserInput observes mode === "exiting" and awaits #exitGoalMode before
-		// arming onInputCallback. Drain microtasks until that side-effect lands.
 		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
 			await Bun.sleep(0);
 		}
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
 		expect(harness.session.getGoalModeState()).toBeUndefined();
-		expect(await toolNamesFor(harness)).toEqual(
-			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+		expect(await toolNamesFor(harness)).toContain("goal");
+		expect(await toolNamesFor(harness)).not.toEqual(
+			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
+		expect(
+			appendCustomEntry.mock.calls.some(call => {
+				const payload = call[1];
+				return typeof payload === "object" && payload !== null && "tokenBudget" in payload;
+			}),
+		).toBe(false);
 		expect(appendCustomEntry).toHaveBeenCalledWith(
 			"goal-completed",
 			expect.objectContaining({
 				objective: "Ship the release",
-				tokenBudget: 50,
 				tokensUsed: 0,
 			}),
 		);

@@ -146,7 +146,7 @@ describe("native GJC ultragoal runtime", () => {
 		});
 	});
 
-	it("accepts full get_goal tool result snapshots with millisecond timestamps", async () => {
+	it("accepts full goal get tool result snapshots with millisecond timestamps", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -164,7 +164,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(plan.goals[0]?.completionVerification?.gjcGoalSnapshotHash).toBeTruthy();
 	});
 
-	it("accepts per-story get_goal snapshots for per-story plans", async () => {
+	it("accepts per-story goal get snapshots for per-story plans", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix", gjcGoalMode: "per-story" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -210,7 +210,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(diagnostic.state).toBe("active_stale_receipt");
 	});
 
-	it("treats receipts as stale after get_goal snapshot ledger mutation", async () => {
+	it("treats receipts as stale after goal get snapshot ledger mutation", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -378,7 +378,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
 	});
 
-	it("requires a fresh get_goal snapshot for complete checkpoints", async () => {
+	it("requires a fresh goal get snapshot for complete checkpoints", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -432,7 +432,7 @@ describe("native GJC ultragoal runtime", () => {
 		).rejects.toThrow("missing durable .gjc/ultragoal/goals.json");
 	});
 
-	it("rejects unrelated or stale get_goal snapshots before mutation", async () => {
+	it("rejects unrelated or stale goal get snapshots before mutation", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -487,7 +487,7 @@ describe("native GJC ultragoal runtime", () => {
 				"--status",
 				"blocked",
 				"--evidence",
-				"legacy completed GJC goal blocks create_goal in this thread",
+				"legacy completed GJC goal blocks goal create in this thread",
 				"--gjc-goal-json",
 				goalSnapshot("legacy completed unrelated goal", "complete"),
 			],
@@ -570,7 +570,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(completedBlocker.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
 	});
 
-	it("requires review blockers to include a fresh active get_goal snapshot", async () => {
+	it("requires review blockers to include a fresh active goal get snapshot", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });

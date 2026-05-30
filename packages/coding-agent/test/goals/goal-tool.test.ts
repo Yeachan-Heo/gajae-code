@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createUltragoalPlan, startNextUltragoalGoal } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
-import { completionBudgetReport, GoalRuntime } from "@gajae-code/coding-agent/goals/runtime";
+import { GoalRuntime } from "@gajae-code/coding-agent/goals/runtime";
 import type { Goal, GoalModeState, GoalTokenUsage } from "@gajae-code/coding-agent/goals/state";
-import { CreateGoalTool, GetGoalTool, GoalTool, UpdateGoalTool } from "@gajae-code/coding-agent/goals/tools/goal-tool";
+import { GoalTool } from "@gajae-code/coding-agent/goals/tools/goal-tool";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
@@ -23,7 +23,6 @@ function createGoal(overrides: Partial<Goal> = {}): Goal {
 		id: "goal-1",
 		objective: "Ship it",
 		status: "active",
-		tokenBudget: undefined,
 		tokensUsed: 0,
 		timeUsedSeconds: 0,
 		createdAt: 0,
@@ -60,23 +59,22 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 }
 
 describe("GoalTool", () => {
-	it("routes create/get/complete operations and returns completion budget details", async () => {
+	it("routes create/get/complete operations without budget details", async () => {
 		const createGoalState: GoalModeState = {
 			enabled: true,
 			mode: "active",
-			goal: createGoal({ objective: "Create route", tokenBudget: 10 }),
+			goal: createGoal({ objective: "Create route" }),
 		};
 		const getGoalState: GoalModeState = {
 			enabled: true,
 			mode: "active",
-			goal: createGoal({ objective: "Get route", tokensUsed: 4, tokenBudget: 10 }),
+			goal: createGoal({ objective: "Get route", tokensUsed: 4 }),
 		};
 		const completedGoal = createGoal({
 			objective: "Complete route",
 			status: "complete",
 			tokensUsed: 7,
 			timeUsedSeconds: 3,
-			tokenBudget: 10,
 		});
 		const runtime = {
 			createGoal: vi.fn(async () => createGoalState),
@@ -93,38 +91,39 @@ describe("GoalTool", () => {
 		const created = await tool.execute("call-create", {
 			op: "create",
 			objective: "  Create route  ",
-			token_budget: 10,
 		});
-		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route", tokenBudget: 10 });
-		expect(created.details).toMatchObject({
-			op: "create",
-			goal: createGoalState.goal,
-			remainingTokens: 10,
-			completionBudgetReport: null,
-		});
+		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route" });
+		expect(created.details).toMatchObject({ op: "create", goal: createGoalState.goal });
+		expect(created.content[0]).toEqual({ type: "text", text: "Goal: Create route\nStatus: active\nTokens used: 0" });
 
 		const fetched = await tool.execute("call-get", { op: "get" });
 		expect(getGoalModeState).toHaveBeenCalledTimes(1);
-		expect(fetched.details).toMatchObject({
-			op: "get",
-			goal: getGoalState.goal,
-			remainingTokens: 6,
-			completionBudgetReport: null,
-		});
+		expect(fetched.details).toMatchObject({ op: "get", goal: getGoalState.goal });
 		expect(runtime.completeGoalFromTool).not.toHaveBeenCalled();
 
 		const completed = await tool.execute("call-complete", { op: "complete" });
 		expect(runtime.completeGoalFromTool).toHaveBeenCalledTimes(1);
-		expect(completed.details).toMatchObject({
-			op: "complete",
-			goal: completedGoal,
-			remainingTokens: 3,
-			completionBudgetReport: completionBudgetReport(completedGoal),
-		});
+		expect(completed.details).toMatchObject({ op: "complete", goal: completedGoal });
 		expect(completed.content[0]).toEqual({
 			type: "text",
-			text: "Goal: Complete route\nStatus: complete\nTokens: 7 used / 10 budget\nRemaining tokens: 3\n\nGoal achieved. Report final budget usage to the user: tokens used: 7 of 10; time used: 3 seconds.",
+			text: "Goal: Complete route\nStatus: complete\nTokens used: 7",
 		});
+		expect(JSON.stringify(completed.details)).not.toContain("Budget");
+	});
+
+	it("rejects unsupported token_budget before creating or mutating", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		await expect(
+			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: 10 } as never),
+		).rejects.toThrow("token_budget is not supported for goals");
+		expect(harness.getState()).toBeUndefined();
 	});
 
 	it("rejects create when a goal already exists", async () => {
@@ -140,9 +139,9 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		await expect(
-			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: 10 }),
-		).rejects.toThrow("cannot create a new goal because this session already has a goal");
+		await expect(tool.execute("call-create", { op: "create", objective: "New goal" })).rejects.toThrow(
+			"cannot create a new goal because this session already has a goal",
+		);
 	});
 
 	it("rejects complete when no goal is active", async () => {
@@ -189,27 +188,9 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("rejects op=create when the token_budget is zero or negative", async () => {
-		const harness = createRuntimeHarness();
-		const tool = new GoalTool(
-			createToolSession({
-				getGoalRuntime: () => harness.runtime,
-				getGoalModeState: () => harness.getState(),
-			}),
-		);
-
-		await expect(tool.execute("call-zero", { op: "create", objective: "Ship it", token_budget: 0 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
-		await expect(tool.execute("call-neg", { op: "create", objective: "Ship it", token_budget: -5 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
-		expect(harness.getState()).toBeUndefined();
-	});
-
 	it("flips state to exiting and clears enabled when op=complete succeeds (fix #1)", async () => {
 		const harness = createRuntimeHarness();
-		await harness.runtime.createGoal({ objective: "Ship the release", tokenBudget: 100 });
+		await harness.runtime.createGoal({ objective: "Ship the release" });
 		const tool = new GoalTool(
 			createToolSession({
 				getGoalRuntime: () => harness.runtime,
@@ -245,7 +226,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()?.goal.status).toBe("complete");
 	});
 
-	it("blocks direct update_goal completion for active ultragoal objectives without verification receipt", async () => {
+	it("blocks direct unified goal completion for active ultragoal objectives without verification receipt", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-goal-ultragoal-"));
 		try {
 			const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
@@ -255,7 +236,7 @@ describe("GoalTool", () => {
 				mode: "active",
 				goal: createGoal({ objective: plan.gjcObjective }),
 			});
-			const tool = new UpdateGoalTool(
+			const tool = new GoalTool(
 				createToolSession({
 					cwd: root,
 					getGoalRuntime: () => harness.runtime,
@@ -263,7 +244,7 @@ describe("GoalTool", () => {
 				}),
 			);
 
-			await expect(tool.execute("call-complete", { status: "complete" })).rejects.toThrow(
+			await expect(tool.execute("call-complete", { op: "complete" })).rejects.toThrow(
 				"Ultragoal aggregate completion requires a fresh final aggregate receipt",
 			);
 			expect(harness.getState()?.goal.status).toBe("active");
@@ -348,62 +329,5 @@ describe("GoalTool", () => {
 		expect(result.details?.op).toBe("drop");
 		expect(result.details?.goal?.status).toBe("dropped");
 		expect(harness.getState()).toBeUndefined();
-	});
-
-	it("exposes Codex-compatible get_goal/create_goal/update_goal tools", async () => {
-		const harness = createRuntimeHarness();
-		const session = createToolSession({
-			getGoalRuntime: () => harness.runtime,
-			getGoalModeState: () => harness.getState(),
-		});
-
-		const created = await new CreateGoalTool(session).execute("call-create-goal", {
-			objective: "  Ship ultragoal lifecycle  ",
-			token_budget: 20,
-		});
-		expect(created.details).toMatchObject({
-			op: "create",
-			goal: { objective: "Ship ultragoal lifecycle", status: "active", tokenBudget: 20 },
-			remainingTokens: 20,
-		});
-
-		const fetched = await new GetGoalTool(session).execute("call-get-goal", {});
-		expect(fetched.details).toMatchObject({
-			op: "get",
-			goal: { objective: "Ship ultragoal lifecycle", status: "active", tokenBudget: 20 },
-			remainingTokens: 20,
-		});
-
-		const completed = await new UpdateGoalTool(session).execute("call-update-goal", { status: "complete" });
-		expect(completed.details).toMatchObject({
-			op: "complete",
-			goal: { objective: "Ship ultragoal lifecycle", status: "complete", tokenBudget: 20 },
-			remainingTokens: 20,
-		});
-		expect(completed.details?.completionBudgetReport).toBe(
-			"Goal achieved. Report final budget usage to the user: tokens used: 0 of 20.",
-		);
-		expect(harness.getState()?.enabled).toBe(false);
-	});
-
-	it("shares the same session goal state between legacy goal and Codex-compatible tools", async () => {
-		const harness = createRuntimeHarness();
-		const session = createToolSession({
-			getGoalRuntime: () => harness.runtime,
-			getGoalModeState: () => harness.getState(),
-		});
-
-		await new GoalTool(session).execute("call-legacy-create", {
-			op: "create",
-			objective: "Shared state",
-		});
-		const fetchedByNamedTool = await new GetGoalTool(session).execute("call-get-goal", {});
-		expect(fetchedByNamedTool.details?.goal?.objective).toBe("Shared state");
-		expect(fetchedByNamedTool.details?.goal?.status).toBe("active");
-
-		await new UpdateGoalTool(session).execute("call-update-goal", { status: "complete" });
-		const fetchedByLegacyTool = await new GoalTool(session).execute("call-legacy-get", { op: "get" });
-		expect(fetchedByLegacyTool.details?.goal?.objective).toBe("Shared state");
-		expect(fetchedByLegacyTool.details?.goal?.status).toBe("complete");
 	});
 });
