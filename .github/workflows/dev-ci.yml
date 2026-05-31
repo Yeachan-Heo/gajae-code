@@ -14,7 +14,7 @@ concurrency:
 jobs:
    affected:
       name: Affected path validation
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       timeout-minutes: 30
       env:
          GITHUB_EVENT_BEFORE: ${{ github.event.before }}

@@ -25,7 +25,7 @@ jobs:
    # in that case, so the canary's retention window (see build-native action) is the
    # effective TTL of a cache hit before main rebuilds anyway.
    rust-hash:
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       outputs:
          hash: ${{ steps.compute.outputs.hash }}
          run-id: ${{ steps.find.outputs.run-id }}
@@ -76,7 +76,7 @@ jobs:
 
    # Fast lint + type check (no Rust, no native build needed)
    check:
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
          - uses: oven-sh/setup-bun@v2
@@ -96,7 +96,7 @@ jobs:
    native_linux:
       needs: [rust-hash]
       if: ${{ startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '' }}
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       strategy:
          fail-fast: false
          matrix:
@@ -139,7 +139,7 @@ jobs:
               save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
 
    test:
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       needs: [native_linux, rust-hash]
       if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
       timeout-minutes: 30
@@ -190,7 +190,7 @@ jobs:
            run: bun run ci:test:smoke
 
    install_methods:
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
          - uses: oven-sh/setup-bun@v2
@@ -315,7 +315,7 @@ jobs:
       if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' }}
       needs: [release_binary]
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       permissions:
          contents: write
       steps:
@@ -358,7 +358,7 @@ jobs:
          needs.release_github_verify.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_binary, release_github_verify, rust-hash]
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
          - uses: oven-sh/setup-bun@v2
