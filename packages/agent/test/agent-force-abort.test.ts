@@ -195,4 +195,49 @@ describe("Agent.forceAbort", () => {
 		});
 		await expect(secondPrompt).resolves.toBeUndefined();
 	});
+
+	it("drops partial thinking and tool-use from replay history when a streamed turn is aborted", async () => {
+		const model = createMockModel({ responses: [{ content: ["after abort"] }] });
+		const firstStream = new AssistantMessageEventStream();
+		let callCount = 0;
+		const streamFn: StreamFn = (selectedModel, context, options) => {
+			callCount += 1;
+			if (callCount === 1) return firstStream;
+			return model.stream(selectedModel, context, options);
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		const firstPrompt = agent.prompt("start risky turn");
+		await waitForStreaming(agent);
+		const partial = createAssistantMessage(
+			[
+				{ type: "thinking", thinking: "partial private reasoning", thinkingSignature: "partial_sig" },
+				{ type: "toolCall", id: "toolu_partial", name: "read", arguments: { path: "README.md" } },
+			],
+			"toolUse",
+		);
+		firstStream.push({ type: "start", partial });
+		firstStream.push({ type: "thinking_start", contentIndex: 0, partial });
+		firstStream.push({
+			type: "toolcall_end",
+			contentIndex: 1,
+			toolCall: { type: "toolCall", id: "toolu_partial", name: "read", arguments: { path: "README.md" } },
+			partial,
+		});
+
+		expect(agent.forceAbort("test timeout")).toBe(true);
+		await expect(firstPrompt).resolves.toBeUndefined();
+
+		await expect(agent.prompt("after abort")).resolves.toBeUndefined();
+
+		const assistantMessages = agent.state.messages.filter(message => message.role === "assistant");
+		expect(assistantMessages).toHaveLength(1);
+		expect(assistantMessages[0]?.content).toEqual([{ type: "text", text: "after abort" }]);
+		expect(model.calls[0]?.context.messages).toEqual([
+			{ role: "user", content: [{ type: "text", text: "after abort" }], timestamp: expect.any(Number) },
+		]);
+	});
 });

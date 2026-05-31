@@ -102,7 +102,43 @@ function sanitizeDump(dump: RawHttpRequestDump): RawHttpRequestDump {
 	return {
 		...dump,
 		headers: redactHeaders(dump.headers),
+		body: sanitizeDumpBody(dump.body),
 	};
+}
+
+function sanitizeDumpBody(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(item => sanitizeDumpBody(item));
+	}
+	if (!isObject(value)) {
+		return value;
+	}
+
+	const type = typeof value.type === "string" ? value.type : undefined;
+	const redactedKeys = getRedactedBodyKeys(type);
+	const sanitized: Record<string, unknown> = {};
+	for (const [key, property] of Object.entries(value)) {
+		if (redactedKeys.has(key)) {
+			sanitized[key] = "[redacted]";
+			continue;
+		}
+		sanitized[key] = sanitizeDumpBody(property);
+	}
+	return sanitized;
+}
+
+function getRedactedBodyKeys(type: string | undefined): Set<string> {
+	const keys = new Set<string>();
+	if (type === "thinking") {
+		keys.add("thinking");
+		keys.add("signature");
+		keys.add("thinkingSignature");
+		keys.add("thoughtSignature");
+	}
+	if (type === "redacted_thinking" || type === "redactedThinking") {
+		keys.add("data");
+	}
+	return keys;
 }
 
 function redactHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {

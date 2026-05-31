@@ -31,6 +31,7 @@ export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
+	options?: { repairLatestAssistantThinking?: boolean },
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
@@ -64,16 +65,24 @@ export function transformMessages<TApi extends Api>(
 				index === latestAssistantIndex &&
 				model.api === "anthropic-messages" &&
 				assistantMsg.api === "anthropic-messages";
-			// Aborted/errored messages may have partially-streamed thinking signatures.
-			// A partial signature is invalid and will be rejected by the API, so we must
-			// strip signatures from thinking blocks in these messages.
-			const hasInvalidSignatures = assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error";
+			// Aborted/errored messages may contain partially-streamed thinking blocks.
+			// Anthropic requires thinking/redacted_thinking bytes in replayed assistant
+			// messages to match the original response exactly; stripping a signature,
+			// well-forming text, or keeping a partial redacted block would emit a
+			// modified thinking sequence. Drop those private blocks instead. Tool calls
+			// are kept so the second pass can either preserve real results or synthesize
+			// an explicit aborted result without leaving dangling tool_use blocks.
+			const hasPartialThinking = assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error";
+			const dropLatestAssistantThinking =
+				options?.repairLatestAssistantThinking === true &&
+				index === latestAssistantIndex &&
+				model.api === "anthropic-messages" &&
+				assistantMsg.api === "anthropic-messages";
 
 			const transformedContent = assistantMsg.content.flatMap(block => {
 				if (block.type === "thinking") {
-					// Strip signature from aborted/errored messages — it's likely incomplete
-					const sanitized =
-						hasInvalidSignatures && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block;
+					if (hasPartialThinking || dropLatestAssistantThinking) return [];
+					const sanitized = block;
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
@@ -88,6 +97,7 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "redactedThinking") {
+					if (hasPartialThinking || dropLatestAssistantThinking) return [];
 					if (mustPreserveLatestAnthropicThinking) return block;
 					if (isSameModel) return block;
 					return [];

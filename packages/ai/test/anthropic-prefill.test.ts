@@ -178,7 +178,7 @@ it("preserves latest Anthropic thinking blocks even when model id changes", () =
 	expect(transformedAssistant?.content[1]).toEqual(assistant.content[1]);
 });
 
-it("strips invalid thinking signatures from aborted Anthropic replay messages", () => {
+it("drops invalid thinking blocks from aborted Anthropic replay messages", () => {
 	const model: Model<"anthropic-messages"> = {
 		api: "anthropic-messages",
 		provider: "anthropic",
@@ -219,9 +219,5 @@ it("strips invalid thinking signatures from aborted Anthropic replay messages", 
 	const transformedAssistant = transformed.find(m => m.role === "assistant") as AssistantMessage | undefined;
 
 	expect(transformedAssistant).toBeDefined();
-	const thinkingBlock = transformedAssistant?.content[0];
-	expect(thinkingBlock).toMatchObject({ type: "thinking", thinking: "partial reasoning" });
-	expect(
-		thinkingBlock && "thinkingSignature" in thinkingBlock ? thinkingBlock.thinkingSignature : undefined,
-	).toBeUndefined();
+	expect(transformedAssistant?.content).toEqual([{ type: "text", text: "partial answer" }]);
 });

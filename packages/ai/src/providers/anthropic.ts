@@ -304,6 +304,17 @@ export function isAnthropicFastModeUnsupportedError(error: unknown): boolean {
 	return false;
 }
 
+export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
+	if (extractHttpStatusFromError(error) !== 400) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		/invalid_request_error/i.test(message) &&
+		/thinking|redacted_thinking/i.test(message) &&
+		/latest assistant message/i.test(message) &&
+		/cannot be modified/i.test(message)
+	);
+}
+
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
 	const tools = params.tools as Array<{ strict?: unknown }> | undefined;
 	return tools?.some(tool => tool.strict === true) ?? false;
@@ -1058,8 +1069,18 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
-			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
-				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools);
+			const prepareParams = async (paramsOptions?: {
+				repairLatestAssistantThinking?: boolean;
+			}): Promise<MessageCreateParamsStreaming> => {
+				let nextParams = buildParams(
+					model,
+					baseUrl,
+					context,
+					isOAuthToken,
+					options,
+					disableStrictTools,
+					paramsOptions?.repairLatestAssistantThinking === true,
+				);
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
@@ -1096,6 +1117,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
+			let thinkingRepairAttempted = false;
 			while (true) {
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const firstEventTimeoutAbortError = new Error(
@@ -1363,6 +1385,26 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						}
 						disableStrictTools = true;
 						params = await prepareParams();
+						providerRetryAttempt = 0;
+						output.content.length = 0;
+						output.responseId = undefined;
+						output.providerPayload = undefined;
+						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+						output.stopReason = "stop";
+						firstTokenTime = undefined;
+						continue;
+					}
+					if (
+						!thinkingRepairAttempted &&
+						firstTokenTime === undefined &&
+						isAnthropicThinkingBlockMutationError(streamFailure)
+					) {
+						logger.debug("anthropic: repairing latest assistant thinking replay after provider rejection", {
+							model: model.id,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+						thinkingRepairAttempted = true;
+						params = await prepareParams({ repairLatestAssistantThinking: true });
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.responseId = undefined;
@@ -1887,11 +1929,12 @@ function buildParams(
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
 	disableStrictTools = false,
+	repairLatestAssistantThinking = false,
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
 	const params: AnthropicSamplingParams = {
 		model: model.id,
-		messages: convertAnthropicMessages(context.messages, model, isOAuthToken),
+		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, { repairLatestAssistantThinking }),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -2074,10 +2117,11 @@ export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
+	options?: { repairLatestAssistantThinking?: boolean },
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
-	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
+	const transformedMessages = transformMessages(messages, model, normalizeToolCallId, options);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];

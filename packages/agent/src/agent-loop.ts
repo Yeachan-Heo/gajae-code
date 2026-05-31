@@ -857,37 +857,35 @@ async function streamAssistantResponse(
 }
 
 function emitAbortedAssistantMessage(
-	partialMessage: AssistantMessage | null,
+	_partialMessage: AssistantMessage | null,
 	addedPartial: boolean,
 	context: AgentContext,
 	config: AgentLoopConfig,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 ): AssistantMessage {
 	const errorMessage = "Request was aborted";
-	const abortedMessage: AssistantMessage = partialMessage
-		? { ...partialMessage, stopReason: "aborted", errorMessage }
-		: {
-				role: "assistant",
-				content: [],
-				api: config.model.api,
-				provider: config.model.provider,
-				model: config.model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "aborted",
-				errorMessage,
-				timestamp: Date.now(),
-			};
+	const now = Date.now();
+	const abortedMessage: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		errorMessage,
+		timestamp: now,
+	};
 	if (addedPartial) {
-		context.messages[context.messages.length - 1] = abortedMessage;
+		context.messages.pop();
 	} else {
-		context.messages.push(abortedMessage);
 		stream.push({ type: "message_start", message: { ...abortedMessage } });
 	}
 	stream.push({ type: "message_end", message: abortedMessage });
