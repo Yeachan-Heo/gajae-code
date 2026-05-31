@@ -301,6 +301,9 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
 		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id}");
+		expect(tmuxLog).toContain("worker-startup-ack");
+		expect(tmuxLog).toContain("protocol_version");
+		expect(tmuxLog).toContain("claim-task/transition-task-status");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
 		expect(tmuxLog).toContain("set-option -t test-session:0 mouse on");
 		expect(tmuxLog).toContain("set-option -t test-session:0 set-clipboard on");
@@ -541,6 +544,64 @@ describe("native gjc team runtime", () => {
 		const stopped = await shutdownGjcTeam("life-team", cleanupRoot, { PATH: "" });
 		expect(stopped.phase).toBe("complete");
 		expect(stopped.workers[0]?.status).toBe("stopped");
+	});
+
+	it("keeps terminal evidence out of task listings and honors claim tokens without implicit worker defaults", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Complete with evidence",
+			teamName: "evidence-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const stateDir = path.join(cleanupRoot, ".gjc", "state", "team", "evidence-team");
+
+		const workerTwoClaim = await claimGjcTeamTask("evidence-team", "worker-2", cleanupRoot, { PATH: "" }, "task-2");
+		expect(workerTwoClaim.ok).toBe(true);
+		await executeGjcTeamApiOperation(
+			"transition-task-status",
+			{
+				team_name: "evidence-team",
+				task_id: "task-2",
+				to: "completed",
+				claim_token: workerTwoClaim.claim_token,
+				evidence: "worker-2 completed the task",
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		);
+
+		expect(await Bun.file(path.join(stateDir, "evidence", "tasks", "task-2.json")).exists()).toBe(true);
+		expect(await Bun.file(path.join(stateDir, "tasks", "task-2.evidence.json")).exists()).toBe(false);
+		await Bun.write(
+			path.join(stateDir, "tasks", "task-2.evidence.json"),
+			`${JSON.stringify({ task_id: "task-2", evidence: "legacy colocated evidence" }, null, 2)}\n`,
+		);
+		const listed = (await executeGjcTeamApiOperation("list-tasks", { team_name: "evidence-team" }, cleanupRoot, {
+			PATH: "",
+		})) as { tasks: Array<{ id: string; status: string }> };
+		expect(listed.tasks.map(task => task.id)).toEqual(["task-1", "task-2"]);
+		expect(listed.tasks.find(task => task.id === "task-2")?.status).toBe("completed");
+
+		const workerOneClaim = await claimGjcTeamTask("evidence-team", "worker-1", cleanupRoot, { PATH: "" }, "task-1");
+		expect(workerOneClaim.ok).toBe(true);
+		await expect(
+			executeGjcTeamApiOperation(
+				"transition-task-status",
+				{
+					team_name: "evidence-team",
+					task_id: "task-1",
+					to: "failed",
+					claim_token: workerOneClaim.claim_token,
+					worker_id: "worker-2",
+				},
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("claim_owner_mismatch:task-1");
 	});
 
 	it("allows only one worker to claim a task under concurrent claim attempts", async () => {

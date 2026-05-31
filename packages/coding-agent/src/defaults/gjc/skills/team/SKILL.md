@@ -218,6 +218,7 @@ Semantics:
 - `.gjc/state/team/<team>/monitor-snapshot.json`
 - `.gjc/state/team/<team>/integration-report.md`
 - `.gjc/state/team/<team>/tasks/task-1.json`
+- `.gjc/state/team/<team>/evidence/tasks/task-1.json`
 - `.gjc/state/team/<team>/mailbox/worker-1/<message-id>.json`
 - `.gjc/state/team/<team>/mailbox/worker-1.json` (legacy compatibility view)
 - `.gjc/state/team/<team>/notifications/<notification-id>.json`
@@ -230,14 +231,16 @@ Semantics:
 Use `gjc team api` for machine-readable task lifecycle operations.
 
 ```bash
+gjc team api worker-startup-ack --input '{"team_name":"my-team","worker_id":"worker-1","protocol_version":"1"}' --json
 gjc team api claim-task --input '{"team_name":"my-team","worker_id":"worker-1"}' --json
-gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","claim_token":"<claim-token>"}' --json
+gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","evidence":"summary of completed work and validation"}' --json
 ```
 
 Canonical worker lifecycle operations:
 
+- `worker-startup-ack` before task work
 - `claim-task`
-- `transition-task-status`
+- `transition-task-status` with the claim token, worker id, and completion evidence
 - `release-task-claim`
 
 GJC-team interop operations are also available for mailbox, native notification, worker heartbeat/status, startup ACK, events, monitor snapshots, approvals, and shutdown request/ack flows; run `gjc team api --help` for the full operation list.

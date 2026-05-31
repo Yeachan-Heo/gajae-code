@@ -431,6 +431,9 @@ function safePathSegment(kind: string, value: string): string {
 function taskPath(dir: string, taskId: string): string {
 	return path.join(dir, "tasks", `${safePathSegment("task_id", taskId)}.json`);
 }
+function taskEvidencePath(dir: string, taskId: string): string {
+	return path.join(dir, "evidence", "tasks", `${safePathSegment("task_id", taskId)}.json`);
+}
 function mailboxPath(dir: string, worker: string): string {
 	return path.join(dir, "mailbox", `${safePathSegment("worker_id", worker)}.json`);
 }
@@ -615,16 +618,31 @@ async function resolveGjcTeamSnapshotPhase(
 	return (await hasPendingGjcTeamIntegration(dir, config, monitor)) ? "awaiting_integration" : storedPhase;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value != null;
+}
+function isGjcTeamTaskRecord(value: unknown): value is GjcTeamTask {
+	return (
+		isRecord(value) &&
+		typeof value.id === "string" &&
+		typeof value.status === "string" &&
+		(isGjcTeamTaskStatus(value.status) || value.status === "complete") &&
+		(typeof value.subject === "string" || typeof value.title === "string") &&
+		(typeof value.description === "string" || typeof value.objective === "string")
+	);
+}
+function isGjcTeamTaskFile(entry: { isFile(): boolean; name: string }): boolean {
+	return entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json");
+}
+
 async function readTasks(dir: string): Promise<GjcTeamTask[]> {
 	try {
 		const entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
 		const tasks = await Promise.all(
-			entries
-				.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
-				.map(entry => readJsonFile<GjcTeamTask>(path.join(dir, "tasks", entry.name))),
+			entries.filter(isGjcTeamTaskFile).map(entry => readJsonFile<unknown>(path.join(dir, "tasks", entry.name))),
 		);
 		return tasks
-			.filter((task): task is GjcTeamTask => task != null)
+			.filter(isGjcTeamTaskRecord)
 			.map(normalizeTask)
 			.sort((a, b) => a.id.localeCompare(b.id));
 	} catch (error) {
@@ -831,6 +849,7 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`Team state root: ${config.state_root}.`,
 		workspace,
 		`Task: ${config.task}`,
+		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
 		`Use gjc team api claim-task/transition-task-status with this worker id, record evidence, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
@@ -2186,7 +2205,7 @@ export async function transitionGjcTeamTaskStatus(
 	};
 	await writeTask(dir, updated);
 	if (terminal && evidence)
-		await writeJsonFile(path.join(dir, "tasks", `${taskId}.evidence.json`), {
+		await writeJsonFile(taskEvidencePath(dir, taskId), {
 			task_id: taskId,
 			worker: workerId ?? task.claim.owner,
 			evidence,
@@ -2739,7 +2758,9 @@ export async function executeGjcTeamApiOperation(
 ): Promise<unknown> {
 	const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 	if (!teamName) throw new Error("missing_team_name");
-	const worker = String(input.worker ?? input.worker_id ?? input.workerId ?? "worker-1");
+	const workerInput = input.worker ?? input.worker_id ?? input.workerId;
+	const worker = String(workerInput ?? "worker-1");
+	const explicitWorker = workerInput == null ? undefined : String(workerInput);
 	switch (operation) {
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
@@ -2787,7 +2808,7 @@ export async function executeGjcTeamApiOperation(
 					cwd,
 					env,
 					typeof input.claim_token === "string" ? input.claim_token : undefined,
-					worker,
+					explicitWorker,
 					typeof input.evidence === "string"
 						? input.evidence
 						: typeof input.result === "string"
