@@ -5,7 +5,7 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { applyGjcTmuxProfile } from "./launch-tmux";
 
-export type GjcTeamPhase = "starting" | "running" | "complete" | "failed" | "cancelled";
+export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
 export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "failed" | "draining" | "unknown";
 
@@ -462,6 +462,51 @@ function normalizeTask(raw: GjcTeamTask): GjcTeamTask {
 		version: raw.version ?? 1,
 	};
 }
+
+const GJC_TEAM_INTEGRATION_ATTENTION_STATUSES = new Set<GjcTeamIntegrationStatus>([
+	"integration_failed",
+	"merge_conflict",
+	"cherry_pick_conflict",
+	"rebase_conflict",
+]);
+const GJC_TEAM_INTEGRATION_SETTLED_STATUSES = new Set<GjcTeamIntegrationStatus>(["idle", "integrated"]);
+
+async function hasPendingGjcTeamIntegration(
+	dir: string,
+	config: GjcTeamConfig,
+	monitor: GjcTeamMonitorSnapshot | null,
+): Promise<boolean> {
+	for (const worker of config.workers) {
+		const integration = monitor?.integration_by_worker?.[worker.id];
+		if (integration?.status && GJC_TEAM_INTEGRATION_ATTENTION_STATUSES.has(integration.status)) return true;
+
+		const request = await readJsonFile<GjcWorkerIntegrationDedupeState>(workerIntegrationDedupePath(dir, worker.id));
+		if (!request?.last_requested_at) continue;
+		if (!integration?.status || !integration.updated_at) return true;
+		if (GJC_TEAM_INTEGRATION_ATTENTION_STATUSES.has(integration.status)) return true;
+		if (
+			GJC_TEAM_INTEGRATION_SETTLED_STATUSES.has(integration.status) &&
+			integration.updated_at >= request.last_requested_at
+		) {
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+async function resolveGjcTeamSnapshotPhase(
+	dir: string,
+	config: GjcTeamConfig,
+	storedPhase: GjcTeamPhase,
+	tasks: GjcTeamTask[],
+	monitor: GjcTeamMonitorSnapshot | null,
+): Promise<GjcTeamPhase> {
+	if (storedPhase !== "running") return storedPhase;
+	if (tasks.length === 0 || !tasks.every(task => task.status === "completed")) return storedPhase;
+	return (await hasPendingGjcTeamIntegration(dir, config, monitor)) ? "awaiting_integration" : storedPhase;
+}
+
 async function readTasks(dir: string): Promise<GjcTeamTask[]> {
 	try {
 		const entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
@@ -1539,7 +1584,7 @@ export async function readGjcTeamSnapshot(
 ): Promise<GjcTeamSnapshot> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
-	const phase = await readPhase(dir);
+	const storedPhase = await readPhase(dir);
 	const tasks = await readTasks(dir);
 	const taskCounts: Record<GjcTeamTaskStatus, number> = {
 		pending: 0,
@@ -1550,6 +1595,7 @@ export async function readGjcTeamSnapshot(
 	};
 	for (const task of tasks) taskCounts[task.status] += 1;
 	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
+	const phase = await resolveGjcTeamSnapshotPhase(dir, config, storedPhase, tasks, monitor);
 	return {
 		team_name: config.team_name,
 		display_name: config.display_name,

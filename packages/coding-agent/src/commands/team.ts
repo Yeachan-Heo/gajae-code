@@ -42,6 +42,13 @@ function formatTaskCounts(counts: Record<string, number>): string {
 		.join(" ");
 }
 
+function formatAwaitingIntegrationNextStep(snapshot: GjcTeamSnapshot): string[] {
+	if (snapshot.phase !== "awaiting_integration") return [];
+	return [
+		"next: worker tasks are completed, but integration still needs leader attention before the team is complete",
+	];
+}
+
 function formatIntegrationSummary(snapshot: {
 	integration_by_worker?: Record<string, { status?: string; conflict_files?: string[] }>;
 }): string[] {
@@ -118,6 +125,7 @@ export default class Team extends Command {
 				`state: ${snapshot.state_dir}`,
 				`tasks: ${snapshot.task_total} (${formatTaskCounts(snapshot.task_counts)})`,
 				`workers: ${snapshot.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")}`,
+				...formatAwaitingIntegrationNextStep(snapshot),
 				...formatIntegrationSummary(snapshot),
 			]);
 			return;

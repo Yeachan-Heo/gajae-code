@@ -833,6 +833,51 @@ describe("native gjc team runtime", () => {
 		expect(JSON.stringify(ledger)).toContain("leader_integration_attempt");
 	});
 
+	it("reports awaiting integration when all worker tasks completed after an integration request", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Complete then integrate",
+			teamName: "awaiting-request-team",
+			cwd: cleanupRoot,
+			env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+		});
+		const config = await readTeamConfig(snapshot.state_dir);
+		const worker = config.workers[0];
+		if (!worker?.worktree_path) throw new Error("missing worker worktree");
+		await Bun.write(path.join(worker.worktree_path, "requested-output.txt"), "pending integration\n");
+		const requestEnv = {
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_NAME: "awaiting-request-team",
+			GJC_TEAM_WORKER_ID: "worker-1",
+			GJC_TEAM_STATE_ROOT: config.state_root,
+			GJC_TEAM_WORKTREE_PATH: worker.worktree_path,
+		};
+		const requested = await requestGjcWorkerIntegrationAttempt(worker.worktree_path, requestEnv);
+		expect(requested.requested).toBe(true);
+
+		const claim = await claimGjcTeamTask("awaiting-request-team", "worker-1", cleanupRoot, {
+			PATH: process.env.PATH ?? "",
+		});
+		await transitionGjcTeamTask(
+			"awaiting-request-team",
+			"task-1",
+			"completed",
+			cleanupRoot,
+			{
+				PATH: process.env.PATH ?? "",
+			},
+			claim.claim_token,
+		);
+
+		const status = await readGjcTeamSnapshot("awaiting-request-team", cleanupRoot, { PATH: process.env.PATH ?? "" });
+		expect(status.task_counts.completed).toBe(1);
+		expect(status.phase).toBe("awaiting_integration");
+		expect(status.phase).not.toBe("running");
+	});
+
 	it("monitor cherry-picks diverged worker commits and stays idempotent on repeated status checks", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
@@ -908,6 +953,48 @@ describe("native gjc team runtime", () => {
 		).json();
 		expect(JSON.stringify(ledger)).toContain('"status":"conflict"');
 		expect(JSON.stringify(ledger)).toContain("integration_merge");
+	});
+
+	it("keeps completed conflicting teams in awaiting integration instead of plain running", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Conflict after completion",
+			teamName: "awaiting-conflict-team",
+			worktreeMode: { enabled: true, detached: false, name: "feature/awaiting-conflict" },
+			cwd: cleanupRoot,
+			env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+		});
+		const config = await readTeamConfig(snapshot.state_dir);
+		const workerPath = config.workers[0]?.worktree_path;
+		if (!workerPath) throw new Error("missing worker worktree");
+		await commitFile(workerPath, "README.md", "# worker\n", "worker readme");
+		await Bun.write(path.join(cleanupRoot, "README.md"), "# leader dirty\n");
+		const claim = await claimGjcTeamTask("awaiting-conflict-team", "worker-1", cleanupRoot, {
+			PATH: process.env.PATH ?? "",
+		});
+		await transitionGjcTeamTask(
+			"awaiting-conflict-team",
+			"task-1",
+			"completed",
+			cleanupRoot,
+			{
+				PATH: process.env.PATH ?? "",
+			},
+			claim.claim_token,
+		);
+
+		const monitored = await monitorGjcTeam("awaiting-conflict-team", cleanupRoot, {
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+		});
+
+		expect(monitored.task_counts.completed).toBe(1);
+		expect(monitored.integration_by_worker?.["worker-1"]?.status).toBe("merge_conflict");
+		expect(monitored.phase).toBe("awaiting_integration");
+		expect(monitored.phase).not.toBe("running");
 	});
 
 	it("monitor reports cherry-pick conflicts and aborts cleanly", async () => {
