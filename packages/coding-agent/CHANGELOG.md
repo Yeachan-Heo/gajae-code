@@ -9,6 +9,10 @@
 ### Changed
 
 - Changed `gjc --tmux` startup to create a fresh GJC-managed tmux session instead of attaching to an existing default session.
+
+### Fixed
+
+- Fixed package asset resolution to prefer `GJC_PACKAGE_DIR` over the legacy `PI_PACKAGE_DIR`, preventing update-launch changelog displays from reading stale OMP package assets.
 ## [0.2.1] - 2026-05-30
 
 ### Fixed

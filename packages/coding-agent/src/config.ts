@@ -20,7 +20,7 @@ const PROJECT_CONFIG_PRIORITY = [{ dir: CONFIG_DIR_NAME }, { dir: ".gemini" }];
  */
 export function getPackageDir(): string {
 	// Allow override via environment variable (useful for Nix/Guix where store paths tokenize poorly)
-	const envDir = process.env.PI_PACKAGE_DIR;
+	const envDir = process.env.GJC_PACKAGE_DIR ?? process.env.PI_PACKAGE_DIR;
 	if (envDir) {
 		return expandTilde(envDir);
 	}
