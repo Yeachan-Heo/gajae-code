@@ -49,7 +49,7 @@ import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
 import type { LspStartupServerInfo } from "./tools";
-import { getChangelogPath, getNewEntries, parseChangelog } from "./utils/changelog";
+import { getDisplayChangelogEntries, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
@@ -341,8 +341,7 @@ async function getChangelogForDisplay(parsed: Args): Promise<string | undefined>
 		return undefined;
 	}
 
-	const changelogPath = getChangelogPath();
-	const entries = await parseChangelog(changelogPath);
+	const entries = getDisplayChangelogEntries();
 
 	if (!lastVersion) {
 		if (entries.length > 0) {

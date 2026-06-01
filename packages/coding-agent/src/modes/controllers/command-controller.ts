@@ -42,7 +42,7 @@ import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs } from "../../tools/render-utils";
-import { getChangelogPath, parseChangelog } from "../../utils/changelog";
+import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
@@ -525,8 +525,7 @@ export class CommandController {
 	}
 
 	async handleChangelogCommand(showFull = false): Promise<void> {
-		const changelogPath = getChangelogPath();
-		const allEntries = await parseChangelog(changelogPath);
+		const allEntries = getDisplayChangelogEntries();
 		// Default to showing only the latest 3 versions unless --full is specified
 		// allEntries comes from parseChangelog with newest first, reverse to show oldest->newest
 		const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);

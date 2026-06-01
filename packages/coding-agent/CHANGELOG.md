@@ -6,6 +6,11 @@
 
 - Added a built-in `skill` tool so the agent can chain into another loaded skill on its next turn. Mirrors `/skill:<name>` typing and subagent `autoloadSkills` by dispatching the chained skill's SKILL.md as a user-attribution custom message; controlled by the new `skill.enabled` setting (default true).
 
+### Fixed
+
+- Made startup CHANGELOG display deterministic by embedding `packages/coding-agent/CHANGELOG.md` into the binary so post-update launches show the shipped history regardless of cwd or `GJC_PACKAGE_DIR`/`PI_PACKAGE_DIR` overrides.
+- Registered `gjc update` as a public root subcommand so it invokes the bundled updater instead of routing into the interactive launcher.
+
 ## [0.2.2] - 2026-05-31
 
 ### Added

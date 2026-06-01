@@ -27,8 +27,25 @@ describe("GJC public CLI command surface", () => {
 			"ralplan",
 			"contribute-pr",
 			"deep-interview",
+			"update",
 			"launch",
 		]);
+	});
+
+	it("exposes the update command help without launching the TUI", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "update", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const stdout = result.stdout.toString();
+		const stderr = result.stderr.toString();
+		const combined = `${stdout}\n${stderr}`;
+
+		expect(result.exitCode, combined).toBe(0);
+		expect(stdout).toContain("Check for and install updates");
+		expect(combined).not.toContain("What's New");
+		expect(combined).not.toContain("chatContainer");
 	});
 
 	it("documents the native CLI surface in command help", async () => {
