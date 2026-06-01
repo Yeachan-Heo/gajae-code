@@ -5,6 +5,10 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { AssistantMessage, Message, ProviderPayload, ProviderSessionState, Usage } from "@gajae-code/ai/types";
 import { createOpenAIResponsesHistoryPayload } from "@gajae-code/ai/utils";
+import * as asyncModule from "@gajae-code/coding-agent/async";
+import * as settingsModule from "@gajae-code/coding-agent/config/settings";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import * as sdkModule from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
 import type { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import {
@@ -12,15 +16,11 @@ import {
 	SessionManager,
 	type SessionMessageEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { Snowflake } from "@gajae-code/utils";
-import * as asyncModule from "@gajae-code/coding-agent/async";
-import * as settingsModule from "@gajae-code/coding-agent/config/settings";
-import * as sdkModule from "@gajae-code/coding-agent/sdk";
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import * as taskModule from "@gajae-code/coding-agent/task";
 import * as agentsModule from "@gajae-code/coding-agent/task/agents";
 import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
-import * as taskModule from "@gajae-code/coding-agent/task";
 import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
+import { Snowflake } from "@gajae-code/utils";
 
 function createUsage(): Usage {
 	return {
@@ -499,9 +499,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		if (parent.agent.appendOnlyContext) {
 			expect(seed.appendOnlyPrefixSnapshot).toBeDefined();
-			expect(seed.appendOnlyPrefixSnapshot?.fingerprint).toBe(
-				parent.agent.appendOnlyContext.prefix.fingerprint,
-			);
+			expect(seed.appendOnlyPrefixSnapshot?.fingerprint).toBe(parent.agent.appendOnlyContext.prefix.fingerprint);
 
 			const parentFingerprintBefore = parent.agent.appendOnlyContext.prefix.fingerprint;
 			(seed.appendOnlyPrefixSnapshot as { fingerprint: string }).fingerprint = "TAMPER";
@@ -550,7 +548,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				forkContextSeed: options.forkContextSeed,
 				providerSessionId: options.providerSessionId,
 			});
-			const listeners: Array<(event: Parameters<AgentSession["subscribe"]>[0] extends (event: infer E) => void ? E : never) => void> = [];
+			const listeners: Array<
+				(event: Parameters<AgentSession["subscribe"]>[0] extends (event: infer E) => void ? E : never) => void
+			> = [];
 			const stubSession: Partial<AgentSession> = {
 				state: { messages: [] } as unknown as AgentSession["state"],
 				agent: { state: { systemPrompt: ["stub"] } } as unknown as AgentSession["agent"],
@@ -636,7 +636,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			},
 		};
 
-		const tool = await taskModule.TaskTool.create(toolSession as unknown as Parameters<typeof taskModule.TaskTool.create>[0]);
+		const tool = await taskModule.TaskTool.create(
+			toolSession as unknown as Parameters<typeof taskModule.TaskTool.create>[0],
+		);
 
 		await tool.execute("call-exec", {
 			agent: "executor",
