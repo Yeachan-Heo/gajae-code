@@ -21,6 +21,7 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
+import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
@@ -513,6 +514,19 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleJobsCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "context",
+		description: "Show active context token usage breakdown",
+		acpDescription: "Show active context token usage breakdown",
+		handle: async (_command, runtime) => {
+			await runtime.output(buildContextReportText(runtime));
+			return commandConsumed();
+		},
+		handleTui: (_command, runtime) => {
+			runtime.ctx.handleContextCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},

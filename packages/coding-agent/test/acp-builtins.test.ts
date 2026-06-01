@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { Settings } from "../src/config/settings";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
@@ -29,7 +30,15 @@ interface FakeAcpBuiltinSession {
 			options?: { candidates?: Array<{ provider: string; id: string; contextWindow?: number }> },
 		) => { provider: string; id: string; contextWindow?: number } | undefined;
 	};
-	model: { provider: string; id: string } | undefined;
+	model: { provider: string; id: string; contextWindow?: number } | undefined;
+	agent: {
+		state: {
+			tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
+		};
+	};
+	settings: Settings;
+	systemPrompt: string[];
+	skills: Array<{ name: string; description: string }>;
 	newSession(opts?: { drop?: boolean; parentSession?: string }): Promise<boolean>;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
@@ -48,6 +57,7 @@ interface FakeAcpBuiltinSession {
 
 function createRuntime() {
 	const output: string[] = [];
+	const settings = Settings.isolated();
 	const session: FakeAcpBuiltinSession = {
 		fastMode: false,
 		forcedToolChoice: undefined as string | undefined,
@@ -98,6 +108,10 @@ function createRuntime() {
 			},
 		},
 		model: undefined,
+		agent: { state: { tools: [] } },
+		settings,
+		systemPrompt: [],
+		skills: [],
 		getToolByName: (_name: string) => undefined,
 		async compact(_args?: string) {},
 		getContextUsage: () => undefined,
@@ -141,6 +155,20 @@ function createRuntime() {
 		getCwd(): string {
 			return this._cwd;
 		},
+		buildSessionContext() {
+			return {
+				messages: [] as AgentMessage[],
+				thinkingLevel: "off",
+				models: {},
+				injectedTtsrRules: [],
+				selectedMCPToolNames: [],
+				hasPersistedMCPToolSelection: false,
+				mode: "none",
+			};
+		},
+		getUsageStatistics() {
+			return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 };
+		},
 		async setSessionName(name: string, _source: string): Promise<boolean> {
 			this._sessionName = name;
 			return true;
@@ -153,7 +181,7 @@ function createRuntime() {
 		runtime: {
 			session: typedSession,
 			sessionManager: fakeSessionManager as unknown as SessionManager,
-			settings: Settings.isolated(),
+			settings,
 			cwd: "/tmp/project",
 			output: (text: string) => {
 				output.push(text);
@@ -473,7 +501,6 @@ describe("ACP builtin slash commands", () => {
 			"/branch",
 			"/browser",
 			"/changelog",
-			"/context",
 			"/plan",
 			"/share",
 			"/hotkeys",
@@ -769,6 +796,73 @@ describe("wave 5 — adapters and polish", () => {
 	});
 
 	// /context breakdown
+	it("/context: renders active context, history, and last provider usage", async () => {
+		const { output, runtime, session, fakeSessionManager } = createRuntime();
+		session.model = { provider: "openai", id: "gpt-test", contextWindow: 100_000 };
+		session.systemPrompt = [
+			[
+				"<system>base instructions</system>",
+				'<skills><skill name="sample">Skill description</skill></skills>',
+				'<rules><rule name="repo">Repo rule</rule></rules>',
+			].join("\n"),
+			"<project>project context</project>",
+		];
+		session.skills = [{ name: "sample", description: "Skill description" }];
+		session.agent.state.tools = [{ name: "read", description: "Read files", parameters: { type: "object" } }];
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "older prompt", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "older answer" }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "gpt-test",
+				usage: {
+					input: 1000,
+					output: 200,
+					cacheRead: 300,
+					cacheWrite: 0,
+					totalTokens: 1500,
+					cost: { input: 0.001, output: 0.002, cacheRead: 0.0001, cacheWrite: 0, total: 0.0031 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			},
+			{ role: "user", content: "what is the current context?", timestamp: 3 },
+		];
+		fakeSessionManager.buildSessionContext = () => ({
+			messages,
+			thinkingLevel: "off",
+			models: {},
+			injectedTtsrRules: [],
+			selectedMCPToolNames: [],
+			hasPersistedMCPToolSelection: false,
+			mode: "none",
+		});
+		fakeSessionManager.getBranch = () => [
+			{ type: "message", id: "1", parentId: null, timestamp: "t", message: messages[0] },
+			{
+				type: "compaction",
+				id: "2",
+				parentId: "1",
+				timestamp: "t",
+				summary: "summary",
+				firstKeptEntryId: "1",
+				tokensBefore: 42_000,
+			},
+			{ type: "message", id: "3", parentId: "2", timestamp: "t", message: messages[1] },
+			{ type: "message", id: "4", parentId: "3", timestamp: "t", message: messages[2] },
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/context", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Context usage");
+		expect(output[0]).toContain("Active context breakdown");
+		expect(output[0]).toContain("Last user turn");
+		expect(output[0]).toContain("Compacted history: summary active");
+		expect(output[0]).toContain("Cost: $0.003100");
+	});
 
 	// /jobs empty state
 	it("/jobs: empty-state output mentions background jobs definition", async () => {

@@ -1,6 +1,87 @@
+import type { AgentMessage } from "@gajae-code/agent-core";
+import { type CompactionSettings, calculatePromptTokens } from "@gajae-code/agent-core/compaction";
+import type { AssistantMessage, Usage } from "@gajae-code/ai";
 import { computeContextBreakdown } from "../../modes/utils/context-usage";
+import type { CompactionEntry, SessionEntry } from "../../session/session-manager";
 import type { SlashCommandRuntime } from "../types";
 import { renderAsciiBar } from "./format";
+
+interface ActiveHistorySummary {
+	activeMessages: readonly AgentMessage[];
+	rawBranchMessages: number;
+	rawBranchEntries: number;
+	compaction: CompactionEntry | undefined;
+	compactedRawMessages: number | undefined;
+}
+
+function isMessageEntry(entry: SessionEntry): boolean {
+	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
+}
+
+function summarizeActiveHistory(runtime: SlashCommandRuntime): ActiveHistorySummary {
+	const activeContext = runtime.sessionManager.buildSessionContext();
+	const branch = runtime.sessionManager.getBranch();
+	let compaction: CompactionEntry | undefined;
+	let compactionIndex = -1;
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type === "compaction") {
+			compaction = entry;
+			compactionIndex = i;
+			break;
+		}
+	}
+
+	const rawBranchMessages = branch.filter(isMessageEntry).length;
+	let compactedRawMessages: number | undefined;
+	if (compaction) {
+		const firstKeptIndex = branch.findIndex(entry => entry.id === compaction?.firstKeptEntryId);
+		if (firstKeptIndex >= 0 && compactionIndex >= 0) {
+			compactedRawMessages = branch.slice(0, firstKeptIndex).filter(isMessageEntry).length;
+		}
+	}
+
+	return {
+		activeMessages: activeContext.messages,
+		rawBranchMessages,
+		rawBranchEntries: branch.length,
+		compaction,
+		compactedRawMessages,
+	};
+}
+
+function findLastAssistantUsage(messages: readonly AgentMessage[]):
+	| {
+			message: AssistantMessage;
+			usage: Usage;
+	  }
+	| undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role === "assistant") {
+			const assistant = message as AssistantMessage;
+			return { message: assistant, usage: assistant.usage };
+		}
+	}
+	return undefined;
+}
+
+function formatUnknownNumber(value: number | undefined): string {
+	return value === undefined ? "unknown" : value.toLocaleString();
+}
+
+function formatTokenLine(label: string, tokens: number, contextWindow: number): string {
+	const fraction = contextWindow > 0 ? tokens / contextWindow : 0;
+	return `  ${label.padEnd(16)} ${renderAsciiBar(fraction)}  ${tokens.toLocaleString()} tokens`;
+}
+
+function formatReserveText(runtime: SlashCommandRuntime, contextWindow: number, reserveTokens: number): string {
+	if (contextWindow <= 0) return "unknown";
+	if (reserveTokens > 0) return `${reserveTokens.toLocaleString()} tokens`;
+	const compaction = runtime.settings.getGroup("compaction") as CompactionSettings;
+	if (!compaction.enabled || compaction.strategy === "off") return "none configured";
+	return "unknown";
+}
 
 /**
  * Build the `/context` ACP-mode text. Tries the rich breakdown first
@@ -9,31 +90,60 @@ import { renderAsciiBar } from "./format";
  */
 export function buildContextReportText(runtime: SlashCommandRuntime): string {
 	try {
-		const breakdown = computeContextBreakdown(runtime.session);
+		const history = summarizeActiveHistory(runtime);
+		const breakdown = computeContextBreakdown(runtime.session, { messages: history.activeMessages });
 		if (breakdown.contextWindow <= 0) {
 			return "Context usage is unavailable: no model is selected for this session.";
 		}
-		const usedPct = Math.round((breakdown.usedTokens / breakdown.contextWindow) * 100);
-		const lines = [`Context window: ${breakdown.contextWindow} tokens (${usedPct}% used)`];
+		const promptUsage = findLastAssistantUsage(history.activeMessages);
+		const usedPct = (breakdown.usedTokens / breakdown.contextWindow) * 100;
+		const lines = [
+			"Context usage",
+			`Model: ${breakdown.model?.provider ?? "unknown"}/${breakdown.model?.id ?? "unknown"}`,
+			`Active context: ${breakdown.usedTokens.toLocaleString()} / ${breakdown.contextWindow.toLocaleString()} tokens (${usedPct.toFixed(1)}% used)`,
+			`Reserve: ${formatReserveText(runtime, breakdown.contextWindow, breakdown.autoCompactBufferTokens)}`,
+			"",
+			"Active context breakdown (estimated)",
+		];
 		for (const category of breakdown.categories) {
-			if (category.tokens === 0) continue;
-			const fraction = category.tokens / breakdown.contextWindow;
-			lines.push(`  ${category.label.padEnd(16)} ${renderAsciiBar(fraction)}  ${category.tokens} tokens`);
+			lines.push(formatTokenLine(category.label, category.tokens, breakdown.contextWindow));
 		}
 		if (breakdown.autoCompactBufferTokens > 0) {
-			const fraction = breakdown.autoCompactBufferTokens / breakdown.contextWindow;
-			lines.push(
-				`  ${"Auto-compact buf".padEnd(16)} ${renderAsciiBar(fraction)}  ${breakdown.autoCompactBufferTokens} tokens`,
-			);
+			lines.push(formatTokenLine("Reserve", breakdown.autoCompactBufferTokens, breakdown.contextWindow));
 		}
-		if (breakdown.freeTokens > 0) {
-			const fraction = breakdown.freeTokens / breakdown.contextWindow;
-			lines.push(`  ${"Free".padEnd(16)} ${renderAsciiBar(fraction)}  ${breakdown.freeTokens} tokens`);
+		lines.push(formatTokenLine("Free", breakdown.freeTokens, breakdown.contextWindow));
+		lines.push(
+			"",
+			"History",
+			`Active messages sent next turn: ${history.activeMessages.length.toLocaleString()}`,
+			`Raw branch history: ${history.rawBranchMessages.toLocaleString()} message entries / ${history.rawBranchEntries.toLocaleString()} total entries`,
+			history.compaction
+				? `Compacted history: summary active; compacted raw messages: ${formatUnknownNumber(history.compactedRawMessages)}; tokens before compaction: ${history.compaction.tokensBefore.toLocaleString()}`
+				: "Compacted history: none on active branch",
+			"",
+			"Last recorded provider turn",
+		);
+		if (promptUsage) {
+			lines.push(
+				`Model: ${promptUsage.message.provider}/${promptUsage.message.model}`,
+				`Prompt tokens: ${calculatePromptTokens(promptUsage.usage).toLocaleString()}`,
+				`Input/output/cache: ${promptUsage.usage.input.toLocaleString()} / ${promptUsage.usage.output.toLocaleString()} / ${(
+					promptUsage.usage.cacheRead + promptUsage.usage.cacheWrite
+				).toLocaleString()}`,
+				`Cost: $${promptUsage.usage.cost.total.toFixed(6)}`,
+			);
+		} else {
+			lines.push("Usage/cost: unknown (no assistant response with recorded provider usage yet)");
 		}
 		return lines.join("\n");
 	} catch {
 		const fallback = runtime.session.getContextUsage();
 		if (!fallback) return "Context usage is unavailable.";
-		return ["Context", `Window: ${fallback.contextWindow}`, `Used: ${fallback.tokens ?? 0}`].join("\n");
+		return [
+			"Context usage",
+			`Active context: ${fallback.tokens === null || fallback.tokens === undefined ? "unknown" : fallback.tokens.toLocaleString()}`,
+			`Context window: ${fallback.contextWindow.toLocaleString()}`,
+			"Breakdown: unknown",
+		].join("\n");
 	}
 }

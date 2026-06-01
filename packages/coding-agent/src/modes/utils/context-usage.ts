@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionSettings } from "@gajae-code/agent-core/compaction";
 import { effectiveReserveTokens, estimateTokens, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { Model } from "@gajae-code/ai";
@@ -18,7 +19,7 @@ const CELL_FILLED_MESSAGES = "⛃";
 const CELL_FREE = "⛶";
 const CELL_BUFFER = "⛝";
 
-type CategoryId = "systemPrompt" | "systemContext" | "systemTools" | "skills" | "messages";
+type CategoryId = "systemPrompt" | "systemContext" | "rules" | "tools" | "skills" | "messages" | "lastUserTurn";
 
 interface CategoryInfo {
 	id: CategoryId;
@@ -32,6 +33,7 @@ export interface ContextBreakdown {
 	model: Model | undefined;
 	contextWindow: number;
 	categories: CategoryInfo[];
+	lastUserTurnTokens: number;
 	usedTokens: number;
 	autoCompactBufferTokens: number;
 	freeTokens: number;
@@ -76,7 +78,9 @@ export function estimateToolSchemaTokens(
  */
 export function computeNonMessageTokens(session: AgentSession): number {
 	const parts = computeNonMessageBreakdown(session);
-	return parts.systemPromptTokens + parts.systemContextTokens + parts.toolsTokens + parts.skillsTokens;
+	return (
+		parts.systemPromptTokens + parts.systemContextTokens + parts.rulesTokens + parts.toolsTokens + parts.skillsTokens
+	);
 }
 
 /**
@@ -86,6 +90,7 @@ export function computeNonMessageTokens(session: AgentSession): number {
  * the two surfaces — they MUST report the same numbers.
  */
 function computeNonMessageBreakdown(session: AgentSession): {
+	rulesTokens: number;
 	skillsTokens: number;
 	toolsTokens: number;
 	systemContextTokens: number;
@@ -94,26 +99,60 @@ function computeNonMessageBreakdown(session: AgentSession): {
 	const skillsTokens = estimateSkillsTokens(session.skills ?? []);
 	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? []);
 	const systemPromptParts = session.systemPrompt ?? [];
+	const rulesTokens = estimateRulesTokens(systemPromptParts);
 	const systemContextTokens = countTokens(systemPromptParts.slice(1));
-	const systemPromptTokens = Math.max(0, countTokens(systemPromptParts[0] ?? "") - skillsTokens);
-	return { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
+	const systemPromptTokens = Math.max(0, countTokens(systemPromptParts[0] ?? "") - skillsTokens - rulesTokens);
+	return { rulesTokens, skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
+}
+
+function estimateRulesTokens(systemPromptParts: readonly string[]): number {
+	const fragments: string[] = [];
+	for (const part of systemPromptParts) {
+		for (const match of part.matchAll(/<rules>[\s\S]*?<\/rules>/g)) {
+			fragments.push(match[0]);
+		}
+	}
+	return fragments.length === 0 ? 0 : countTokens(fragments);
+}
+
+function splitLastUserTurn(messages: readonly AgentMessage[]): {
+	regularMessagesTokens: number;
+	lastUserTurnTokens: number;
+} {
+	let lastUserIndex = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i]?.role === "user") {
+			lastUserIndex = i;
+			break;
+		}
+	}
+
+	let regularMessagesTokens = 0;
+	let lastUserTurnTokens = 0;
+	for (let i = 0; i < messages.length; i++) {
+		const tokens = estimateTokens(messages[i]);
+		if (i === lastUserIndex) {
+			lastUserTurnTokens = tokens;
+		} else {
+			regularMessagesTokens += tokens;
+		}
+	}
+	return { regularMessagesTokens, lastUserTurnTokens };
 }
 
 /**
  * Compute a breakdown of estimated context usage by category for the active
  * session and model.
  */
-export function computeContextBreakdown(session: AgentSession): ContextBreakdown {
+export function computeContextBreakdown(
+	session: AgentSession,
+	options: { messages?: readonly AgentMessage[] } = {},
+): ContextBreakdown {
 	const model = session.model;
 	const contextWindow = model?.contextWindow ?? 0;
 
-	let messagesTokens = 0;
-	const convo = session.messages;
-	if (convo) {
-		for (const message of convo) {
-			messagesTokens += estimateTokens(message);
-		}
-	}
+	const convo = options.messages ?? session.messages ?? [];
+	const { regularMessagesTokens, lastUserTurnTokens } = splitLastUserTurn(convo);
 
 	// The rendered system prompt already contains the skill descriptions and the
 	// markdown tool descriptions. To present a non-overlapping breakdown:
@@ -121,14 +160,16 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 	//   Tools         = JSON tool schema sent separately on the wire
 	//   Skills        = the skill list embedded in the system prompt
 	//   Messages      = conversation messages
-	const { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } = computeNonMessageBreakdown(session);
+	const { rulesTokens, skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } =
+		computeNonMessageBreakdown(session);
 
 	const categories: CategoryInfo[] = [
-		{ id: "systemPrompt", label: "System prompt", tokens: systemPromptTokens, color: "accent", glyph: CELL_FILLED },
-		{ id: "systemTools", label: "System tools", tokens: toolsTokens, color: "warning", glyph: CELL_FILLED },
+		{ id: "systemPrompt", label: "System", tokens: systemPromptTokens, color: "accent", glyph: CELL_FILLED },
+		{ id: "rules", label: "Rules", tokens: rulesTokens, color: "warning", glyph: CELL_FILLED },
+		{ id: "tools", label: "Tools", tokens: toolsTokens, color: "warning", glyph: CELL_FILLED },
 		{
 			id: "systemContext",
-			label: "System context",
+			label: "Context files",
 			tokens: systemContextTokens,
 			color: "customMessageLabel",
 			glyph: CELL_FILLED,
@@ -137,7 +178,14 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 		{
 			id: "messages",
 			label: "Messages",
-			tokens: messagesTokens,
+			tokens: regularMessagesTokens,
+			color: "userMessageText",
+			glyph: CELL_FILLED_MESSAGES,
+		},
+		{
+			id: "lastUserTurn",
+			label: "Last user turn",
+			tokens: lastUserTurnTokens,
 			color: "userMessageText",
 			glyph: CELL_FILLED_MESSAGES,
 		},
@@ -167,6 +215,7 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 		model,
 		contextWindow,
 		categories,
+		lastUserTurnTokens,
 		usedTokens,
 		autoCompactBufferTokens,
 		freeTokens,
