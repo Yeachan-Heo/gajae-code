@@ -192,6 +192,16 @@ Receipts are freshness-scoped:
 - Normal later `goal_started` or clean receipt-backed `goal_checkpointed` events for other goals do not stale older per-goal receipts.
 - Appending required goals or changing final required-goal state stales final aggregate receipts. Final aggregate completion requires a fresh final aggregate receipt proving no incomplete, blocked, or `review_blocked` required goals remain.
 
+## Handoff back to planning
+
+When the aggregate ultragoal is complete OR the user requests return to planning/clarification, mark ultragoal ready for handoff so the skill tool's chain guard permits the backward transition:
+
+```
+gjc state ultragoal write --input '{"current_phase":"handoff"}' --json
+```
+
+The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-turn and runs `gjc state ultragoal handoff --to <ralplan|deep-interview> --json` in-process to atomically demote ultragoal, promote the callee, and sync both `skill-active-state.json` files. You do not need to run the handoff verb yourself.
+
 ## Constraints
 
 - The shell command cannot directly invoke interactive `/goal`; it emits a model-facing handoff for the active GJC agent.

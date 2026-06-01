@@ -72,6 +72,14 @@ The consensus workflow:
 7. *(--interactive only)* User chooses: Approve team execution, Request changes, or Reject
 8. *(--interactive only)* On approval: invoke `/skill:team` for execution -- never implement directly
 
+   Before invoking `/skill:team` or `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition:
+
+   ```
+   gjc state ralplan write --input '{"current_phase":"handoff"}' --json
+   ```
+
+   The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to <team|ultragoal> --json` in-process to atomically demote ralplan, promote the callee, and sync both `skill-active-state.json` files. You do not need to run the handoff verb yourself.
+
 > **Important:** Steps 3 and 4 MUST run sequentially. Do NOT issue both agent Task calls in the same parallel batch. Always await the Architect result before issuing the Critic Task.
 
 Follow the Plan skill's full documentation for consensus mode details.

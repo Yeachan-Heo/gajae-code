@@ -1205,6 +1205,28 @@ export class AgentSession {
 		};
 	}
 
+	/** Best-effort accessor for the active skill's `current_phase` field from
+	 *  its persisted mode-state file. Used by the `skill` tool to enforce the
+	 *  terminal-phase chain guard. Returns undefined when no active skill is
+	 *  recorded or the mode-state file is missing/unreadable; callers should
+	 *  treat undefined as a non-terminal phase (refuses to chain). */
+	getActiveSkillPhase(): string | undefined {
+		const active = this.#activeSkillState;
+		if (!active) return undefined;
+		try {
+			const stateDir = path.join(this.sessionManager.getCwd(), ".gjc", "state");
+			const segments = active.sessionId
+				? [stateDir, "sessions", encodeURIComponent(active.sessionId).replaceAll(".", "%2E")]
+				: [stateDir];
+			const filePath = path.join(...segments, `${active.skill}-state.json`);
+			const raw = fs.readFileSync(filePath, "utf-8");
+			const parsed = JSON.parse(raw) as { current_phase?: unknown };
+			return typeof parsed.current_phase === "string" ? parsed.current_phase : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Peek the in-flight directive's invocation handler for use by the resolve tool. */
 	peekQueueInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
 		return this.#toolChoiceQueue.peekInFlightInvoker();

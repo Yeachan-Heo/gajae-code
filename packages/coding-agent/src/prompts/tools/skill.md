@@ -1,4 +1,4 @@
-Invoke another available skill as the next turn.
+Invoke another available skill in the current turn.
 
 <conditions>
 - A SKILL document instructs you to chain into another skill on completion (e.g. ralplan → ultragoal)
@@ -8,8 +8,9 @@ Invoke another available skill as the next turn.
 <instruction>
 - `name` is the skill name as it appears in `/skill:<name>` (e.g. `ralplan`, `ultragoal`, `team`, `deep-interview`)
 - `args` is the free-form argument string the skill would receive after `/skill:<name>` on the command line
-- The skill's SKILL.md is queued as a user-attribution message and activates on the **next** turn — current turn finishes first
-- Call once per chained skill. To chain `A → B → C`, A's skill calls `skill(B)`, then B's skill (running next turn) calls `skill(C)`
+- The skill tool dispatches the callee's SKILL.md as a user-attribution custom message in the current turn (steering the stream when active, appending otherwise). Before dispatch, the tool atomically demotes the caller and promotes the callee in `.gjc/state/` by calling `gjc state <caller> handoff --to <callee>` in-process.
+- The chain is refused unless the caller's `current_phase` is in `{complete, completed, handoff, failed, cancelled, inactive}`. To prepare the active skill for chaining, write `current_phase: "handoff"` to its mode-state via `gjc state <skill> write --input '{"current_phase":"handoff"}' --json`. The skill tool itself then runs `gjc state <skill> handoff --to <callee>` in-process to atomically demote the caller and promote the callee — you do not need to run the handoff verb separately.
+- Call once per chain step. To chain `A → B → C`, A calls `skill(B)`; B's next agent turn calls `skill(C)`.
 </instruction>
 
 <critical>

@@ -100,7 +100,7 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
-	it("keeps stale active entries visible with derived stale metadata", async () => {
+	it("does not derive a stale flag for aged entries without explicit deactivation", async () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
@@ -111,7 +111,9 @@ describe("GJC skill-active state", () => {
 			});
 
 			const visible = await readVisibleSkillActiveState(cwd, "sess-old");
-			expect(visible?.active_skills?.[0]).toEqual(expect.objectContaining({ skill: "team", stale: true }));
+			const entry = visible?.active_skills?.[0];
+			expect(entry?.skill).toBe("team");
+			expect(entry?.stale).toBeUndefined();
 		});
 	});
 

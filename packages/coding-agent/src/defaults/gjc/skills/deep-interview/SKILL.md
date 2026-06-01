@@ -515,6 +515,16 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 **IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:team`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. `gjc team` is a native tmux runtime command and may be used only when the Team workflow explicitly requires the CLI runtime. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
 
+### Phase 5b: Handoff before chain
+
+Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, mark deep-interview ready for handoff so the skill tool's chain guard lets the transition proceed. Run:
+
+```
+gjc state deep-interview write --input '{"current_phase":"handoff"}' --json
+```
+
+The skill tool then dispatches the next skill same-turn and runs `gjc state deep-interview handoff --to <callee> --json` in-process to atomically demote deep-interview, promote the callee, and sync both `skill-active-state.json` files. You do not need to run the handoff verb yourself. Skipping the `current_phase: "handoff"` write leaves the skill tool's terminal-phase guard refusing to chain.
+
 ### Approval-Gated Refinement Path (Recommended)
 
 ```

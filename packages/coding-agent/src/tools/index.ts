@@ -127,6 +127,10 @@ export interface ToolSession {
 	skills?: Skill[];
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
+	/** Get the active skill prompt's current phase so the skill tool can apply
+	 *  its terminal-phase chain guard. Returns the raw phase string or undefined
+	 *  when no active skill (or accessor) is available. */
+	getActiveSkillPhase?: () => string | undefined;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Whether LSP integrations are enabled */
@@ -252,7 +256,7 @@ export interface ToolSession {
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Dispatch a custom message through the active session. Used by the `skill`
-	 *  tool to chain another skill prompt as a queued next-turn message. */
+	 *  tool to dispatch another skill prompt same-turn after recording a handoff. */
 	sendCustomMessage?(
 		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },

@@ -1154,6 +1154,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getActiveSkillState: () => session?.getActiveSkillState(),
+			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),

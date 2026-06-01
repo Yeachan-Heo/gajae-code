@@ -9,6 +9,7 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
+import { initialPhaseForSkill } from "../skill-state/initial-phase";
 import {
 	buildDeepInterviewHudSummary,
 	buildRalplanHudSummary,
@@ -60,11 +61,11 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
 
-const FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id"]);
-const ACTION_NAMES = new Set(["read", "write", "clear", "contract"]);
+const FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id", "--to"]);
+const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff"]);
 
 interface ParsedInvocation {
-	action: "read" | "write" | "clear" | "contract";
+	action: "read" | "write" | "clear" | "contract" | "handoff";
 	positionalSkill?: string;
 }
 
@@ -169,9 +170,18 @@ async function resolveSelectors(
 	}
 	if (mode) assertKnownMode(mode);
 
+	// Session-id resolution order: explicit --session-id flag, then payload
+	// session_id, then GJC_SESSION_ID env var (set by AgentSession.sdk for
+	// agent-initiated CLI invocations). The env-var default keeps shell
+	// snippets in skill docs short while still routing writes/reads to the
+	// caller's session-scoped state files.
 	let sessionId = flagValue(args, "--session-id")?.trim() || undefined;
 	if (!sessionId && payload && typeof payload.session_id === "string") {
 		sessionId = payload.session_id.trim() || undefined;
+	}
+	if (!sessionId) {
+		const envSessionId = process.env.GJC_SESSION_ID?.trim();
+		if (envSessionId) sessionId = envSessionId;
 	}
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
 
@@ -397,6 +407,37 @@ async function syncWorkflowSkillState(options: {
 	}
 }
 
+async function syncWorkflowSkillStateStrict(options: {
+	cwd: string;
+	mode: CanonicalGjcWorkflowSkill;
+	sessionId: string | undefined;
+	threadId?: string;
+	turnId?: string;
+	active: boolean;
+	phase: string | undefined;
+	payload: Record<string, unknown>;
+	receipt?: WorkflowStateReceipt;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
+}): Promise<void> {
+	await syncSkillActiveState({
+		cwd: options.cwd,
+		skill: options.mode,
+		active: options.active,
+		phase: options.phase,
+		sessionId: options.sessionId,
+		threadId: options.threadId,
+		turnId: options.turnId,
+		source: "gjc-state-cli",
+		hud: buildHudForMode(options.mode, options.payload),
+		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
+		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
+		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
+		...(options.receipt ? { receipt: options.receipt } : {}),
+	});
+}
+
 async function handleRead(
 	args: readonly string[],
 	cwd: string,
@@ -527,6 +568,151 @@ async function handleClear(
 	return { status: 0, stdout: `${JSON.stringify(cleared, null, 2)}\n` };
 }
 
+/**
+ * `handoff` exists in two distinct roles:
+ *   - As a verb: this CLI action, which atomically transitions caller→callee.
+ *     Writes the callee mode-state first, the caller mode-state second, then
+ *     syncs both `skill-active-state.json` files. Every intermediate crashed
+ *     state remains HUD-coherent: the active-state file either reflects the
+ *     old skill entirely or the new skill entirely, never both as active.
+ *   - As a phase: `current_phase: "handoff"` is set by this verb when demoting
+ *     the caller. Agents writing `current_phase: "handoff"` manually via
+ *     `gjc state <skill> write` are declaring "I am ready to be handed off";
+ *     the next agent-initiated `skill` tool call will then satisfy the phase
+ *     guard and may chain.
+ *
+ * `handoff` is in the terminal-phase set used by `isTerminalModeState` and by
+ * the skill tool's chain guard. A manual `current_phase: "handoff"` write does
+ * NOT mark `active: false` — only this verb does that — so a skill that wrote
+ * the phase remains in `skill-active-state.json` until a chain call (or
+ * explicit `clear`) demotes it.
+ */
+async function handleHandoff(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill);
+	const { sessionId, threadId, turnId } = selectors;
+	const caller = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
+	if (!caller) {
+		throw new StateCommandError(
+			2,
+			"gjc state handoff requires --mode <caller>, positional <caller>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+		);
+	}
+	const calleeRaw = flagValue(args, "--to")?.trim();
+	if (!calleeRaw) {
+		throw new StateCommandError(2, "gjc state handoff requires --to <callee>");
+	}
+	assertKnownMode(calleeRaw);
+	const callee = calleeRaw as CanonicalGjcWorkflowSkill;
+	if (callee === caller) {
+		throw new StateCommandError(2, `gjc state handoff: --to must differ from caller (both are "${caller}")`);
+	}
+
+	const callerPath = modeStateFile(cwd, caller, sessionId);
+	const calleePath = modeStateFile(cwd, callee, sessionId);
+	const existingCaller = await readJsonFile(callerPath);
+	if (!existingCaller) {
+		throw new StateCommandError(
+			2,
+			`gjc state ${caller} handoff: caller is not active (no mode-state file at ${callerPath})`,
+		);
+	}
+	const existingCallee = (await readJsonFile(calleePath)) ?? {};
+
+	const handoffAt = nowIso();
+	const callerReceipt = buildWorkflowStateReceipt({
+		cwd,
+		skill: caller,
+		owner: "gjc-state-cli",
+		command: `gjc state ${caller} handoff --to ${callee}`,
+		sessionId,
+		nowIso: handoffAt,
+	});
+	const calleeReceipt = buildWorkflowStateReceipt({
+		cwd,
+		skill: callee,
+		owner: "gjc-state-cli",
+		command: `gjc state ${caller} handoff --to ${callee}`,
+		sessionId,
+		nowIso: handoffAt,
+	});
+
+	const calleeInitial = initialPhaseForSkill(callee);
+	const mergedCalleeState: Record<string, unknown> = {
+		...existingCallee,
+		skill: callee,
+		version: typeof existingCallee.version === "number" ? existingCallee.version : 1,
+		active: true,
+		current_phase: calleeInitial,
+		handoff_from: caller,
+		handoff_at: handoffAt,
+		updated_at: handoffAt,
+		receipt: calleeReceipt,
+	};
+	if (sessionId && typeof mergedCalleeState.session_id !== "string") {
+		mergedCalleeState.session_id = sessionId;
+	}
+	const mergedCallerState: Record<string, unknown> = {
+		...existingCaller,
+		skill: caller,
+		active: false,
+		current_phase: "handoff",
+		handoff_to: callee,
+		handoff_at: handoffAt,
+		updated_at: handoffAt,
+		receipt: callerReceipt,
+	};
+
+	// Atomic write order (Principle 6): callee first, caller second,
+	// then strict active-state syncs (caller demotion, callee promotion).
+	await writeJsonAtomic(calleePath, mergedCalleeState);
+	await writeJsonAtomic(callerPath, mergedCallerState);
+	await syncWorkflowSkillStateStrict({
+		cwd,
+		mode: caller,
+		sessionId,
+		threadId,
+		turnId,
+		active: false,
+		phase: "handoff",
+		payload: mergedCallerState,
+		receipt: callerReceipt,
+		handoff_to: callee,
+		handoff_at: handoffAt,
+	});
+	await syncWorkflowSkillStateStrict({
+		cwd,
+		mode: callee,
+		sessionId,
+		threadId,
+		turnId,
+		active: true,
+		phase: calleeInitial,
+		payload: mergedCalleeState,
+		receipt: calleeReceipt,
+		handoff_from: caller,
+		handoff_at: handoffAt,
+	});
+
+	return {
+		status: 0,
+		stdout: `${JSON.stringify(
+			{
+				from: caller,
+				to: callee,
+				handoff_at: handoffAt,
+				caller_state: mergedCallerState,
+				callee_state: mergedCalleeState,
+			},
+			null,
+			2,
+		)}\n`,
+	};
+}
+
 async function handleContract(
 	args: readonly string[],
 	cwd: string,
@@ -552,6 +738,8 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return await handleClear(args, cwd, parsed.positionalSkill);
 			case "contract":
 				return await handleContract(args, cwd, parsed.positionalSkill);
+			case "handoff":
+				return await handleHandoff(args, cwd, parsed.positionalSkill);
 			default:
 				return { status: 2, stderr: `Unknown gjc state command: ${parsed.action}\n` };
 		}

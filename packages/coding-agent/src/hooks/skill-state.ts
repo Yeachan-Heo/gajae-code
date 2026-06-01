@@ -112,6 +112,9 @@ export interface ModeState {
 	thread_id?: string;
 	cwd?: string;
 	updated_at?: string;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
 	[key: string]: unknown;
 }
 
@@ -220,11 +223,10 @@ function encodeStatePathSegment(value: string): string {
 	return encodeURIComponent(value).replaceAll(".", "%2E");
 }
 
-function initialPhaseForSkill(skill: GjcWorkflowSkill): string {
-	if (skill === "deep-interview") return "interviewing";
-	if (skill === "ultragoal") return "goal-planning";
-	return "planning";
-}
+import { initialPhaseForSkill } from "../skill-state/initial-phase";
+
+// Re-export for existing callers and tests that imported it from this module.
+export { initialPhaseForSkill };
 
 function modeStateFileName(skill: GjcWorkflowSkill): string {
 	return `${skill}-state.json`;
@@ -347,7 +349,7 @@ function isTerminalModeState(state: ModeState | null): boolean {
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();
-	return ["complete", "completed", "failed", "cancelled", "canceled", "inactive"].includes(phase);
+	return ["complete", "completed", "handoff", "failed", "cancelled", "canceled", "inactive"].includes(phase);
 }
 
 async function readVisibleModeState(

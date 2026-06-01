@@ -119,4 +119,35 @@ describe("skill HUD bar renderer", () => {
 		expect(rendered).toContain("next=ask user for approval");
 		expect(rendered).toContain("receipt=fresh");
 	});
+
+	it("shows only the callee after a D->R handoff (caller removed from active_skills)", () => {
+		// After `gjc state deep-interview handoff --to ralplan`, the upsertEntry
+		// pathway removes deep-interview from active_skills entirely (active=false
+		// drops the entry). The HUD reflects only what is active.
+		const rendered = Bun.stripANSI(renderSkillHudBar([{ skill: "ralplan", phase: "planning" }], 80) ?? "");
+		expect(rendered).toContain("ralplan:planning");
+		expect(rendered).not.toContain("deep-interview");
+	});
+
+	it("shows only the callee after an R->U handoff", () => {
+		const rendered = Bun.stripANSI(renderSkillHudBar([{ skill: "ultragoal", phase: "goal-planning" }], 80) ?? "");
+		expect(rendered).toContain("ultragoal:goal-planning");
+		expect(rendered).not.toContain("ralplan");
+	});
+
+	it("shows only the callee after a backward U->R handoff", () => {
+		const rendered = Bun.stripANSI(renderSkillHudBar([{ skill: "ralplan", phase: "planning" }], 80) ?? "");
+		expect(rendered).toContain("ralplan:planning");
+		expect(rendered).not.toContain("ultragoal");
+	});
+
+	it("does not emit warn:stale for an entry without explicit stale flag (no 24h derivation)", () => {
+		// Pre-G003 the renderer relied on withDerivedStale to flag aged entries.
+		// Post-G003, only explicit `entry.stale === true` produces the chip.
+		const rendered = Bun.stripANSI(
+			renderSkillHudBar([{ skill: "team", phase: "running", updated_at: "2000-01-01T00:00:00.000Z" }], 80) ?? "",
+		);
+		expect(rendered).toContain("team:running");
+		expect(rendered).not.toContain("warn:stale");
+	});
 });

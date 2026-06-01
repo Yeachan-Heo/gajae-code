@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
-export const SKILL_ACTIVE_STALE_MS = 24 * 60 * 60 * 1000;
 
 export const CANONICAL_GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
 
@@ -40,6 +39,9 @@ export interface SkillActiveEntry {
 	hud?: WorkflowHudSummary;
 	stale?: boolean;
 	receipt?: WorkflowStateReceipt;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
 }
 
 export interface SkillActiveState {
@@ -75,6 +77,9 @@ export interface SyncSkillActiveStateOptions {
 	source?: string;
 	hud?: WorkflowHudSummary;
 	receipt?: WorkflowStateReceipt;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -185,25 +190,6 @@ function entryKey(entry: Pick<SkillActiveEntry, "skill" | "session_id">): string
 	return `${entry.skill}::${safeString(entry.session_id).trim()}`;
 }
 
-function timestampMs(value: string | undefined): number | null {
-	if (!value) return null;
-	const ms = Date.parse(value);
-	return Number.isFinite(ms) ? ms : null;
-}
-
-function entryTimestampMs(entry: SkillActiveEntry): number | null {
-	return timestampMs(entry.hud?.updated_at) ?? timestampMs(entry.updated_at) ?? timestampMs(entry.activated_at);
-}
-
-function isFreshEntry(entry: SkillActiveEntry, nowMs = Date.now()): boolean {
-	const ms = entryTimestampMs(entry);
-	return ms === null || nowMs - ms <= SKILL_ACTIVE_STALE_MS;
-}
-
-function withDerivedStale(entry: SkillActiveEntry, nowMs = Date.now()): SkillActiveEntry {
-	return { ...entry, stale: !isFreshEntry(entry, nowMs) };
-}
-
 function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 	if (!raw || typeof raw !== "object") return null;
 	const record = raw as Record<string, unknown>;
@@ -221,6 +207,9 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 		session_id: safeString(record.session_id).trim() || undefined,
 		thread_id: safeString(record.thread_id).trim() || undefined,
 		turn_id: safeString(record.turn_id).trim() || undefined,
+		handoff_from: safeString(record.handoff_from).trim() || undefined,
+		handoff_to: safeString(record.handoff_to).trim() || undefined,
+		handoff_at: safeString(record.handoff_at).trim() || undefined,
 		...(hud ? { hud } : {}),
 		...(receipt ? { receipt } : {}),
 		stale: undefined,
@@ -319,12 +308,9 @@ function mergeVisibleEntries(
 	rootState: SkillActiveState | null,
 	sessionId?: string,
 ): SkillActiveEntry[] {
-	const nowMs = Date.now();
-	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId).map(entry =>
-		withDerivedStale(entry, nowMs),
-	);
+	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId);
 	const merged = new Map(rootEntries.map(entry => [entryKey(entry), entry]));
-	for (const entry of listActiveSkills(sessionState).map(candidate => withDerivedStale(candidate, nowMs))) {
+	for (const entry of listActiveSkills(sessionState)) {
 		merged.set(entryKey(entry), entry);
 	}
 	return [...merged.values()];
@@ -374,6 +360,9 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		session_id: options.sessionId,
 		thread_id: options.threadId,
 		turn_id: options.turnId,
+		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
+		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
+		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
 	};
