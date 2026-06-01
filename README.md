@@ -52,6 +52,28 @@ gjc --tmux --worktree <path>
 
 Use a dedicated path for throwaway or branch-specific work so the main checkout stays clean.
 
+## Provider retry budgets
+
+Gajae-Code has two retry layers:
+
+- Session auto-retry (`retry.maxRetries`) retries a failed assistant turn after a terminal transient error.
+- Provider retry budgets control retries inside the provider transport before that terminal error reaches the session.
+
+Configure provider budgets in `~/.gjc/config.yml` (or the active project/user settings source):
+
+```yaml
+retry:
+  # Similar to codex-cli request_max_retries. Counts retries, not the initial request.
+  requestMaxRetries: 4
+  # Similar to codex-cli stream_max_retries. Counts replay-safe stream retries.
+  streamMaxRetries: 100
+  # Session-level terminal-error retries remain separately configurable.
+  maxRetries: 3
+  maxDelayMs: 300000
+```
+
+`requestMaxRetries` applies to provider SDK/fetch retries before a stream is established. `streamMaxRetries` applies only when a provider can safely replay a transient stream failure before user-visible content or in provider-specific replay-safe paths. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast instead of being hidden by retry loops.
+
 ## Default TUI identity
 
 The default dark TUI identity is the GJC red-claw theme: a red/orange crustacean look for Gajae-Code terminals. Explicit user theme settings still win.

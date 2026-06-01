@@ -31,6 +31,7 @@ import { normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { toolWireSchema } from "../utils/schema/wire";
 import { resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
@@ -259,6 +260,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				headers: requestHeaders,
 				body,
 				signal: options.signal,
+				maxAttempts: resolveRetryBudget(options.requestMaxRetries, 4) + 1,
 			});
 
 			if (!response.ok) {

@@ -311,6 +311,16 @@ export interface StreamOptions {
 	 */
 	maxRetryDelayMs?: number;
 	/**
+	 * Maximum provider request retries for transports/SDKs that retry before a stream is established.
+	 * Counts retries only, not the initial attempt. Providers keep their built-in default when unset.
+	 */
+	requestMaxRetries?: number;
+	/**
+	 * Maximum provider stream replay retries after a replay-safe transient stream failure.
+	 * Counts retries only, not the initial stream attempt. Providers keep their built-in default when unset.
+	 */
+	streamMaxRetries?: number;
+	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.

@@ -21,6 +21,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
+import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
@@ -340,7 +341,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					headers: requestHeaders,
 					body: requestBodyJson,
 					signal: options?.signal,
-					maxAttempts: MAX_RETRIES + 1,
+					maxAttempts: resolveRetryBudget(options?.requestMaxRetries, MAX_RETRIES) + 1,
 					defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
 					maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
 					fetch: options?.fetch,
@@ -509,7 +510,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			let receivedContent = false;
 			let currentResponse = response;
 
-			for (let emptyAttempt = 0; emptyAttempt <= MAX_EMPTY_STREAM_RETRIES; emptyAttempt++) {
+			const emptyStreamRetryBudget = resolveRetryBudget(options?.streamMaxRetries, MAX_EMPTY_STREAM_RETRIES);
+			for (let emptyAttempt = 0; emptyAttempt <= emptyStreamRetryBudget; emptyAttempt++) {
 				if (options?.signal?.aborted) {
 					throw new Error("Request was aborted");
 				}
@@ -549,7 +551,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					break;
 				}
 
-				if (emptyAttempt < MAX_EMPTY_STREAM_RETRIES) {
+				if (emptyAttempt < emptyStreamRetryBudget) {
 					resetOutput();
 				}
 			}

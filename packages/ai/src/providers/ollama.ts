@@ -18,6 +18,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { toolWireSchema } from "../utils/schema/wire";
 import { transformMessages } from "./transform-messages";
 
@@ -402,6 +403,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				},
 				body: JSON.stringify(body),
 				signal: options.signal,
+				maxAttempts: resolveRetryBudget(options.requestMaxRetries, 4) + 1,
 				defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
 				fetch: options.fetch,
 			});

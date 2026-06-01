@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `retry.requestMaxRetries` and `retry.streamMaxRetries` settings plus docs for codex-cli-style provider retry budgets.
+
 ## [0.2.3] - 2026-06-01
 
 ### Added

@@ -563,6 +563,8 @@ function mapOptionsForApi<TApi extends Api>(
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
+		requestMaxRetries: options?.requestMaxRetries,
+		streamMaxRetries: options?.streamMaxRetries,
 		metadata: options?.metadata,
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,

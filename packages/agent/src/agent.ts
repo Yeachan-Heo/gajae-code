@@ -185,6 +185,10 @@ export interface AgentOptions {
 	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
 	 */
 	maxRetryDelayMs?: number;
+	/** Provider request retry budget. Counts retries, not the initial attempt. */
+	requestMaxRetries?: number;
+	/** Provider stream replay retry budget. Counts retries, not the initial attempt. */
+	streamMaxRetries?: number;
 
 	/**
 	 * Provides tool execution context, resolved per tool call.
@@ -285,6 +289,8 @@ export class Agent {
 	#serviceTier?: ServiceTier;
 	#hideThinkingSummary?: boolean;
 	#maxRetryDelayMs?: number;
+	#requestMaxRetries?: number;
+	#streamMaxRetries?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
 	#cursorOnToolResult?: CursorToolResultHandler;
@@ -348,6 +354,8 @@ export class Agent {
 		this.#serviceTier = opts.serviceTier;
 		this.#hideThinkingSummary = opts.hideThinkingSummary;
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
+		this.#requestMaxRetries = opts.requestMaxRetries;
+		this.#streamMaxRetries = opts.streamMaxRetries;
 		this.getApiKey = opts.getApiKey;
 		this.getAuthCredentialType = opts.getAuthCredentialType;
 		this.#onPayload = opts.onPayload;
@@ -564,6 +572,22 @@ export class Agent {
 	 */
 	set maxRetryDelayMs(value: number | undefined) {
 		this.#maxRetryDelayMs = value;
+	}
+
+	get requestMaxRetries(): number | undefined {
+		return this.#requestMaxRetries;
+	}
+
+	set requestMaxRetries(value: number | undefined) {
+		this.#requestMaxRetries = value;
+	}
+
+	get streamMaxRetries(): number | undefined {
+		return this.#streamMaxRetries;
+	}
+
+	set streamMaxRetries(value: number | undefined) {
+		this.#streamMaxRetries = value;
 	}
 
 	get state(): AgentState {
@@ -1092,6 +1116,8 @@ export class Agent {
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
+			requestMaxRetries: this.#requestMaxRetries,
+			streamMaxRetries: this.#streamMaxRetries,
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,

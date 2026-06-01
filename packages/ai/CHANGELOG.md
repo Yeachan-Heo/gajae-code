@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added configurable provider request and stream retry budgets so hosts can bound transient upstream/server retry behavior separately from session-level retries.
+
 ## [0.2.2] - 2026-05-31
 
 ### Fixed

@@ -1732,6 +1732,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const preferOpenAICodexWebsockets =
 			openaiWebsocketSetting === "on" ? true : openaiWebsocketSetting === "off" ? false : undefined;
 		const serviceTierSetting = settings.get("serviceTier");
+		const retrySettings = settings.getGroup("retry");
 
 		const initialServiceTier = hasServiceTierEntry
 			? existingSession.serviceTier
@@ -1789,6 +1790,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			repetitionPenalty: settings.get("repetitionPenalty") >= 0 ? settings.get("repetitionPenalty") : undefined,
 			serviceTier: initialServiceTier,
 			hideThinkingSummary: settings.get("hideThinkingBlock"),
+			maxRetryDelayMs: retrySettings.maxDelayMs,
+			requestMaxRetries: retrySettings.requestMaxRetries,
+			streamMaxRetries: retrySettings.streamMaxRetries,
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),

@@ -843,6 +843,26 @@ export const SETTINGS_SCHEMA = {
 				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
 		},
 	},
+	"retry.requestMaxRetries": {
+		type: "number",
+		default: 5,
+		ui: {
+			tab: "model",
+			label: "Provider Request Retries",
+			description:
+				"Maximum provider request retries before a stream is established. Counts retries, not the first attempt. Set to 0 to disable provider request retries.",
+		},
+	},
+	"retry.streamMaxRetries": {
+		type: "number",
+		default: 5,
+		ui: {
+			tab: "model",
+			label: "Provider Stream Retries",
+			description:
+				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+		},
+	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
 	"retry.fallbackRevertPolicy": {
 		type: "enum",
@@ -2833,6 +2853,8 @@ export interface RetrySettings {
 	maxRetries: number;
 	baseDelayMs: number;
 	maxDelayMs: number;
+	requestMaxRetries: number;
+	streamMaxRetries: number;
 }
 
 export interface MemoriesSettings {

@@ -87,6 +87,9 @@ Settings:
 - `retry.enabled` (default `true`)
 - `retry.maxRetries` (default `3`)
 - `retry.baseDelayMs` (default `2000`)
+- `retry.maxDelayMs` (default `300000`)
+- `retry.requestMaxRetries` (default `5`) — provider request retries before a stream is established; counts retries, not the initial request
+- `retry.streamMaxRetries` (default `5`) — provider stream replay retries for replay-safe transient stream failures; counts retries, not the initial stream attempt
 
 Attempt numbering:
 
@@ -214,3 +217,17 @@ A new retry chain can still start later on a future retryable error after counte
 - Retry strips the failing assistant error from **runtime context** before re-continue, but session history still keeps that error entry.
 - `RpcSessionState` currently exposes `autoCompactionEnabled` but not an `autoRetryEnabled` field; RPC callers must track their own toggle state or query settings through other APIs.
 - Model fallback changes append temporary `model_change` entries and may later restore the primary model when its cooldown expires, depending on `retry.fallbackRevertPolicy`.
+
+## Provider request/stream retry budgets
+
+The provider budgets are deliberately separate from session auto-retry:
+
+```yaml
+retry:
+  requestMaxRetries: 4
+  streamMaxRetries: 100
+```
+
+`requestMaxRetries` maps to provider SDK/fetch retry counts for request setup failures such as retryable 5xx/408/429/network errors. `streamMaxRetries` maps to provider-specific stream replay loops that are safe to repeat without duplicating visible assistant output. Providers that cannot safely replay a stream continue to surface the terminal error so the session-level auto-retry layer can decide whether to retry the turn.
+
+Fail-fast cases stay fail-fast: invalid credentials (after any credential-refresh path is exhausted), unsupported model/provider configuration, malformed requests, context overflow, explicit user aborts, and permanent quota failures are not treated as transient provider budget candidates.

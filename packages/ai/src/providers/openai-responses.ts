@@ -42,6 +42,7 @@ import {
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice, type OpenAIResponsesToolChoice } from "../utils/tool-choice";
@@ -253,6 +254,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.onSseEvent,
 				options?.fetch,
 				options?.authCredentialType,
+				options?.requestMaxRetries,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -354,6 +356,7 @@ function createClient(
 	onSseEvent?: OpenAIResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
+	requestMaxRetries?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -410,7 +413,7 @@ function createClient(
 			apiKey,
 			baseURL: baseUrl,
 			dangerouslyAllowBrowser: true,
-			maxRetries: 5,
+			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
 			fetch: onSseEvent
 				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))

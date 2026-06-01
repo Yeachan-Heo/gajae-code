@@ -56,6 +56,7 @@ import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
@@ -444,6 +445,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.fetch,
 				options?.streamFirstEventTimeoutMs,
 				options?.authCredentialType,
+				options?.requestMaxRetries,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -920,6 +922,7 @@ async function createClient(
 	fetchOverride?: FetchImpl,
 	streamFirstEventTimeoutOverride?: number,
 	authCredentialType?: OpenAICompletionsOptions["authCredentialType"],
+	requestMaxRetries?: number,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -1051,7 +1054,7 @@ async function createClient(
 			apiKey,
 			baseURL: baseUrl,
 			dangerouslyAllowBrowser: true,
-			maxRetries: 5,
+			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
 			defaultQuery: azureDefaultQuery,
 			fetch: debugFetch,

@@ -61,6 +61,7 @@ import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { spillToDescription } from "../utils/schema/spill";
 import { notifyRawSseEvent, wrapFetchForSseDebug } from "../utils/sse-debug";
@@ -626,6 +627,7 @@ export type AnthropicClientOptionsArgs = {
 	hasTools?: boolean;
 	onSseEvent?: AnthropicOptions["onSseEvent"];
 	fetch?: FetchImpl;
+	requestMaxRetries?: number;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -1057,6 +1059,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					hasTools: !!context.tools?.length,
 					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
+					requestMaxRetries: options?.requestMaxRetries,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -1445,7 +1448,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
 					if (
 						activeAbortTracker.wasCallerAbort() ||
-						providerRetryAttempt >= PROVIDER_MAX_RETRIES ||
+						providerRetryAttempt >= resolveRetryBudget(options?.streamMaxRetries, PROVIDER_MAX_RETRIES) ||
 						(!canRetryTransientEnvelopeFailure && !canRetryProviderFailure)
 					) {
 						throw streamFailure;
@@ -1604,7 +1607,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			apiKey: null,
 			authToken: copilotApiKey,
 			baseURL: baseUrl,
-			maxRetries: 5,
+			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
@@ -1637,7 +1640,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			apiKey: null,
 			authToken: null,
 			baseURL: baseUrl,
-			maxRetries: 5,
+			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
@@ -1650,7 +1653,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		apiKey: oauthToken ? null : apiKey,
 		authToken: oauthToken ? apiKey : undefined,
 		baseURL: baseUrl,
-		maxRetries: 5,
+		maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
 		logLevel: ANTHROPIC_SDK_LOG_LEVEL,

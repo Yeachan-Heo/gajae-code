@@ -49,6 +49,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { getOpenAIStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import { parseStreamingJson } from "../utils/json-parse";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { compactGrammarDefinition } from "./grammar";
 import { CODEX_BASE_URL, getCodexAccountId, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "./openai-codex/constants";
@@ -227,7 +228,10 @@ function isCodexWebSocketEnvEnabled(): boolean {
 	return $flag("PI_CODEX_WEBSOCKET");
 }
 
-function getCodexWebSocketRetryBudget(): number {
+function getCodexWebSocketRetryBudget(options?: Pick<OpenAICodexResponsesOptions, "streamMaxRetries">): number {
+	if (options?.streamMaxRetries !== undefined) {
+		return resolveRetryBudget(options.streamMaxRetries, CODEX_WEBSOCKET_RETRY_BUDGET);
+	}
 	return parseCodexNonNegativeInteger($env.PI_CODEX_WEBSOCKET_RETRY_BUDGET, CODEX_WEBSOCKET_RETRY_BUDGET);
 }
 
@@ -641,7 +645,7 @@ async function openInitialCodexEventStream(
 }> {
 	const { transformedBody, websocketState } = requestContext;
 	if (websocketState && shouldUseCodexWebSocket(model, websocketState, options?.preferWebsockets)) {
-		const websocketRetryBudget = getCodexWebSocketRetryBudget();
+		const websocketRetryBudget = getCodexWebSocketRetryBudget(options);
 		let websocketRetries = 0;
 		while (true) {
 			try {
@@ -707,7 +711,7 @@ async function openCodexWebSocketTransport(
 		sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 		requestType: websocketRequest.type,
 		retry,
-		retryBudget: getCodexWebSocketRetryBudget(),
+		retryBudget: getCodexWebSocketRetryBudget(options),
 	});
 	const eventStream = await openCodexWebSocketEventStream(
 		toWebSocketUrl(requestContext.url),
@@ -744,6 +748,7 @@ async function openCodexSseTransport(
 			requestSetup.requestSignal,
 			event => options?.onSseEvent?.(event, model),
 			options?.fetch,
+			options,
 		),
 	);
 	return { eventStream, requestBodyForState: structuredCloneJSON(body), transport: "sse" };
@@ -1348,7 +1353,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 		runtime.transport !== "websocket" ||
 		context.output.content.length > 0 ||
 		context.options?.signal?.aborted ||
-		runtime.providerRetryAttempt >= CODEX_MAX_RETRIES
+		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES)
 	) {
 		return false;
 	}
@@ -1390,12 +1395,14 @@ async function tryReplayWebsocketFailureOverSse(
 	const replayingBufferedOutputOverSse = context.output.content.length > 0;
 	const isFatal = isCodexWebSocketFatalError(streamError);
 	const activateFallback =
-		replayingBufferedOutputOverSse || isFatal || runtime.websocketStreamRetries >= getCodexWebSocketRetryBudget();
+		replayingBufferedOutputOverSse ||
+		isFatal ||
+		runtime.websocketStreamRetries >= getCodexWebSocketRetryBudget(context.options);
 	recordCodexWebSocketFailure(state, activateFallback);
 	logCodexDebug("codex websocket stream fallback", {
 		error: streamError.message,
 		retry: runtime.websocketStreamRetries,
-		retryBudget: getCodexWebSocketRetryBudget(),
+		retryBudget: getCodexWebSocketRetryBudget(context.options),
 		activated: activateFallback,
 		fatal: isFatal,
 		replayedBufferedOutput: replayingBufferedOutputOverSse,
@@ -1431,7 +1438,7 @@ async function tryRetryCodexProviderError(
 	if (
 		!isRetryableCodexProviderError(error) ||
 		context.output.content.length > 0 ||
-		runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
+		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted
 	) {
 		return false;
@@ -1447,7 +1454,7 @@ async function tryRetryCodexProviderError(
 	logCodexDebug("retrying codex provider stream error", {
 		error: error instanceof Error ? error.message : String(error),
 		retry: runtime.providerRetryAttempt,
-		retryBudget: CODEX_MAX_RETRIES,
+		retryBudget: resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES),
 		transport: runtime.transport,
 	});
 
@@ -2187,6 +2194,7 @@ async function openCodexSseEventStream(
 	signal?: AbortSignal,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
+	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries">,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
 	logCodexDebug("codex request", {
@@ -2201,7 +2209,7 @@ async function openCodexSseEventStream(
 		headers,
 		body: JSON.stringify(body),
 		signal,
-		maxAttempts: CODEX_MAX_RETRIES + 1,
+		maxAttempts: resolveRetryBudget(options?.requestMaxRetries, CODEX_MAX_RETRIES) + 1,
 		defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 		maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 		fetch: fetchOverride,
