@@ -12,7 +12,7 @@ import {
 } from "./workflow-state-contract";
 
 export const DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE =
-	"Deep-interview is active; continue interviewing with `ask`, write/finalize pending specs through the required GJC workflow CLI, or use an explicit force override. Direct `.gjc/` and product-code edits are blocked until explicit execution approval.";
+	"Deep-interview phase boundary: continue gathering context/questions/risks and emit a handoff/spec before code edits. Mutation tools and patch execution are blocked while deep-interview is active; finalize specs through `gjc deep-interview --write --stage final` or hand off to an execution phase.";
 export const WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE =
 	"Workflow state JSON is runtime-owned. Use `gjc state <skill> read|write --input '<json>'` for deep-interview, ralplan, ultragoal, and team. Planning artifacts under `.gjc/specs/` and `.gjc/plans/` remain allowed.";
 
@@ -88,7 +88,7 @@ async function readVisibleModeState(cwd: string, skill: string, sessionId?: stri
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {
-	if (!state || state.active !== true) return true;
+	if (state?.active !== true) return true;
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();
@@ -265,7 +265,7 @@ function relativeGjcSegments(cwd: string, rawPath: string): string[] | null {
 
 function blockedWorkflowStateSkill(cwd: string, rawPath: string): CanonicalGjcWorkflowSkill | null {
 	const segments = relativeGjcSegments(cwd, rawPath);
-	if (!segments || segments[0] !== ".gjc") return null;
+	if (segments?.[0] !== ".gjc") return null;
 	if (segments[1] === "specs" || segments[1] === "plans") return null;
 	if (segments[1] !== "state") return null;
 	const fileName = segments.at(-1) ?? "";
@@ -284,20 +284,10 @@ function firstBlockedWorkflowStateSkill(cwd: string, targets: ExtractedTargets):
 	return null;
 }
 
-function isGjcManagedPath(cwd: string, rawPath: string): boolean {
-	const segments = relativeGjcSegments(cwd, rawPath);
-	return segments?.[0] === ".gjc";
-}
-
 function isAllowlistedPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
-	if (!segments || segments[0] !== ".gjc") return false;
+	if (segments?.[0] !== ".gjc") return false;
 	return segments[1] === "specs" || segments[1] === "plans";
-}
-
-function hasGjcManagedTarget(cwd: string, targets: ExtractedTargets): boolean {
-	if (targets.unknown || targets.paths.length === 0) return false;
-	return targets.paths.some(rawPath => isGjcManagedPath(cwd, rawPath));
 }
 
 function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean {
@@ -315,7 +305,7 @@ export async function assertDeepInterviewMutationRawPathsAllowed(input: {
 	if (input.forceOverride) return;
 	if (!(await isActiveDeepInterview(input.cwd, input.sessionId, input.threadId))) return;
 	const targets: ExtractedTargets = { paths: input.rawPaths, unknown: input.rawPaths.length === 0 };
-	if (hasGjcManagedTarget(input.cwd, targets)) {
+	if (targets.unknown || targets.paths.length > 0) {
 		throw new ToolError(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
 	}
 }
@@ -350,15 +340,12 @@ export async function getDeepInterviewMutationDecision(
 			reason: "unknown-target",
 		};
 	}
-	if (hasGjcManagedTarget(input.cwd, targets) && !allTargetsAllowlisted(input.cwd, targets)) {
-		return {
-			blocked: true,
-			message: DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
-			targets: targets.paths,
-			reason: "gjc-managed-target",
-		};
-	}
-	return { blocked: false, targets: targets.paths };
+	return {
+		blocked: true,
+		message: DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
+		targets: targets.paths,
+		reason: allTargetsAllowlisted(input.cwd, targets) ? "handoff-artifact-tool-target" : "phase-boundary",
+	};
 }
 
 export async function assertDeepInterviewMutationAllowed(input: DeepInterviewMutationGuardInput): Promise<void> {

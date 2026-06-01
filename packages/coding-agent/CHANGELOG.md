@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Enforced the deep-interview phase boundary so active interviews block mutation tools until a handoff/spec is produced.
 - Made settings theme browsing confirm-only so arrowing through themes no longer changes the rendered theme before the displayed/persisted theme name changes.
 - Made startup CHANGELOG display deterministic by embedding `packages/coding-agent/CHANGELOG.md` into the binary so post-update launches show the shipped history regardless of cwd or `GJC_PACKAGE_DIR`/`PI_PACKAGE_DIR` overrides.
 - Registered `gjc update` as a public root subcommand so it invokes the bundled updater instead of routing into the interactive launcher.
