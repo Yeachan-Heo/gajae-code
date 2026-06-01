@@ -91,11 +91,16 @@ async function resolveBaseRef(): Promise<string> {
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
 	const baseRef = Bun.env.GITHUB_BASE_REF?.trim();
 
+	if (eventName === "pull_request" && baseRef) {
+		const mergeBase = await $`git merge-base HEAD ${`origin/${baseRef}`}`.cwd(repoRoot).quiet().nothrow();
+		if (mergeBase.exitCode === 0) {
+			const value = mergeBase.stdout.toString().trim();
+			if (value !== "") return value;
+		}
+		return `origin/${baseRef}`;
+	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
 		return baseSha;
-	}
-	if (eventName === "pull_request" && baseRef) {
-		return `origin/${baseRef}`;
 	}
 	if (before && !ZERO_SHA.test(before)) {
 		return `${before}..${Bun.env.GITHUB_SHA?.trim() || "HEAD"}`;
