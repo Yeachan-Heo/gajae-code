@@ -16,7 +16,9 @@ import { validateGoalObjective } from "../runtime";
 import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = z.object({
-	op: z.enum(["create", "get", "complete", "resume", "drop"]).describe("goal operation"),
+	op: z.enum(["create", "get", "complete", "resume", "drop"]).describe(
+		"op: get | create | complete | drop | resume — drop clears the active goal without exiting goal mode (tool stays callable for the next create)",
+	),
 	objective: z.string().describe("goal objective").optional(),
 });
 

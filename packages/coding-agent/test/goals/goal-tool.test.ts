@@ -330,4 +330,23 @@ describe("GoalTool", () => {
 		expect(result.details?.goal?.status).toBe("dropped");
 		expect(harness.getState()).toBeUndefined();
 	});
+
+	it("exposes the schema describe enumerating all five ops", () => {
+		const tool = new GoalTool(createToolSession({}));
+		const opDescribe = (tool.parameters as any).shape.op.description;
+		expect(opDescribe).toBe(
+			"op: get | create | complete | drop | resume — drop clears the active goal without exiting goal mode (tool stays callable for the next create)",
+		);
+	});
+
+	it("schema describe contains every op token and the drop-armed semantic", () => {
+		const tool = new GoalTool(createToolSession({}));
+		const opDescribe = (tool.parameters as any).shape.op.description as string;
+		expect(opDescribe).toContain("get");
+		expect(opDescribe).toContain("create");
+		expect(opDescribe).toContain("complete");
+		expect(opDescribe).toContain("drop");
+		expect(opDescribe).toContain("resume");
+		expect(opDescribe).toContain("without exiting goal mode");
+	});
 });

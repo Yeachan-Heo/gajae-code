@@ -215,6 +215,90 @@ describe("InteractiveMode goal mode integration", () => {
 		expect("tokenBudget" in (goal ?? {})).toBe(false);
 	});
 
+	it("keeps the goal tool in the active set after goal({op:drop})", async () => {
+		await harness.mode.handleGoalModeCommand("objective A");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		const goalTool = harness.session.getToolByName("goal");
+		if (!goalTool) throw new Error("goal tool not registered");
+		await goalTool.execute("call-id", { op: "drop" });
+
+		// Runtime drop wipes host state and emits a goal_updated event. The mode
+		// subscriber that handles dropped→#exitGoalMode is wired by mode.init(),
+		// which the harness does not call (avoids TUI startup). AC10 below covers
+		// the UI-path that bypasses the subscriber via #confirmAndDropGoal.
+		// Here we verify the runtime-side invariants: state is cleared and the
+		// `goal` tool remains in the raw active set (no side-effect deregistered it).
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+	});
+
+	it("removes the goal tool from the active set when goal({op:complete}) flows through getUserInput", async () => {
+		await harness.mode.handleGoalModeCommand("objective A");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		const goalTool = harness.session.getToolByName("goal");
+		if (!goalTool) throw new Error("goal tool not registered");
+		await goalTool.execute("call-id", { op: "complete" });
+
+		// completeGoalFromTool sets state.mode="exiting". The deferred completed-exit
+		// runs at the next getUserInput() (interactive-mode.ts:623-625) BEFORE the
+		// promise awaits the input callback, so we drain state, then resolve the
+		// input callback to release the promise.
+		const nextTurn = harness.mode.getUserInput();
+		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
+			await Bun.sleep(0);
+		}
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
+		await nextTurn;
+
+		expect(harness.session.getActiveToolNames()).not.toContain("goal");
+	});
+
+	it("supports create A → drop → create B → get in one session", async () => {
+		await harness.mode.handleGoalModeCommand("objective A");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		const goalTool = harness.session.getToolByName("goal");
+		if (!goalTool) throw new Error("goal tool not registered");
+
+		await goalTool.execute("call-1", { op: "drop" });
+		// Runtime drop wipes host state and emits goal_updated. The session
+		// subscriber that would route this to mode is wired by mode.init().
+		// For the round-trip we verify what the runtime guarantees: drop clears
+		// state, create after dropped succeeds, and the goal tool remains
+		// callable throughout (the bug being fixed was a side-effect on the
+		// active tool set; in this harness setup the set is only mutated by
+		// #enterGoalMode, so seeing "goal" still present is the AC).
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		await goalTool.execute("call-2", { op: "create", objective: "objective B" });
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("objective B");
+
+		const getResult = await goalTool.execute("call-3", { op: "get" });
+		expect((getResult as any).details?.goal?.objective).toBe("objective B");
+	});
+
+	it("keeps the goal tool armed after /goal drop (UI path)", async () => {
+		await harness.mode.handleGoalModeCommand("objective A");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		// The UI path invokes #confirmAndDropGoal which calls #exitGoalMode
+		// directly (not via the goal_updated subscriber), so the mode-side
+		// invariant is observable even without mode.init().
+		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
+
+		await harness.mode.handleGoalModeCommand("drop");
+		for (let i = 0; i < 100 && harness.mode.goalModeEnabled; i++) {
+			await Bun.sleep(0);
+		}
+
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		expect(harness.mode.goalModeEnabled).toBe(false);
+	});
+
 	it("returns completion usage from the goal tool and exits goal mode before the next turn rebuild", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");

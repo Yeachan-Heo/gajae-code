@@ -1281,7 +1281,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		reason?: "completed" | "paused" | "dropped";
 	}): Promise<void> {
 		const previousTools = this.#goalModePreviousTools;
-		if (this.goalModeEnabled && previousTools) {
+		// Drop keeps the `goal` tool callable so the agent can immediately create a new
+		// goal in the same session without a leader-side cleanup. Complete (and pause)
+		// exit goal mode and restore the pre-goal tool set even when the goal_updated
+		// event has already cleared goalModeEnabled (see #completeGoalFromTool emitting
+		// state.enabled = false before #exitGoalMode runs). Spec: deep-interview-ultragoal-goal-tool-wiring AC1+AC2.
+		const shouldRestoreTools =
+			previousTools &&
+			options?.reason !== "dropped" &&
+			(this.goalModeEnabled || options?.reason === "completed" || options?.paused === true);
+		if (shouldRestoreTools) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		const currentState = this.session.getGoalModeState();

@@ -11,7 +11,7 @@ Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durabl
 
 ## Purpose
 
-`ultragoal` turns a brief into repo-native artifacts and then drives a GJC goal safely through the unified `goal` tool. New plans default to a stable pointer-style aggregate GJC goal for the whole durable plan in `.gjc/ultragoal/goals.json`, including later accepted/appended stories under the original brief constraints, while GJC tracks G001/G002 story progress in the ledger. Ultragoal does not call `/goal clear`; before multiple sequential ultragoal runs in one session/thread, manually run `/goal clear` in the UI so the previous completed aggregate goal does not block or confuse the next `goal({"op":"create"})`.
+`ultragoal` turns a brief into repo-native artifacts and then drives a GJC goal safely through the unified `goal` tool. New plans default to a stable pointer-style aggregate GJC goal for the whole durable plan in `.gjc/ultragoal/goals.json`, including later accepted/appended stories under the original brief constraints, while GJC tracks G001/G002 story progress in the ledger. Ultragoal does not require any `/goal` slash-command between runs. For back-to-back ultragoal runs in one session/thread, call `goal({"op":"drop"})` only when `goal({"op":"get"})` still reports an active aggregate; then call `goal({"op":"create"})`. The goal tool stays armed across drop so the next create works in-session, and no slash-command cleanup exists or is required.
 
 - `.gjc/ultragoal/brief.md`
 - `.gjc/ultragoal/goals.json`
@@ -41,9 +41,12 @@ Use these exact goal-tool calls for the inline goal state:
 goal({"op":"get"})
 goal({"op":"create","objective":"<printed aggregate or per-story objective>"})
 goal({"op":"complete"})
+goal({"op":"drop"})
+goal({"op":"resume"})
 ```
+`drop` clears the active goal without exiting goal mode; `resume` reactivates a paused goal.
 
-The unified `goal` tool shares the same session goal state as `/goal`; use `goal({"op":"get"})` snapshots inside Ultragoal for ledger reconciliation.
+Use `goal({"op":"get"})` snapshots inside Ultragoal for ledger reconciliation. The unified `goal` tool is the only agent-facing surface for goal state; no `/goal` subcommand is required.
 
 ## Create goals
 
@@ -61,7 +64,7 @@ Loop until `gjc ultragoal status` reports all goals complete:
 1. Run `gjc ultragoal complete-goals`.
 2. Read the printed handoff.
 3. Call `goal({"op":"get"})`.
-4. If no active GJC goal exists, call `goal({"op":"create","objective":"<printed payload objective>"})` with the printed payload. In aggregate mode, if the same aggregate objective is already active, continue the current GJC story without creating a new GJC goal.
+4. If no active GJC goal exists, call `goal({"op":"create","objective":"<printed payload objective>"})` with the printed payload. In aggregate mode, if the same aggregate objective is already active, continue the current GJC story without creating a new GJC goal. If `goal({"op":"get"})` shows a stale dropped goal (status `"dropped"`) and a new aggregate must start, no extra cleanup is needed — `goal({"op":"create"})` succeeds directly. If a previous aggregate is still active and you genuinely need a fresh start in the same session, call `goal({"op":"drop"})` first, then `goal({"op":"create"})`.
 5. Complete the current GJC story only.
 6. Run a completion audit against the story objective and real artifacts/tests.
 7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `goal({"op":"complete"})` for intermediate stories; checkpoint each story with a fresh `goal({"op":"get"})` snapshot whose aggregate objective is still `active`. On the final story, use the same fresh active snapshot to create the final aggregate receipt first; only after that receipt exists may `goal({"op":"complete"})` run.
@@ -204,9 +207,9 @@ The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-
 
 ## Constraints
 
-- The shell command cannot directly invoke interactive `/goal`; it emits a model-facing handoff for the active GJC agent.
-- Ultragoal intentionally does not invoke `/goal clear` or hidden `thread/goal/clear`; use only the unified goal-tool surface: `goal({"op":"get"})`, `goal({"op":"create"})`, and `goal({"op":"complete"})`.
-- After a completed aggregate ultragoal run, clear the goal manually with `/goal clear` before starting another ultragoal run in the same session/thread.
+- The shell command emits a model-facing handoff for the active GJC agent; it does not invoke any `/goal` slash-command and the agent loop must not depend on any `/goal` subcommand.
+- Use only the unified goal-tool surface from the agent loop: `goal({"op":"get"})`, `goal({"op":"create"})`, `goal({"op":"complete"})`, `goal({"op":"drop"})`, `goal({"op":"resume"})`. `drop` clears the active goal without exiting goal mode so the next `goal({"op":"create"})` works in-session. No slash-command cleanup exists or is required; Ultragoal never calls any `/goal` subcommand.
+- For back-to-back ultragoal runs in the same session/thread, when `goal({"op":"get"})` still reports an active aggregate, call `goal({"op":"drop"})` before `goal({"op":"create"})`; when no active goal exists or the prior aggregate is already complete or dropped, call `goal({"op":"create"})` directly. The goal tool remains callable across drop; no slash-command cleanup exists or is required.
 - Never call `goal({"op":"create"})` when `goal({"op":"get"})` reports a different active goal.
 - Never call `goal({"op":"complete"})` unless the aggregate run or legacy per-story goal is actually complete.
 - In aggregate mode, intermediate and final story checkpoints require a matching `active` GJC goal snapshot; the final story checkpoint creates the final aggregate receipt before `goal({"op":"complete"})` may reconcile the inline goal state.
