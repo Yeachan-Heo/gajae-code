@@ -172,6 +172,7 @@ async function createSessionHarness(
 		forkContextSeed?: ForkContextSeed;
 		providerSessionId?: string;
 		providerSessionState?: Map<string, ProviderSessionState>;
+		settings?: Record<string, unknown>;
 	} = {},
 ): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
 	const { provider = "openai", modelId = "gpt-5-mini" } = options;
@@ -194,7 +195,7 @@ async function createSessionHarness(
 		authStorage,
 		sessionManager,
 		model,
-		settings: Settings.isolated(),
+		settings: Settings.isolated(options.settings ?? {}),
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],
@@ -460,6 +461,205 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const boundedSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 1 });
 		expect(boundedSeed.messages).toHaveLength(0);
 		expect(boundedSeed.metadata.skippedReasons["token-limit"]).toBeGreaterThan(0);
+	});
+
+	it("propagates appendOnlyPrefixSnapshot through buildForkContextSeed when append-only mode is active", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-default-append-only-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+
+		const deepseekModel = getBundledModel("deepseek", "deepseek-chat");
+		const provider: Parameters<typeof getBundledModel>[0] = deepseekModel ? "deepseek" : "openai";
+		const modelId = deepseekModel ? "deepseek-chat" : "gpt-5-mini";
+
+		const { session: parent, authStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider,
+			modelId,
+			settings: { "provider.appendOnlyContext": "on" },
+		});
+		sessions.push(parent);
+		authStorages.push(authStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Refactor auth." }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+
+		if (parent.agent.appendOnlyContext) {
+			expect(seed.appendOnlyPrefixSnapshot).toBeDefined();
+			expect(seed.appendOnlyPrefixSnapshot?.fingerprint).toBe(
+				parent.agent.appendOnlyContext.prefix.fingerprint,
+			);
+
+			const parentFingerprintBefore = parent.agent.appendOnlyContext.prefix.fingerprint;
+			(seed.appendOnlyPrefixSnapshot as { fingerprint: string }).fingerprint = "TAMPER";
+			expect(parent.agent.appendOnlyContext.prefix.fingerprint).toBe(parentFingerprintBefore);
+		} else {
+			expect(seed.appendOnlyPrefixSnapshot).toBeUndefined();
+		}
+	});
+
+	it("spawns bundled executor and architect via TaskTool with inheritContext: true through the production path", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+
+		const { session: parent, authStorage } = await createSessionHarness(tempDir, parentManager, {
+			settings: { "task.forkContext.enabled": true },
+		});
+		sessions.push(parent);
+		authStorages.push(authStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Establishing parent context for fork-context spawn test." }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+
+		const sdkModule = await import("@gajae-code/coding-agent/sdk");
+		const taskModule = await import("@gajae-code/coding-agent/task");
+		const discoveryModule = await import("@gajae-code/coding-agent/task/discovery");
+		const agentsModule = await import("@gajae-code/coding-agent/task/agents");
+		const asyncModule = await import("@gajae-code/coding-agent/async");
+		const settingsModule = await import("@gajae-code/coding-agent/config/settings");
+		const eventBusModule = await import("@gajae-code/coding-agent/utils/event-bus");
+
+		const bundledExecutor = agentsModule.getBundledAgent("executor");
+		const bundledArchitect = agentsModule.getBundledAgent("architect");
+		expect(bundledExecutor?.forkContext).toBe("allowed");
+		expect(bundledArchitect?.forkContext).toBe("allowed");
+
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [bundledExecutor!, bundledArchitect!],
+			projectAgentsDir: null,
+		});
+
+		const childCaptures: Array<{
+			agentDisplayName?: string;
+			forkContextSeed?: ForkContextSeed;
+			providerSessionId?: string;
+		}> = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
+			childCaptures.push({
+				agentDisplayName: options.agentDisplayName,
+				forkContextSeed: options.forkContextSeed,
+				providerSessionId: options.providerSessionId,
+			});
+			const listeners: Array<(event: Parameters<AgentSession["subscribe"]>[0] extends (event: infer E) => void ? E : never) => void> = [];
+			const stubSession: Partial<AgentSession> = {
+				state: { messages: [] } as unknown as AgentSession["state"],
+				agent: { state: { systemPrompt: ["stub"] } } as unknown as AgentSession["agent"],
+				model: undefined,
+				sessionManager: {
+					appendSessionInit: () => {},
+					getSessionFile: () => null,
+					getArtifactsDir: () => null,
+				} as unknown as AgentSession["sessionManager"],
+				getActiveToolNames: () => ["yield"],
+				setActiveToolsByName: async () => {},
+				subscribe: ((listener: (typeof listeners)[number]) => {
+					listeners.push(listener);
+					return () => {
+						const index = listeners.indexOf(listener);
+						if (index >= 0) listeners.splice(index, 1);
+					};
+				}) as AgentSession["subscribe"],
+				prompt: async () => {
+					(stubSession.state as { messages: Message[] }).messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "(stub-yield)" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "mock",
+						usage: createUsage(),
+						stopReason: "stop",
+						timestamp: Date.now(),
+					});
+					for (const listener of listeners) {
+						listener({
+							type: "tool_execution_end",
+							toolCallId: "yield-call",
+							toolName: "yield",
+							result: {
+								content: [{ type: "text", text: "Result submitted." }],
+								details: { status: "success", data: { ok: true } },
+							},
+							isError: false,
+						});
+					}
+				},
+				waitForIdle: async () => {},
+				getLastAssistantMessage: () => (stubSession.state as { messages: Message[] }).messages.at(-1),
+				abort: async () => {},
+				dispose: async () => {},
+			};
+			return {
+				session: stubSession as AgentSession,
+				extensionsResult: {} as Awaited<ReturnType<typeof sdkModule.createAgentSession>>["extensionsResult"],
+				setToolUIContext: () => {},
+				eventBus: new eventBusModule.EventBus(),
+			} satisfies Awaited<ReturnType<typeof sdkModule.createAgentSession>>;
+		});
+
+		const manager = new asyncModule.AsyncJobManager({ onJobComplete: async () => {} });
+		asyncModule.AsyncJobManager.setInstance(manager);
+
+		const toolSession = {
+			cwd: tempDir,
+			hasUI: false,
+			settings: settingsModule.Settings.isolated({
+				"async.enabled": false,
+				"task.forkContext.enabled": true,
+			}),
+			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionSpawns: () => "*",
+			model: parent.model,
+			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
+				parent.buildForkContextSeed(opts),
+			modelRegistry: {
+				authStorage: undefined,
+				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => null,
+			},
+		};
+
+		const tool = await taskModule.TaskTool.create(toolSession as unknown as Parameters<typeof taskModule.TaskTool.create>[0]);
+
+		await tool.execute("call-exec", {
+			agent: "executor",
+			tasks: [{ id: "ExecFork", description: "d", assignment: "a", inheritContext: true }],
+		});
+		await tool.execute("call-arch", {
+			agent: "architect",
+			tasks: [{ id: "ArchFork", description: "d", assignment: "a", inheritContext: true }],
+		});
+		try {
+			await manager.waitForAll();
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			asyncModule.AsyncJobManager.resetForTests();
+			vi.restoreAllMocks();
+		}
+
+		expect(childCaptures).toHaveLength(2);
+		const execChild = childCaptures.find(o => o.agentDisplayName === "executor");
+		const archChild = childCaptures.find(o => o.agentDisplayName === "architect");
+		expect(execChild).toBeDefined();
+		expect(archChild).toBeDefined();
+
+		for (const child of [execChild!, archChild!]) {
+			expect(child.forkContextSeed).toBeDefined();
+			// cacheIdentity is the seed-borne identity; it must reuse the parent's sessionId so
+			// the child session's provider-side prefix cache hits when configured via sdk.ts:870
+			// (which uses options.forkContextSeed?.cacheIdentity as the providerSessionId fallback).
+			expect(child.forkContextSeed!.cacheIdentity).toBe(parent.sessionId);
+		}
 	});
 
 	it("keeps provider session state when same-file reload only changes message metadata", async () => {

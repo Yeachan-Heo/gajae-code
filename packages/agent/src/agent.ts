@@ -306,6 +306,10 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
+	get intentTracing(): boolean {
+		return this.#intentTracing;
+	}
+
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
 

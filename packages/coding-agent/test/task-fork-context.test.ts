@@ -7,6 +7,7 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src
 import * as sdkModule from "../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../src/session/agent-session";
 import { TaskTool } from "../src/task";
+import { getBundledAgent } from "../src/task/agents";
 import * as discoveryModule from "../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../src/task/types";
 import { taskSchema } from "../src/task/types";
@@ -325,5 +326,52 @@ describe("fork context policy surface", () => {
 
 		expect(seedBuilder).toHaveBeenCalledTimes(1);
 		expect(getOptions()?.forkContextSeed).toBe(seedAtDispatch);
+	});
+
+	test("bundled executor and architect agents default to forkContext: allowed", () => {
+		expect(getBundledAgent("executor")?.forkContext).toBe("allowed");
+		expect(getBundledAgent("architect")?.forkContext).toBe("allowed");
+	});
+
+	test("taskSchema preserves inheritContext: undefined when omitted", () => {
+		const result = taskSchema.safeParse({
+			agent: "executor",
+			tasks: [{ id: "NoFork", description: "d", assignment: "a" }],
+		});
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.data.tasks[0]?.inheritContext).toBeUndefined();
+		}
+	});
+
+	test("bundled executor routes inheritContext through the per-agent gate", async () => {
+		const bundledExecutor = getBundledAgent("executor");
+		expect(bundledExecutor).toBeDefined();
+		expect(bundledExecutor!.forkContext).toBe("allowed");
+		mockAgents([bundledExecutor!]);
+
+		{
+			const seedBuilder = vi.fn(async () => createSeed());
+			const { getOptions } = mockCreateAgentSession();
+			const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+			await executeDetached(tool, {
+				agent: "executor",
+				tasks: [{ id: "NoFork", description: "d", assignment: "a" }],
+			});
+			expect(seedBuilder).not.toHaveBeenCalled();
+			expect(getOptions()?.forkContextSeed).toBeUndefined();
+		}
+
+		{
+			const seedBuilder = vi.fn(async () => createSeed());
+			const { getOptions } = mockCreateAgentSession();
+			const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+			await executeDetached(tool, {
+				agent: "executor",
+				tasks: [{ id: "Fork", description: "d", assignment: "a", inheritContext: true }],
+			});
+			expect(seedBuilder).toHaveBeenCalledTimes(1);
+			expect(getOptions()?.forkContextSeed).toBeDefined();
+		}
 	});
 });
