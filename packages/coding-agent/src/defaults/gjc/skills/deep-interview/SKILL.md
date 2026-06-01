@@ -54,6 +54,15 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - Challenge agents activate at specific round thresholds to shift perspective
 </Execution_Policy>
 
+<Internal_Auto_Mode_Protocol>
+- `auto-research-greenfield.md` and `auto-answer-uncertain.md` are internal prompt fragments loaded on demand with bundle metadata `kind: "skill-fragment"`; they are not public skills, are never slash-command/discoverable, and must not be registered through any `skill://` route.
+- Load fragments only for the specific hook that needs them, with forked inherited context kept read-only and prompt-budgeted; summarize active interview context before spawning the architect if the payload is large.
+- Auto-mode architects are read-only: no code edits, no `.gjc/` mutation, no workflow chaining, no formatters, and no execution delegation.
+- Validate every fragment response before using it: required sections must be present, candidates/answer must match the requested shape, rationale must cite available context, confidence must be explicit, and insufficient-context fallbacks must be honored.
+- If architect spawn, fragment loading, or response validation fails, continue the normal manual interview path silently and record an internal audit note in state by incrementing `architect_failures`; do not expose tool noise to the user unless it changes the next user-facing question.
+- Track `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures` in state and final spec metadata.
+</Internal_Auto_Mode_Protocol>
+
 
 
 <Steps>
@@ -133,7 +142,10 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
       "last_targeted_component_id": null
     },
     "challenge_modes_used": [],
-    "ontology_snapshots": []
+    "ontology_snapshots": [],
+    "auto_researched_rounds": [],
+    "auto_answered_rounds": [],
+    "architect_failures": 0
   }
 }
 ```
@@ -246,6 +258,12 @@ If any prompt input is too large, summarize it first and then continue from the 
 | Context Clarity (brownfield) | "How does this fit?" | "I found JWT auth middleware in `src/auth/` (pattern: passport + JWT). Should this feature extend that path or intentionally diverge from it?" |
 | Scope-fuzzy / ontology stress | "What IS the core thing here?" | "You have named Tasks, Projects, and Workspaces across the last rounds. Which one is the core entity, and which are supporting views or containers?" |
 
+### Step 2a′: Auto-Research Greenfield Questions
+
+When the next question is for a greenfield interview and is tagged `research: true`, load `auto-research-greenfield.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect before Step 2b. Pass only the tagged question, locked topology summary, prompt-safe initial idea, trimmed prior decisions/gaps, and relevant constraints. The architect must return 2-3 ranked candidates with rationale, confidence, and fallback notes. Validate the shape before use; if valid, incorporate the candidates as concise answer options or context for the single user-facing question and append the round number to `auto_researched_rounds`. If invalid or unavailable, fall back silently to the normal generated question and increment `architect_failures`.
+
+Auto-research must never add a public skill entrypoint, never be slash-command/discoverable, never register a `skill://` handler, and never alter the one-question-per-round rule.
+
 ### Step 2b: Ask the Question
 
 Use the `ask` tool with the generated question. Present it clearly with the current ambiguity context:
@@ -258,9 +276,17 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 
 Options should include contextually relevant choices plus free-text.
 
+### Step 2b′: Auto-Answer Opted-Out Questions
+
+After the `ask` tool resolves and before ambiguity scoring, if the user opts out of answering the current question or explicitly asks the agent to decide, load `auto-answer-uncertain.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect. Pass the opted-out question, prompt-safe transcript summary, locked topology, current scores/gaps, and any auto-research candidates used for the round. The architect must return exactly one decisive answer with rationale, confidence, and explicit uncertainty. Validate the response shape before using it; if valid, record it as the tentative answer for scoring, append the round number to `auto_answered_rounds`, and mark the transcript answer as architect-assisted.
+
+Auto-answer has a clarity cap: unless the architect confidence is `high` and uncertainty is negligible, no dimension score improved solely by the auto-answer may exceed `0.85`. If the auto-answer would make ambiguity cross the resolved threshold, ask the user for threshold-crossing confirmation before Phase 4: present the tentative assumption and require explicit confirmation, revision, or continued questioning. On architect failure or invalid response, continue with the user's opt-out as an unresolved gap, increment `architect_failures`, and do not block the interview.
+
 ### Step 2c: Score Ambiguity
 
 After receiving the user's answer, score clarity across all dimensions.
+
+If the round used an auto-answer, include the architect answer, rationale, confidence, and uncertainty in the scoring prompt. Apply the Step 2b′ clarity cap mechanically before calculating ambiguity, and treat any low-confidence or insufficient-context auto-answer as an unresolved gap rather than user-confirmed truth.
 
 **Scoring prompt** (use opus model, temperature 0.1 for consistency):
 
@@ -355,7 +381,7 @@ Round {n} complete.
 
 ### Step 2e: Update State
 
-Update interview state with the new round, global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, ontology snapshot, and `topology.last_targeted_component_id` via `gjc state write`; never patch `.gjc/state` directly unless an explicit force override is active.
+Update interview state with the new round, global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures` via `gjc state write`; never patch `.gjc/state` directly unless an explicit force override is active.
 
 ### Step 2f: Check Soft Limits
 
@@ -408,6 +434,9 @@ Spec structure:
 - Threshold Source: <resolvedThresholdSource>
 - Initial Context Summarized: {yes|no}
 - Status: {PASSED | BELOW_THRESHOLD_EARLY_EXIT}
+- Auto-Researched Rounds: {auto_researched_rounds}
+- Auto-Answered Rounds: {auto_answered_rounds}
+- Architect Failures: {architect_failures}
 
 ## Clarity Breakdown
 | Dimension | Score | Weight | Weighted |
@@ -569,6 +598,8 @@ Skipping any stage is possible but reduces quality assurance:
 - Use the GJC workflow CLI to save the final spec at `.gjc/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan/team only after explicit execution approval — never implement directly
 - Challenge agent modes are prompt injections, not separate agent spawns
+- Use internal fragment auto-modes only at their documented hooks: `auto-research-greenfield.md` between Step 2a and 2b for greenfield `research: true` questions, and `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring.
+- Fragment auto-modes are loaded on demand as `kind: "skill-fragment"`; they are not public workflow skills, not slash-command/discoverable, and not `skill://` registrations.
 </Tool_Usage>
 
 <Examples>
@@ -703,6 +734,8 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Multi-component interviews rotate targeting across active components when N > 1
 - [ ] Spec includes Topology section with confirmed active components and user-confirmed deferrals
 - [ ] Spec includes Ontology (Key Entities) table and Ontology Convergence section
+- [ ] Internal auto-mode fragments, when used, were loaded only on demand as non-public `kind: "skill-fragment"` prompts; responses were validated, failures incremented `architect_failures`, and final metadata includes `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`
+- [ ] Auto-answer threshold crossing, if any, received explicit user confirmation before spec crystallization
 </Final_Checklist>
 
 <Advanced>

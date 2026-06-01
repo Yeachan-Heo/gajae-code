@@ -171,16 +171,17 @@ async function resolveSelectors(
 	}
 	if (mode) assertKnownMode(mode);
 
+	const explicitSessionId = flagValue(args, "--session-id");
 	// Session-id resolution order: explicit --session-id flag, then payload
 	// session_id, then GJC_SESSION_ID env var (set by AgentSession.sdk for
 	// agent-initiated CLI invocations). The env-var default keeps shell
 	// snippets in skill docs short while still routing writes/reads to the
 	// caller's session-scoped state files.
-	let sessionId = flagValue(args, "--session-id")?.trim() || undefined;
+	let sessionId = explicitSessionId !== undefined ? explicitSessionId.trim() || undefined : undefined;
 	if (!sessionId && payload && typeof payload.session_id === "string") {
 		sessionId = payload.session_id.trim() || undefined;
 	}
-	if (!sessionId) {
+	if (!sessionId && explicitSessionId === undefined) {
 		const envSessionId = process.env.GJC_SESSION_ID?.trim();
 		if (envSessionId) sessionId = envSessionId;
 	}

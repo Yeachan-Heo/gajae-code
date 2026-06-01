@@ -9,9 +9,13 @@ import {
 import {
 	DEFAULT_GJC_DEFINITION_NAMES,
 	getDefaultGjcDefinitions,
+	getEmbeddedDefaultGjcSkillFragments,
+	getEmbeddedDefaultGjcSkills,
 	installDefaultGjcDefinitions,
 } from "@gajae-code/coding-agent/defaults/gjc-defaults";
-import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { loadSkills, resetActiveSkillsForTests, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
+import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
 
@@ -42,20 +46,49 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 }
 
 afterEach(async () => {
+	resetActiveSkillsForTests();
 	await Promise.all(tempRoots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
 
 describe("default GJC definitions", () => {
-	it("bundles exactly the four default workflow skills as installable source assets", () => {
+	it("bundles exactly the four default workflow skills plus deep-interview fragments as installable assets", () => {
 		const definitions = getDefaultGjcDefinitions();
-		const skills = definitions.map(definition => definition.name).sort();
+		const workflowDefinitions = definitions.filter(definition => definition.kind === "skill");
+		const fragmentDefinitions = definitions.filter(definition => definition.kind === "skill-fragment");
+		const skills = workflowDefinitions.map(definition => definition.name).sort();
 		const expected = [...DEFAULT_GJC_DEFINITION_NAMES].sort();
 
-		expect(definitions.every(definition => definition.kind === "skill")).toBe(true);
 		expect(skills).toEqual(expected);
-		expect(definitions).toHaveLength(4);
-		expect(definitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
-		expect(definitions.every(definition => definition.content.includes(definition.name))).toBe(true);
+		expect(workflowDefinitions).toHaveLength(4);
+		expect(definitions).toHaveLength(6);
+		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
+		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
+		expect(fragmentDefinitions).toHaveLength(2);
+		expect(fragmentDefinitions.map(definition => definition.parentSkillName)).toEqual([
+			"deep-interview",
+			"deep-interview",
+		]);
+		expect(fragmentDefinitions.map(definition => definition.relativePath).sort()).toEqual([
+			"skill-fragments/deep-interview/auto-answer-uncertain.md",
+			"skill-fragments/deep-interview/auto-research-greenfield.md",
+		]);
+	});
+
+	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
+		const fragments = getEmbeddedDefaultGjcSkillFragments("deep-interview");
+
+		expect(
+			getEmbeddedDefaultGjcSkills()
+				.map(skill => skill.name)
+				.sort(),
+		).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
+		expect(fragments).toHaveLength(2);
+		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
+		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
+			"skill-fragments/deep-interview/auto-answer-uncertain.md",
+			"skill-fragments/deep-interview/auto-research-greenfield.md",
+		]);
+		expect(fragments.every(fragment => fragment.content.includes("read-only architect"))).toBe(true);
 	});
 
 	it("keeps the four role agents bundled when project .gjc is absent", async () => {
@@ -127,6 +160,8 @@ describe("default GJC definitions", () => {
 			const expected = [...DEFAULT_GJC_DEFINITION_NAMES].sort();
 
 			expect(skills.skills.map(skill => skill.name).sort()).toEqual(expected);
+			expect(skills.skills.some(skill => skill.name === "auto-research-greenfield")).toBe(false);
+			expect(skills.skills.some(skill => skill.name === "auto-answer-uncertain")).toBe(false);
 			expect(
 				agents.agents
 					.filter(agent => agent.source === "project")
@@ -202,7 +237,9 @@ Project executor override body.
 	});
 
 	it("keeps bundled deep-interview skill on GJC-native workflow vocabulary", () => {
-		const deepInterview = getDefaultGjcDefinitions().find(definition => definition.name === "deep-interview");
+		const deepInterview = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "deep-interview",
+		);
 		expect(deepInterview).toBeDefined();
 		const content = deepInterview?.content ?? "";
 
@@ -233,7 +270,9 @@ Project executor override body.
 	});
 
 	it("keeps bundled ralplan stage artifacts on CLI write path", () => {
-		const ralplan = getDefaultGjcDefinitions().find(definition => definition.name === "ralplan");
+		const ralplan = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "ralplan",
+		);
 		expect(ralplan).toBeDefined();
 		const content = ralplan?.content ?? "";
 
@@ -253,22 +292,54 @@ Project executor override body.
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
 		const installedDeepInterview = await Bun.file(deepInterviewSkillPath).text();
 
-		expect(initial.written).toBe(4);
+		expect(initial.written).toBe(6);
+		expect(initial.total).toBe(6);
 		expect(initial.skipped).toBe(0);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(2);
 
+		const installedResearchFragment = await Bun.file(
+			path.join(targetRoot, "skill-fragments", "deep-interview", "auto-research-greenfield.md"),
+		).text();
+		expect(installedResearchFragment).toContain("ranked candidate answers");
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(4);
+		expect(skipped.skipped).toBe(6);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(3);
+		expect(check.matching).toBe(5);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(4);
+		expect(forced.written).toBe(6);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
+		expect(
+			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
+		).toBe(true);
+	});
+
+	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
+		await withTempHome(async () => {
+			const repoRoot = await makeTempRoot();
+			await installDefaultGjcDefinitions({ targetRoot: path.join(repoRoot, ".gjc") });
+
+			const skills = await loadSkills({
+				cwd: repoRoot,
+				enabled: true,
+				enablePiProject: true,
+				enablePiUser: false,
+			});
+			const deepInterview = skills.skills.find(
+				skill => skill.name === "deep-interview" && skill.source === "native:project",
+			);
+			if (!deepInterview) throw new Error("missing installed deep-interview skill");
+
+			setActiveSkills([deepInterview]);
+			await expect(
+				new SkillProtocolHandler().resolve(parseInternalUrl("skill://deep-interview/auto-research-greenfield.md")),
+			).rejects.toThrow("File not found");
+		});
 	});
 });
 
@@ -340,5 +411,39 @@ describe("bundled skills CLI", () => {
 		const parsed = JSON.parse(stdout) as { skills: Array<{ name: string; path: string }> };
 		expect(parsed.skills.map(skill => skill.name).sort()).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
 		expect(parsed.skills.every(skill => skill.path.startsWith("embedded:gjc/skills/"))).toBe(true);
+		expect(parsed.skills.some(skill => skill.name === "auto-research-greenfield")).toBe(false);
+		expect(parsed.skills.some(skill => skill.name === "auto-answer-uncertain")).toBe(false);
+	});
+
+	it("does not expose embedded fragments through skills read", async () => {
+		const externalRoot = await makeTempRoot();
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
+				"skills",
+				"read",
+				"auto-research-greenfield",
+				"--json",
+			],
+			{
+				cwd: externalRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					HOME: await makeTempRoot(),
+					PI_NO_TITLE: "1",
+					NO_COLOR: "1",
+				},
+			},
+		);
+		const stdout = await new Response(proc.stdout).text();
+		const stderr = await new Response(proc.stderr).text();
+		const exitCode = await proc.exited;
+
+		expect(exitCode).not.toBe(0);
+		expect(stdout).toBe("");
+		expect(stderr).toContain("unknown embedded skill");
 	});
 });

@@ -1,5 +1,9 @@
 import * as path from "node:path";
 import { getAgentDir, isEnoent, parseFrontmatter } from "@gajae-code/utils";
+import autoAnswerUncertainFragment from "./gjc/skills/deep-interview/auto-answer-uncertain.md" with { type: "text" };
+import autoResearchGreenfieldFragment from "./gjc/skills/deep-interview/auto-research-greenfield.md" with {
+	type: "text",
+};
 import deepInterviewSkill from "./gjc/skills/deep-interview/SKILL.md" with { type: "text" };
 import ralplanSkill from "./gjc/skills/ralplan/SKILL.md" with { type: "text" };
 import teamSkill from "./gjc/skills/team/SKILL.md" with { type: "text" };
@@ -7,7 +11,7 @@ import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text"
 
 export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
-export type DefaultGjcDefinitionKind = "skill";
+export type DefaultGjcDefinitionKind = "skill" | "skill-fragment";
 export type EmbeddedDefaultGjcSkill = {
 	name: DefaultGjcDefinitionName;
 	description: string;
@@ -19,12 +23,21 @@ export type EmbeddedDefaultGjcSkill = {
 };
 export type DefaultGjcInstallStatus = "different" | "matching" | "missing" | "skipped" | "written";
 
-export interface DefaultGjcDefinition {
-	kind: DefaultGjcDefinitionKind;
+export interface DefaultGjcSkillDefinition {
+	kind: "skill";
 	name: DefaultGjcDefinitionName;
 	relativePath: string;
 	content: string;
 }
+
+export interface DefaultGjcSkillFragmentDefinition {
+	kind: "skill-fragment";
+	parentSkillName: DefaultGjcDefinitionName;
+	relativePath: string;
+	content: string;
+}
+
+export type DefaultGjcDefinition = DefaultGjcSkillDefinition | DefaultGjcSkillFragmentDefinition;
 
 export interface InstallDefaultGjcDefinitionsOptions {
 	check?: boolean;
@@ -32,12 +45,19 @@ export interface InstallDefaultGjcDefinitionsOptions {
 	targetRoot?: string;
 }
 
-export interface DefaultGjcDefinitionInstallFile {
-	kind: DefaultGjcDefinitionKind;
-	name: DefaultGjcDefinitionName;
-	path: string;
-	status: DefaultGjcInstallStatus;
-}
+export type DefaultGjcDefinitionInstallFile =
+	| {
+			kind: "skill";
+			name: DefaultGjcDefinitionName;
+			path: string;
+			status: DefaultGjcInstallStatus;
+	  }
+	| {
+			kind: "skill-fragment";
+			parentSkillName: DefaultGjcDefinitionName;
+			path: string;
+			status: DefaultGjcInstallStatus;
+	  };
 
 export interface DefaultGjcDefinitionInstallResult {
 	targetRoot: string;
@@ -60,6 +80,18 @@ const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = [
 	{ kind: "skill", name: "ralplan", relativePath: "skills/ralplan/SKILL.md", content: ralplanSkill },
 	{ kind: "skill", name: "team", relativePath: "skills/team/SKILL.md", content: teamSkill },
 	{ kind: "skill", name: "ultragoal", relativePath: "skills/ultragoal/SKILL.md", content: ultragoalSkill },
+	{
+		kind: "skill-fragment",
+		parentSkillName: "deep-interview",
+		relativePath: "skill-fragments/deep-interview/auto-research-greenfield.md",
+		content: autoResearchGreenfieldFragment,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "deep-interview",
+		relativePath: "skill-fragments/deep-interview/auto-answer-uncertain.md",
+		content: autoAnswerUncertainFragment,
+	},
 ];
 
 export function getDefaultGjcDefinitions(): readonly DefaultGjcDefinition[] {
@@ -70,8 +102,19 @@ export function getDefaultGjcAgentDefinitions(): readonly DefaultGjcDefinition[]
 	return [];
 }
 
+export function getEmbeddedDefaultGjcSkillFragments(
+	parentSkillName: DefaultGjcDefinitionName,
+): DefaultGjcSkillFragmentDefinition[] {
+	return DEFAULT_GJC_DEFINITIONS.filter(
+		(definition): definition is DefaultGjcSkillFragmentDefinition =>
+			definition.kind === "skill-fragment" && definition.parentSkillName === parentSkillName,
+	);
+}
+
 export function getEmbeddedDefaultGjcSkills(): EmbeddedDefaultGjcSkill[] {
-	return DEFAULT_GJC_DEFINITIONS.filter(definition => definition.kind === "skill").map(definition => {
+	return DEFAULT_GJC_DEFINITIONS.filter(
+		(definition): definition is DefaultGjcSkillDefinition => definition.kind === "skill",
+	).map(definition => {
 		const { frontmatter } = parseFrontmatter(definition.content, {
 			source: `embedded:gjc/${definition.relativePath}`,
 			level: "warn",
@@ -110,12 +153,21 @@ export async function installDefaultGjcDefinitions(
 			status = "written";
 		}
 
-		files.push({
-			kind: definition.kind,
-			name: definition.name,
-			path: destination,
-			status,
-		});
+		if (definition.kind === "skill") {
+			files.push({
+				kind: definition.kind,
+				name: definition.name,
+				path: destination,
+				status,
+			});
+		} else {
+			files.push({
+				kind: definition.kind,
+				parentSkillName: definition.parentSkillName,
+				path: destination,
+				status,
+			});
+		}
 	}
 
 	return summarizeInstallResult(targetRoot, files);

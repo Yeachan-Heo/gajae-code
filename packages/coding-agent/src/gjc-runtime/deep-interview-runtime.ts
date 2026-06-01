@@ -469,6 +469,7 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 
 		const handoffArgs = ["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"];
 		if (resolved.sessionId) handoffArgs.push("--session-id", resolved.sessionId);
+		else handoffArgs.push("--session-id", "");
 		const handoffResult = await runNativeStateCommand(handoffArgs, cwd);
 		if (handoffResult.status !== 0) {
 			throw new DeepInterviewCommandError(
