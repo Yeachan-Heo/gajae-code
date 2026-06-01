@@ -21,7 +21,7 @@ import type {
 	StatusLineSeparatorStyle,
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
-import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
+import { getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
@@ -200,8 +200,6 @@ export interface StatusLinePreviewSettings {
 export interface SettingsCallbacks {
 	/** Called when any setting value changes */
 	onChange: (path: SettingPath, newValue: unknown) => void;
-	/** Called for theme preview while browsing */
-	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
@@ -376,15 +374,10 @@ export class SettingsSelectorComponent extends Container {
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
 		let onPreviewCancel: (() => void) | undefined;
 
-		const activeThemeBeforePreview = getCurrentThemeName() ?? currentValue;
-		if (def.path === "theme.dark" || def.path === "theme.light") {
-			onPreview = value => {
-				return this.callbacks.onThemePreview?.(value);
-			};
-			onPreviewCancel = () => {
-				this.callbacks.onThemePreview?.(activeThemeBeforePreview);
-			};
-		} else if (def.path === "statusLine.preset") {
+		// Theme selection is confirm-only: moving through the list must not mutate
+		// the rendered theme while the displayed/persisted setting still names
+		// the previous value. Confirmation persists through Settings hooks.
+		if (def.path === "statusLine.preset") {
 			onPreview = value => {
 				const presetDef = getPreset(
 					value as "default" | "minimal" | "compact" | "full" | "nerd" | "ascii" | "custom",

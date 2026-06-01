@@ -190,7 +190,7 @@ On failure:
 - does **not** change persisted settings by itself
 - returns success/error without fallback replacement
 
-Settings UI uses this for live preview and restores prior theme on cancel.
+The settings theme picker is confirm-only; arrow-key browsing does not call `previewTheme`, so the rendered theme and displayed/persisted theme name stay aligned until Enter confirms a new selection.
 
 ## Watchers and live reload
 
@@ -328,7 +328,7 @@ Minimal skeleton:
 Use this workflow:
 
 1. Start interactive mode (watcher enabled from startup).
-2. Open settings and preview theme values (live `previewTheme`).
+2. Open settings and confirm the custom theme in the dark/light theme picker; arrow-key browsing is intentionally non-mutating.
 3. For custom theme files, edit the JSON while running and confirm auto-reload on save.
 4. Exercise critical surfaces:
    - markdown rendering
