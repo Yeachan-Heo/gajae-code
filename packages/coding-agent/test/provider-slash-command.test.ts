@@ -88,6 +88,51 @@ describe("provider slash command", () => {
 		expect(configChanged).toBe(true);
 	});
 
+	it("adds MiniMax and GLM provider presets through slash onboarding", async () => {
+		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-slash-"));
+		setAgentDir(tempAgentDir);
+		const outputs: string[] = [];
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
+		expect(command?.handle).toBeTruthy();
+		const runtime = {
+			session: { modelRegistry: { refresh: async () => undefined } },
+			sessionManager: {},
+			settings: {},
+			cwd: process.cwd(),
+			output: (text: string) => outputs.push(text),
+			refreshCommands: () => undefined,
+			reloadPlugins: async () => undefined,
+			notifyConfigChanged: () => undefined,
+		} as unknown as SlashCommandRuntime;
+
+		await command?.handle?.({ name: "provider", args: "add --preset minimax", text: "/provider add" }, runtime);
+		await command?.handle?.({ name: "provider", args: "add zai", text: "/provider add" }, runtime);
+
+		const parsed = YAML.parse(await Bun.file(path.join(tempAgentDir, "models.yml")).text()) as {
+			providers: Record<
+				string,
+				{
+					api: string;
+					baseUrl: string;
+					apiKeyEnv?: string;
+					compat?: { thinkingFormat?: string };
+					models: Array<{ id: string }>;
+				}
+			>;
+		};
+		expect(parsed.providers["minimax-code"]?.api).toBe("openai-completions");
+		expect(parsed.providers["minimax-code"]?.baseUrl).toBe("https://api.minimax.io/v1");
+		expect(parsed.providers["minimax-code"]?.apiKeyEnv).toBe("MINIMAX_CODE_API_KEY");
+		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["MiniMax-M2.5"]);
+		expect(parsed.providers["glm-proxy"]?.api).toBe("openai-completions");
+		expect(parsed.providers["glm-proxy"]?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
+		expect(parsed.providers["glm-proxy"]?.apiKeyEnv).toBe("ZAI_API_KEY");
+		expect(parsed.providers["glm-proxy"]?.compat?.thinkingFormat).toBe("zai");
+		expect(parsed.providers["glm-proxy"]?.models.map(model => model.id)).toEqual(["glm-4.6"]);
+		expect(outputs.join("\n")).toContain("MiniMax Coding Plan");
+		expect(outputs.join("\n")).toContain("GLM / zAI");
+	});
+
 	it("rejects raw API keys in public provider onboarding", async () => {
 		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-slash-"));
 		setAgentDir(tempAgentDir);

@@ -28,6 +28,7 @@ import { type SessionInfo, SessionManager } from "../../session/session-manager"
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
+	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
@@ -63,7 +64,9 @@ const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect UR
 
 function formatProviderOnboardingCommandGuide(): string {
 	return [
-		"API-compatible provider setup:",
+		"Provider preset setup:",
+		MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
+		"Custom API-compatible provider setup:",
 		MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 		MODEL_ONBOARDING_SETUP_COMMAND,
 	].join("\n");

@@ -16,6 +16,7 @@ import {
 import { theme } from "../modes/theme/theme";
 import {
 	addApiCompatibleProvider,
+	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
@@ -28,6 +29,7 @@ export interface SetupCommandArgs {
 		json?: boolean;
 		check?: boolean;
 		force?: boolean;
+		preset?: string;
 		compat?: string;
 		provider?: string;
 		baseUrl?: string;
@@ -42,6 +44,7 @@ const VALID_COMPONENTS: SetupComponent[] = ["defaults", "hooks", "provider", "py
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
 		flags.compat !== undefined ||
+		flags.preset !== undefined ||
 		flags.provider !== undefined ||
 		flags.baseUrl !== undefined ||
 		flags.apiKeyEnv !== undefined ||
@@ -57,7 +60,7 @@ function rejectProviderFlagsOutsideProvider(component: SetupComponent, flags: Se
 	console.error(chalk.red("Provider setup flags require the explicit `provider` component."));
 	console.error(
 		chalk.dim(
-			`Run: ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
+			`Run: ${APP_NAME} setup provider --preset <minimax|glm> or ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
 		),
 	);
 	process.exit(1);
@@ -87,6 +90,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.force = true;
 		} else if (arg === "--compat") {
 			flags.compat = args[++i];
+		} else if (arg === "--preset") {
+			flags.preset = args[++i];
 		} else if (arg === "--provider") {
 			flags.provider = args[++i];
 		} else if (arg === "--base-url") {
@@ -190,6 +195,7 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 async function handleProviderSetup(flags: {
 	json?: boolean;
 	force?: boolean;
+	preset?: string;
 	compat?: string;
 	provider?: string;
 	baseUrl?: string;
@@ -199,20 +205,25 @@ async function handleProviderSetup(flags: {
 }): Promise<void> {
 	try {
 		const missing: string[] = [];
-		if (!flags.compat) missing.push("--compat");
-		if (!flags.provider) missing.push("--provider");
-		if (!flags.baseUrl) missing.push("--base-url");
-		if (!flags.apiKeyEnv) missing.push("--api-key-env");
-		if (!flags.model || flags.model.length === 0) missing.push("--model");
+		if (!flags.preset) {
+			if (!flags.compat) missing.push("--compat");
+			if (!flags.provider) missing.push("--provider");
+			if (!flags.baseUrl) missing.push("--base-url");
+			if (!flags.apiKeyEnv) missing.push("--api-key-env");
+			if (!flags.model || flags.model.length === 0) missing.push("--model");
+		}
 		if (missing.length > 0) {
-			throw new Error(`Missing required provider setup option(s): ${missing.join(", ")}`);
+			throw new Error(
+				`Missing required provider setup option(s): ${missing.join(", ")}. Or use --preset <preset>.\nAvailable presets:\n${formatProviderPresetList()}`,
+			);
 		}
 		const result = await addApiCompatibleProvider({
-			compatibility: parseProviderCompatibility(flags.compat!),
-			providerId: flags.provider!,
-			baseUrl: flags.baseUrl!,
+			compatibility: flags.compat ? parseProviderCompatibility(flags.compat) : undefined,
+			preset: flags.preset,
+			providerId: flags.provider,
+			baseUrl: flags.baseUrl,
 			apiKeyEnv: flags.apiKeyEnv,
-			models: flags.model!,
+			models: flags.model,
 			modelsPath: flags.modelsPath,
 			force: flags.force,
 		});
@@ -400,18 +411,21 @@ ${chalk.bold("Usage:")}
 ${chalk.bold("Components:")}
   defaults  Install bundled GJC default workflow skills (default)
   hooks     Optional: install GJC native Codex UserPromptSubmit/Stop skill-state hooks
-  provider  Optional: add an OpenAI-compatible or Anthropic-compatible API provider
+  provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
 
 
 ${chalk.bold("Provider example:")}
+  ${APP_NAME} setup provider --preset minimax
+  ${APP_NAME} setup provider --preset glm
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
   -f, --force       Overwrite existing default workflow skill files
   --json            Output status as JSON
+  --preset          Provider preset: minimax, minimax-cn, or glm (aliases include minimax-code and zai)
   --compat          Provider compatibility: openai or anthropic
   --provider        Provider id to add to models.yml
   --base-url        Provider API base URL

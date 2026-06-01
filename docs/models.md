@@ -150,6 +150,24 @@ providers:
 
 ### MiniMax and GLM custom provider examples
 
+For common MiniMax and GLM/zAI setup, prefer the provider presets so the OpenAI-compatible API, base URL, env var, model id, and compatibility flags are written together:
+
+```sh
+gjc setup provider --preset minimax
+gjc setup provider --preset minimax-cn
+gjc setup provider --preset glm
+```
+
+The same presets are available inside the TUI:
+
+```text
+/provider add --preset minimax
+/provider add --preset glm
+/provider add zai
+```
+
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, or `ZAI_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider.
+
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
 ```yaml
@@ -172,7 +190,7 @@ GLM via z.ai is available as the first-class `zai` provider. For a private GLM-c
 ```yaml
 providers:
   glm-proxy:
-    baseUrl: https://open.bigmodel.cn/api/paas/v4
+    baseUrl: https://api.z.ai/api/paas/v4
     apiKeyEnv: ZAI_API_KEY
     api: openai-completions
     compat:

@@ -6,6 +6,8 @@ import { YAML } from "bun";
 import { parseSetupArgs } from "../src/cli/setup-cli";
 import {
 	addApiCompatibleProvider,
+	findProviderPreset,
+	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseModelList,
 	parseProviderCompatibility,
@@ -99,13 +101,79 @@ describe("provider onboarding setup core", () => {
 		const result = await addApiCompatibleProvider({
 			compatibility: "openai",
 			providerId: "glm-proxy",
-			baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+			baseUrl: "https://api.z.ai/api/paas/v4",
 			apiKeyEnv: "ZAI_API_KEY",
 			models: ["glm-4.6"],
 			modelsPath,
 		});
 
 		expect(result.providerId).toBe("glm-proxy");
+	});
+
+	it("adds MiniMax through the provider preset with OpenAI-compatible config", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({
+			preset: "minimax",
+			modelsPath,
+		});
+
+		expect(result.providerId).toBe("minimax-code");
+		expect(result.api).toBe("openai-completions");
+		expect(result.preset).toBe("minimax");
+		expect(result.modelIds).toEqual(["MiniMax-M2.5"]);
+		expect(formatProviderSetupResult(result)).toContain("MiniMax Coding Plan");
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<
+				string,
+				{
+					api: string;
+					baseUrl: string;
+					apiKeyEnv?: string;
+					compat?: { supportsStore?: boolean; supportsDeveloperRole?: boolean; reasoningContentField?: string };
+					models: Array<{ id: string }>;
+				}
+			>;
+		};
+		expect(parsed.providers["minimax-code"]?.api).toBe("openai-completions");
+		expect(parsed.providers["minimax-code"]?.baseUrl).toBe("https://api.minimax.io/v1");
+		expect(parsed.providers["minimax-code"]?.apiKeyEnv).toBe("MINIMAX_CODE_API_KEY");
+		expect(parsed.providers["minimax-code"]?.compat?.supportsStore).toBe(false);
+		expect(parsed.providers["minimax-code"]?.compat?.supportsDeveloperRole).toBe(false);
+		expect(parsed.providers["minimax-code"]?.compat?.reasoningContentField).toBe("reasoning_content");
+		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["MiniMax-M2.5"]);
+	});
+
+	it("adds GLM/zAI through preset aliases with OpenAI-compatible config", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({
+			preset: "zai",
+			modelsPath,
+		});
+
+		expect(result.providerId).toBe("glm-proxy");
+		expect(result.api).toBe("openai-completions");
+		expect(result.preset).toBe("glm");
+		expect(result.modelIds).toEqual(["glm-4.6"]);
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<
+				string,
+				{
+					api: string;
+					baseUrl: string;
+					apiKeyEnv?: string;
+					compat?: { supportsDeveloperRole?: boolean; supportsReasoningEffort?: boolean; thinkingFormat?: string };
+					models: Array<{ id: string }>;
+				}
+			>;
+		};
+		expect(parsed.providers["glm-proxy"]?.api).toBe("openai-completions");
+		expect(parsed.providers["glm-proxy"]?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
+		expect(parsed.providers["glm-proxy"]?.apiKeyEnv).toBe("ZAI_API_KEY");
+		expect(parsed.providers["glm-proxy"]?.compat?.supportsDeveloperRole).toBe(false);
+		expect(parsed.providers["glm-proxy"]?.compat?.supportsReasoningEffort).toBe(false);
+		expect(parsed.providers["glm-proxy"]?.compat?.thinkingFormat).toBe("zai");
+		expect(parsed.providers["glm-proxy"]?.models.map(model => model.id)).toEqual(["glm-4.6"]);
 	});
 
 	it("adds an Anthropic-compatible provider without deleting unrelated providers", async () => {
@@ -189,12 +257,33 @@ describe("provider onboarding setup core", () => {
 		expect(parsed.providers["local-http"]?.models.map(model => model.id)).toEqual(["gpt-updated"]);
 	});
 
+	it("rejects conflicting compatibility when a provider preset is used", async () => {
+		await expect(
+			addApiCompatibleProvider({
+				preset: "minimax",
+				compatibility: "anthropic",
+				modelsPath: await tempModelsPath(),
+			}),
+		).rejects.toThrow("minimax' is openai-compatible");
+	});
+
 	it("validates compatibility, models, urls, and redacts short secrets", () => {
 		expect(parseProviderCompatibility("oai")).toBe("openai");
 		expect(parseProviderCompatibility("claude")).toBe("anthropic");
+		expect(findProviderPreset("minimax-code")?.id).toBe("minimax");
+		expect(findProviderPreset("zai")?.id).toBe("glm");
+		expect(formatProviderPresetList()).toContain("minimax");
+		expect(formatProviderPresetList()).toContain("glm");
 		expect(parseModelList(["a,b", "a", " c "])).toEqual(["a", "b", "c"]);
 		expect(redactSecret("short")).toBe("***");
 		expect(redactSecret("sk-1234567890")).toBe("sk-1…7890");
+	});
+
+	it("parses setup command provider preset option", () => {
+		const parsed = parseSetupArgs(["setup", "provider", "--preset", "glm"]);
+
+		expect(parsed?.component).toBe("provider");
+		expect(parsed?.flags.preset).toBe("glm");
 	});
 
 	it("parses explicit setup command provider options", () => {

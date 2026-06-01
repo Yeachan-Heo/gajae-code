@@ -6,6 +6,7 @@ import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelC
 import { kNoAuth, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("ModelRegistry", () => {
@@ -1152,6 +1153,25 @@ describe("ModelRegistry", () => {
 			expect(discovered?.baseUrl).toBe("https://provider.example.com/v1");
 			expect(discovered?.headers?.["X-Provider"]).toBe("provider");
 			expect(discovered?.headers?.["X-Model"]).toBeUndefined();
+		});
+
+		test("provider presets load through the model registry with expected OpenAI-compatible settings", async () => {
+			const presetModelsPath = path.join(tempDir, "preset-models.yml");
+			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
+
+			const registry = new ModelRegistry(authStorage, presetModelsPath);
+			const minimax = registry.find("minimax-code", "MiniMax-M2.5");
+			const glm = registry.find("glm-proxy", "glm-4.6");
+
+			expect(minimax?.api).toBe("openai-completions");
+			expect(minimax?.baseUrl).toBe("https://api.minimax.io/v1");
+			expect(getOpenAICompat(minimax)?.supportsStore).toBe(false);
+			expect(getOpenAICompat(minimax)?.reasoningContentField).toBe("reasoning_content");
+			expect(glm?.api).toBe("openai-completions");
+			expect(glm?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
+			expect(getOpenAICompat(glm)?.thinkingFormat).toBe("zai");
+			expect(getOpenAICompat(glm)?.supportsReasoningEffort).toBe(false);
 		});
 
 		test("same-id replacement uses configured compat without bundled compat leak", () => {
