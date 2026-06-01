@@ -25,6 +25,7 @@ jobs:
    # in that case, so the canary's retention window (see build-native action) is the
    # effective TTL of a cache hit before main rebuilds anyway.
    rust-hash:
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       outputs:
          hash: ${{ steps.compute.outputs.hash }}
@@ -76,6 +77,7 @@ jobs:
 
    # Fast lint + type check (no Rust, no native build needed)
    check:
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
@@ -95,7 +97,8 @@ jobs:
    # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
    native_linux:
       needs: [rust-hash]
-      if: ${{ startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '' }}
+      if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+         (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       strategy:
          fail-fast: false
@@ -141,7 +144,8 @@ jobs:
    test:
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       needs: [native_linux, rust-hash]
-      if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
+      if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+         !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
       timeout-minutes: 30
       steps:
          - uses: actions/checkout@v4
@@ -190,6 +194,7 @@ jobs:
            run: bun run ci:test:smoke
 
    install_methods:
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
@@ -312,7 +317,9 @@ jobs:
               path: ${{ matrix.binary_path }}
 
    release-github:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
+      if: ${{ (github.event_name != 'pull_request' ||
+         github.event.pull_request.head.repo.full_name == github.repository) &&
+         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' }}
       needs: [release_binary]
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
@@ -353,7 +360,9 @@ jobs:
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
 
    release-npm:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
+      if: ${{ (github.event_name != 'pull_request' ||
+         github.event.pull_request.head.repo.full_name == github.repository) &&
+         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
          !inputs.skip_npm }}
