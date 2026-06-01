@@ -161,6 +161,54 @@ describe("provider slash command", () => {
 		expect(await Bun.file(path.join(tempAgentDir, "models.yml")).exists()).toBe(false);
 	});
 
+	it("rejects preset overrides through slash provider onboarding", async () => {
+		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-slash-"));
+		setAgentDir(tempAgentDir);
+		const outputs: string[] = [];
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
+		const runtime = {
+			session: { modelRegistry: { refresh: async () => undefined } },
+			sessionManager: {},
+			settings: {},
+			cwd: process.cwd(),
+			output: (text: string) => outputs.push(text),
+			refreshCommands: () => undefined,
+			reloadPlugins: async () => undefined,
+			notifyConfigChanged: () => undefined,
+		} as unknown as SlashCommandRuntime;
+
+		await command?.handle?.(
+			{
+				name: "provider",
+				args: "add --preset minimax --base-url https://example.invalid/v1",
+				text: "/provider add",
+			},
+			runtime,
+		);
+		await command?.handle?.(
+			{
+				name: "provider",
+				args: "add --preset minimax --model custom-model",
+				text: "/provider add",
+			},
+			runtime,
+		);
+		await command?.handle?.(
+			{
+				name: "provider",
+				args: "add --preset minimax --api-key-env CUSTOM_KEY",
+				text: "/provider add",
+			},
+			runtime,
+		);
+
+		const output = outputs.join("\n");
+		expect(output).toContain("fixed base URL");
+		expect(output).toContain("fixed model ids");
+		expect(output).toContain("MINIMAX_CODE_API_KEY");
+		expect(await Bun.file(path.join(tempAgentDir, "models.yml")).exists()).toBe(false);
+	});
+
 	it("honors trailing --force for replacement", async () => {
 		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-slash-"));
 		setAgentDir(tempAgentDir);

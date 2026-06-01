@@ -267,6 +267,56 @@ describe("provider onboarding setup core", () => {
 		).rejects.toThrow("minimax' is openai-compatible");
 	});
 
+	it("rejects provider preset attempts to override fixed base URL, model, or API key env", async () => {
+		const modelsPath = await tempModelsPath();
+
+		await expect(
+			addApiCompatibleProvider({
+				preset: "minimax",
+				baseUrl: "https://example.invalid/v1",
+				modelsPath,
+			}),
+		).rejects.toThrow("fixed base URL");
+		await expect(
+			addApiCompatibleProvider({
+				preset: "minimax",
+				models: ["custom-model"],
+				modelsPath,
+			}),
+		).rejects.toThrow("fixed model ids");
+		await expect(
+			addApiCompatibleProvider({
+				preset: "minimax",
+				apiKeyEnv: "CUSTOM_KEY",
+				modelsPath,
+			}),
+		).rejects.toThrow("MINIMAX_CODE_API_KEY");
+
+		expect(await Bun.file(modelsPath).exists()).toBe(false);
+	});
+
+	it("keeps generic OpenAI-compatible custom provider setup available for custom values", async () => {
+		const modelsPath = await tempModelsPath();
+
+		const result = await addApiCompatibleProvider({
+			compatibility: "openai",
+			providerId: "custom-minimax",
+			baseUrl: "https://example.invalid/v1",
+			apiKeyEnv: "CUSTOM_KEY",
+			models: ["custom-model"],
+			modelsPath,
+		});
+
+		expect(result.providerId).toBe("custom-minimax");
+		expect(result.modelIds).toEqual(["custom-model"]);
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { baseUrl: string; apiKeyEnv?: string; models: Array<{ id: string }> }>;
+		};
+		expect(parsed.providers["custom-minimax"]?.baseUrl).toBe("https://example.invalid/v1");
+		expect(parsed.providers["custom-minimax"]?.apiKeyEnv).toBe("CUSTOM_KEY");
+		expect(parsed.providers["custom-minimax"]?.models.map(model => model.id)).toEqual(["custom-model"]);
+	});
+
 	it("validates compatibility, models, urls, and redacts short secrets", () => {
 		expect(parseProviderCompatibility("oai")).toBe("openai");
 		expect(parseProviderCompatibility("claude")).toBe("anthropic");

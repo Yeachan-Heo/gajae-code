@@ -178,6 +178,21 @@ function resolvePresetInput(input: ProviderSetupInput): {
 			`Provider preset '${preset.id}' is ${preset.compatibility}-compatible; omit --compat or use '${preset.compatibility}'.`,
 		);
 	}
+	if (preset && input.baseUrl !== undefined) {
+		throw new Error(
+			`Provider preset '${preset.id}' uses a fixed base URL; omit --base-url or use --compat openai for a custom provider.`,
+		);
+	}
+	if (preset && input.models && input.models.length > 0) {
+		throw new Error(
+			`Provider preset '${preset.id}' uses fixed model ids; omit --model or use --compat openai for a custom provider.`,
+		);
+	}
+	if (preset && input.apiKeyEnv !== undefined && input.apiKeyEnv.trim() !== preset.apiKeyEnv) {
+		throw new Error(
+			`Provider preset '${preset.id}' uses ${preset.apiKeyEnv}; omit --api-key-env or use --compat openai for a custom provider.`,
+		);
+	}
 	const compatibility = preset?.compatibility ?? input.compatibility;
 	if (!compatibility) {
 		throw new Error("Provider compatibility is required unless --preset is used.");
