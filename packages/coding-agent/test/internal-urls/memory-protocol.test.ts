@@ -31,6 +31,9 @@ async function withMemoryFixture(fn: (fixture: MemoryFixture) => Promise<void>):
 			displayName: "test",
 			kind: "main",
 			session: {
+				settings: {
+					getAgentDir: () => agentDir,
+				},
 				sessionManager: {
 					getCwd: () => cwd,
 					getArtifactsDir: () => null,
@@ -67,6 +70,52 @@ describe("MemoryProtocolHandler", () => {
 			expect(resource.content).toBe("summary");
 			expect(resource.contentType).toBe("text/markdown");
 		});
+	});
+
+	it("uses the registered session agent dir instead of the process-global agent dir", async () => {
+		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-custom-agent-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const globalAgentDir = path.join(cleanupRoot, "global-agent");
+			const sessionAgentDir = path.join(cleanupRoot, "session-agent");
+			const cwd = path.join(cleanupRoot, "project");
+			await fs.mkdir(globalAgentDir, { recursive: true });
+			await fs.mkdir(sessionAgentDir, { recursive: true });
+			await fs.mkdir(cwd, { recursive: true });
+			setAgentDir(globalAgentDir);
+
+			const sessionMemoryRoot = getMemoryRoot(sessionAgentDir, cwd);
+			await fs.mkdir(sessionMemoryRoot, { recursive: true });
+			await Bun.write(path.join(sessionMemoryRoot, "memory_summary.md"), "session-agent summary");
+
+			AgentRegistry.global().register({
+				id: "test-main",
+				displayName: "test",
+				kind: "main",
+				session: {
+					settings: {
+						getAgentDir: () => sessionAgentDir,
+					},
+					sessionManager: {
+						getCwd: () => cwd,
+						getArtifactsDir: () => null,
+						getSessionId: () => "test",
+					},
+				} as unknown as AgentSession,
+				sessionFile: null,
+			});
+
+			const router = InternalUrlRouter.instance();
+			const resource = await router.resolve("memory://root");
+
+			expect(resource.content).toBe("session-agent summary");
+			const sourcePath = resource.sourcePath;
+			if (sourcePath === undefined) throw new Error("Expected memory resource source path");
+			expect(sourcePath.startsWith(sessionMemoryRoot)).toBe(true);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await fs.rm(cleanupRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("resolves memory://root/<path> within memory root", async () => {

@@ -11,7 +11,9 @@ import {
 	startMemoryStartupTask,
 } from "@gajae-code/coding-agent/memories";
 import * as memoryStorage from "@gajae-code/coding-agent/memories/storage";
+import { localBackend } from "@gajae-code/coding-agent/memory-backend";
 import { getAgentDbPath, Snowflake } from "@gajae-code/utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface SessionFixture {
 	agentDir: string;
@@ -75,6 +77,7 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 			getCwd: () => agentDir,
 		},
 		settings,
+		taskDepth: 0,
 		model,
 		modelRegistry,
 		refreshBaseSystemPrompt,
@@ -174,33 +177,24 @@ describe("memories runtime", () => {
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
 		vi.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							rollout_summary: "Rollout summary A",
-							rollout_slug: "thread-a-rollout",
-							raw_memory: "Raw memory A",
-						}),
-					},
-				],
-				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-			} as any)
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							memory_md: "# Memory\n\nConsolidated body",
-							memory_summary: "Consolidated summary",
-							skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
-						}),
-					},
-				],
-			} as any);
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						rollout_summary: "Rollout summary A",
+						rollout_slug: "thread-a-rollout",
+						raw_memory: "Raw memory A",
+					}),
+				),
+			)
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nConsolidated body",
+						memory_summary: "Consolidated summary",
+						skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
+					}),
+				),
+			);
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -223,26 +217,85 @@ describe("memories runtime", () => {
 			).toBe("# Deploy\nUse blue/green.");
 		});
 
-		expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
+		await waitFor(() => {
+			expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
+		});
 		expect(ai.completeSimple).toHaveBeenCalled();
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
 	});
 
+	test("local backend enqueue starts maintenance immediately for the explicit local selector", async () => {
+		const fx = await createFixture({ "memory.backend": "local", "memories.enabled": false });
+		const rolloutPath = path.join(fx.sessionDir, "thread-local.jsonl");
+		const rolloutRows = [
+			{ type: "session", id: "thread-local", cwd: fx.agentDir },
+			{ type: "message", message: { role: "user", content: "persist this local memory" } },
+		];
+		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+
+		vi.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						rollout_summary: "Local backend rollout summary",
+						rollout_slug: "local-memory",
+						raw_memory: "Local backend raw memory",
+					}),
+				),
+			)
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nLocal backend persisted body",
+						memory_summary: "Local backend persisted summary",
+						skills: [],
+					}),
+				),
+			);
+
+		await localBackend.enqueue(fx.agentDir, fx.session.sessionManager.getCwd(), fx.session);
+
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		expect(fx.settings.getCwd()).not.toBe(fx.session.sessionManager.getCwd());
+		await waitFor(async () => {
+			expect((await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).trim()).toBe(
+				"Local backend persisted summary",
+			);
+			const payload = await localBackend.buildDeveloperInstructions(fx.agentDir, fx.settings, fx.session);
+			expect(payload).toContain("Local backend persisted summary");
+			expect(payload).toContain("memory://root/memory_summary.md");
+			expect(payload).not.toContain(memoryRoot);
+		});
+
+		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
+		await waitFor(() => {
+			expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	test("local backend enqueue keeps subagent sessions from starting local maintenance", async () => {
+		const fx = await createFixture({ "memory.backend": "local" });
+		fx.session.taskDepth = 1;
+		const completeSimpleSpy = vi.spyOn(ai, "completeSimple");
+
+		await localBackend.enqueue(fx.agentDir, fx.session.sessionManager.getCwd(), fx.session);
+		await Bun.sleep(50);
+
+		expect(completeSimpleSpy).not.toHaveBeenCalled();
+		expect(fx.session.refreshBaseSystemPrompt).not.toHaveBeenCalled();
+	});
+
 	test("phase2 sync prunes stale summaries and preserves raw memory ordering", async () => {
 		const fx = await createFixture();
-		vi.spyOn(ai, "completeSimple").mockResolvedValue({
-			stopReason: "end_turn",
-			content: [
-				{
-					type: "text",
-					text: JSON.stringify({
-						memory_md: "# Memory\n\nMerged",
-						memory_summary: "Merged summary",
-						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
-					}),
-				},
-			],
-		} as any);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
 
 		const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
 		memoryStorage.upsertThreads(db, [

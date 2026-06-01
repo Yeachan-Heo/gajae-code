@@ -15,11 +15,12 @@ const MEMORY_NAMESPACE = "root";
  * may see different roots.
  */
 export function memoryRootsFromRegistry(): string[] {
-	const agentDir = getAgentDir();
 	const roots: string[] = [];
 	for (const ref of AgentRegistry.global().list()) {
-		const sm = ref.session?.sessionManager;
+		const session = ref.session;
+		const sm = session?.sessionManager;
 		if (!sm) continue;
+		const agentDir = session.settings?.getAgentDir() ?? getAgentDir();
 		const root = getMemoryRoot(agentDir, sm.getCwd());
 		if (root && !roots.includes(root)) roots.push(root);
 	}

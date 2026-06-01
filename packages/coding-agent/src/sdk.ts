@@ -1872,6 +1872,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
+			taskDepth,
 			toolRegistry,
 			transformContext,
 			onPayload,

@@ -11,6 +11,7 @@
 
 - Made startup CHANGELOG display deterministic by embedding `packages/coding-agent/CHANGELOG.md` into the binary so post-update launches show the shipped history regardless of cwd or `GJC_PACKAGE_DIR`/`PI_PACKAGE_DIR` overrides.
 - Registered `gjc update` as a public root subcommand so it invokes the bundled updater instead of routing into the interactive launcher.
+- Fixed local memory backend persistence so manual enqueue/rebuild starts maintenance immediately and prompt injection reads the active session's memory root.
 
 ## [0.2.2] - 2026-05-31
 

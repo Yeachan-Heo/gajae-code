@@ -149,10 +149,11 @@ export function startMemoryStartupTask(options: {
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
 	settings: Settings,
+	session?: AgentSession,
 ): Promise<string | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
+	const memoryRoot = getMemoryRoot(agentDir, session?.sessionManager.getCwd() ?? settings.getCwd());
 	const summaryPath = path.join(memoryRoot, "memory_summary.md");
 
 	let text: string;
