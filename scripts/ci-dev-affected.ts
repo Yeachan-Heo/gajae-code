@@ -350,7 +350,7 @@ function isCodingAgentRuntimePath(changedPath: string): boolean {
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {
-	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts";
+	return isWorkflowHarnessPath(changedPath);
 }
 
 function isWorkflowPath(changedPath: string): boolean {
