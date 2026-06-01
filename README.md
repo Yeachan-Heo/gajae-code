@@ -60,9 +60,12 @@ The default dark TUI identity is the GJC red-claw theme: a red/orange crustacean
 
 Gajae-Code (`gjc`) keeps the public agent surface intentionally small while making the runtime around it dependable. It focuses on one useful loop:
 
-```text
-deep interview -> ralplan -> team execution -> ultragoal verification
-```
+1. Start with `deep-interview` when the task is underspecified. Use it to pin down context, constraints, risks, likely files, and acceptance checks before code changes.
+2. Use `ralplan` when the clarified task still needs a plan or tradeoff review.
+3. Use `team` only when parallel discovery, review, or architecture lanes would help. Team is optional; it is not a required handoff stage.
+4. Use `ultragoal` for durable implementation and verification. Ultragoal can drive the fix, revise when findings change, run checks, and summarize evidence.
+
+For example, for a bug where `gjc --tmux --worktree` opens in the wrong directory, first clarify the expected directory, constraints, risky files, and acceptance checks with `deep-interview`; skip `team` unless parallel review would help; then use `ultragoal` to implement the fix and verify the command behavior.
 
 The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, model routing, tool execution, and persistent evidence when the work needs it.
 
@@ -75,7 +78,7 @@ Gajae-Code ships four default workflow skills:
 | `deep-interview` | Removes ambiguity before planning or code changes. |
 | `ralplan` | Builds and critiques a plan before mutation. |
 | `team` | Coordinates tmux-backed parallel execution. |
-| `ultragoal` | Tracks durable goals, checkpoints, and verification evidence. |
+| `ultragoal` | Drives durable implementation, checkpoints, and verification evidence. |
 
 And four bundled role agents:
 
