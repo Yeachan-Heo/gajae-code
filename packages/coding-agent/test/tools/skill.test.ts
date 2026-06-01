@@ -272,6 +272,34 @@ describe("SkillTool", () => {
 		expect(rp?.handoff_from).toBe("ultragoal");
 	});
 
+	// Terminal-phase allow-list coverage (architect blocker, code lane).
+	// TERMINAL_PHASES = {complete, completed, handoff, failed, cancelled, canceled, inactive}.
+	// For each terminal phase, the caller (deep-interview) must be allowed to
+	// chain into ralplan; handoff in particular is the documented happy path
+	// and the others must also pass the guard.
+	const TERMINAL_PHASES_TO_TEST = ["complete", "completed", "failed", "cancelled", "canceled", "inactive"] as const;
+	for (const phase of TERMINAL_PHASES_TO_TEST) {
+		it(`allows chaining when caller phase is terminal '${phase}'`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "deep-interview", phase, "s1");
+			const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+			const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [deepInterview, ralplan], captured, {
+				getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: "ralplan" });
+			expect(result.details?.name).toBe("ralplan");
+			expect(captured).toHaveLength(1);
+			const rp = await readModeState(cwd, "ralplan", "s1");
+			expect(rp?.active).toBe(true);
+			expect(rp?.handoff_from).toBe("deep-interview");
+		});
+	}
+
 	it("calls handoff CLI before dispatching the chained skill (ordering)", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");

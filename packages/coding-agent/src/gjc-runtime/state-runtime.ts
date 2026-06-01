@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
+	applyHandoffToActiveState,
 	CANONICAL_GJC_WORKFLOW_SKILLS,
 	type CanonicalGjcWorkflowSkill,
 	listActiveSkills,
@@ -406,38 +407,6 @@ async function syncWorkflowSkillState(options: {
 		// HUD sync is best-effort and must not change command semantics.
 	}
 }
-
-async function syncWorkflowSkillStateStrict(options: {
-	cwd: string;
-	mode: CanonicalGjcWorkflowSkill;
-	sessionId: string | undefined;
-	threadId?: string;
-	turnId?: string;
-	active: boolean;
-	phase: string | undefined;
-	payload: Record<string, unknown>;
-	receipt?: WorkflowStateReceipt;
-	handoff_from?: string;
-	handoff_to?: string;
-	handoff_at?: string;
-}): Promise<void> {
-	await syncSkillActiveState({
-		cwd: options.cwd,
-		skill: options.mode,
-		active: options.active,
-		phase: options.phase,
-		sessionId: options.sessionId,
-		threadId: options.threadId,
-		turnId: options.turnId,
-		source: "gjc-state-cli",
-		hud: buildHudForMode(options.mode, options.payload),
-		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
-		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
-		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
-		...(options.receipt ? { receipt: options.receipt } : {}),
-	});
-}
-
 async function handleRead(
 	args: readonly string[],
 	cwd: string,
@@ -666,35 +635,47 @@ async function handleHandoff(
 		receipt: callerReceipt,
 	};
 
-	// Atomic write order (Principle 6): callee first, caller second,
-	// then strict active-state syncs (caller demotion, callee promotion).
+	// Atomic write order (architecture blocker AR-3): mode-state files first,
+	// then a single atomic active-state mutation per file (session before root)
+	// via applyHandoffToActiveState. The single-write transaction prevents the
+	// HUD from observing a window where neither caller nor callee is active,
+	// and write order keeps the session-scoped source of truth ahead of the
+	// root aggregate. strict:true on the active-state read tolerates ENOENT
+	// only; corrupt JSON / IO failures propagate as non-zero CLI status.
 	await writeJsonAtomic(calleePath, mergedCalleeState);
 	await writeJsonAtomic(callerPath, mergedCallerState);
-	await syncWorkflowSkillStateStrict({
+	await applyHandoffToActiveState({
 		cwd,
-		mode: caller,
-		sessionId,
-		threadId,
-		turnId,
-		active: false,
-		phase: "handoff",
-		payload: mergedCallerState,
-		receipt: callerReceipt,
-		handoff_to: callee,
-		handoff_at: handoffAt,
-	});
-	await syncWorkflowSkillStateStrict({
-		cwd,
-		mode: callee,
-		sessionId,
-		threadId,
-		turnId,
-		active: true,
-		phase: calleeInitial,
-		payload: mergedCalleeState,
-		receipt: calleeReceipt,
-		handoff_from: caller,
-		handoff_at: handoffAt,
+		nowIso: handoffAt,
+		strict: true,
+		caller: {
+			cwd,
+			skill: caller,
+			active: false,
+			phase: "handoff",
+			sessionId,
+			threadId,
+			turnId,
+			source: "gjc-state-cli",
+			hud: buildHudForMode(caller, mergedCallerState),
+			handoff_to: callee,
+			handoff_at: handoffAt,
+			receipt: callerReceipt,
+		},
+		callee: {
+			cwd,
+			skill: callee,
+			active: true,
+			phase: calleeInitial,
+			sessionId,
+			threadId,
+			turnId,
+			source: "gjc-state-cli",
+			hud: buildHudForMode(callee, mergedCalleeState),
+			handoff_from: caller,
+			handoff_at: handoffAt,
+			receipt: calleeReceipt,
+		},
 	});
 
 	return {

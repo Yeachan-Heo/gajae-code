@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
@@ -13,6 +13,21 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+// Tests in this file assume root-scoped `.gjc/state` paths. The state runtime
+// falls back to the `GJC_SESSION_ID` env var when no `--session-id` flag is
+// provided, which would route writes into `.gjc/state/sessions/<id>/` and
+// break these root-scoped assertions when run inside a shell session that
+// exports `GJC_SESSION_ID` (e.g. the coding-agent dev loop). Clear and
+// restore the env so each test sees a deterministic root scope.
+let priorSessionId: string | undefined;
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	delete process.env.GJC_SESSION_ID;
+});
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 });
 
 function parseStdout(stdout: string | undefined): Record<string, unknown> {

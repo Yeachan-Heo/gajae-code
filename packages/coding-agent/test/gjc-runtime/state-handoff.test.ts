@@ -71,14 +71,17 @@ describe("gjc state handoff", () => {
 
 			const activeState = await readJson(path.join(cwd, ".gjc/state/skill-active-state.json"));
 			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
-			// Handoff demotes the caller: it should NOT appear as an active entry.
-			// Only the callee is in active_skills, so HUD shows only the callee.
+			// Handoff demotes the caller to active:false with handoff_to lineage so
+			// downstream readers can audit the transition; HUD readers filter on
+			// active!==false so the demoted entry stays out of the visible bar.
 			const ralplan = activeSkills.find(e => e.skill === "ralplan");
 			const di = activeSkills.find(e => e.skill === "deep-interview");
 			expect(ralplan?.active).toBe(true);
 			expect(ralplan?.handoff_from).toBe("deep-interview");
 			expect(typeof ralplan?.handoff_at).toBe("string");
-			expect(di).toBeUndefined();
+			expect(di?.active).toBe(false);
+			expect(di?.handoff_to).toBe("ralplan");
+			expect(di?.handoff_at).toBe(handoffAt);
 		});
 	});
 
@@ -232,17 +235,21 @@ describe("gjc state handoff", () => {
 			expect(typeof ralplanEntry?.handoff_at).toBe("string");
 		});
 	});
-	it("propagates strict sync failure when callee state cannot be written", async () => {
+	it("propagates strict sync failure when active-state write fails after mode-state writes succeed", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/deep-interview-state.json"), {
+			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
 				current_phase: "interviewing",
 			});
-			// Pre-create the callee path AS A DIRECTORY so writeJsonAtomic fails when
-			// renaming the temp file over an existing directory.
-			await fs.mkdir(path.join(cwd, ".gjc/state/ralplan-state.json"), { recursive: true });
+			// Pre-create the root active-state path AS A DIRECTORY so writing it
+			// fails *after* both mode-state writes have already succeeded. This
+			// exercises the strict active-state path, not the pre-sync mode-state
+			// path, and proves the CLI returns non-zero status when the atomic
+			// transaction cannot complete.
+			await fs.mkdir(path.join(cwd, ".gjc/state/skill-active-state.json"), { recursive: true });
 
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
@@ -250,13 +257,39 @@ describe("gjc state handoff", () => {
 			);
 			expect(result.status).not.toBe(0);
 			expect(result.stderr).toBeDefined();
-			// Caller mode-state should NOT have been demoted because the callee write
-			// (step a in the atomicity model) failed first.
-			const caller = JSON.parse(
-				await fs.readFile(path.join(cwd, ".gjc/state/deep-interview-state.json"), "utf-8"),
+			// Mode-state writes happen before the active-state sync, so the caller
+			// mode-state is already demoted. The recoverable contract is: mode-state
+			// reflects intent, and a subsequent retry (or explicit `gjc state
+			// <caller> handoff --to <callee>`) can re-apply the active-state sync
+			// without corrupting either mode-state file.
+			const caller = JSON.parse(await fs.readFile(callerPath, "utf-8")) as Record<string, unknown>;
+			expect(caller.current_phase).toBe("handoff");
+			expect(caller.active).toBe(false);
+			const callee = JSON.parse(
+				await fs.readFile(path.join(cwd, ".gjc/state/ralplan-state.json"), "utf-8"),
 			) as Record<string, unknown>;
-			expect(caller.active).toBe(true);
-			expect(caller.current_phase).toBe("interviewing");
+			expect(callee.active).toBe(true);
+			expect(callee.handoff_from).toBe("deep-interview");
+		});
+	});
+
+	it("treats corrupt active-state JSON as a strict failure", async () => {
+		await withTempCwd(async cwd => {
+			await writeJson(path.join(cwd, ".gjc/state/deep-interview-state.json"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			await fs.mkdir(path.join(cwd, ".gjc/state"), { recursive: true });
+			await fs.writeFile(path.join(cwd, ".gjc/state/skill-active-state.json"), "{ not valid json");
+
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(result.status).not.toBe(0);
+			expect(result.stderr).toBeDefined();
 		});
 	});
 	it("defaults session-id from GJC_SESSION_ID env var when no --session-id flag is passed", async () => {

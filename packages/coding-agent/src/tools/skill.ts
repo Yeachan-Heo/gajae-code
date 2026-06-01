@@ -10,8 +10,8 @@
  * transition atomically.
  *
  * Chaining is refused unless the caller's `current_phase` is in
- * `{complete, completed, handoff, failed, cancelled, inactive}`. The agent
- * declares readiness either by writing `current_phase: "handoff"` to its
+ * `{complete, completed, handoff, failed, cancelled, canceled, inactive}`. The
+ * agent declares readiness either by writing `current_phase: "handoff"` to its
  * mode-state or by running the handoff verb directly.
  */
 

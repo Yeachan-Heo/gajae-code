@@ -294,6 +294,28 @@ async function readStateFile(filePath: string): Promise<SkillActiveState | null>
 	}
 }
 
+async function readStateFileStrict(filePath: string): Promise<SkillActiveState | null> {
+	let raw: string;
+	try {
+		raw = await Bun.file(filePath).text();
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return null;
+		throw err;
+	}
+	return normalizeSkillActiveState(JSON.parse(raw));
+}
+
+function rawActiveEntries(state: SkillActiveState | null): SkillActiveEntry[] {
+	if (!state || !Array.isArray(state.active_skills)) return [];
+	const out: SkillActiveEntry[] = [];
+	for (const candidate of state.active_skills) {
+		const normalized = normalizeEntry(candidate);
+		if (normalized) out.push(normalized);
+	}
+	return out;
+}
+
 function filterRootEntriesForSession(entries: SkillActiveEntry[], sessionId?: string): SkillActiveEntry[] {
 	const normalizedSessionId = safeString(sessionId).trim();
 	if (!normalizedSessionId) return entries;
@@ -396,4 +418,86 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		active_skills: sessionEntries,
 	};
 	await writeStateFile(sessionPath, nextSession);
+}
+
+export interface ApplyHandoffOptions {
+	cwd: string;
+	caller: SyncSkillActiveStateOptions;
+	callee: SyncSkillActiveStateOptions;
+	/** Shared timestamp; falls back to new Date().toISOString(). */
+	nowIso?: string;
+	/** When true, read errors other than ENOENT propagate. */
+	strict?: boolean;
+}
+
+/**
+ * Atomically apply a workflow-skill handoff to both the session-scoped and
+ * root `skill-active-state.json` files in a single write per file.
+ *
+ * Write order: **session first, root last**. The session file is the
+ * source of truth for HUD; the root aggregate must never lead the session
+ * during a handoff window. Each file is rewritten once with caller demoted
+ * to `active:false` (preserving `handoff_to`/`handoff_at` lineage) and
+ * callee promoted to `active:true` (with `handoff_from`/`handoff_at`).
+ */
+export async function applyHandoffToActiveState(options: ApplyHandoffOptions): Promise<void> {
+	const nowIso = options.nowIso ?? new Date().toISOString();
+	const callerEntry = buildSyncEntry(options.caller, nowIso);
+	const calleeEntry = buildSyncEntry(options.callee, nowIso);
+	const sessionId = options.callee.sessionId ?? options.caller.sessionId;
+	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId);
+	const readState = options.strict ? readStateFileStrict : readStateFile;
+
+	const applyEntries = (entries: SkillActiveEntry[]): SkillActiveEntry[] => {
+		const callerKey = entryKey(callerEntry);
+		const calleeKey = entryKey(calleeEntry);
+		const kept = entries.filter(e => entryKey(e) !== callerKey && entryKey(e) !== calleeKey);
+		return [...kept, callerEntry, calleeEntry];
+	};
+	const buildNextState = (
+		prior: SkillActiveState | null,
+		entries: SkillActiveEntry[],
+		scope: "session" | "root",
+	): SkillActiveState => {
+		const visible = entries.filter(e => e.active !== false);
+		return {
+			...(prior ?? {}),
+			version: 1,
+			active: visible.length > 0,
+			skill: visible[0]?.skill ?? "",
+			phase: visible[0]?.phase ?? "",
+			...(scope === "session" ? { session_id: sessionId } : {}),
+			updated_at: nowIso,
+			source: options.callee.source ?? options.caller.source,
+			active_skills: entries,
+		};
+	};
+
+	if (sessionPath) {
+		const prior = await readState(sessionPath);
+		const next = buildNextState(prior, applyEntries(rawActiveEntries(prior)), "session");
+		await writeStateFile(sessionPath, next);
+	}
+	const priorRoot = await readState(rootPath);
+	const nextRoot = buildNextState(priorRoot, applyEntries(rawActiveEntries(priorRoot)), "root");
+	await writeStateFile(rootPath, nextRoot);
+}
+
+function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): SkillActiveEntry {
+	const hud = normalizeWorkflowHudSummary(options.hud);
+	return {
+		skill: options.skill,
+		phase: options.phase,
+		active: options.active,
+		activated_at: nowIso,
+		updated_at: nowIso,
+		session_id: options.sessionId,
+		thread_id: options.threadId,
+		turn_id: options.turnId,
+		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
+		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
+		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
+		...(hud ? { hud } : {}),
+		...(options.receipt ? { receipt: options.receipt } : {}),
+	};
 }

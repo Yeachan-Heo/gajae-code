@@ -120,10 +120,11 @@ describe("skill HUD bar renderer", () => {
 		expect(rendered).toContain("receipt=fresh");
 	});
 
-	it("shows only the callee after a D->R handoff (caller removed from active_skills)", () => {
-		// After `gjc state deep-interview handoff --to ralplan`, the upsertEntry
-		// pathway removes deep-interview from active_skills entirely (active=false
-		// drops the entry). The HUD reflects only what is active.
+	it("shows only the callee after a D->R handoff (caller demoted to inactive entry, HUD filters it out)", () => {
+		// After `gjc state deep-interview handoff --to ralplan`, the caller
+		// entry is preserved in active_skills with active:false and handoff_to
+		// lineage for audit; the HUD filters on active!==false so only ralplan
+		// appears in the rendered bar.
 		const rendered = Bun.stripANSI(renderSkillHudBar([{ skill: "ralplan", phase: "planning" }], 80) ?? "");
 		expect(rendered).toContain("ralplan:planning");
 		expect(rendered).not.toContain("deep-interview");
