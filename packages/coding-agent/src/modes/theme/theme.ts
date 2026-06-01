@@ -1758,6 +1758,10 @@ function getDefaultTheme(): string {
 	return bg === "light" ? autoLightTheme : autoDarkTheme;
 }
 
+export function getDetectedThemeSettingsPath(): "theme.dark" | "theme.light" {
+	return detectTerminalBackground() === "light" ? "theme.light" : "theme.dark";
+}
+
 // ============================================================================
 // Global Theme Instance
 // ============================================================================
@@ -1779,6 +1783,7 @@ var autoDarkTheme: string = "red-claw";
 var autoLightTheme: string = "light";
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
+var previewThemeActive: boolean = false;
 
 function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
@@ -1798,6 +1803,7 @@ export async function initTheme(
 	autoDarkTheme = darkTheme ?? "red-claw";
 	autoLightTheme = lightTheme ?? "light";
 	const name = getDefaultTheme();
+	previewThemeActive = false;
 	currentThemeName = name;
 	currentSymbolPresetOverride = symbolPreset;
 	currentColorBlindMode = colorBlindMode ?? false;
@@ -1820,6 +1826,7 @@ export async function setTheme(
 	enableWatcher: boolean = false,
 ): Promise<{ success: boolean; error?: string }> {
 	autoDetectedTheme = false;
+	previewThemeActive = false;
 	currentThemeName = name;
 	const requestId = ++themeLoadRequestId;
 	try {
@@ -1858,6 +1865,7 @@ export async function previewTheme(name: string): Promise<{ success: boolean; er
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}
 		theme = loadedTheme;
+		previewThemeActive = true;
 		if (onThemeChangeCallback) {
 			onThemeChangeCallback();
 		}
@@ -1865,6 +1873,32 @@ export async function previewTheme(name: string): Promise<{ success: boolean; er
 	} catch (error) {
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme preview superseded by a newer request" };
+		}
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+export async function restoreThemePreview(name: string): Promise<{ success: boolean; error?: string }> {
+	const resolvedName = autoDetectedTheme ? getDefaultTheme() : name;
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(resolvedName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) {
+			return { success: false, error: "Theme preview restore superseded by a newer request" };
+		}
+		theme = loadedTheme;
+		currentThemeName = resolvedName;
+		previewThemeActive = false;
+		if (onThemeChangeCallback) {
+			onThemeChangeCallback();
+		}
+		return { success: true };
+	} catch (error) {
+		if (requestId !== themeLoadRequestId) {
+			return { success: false, error: "Theme preview restore superseded by a newer request" };
 		}
 		return {
 			success: false,
@@ -1904,6 +1938,7 @@ export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 
 export function setThemeInstance(themeInstance: Theme): void {
 	autoDetectedTheme = false;
+	previewThemeActive = false;
 	theme = themeInstance;
 	currentThemeName = "<in-memory>";
 	stopThemeWatcher();
@@ -2056,11 +2091,12 @@ async function startThemeWatcher(): Promise<void> {
 function reevaluateAutoTheme(debugLabel: string): void {
 	if (!autoDetectedTheme) return;
 	const resolved = getDefaultTheme();
-	if (resolved === currentThemeName) return;
+	if (resolved === currentThemeName && !previewThemeActive) return;
 	currentThemeName = resolved;
 	loadTheme(resolved, getCurrentThemeOptions())
 		.then(loadedTheme => {
 			theme = loadedTheme;
+			previewThemeActive = false;
 			if (onThemeChangeCallback) {
 				onThemeChangeCallback();
 			}

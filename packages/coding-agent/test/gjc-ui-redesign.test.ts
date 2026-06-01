@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { TEMPLATE } from "../src/export/html/template.generated";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
+import blueCrabTheme from "../src/modes/theme/defaults/blue-crab.json" with { type: "json" };
 import redClawTheme from "../src/modes/theme/defaults/red-claw.json" with { type: "json" };
 import * as themeModule from "../src/modes/theme/theme";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
+import { lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
 describe("GJC red-claw redesign defaults", () => {
 	afterEach(() => {
@@ -41,6 +44,41 @@ describe("GJC red-claw redesign defaults", () => {
 		expect(colors.warning).toBe(vars.warningAmber);
 		expect(colors.toolDiffRemoved).toBe(vars.diffRemovalRed);
 		expect(new Set([colors.accent, colors.error, colors.warning, colors.toolDiffRemoved]).size).toBe(4);
+	});
+
+	it("registers blue-crab as a bundled selectable theme without changing red-claw defaults", async () => {
+		const themes = await themeModule.getAvailableThemes();
+
+		expect(themes).toContain("blue-crab");
+		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
+	});
+
+	it("keeps blue-crab coastal tokens separate from semantic warning/error/diff tokens", async () => {
+		const colors = await themeModule.getResolvedThemeColors("blue-crab");
+		const vars = blueCrabTheme.vars;
+
+		expect(vars.brandBlue).toBeDefined();
+		expect(vars.claw).toBeDefined();
+		expect(vars.seafoam).toBeDefined();
+		expect(vars.sand).toBeDefined();
+		expect(vars.dangerRed).toBeDefined();
+		expect(vars.warningAmber).toBeDefined();
+		expect(vars.diffRemovalRed).toBeDefined();
+
+		expect(colors.accent).toBe(vars.claw);
+		expect(colors.borderAccent).toBe(vars.brandBlue);
+		expect(colors.error).toBe(vars.dangerRed);
+		expect(colors.warning).toBe(vars.warningAmber);
+		expect(colors.toolDiffRemoved).toBe(vars.diffRemovalRed);
+		expect(new Set([colors.accent, colors.error, colors.warning, colors.toolDiffRemoved]).size).toBe(4);
+	});
+
+	it("exposes /theme only for TUI selection, not ACP text clients", () => {
+		const command = lookupBuiltinSlashCommand("theme");
+
+		expect(command?.handleTui).toBeDefined();
+		expect(command?.handle).toBeUndefined();
+		expect(ACP_BUILTIN_SLASH_COMMANDS.map(item => item.name)).not.toContain("theme");
 	});
 
 	it("keeps public status presets on the GJC identity", () => {

@@ -107,6 +107,64 @@ describe("theme auto-detection", () => {
 		themeModule.stopThemeWatcher();
 		expect(stop).toHaveBeenCalledTimes(1);
 	});
+
+	it("routes theme selection persistence to the detected appearance slot", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		themeModule.onTerminalAppearanceChange("light");
+		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+
+		expect(themeModule.getDetectedThemeSettingsPath()).toBe("theme.light");
+
+		themeModule.onTerminalAppearanceChange("dark");
+		await Bun.sleep(0);
+		expect(themeModule.getDetectedThemeSettingsPath()).toBe("theme.dark");
+	});
+
+	it("restores previewed themes without leaving preview mode active", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+
+		await themeModule.previewTheme("light");
+		expect(themeModule.theme.getFgAnsi("accent")).not.toBe(darkAccent);
+
+		await themeModule.restoreThemePreview("dark");
+		expect(themeModule.getCurrentThemeName()).toBe("dark");
+		expect(themeModule.theme.getFgAnsi("accent")).toBe(darkAccent);
+
+		themeModule.setAutoThemeMapping("dark", "dark");
+		await Bun.sleep(0);
+		expect(themeModule.getCurrentThemeName()).toBe("dark");
+		expect(themeModule.theme.getFgAnsi("accent")).toBe(darkAccent);
+	});
+
+	it("restores the latest detected auto theme when terminal appearance changes during preview", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+
+		await themeModule.previewTheme("dark");
+		themeModule.onTerminalAppearanceChange("light");
+		await Bun.sleep(0);
+		await themeModule.restoreThemePreview("dark");
+
+		expect(themeModule.getCurrentThemeName()).toBe("light");
+		expect(themeModule.theme.getFgAnsi("accent")).not.toBe(darkAccent);
+	});
+
+	it("restores the resolved auto theme after saving the inactive theme slot from preview", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+
+		await themeModule.previewTheme("light");
+		themeModule.setAutoThemeMapping("light", "light");
+		await Bun.sleep(0);
+
+		expect(themeModule.getCurrentThemeName()).toBe("dark");
+		expect(themeModule.theme.getFgAnsi("accent")).toBe(darkAccent);
+	});
+
 	it("Zellij fallback stays macOS-only (Linux + Zellij = honor terminal)", async () => {
 		using _globals = withThemeTestGlobals({ platform: "linux", zellij: "1" });
 		const detectSpy = vi.spyOn(nativesModule, "detectMacOSAppearance").mockReturnValue(MacOSAppearance.Light);

@@ -231,6 +231,7 @@ export interface InteractiveModeContext {
 
 	// Selector handling
 	showSettingsSelector(): void;
+	showThemeSelector(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;

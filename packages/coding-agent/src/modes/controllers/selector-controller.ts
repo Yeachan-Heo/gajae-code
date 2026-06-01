@@ -17,7 +17,11 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import {
 	getAvailableThemes,
+	getCurrentThemeName,
+	getDetectedThemeSettingsPath,
 	getSymbolTheme,
+	previewTheme,
+	restoreThemePreview,
 	setColorBlindMode,
 	setSymbolPreset,
 	setTheme,
@@ -47,6 +51,7 @@ import {
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
+import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
@@ -170,6 +175,48 @@ export class SelectorController {
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
+					},
+				);
+				return { component: selector, focus: selector };
+			});
+		});
+	}
+
+	#refreshThemeUi(): void {
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorTopBorder();
+		this.ctx.ui.requestRender();
+	}
+
+	showThemeSelector(): void {
+		getAvailableThemes().then(availableThemes => {
+			const initialTheme = getCurrentThemeName() ?? "red-claw";
+			this.showSelector(done => {
+				const selector = new ThemeSelectorComponent(
+					initialTheme,
+					availableThemes,
+					themeName => {
+						const settingPath = getDetectedThemeSettingsPath();
+						settings.set(settingPath, themeName);
+						this.#refreshThemeUi();
+						done();
+					},
+					() => {
+						void restoreThemePreview(initialTheme).then(result => {
+							if (!result.success && result.error) {
+								this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+							}
+							this.#refreshThemeUi();
+						});
+						done();
+					},
+					themeName => {
+						void previewTheme(themeName).then(result => {
+							if (!result.success && result.error) {
+								this.ctx.showError(`Failed to preview theme: ${result.error}`);
+							}
+							this.#refreshThemeUi();
+						});
 					},
 				);
 				return { component: selector, focus: selector };
