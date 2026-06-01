@@ -594,7 +594,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 					}
 				},
 				waitForIdle: async () => {},
-				getLastAssistantMessage: () => (stubSession.state as { messages: Message[] }).messages.at(-1),
+				getLastAssistantMessage: () => {
+					const messages = (stubSession.state as { messages: Message[] }).messages;
+					for (let i = messages.length - 1; i >= 0; i--) {
+						const message = messages[i];
+						if (message?.role === "assistant") return message as AssistantMessage;
+					}
+					return undefined;
+				},
 				abort: async () => {},
 				dispose: async () => {},
 			};
