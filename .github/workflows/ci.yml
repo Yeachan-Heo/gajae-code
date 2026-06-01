@@ -165,10 +165,20 @@ jobs:
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
            run: |
-              sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-              sudo ln -sf $(which fdfind) /usr/local/bin/fd
-              sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                 sudo apt-get update
+                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
+                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              else
+                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
+                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
+                 for tool in fd rg convert tmux gh; do
+                    if ! command -v "$tool" >/dev/null 2>&1; then
+                       echo "warning: optional helper not on PATH: $tool"
+                    fi
+                 done
+              fi
          - run: bun install --frozen-lockfile
          - name: Resolve native source run
            id: source
@@ -227,10 +237,20 @@ jobs:
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
            run: |
-              sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-              sudo ln -sf $(which fdfind) /usr/local/bin/fd
-              sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                 sudo apt-get update
+                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
+                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              else
+                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
+                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
+                 for tool in fd rg convert tmux gh; do
+                    if ! command -v "$tool" >/dev/null 2>&1; then
+                       echo "warning: optional helper not on PATH: $tool"
+                    fi
+                 done
+              fi
          - run: bun install --frozen-lockfile
          - name: Install method smoke tests
            run: bun run ci:test:install-methods
