@@ -61,32 +61,46 @@ The default dark TUI identity is the GJC red-claw theme: a red/orange crustacean
 Gajae-Code (`gjc`) keeps the public agent surface intentionally small while making the runtime around it dependable. It focuses on one useful loop:
 
 ```text
-deep interview -> ralplan -> team execution -> ultragoal verification
+deep-interview -> ralplan -> ultragoal
+                         └─ optional team execution when parallel tmux workers help
 ```
 
-The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, model routing, tool execution, and persistent evidence when the work needs it.
+Use `deep-interview` to clarify intent, `ralplan` to critique the approach, and `$ultragoal` to carry the work through implementation, revision, verification, and an evidence summary. Add `$team` only when the task benefits from coordinated parallel workers; `$team` is an optional execution mode, not a required handoff step. The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, model routing, tool execution, and persistent evidence when the work needs it.
 
 ## Workflow surface
 
 Gajae-Code ships four default workflow skills:
 
-| Skill | What it does |
-| --- | --- |
-| `deep-interview` | Removes ambiguity before planning or code changes. |
-| `ralplan` | Builds and critiques a plan before mutation. |
-| `team` | Coordinates tmux-backed parallel execution. |
-| `ultragoal` | Tracks durable goals, checkpoints, and verification evidence. |
+| Skill            | What it does                                                                                        |
+| ---------------- | --------------------------------------------------------------------------------------------------- |
+| `deep-interview` | Removes ambiguity before planning or code changes.                                                  |
+| `ralplan`        | Builds and critiques a plan before mutation.                                                        |
+| `team`           | Optionally coordinates tmux-backed parallel execution when the work benefits from multiple workers. |
+| `ultragoal`      | Tracks durable goals through implementation, revisions, verification, and evidence summaries.       |
 
 And four bundled role agents:
 
-| Agent | What it does |
-| --- | --- |
-| `executor` | Bounded implementation, fixes, and refactors. |
+| Agent       | What it does                                       |
+| ----------- | -------------------------------------------------- |
+| `executor`  | Bounded implementation, fixes, and refactors.      |
 | `architect` | Read-only architecture and code-review assessment. |
-| `planner` | Read-only sequencing and acceptance criteria. |
-| `critic` | Read-only plan critique and actionability review. |
+| `planner`   | Read-only sequencing and acceptance criteria.      |
+| `critic`    | Read-only plan critique and actionability review.  |
 
 No sprawling default skill zoo: the harness improves by making this small method better.
+
+A concrete bug-fix pass might look like this:
+
+```text
+/skill:deep-interview clarify the bug, affected behavior, non-goals, and acceptance checks
+/skill:ralplan turn the clarified bug report into a reviewed fix plan
+gjc ultragoal create-goals --brief-file <approved-plan>
+# Optional only for parallel work:
+gjc team 2:executor "split implementation and verification for this bug fix"
+gjc ultragoal complete-goals
+```
+
+That flow is meant to describe the operator sequence, not to guarantee hidden automation: the agent still reports what it changed, what it revised after findings, what checks ran, and what evidence supports the fix.
 
 ## Development
 
