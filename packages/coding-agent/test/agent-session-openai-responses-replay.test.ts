@@ -13,6 +13,14 @@ import {
 	type SessionMessageEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import * as asyncModule from "@gajae-code/coding-agent/async";
+import * as settingsModule from "@gajae-code/coding-agent/config/settings";
+import * as sdkModule from "@gajae-code/coding-agent/sdk";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import * as agentsModule from "@gajae-code/coding-agent/task/agents";
+import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
+import * as taskModule from "@gajae-code/coding-agent/task";
+import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
 
 function createUsage(): Usage {
 	return {
@@ -521,14 +529,6 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			timestamp: Date.now() - 10_000,
 		});
 
-		const sdkModule = await import("@gajae-code/coding-agent/sdk");
-		const taskModule = await import("@gajae-code/coding-agent/task");
-		const discoveryModule = await import("@gajae-code/coding-agent/task/discovery");
-		const agentsModule = await import("@gajae-code/coding-agent/task/agents");
-		const asyncModule = await import("@gajae-code/coding-agent/async");
-		const settingsModule = await import("@gajae-code/coding-agent/config/settings");
-		const eventBusModule = await import("@gajae-code/coding-agent/utils/event-bus");
-
 		const bundledExecutor = agentsModule.getBundledAgent("executor");
 		const bundledArchitect = agentsModule.getBundledAgent("architect");
 		expect(bundledExecutor?.forkContext).toBe("allowed");
@@ -607,10 +607,10 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			};
 			return {
 				session: stubSession as AgentSession,
-				extensionsResult: {} as Awaited<ReturnType<typeof sdkModule.createAgentSession>>["extensionsResult"],
+				extensionsResult: {} as CreateAgentSessionResult["extensionsResult"],
 				setToolUIContext: () => {},
 				eventBus: new eventBusModule.EventBus(),
-			} satisfies Awaited<ReturnType<typeof sdkModule.createAgentSession>>;
+			} satisfies CreateAgentSessionResult;
 		});
 
 		const manager = new asyncModule.AsyncJobManager({ onJobComplete: async () => {} });
