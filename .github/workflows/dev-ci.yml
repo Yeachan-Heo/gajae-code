@@ -47,7 +47,7 @@ jobs:
          - name: Install system deps
            run: |
               sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick
+              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
               sudo ln -sf $(which fdfind) /usr/local/bin/fd
               sudo ln -sf /usr/bin/convert /usr/local/bin/magick
          - run: bun install --frozen-lockfile
