@@ -292,6 +292,64 @@ describe("gjc state handoff", () => {
 			expect(result.stderr).toBeDefined();
 		});
 	});
+
+	it("preserves earlier inactive lineage across successive handoffs (D->R->U keeps di's handoff_to in active_skills)", async () => {
+		await withTempCwd(async cwd => {
+			const stateDir = path.join(cwd, ".gjc/state");
+			await writeJson(path.join(stateDir, "deep-interview-state.json"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+
+			// Step 1: D -> R.
+			const step1 = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(step1.status).toBe(0);
+
+			// Bridge state for step 2: ralplan must look ready-to-hand-off.
+			await fs.writeFile(
+				path.join(stateDir, "ralplan-state.json"),
+				JSON.stringify(
+					{
+						...(JSON.parse(await fs.readFile(path.join(stateDir, "ralplan-state.json"), "utf-8")) as Record<
+							string,
+							unknown
+						>),
+						current_phase: "handoff",
+					},
+					null,
+					2,
+				),
+			);
+
+			// Step 2: R -> U.
+			const step2 = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(step2.status).toBe(0);
+
+			// Assert all three lineage records are present in active_skills.
+			const activeState = (await readJson(path.join(stateDir, "skill-active-state.json"))) as {
+				active_skills?: Array<Record<string, unknown>>;
+			};
+			const skills = activeState?.active_skills ?? [];
+			const di = skills.find(e => e.skill === "deep-interview");
+			const rp = skills.find(e => e.skill === "ralplan");
+			const ug = skills.find(e => e.skill === "ultragoal");
+			expect(di?.active).toBe(false);
+			expect(di?.handoff_to).toBe("ralplan");
+			expect(rp?.active).toBe(false);
+			expect(rp?.handoff_to).toBe("ultragoal");
+			expect(rp?.handoff_from).toBe("deep-interview");
+			expect(ug?.active).toBe(true);
+			expect(ug?.handoff_from).toBe("ralplan");
+		});
+	});
 	it("defaults session-id from GJC_SESSION_ID env var when no --session-id flag is passed", async () => {
 		await withTempCwd(async cwd => {
 			const sessionId = "session-env-default";

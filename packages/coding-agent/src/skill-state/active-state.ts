@@ -294,16 +294,36 @@ async function readStateFile(filePath: string): Promise<SkillActiveState | null>
 	}
 }
 
-async function readStateFileStrict(filePath: string): Promise<SkillActiveState | null> {
+/**
+ * Raw read for handoff mutations. Returns the *unnormalized* parsed object so
+ * inactive entries remain visible to `rawActiveEntries` — `normalizeSkillActiveState`
+ * delegates to `listActiveSkills`, which filters out `active:false` rows for HUD
+ * purposes. Handoff history (e.g. previously demoted callers carrying
+ * `handoff_to`/`handoff_at` lineage) must survive across successive handoffs,
+ * so the on-disk `active_skills` array is preserved verbatim and the next
+ * write recomputes the per-skill row from there.
+ *
+ * Strict semantics: tolerates ENOENT only. Corrupt JSON / non-ENOENT I/O
+ * errors propagate so callers can surface a non-zero CLI status.
+ */
+async function readRawActiveStateForHandoff(filePath: string, strict: boolean): Promise<SkillActiveState | null> {
 	let raw: string;
 	try {
 		raw = await Bun.file(filePath).text();
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException).code;
 		if (code === "ENOENT") return null;
+		if (!strict) return null;
 		throw err;
 	}
-	return normalizeSkillActiveState(JSON.parse(raw));
+	try {
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object") return null;
+		return parsed as SkillActiveState;
+	} catch (err) {
+		if (!strict) return null;
+		throw err;
+	}
 }
 
 function rawActiveEntries(state: SkillActiveState | null): SkillActiveEntry[] {
@@ -446,13 +466,25 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 	const calleeEntry = buildSyncEntry(options.callee, nowIso);
 	const sessionId = options.callee.sessionId ?? options.caller.sessionId;
 	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId);
-	const readState = options.strict ? readStateFileStrict : readStateFile;
+	const readState = (filePath: string) => readRawActiveStateForHandoff(filePath, options.strict === true);
 
 	const applyEntries = (entries: SkillActiveEntry[]): SkillActiveEntry[] => {
 		const callerKey = entryKey(callerEntry);
 		const calleeKey = entryKey(calleeEntry);
+		const priorCaller = entries.find(e => entryKey(e) === callerKey);
 		const kept = entries.filter(e => entryKey(e) !== callerKey && entryKey(e) !== calleeKey);
-		return [...kept, callerEntry, calleeEntry];
+		// Merge prior lineage into the demoted caller so multi-step handoff
+		// chains preserve `handoff_from` from the previous transition while
+		// the new `handoff_to`/`handoff_at` describe this one.
+		const mergedCaller: SkillActiveEntry = priorCaller
+			? {
+					...callerEntry,
+					...(priorCaller.handoff_from && !callerEntry.handoff_from
+						? { handoff_from: priorCaller.handoff_from }
+						: {}),
+				}
+			: callerEntry;
+		return [...kept, mergedCaller, calleeEntry];
 	};
 	const buildNextState = (
 		prior: SkillActiveState | null,
