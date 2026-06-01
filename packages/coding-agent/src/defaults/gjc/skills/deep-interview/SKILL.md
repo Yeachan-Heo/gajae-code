@@ -389,8 +389,9 @@ When ambiguity ≤ threshold (or hard cap / early exit):
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
 2. **Write the final spec through the workflow CLI**: persist the artifact at `.gjc/specs/deep-interview-{slug}.md`
    - Always use this exact final spec path. Do not write temporary working files to the repo root or other ad hoc paths; repos may allowlist `.gjc/` for planning artifacts while protecting product branches.
-   - Use the GJC workflow/state CLI for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
+   - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--json]` for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
    - Persist the final `spec_path` in state when available so downstream skills and resumed sessions can pass the artifact path explicitly.
+   - If the user preselected the deliberate ralplan path, use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> --deliberate [--json]` so the final spec is persisted before deep-interview hands off to ralplan.
 
 Spec structure:
 
@@ -517,13 +518,20 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 ### Phase 5b: Handoff before chain
 
-Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, mark deep-interview ready for handoff so the skill tool's chain guard lets the transition proceed. Run:
+Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command. For ordinary user-selected handoff, mark deep-interview ready for the skill tool's chain guard:
 
 ```
 gjc state deep-interview write --input '{"current_phase":"handoff"}' --json
 ```
 
-The skill tool then dispatches the next skill same-turn and runs `gjc state deep-interview handoff --to <callee> --json` in-process to atomically demote deep-interview, promote the callee, and sync both `skill-active-state.json` files. You do not need to run the handoff verb yourself. Skipping the `current_phase: "handoff"` write leaves the skill tool's terminal-phase guard refusing to chain.
+For a preselected deliberate ralplan path, prefer the single sanctioned bridge command instead:
+
+```
+gjc \
+deep-interview --write --stage final --slug {slug} --spec <markdown-or-path> --deliberate --json
+```
+
+That command persists `.gjc/specs/deep-interview-{slug}.md`, seeds ralplan in deliberate mode, and performs the safe deep-interview → ralplan state handoff. Skipping spec persistence leaves the Phase 5 chain blocked by design.
 
 ### Approval-Gated Refinement Path (Recommended)
 

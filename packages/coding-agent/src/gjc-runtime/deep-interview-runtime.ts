@@ -1,8 +1,11 @@
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildDeepInterviewHudSummary } from "../skill-state/workflow-hud";
+import { runNativeRalplanCommand } from "./ralplan-runtime";
+import { runNativeStateCommand } from "./state-runtime";
 
 /**
  * Native implementation of `gjc deep-interview`.
@@ -42,7 +45,15 @@ class DeepInterviewCommandError extends Error {
 	}
 }
 
-const VALUE_FLAGS = new Set(["--session-id", "--threshold", "--threshold-source"]);
+const VALUE_FLAGS = new Set([
+	"--session-id",
+	"--threshold",
+	"--threshold-source",
+	"--stage",
+	"--slug",
+	"--spec",
+	"--handoff",
+]);
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
 	const index = args.indexOf(flag);
@@ -64,6 +75,56 @@ function encodeSessionSegment(value: string): string {
 	return encodeURIComponent(value).replaceAll(".", "%2E");
 }
 
+function defaultSpecSlug(now: Date = new Date()): string {
+	const yyyy = now.getUTCFullYear().toString().padStart(4, "0");
+	const mm = (now.getUTCMonth() + 1).toString().padStart(2, "0");
+	const dd = now.getUTCDate().toString().padStart(2, "0");
+	const hh = now.getUTCHours().toString().padStart(2, "0");
+	const min = now.getUTCMinutes().toString().padStart(2, "0");
+	return `${yyyy}-${mm}-${dd}-${hh}${min}-${randomBytes(2).toString("hex")}`;
+}
+
+function stateDirFor(cwd: string, sessionId: string | undefined): string {
+	return sessionId
+		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(sessionId))
+		: path.join(cwd, ".gjc", "state");
+}
+
+function deepInterviewStatePath(cwd: string, sessionId: string | undefined): string {
+	return path.join(stateDirFor(cwd, sessionId), "deep-interview-state.json");
+}
+
+async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
+	try {
+		const parsed = JSON.parse(await fs.readFile(filePath, "utf-8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+	} catch {
+		// Missing/corrupt state should not prevent the sanctioned persistence CLI from writing a receipt.
+	}
+	return {};
+}
+
+async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	const tmp = `${filePath}.tmp-${randomBytes(6).toString("hex")}`;
+	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`);
+	await fs.rename(tmp, filePath);
+}
+
+async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
+	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
+	try {
+		const stat = await fs.stat(candidate);
+		if (stat.isFile()) return await fs.readFile(candidate, "utf-8");
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code !== "ENOENT" && err.code !== "ENOTDIR") {
+			throw new DeepInterviewCommandError(2, `failed to read --spec ${candidate}: ${err.message}`);
+		}
+	}
+	return rawSpec;
+}
+
 interface ResolvedDeepInterviewArgs {
 	resolution: DeepInterviewResolution;
 	threshold: number;
@@ -71,6 +132,41 @@ interface ResolvedDeepInterviewArgs {
 	sessionId?: string;
 	idea: string;
 	json: boolean;
+}
+
+export interface ResolvedDeepInterviewSpecWriteArgs {
+	stage: "final";
+	slug: string;
+	spec: string;
+	sessionId?: string;
+	json: boolean;
+	deliberate: boolean;
+	handoff?: "ralplan";
+}
+
+export interface PersistedDeepInterviewSpec {
+	slug: string;
+	path: string;
+	stage: "final";
+	sha256: string;
+	createdAt: string;
+	statePath: string;
+}
+
+interface DeepInterviewSpecWriteSummary {
+	skill: "deep-interview";
+	stage: "final";
+	slug: string;
+	path: string;
+	sha256: string;
+	created_at: string;
+	state_path: string;
+	handoff?: {
+		to: "ralplan";
+		mode: "deliberate";
+		state_path?: string;
+		run_id?: string;
+	};
 }
 
 async function readSettingsAmbiguityThreshold(
@@ -107,6 +203,68 @@ async function resolveConfiguredAmbiguityThreshold(
 	const configDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
 	const userSettings = path.join(configDir, "settings.json");
 	return await readSettingsAmbiguityThreshold(userSettings);
+}
+
+function isDeepInterviewSpecWriteInvocation(args: readonly string[]): boolean {
+	return hasFlag(args, "--write");
+}
+
+async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewSpecWriteArgs> {
+	const stage = flagValue(args, "--stage")?.trim() || "final";
+	if (stage !== "final") {
+		throw new DeepInterviewCommandError(2, 'unknown --stage for deep-interview --write: expected "final"');
+	}
+
+	const slug = flagValue(args, "--slug")?.trim() || defaultSpecSlug();
+	assertSafePathComponent(slug, "slug");
+
+	const rawSpec = flagValue(args, "--spec");
+	if (rawSpec === undefined || rawSpec === "") {
+		throw new DeepInterviewCommandError(2, "--spec is required for deep-interview --write");
+	}
+
+	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
+	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+
+	const rawHandoff = flagValue(args, "--handoff")?.trim() || undefined;
+	if (rawHandoff && rawHandoff !== "ralplan") {
+		throw new DeepInterviewCommandError(2, 'unknown --handoff target: expected "ralplan"');
+	}
+
+	const allowedFlags = new Set([
+		"--write",
+		"--stage",
+		"--slug",
+		"--spec",
+		"--session-id",
+		"--handoff",
+		"--deliberate",
+		"--json",
+	]);
+	let skipNext = false;
+	for (const arg of args) {
+		if (skipNext) {
+			skipNext = false;
+			continue;
+		}
+		if (["--stage", "--slug", "--spec", "--session-id", "--handoff"].includes(arg)) {
+			skipNext = true;
+			continue;
+		}
+		if (arg.startsWith("-") && !allowedFlags.has(arg)) {
+			throw new DeepInterviewCommandError(2, `unknown flag for gjc deep-interview --write: ${arg}`);
+		}
+	}
+
+	return {
+		stage: "final",
+		slug,
+		spec: await resolveSpecContent(rawSpec, cwd),
+		sessionId,
+		json: hasFlag(args, "--json"),
+		deliberate: hasFlag(args, "--deliberate"),
+		handoff: rawHandoff as "ralplan" | undefined,
+	};
 }
 
 async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewArgs> {
@@ -173,6 +331,57 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 	};
 }
 
+export async function persistDeepInterviewSpec(
+	cwd: string,
+	resolved: ResolvedDeepInterviewSpecWriteArgs,
+): Promise<PersistedDeepInterviewSpec> {
+	const specsDir = path.join(cwd, ".gjc", "specs");
+	await fs.mkdir(specsDir, { recursive: true });
+	const specPath = path.join(specsDir, `deep-interview-${resolved.slug}.md`);
+	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
+	await fs.writeFile(specPath, content);
+
+	const sha256 = createHash("sha256").update(content).digest("hex");
+	const createdAt = new Date().toISOString();
+	await fs.appendFile(
+		path.join(specsDir, "deep-interview-index.jsonl"),
+		`${JSON.stringify({ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 })}\n`,
+	);
+
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	const existing = await readJsonObject(statePath);
+	const payload: Record<string, unknown> = {
+		...existing,
+		active: true,
+		current_phase: "handoff",
+		skill: "deep-interview",
+		version: typeof existing.version === "number" ? existing.version : 1,
+		spec_slug: resolved.slug,
+		spec_path: specPath,
+		spec_sha256: sha256,
+		spec_stage: resolved.stage,
+		spec_persisted_at: createdAt,
+		updated_at: createdAt,
+	};
+	if (resolved.sessionId) payload.session_id = resolved.sessionId;
+	await writeJsonAtomic(statePath, payload);
+	await syncDeepInterviewHud({
+		cwd,
+		sessionId: resolved.sessionId,
+		phase: "handoff",
+		specStatus: "persisted",
+	});
+
+	return {
+		slug: resolved.slug,
+		path: specPath,
+		stage: resolved.stage,
+		sha256,
+		createdAt,
+		statePath,
+	};
+}
+
 async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
 	const stateDir = resolved.sessionId
 		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(resolved.sessionId))
@@ -232,11 +441,69 @@ async function syncDeepInterviewHud(options: {
 	}
 }
 
+async function handleSpecWrite(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
+	const resolved = await resolveSpecWriteArgs(args, cwd);
+	const persisted = await persistDeepInterviewSpec(cwd, resolved);
+	const shouldHandoff = resolved.deliberate || resolved.handoff === "ralplan";
+	const summary: DeepInterviewSpecWriteSummary = {
+		skill: "deep-interview",
+		stage: persisted.stage,
+		slug: persisted.slug,
+		path: persisted.path,
+		sha256: persisted.sha256,
+		created_at: persisted.createdAt,
+		state_path: persisted.statePath,
+	};
+
+	if (shouldHandoff) {
+		const ralplanArgs = ["--deliberate", "--json"];
+		if (resolved.sessionId) ralplanArgs.push("--session-id", resolved.sessionId);
+		ralplanArgs.push(persisted.path);
+		const ralplanResult = await runNativeRalplanCommand(ralplanArgs, cwd);
+		if (ralplanResult.status !== 0) {
+			throw new DeepInterviewCommandError(
+				ralplanResult.status,
+				ralplanResult.stderr?.trim() || "failed to seed ralplan",
+			);
+		}
+
+		const handoffArgs = ["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"];
+		if (resolved.sessionId) handoffArgs.push("--session-id", resolved.sessionId);
+		const handoffResult = await runNativeStateCommand(handoffArgs, cwd);
+		if (handoffResult.status !== 0) {
+			throw new DeepInterviewCommandError(
+				handoffResult.status,
+				handoffResult.stderr?.trim() || "failed to hand off deep-interview to ralplan",
+			);
+		}
+
+		const ralplanPayload = ralplanResult.stdout ? (JSON.parse(ralplanResult.stdout) as Record<string, unknown>) : {};
+		summary.handoff = {
+			to: "ralplan",
+			mode: "deliberate",
+			state_path: typeof ralplanPayload.state_path === "string" ? ralplanPayload.state_path : undefined,
+			run_id: typeof ralplanPayload.run_id === "string" ? ralplanPayload.run_id : undefined,
+		};
+	}
+
+	const stdout = resolved.json
+		? `${JSON.stringify(summary, null, 2)}\n`
+		: [
+				`Persisted deep-interview ${persisted.stage} spec at ${persisted.path}.`,
+				shouldHandoff ? "Handed off deep-interview to ralplan (deliberate)." : undefined,
+				"",
+			]
+				.filter((line): line is string => Boolean(line))
+				.join("\n");
+	return { status: 0, stdout };
+}
+
 export async function runNativeDeepInterviewCommand(
 	args: string[],
 	cwd = process.cwd(),
 ): Promise<DeepInterviewCommandResult> {
 	try {
+		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
 		const resolved = await resolveDeepInterviewArgs(args, cwd);
 		if (!resolved.idea) {
 			throw new DeepInterviewCommandError(

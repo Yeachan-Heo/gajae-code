@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 
 const tempRoots: string[] = [];
 
@@ -16,6 +17,105 @@ afterEach(async () => {
 });
 
 describe("native gjc deep-interview runtime", () => {
+	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
+		const source = await fs.readFile(
+			path.join(process.cwd(), "packages/coding-agent/src/commands/deep-interview.ts"),
+			"utf-8",
+		);
+		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
+		expect(source).toContain("write: Flags.boolean");
+		expect(source).toContain("stage: Flags.string");
+		expect(source).toContain("slug: Flags.string");
+		expect(source).toContain("spec: Flags.string");
+		expect(source).toContain("deliberate: Flags.boolean");
+		expect(source).toContain("handoff: Flags.string");
+	});
+
+	it("persists a final spec under .gjc/specs through the native CLI/API", async () => {
+		const root = await tempDir();
+		const specPath = path.join(root, "final-spec.md");
+		await fs.writeFile(specPath, "# Final Spec\n\nAcceptance: persist me.\n");
+
+		const result = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "persist-me", "--spec", specPath, "--json"],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.path).toBe(path.join(root, ".gjc", "specs", "deep-interview-persist-me.md"));
+		expect(await fs.readFile(payload.path, "utf-8")).toBe("# Final Spec\n\nAcceptance: persist me.\n");
+
+		const state = JSON.parse(
+			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
+		);
+		expect(state.current_phase).toBe("handoff");
+		expect(state.active).toBe(true);
+		expect(state.spec_path).toBe(payload.path);
+		expect(state.spec_slug).toBe("persist-me");
+		await expect(fs.access(path.join(root, ".gjc", "plans"))).rejects.toThrow();
+	});
+
+	it("uses --deliberate to persist the final spec and hand off to ralplan", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--slug",
+				"deliberate-spec",
+				"--spec",
+				"# Final Spec\n\nUse ralplan deliberately.",
+				"--deliberate",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.handoff).toMatchObject({ to: "ralplan", mode: "deliberate" });
+
+		const specPath = path.join(root, ".gjc", "specs", "deep-interview-deliberate-spec.md");
+		expect(await fs.readFile(specPath, "utf-8")).toContain("Use ralplan deliberately.");
+
+		const deepInterviewState = JSON.parse(
+			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
+		);
+		expect(deepInterviewState.active).toBe(false);
+		expect(deepInterviewState.current_phase).toBe("handoff");
+		expect(deepInterviewState.handoff_to).toBe("ralplan");
+		expect(deepInterviewState.spec_path).toBe(specPath);
+
+		const ralplanState = JSON.parse(
+			await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"),
+		);
+		expect(ralplanState.active).toBe(true);
+		expect(ralplanState.current_phase).toBe("planning");
+		expect(ralplanState.mode).toBe("deliberate");
+		expect(ralplanState.task).toBe(specPath);
+		expect(ralplanState.handoff_from).toBe("deep-interview");
+	});
+
+	it("keeps deep-interview spec persistence distinct from ralplan plan writes", async () => {
+		const root = await tempDir();
+		const deepResult = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "separate", "--spec", "# Requirements", "--json"],
+			root,
+		);
+		expect(deepResult.status).toBe(0);
+		const deepPayload = JSON.parse(deepResult.stdout ?? "{}");
+		expect(deepPayload.path).toContain(path.join(".gjc", "specs", "deep-interview-separate.md"));
+
+		const ralplanResult = await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "separate", "--json"],
+			root,
+		);
+		expect(ralplanResult.status).toBe(0);
+		const ralplanPayload = JSON.parse(ralplanResult.stdout ?? "{}");
+		expect(ralplanPayload.path).toContain(path.join(".gjc", "plans", "ralplan", "separate", "stage-01-final.md"));
+		expect(await fs.readFile(deepPayload.path, "utf-8")).toBe("# Requirements\n");
+		expect(await fs.readFile(ralplanPayload.path, "utf-8")).toBe("# Plan\n");
+	});
 	it("defaults to the SKILL.md default threshold (0.05) when no resolution flag or settings exist", async () => {
 		const root = await tempDir();
 		const result = await runNativeDeepInterviewCommand(["my vague idea"], root);
