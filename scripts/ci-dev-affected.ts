@@ -236,6 +236,9 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
+		if (paths.some(isWorkflowPath)) {
+			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
+		}
 	}
 
 	return Array.from(tasks.values());
@@ -341,7 +344,11 @@ function isCodingAgentRuntimePath(changedPath: string): boolean {
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {
-	return changedPath.startsWith(".github/workflows/") || changedPath === "scripts/ci-dev-affected.ts";
+	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts";
+}
+
+function isWorkflowPath(changedPath: string): boolean {
+	return changedPath.startsWith(".github/workflows/");
 }
 
 function isToolingScriptPath(changedPath: string): boolean {
