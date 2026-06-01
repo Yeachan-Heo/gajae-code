@@ -23,7 +23,7 @@ import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prom
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
@@ -157,6 +157,7 @@ export interface ExecutorOptions {
 	parentTelemetry?: AgentTelemetryConfig;
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
+	forkContextSeed?: ForkContextSeed;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -1143,6 +1144,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
+			const forkContextNotice = options.forkContextSeed
+				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live; use IRC for live coordination when enabled.`
+				: "";
+
 			const { session } = await awaitAbortable(
 				createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1167,6 +1172,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							contextFile: contextFileForPrompt,
 							ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 							ircSelfId: ircEnabled ? id : "",
+							forkContext: forkContextNotice,
 						});
 						return defaultPrompt.length === 0
 							? [subagentPrompt]
@@ -1185,6 +1191,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					enableMCP,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
+					forkContextSeed: options.forkContextSeed,
 				}),
 			);
 
@@ -1215,6 +1222,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				task,
 				tools: session.getActiveToolNames(),
 				outputSchema,
+				forkContext: options.forkContextSeed?.metadata,
 			});
 
 			abortSignal.addEventListener(

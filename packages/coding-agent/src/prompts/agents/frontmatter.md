@@ -8,5 +8,6 @@ description: {{jsonStringify description}}
 {{/if}}{{#if blocking}}blocking: true
 {{/if}}{{#if hide}}hide: true
 {{/if}}{{#if autoloadSkills}}autoloadSkills: {{jsonStringify autoloadSkills}}
+{{/if}}{{#if forkContext}}forkContext: {{jsonStringify forkContext}}
 {{/if}}---
 {{body}}

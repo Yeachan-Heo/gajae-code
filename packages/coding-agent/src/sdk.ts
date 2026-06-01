@@ -12,6 +12,7 @@ import {
 	type CredentialDisabledEvent,
 	type Message,
 	type Model,
+	type ProviderSessionState,
 	type SimpleStreamOptions,
 	streamSimple,
 } from "@gajae-code/ai";
@@ -82,7 +83,7 @@ import {
 	obfuscateMessages,
 	SecretObfuscator,
 } from "./secrets";
-import { AgentSession } from "./session/agent-session";
+import { AgentSession, type ForkContextSeed } from "./session/agent-session";
 import { resolveAuthBrokerConfig } from "./session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "./session/auth-storage";
 import { type CustomMessage, convertToLlm } from "./session/messages";
@@ -320,6 +321,10 @@ export interface CreateAgentSessionOptions {
 	 * `@opentelemetry/api` package returns a no-op tracer in that case.
 	 */
 	telemetry?: AgentTelemetryConfig;
+	/** Optional fork-context seed used to initialize a child session before its first prompt. */
+	forkContextSeed?: ForkContextSeed;
+	/** Optional provider state override. Fork-context children should omit this by default. */
+	providerSessionState?: Map<string, ProviderSessionState>;
 }
 
 /** Result from createAgentSession */
@@ -861,7 +866,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
-	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	const logicalSessionId = sessionManager.getSessionId();
+	const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
 	const modelApiKeyAvailability = new Map<string, boolean>();
 	const getModelAvailabilityKey = (candidate: Model): string =>
 		`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
@@ -1155,6 +1161,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getActiveSkillState: () => session?.getActiveSkillState(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
+			get model() {
+				return agent?.state.model ?? model;
+			},
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
@@ -1212,6 +1221,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
+			buildForkContextSeed: forkOptions => session.buildForkContextSeed(forkOptions),
 		};
 
 		// Wire process-wide internal URL singletons owned by their real classes.
@@ -1728,17 +1738,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? undefined
 				: serviceTierSetting;
 
+		const appendOnlyContext =
+			model && resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
+				? new AppendOnlyContextManager()
+				: undefined;
+		if (appendOnlyContext && options.forkContextSeed && !hasExistingSession) {
+			if (options.forkContextSeed.appendOnlyPrefixSnapshot) {
+				(
+					appendOnlyContext.prefix as typeof appendOnlyContext.prefix & {
+						importSnapshot(
+							snapshot: NonNullable<ForkContextSeed["appendOnlyPrefixSnapshot"]>,
+							options: { intentTracing: boolean },
+						): void;
+					}
+				).importSnapshot(options.forkContextSeed.appendOnlyPrefixSnapshot, { intentTracing: !!intentField });
+			}
+			(
+				appendOnlyContext as AppendOnlyContextManager & {
+					seedNormalizedMessages(messages: readonly Message[]): void;
+				}
+			).seedNormalizedMessages(options.forkContextSeed.messages);
+		}
+
 		agent = new Agent({
 			initialState: {
 				systemPrompt,
 				model,
 				thinkingLevel: toReasoningEffort(thinkingLevel),
 				tools: initialTools,
+				...(options.forkContextSeed && !hasExistingSession
+					? { messages: options.forkContextSeed.agentMessages }
+					: {}),
 			},
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,
-			sessionId: providerSessionId,
+			sessionId: logicalSessionId,
+			providerSessionId,
 			transformContext,
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
@@ -1758,13 +1794,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
+				const key = await modelRegistry.getApiKeyForProvider(provider, agent.providerSessionId ?? agent.sessionId);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
-			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, agent.sessionId),
+			getAuthCredentialType: provider =>
+				modelRegistry.getSessionCredentialType(provider, agent.providerSessionId ?? agent.sessionId),
 			streamFn: (streamModel, context, streamOptions) =>
 				streamSimple(streamModel, context, {
 					...streamOptions,
@@ -1795,11 +1832,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			intentTracing: !!intentField,
 			getToolChoice: () => session?.nextToolChoice(),
 			telemetry: options.telemetry,
-			appendOnlyContext: model
-				? resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
-					? new AppendOnlyContextManager()
-					: undefined
-				: undefined,
+			appendOnlyContext,
 		});
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
@@ -1870,6 +1903,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentId: resolvedAgentId,
 			agentRegistry,
 			providerSessionId: options.providerSessionId,
+			providerCacheSessionId: providerSessionId,
+			forkContextSeed: options.forkContextSeed,
+			providerSessionState: options.providerSessionState,
 		});
 		hasSession = true;
 		if (asyncJobManager) {

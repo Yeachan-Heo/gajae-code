@@ -43,6 +43,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Used by providers that support session-based caching (e.g., OpenAI code provider).
 	 */
 	sessionId?: string;
+	/**
+	 * Optional provider-facing cache/session affinity identifier. When set, this
+	 * is forwarded to providers as StreamOptions.sessionId while `sessionId`
+	 * remains the logical agent conversation id for telemetry/metadata.
+	 */
+	providerSessionId?: string;
 
 	/**
 	 * Optional resolver called per LLM request to produce request metadata.

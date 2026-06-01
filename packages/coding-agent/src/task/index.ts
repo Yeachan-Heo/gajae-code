@@ -16,7 +16,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { Usage } from "@gajae-code/ai";
+import type { Model, Usage } from "@gajae-code/ai";
 import { $env, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { AsyncJobManager } from "../async";
@@ -26,12 +26,15 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
+import type { ForkContextSeed } from "../session/agent-session";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type ForkContextPolicy,
 	getTaskSchema,
 	type SingleResult,
+	type TaskItem,
 	type TaskParams,
 	type TaskToolDetails,
 	type TaskToolSchemaInstance,
@@ -203,6 +206,33 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 	return "task.simple is set to independent, so the task tool does not accept `context` or `schema`. Put all required background and output expectations inside each task assignment or the selected agent definition.";
 }
 
+function getForkContextPolicy(agent: AgentDefinition): ForkContextPolicy {
+	return agent.forkContext ?? "forbidden";
+}
+
+function validateForkContextRequests(
+	tasks: readonly TaskItem[],
+	agent: AgentDefinition,
+	forkContextEnabled: boolean,
+): string | undefined {
+	const requested = tasks.filter(task => task.inheritContext === true);
+	if (requested.length === 0) return undefined;
+	const taskIds = requested.map(task => task.id).join(", ");
+	if (!forkContextEnabled) {
+		return `Cannot inherit parent context for task(s) ${taskIds}: task.forkContext.enabled is false.`;
+	}
+	if (getForkContextPolicy(agent) !== "allowed") {
+		return `Cannot inherit parent context for task(s) ${taskIds}: agent '${agent.name}' does not declare forkContext: allowed.`;
+	}
+	return undefined;
+}
+
+function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
+	if (configured > 0) return Math.trunc(configured);
+	const contextWindow = model?.contextWindow ?? 0;
+	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.25)) : 25_000;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool Class
 // ═══════════════════════════════════════════════════════════════════════════
@@ -314,6 +344,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
+		const forkContextValidationError = validateForkContextRequests(
+			taskItems,
+			agent,
+			this.session.settings.get("task.forkContext.enabled"),
+		);
+		if (forkContextValidationError) {
+			return createTaskModeError(forkContextValidationError);
+		}
+
 		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			return {
@@ -378,6 +417,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
 		const semaphore = new Semaphore(maxConcurrency);
+		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
+			if (task.inheritContext !== true) return undefined;
+			if (!this.session.buildForkContextSeed) {
+				throw new Error("Current session cannot build fork-context seeds.");
+			}
+			const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
+			const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+			return await this.session.buildForkContextSeed({
+				maxMessages,
+				maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+				signal,
+			});
+		};
+		const frozenForkSeeds = new Map<string, ForkContextSeed>();
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -391,6 +444,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 
 			const uniqueId = uniqueIds[i];
+			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
+			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {
@@ -416,9 +471,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							buildAsyncDetails("running", startedJobs[0]?.jobId ?? label) as unknown as Record<string, unknown>,
 						);
 						try {
-							const result = await this.#executeSync(_toolCallId, singleParams, runSignal, undefined, [
-								uniqueId,
-							]);
+							const result = await this.#executeSync(
+								_toolCallId,
+								singleParams,
+								runSignal,
+								undefined,
+								[uniqueId],
+								frozenForkSeeds,
+							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 							const singleResult = result.details?.results[0];
 							if (progress) {
@@ -576,6 +636,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedIds?: string[],
+		prebuiltForkContextSeeds?: ReadonlyMap<string, ForkContextSeed>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
@@ -649,6 +710,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					totalDurationMs: 0,
 				},
 			};
+		}
+
+		const forkContextValidationError = validateForkContextRequests(
+			params.tasks ?? [],
+			agent,
+			this.session.settings.get("task.forkContext.enabled"),
+		);
+		if (forkContextValidationError) {
+			return createTaskModeError(forkContextValidationError);
 		}
 
 		const planModeState = this.session.getPlanModeState?.();
@@ -912,7 +982,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			emitProgress();
 
+			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number]) => {
+				if (task.inheritContext !== true) return undefined;
+				if (!this.session.buildForkContextSeed) {
+					throw new Error("Current session cannot build fork-context seeds.");
+				}
+				const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
+				const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+				return await this.session.buildForkContextSeed({
+					maxMessages,
+					maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+					signal,
+				});
+			};
+
 			const runTask = async (task: (typeof tasksWithUniqueIds)[number], index: number) => {
+				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
 				if (!isIsolated) {
 					return runSubprocess({
 						cwd: this.session.cwd,
@@ -953,6 +1038,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
+						forkContextSeed,
 					});
 				}
 
@@ -1007,6 +1093,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
+						forkContextSeed,
 					});
 					if (mergeMode === "branch" && result.exitCode === 0) {
 						try {

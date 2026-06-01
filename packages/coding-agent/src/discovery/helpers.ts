@@ -8,6 +8,7 @@ import {
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
+	logger,
 	parseFrontmatter,
 	tryParseJson,
 } from "@gajae-code/utils";
@@ -16,6 +17,7 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
 import { buildPluginDirRoot } from "./plugin-dir-roots";
@@ -214,6 +216,7 @@ export interface ParsedAgentFields {
 	autoloadSkills?: string[];
 	blocking?: boolean;
 	hide?: boolean;
+	forkContext?: ForkContextPolicy;
 }
 
 /**
@@ -267,10 +270,30 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
 	const hide = parseBoolean(frontmatter.hide);
+	const forkContext = parseForkContextPolicy(frontmatter.forkContext);
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
-	return { name, description, tools, spawns, model, output, thinkingLevel, blocking, autoloadSkills, hide };
+	return {
+		name,
+		description,
+		tools,
+		spawns,
+		model,
+		output,
+		thinkingLevel,
+		blocking,
+		autoloadSkills,
+		hide,
+		forkContext,
+	};
+}
+
+function parseForkContextPolicy(value: unknown): ForkContextPolicy | undefined {
+	if (value === undefined) return undefined;
+	if (value === "forbidden" || value === "allowed") return value;
+	logger.warn("Invalid agent forkContext frontmatter; expected 'allowed' or 'forbidden', ignoring", { value });
+	return undefined;
 }
 
 async function globIf(

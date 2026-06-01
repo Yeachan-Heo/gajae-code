@@ -23,6 +23,9 @@ Subagents have no conversation history. Every fact, file path, and direction the
  - `.description`: UI label only — subagent never sees it
  - `.assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
 {{#if contextEnabled}}- `context`: shared background prepended to every assignment; session-specific only{{/if}}
+{{#if contextEnabled}}
+- `.inheritContext` (optional): `true` explicitly requests a sanitized, bounded forked snapshot of the parent conversation for this task. This works only when the global `task.forkContext.enabled` setting is true and the target agent declares `forkContext: allowed`; otherwise the call is rejected. Use sparingly for cache-efficient children that need parent-history background.
+{{/if}}
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 {{#if isolationEnabled}}- `isolated`: run in isolated env; use when tasks edit overlapping files{{/if}}
 </parameters>

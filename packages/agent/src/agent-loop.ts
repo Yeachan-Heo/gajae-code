@@ -300,7 +300,7 @@ function createDetailedCapture(config: AgentLoopConfig): {
 	};
 }
 
-function normalizeMessagesForProvider(
+export function normalizeMessagesForProvider(
 	messages: Context["messages"],
 	model: AgentLoopConfig["model"],
 ): Context["messages"] {
@@ -735,6 +735,7 @@ async function streamAssistantResponse(
 				apiKey: resolvedApiKey,
 				authCredentialType,
 				metadata: resolvedMetadata,
+				sessionId: config.providerSessionId ?? config.sessionId,
 				toolChoice: effectiveToolChoice,
 				reasoning: effectiveReasoning,
 				temperature: effectiveTemperature,
@@ -857,7 +858,7 @@ async function streamAssistantResponse(
 }
 
 function emitAbortedAssistantMessage(
-	_partialMessage: AssistantMessage | null,
+	partialMessage: AssistantMessage | null,
 	addedPartial: boolean,
 	context: AgentContext,
 	config: AgentLoopConfig,
@@ -867,7 +868,7 @@ function emitAbortedAssistantMessage(
 	const now = Date.now();
 	const abortedMessage: AssistantMessage = {
 		role: "assistant",
-		content: [],
+		content: partialMessage ? structuredClone(partialMessage.content) : [],
 		api: config.model.api,
 		provider: config.model.provider,
 		model: config.model.id,

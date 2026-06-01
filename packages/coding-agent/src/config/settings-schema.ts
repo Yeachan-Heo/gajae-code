@@ -2354,6 +2354,37 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.forkContext.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context for Subagents",
+			description:
+				"Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
+		},
+	},
+
+	"task.forkContext.maxMessages": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context Max Messages",
+			description: "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
+		},
+	},
+
+	"task.forkContext.maxTokens": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context Max Tokens",
+			description: "Approximate token cap for fork-context seeds. 0 uses 25% of the target model context window.",
+		},
+	},
+
 	"task.maxRecursionDepth": {
 		type: "number",
 		default: 2,

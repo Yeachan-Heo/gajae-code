@@ -28,8 +28,10 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	resolveTelemetry,
+	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import { normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
 import {
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
 	CompactionCancelledError,
@@ -75,6 +77,33 @@ import {
 	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai";
+
+export interface ForkContextSeedMetadata {
+	sourceSessionId: string;
+	parentMessageCount: number;
+	includedMessages: number;
+	skippedMessages: number;
+	approximateTokens: number;
+	maxMessages: number;
+	maxTokens: number;
+	skippedReasons: Record<string, number>;
+}
+
+export interface ForkContextSeed {
+	messages: Message[];
+	agentMessages: AgentMessage[];
+	metadata: ForkContextSeedMetadata;
+	cacheIdentity?: string;
+	appendOnlyPrefixSnapshot?: StablePrefixSnapshot;
+}
+
+export interface ForkContextSeedOptions {
+	maxMessages: number;
+	maxTokens: number;
+	cacheIdentity?: string;
+	signal?: AbortSignal;
+}
+
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
@@ -331,6 +360,10 @@ export interface AgentSessionConfig {
 	 * **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedAsyncJobManager?: AsyncJobManager;
+	/** Optional fork-context seed used to initialize a child session before its first prompt. */
+	forkContextSeed?: ForkContextSeed;
+	/** Optional provider state override. Fork-context children should omit this by default. */
+	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Agent identity (registry id like "0-Main" or "3-Alice") used for IRC routing. */
 	agentId?: string;
 	/** Shared agent registry (for forwarding IRC observations to the main session UI). */
@@ -342,6 +375,8 @@ export interface AgentSessionConfig {
 	 * so that credential sticky selection is consistent with the session's streaming calls.
 	 */
 	providerSessionId?: string;
+	/** Optional provider-facing cache identity, distinct from logical session identity. */
+	providerCacheSessionId?: string;
 }
 
 /** Options for AgentSession.prompt() */
@@ -836,6 +871,7 @@ export class AgentSession {
 	#agentId: string | undefined;
 	#agentRegistry: AgentRegistry | undefined;
 	#providerSessionId: string | undefined;
+	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -1020,6 +1056,9 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		if (config.providerSessionState) {
+			this.#providerSessionState = config.providerSessionState;
+		}
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#requestedToolNames = config.requestedToolNames;
@@ -1099,6 +1138,7 @@ export class AgentSession {
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
+		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
 				type: "message_update",
@@ -1226,6 +1266,91 @@ export class AgentSession {
 	/** Provider-scoped mutable state store for transport/session caches. */
 	get providerSessionState(): Map<string, ProviderSessionState> {
 		return this.#providerSessionState;
+	}
+
+	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
+		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
+		const convertedMessages = await this.#convertToLlm(transformedMessages);
+		const providerMessages = this.model
+			? normalizeMessagesForProvider(convertedMessages, this.model)
+			: convertedMessages;
+		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
+		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
+		const selected: Message[] = [];
+		const skippedReasons: Record<string, number> = {};
+		let skippedMessages = 0;
+		let approximateTokens = 0;
+
+		const recordSkip = (reason: string) => {
+			skippedMessages++;
+			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+		};
+
+		const sanitizeMessage = (message: Message): Message | undefined => {
+			if (message.role === "developer") {
+				recordSkip("developer-role");
+				return undefined;
+			}
+			if (message.role === "toolResult") {
+				recordSkip("tool-result-role");
+				return undefined;
+			}
+			if (message.role !== "user" && message.role !== "assistant") {
+				recordSkip("unsupported-role");
+				return undefined;
+			}
+			const cloned = structuredClone(message) as Message;
+			if ("providerPayload" in cloned) {
+				delete (cloned as { providerPayload?: unknown }).providerPayload;
+			}
+			if (Array.isArray(cloned.content)) {
+				const sanitizedContent: TextContent[] = [];
+				for (const block of cloned.content) {
+					if (block.type === "text") {
+						sanitizedContent.push(block);
+					} else if (block.type === "image") {
+						sanitizedContent.push({ type: "text", text: "[Image omitted from fork-context seed]" });
+					} else if (block.type !== "thinking") {
+						recordSkip(`unsupported-content-${block.type}`);
+					}
+				}
+				return { ...cloned, content: sanitizedContent } as Message;
+			}
+			return cloned;
+		};
+
+		for (let i = providerMessages.length - 1; i >= 0; i--) {
+			if (selected.length >= maxMessages) {
+				recordSkip("message-limit");
+				continue;
+			}
+			const sanitized = sanitizeMessage(providerMessages[i]!);
+			if (!sanitized) continue;
+			const messageTokens = estimateTokens(sanitized);
+			if (maxTokens > 0 && approximateTokens + messageTokens > maxTokens) {
+				recordSkip("token-limit");
+				continue;
+			}
+			selected.unshift(sanitized);
+			approximateTokens += messageTokens;
+		}
+
+		const messages = selected;
+		return {
+			messages,
+			agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+			metadata: {
+				sourceSessionId: this.sessionId,
+				parentMessageCount: providerMessages.length,
+				includedMessages: messages.length,
+				skippedMessages,
+				approximateTokens,
+				maxMessages,
+				maxTokens,
+				skippedReasons,
+			},
+			cacheIdentity: options.cacheIdentity ?? this.sessionId,
+		};
 	}
 
 	getHindsightSessionState(): HindsightSessionState | undefined {
@@ -2766,6 +2891,7 @@ export class AgentSession {
 	#syncAgentSessionId(sessionId?: string): void {
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
+		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
 		);

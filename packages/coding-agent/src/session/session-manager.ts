@@ -176,6 +176,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	tools: string[];
 	/** Output schema if structured output was requested */
 	outputSchema?: unknown;
+	/** Fork-context seed metadata for subagent debugging/replay. */
+	forkContext?: unknown;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */
@@ -2714,7 +2716,13 @@ export class SessionManager {
 	}
 
 	/** Append session init metadata (for subagent debugging/replay). Returns entry id. */
-	appendSessionInit(init: { systemPrompt: string; task: string; tools: string[]; outputSchema?: unknown }): string {
+	appendSessionInit(init: {
+		systemPrompt: string;
+		task: string;
+		tools: string[];
+		outputSchema?: unknown;
+		forkContext?: unknown;
+	}): string {
 		const entry: SessionInitEntry = {
 			type: "session_init",
 			id: generateId(this.#byId),

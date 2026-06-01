@@ -29,6 +29,7 @@ interface AgentFrontmatter {
 	thinkingLevel?: string;
 	blocking?: boolean;
 	hide?: boolean;
+	forkContext?: "forbidden" | "allowed";
 }
 
 interface EmbeddedAgentDef {

@@ -7,6 +7,7 @@ import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
+export type ForkContextPolicy = "forbidden" | "allowed";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -64,6 +65,10 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 		id: z.string().max(48).describe("camelcase identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
+		inheritContext: z
+			.boolean()
+			.optional()
+			.describe("explicit request to seed a subagent with sanitized parent context"),
 	});
 
 /** Single task item for parallel execution (default shape with context enabled). */
@@ -175,6 +180,7 @@ export interface AgentDefinition {
 	blocking?: boolean;
 	autoloadSkills?: string[];
 	hide?: boolean;
+	forkContext?: ForkContextPolicy;
 	source: AgentSource;
 	filePath?: string;
 }

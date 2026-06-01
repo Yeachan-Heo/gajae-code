@@ -57,6 +57,23 @@ export class StablePrefix {
 		return this.#snapshot !== null;
 	}
 
+	exportSnapshot(): StablePrefixSnapshot | null {
+		return this.#snapshot ? cloneJson(this.#snapshot) : null;
+	}
+
+	importSnapshot(snapshot: StablePrefixSnapshot, options: BuildOptions): void {
+		const systemPrompt = cloneJson(snapshot.systemPrompt);
+		const tools = normalizeImportedTools(snapshot.tools, options);
+		const fingerprint = computeFingerprint(systemPrompt, tools, options);
+		if (fingerprint !== snapshot.fingerprint) {
+			throw new Error(
+				`StablePrefix.importSnapshot() fingerprint mismatch: expected ${fingerprint}, received ${snapshot.fingerprint}`,
+			);
+		}
+		this.#snapshot = { systemPrompt, tools, fingerprint };
+		this.#version++;
+	}
+
 	/**
 	 * Build or rebuild from live context.
 	 * Returns `true` if the prefix actually changed (cache miss imminent).
@@ -83,7 +100,7 @@ export class StablePrefix {
 	toContext(): { systemPrompt: string[]; tools: Tool[] } {
 		const s = this.#snapshot;
 		if (!s) throw new Error("StablePrefix.toContext() called before build()");
-		return { systemPrompt: s.systemPrompt, tools: s.tools };
+		return { systemPrompt: cloneJson(s.systemPrompt), tools: cloneJson(s.tools) };
 	}
 }
 
@@ -160,6 +177,23 @@ export class AppendOnlyContextManager {
 	#lastSyncCount = 0;
 	/** Rolling digest of synced message content — detects in-place rewrites. */
 	#syncedDigest = 0;
+	/** Number of provider-normalized messages that were seeded before child-local messages. */
+	#seededPrefixCount = 0;
+
+	static forkFromSeed(args: {
+		prefixSnapshot?: StablePrefixSnapshot;
+		messages?: readonly Message[];
+		options: BuildOptions;
+	}): AppendOnlyContextManager {
+		const manager = new AppendOnlyContextManager();
+		if (args.prefixSnapshot) {
+			manager.prefix.importSnapshot(args.prefixSnapshot, args.options);
+		}
+		if (args.messages) {
+			manager.seedNormalizedMessages(args.messages);
+		}
+		return manager;
+	}
 
 	build(context: AgentContext, options: BuildOptions): Context {
 		this.prefix.build(context, options);
@@ -174,29 +208,57 @@ export class AppendOnlyContextManager {
 	 * (same length, changed content via a rolling digest).
 	 */
 	syncMessages(normalizedMessages: any[]): void {
+		const seededPrefix = this.#seededPrefixCount > 0 ? this.log.toMessages().slice(0, this.#seededPrefixCount) : [];
+		const includesSeedPrefix =
+			seededPrefix.length > 0 &&
+			normalizedMessages.length >= seededPrefix.length &&
+			this.#computeDigest(normalizedMessages.slice(0, seededPrefix.length)) === this.#computeDigest(seededPrefix);
+		const messagesToSync =
+			seededPrefix.length > 0 && !includesSeedPrefix ? [...seededPrefix, ...normalizedMessages] : normalizedMessages;
+
 		// Detect in-place rewrites of already-synced messages.
 		if (
 			this.#lastSyncCount > 0 &&
-			this.#lastSyncCount <= normalizedMessages.length &&
-			this.#computeDigest(normalizedMessages.slice(0, this.#lastSyncCount)) !== this.#syncedDigest
+			this.#lastSyncCount <= messagesToSync.length &&
+			this.#computeDigest(messagesToSync.slice(0, this.#lastSyncCount)) !== this.#syncedDigest
 		) {
+			if (this.#seededPrefixCount > 0) {
+				throw new Error("AppendOnlyContextManager.syncMessages() seed prefix changed");
+			}
 			this.log.clear();
 			this.#lastSyncCount = 0;
 		}
 
-		// Compaction — array shrunk.
-		if (normalizedMessages.length < this.#lastSyncCount) {
+		// Compaction — array shrunk. Seeded forks preserve the inherited prefix
+		// and append child-local deltas, so a shorter child message array is not a
+		// compaction signal while a seed prefix is active.
+		if (messagesToSync.length < this.#lastSyncCount) {
+			if (this.#seededPrefixCount > 0) {
+				throw new Error("AppendOnlyContextManager.syncMessages() cannot compact a seeded fork without reset");
+			}
 			this.log.clear();
 			this.#lastSyncCount = 0;
 		}
 
-		const newMsgs = normalizedMessages.slice(this.#lastSyncCount);
+		const newMsgs = messagesToSync.slice(this.#lastSyncCount);
 		for (const msg of newMsgs) {
 			this.log.append(msg);
 		}
 
-		this.#lastSyncCount = normalizedMessages.length;
-		this.#syncedDigest = this.#computeDigest(normalizedMessages);
+		this.#lastSyncCount = messagesToSync.length;
+		this.#syncedDigest = this.#computeDigest(messagesToSync);
+	}
+
+	seedNormalizedMessages(messages: readonly Message[], options?: { reset?: boolean }): void {
+		if (this.log.length > 0 && options?.reset !== true) {
+			throw new Error("AppendOnlyContextManager.seedNormalizedMessages() cannot seed a non-empty log without reset");
+		}
+		const clonedMessages = cloneJson([...messages]);
+		this.log.clear();
+		this.log.extend(clonedMessages);
+		this.#lastSyncCount = clonedMessages.length;
+		this.#syncedDigest = this.#computeDigest(clonedMessages);
+		this.#seededPrefixCount = clonedMessages.length;
 	}
 
 	/** Reset prefix + log for a model/provider switch while mode stays active. */
@@ -205,6 +267,7 @@ export class AppendOnlyContextManager {
 		this.log.clear();
 		this.#lastSyncCount = 0;
 		this.#syncedDigest = 0;
+		this.#seededPrefixCount = 0;
 	}
 
 	/** Reset the sync cursor AND clear the log. */
@@ -212,6 +275,7 @@ export class AppendOnlyContextManager {
 		this.log.clear();
 		this.#lastSyncCount = 0;
 		this.#syncedDigest = 0;
+		this.#seededPrefixCount = 0;
 	}
 
 	appendMessage(message: any): void {
@@ -231,6 +295,7 @@ export class AppendOnlyContextManager {
 		this.log.clear();
 		this.#lastSyncCount = 0;
 		this.#syncedDigest = 0;
+		this.#seededPrefixCount = 0;
 		this.prefix.build(context, options);
 	}
 
@@ -274,6 +339,16 @@ function takeSnapshot(context: AgentContext, options: BuildOptions): StablePrefi
 		tools,
 		fingerprint: computeFingerprint(systemPrompt, tools, options),
 	};
+}
+
+function normalizeImportedTools(tools: readonly Tool[], options: BuildOptions): Tool[] {
+	const clonedTools = cloneJson(tools);
+	const normalizedTools = normalizeTools(clonedTools as AgentContext["tools"], options.intentTracing) ?? [];
+	return cloneJson(normalizedTools);
+}
+
+function cloneJson<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function computeFingerprint(systemPrompt: string[], tools: Tool[], options: BuildOptions): string {

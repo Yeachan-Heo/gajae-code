@@ -1,5 +1,5 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
-import type { ToolChoice } from "@gajae-code/ai";
+import type { Model, ToolChoice } from "@gajae-code/ai";
 import { $env, $flag, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -12,6 +12,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
+import type { ForkContextSeed, ForkContextSeedOptions } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
@@ -169,6 +170,8 @@ export interface ToolSession {
 	getSessionSpawns: () => string | null;
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
+	/** Current model, when selected. */
+	model?: Model;
 	/** Get the current session model string, regardless of how it was chosen */
 	getActiveModelString?: () => string | undefined;
 	/** Auth storage for passing to subagents (avoids re-discovery) */
@@ -260,6 +263,8 @@ export interface ToolSession {
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
+	/** Build a sanitized fork-context seed for task subagents. */
+	buildForkContextSeed?: (options: ForkContextSeedOptions) => Promise<ForkContextSeed>;
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { AssistantMessage, Message, ProviderPayload, ProviderSessionState, Usage } from "@gajae-code/ai/types";
 import { createOpenAIResponsesHistoryPayload } from "@gajae-code/ai/utils";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
 import type { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import {
 	type SessionEntry,
@@ -166,7 +166,13 @@ async function createPersistedSession(
 async function createSessionHarness(
 	tempDir: string,
 	sessionManager: SessionManager,
-	options: { provider?: Parameters<typeof getBundledModel>[0]; modelId?: string } = {},
+	options: {
+		provider?: Parameters<typeof getBundledModel>[0];
+		modelId?: string;
+		forkContextSeed?: ForkContextSeed;
+		providerSessionId?: string;
+		providerSessionState?: Map<string, ProviderSessionState>;
+	} = {},
 ): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
 	const { provider = "openai", modelId = "gpt-5-mini" } = options;
 	const [{ createAgentSession }, { Settings }, { AuthStorage }] = await Promise.all([
@@ -196,6 +202,9 @@ async function createSessionHarness(
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
+		forkContextSeed: options.forkContextSeed,
+		providerSessionId: options.providerSessionId,
+		providerSessionState: options.providerSessionState,
 	});
 
 	return { session, authStorage };
@@ -362,6 +371,95 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			throw new Error("Expected reloaded assistant message");
 		}
 		expectAssistantReplayMetadataSanitized(persistedAssistant);
+	});
+
+	it("builds sanitized fork seeds while sharing cache identity without provider transport state", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fork-seed-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+		});
+		sessions.push(parent);
+		authStorages.push(parentAuthStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: "Parent summary",
+			providerPayload: createUserHistoryPayload("openai-codex"),
+			timestamp: Date.now() - 2,
+		});
+		parent.agent.appendMessage(
+			createStaleAssistantMessage("Parent assistant", {
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-5.2-codex",
+			}),
+		);
+		parent.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: "Do not override child" }],
+			timestamp: Date.now() - 1,
+		});
+		parent.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "parent-tool",
+			toolName: "bash",
+			content: [{ type: "text", text: "parent tool output" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+
+		const parentCloseSpy = vi.fn();
+		parent.providerSessionState.set("openai-codex-responses", {
+			close: parentCloseSpy,
+		} satisfies ProviderSessionState);
+
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+		expect(seed.cacheIdentity).toBe(parent.sessionId);
+		expect(seed.messages).toHaveLength(2);
+		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
+		expect(seed.metadata.skippedReasons["tool-result-role"]).toBe(1);
+		expect(seed.agentMessages).toEqual(seed.messages);
+		expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
+		const inheritedAssistant = seed.messages.find(message => message.role === "assistant");
+		if (!inheritedAssistant || typeof inheritedAssistant.content === "string") {
+			throw new Error("Expected sanitized inherited assistant message");
+		}
+		expect(inheritedAssistant.content.every(block => block.type !== "thinking")).toBe(true);
+
+		const childState = new Map<string, ProviderSessionState>();
+		const childManager = SessionManager.create(tempDir, tempDir);
+		const { session: child, authStorage: childAuthStorage } = await createSessionHarness(tempDir, childManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			forkContextSeed: seed,
+			providerSessionState: childState,
+		});
+		sessions.push(child);
+		authStorages.push(childAuthStorage);
+
+		expect(child.sessionId).not.toBe(parent.sessionId);
+		expect(child.agent.providerSessionId).toBe(parent.sessionId);
+		expect(child.providerSessionState).toBe(childState);
+		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
+		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
+			| { webSocketSessions?: Map<string, { lastResponseId?: string; lastResponseItems?: unknown[] }> }
+			| undefined;
+		expect(childCodexState?.webSocketSessions).toBeDefined();
+		for (const sessionState of childCodexState?.webSocketSessions?.values() ?? []) {
+			expect(sessionState.lastResponseId).toBeUndefined();
+			expect(sessionState.lastResponseItems).toBeUndefined();
+		}
+		expect(parent.providerSessionState.size).toBe(1);
+		expect(parentCloseSpy).not.toHaveBeenCalled();
+		expect(child.messages.slice(0, 2)).toEqual(seed.agentMessages);
+
+		parent.agent.appendMessage({ role: "user", content: "oversized ".repeat(5_000), timestamp: Date.now() });
+		const boundedSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 1 });
+		expect(boundedSeed.messages).toHaveLength(0);
+		expect(boundedSeed.metadata.skippedReasons["token-limit"]).toBeGreaterThan(0);
 	});
 
 	it("keeps provider session state when same-file reload only changes message metadata", async () => {

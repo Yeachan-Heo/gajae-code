@@ -138,6 +138,63 @@ describe("StablePrefix", () => {
 		p.build(makeContext({ systemPrompt: ["V2"] }), BUILD_OPTS);
 		expect(p.version).toBe(2); // unchanged = no increment
 	});
+
+	it("exports a full deep-cloned snapshot", () => {
+		const prefix = new StablePrefix();
+		prefix.build(
+			makeContext({
+				systemPrompt: ["System", "Rules"],
+				tools: [makeTool("read", "Read files", { type: "object", properties: { path: { type: "string" } } })],
+			}),
+			BUILD_OPTS,
+		);
+
+		const snapshot = prefix.exportSnapshot();
+		expect(snapshot).not.toBeNull();
+		expect(snapshot!.systemPrompt).toEqual(["System", "Rules"]);
+		expect(snapshot!.tools).toHaveLength(1);
+		expect(snapshot!.tools[0]!.name).toBe("read");
+		expect(snapshot!.fingerprint).toBe(prefix.fingerprint);
+
+		snapshot!.systemPrompt[0] = "Mutated";
+		(snapshot!.tools[0]!.parameters as Record<string, unknown>).mutated = true;
+
+		const freshSnapshot = prefix.exportSnapshot();
+		expect(freshSnapshot!.systemPrompt).toEqual(["System", "Rules"]);
+		expect((freshSnapshot!.tools[0]!.parameters as Record<string, unknown>).mutated).toBeUndefined();
+	});
+
+	it("exportSnapshot returns null before build", () => {
+		const prefix = new StablePrefix();
+		expect(prefix.exportSnapshot()).toBeNull();
+	});
+
+	it("imports a verified deep-cloned snapshot", () => {
+		const source = new StablePrefix();
+		source.build(makeContext({ systemPrompt: ["Imported"], tools: [makeTool("read")] }), BUILD_OPTS);
+		const snapshot = source.exportSnapshot();
+		expect(snapshot).not.toBeNull();
+
+		const target = new StablePrefix();
+		target.importSnapshot(snapshot!, BUILD_OPTS);
+		expect(target.fingerprint).toBe(source.fingerprint);
+		expect(target.toContext()).toEqual({ systemPrompt: snapshot!.systemPrompt, tools: snapshot!.tools });
+
+		snapshot!.systemPrompt[0] = "Mutated after import";
+		expect(target.toContext().systemPrompt).toEqual(["Imported"]);
+	});
+
+	it("import rejects tampered fingerprint", () => {
+		const source = new StablePrefix();
+		source.build(makeContext({ systemPrompt: ["Original"], tools: [makeTool("read")] }), BUILD_OPTS);
+		const snapshot = source.exportSnapshot();
+		expect(snapshot).not.toBeNull();
+		snapshot!.fingerprint = "tampered";
+
+		const target = new StablePrefix();
+		expect(() => target.importSnapshot(snapshot!, BUILD_OPTS)).toThrow("fingerprint mismatch");
+		expect(target.built).toBe(false);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -352,6 +409,78 @@ describe("AppendOnlyContextManager", () => {
 
 		const result = mgr.build(ctx, BUILD_OPTS);
 		expect(result.tools).toEqual([]);
+	});
+	it("seeded manager does not duplicate seed after syncing seed plus assignment", () => {
+		const seed = [
+			{ role: "user", content: "seed user" },
+			{ role: "assistant", content: "seed assistant" },
+		] as Message[];
+		const assignment = { role: "user", content: "assignment" } as Message;
+		const mgr = AppendOnlyContextManager.forkFromSeed({ messages: seed, options: BUILD_OPTS });
+
+		mgr.syncMessages([...seed, assignment]);
+
+		const result = mgr.build(makeContext(), BUILD_OPTS);
+		expect(result.messages).toHaveLength(3);
+		expect(result.messages.map(message => message.content)).toEqual(["seed user", "seed assistant", "assignment"]);
+	});
+
+	it("seeded manager preserves inherited seed when first sync contains only child messages", () => {
+		const seed = [
+			{ role: "user", content: "seed user" },
+			{ role: "assistant", content: "seed assistant" },
+		] as Message[];
+		const assignment = { role: "user", content: "assignment" } as Message;
+		const mgr = AppendOnlyContextManager.forkFromSeed({ messages: seed, options: BUILD_OPTS });
+
+		mgr.syncMessages([assignment]);
+
+		const result = mgr.build(makeContext(), BUILD_OPTS);
+		expect(result.messages).toHaveLength(3);
+		expect(result.messages.map(message => message.content)).toEqual(["seed user", "seed assistant", "assignment"]);
+	});
+
+	it("seed mutation after fork does not mutate manager log", () => {
+		const seed = [{ role: "user", content: "original" }] as Message[];
+		const mgr = AppendOnlyContextManager.forkFromSeed({ messages: seed, options: BUILD_OPTS });
+
+		seed[0]!.content = "mutated";
+		const result = mgr.build(makeContext(), BUILD_OPTS);
+
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0]!.content).toBe("original");
+	});
+
+	it("seedNormalizedMessages rejects non-empty log unless reset", () => {
+		const mgr = new AppendOnlyContextManager();
+		mgr.seedNormalizedMessages([{ role: "user", content: "first" }] as Message[]);
+
+		expect(() => mgr.seedNormalizedMessages([{ role: "user", content: "second" }] as Message[])).toThrow(
+			"non-empty log",
+		);
+
+		mgr.seedNormalizedMessages([{ role: "user", content: "second" }] as Message[], { reset: true });
+		const result = mgr.build(makeContext(), BUILD_OPTS);
+		expect(result.messages).toEqual([{ role: "user", content: "second" }] as Message[]);
+	});
+
+	it("forkFromSeed imports prefix snapshot and seeds messages atomically", () => {
+		const prefix = new StablePrefix();
+		const context = makeContext({ systemPrompt: ["Forked"], tools: [makeTool("read")] });
+		prefix.build(context, BUILD_OPTS);
+		const snapshot = prefix.exportSnapshot();
+		expect(snapshot).not.toBeNull();
+
+		const mgr = AppendOnlyContextManager.forkFromSeed({
+			prefixSnapshot: snapshot!,
+			messages: [{ role: "user", content: "seed" }] as Message[],
+			options: BUILD_OPTS,
+		});
+		const result = mgr.build(context, BUILD_OPTS);
+
+		expect(result.systemPrompt).toEqual(["Forked"]);
+		expect(result.tools).toHaveLength(1);
+		expect(result.messages).toEqual([{ role: "user", content: "seed" }] as Message[]);
 	});
 });
 
