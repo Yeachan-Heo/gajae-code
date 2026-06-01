@@ -180,6 +180,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 	const wrapperChanged = paths.some(isUnscopedWrapperPath);
 	const toolingScriptChanged = paths.some(isToolingScriptPath);
 	const needsNativeRuntime = paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace;
+	const workflowHarnessOnly = paths.length > 0 && paths.every(isWorkflowHarnessPath);
 	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
 
 	if (needsNativeRuntime) {
@@ -190,7 +191,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 		addNativeBuild(tasks);
 		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
-	} else if (!ciOnly) {
+	} else if (!ciOnly && !workflowHarnessOnly) {
 		const affectedPackages = expandWithDependents(touchedPackages, packages);
 		if (affectedPackages.some(workspacePackage => workspacePackage.manifest.scripts?.test)) {
 			addNativeBuild(tasks);
@@ -205,7 +206,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 		}
 	}
 
-	if (toolingScriptChanged && !fullWorkspace && !ciOnly) {
+	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 	}
 	if (wrapperChanged) {
@@ -349,6 +350,10 @@ function isWorkflowOrScriptPath(changedPath: string): boolean {
 
 function isWorkflowPath(changedPath: string): boolean {
 	return changedPath.startsWith(".github/workflows/");
+}
+
+function isWorkflowHarnessPath(changedPath: string): boolean {
+	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/check-workflow-yaml.ts";
 }
 
 function isToolingScriptPath(changedPath: string): boolean {
