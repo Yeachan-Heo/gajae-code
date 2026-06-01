@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a built-in `skill` tool so the agent can chain into another loaded skill on its next turn. Mirrors `/skill:<name>` typing and subagent `autoloadSkills` by dispatching the chained skill's SKILL.md as a user-attribution custom message; controlled by the new `skill.enabled` setting (default true).
+
 ## [0.2.2] - 2026-05-31
 
 ### Added

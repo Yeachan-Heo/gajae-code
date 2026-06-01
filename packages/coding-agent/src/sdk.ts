@@ -1195,6 +1195,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					attribution: "agent",
 					timestamp: Date.now(),
 				}),
+			sendCustomMessage: (msg, opts) => session.sendCustomMessage(msg, opts),
 			peekQueueInvoker: () => session.peekQueueInvoker(),
 			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
 			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),

@@ -47,6 +47,7 @@ import { ResolveTool } from "./resolve";
 import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
+import { SkillTool } from "./skill";
 import { loadSshTool } from "./ssh";
 import { SubagentTool } from "./subagent";
 import { type TodoPhase, TodoWriteTool } from "./todo-write";
@@ -84,6 +85,7 @@ export * from "./resolve";
 export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
+export * from "./skill";
 export * from "./ssh";
 export * from "./subagent";
 export * from "./todo-write";
@@ -246,6 +248,12 @@ export interface ToolSession {
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	/** Dispatch a custom message through the active session. Used by the `skill`
+	 *  tool to chain another skill prompt as a queued next-turn message. */
+	sendCustomMessage?(
+		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void>;
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
@@ -308,6 +316,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	retain: HindsightRetainTool.createIf,
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
+	skill: SkillTool.createIf,
 	goal: s => new GoalTool(s),
 };
 
@@ -464,6 +473,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		// search_tool_bm25 is allowed when either legacy mcp.discoveryMode or new tools.discoveryMode is active.
 		if (name === "search_tool_bm25") return discoveryActive;
 		if (name === "calc") return session.settings.get("calc.enabled");
+		if (name === "skill") return session.settings.get("skill.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "irc") {

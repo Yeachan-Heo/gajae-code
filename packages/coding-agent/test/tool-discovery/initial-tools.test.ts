@@ -72,6 +72,17 @@ const toolSession: ToolSession = {
 	activateDiscoveredTools: async names => names,
 	getGoalModeState: () => activeGoalState,
 	getGoalRuntime: () => goalRuntime,
+	skills: [
+		{
+			name: "stub-skill",
+			description: "stub skill for tool metadata coverage",
+			filePath: "/tmp/stub-skill/SKILL.md",
+			baseDir: "/tmp/stub-skill",
+			source: "test",
+			content: "stub",
+		},
+	],
+	sendCustomMessage: async () => {},
 };
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {

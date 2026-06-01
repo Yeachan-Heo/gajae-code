@@ -1940,6 +1940,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"skill.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Skill",
+			description: "Enable the skill tool so the agent can chain into another available skill on its next turn",
+		},
+	},
+
 	// Fetching and browser
 	"fetch.enabled": {
 		type: "boolean",
