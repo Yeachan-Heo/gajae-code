@@ -1727,11 +1727,7 @@ export class AgentSession {
 									}
 
 									const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
-									if (
-										!this.#ttsrAbortPending ||
-										this.#promptGeneration !== generation ||
-										targetAssistantIndex === -1
-									) {
+									if (!this.#ttsrAbortPending || this.#promptGeneration !== generation) {
 										this.#ttsrAbortPending = false;
 										this.#pendingTtsrInjections = [];
 										this.#perToolTtsrInjections.clear();
@@ -1741,8 +1737,8 @@ export class AgentSession {
 									this.#ttsrAbortPending = false;
 									this.#perToolTtsrInjections.clear();
 									const ttsrSettings = this.#ttsrManager?.getSettings();
-									if (ttsrSettings?.contextMode === "discard") {
-										// Remove the partial/aborted assistant turn from agent state
+									if (ttsrSettings?.contextMode === "discard" && targetAssistantIndex !== -1) {
+										// Remove the partial/aborted assistant turn from agent state when it was persisted.
 										this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
 									}
 									// Inject TTSR rules as system reminder before retry

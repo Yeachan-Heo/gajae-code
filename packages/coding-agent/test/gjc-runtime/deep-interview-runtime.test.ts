@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as url from "node:url";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 
 const tempRoots: string[] = [];
+const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../..");
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-runtime-"));
@@ -18,10 +20,7 @@ afterEach(async () => {
 
 describe("native gjc deep-interview runtime", () => {
 	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
-		const source = await fs.readFile(
-			path.join(process.cwd(), "packages/coding-agent/src/commands/deep-interview.ts"),
-			"utf-8",
-		);
+		const source = await fs.readFile(path.join(codingAgentRoot, "src/commands/deep-interview.ts"), "utf-8");
 		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
 		expect(source).toContain("write: Flags.boolean");
 		expect(source).toContain("stage: Flags.string");

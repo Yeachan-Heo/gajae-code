@@ -368,7 +368,7 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const opusVariants = registry.getCanonicalVariants("claude-opus-4-7");
+			const opusVariants = registry.getCanonicalVariants("claude-opus-4-8");
 			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
