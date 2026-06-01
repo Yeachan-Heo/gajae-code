@@ -28,7 +28,7 @@ interface CapturedSend {
 	options?: { deliverAs?: string; triggerTurn?: boolean };
 }
 
-function createSession(skills: Skill[], capture: CapturedSend[]): ToolSession {
+function createSession(skills: Skill[], capture: CapturedSend[], overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -39,6 +39,7 @@ function createSession(skills: Skill[], capture: CapturedSend[]): ToolSession {
 		sendCustomMessage: async (message, options) => {
 			capture.push({ message, options });
 		},
+		...overrides,
 	};
 }
 
@@ -103,6 +104,37 @@ describe("SkillTool", () => {
 		await tool.execute("call-1", { name: "deep-interview", args: "   " });
 		const content = captured[0]!.message.content as string;
 		expect(content).not.toContain("User:");
+	});
+
+	it("rejects chaining into the currently active skill", async () => {
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession([deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "session-1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: " deep-interview " })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "deep-interview" })).rejects.toThrow(
+			/refusing to chain into currently active skill "deep-interview"/,
+		);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("allows chaining into a different skill while a skill is active", async () => {
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const session = createSession([deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "session-1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ralplan" });
+
+		expect(result.details?.name).toBe("ralplan");
+		expect(captured).toHaveLength(1);
 	});
 
 	it("throws a ToolError naming the available skills when the name is unknown", async () => {

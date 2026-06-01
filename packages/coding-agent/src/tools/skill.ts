@@ -23,6 +23,10 @@ const skillSchema = z.object({
 	args: z.string().describe("argument string passed to the skill").optional(),
 });
 
+function normalizeSkillName(name: string | undefined): string {
+	return (name ?? "").trim();
+}
+
 type SkillToolInput = z.infer<typeof skillSchema>;
 
 export interface SkillToolDetails {
@@ -69,10 +73,17 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				throw new ToolError("skill tool: session has no custom-message bridge");
 			}
 			const skills = this.#session.skills ?? [];
-			const requestedName = input.name.trim();
+			const requestedName = normalizeSkillName(input.name);
 			if (!requestedName) {
 				throw new ToolError("skill tool: `name` is required");
 			}
+			const activeSkill = normalizeSkillName(this.#session.getActiveSkillState?.()?.skill);
+			if (activeSkill && requestedName === activeSkill) {
+				throw new ToolError(
+					`skill tool: refusing to chain into currently active skill "${requestedName}". Follow the active skill instructions instead of invoking it recursively.`,
+				);
+			}
+
 			const skill = skills.find(s => s.name === requestedName);
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();

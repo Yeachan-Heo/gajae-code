@@ -1196,6 +1196,15 @@ export class AgentSession {
 		return this.#toolChoiceQueue;
 	}
 
+	/** Current skill prompt executing in this session, if any. */
+	getActiveSkillState(): { skill: string; session_id?: string } | undefined {
+		if (!this.#activeSkillState) return undefined;
+		return {
+			skill: this.#activeSkillState.skill,
+			...(this.#activeSkillState.sessionId ? { session_id: this.#activeSkillState.sessionId } : {}),
+		};
+	}
+
 	/** Peek the in-flight directive's invocation handler for use by the resolve tool. */
 	peekQueueInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
 		return this.#toolChoiceQueue.peekInFlightInvoker();
@@ -4092,18 +4101,21 @@ export class AgentSession {
 		const details = message.details;
 		if (!details || typeof details !== "object") return;
 		const name = (details as { name?: unknown }).name;
-		if (typeof name !== "string" || !isCanonicalGjcWorkflowSkill(name)) return;
-		const cwd = this.sessionManager.getCwd();
+		if (typeof name !== "string" || !name.trim()) return;
+		const skill = name.trim();
 		const sessionId = this.sessionManager.getSessionId();
-		await syncSkillActiveState({
-			cwd,
-			skill: name,
-			active,
-			phase: active ? "running" : "complete",
-			sessionId,
-			source: "skill-prompt",
-		});
-		this.#activeSkillState = active ? { skill: name, sessionId } : undefined;
+		if (isCanonicalGjcWorkflowSkill(skill)) {
+			const cwd = this.sessionManager.getCwd();
+			await syncSkillActiveState({
+				cwd,
+				skill,
+				active,
+				phase: active ? "running" : "complete",
+				sessionId,
+				source: "skill-prompt",
+			});
+		}
+		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 	}
 
 	async #syncSkillPromptActiveStateSafely(

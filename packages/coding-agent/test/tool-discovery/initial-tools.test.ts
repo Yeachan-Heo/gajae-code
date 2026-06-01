@@ -106,6 +106,30 @@ describe("BUILTIN_TOOLS public factory map", () => {
 		expect(missing).toEqual([]);
 	});
 
+	it("exposes the skill tool by default when skills and custom-message bridge are available", async () => {
+		const tools = await createTools(
+			{
+				...toolSession,
+				settings: Settings.isolated(),
+			},
+			["skill"],
+		);
+
+		expect(tools.some(tool => tool.name === "skill")).toBe(true);
+	});
+
+	it("omits the skill tool when skill.enabled is false", async () => {
+		const tools = await createTools(
+			{
+				...toolSession,
+				settings: Settings.isolated({ "skill.enabled": false }),
+			},
+			["skill"],
+		);
+
+		expect(tools.some(tool => tool.name === "skill")).toBe(false);
+	});
+
 	it("exposes detached subagent controls and keeps generic job controls without async flags", async () => {
 		const session = {
 			...toolSession,

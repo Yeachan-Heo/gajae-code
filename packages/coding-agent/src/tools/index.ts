@@ -16,6 +16,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
+import type { SkillActiveEntry } from "../skill-state/active-state";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
@@ -124,6 +125,8 @@ export interface ToolSession {
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
 	skills?: Skill[];
+	/** Currently executing skill prompt, when this tool session is inside one. */
+	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Whether LSP integrations are enabled */
