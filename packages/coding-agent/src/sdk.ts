@@ -32,7 +32,6 @@ import {
 	Snowflake,
 } from "@gajae-code/utils";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
-import { createAutoresearchExtension } from "./autoresearch/index";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { ModelRegistry } from "./config/model-registry";
@@ -1278,7 +1277,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
 		// Explicit SDK extension factories are still honored; callers use them to
 		// register in-process tools/providers without enabling filesystem discovery.
-		const inlineExtensions: ExtensionFactory[] = [createAutoresearchExtension, ...(options.extensions ?? [])];
+		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
