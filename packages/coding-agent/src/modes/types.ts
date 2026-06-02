@@ -86,6 +86,7 @@ export interface InteractiveModeContext {
 	isInitialized: boolean;
 	isBackgrounded: boolean;
 	isBashMode: boolean;
+	isBashNoContext: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
 	planModeEnabled: boolean;

@@ -22,6 +22,7 @@ type FakeEditor = {
 	onExternalEditor?: () => void;
 	onDequeue?: () => void;
 	onChange?: (text: string) => void;
+	onSubmit?: (text: string) => void | Promise<void>;
 	setText(text: string): void;
 	getText(): string;
 	addToHistory(text: string): void;
@@ -40,6 +41,7 @@ async function createContext() {
 	const showModelSelector = vi.fn();
 	const prompt = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
+	const handleBashCommand = vi.fn(async () => {});
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
@@ -66,6 +68,7 @@ async function createContext() {
 			isGeneratingHandoff: false,
 			isBashRunning: false,
 			isEvalRunning: false,
+			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
 		} as unknown as InteractiveModeContext["session"],
@@ -104,6 +107,7 @@ async function createContext() {
 		},
 		updatePendingMessagesDisplay,
 		isBashMode: false,
+		isBashNoContext: false,
 		isPythonMode: false,
 		handleHotkeysCommand: vi.fn(),
 		handlePlanModeCommand: vi.fn(),
@@ -117,6 +121,8 @@ async function createContext() {
 		toggleThinkingBlockVisibility: vi.fn(),
 		showModelSelector,
 		updateEditorBorderColor: vi.fn(),
+		handleBashCommand,
+		showWarning: vi.fn(),
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
 
@@ -129,6 +135,7 @@ async function createContext() {
 			showModelSelector,
 			prompt,
 			updatePendingMessagesDisplay,
+			handleBashCommand,
 		},
 	};
 }
@@ -211,5 +218,49 @@ describe("InputController keybinding setup", () => {
 		await expect(controller.handleFollowUp()).rejects.toThrow("queue full");
 
 		expect(ctx.locallySubmittedUserSignatures.has("queued during stream\u00000")).toBe(false);
+	});
+});
+
+describe("InputController shell mode cues", () => {
+	it("marks leading bang input as shell mode without rewriting editor text", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("!pwd");
+		editor.onChange?.("!pwd");
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(ctx.isBashNoContext).toBe(false);
+		expect(ctx.isPythonMode).toBe(false);
+		expect(editor.getText()).toBe("!pwd");
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+	});
+
+	it("marks double bang input as no-context shell mode", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("!!pwd");
+		editor.onChange?.("!!pwd");
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(ctx.isBashNoContext).toBe(true);
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+	});
+
+	it("keeps existing shell submit and history semantics", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("!!pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", true);
+		expect(editor.addToHistory).toHaveBeenCalledWith("!!pwd");
+		expect(ctx.isBashMode).toBe(false);
+		expect(ctx.isBashNoContext).toBe(false);
 	});
 });

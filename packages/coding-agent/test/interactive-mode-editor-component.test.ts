@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { CustomEditor } from "../src/modes/components/custom-editor";
@@ -88,6 +88,40 @@ describe("InteractiveMode.setEditorComponent", () => {
 			expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
 			expect(lines.join("\n")).not.toContain("Type your message...");
 		}
+	});
+
+	it("keeps the default prompt prefix while reflecting shell modes in border color", () => {
+		mode.editor.setText("!!pwd");
+		mode.isBashMode = true;
+		mode.isBashNoContext = true;
+
+		mode.updateEditorChrome();
+
+		expect(mode.editor.borderColor("x")).toBe(theme.fg("warning", "x"));
+		let lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		expect(
+			lines.some(
+				line =>
+					line.startsWith("│") &&
+					line.includes("shell no-context") &&
+					line.includes(">") &&
+					line.includes("!!pwd"),
+			),
+		).toBe(true);
+
+		mode.isBashNoContext = false;
+		mode.updateEditorChrome();
+
+		expect(mode.editor.borderColor("x")).toBe(theme.getBashModeBorderColor()("x"));
+		lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		expect(lines.some(line => line.startsWith("│") && line.includes("shell") && line.includes("!!pwd"))).toBe(true);
+
+		mode.isBashMode = false;
+		mode.updateEditorChrome();
+
+		lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.includes("!!pwd"))).toBe(true);
+		expect(lines.join("\n")).not.toContain("shell");
 	});
 
 	it("replaces the editor and rebinds interactive handlers", () => {

@@ -64,6 +64,7 @@ export class InputController {
 			} else if (this.ctx.isBashMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isBashMode = false;
+				this.ctx.isBashNoContext = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isEvalRunning) {
 				this.ctx.session.abortEval();
@@ -172,11 +173,17 @@ export class InputController {
 
 		this.ctx.editor.onChange = (text: string) => {
 			const wasBashMode = this.ctx.isBashMode;
+			const wasBashNoContext = this.ctx.isBashNoContext;
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();
-			this.ctx.isBashMode = text.trimStart().startsWith("!");
+			this.ctx.isBashMode = trimmed.startsWith("!");
+			this.ctx.isBashNoContext = trimmed.startsWith("!!");
 			this.ctx.isPythonMode = trimmed.startsWith("$") && !trimmed.startsWith("${");
-			if (wasBashMode !== this.ctx.isBashMode || wasPythonMode !== this.ctx.isPythonMode) {
+			if (
+				wasBashMode !== this.ctx.isBashMode ||
+				wasBashNoContext !== this.ctx.isBashNoContext ||
+				wasPythonMode !== this.ctx.isPythonMode
+			) {
 				this.ctx.updateEditorBorderColor();
 			}
 		};
@@ -260,6 +267,7 @@ export class InputController {
 					this.ctx.editor.addToHistory(text);
 					await this.ctx.handleBashCommand(command, isExcluded);
 					this.ctx.isBashMode = false;
+					this.ctx.isBashNoContext = false;
 					this.ctx.updateEditorBorderColor();
 					return;
 				}

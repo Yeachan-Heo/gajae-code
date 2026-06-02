@@ -112,12 +112,23 @@ const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	high: "borderAccent",
 };
 
+function getDefaultInputPrefix(): string {
+	return `${theme.fg("accent", ">")} `;
+}
+
+function getShellInputPrefix(isNoContext: boolean): string {
+	const shellLabel = isNoContext
+		? theme.fg("warning", theme.bold("shell no-context"))
+		: theme.fg("bashMode", theme.bold("shell"));
+	return `${shellLabel} ${getDefaultInputPrefix()}`;
+}
+
 function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setBorderVisible(true);
 	editor.setBorderStyle("sharp");
 	editor.setClosedBorderBox(true);
 	editor.setPromptGutter(undefined);
-	editor.setInputPrefix(`${theme.fg("accent", ">")} `);
+	editor.setInputPrefix(getDefaultInputPrefix());
 	editor.setPlaceholder("Type your message...");
 	editor.setPaddingX(1);
 	editor.setTopBorder(undefined);
@@ -236,6 +247,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	isInitialized = false;
 	isBackgrounded = false;
 	isBashMode = false;
+	isBashNoContext = false;
 	toolOutputExpanded = false;
 	todoExpanded = false;
 	planModeEnabled = false;
@@ -808,7 +820,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	updateEditorChrome(): void {
 		if (this.isBashMode) {
-			this.editor.borderColor = theme.getBashModeBorderColor();
+			this.editor.borderColor = this.isBashNoContext
+				? (str: string) => theme.fg("warning", str)
+				: theme.getBashModeBorderColor();
+			this.editor.setInputPrefix(getShellInputPrefix(this.isBashNoContext));
 		} else if (this.isPythonMode) {
 			this.editor.borderColor = theme.getPythonModeBorderColor();
 		} else {
@@ -822,6 +837,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				const level = this.session.thinkingLevel ?? ThinkingLevel.Off;
 				this.editor.borderColor = theme.getThinkingBorderColor(level);
 			}
+		}
+		if (!this.isBashMode) {
+			this.editor.setInputPrefix(getDefaultInputPrefix());
 		}
 		this.#setComposerTopBorder();
 		this.ui.requestRender();
