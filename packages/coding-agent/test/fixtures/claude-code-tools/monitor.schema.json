@@ -1,0 +1,46 @@
+{
+  "captured_at": "2026-06-02T01:05:00Z",
+  "claude_version": "2.1.152 (Claude Code)",
+  "capture_command": "strings /Users/bellman/.local/share/claude/versions/2.1.152 | grep -E 'Monitor|_D=\"Monitor\"|zW8' (binary symbols) + https://code.claude.com/docs/en/tools-reference#monitor-tool and https://code.claude.com/docs/en/scheduled-tasks",
+  "tool_name": "Monitor",
+  "description": "Start a background monitor that streams events from a long-running script. Each stdout line is an event — you keep working and notifications arrive in the chat. Events arrive on their own schedule and are not replies from the user, even if one lands while you're waiting for the user to answer a question.\n\nPick by how many notifications you need:\n- One (\"tell me when the server is ready / the build finishes\") → use Bash with `run_in_background`.\n- Many ongoing events (logs, polling, file watching) → use Monitor.\n\nMonitor uses the same permission rules as Bash. Stop a monitor by asking Claude to cancel it (kill its background task) or by ending the session.\n\nRequires Claude Code v2.1.98 or later. Not available on Amazon Bedrock, Google Vertex AI, or Microsoft Foundry, and not available when DISABLE_TELEMETRY or CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Shell command to run as a background monitor. Each stdout line is delivered as a separate task-notification event."
+      },
+      "kind": {
+        "type": "string",
+        "enum": ["log", "poll", "watch", "other"],
+        "description": "Category of monitor. 'log' tails a log file, 'poll' polls a status endpoint, 'watch' watches a directory, 'other' for arbitrary streams."
+      },
+      "description": {
+        "type": "string",
+        "description": "Short human-readable description of what is being monitored. Appears in task listings."
+      },
+      "timeout": {
+        "type": "number",
+        "description": "Optional maximum wall-clock seconds the monitor may run before automatic shutdown. Omit for indefinite (subject to session lifetime).",
+        "minimum": 1
+      },
+      "persistent": {
+        "type": "boolean",
+        "description": "Whether to keep the monitor running past the originating turn. Persistent monitors survive until session end or explicit kill via the background-task stop tool."
+      }
+    },
+    "required": ["command", "kind", "description"],
+    "additionalProperties": false
+  },
+  "observed_returns": [
+    "Monitor started · task <task_id> · persistent: true|false",
+    "<task-notification> events: each stdout line of the monitored command becomes one event delivered into the conversation between turns",
+    "Kill path: there is NO separate Monitor-side kill tool; cancellation reuses the existing background-task stop tool (Bash's task_id, exposed via TaskStop / `/tasks` listing)."
+  ],
+  "notes": [
+    "Permission rules: Bash(<command pattern>) applies; Monitor inherits the same allow/deny rules as Bash.",
+    "Monitor lives in the same task registry as Bash run_in_background — listed via TaskList and stopped via TaskStop. There is no MonitorKill tool.",
+    "Source-of-truth strings extracted verbatim from the local claude binary: var _D=\"Monitor\"; zW8 = the full description block above."
+  ]
+}

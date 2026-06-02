@@ -1,0 +1,21 @@
+{
+  "captured_at": "2026-06-02T01:05:00Z",
+  "claude_version": "2.1.152 (Claude Code)",
+  "capture_command": "strings /Users/bellman/.local/share/claude/versions/2.1.152 | grep -E 'CronList|buildCronListPrompt|List all cron jobs|List scheduled cron jobs' + https://code.claude.com/docs/en/scheduled-tasks",
+  "tool_name": "CronList",
+  "description": "List all cron jobs scheduled via CronCreate in this session. Each entry includes the 8-character id, the 5-field cron expression, the prompt, the recurring flag, and a human-readable cadence. Returns an empty list with 'No scheduled jobs' when nothing is scheduled.",
+  "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "observed_returns": [
+    "Empty: 'No scheduled jobs'",
+    "Populated: array of { id: 8-char string, cron: '5-field expression', recurring: boolean, prompt: string, humanSchedule: string }",
+    "Each entry renders as: '<id> (<humanSchedule>): <prompt-preview>'"
+  ],
+  "notes": [
+    "Source-of-truth strings extracted verbatim from the local claude binary: var yM_=\"CronList\"; jW8=\"List scheduled cron jobs\"; buildCronListPrompt contains the full prompt block.",
+    "CronList takes no parameters. The output enumerates all session-scoped scheduled tasks (and durable jobs when durable cron is enabled)."
+  ]
+}

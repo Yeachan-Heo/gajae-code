@@ -1,6 +1,6 @@
 /**
  * ACP-side `ClientBridge` implementation. Wraps `AgentSideConnection` so the
- * `read`/`write`/`bash`/`edit` tools (and the permission gate in
+ * `read`/`write`/`bash`/`monitor`/`edit` tools (and the permission gate in
  * `AgentSession`) can route through the client when it advertises the
  * relevant capabilities at `initialize` time.
  */

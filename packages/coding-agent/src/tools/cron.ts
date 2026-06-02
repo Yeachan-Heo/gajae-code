@@ -1,0 +1,665 @@
+import { randomBytes } from "node:crypto";
+import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import { logger, prompt } from "@gajae-code/utils";
+import * as z from "zod/v4";
+import { AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
+import cronDescription from "../prompts/tools/cron.md" with { type: "text" };
+import type { ToolSession } from "./index";
+import { ToolError } from "./tool-errors";
+
+/** Maximum scheduled tasks per owner. Mirrors upstream Claude Code's 50-task cap. */
+export const MAX_CRON_TASKS_PER_OWNER = 50;
+
+/** Recurring tasks auto-expire 7 days after creation (mirrors upstream). */
+export const CRON_RECURRING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+const CRON_ID_LENGTH = 8;
+const MAX_CRON_SCAN_MINUTES = 366 * 24 * 60;
+const MAX_RECURRING_JITTER_MS = 30 * 60 * 1000;
+const MAX_ONE_SHOT_EARLY_JITTER_MS = 90 * 1000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+const cronCreateSchema = z.object({
+	cron_expression: z
+		.string()
+		.describe(
+			"Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics).",
+		),
+	prompt: z
+		.string()
+		.describe(
+			"Prompt to inject between turns when the cron fires. May reference slash commands (e.g. '/review-pr 1234') or natural-language instructions.",
+		),
+	recurring: z
+		.boolean()
+		.default(true)
+		.describe(
+			"true to fire on every match of the cron expression (recurring, auto-expires after 7 days); false to fire once at the next match and then self-delete.",
+		),
+});
+
+export type CronCreateParams = z.infer<typeof cronCreateSchema>;
+
+const cronListSchema = z.object({});
+export type CronListParams = z.infer<typeof cronListSchema>;
+
+const cronDeleteSchema = z.object({
+	id: z.string().min(1).describe("The 8-character job ID returned by CronCreate."),
+});
+export type CronDeleteParams = z.infer<typeof cronDeleteSchema>;
+
+export interface CronJobSnapshot {
+	id: string;
+	cron_expression: string;
+	prompt: string;
+	recurring: boolean;
+	createdAt: number;
+	expiresAt?: number;
+	nextFireAt?: number;
+	humanSchedule: string;
+	ownerId?: string;
+}
+
+export interface CronListJobDetails {
+	id: string;
+	cron: string;
+	recurring: boolean;
+	prompt: string;
+	humanSchedule: string;
+}
+
+export interface CronCreateToolDetails {
+	id: string;
+	cron_expression: string;
+	recurring: boolean;
+	nextFireAt?: number;
+}
+
+export interface CronListToolDetails {
+	jobs: CronListJobDetails[];
+}
+
+export interface CronDeleteToolDetails {
+	id: string;
+	deleted: boolean;
+}
+
+interface CronTimerHandle {
+	clear(): void;
+}
+
+interface CronScheduleRecord {
+	snapshot: CronJobSnapshot;
+	session: ToolSession;
+	timer?: CronTimerHandle;
+	expiryTimer?: CronTimerHandle;
+	disposed: boolean;
+}
+
+interface OwnerScheduleState {
+	jobs: Map<string, CronScheduleRecord>;
+	cleanupRegistered: boolean;
+}
+
+const schedulesByOwner = new Map<string, OwnerScheduleState>();
+
+function ownerKey(ownerId: string | undefined): string {
+	return ownerId ?? "__legacy__";
+}
+
+function getOrCreateOwnerState(ownerId: string | undefined): OwnerScheduleState {
+	const key = ownerKey(ownerId);
+	let state = schedulesByOwner.get(key);
+	if (!state) {
+		state = { jobs: new Map(), cleanupRegistered: false };
+		schedulesByOwner.set(key, state);
+	}
+	return state;
+}
+
+function clearTimer(handle: CronTimerHandle | undefined): void {
+	handle?.clear();
+}
+
+function disposeRecord(record: CronScheduleRecord): void {
+	record.disposed = true;
+	clearTimer(record.timer);
+	clearTimer(record.expiryTimer);
+	record.timer = undefined;
+	record.expiryTimer = undefined;
+}
+
+function deleteRecord(ownerId: string | undefined, id: string): boolean {
+	const key = ownerKey(ownerId);
+	const state = schedulesByOwner.get(key);
+	const record = state?.jobs.get(id);
+	if (!state || !record) return false;
+	disposeRecord(record);
+	const deleted = state.jobs.delete(id);
+	if (state.jobs.size === 0) schedulesByOwner.delete(key);
+	return deleted;
+}
+
+function ensureOwnerCleanup(ownerId: string | undefined, manager: AsyncJobManager, state: OwnerScheduleState): void {
+	if (state.cleanupRegistered) return;
+	if (!ownerId) return;
+	manager.registerOwnerCleanup(ownerId, () => {
+		clearOwnerSchedules(ownerId);
+	});
+	state.cleanupRegistered = true;
+}
+
+/** Clear every schedule for an owner. Exported for tests + lifecycle teardown. */
+export function clearOwnerSchedules(ownerId: string | undefined): void {
+	const key = ownerKey(ownerId);
+	const state = schedulesByOwner.get(key);
+	if (!state) return;
+	for (const record of state.jobs.values()) disposeRecord(record);
+	state.jobs.clear();
+	state.cleanupRegistered = false;
+	schedulesByOwner.delete(key);
+}
+
+/** Reset every owner's schedule store. Test-only. */
+export function resetCronRegistryForTests(): void {
+	for (const key of Array.from(schedulesByOwner.keys())) {
+		const ownerId = key === "__legacy__" ? undefined : key;
+		clearOwnerSchedules(ownerId);
+	}
+	schedulesByOwner.clear();
+}
+
+const CRON_FIELD_BOUNDS: Array<{ name: string; min: number; max: number }> = [
+	{ name: "minute", min: 0, max: 59 },
+	{ name: "hour", min: 0, max: 23 },
+	{ name: "day-of-month", min: 1, max: 31 },
+	{ name: "month", min: 1, max: 12 },
+	{ name: "day-of-week", min: 0, max: 7 },
+];
+
+function validateCronField(spec: string, bounds: { name: string; min: number; max: number }): void {
+	if (spec === "*") return;
+	const parts = spec.split(",");
+	for (const part of parts) {
+		const stepSplit = part.split("/");
+		if (stepSplit.length > 2) {
+			throw new ToolError(`Invalid cron expression: bad step in ${bounds.name} field '${part}'.`);
+		}
+		const [rangePart, stepRaw] = stepSplit;
+		if (!rangePart) {
+			throw new ToolError(`Invalid cron expression: empty ${bounds.name} field segment.`);
+		}
+		if (stepRaw !== undefined) {
+			const step = Number(stepRaw);
+			if (!Number.isInteger(step) || step <= 0) {
+				throw new ToolError(
+					`Invalid cron expression: step value must be a positive integer in ${bounds.name} field.`,
+				);
+			}
+		}
+		if (rangePart === "*") continue;
+		const rangeSplit = rangePart.split("-");
+		if (rangeSplit.length > 2) {
+			throw new ToolError(`Invalid cron expression: bad range in ${bounds.name} field '${rangePart}'.`);
+		}
+		for (const raw of rangeSplit) {
+			const value = Number(raw);
+			if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+				throw new ToolError(
+					`Invalid cron expression: value '${raw}' out of range for ${bounds.name} (${bounds.min}-${bounds.max}).`,
+				);
+			}
+		}
+		if (rangeSplit.length === 2) {
+			const [lo, hi] = rangeSplit.map(Number);
+			if (lo > hi) {
+				throw new ToolError(
+					`Invalid cron expression: range must be ascending in ${bounds.name} field '${rangePart}'.`,
+				);
+			}
+		}
+	}
+}
+
+export function validateCronExpression(expression: string): void {
+	const trimmed = expression.trim();
+	if (!trimmed) {
+		throw new ToolError("Invalid cron expression: expression must not be empty.");
+	}
+	const fields = trimmed.split(/\s+/);
+	if (fields.length !== 5) {
+		throw new ToolError(
+			"Invalid cron expression: expected 5 space-separated fields (minute hour day month weekday).",
+		);
+	}
+	for (let i = 0; i < CRON_FIELD_BOUNDS.length; i += 1) {
+		validateCronField(fields[i]!, CRON_FIELD_BOUNDS[i]!);
+	}
+}
+
+interface ParsedCronExpression {
+	minute: Set<number>;
+	hour: Set<number>;
+	dayOfMonth: Set<number>;
+	month: Set<number>;
+	dayOfWeek: Set<number>;
+	dayOfMonthRestricted: boolean;
+	dayOfWeekRestricted: boolean;
+}
+
+function expandCronField(
+	spec: string,
+	bounds: { min: number; max: number },
+	normalize?: (value: number) => number,
+): Set<number> {
+	const values = new Set<number>();
+	for (const part of spec.split(",")) {
+		const [rangePartRaw, stepRaw] = part.split("/");
+		const rangePart = rangePartRaw!;
+		const step = stepRaw === undefined ? 1 : Number(stepRaw);
+		const [loRaw, hiRaw] = rangePart === "*" ? [String(bounds.min), String(bounds.max)] : rangePart.split("-");
+		const lo = Number(loRaw);
+		const hi = hiRaw === undefined ? lo : Number(hiRaw);
+		for (let value = lo; value <= hi; value += step) {
+			values.add(normalize ? normalize(value) : value);
+		}
+	}
+	return values;
+}
+
+function parseCronExpression(expression: string): ParsedCronExpression {
+	validateCronExpression(expression);
+	const [minute, hour, dayOfMonth, month, dayOfWeek] = expression.trim().split(/\s+/);
+	return {
+		minute: expandCronField(minute!, CRON_FIELD_BOUNDS[0]!),
+		hour: expandCronField(hour!, CRON_FIELD_BOUNDS[1]!),
+		dayOfMonth: expandCronField(dayOfMonth!, CRON_FIELD_BOUNDS[2]!),
+		month: expandCronField(month!, CRON_FIELD_BOUNDS[3]!),
+		dayOfWeek: expandCronField(dayOfWeek!, CRON_FIELD_BOUNDS[4]!, value => (value === 7 ? 0 : value)),
+		dayOfMonthRestricted: dayOfMonth !== "*",
+		dayOfWeekRestricted: dayOfWeek !== "*",
+	};
+}
+
+function matchesCronDate(parsed: ParsedCronExpression, date: Date): boolean {
+	if (!parsed.minute.has(date.getMinutes())) return false;
+	if (!parsed.hour.has(date.getHours())) return false;
+	if (!parsed.month.has(date.getMonth() + 1)) return false;
+	const domMatches = parsed.dayOfMonth.has(date.getDate());
+	const dowMatches = parsed.dayOfWeek.has(date.getDay());
+	if (parsed.dayOfMonthRestricted && parsed.dayOfWeekRestricted) return domMatches || dowMatches;
+	return domMatches && dowMatches;
+}
+
+export function findNextCronMatchMs(expression: string, afterMs: number, deadlineMs?: number): number | undefined {
+	const parsed = parseCronExpression(expression);
+	const cursor = new Date(afterMs);
+	cursor.setSeconds(0, 0);
+	cursor.setMinutes(cursor.getMinutes() + 1);
+	for (let i = 0; i < MAX_CRON_SCAN_MINUTES; i += 1) {
+		const candidateMs = cursor.getTime();
+		if (deadlineMs !== undefined && candidateMs > deadlineMs) return undefined;
+		if (matchesCronDate(parsed, cursor)) return candidateMs;
+		cursor.setMinutes(cursor.getMinutes() + 1);
+	}
+	return undefined;
+}
+
+function hashStringToUint32(value: string): number {
+	let hash = 2166136261;
+	for (let i = 0; i < value.length; i += 1) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return hash >>> 0;
+}
+
+function deterministicJitterMs(seed: string, maxMs: number): number {
+	if (maxMs <= 0) return 0;
+	return hashStringToUint32(seed) % (Math.floor(maxMs) + 1);
+}
+
+export function calculateCronFireTimeMs(params: {
+	id: string;
+	cronExpression: string;
+	baseMatchMs: number;
+	recurring: boolean;
+	nowMs: number;
+	expiresAt?: number;
+}): number {
+	if (params.recurring) {
+		const followingMatchMs = findNextCronMatchMs(params.cronExpression, params.baseMatchMs, params.expiresAt);
+		const intervalMs = followingMatchMs
+			? Math.max(60_000, followingMatchMs - params.baseMatchMs)
+			: MAX_RECURRING_JITTER_MS * 2;
+		const maxJitterMs = Math.min(MAX_RECURRING_JITTER_MS, Math.floor(intervalMs / 2));
+		return params.baseMatchMs + deterministicJitterMs(`${params.id}:${params.baseMatchMs}:late`, maxJitterMs);
+	}
+	const baseDate = new Date(params.baseMatchMs);
+	if (baseDate.getMinutes() === 0 || baseDate.getMinutes() === 30) {
+		const jitterMs = deterministicJitterMs(`${params.id}:${params.baseMatchMs}:early`, MAX_ONE_SHOT_EARLY_JITTER_MS);
+		return Math.max(params.nowMs, params.baseMatchMs - jitterMs);
+	}
+	return params.baseMatchMs;
+}
+
+function setCronTimeout(callback: () => void, delayMs: number): CronTimerHandle {
+	let handle: ReturnType<typeof setTimeout> | undefined;
+	let cleared = false;
+	const schedule = (remainingMs: number) => {
+		if (cleared) return;
+		const boundedDelayMs = Math.max(0, Math.min(MAX_TIMEOUT_MS, Math.floor(remainingMs)));
+		handle = setTimeout(() => {
+			if (cleared) return;
+			const nextRemainingMs = remainingMs - boundedDelayMs;
+			if (nextRemainingMs > 0) {
+				schedule(nextRemainingMs);
+				return;
+			}
+			callback();
+		}, boundedDelayMs);
+	};
+	schedule(Math.max(0, delayMs));
+	return {
+		clear() {
+			cleared = true;
+			if (handle) clearTimeout(handle);
+		},
+	};
+}
+
+function humanizeCronExpression(expression: string): string {
+	const [minute, hour, dayOfMonth, month, dayOfWeek] = expression.trim().split(/\s+/);
+	if (minute === "*" && hour === "*" && dayOfMonth === "*" && month === "*" && dayOfWeek === "*") {
+		return "every minute";
+	}
+	const stepMatch = minute?.match(/^\*\/(\d+)$/);
+	if (stepMatch && hour === "*" && dayOfMonth === "*" && month === "*" && dayOfWeek === "*") {
+		const step = Number(stepMatch[1]);
+		return `every ${step} minute${step === 1 ? "" : "s"}`;
+	}
+	if (/^\d+$/u.test(minute ?? "") && /^\d+$/u.test(hour ?? "") && dayOfMonth === "*" && month === "*") {
+		const hh = hour!.padStart(2, "0");
+		const mm = minute!.padStart(2, "0");
+		if (dayOfWeek === "*") return `at ${hh}:${mm} every day`;
+		return `at ${hh}:${mm} on day-of-week ${dayOfWeek}`;
+	}
+	return expression;
+}
+
+function toCronListJobDetails(snapshot: CronJobSnapshot): CronListJobDetails {
+	return {
+		id: snapshot.id,
+		cron: snapshot.cron_expression,
+		recurring: snapshot.recurring,
+		prompt: snapshot.prompt,
+		humanSchedule: snapshot.humanSchedule,
+	};
+}
+
+function formatCronFireContent(snapshot: CronJobSnapshot): string {
+	return `<task-notification>\nScheduled task ${snapshot.id} fired (${snapshot.humanSchedule}).\n\n${snapshot.prompt}\n</task-notification>`;
+}
+
+function deliverCronFire(record: CronScheduleRecord): void {
+	const content = formatCronFireContent(record.snapshot);
+	const details = {
+		id: record.snapshot.id,
+		cron_expression: record.snapshot.cron_expression,
+		recurring: record.snapshot.recurring,
+	};
+	const sendPromise = record.session.sendCustomMessage?.(
+		{ customType: "cron-fire", content, display: false, attribution: "agent", details },
+		{ triggerTurn: true, deliverAs: "followUp" },
+	);
+	if (sendPromise) {
+		void sendPromise.catch(error => {
+			logger.warn("Cron fire delivery failed", {
+				id: record.snapshot.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return;
+	}
+	record.session.steer?.({ customType: "cron-fire", content, details });
+}
+
+function scheduleRecord(ownerId: string | undefined, state: OwnerScheduleState, record: CronScheduleRecord): void {
+	if (record.disposed) return;
+	clearTimer(record.timer);
+	record.timer = undefined;
+	const now = Date.now();
+	if (record.snapshot.expiresAt !== undefined && now >= record.snapshot.expiresAt) {
+		deleteRecord(ownerId, record.snapshot.id);
+		return;
+	}
+	const baseMatchMs = findNextCronMatchMs(record.snapshot.cron_expression, now, record.snapshot.expiresAt);
+	if (baseMatchMs === undefined) {
+		deleteRecord(ownerId, record.snapshot.id);
+		return;
+	}
+	const fireAt = calculateCronFireTimeMs({
+		id: record.snapshot.id,
+		cronExpression: record.snapshot.cron_expression,
+		baseMatchMs,
+		recurring: record.snapshot.recurring,
+		nowMs: now,
+		expiresAt: record.snapshot.expiresAt,
+	});
+	record.snapshot.nextFireAt = fireAt;
+	record.timer = setCronTimeout(() => fireRecord(ownerId, state, record.snapshot.id), fireAt - now);
+}
+
+function scheduleExpiry(ownerId: string | undefined, record: CronScheduleRecord): void {
+	if (record.snapshot.expiresAt === undefined) return;
+	const delayMs = record.snapshot.expiresAt - Date.now();
+	record.expiryTimer = setCronTimeout(() => {
+		deleteRecord(ownerId, record.snapshot.id);
+	}, delayMs);
+}
+
+function fireRecord(ownerId: string | undefined, state: OwnerScheduleState, id: string): void {
+	const record = state.jobs.get(id);
+	if (!record || record.disposed) return;
+	if (record.snapshot.expiresAt !== undefined && Date.now() >= record.snapshot.expiresAt) {
+		deleteRecord(ownerId, id);
+		return;
+	}
+	try {
+		deliverCronFire(record);
+	} catch (error) {
+		logger.warn("Cron fire delivery failed", { id, error: error instanceof Error ? error.message : String(error) });
+	}
+	if (!record.snapshot.recurring) {
+		deleteRecord(ownerId, id);
+		return;
+	}
+	scheduleRecord(ownerId, state, record);
+}
+
+const CRON_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateCronId(taken: Set<string>): string {
+	for (let attempt = 0; attempt < 16; attempt += 1) {
+		const bytes = randomBytes(CRON_ID_LENGTH);
+		let id = "";
+		for (let i = 0; i < CRON_ID_LENGTH; i += 1) {
+			id += CRON_ID_ALPHABET[bytes[i]! % CRON_ID_ALPHABET.length];
+		}
+		if (!taken.has(id)) return id;
+	}
+	return `${randomBytes(6).toString("hex")}-${Date.now().toString(36)}`;
+}
+
+function isCronDisabled(): boolean {
+	return process.env.CLAUDE_CODE_DISABLE_CRON === "1";
+}
+
+export class CronCreateTool implements AgentTool<typeof cronCreateSchema, CronCreateToolDetails> {
+	readonly name = "CronCreate";
+	readonly label = "CronCreate";
+	readonly summary = "Schedule a prompt on a 5-field cron expression";
+	readonly description: string;
+	readonly parameters = cronCreateSchema;
+	readonly strict = true;
+	readonly loadMode = "discoverable";
+
+	constructor(private readonly session: ToolSession) {
+		this.description = prompt.render(cronDescription);
+	}
+
+	static createIf(session: ToolSession): CronCreateTool | null {
+		if (!isBackgroundJobSupportEnabled(session.settings)) return null;
+		if (isCronDisabled()) return null;
+		return new CronCreateTool(session);
+	}
+
+	async execute(
+		_toolCallId: string,
+		params: CronCreateParams,
+		_signal?: AbortSignal,
+		_onUpdate?: AgentToolUpdateCallback<CronCreateToolDetails>,
+		_context?: AgentToolContext,
+	): Promise<AgentToolResult<CronCreateToolDetails>> {
+		const manager = AsyncJobManager.instance();
+		if (!manager) {
+			throw new ToolError("Async execution is disabled; cron is unavailable in this session.");
+		}
+		if (isCronDisabled()) {
+			throw new ToolError("Cron is disabled by CLAUDE_CODE_DISABLE_CRON=1.");
+		}
+		validateCronExpression(params.cron_expression);
+
+		const ownerId = this.session.getAgentId?.() ?? undefined;
+		const state = getOrCreateOwnerState(ownerId);
+		if (state.jobs.size >= MAX_CRON_TASKS_PER_OWNER) {
+			throw new ToolError(
+				`Cron task limit reached (${MAX_CRON_TASKS_PER_OWNER}). Cancel an existing task with CronDelete first.`,
+			);
+		}
+		ensureOwnerCleanup(ownerId, manager, state);
+
+		const id = generateCronId(new Set(state.jobs.keys()));
+		const now = Date.now();
+		const snapshot: CronJobSnapshot = {
+			id,
+			cron_expression: params.cron_expression.trim(),
+			prompt: params.prompt,
+			recurring: params.recurring,
+			createdAt: now,
+			expiresAt: params.recurring ? now + CRON_RECURRING_MAX_AGE_MS : undefined,
+			humanSchedule: humanizeCronExpression(params.cron_expression.trim()),
+			ownerId,
+		};
+		const record: CronScheduleRecord = { snapshot, session: this.session, disposed: false };
+		state.jobs.set(id, record);
+		scheduleExpiry(ownerId, record);
+		scheduleRecord(ownerId, state, record);
+
+		logger.debug("CronCreate: scheduled task", {
+			id,
+			ownerId,
+			cron: snapshot.cron_expression,
+			nextFireAt: snapshot.nextFireAt,
+		});
+
+		return {
+			content: [{ type: "text", text: `Scheduled ${id} (${snapshot.humanSchedule})` }],
+			details: {
+				id,
+				cron_expression: snapshot.cron_expression,
+				recurring: snapshot.recurring,
+				nextFireAt: snapshot.nextFireAt,
+			},
+		};
+	}
+}
+
+export class CronListTool implements AgentTool<typeof cronListSchema, CronListToolDetails> {
+	readonly name = "CronList";
+	readonly label = "CronList";
+	readonly summary = "List scheduled cron jobs";
+	readonly description: string;
+	readonly parameters = cronListSchema;
+	readonly strict = true;
+	readonly loadMode = "discoverable";
+
+	constructor(private readonly session: ToolSession) {
+		this.description = prompt.render(cronDescription);
+	}
+
+	static createIf(session: ToolSession): CronListTool | null {
+		if (!isBackgroundJobSupportEnabled(session.settings)) return null;
+		if (isCronDisabled()) return null;
+		return new CronListTool(session);
+	}
+
+	async execute(
+		_toolCallId: string,
+		_params: CronListParams,
+		_signal?: AbortSignal,
+		_onUpdate?: AgentToolUpdateCallback<CronListToolDetails>,
+		_context?: AgentToolContext,
+	): Promise<AgentToolResult<CronListToolDetails>> {
+		const ownerId = this.session.getAgentId?.() ?? undefined;
+		const state = schedulesByOwner.get(ownerKey(ownerId));
+		const records = state
+			? Array.from(state.jobs.values()).sort((a, b) => a.snapshot.createdAt - b.snapshot.createdAt)
+			: [];
+		const jobs = records.map(record => toCronListJobDetails(record.snapshot));
+		if (jobs.length === 0) {
+			return {
+				content: [{ type: "text", text: "No scheduled jobs" }],
+				details: { jobs: [] },
+			};
+		}
+		const lines = jobs.map(job => {
+			const preview = job.prompt.length > 80 ? `${job.prompt.slice(0, 77)}...` : job.prompt;
+			return `${job.id} (${job.humanSchedule}): ${preview}`;
+		});
+		return {
+			content: [{ type: "text", text: lines.join("\n") }],
+			details: { jobs },
+		};
+	}
+}
+
+export class CronDeleteTool implements AgentTool<typeof cronDeleteSchema, CronDeleteToolDetails> {
+	readonly name = "CronDelete";
+	readonly label = "CronDelete";
+	readonly summary = "Cancel a scheduled cron job by ID";
+	readonly description: string;
+	readonly parameters = cronDeleteSchema;
+	readonly strict = true;
+	readonly loadMode = "discoverable";
+
+	constructor(private readonly session: ToolSession) {
+		this.description = prompt.render(cronDescription);
+	}
+
+	static createIf(session: ToolSession): CronDeleteTool | null {
+		if (!isBackgroundJobSupportEnabled(session.settings)) return null;
+		if (isCronDisabled()) return null;
+		return new CronDeleteTool(session);
+	}
+
+	async execute(
+		_toolCallId: string,
+		params: CronDeleteParams,
+		_signal?: AbortSignal,
+		_onUpdate?: AgentToolUpdateCallback<CronDeleteToolDetails>,
+		_context?: AgentToolContext,
+	): Promise<AgentToolResult<CronDeleteToolDetails>> {
+		const ownerId = this.session.getAgentId?.() ?? undefined;
+		const deleted = deleteRecord(ownerId, params.id);
+		return {
+			content: [
+				{
+					type: "text",
+					text: deleted ? `Cancelled ${params.id}` : `Failed to remove scheduled task '${params.id}'`,
+				},
+			],
+			details: { id: params.id, deleted },
+		};
+	}
+}

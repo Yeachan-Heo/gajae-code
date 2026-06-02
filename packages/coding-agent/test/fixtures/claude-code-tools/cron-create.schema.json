@@ -1,0 +1,37 @@
+{
+  "captured_at": "2026-06-02T01:05:00Z",
+  "claude_version": "2.1.152 (Claude Code)",
+  "capture_command": "strings /Users/bellman/.local/share/claude/versions/2.1.152 | grep -E 'CronCreate|buildCronCreatePrompt|Fire a prompt on a recurring|cron_expression|run_once_at' + https://code.claude.com/docs/en/scheduled-tasks",
+  "tool_name": "CronCreate",
+  "description": "Schedule a new task. Accepts a 5-field cron expression in local time, the prompt to run, and whether it recurs or fires once. Returns an 8-character job ID you can pass to CronDelete. Each scheduled task fires between turns; a session can hold up to 50 scheduled tasks. Recurring tasks auto-expire 7 days after creation; one-shot tasks delete themselves after firing. The scheduler adds a deterministic jitter (recurring tasks may fire up to 30 minutes late or up to half their interval; one-shot tasks scheduled for :00 or :30 may fire up to 90 s early). Use Bash to fetch the current time before computing relative schedules; do not guess the date from context.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "cron_expression": {
+        "type": "string",
+        "description": "Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics)."
+      },
+      "prompt": {
+        "type": "string",
+        "description": "Prompt to inject between turns when the cron fires. May reference slash commands (e.g. '/review-pr 1234') or natural-language instructions."
+      },
+      "recurring": {
+        "type": "boolean",
+        "description": "true to fire on every match of the cron expression (recurring, auto-expires after 7 days); false to fire once at the next match and then self-delete.",
+        "default": true
+      }
+    },
+    "required": ["cron_expression", "prompt", "recurring"],
+    "additionalProperties": false
+  },
+  "observed_returns": [
+    "Scheduled <8char-id> (<human-schedule>)",
+    "Job ID is the 8-character session-scoped identifier. Pass it to CronDelete to cancel before the cron expires."
+  ],
+  "notes": [
+    "Source-of-truth strings extracted verbatim from the local claude binary: var nP=\"CronCreate\"; buildCronCreatePrompt / buildCronCreateDescription contain the full prompt and description blocks.",
+    "Bun.cron also enforces a 5-field minimum. Claude Code likewise rejects expressions with more or fewer fields.",
+    "Disable scheduler entirely via CLAUDE_CODE_DISABLE_CRON=1; CronCreate becomes unavailable.",
+    "Durable jobs path (.claude/scheduled_tasks.json) is optional and only used when durable cron is enabled; the in-memory session store is the default."
+  ]
+}

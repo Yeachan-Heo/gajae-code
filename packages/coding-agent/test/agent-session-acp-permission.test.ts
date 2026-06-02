@@ -538,6 +538,94 @@ it("bash permission requests include execute metadata and command content", asyn
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("monitor permission requests include execute metadata and command content", async () => {
+	const monitorTool = makeFakeTool("monitor");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, _options, _signal) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	session = await createSession([monitorTool], bridge);
+
+	await session.setActiveToolsByName(["monitor"]);
+	const wrappedMonitor = session.agent.state.tools.find(t => t.name === "monitor");
+	expect(wrappedMonitor).toBeDefined();
+
+	await wrappedMonitor!.execute(
+		"call-monitor-rich",
+		{ command: "tail -f /tmp/app.log", kind: "log", description: "app log" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(requests).toHaveLength(1);
+	expect(requests[0]).toMatchObject({
+		toolCallId: "call-monitor-rich",
+		toolName: "monitor",
+		title: "tail -f /tmp/app.log",
+		kind: "execute",
+		status: "pending",
+		rawInput: { command: "tail -f /tmp/app.log", kind: "log", description: "app log" },
+		content: [{ type: "content", content: { type: "text", text: "$ tail -f /tmp/app.log" } }],
+	});
+	expect(monitorTool.executeCalls).toBe(1);
+});
+
+it("monitor reject_once prevents shell monitor execution", async () => {
+	const monitorTool = makeFakeTool("monitor");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([monitorTool], bridge);
+
+	await session.setActiveToolsByName(["monitor"]);
+	const wrappedMonitor = session.agent.state.tools.find(t => t.name === "monitor");
+	expect(wrappedMonitor).toBeDefined();
+
+	await expect(
+		wrappedMonitor!.execute(
+			"call-monitor-reject",
+			{ command: "tail -f /tmp/app.log", kind: "log", description: "app log" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user/);
+
+	expect(monitorTool.executeCalls).toBe(0);
+});
+
+it("monitor allow_always caches shell execution permission", async () => {
+	const monitorTool = makeFakeTool("monitor");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_always", kind: "allow_always" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([monitorTool], bridge);
+
+	await session.setActiveToolsByName(["monitor"]);
+	const wrappedMonitor = session.agent.state.tools.find(t => t.name === "monitor");
+	expect(wrappedMonitor).toBeDefined();
+
+	await wrappedMonitor!.execute(
+		"call-monitor-1",
+		{ command: "tail -f /tmp/a.log", kind: "log", description: "a log" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	await wrappedMonitor!.execute(
+		"call-monitor-2",
+		{ command: "tail -f /tmp/b.log", kind: "log", description: "b log" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(monitorTool.executeCalls).toBe(2);
+});
+
 it("ordinary edit calls still bypass ACP permission after rejecting edit moves forever", async () => {
 	const editTool = makeFakeTool("edit");
 	const bridge = makeBridge({ outcome: "selected", optionId: "reject_always", kind: "reject_always" });

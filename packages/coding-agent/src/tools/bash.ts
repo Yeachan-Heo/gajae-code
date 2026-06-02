@@ -380,6 +380,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							latestText = tailBuffer.text();
 							void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
 						},
+						onRawChunk: chunk => {
+							// Forward the unthrottled sanitized chunk to the async-job
+							// substrate so the Monitor tool can read the complete process
+							// stream by byte offset, independent of the throttled preview
+							// path above.
+							manager.appendOutput(jobId, chunk);
+						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
@@ -457,27 +464,29 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return Math.max(0, Math.min(this.#autoBackgroundThresholdMs, timeoutMs - timeoutBufferMs));
 	}
 
-	async execute(
-		_toolCallId: string,
-		{
-			command: rawCommand,
-			env: rawEnv,
-			timeout: rawTimeout = 300,
-			cwd,
-
-			async: asyncRequested = false,
-			pty = false,
-		}: BashToolInput,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+	/**
+	 * Build the fully-prepared parameters for a `bash`-flavored execution
+	 * (interceptors, internal URL expansion, env resolution, cwd validation,
+	 * timeout clamp). Used by both `execute()` and the public `startMonitorJob`
+	 * helper after `AgentSession` has applied the public-tool permission gate, so
+	 * Monitor inherits Bash's cwd / env / artifact / interceptor pipeline 1:1.
+	 */
+	async #prepareBashExecution(
+		input: { command: string; env?: Record<string, string>; timeout?: number; cwd?: string },
 		ctx?: AgentToolContext,
-	): Promise<AgentToolResult<BashToolDetails>> {
-		let command = rawCommand;
-		const env = normalizeBashEnv(rawEnv);
+	): Promise<{
+		command: string;
+		commandCwd: string;
+		resolvedEnv: Record<string, string>;
+		requestedTimeoutSec: number;
+		timeoutSec: number;
+		timeoutMs: number;
+		notices: string[];
+	}> {
+		let command = input.command;
+		let cwd = input.cwd;
+		const env = normalizeBashEnv(input.env);
 
-		// Apply conservative bash fixups (strip trailing `| head|tail` and redundant
-		// `2>&1`). The helper is single-line only and refuses anything that could
-		// change semantics.
 		if (this.session.settings.get("bash.stripTrailingHeadTail")) {
 			const fixup = applyBashFixups(command);
 			if (fixup.stripped.length > 0) {
@@ -485,9 +494,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 		}
 
-		// Extract leading `cd <path> && ...` into cwd when the model ignores the cwd parameter.
-		// Constrained to a single line so a `&&` that sits on a later line of a multiline
-		// script can't pull the entire script into the "cwd" capture.
 		if (!cwd) {
 			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
 			if (cdMatch) {
@@ -495,10 +501,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				command = command.slice(cdMatch[0].length);
 			}
 		}
-		if (asyncRequested && !this.#asyncEnabled) {
-			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
-		}
 
+		const rawCommand = input.command;
 		const allowedPrefixes = this.session.bashAllowedPrefixes;
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
 			if (env && Object.keys(env).length > 0) {
@@ -561,7 +565,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
 
-		// Resolve protocol URLs (agent://, artifact://, etc.) in extracted cwd.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
 		}
@@ -580,13 +583,153 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
 
-		// Clamp to reasonable range: 1s - 3600s (1 hour)
-		const requestedTimeoutSec = rawTimeout;
+		const requestedTimeoutSec = input.timeout ?? 300;
 		const timeoutSec = clampTimeout("bash", requestedTimeoutSec);
 		const timeoutMs = timeoutSec * 1000;
-		const pendingNotices: string[] = [];
+		const notices: string[] = [];
 		const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec);
-		if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
+		if (timeoutClampNotice) notices.push(timeoutClampNotice);
+
+		return { command, commandCwd, resolvedEnv, requestedTimeoutSec, timeoutSec, timeoutMs, notices };
+	}
+
+	/**
+	 * Start a background bash job for the Monitor tool. Reuses the full Bash
+	 * pipeline (interceptors, internal-URL expansion, env, cwd, timeout); the
+	 * public `monitor` tool itself is ACP-gated by `AgentSession` before this
+	 * helper is called. The caller-supplied `onRawLine` callback is invoked once
+	 * per newline-terminated stdout chunk, between turns, so the upstream Claude
+	 * Code "Each stdout line is a task-notification event" semantics are preserved
+	 * through the agent's existing background-task delivery path.
+	 */
+	async startMonitorJob(
+		input: { command: string; cwd?: string; timeout?: number; env?: Record<string, string> },
+		opts: {
+			ownerId?: string;
+			label?: string;
+			ctx?: AgentToolContext;
+			onRawLine?: (line: string, jobId: string) => void;
+		} = {},
+	): Promise<{ jobId: string; label: string; commandCwd: string }> {
+		const manager = AsyncJobManager.instance();
+		if (!manager) {
+			throw new ToolError("Async job manager unavailable for this session.");
+		}
+		const prepared = await this.#prepareBashExecution(input, opts.ctx);
+		const label =
+			opts.label ?? (prepared.command.length > 120 ? `${prepared.command.slice(0, 117)}...` : prepared.command);
+		const monitorTimeoutMs = input.timeout === undefined ? null : prepared.timeoutMs;
+		const onRawLine = opts.onRawLine;
+		let currentJobId = "";
+		let cursorOffset = 0;
+		let lineBuffer = "";
+		const dispatchLines = (chunk: string) => {
+			if (!onRawLine) return;
+			lineBuffer += chunk;
+			let newlineIndex = lineBuffer.indexOf("\n");
+			while (newlineIndex !== -1) {
+				const line = lineBuffer.slice(0, newlineIndex);
+				lineBuffer = lineBuffer.slice(newlineIndex + 1);
+				try {
+					onRawLine(line, currentJobId);
+				} catch (error) {
+					logger.warn("Monitor onRawLine callback failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				newlineIndex = lineBuffer.indexOf("\n");
+			}
+		};
+		const flushTrailingLine = () => {
+			if (!onRawLine) return;
+			if (lineBuffer.length === 0) return;
+			const remainder = lineBuffer;
+			lineBuffer = "";
+			try {
+				onRawLine(remainder, currentJobId);
+			} catch (error) {
+				logger.warn("Monitor onRawLine callback failed (trailing)", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
+
+		const ownerId = opts.ownerId ?? this.session.getAgentId?.() ?? undefined;
+		const jobId = manager.register(
+			"bash",
+			label,
+			async ({ jobId: id, signal, reportProgress }) => {
+				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+				try {
+					const result = await executeBash(prepared.command, {
+						cwd: prepared.commandCwd,
+						sessionKey: `${this.session.getSessionId?.() ?? ""}:monitor:${id}`,
+						timeout: monitorTimeoutMs,
+						signal,
+						env: prepared.resolvedEnv,
+						artifactPath,
+						artifactId,
+						onChunk: chunk => {
+							tailBuffer.append(chunk);
+							void reportProgress(tailBuffer.text(), {
+								async: { state: "running", jobId: id, type: "bash" },
+							});
+						},
+						onRawChunk: chunk => {
+							manager.appendOutput(id, chunk);
+							const slice = manager.readOutputSince(id, cursorOffset, ownerId ? { ownerId } : undefined);
+							if (!slice) return;
+							cursorOffset = slice.nextOffset;
+							dispatchLines(slice.text);
+						},
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					});
+					flushTrailingLine();
+					this.#buildResultText(result, prepared.timeoutSec, result.output || "(no output)");
+					return result.output;
+				} catch (error) {
+					flushTrailingLine();
+					throw error instanceof Error ? error : new Error(String(error));
+				}
+			},
+			{ ownerId },
+		);
+		currentJobId = jobId;
+		return { jobId, label, commandCwd: prepared.commandCwd };
+	}
+
+	async execute(
+		_toolCallId: string,
+		{
+			command: rawCommand,
+			env: rawEnv,
+			timeout: rawTimeout = 300,
+			cwd,
+
+			async: asyncRequested = false,
+			pty = false,
+		}: BashToolInput,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+		ctx?: AgentToolContext,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		if (asyncRequested && !this.#asyncEnabled) {
+			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
+		}
+		const prepared = await this.#prepareBashExecution(
+			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
+			ctx,
+		);
+		const {
+			command,
+			commandCwd,
+			resolvedEnv,
+			requestedTimeoutSec,
+			timeoutSec,
+			timeoutMs,
+			notices: pendingNotices,
+		} = prepared;
 
 		if (asyncRequested) {
 			if (!AsyncJobManager.instance()) {

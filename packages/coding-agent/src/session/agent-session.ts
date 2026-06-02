@@ -629,7 +629,11 @@ function createHandoffFileName(date = new Date()): string {
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "edit", "delete", "move"]);
+
+function isShellExecutionPermissionTool(toolName: string): boolean {
+	return toolName === "bash" || toolName === "monitor";
+}
 
 /** Permission options presented to the client on each gated tool call. */
 const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
@@ -694,7 +698,7 @@ function getPermissionIntent(
 	args: unknown,
 ): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
 	const a = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
-	if (toolName === "bash") {
+	if (isShellExecutionPermissionTool(toolName)) {
 		const cmd = getStringProperty(a, "command")?.slice(0, 80);
 		return { toolName, title: cmd || toolName, cacheKey: toolName };
 	}
@@ -1497,7 +1501,13 @@ export class AgentSession {
 	 */
 	#cancelOwnAsyncJobs(): void {
 		if (!this.#agentId) return;
-		AsyncJobManager.instance()?.cancelAll({ ownerId: this.#agentId });
+		const manager = AsyncJobManager.instance();
+		if (!manager) return;
+		// Run owner cleanups first so cron timers (and any other owner-scoped
+		// resource cleanup) cannot register fresh jobs while we tear down the
+		// existing ones. Cleanup callbacks are error-isolated inside the manager.
+		manager.runOwnerCleanups({ ownerId: this.#agentId });
+		manager.cancelAll({ ownerId: this.#agentId });
 	}
 
 	// =========================================================================
@@ -3395,8 +3405,9 @@ export class AgentSession {
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
+					const isShellExecutionTool = isShellExecutionPermissionTool(target.name);
 					const command =
-						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
+						isShellExecutionTool && args && typeof args === "object" && !Array.isArray(args)
 							? getStringProperty(args as Record<string, unknown>, "command")
 							: undefined;
 					const commandContent = command
@@ -3426,7 +3437,7 @@ export class AgentSession {
 								toolCallId,
 								toolName: target.name,
 								title: permissionIntent.title,
-								...(target.name === "bash" ? { kind: "execute" } : {}),
+								...(isShellExecutionTool ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
 								...(commandContent ? { content: commandContent } : {}),

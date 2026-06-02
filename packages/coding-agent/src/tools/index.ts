@@ -31,6 +31,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { FindTool } from "./find";
@@ -41,6 +42,7 @@ import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
+import { MonitorTool } from "./monitor";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
@@ -69,6 +71,7 @@ export * from "./bash";
 export * from "./browser";
 export * from "./calculator";
 export * from "./checkpoint";
+export * from "./cron";
 export * from "./debug";
 export * from "./eval";
 export * from "./find";
@@ -80,6 +83,7 @@ export * from "./image-gen";
 export * from "./inspect-image";
 export * from "./irc";
 export * from "./job";
+export * from "./monitor";
 export * from "./read";
 export * from "./recipe";
 export * from "./render-mermaid";
@@ -321,6 +325,10 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	task: s => TaskTool.create(s),
 	subagent: s => new SubagentTool(s),
 	job: JobTool.createIf,
+	monitor: MonitorTool.createIf,
+	CronCreate: CronCreateTool.createIf,
+	CronList: CronListTool.createIf,
+	CronDelete: CronDeleteTool.createIf,
 	recipe: RecipeTool.createIf,
 	irc: IrcTool.createIf,
 	todo_write: s => new TodoWriteTool(s),
@@ -468,6 +476,11 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const discoveryActive = effectiveDiscoveryMode !== "off";
 
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
+	const allToolFactoryEntries = Object.entries(allTools) as Array<[string, ToolFactory]>;
+	const allToolsByRequestName = new Map<string, [string, ToolFactory]>();
+	for (const [name, factory] of allToolFactoryEntries) {
+		allToolsByRequestName.set(name.toLowerCase(), [name, factory]);
+	}
 	const isToolAllowed = (name: string) => {
 		if (name === "goal") return goalEnabled && session.getGoalRuntime !== undefined;
 		if (goalStateToolNames.includes(name as (typeof GOAL_MODE_TOOL_NAMES)[number])) return goalEnabled;
@@ -511,10 +524,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		requestedTools.push("yield");
 	}
 
-	const filteredRequestedTools = requestedTools?.filter(name => name in allTools && isToolAllowed(name));
+	const filteredRequestedTools = requestedTools
+		?.map(name => allToolsByRequestName.get(name))
+		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)
+		.filter(([name]) => isToolAllowed(name));
 	const baseEntries =
 		filteredRequestedTools !== undefined
-			? filteredRequestedTools.filter(name => name !== "resolve").map(name => [name, allTools[name]] as const)
+			? filteredRequestedTools.filter(([name]) => name !== "resolve")
 			: [
 					...Object.entries(BUILTIN_TOOLS)
 						.filter(([name]) => isToolAllowed(name))

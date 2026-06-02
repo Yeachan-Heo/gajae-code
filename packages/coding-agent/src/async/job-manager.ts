@@ -78,6 +78,56 @@ export interface AsyncJobFilter {
 	ownerId?: string;
 }
 
+function sliceTextFromUtf8ByteOffset(text: string, offsetBytes: number): string {
+	if (offsetBytes <= 0) return text;
+	let consumedBytes = 0;
+	let codeUnitIndex = 0;
+	for (const char of text) {
+		const charBytes = Buffer.byteLength(char, "utf8");
+		if (consumedBytes + charBytes > offsetBytes) break;
+		consumedBytes += charBytes;
+		codeUnitIndex += char.length;
+	}
+	return text.slice(codeUnitIndex);
+}
+
+/**
+ * A slice of process-stream output for a background job, as recorded by
+ * `appendOutput` / read by `readOutputSince`.
+ *
+ * The cursor model is monotonic UTF-8 byte offsets. `nextOffset` is the offset
+ * to pass to the next read to receive only fresh bytes; `startOffset` is the
+ * first byte the manager still retains for this job. When the requested offset
+ * is older than `startOffset`, the manager returns the retained tail and sets
+ * `truncated: true`.
+ */
+export interface AsyncJobOutputSlice {
+	jobId: string;
+	status: AsyncJob["status"];
+	text: string;
+	startOffset: number;
+	nextOffset: number;
+	truncated: boolean;
+}
+
+/** Internal: a single chunk of captured stdout/stderr keyed by its byte range. */
+interface AsyncJobOutputChunk {
+	startByte: number;
+	endByte: number;
+	text: string;
+}
+
+interface AsyncJobOutputState {
+	chunks: AsyncJobOutputChunk[];
+	startOffset: number;
+	nextOffset: number;
+	retainedBytes: number;
+}
+
+/** Default retention cap for per-job captured output. ~512 KiB matches the
+ *  bash tail-buffer order of magnitude without dominating session memory. */
+export const DEFAULT_JOB_OUTPUT_RETENTION_BYTES = 512 * 1024;
+
 export class AsyncJobManager {
 	static #instance: AsyncJobManager | undefined;
 
@@ -102,6 +152,9 @@ export class AsyncJobManager {
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #watchedJobs = new Set<string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
+	readonly #outputState = new Map<string, AsyncJobOutputState>();
+	readonly #ownerCleanups = new Map<string, Set<() => void>>();
+	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -237,6 +290,169 @@ export class AsyncJobManager {
 		return this.#filterJobs(this.#jobs.values(), filter);
 	}
 
+	/**
+	 * Append a sanitized process-stream chunk for a background job. Called from
+	 * the unthrottled bash-executor capture hook (`onRawChunk`) so monitor sees
+	 * every chunk even when preview/progress callbacks are throttled.
+	 *
+	 * Offsets are in UTF-8 bytes. Storing chunk metadata avoids unsafe byte
+	 * slicing across multibyte characters at read time. The retention window is
+	 * a per-job rolling cap (`DEFAULT_JOB_OUTPUT_RETENTION_BYTES`); when it
+	 * overflows, oldest whole chunks are evicted and `startOffset` advances —
+	 * subsequent reads from a stale offset get `truncated: true`.
+	 */
+	appendOutput(jobId: string, chunk: string): void {
+		if (this.#disposed) return;
+		if (!chunk) return;
+		if (!this.#jobs.has(jobId)) return;
+
+		const state = this.#outputState.get(jobId) ?? {
+			chunks: [],
+			startOffset: 0,
+			nextOffset: 0,
+			retainedBytes: 0,
+		};
+
+		const byteLength = Buffer.byteLength(chunk, "utf8");
+		if (byteLength === 0) return;
+
+		const startByte = state.nextOffset;
+		const endByte = startByte + byteLength;
+		state.chunks.push({ startByte, endByte, text: chunk });
+		state.retainedBytes += byteLength;
+		state.nextOffset = endByte;
+
+		while (state.retainedBytes > this.#outputRetentionBytes && state.chunks.length > 0) {
+			const dropped = state.chunks.shift();
+			if (!dropped) break;
+			const droppedBytes = dropped.endByte - dropped.startByte;
+			state.retainedBytes -= droppedBytes;
+			state.startOffset = dropped.endByte;
+		}
+
+		this.#outputState.set(jobId, state);
+	}
+
+	/**
+	 * Read fresh process-stream output for a job since `offset` (in UTF-8
+	 * bytes). Returns `undefined` when the job does not exist or when an
+	 * `ownerId` filter is set and the job belongs to a different owner — this
+	 * mirrors the manager-level "not found" pattern used by `cancel`.
+	 *
+	 * - `offset < startOffset` returns the retained tail with `truncated: true`.
+	 * - `offset > nextOffset` clamps to `nextOffset` and returns an empty text
+	 *   slice with `truncated: false`.
+	 * - Assembled text slices the leading retained chunk at a UTF-8 codepoint
+	 *   boundary when needed, so multibyte characters cannot be split.
+	 */
+	readOutputSince(jobId: string, offset: number, filter?: AsyncJobFilter): AsyncJobOutputSlice | undefined {
+		const job = this.#jobs.get(jobId);
+		if (!job) return undefined;
+		if (filter?.ownerId && job.ownerId !== filter.ownerId) return undefined;
+
+		const state = this.#outputState.get(jobId);
+		if (!state) {
+			return {
+				jobId,
+				status: job.status,
+				text: "",
+				startOffset: 0,
+				nextOffset: 0,
+				truncated: false,
+			};
+		}
+
+		const requestedOffset = Math.max(0, Math.floor(offset));
+		if (requestedOffset >= state.nextOffset) {
+			return {
+				jobId,
+				status: job.status,
+				text: "",
+				startOffset: state.startOffset,
+				nextOffset: state.nextOffset,
+				truncated: false,
+			};
+		}
+
+		const truncated = requestedOffset < state.startOffset;
+		const effectiveOffset = truncated ? state.startOffset : requestedOffset;
+		const parts: string[] = [];
+		for (const chunk of state.chunks) {
+			if (chunk.endByte <= effectiveOffset) continue;
+			if (effectiveOffset > chunk.startByte) {
+				parts.push(sliceTextFromUtf8ByteOffset(chunk.text, effectiveOffset - chunk.startByte));
+				continue;
+			}
+			parts.push(chunk.text);
+		}
+
+		return {
+			jobId,
+			status: job.status,
+			text: parts.join(""),
+			startOffset: state.startOffset,
+			nextOffset: state.nextOffset,
+			truncated,
+		};
+	}
+
+	/**
+	 * Register an owner-scoped cleanup callback. Returns an unregister function.
+	 *
+	 * Used by Cron* tools to clear session-scoped timers when the owning agent
+	 * is torn down. Invoked by `runOwnerCleanups({ ownerId })` before
+	 * `cancelAll({ ownerId })` so timers cannot register new jobs during
+	 * teardown.
+	 */
+	registerOwnerCleanup(ownerId: string, cleanup: () => void): () => void {
+		if (!ownerId) {
+			throw new Error("registerOwnerCleanup requires a non-empty ownerId");
+		}
+		let bag = this.#ownerCleanups.get(ownerId);
+		if (!bag) {
+			bag = new Set();
+			this.#ownerCleanups.set(ownerId, bag);
+		}
+		bag.add(cleanup);
+		return () => {
+			const current = this.#ownerCleanups.get(ownerId);
+			if (!current) return;
+			current.delete(cleanup);
+			if (current.size === 0) this.#ownerCleanups.delete(ownerId);
+		};
+	}
+
+	/**
+	 * Run and clear every registered cleanup for the given filter. Idempotent
+	 * and error-isolated: a throwing cleanup does not prevent siblings from
+	 * running and never escalates to the caller.
+	 */
+	runOwnerCleanups(filter?: AsyncJobFilter): void {
+		const ownerId = filter?.ownerId;
+		const targets: Array<[string, Set<() => void>]> = [];
+		if (ownerId) {
+			const bag = this.#ownerCleanups.get(ownerId);
+			if (bag) targets.push([ownerId, bag]);
+		} else {
+			for (const entry of this.#ownerCleanups.entries()) targets.push(entry);
+		}
+		for (const [id, bag] of targets) {
+			const callbacks = Array.from(bag);
+			bag.clear();
+			this.#ownerCleanups.delete(id);
+			for (const cleanup of callbacks) {
+				try {
+					cleanup();
+				} catch (error) {
+					logger.warn("Async job owner cleanup failed", {
+						ownerId: id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		}
+	}
+
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
@@ -357,6 +573,10 @@ export class AsyncJobManager {
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
 		this.#disposed = true;
 		this.#clearEvictionTimers();
+		// Run-and-clear any remaining owner cleanups before tearing down jobs so
+		// late-arriving timers cannot register fresh work against a disposed
+		// manager. Errors in cleanup callbacks are logged but never escalated.
+		this.runOwnerCleanups();
 		this.cancelAll();
 		await this.waitForAll();
 		const drained = await this.drainDeliveries({ timeoutMs: options?.timeoutMs ?? 3_000 });
@@ -366,6 +586,8 @@ export class AsyncJobManager {
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
+		this.#outputState.clear();
+		this.#ownerCleanups.clear();
 		return drained;
 	}
 
@@ -399,6 +621,7 @@ export class AsyncJobManager {
 			this.#jobs.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
 			this.#watchedJobs.delete(jobId);
+			this.#outputState.delete(jobId);
 			return;
 		}
 		const existing = this.#evictionTimers.get(jobId);
@@ -410,6 +633,7 @@ export class AsyncJobManager {
 			this.#jobs.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
 			this.#watchedJobs.delete(jobId);
+			this.#outputState.delete(jobId);
 		}, this.#retentionMs);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);

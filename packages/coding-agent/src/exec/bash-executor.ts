@@ -13,8 +13,15 @@ import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
 
 export interface BashExecutorOptions {
 	cwd?: string;
-	timeout?: number;
+	timeout?: number | null;
 	onChunk?: (chunk: string) => void;
+	/**
+	 * Unthrottled per-chunk callback that fires for every sanitized stdout/stderr
+	 * chunk *before* preview throttling. Background-job substrate uses this to
+	 * record the complete process stream for the Monitor tool while keeping
+	 * `onChunk` cheap for UI/progress rendering.
+	 */
+	onRawChunk?: (chunk: string) => void;
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
 	sessionKey?: string;
@@ -92,6 +99,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
+		onRawChunk: options?.onRawChunk,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
@@ -154,11 +162,14 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	let timeoutTimer: NodeJS.Timeout | undefined;
 	const timeoutDeferred = Promise.withResolvers<"timeout">();
-	const baseTimeoutMs = Math.max(1_000, options?.timeout ?? 300_000);
-	timeoutTimer = setTimeout(() => {
-		abortCurrentExecution();
-		timeoutDeferred.resolve("timeout");
-	}, baseTimeoutMs);
+	const executionTimeoutMs = options?.timeout === null ? undefined : (options?.timeout ?? 300_000);
+	const baseTimeoutMs = executionTimeoutMs === undefined ? undefined : Math.max(1_000, executionTimeoutMs);
+	if (baseTimeoutMs !== undefined) {
+		timeoutTimer = setTimeout(() => {
+			abortCurrentExecution();
+			timeoutDeferred.resolve("timeout");
+		}, baseTimeoutMs);
+	}
 
 	let resetSession = false;
 
@@ -169,7 +180,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						command: finalCommand,
 						cwd: commandCwd,
 						env: commandEnv,
-						timeoutMs: options?.timeout,
+						timeoutMs: executionTimeoutMs,
 						signal: runAbortController.signal,
 					},
 					(err, chunk) => {
@@ -186,7 +197,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						sessionEnv: shellEnv,
 						snapshotPath: snapshotPath ?? undefined,
 						minimizer,
-						timeoutMs: options?.timeout,
+						timeoutMs: executionTimeoutMs,
 						signal: runAbortController.signal,
 					},
 					(err, chunk) => {
@@ -215,7 +226,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				exitCode: undefined,
 				cancelled: true,
 				...(await sink.dump(
-					winner.kind === "timeout"
+					winner.kind === "timeout" && baseTimeoutMs !== undefined
 						? `Command timed out after ${Math.round(baseTimeoutMs / 1000)} seconds`
 						: "Command cancelled",
 				)),

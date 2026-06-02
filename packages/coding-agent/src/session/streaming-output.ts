@@ -58,6 +58,17 @@ export interface OutputSinkOptions {
 	onChunk?: (chunk: string) => void;
 	/** Minimum ms between onChunk calls. 0 = every chunk (default). */
 	chunkThrottleMs?: number;
+	/**
+	 * Unthrottled per-chunk callback fired *after* sanitization but *before*
+	 * any throttle gating, column capping, or head/tail bookkeeping. Used by
+	 * background-job substrate to record the complete process stream for the
+	 * Monitor tool while keeping `onChunk` cheap for UI/progress.
+	 *
+	 * Receives the sanitized chunk verbatim; never receives the column-capped
+	 * or minimized text. Implementations must be fast and side-effect-free
+	 * relative to the sink (the sink does not catch errors from this callback).
+	 */
+	onRawChunk?: (chunk: string) => void;
 }
 
 export interface TruncationResult {
@@ -672,6 +683,7 @@ export class OutputSink {
 	readonly #spillThreshold: number;
 	readonly #headLimit: number;
 	readonly #onChunk?: (chunk: string) => void;
+	readonly #onRawChunk?: (chunk: string) => void;
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
 
@@ -684,6 +696,7 @@ export class OutputSink {
 			maxColumns = 0,
 			onChunk,
 			chunkThrottleMs = 0,
+			onRawChunk,
 		} = options ?? {};
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
@@ -691,6 +704,7 @@ export class OutputSink {
 		this.#headLimit = Math.max(0, headBytes);
 		this.#maxColumns = Math.max(0, maxColumns);
 		this.#onChunk = onChunk;
+		this.#onRawChunk = onRawChunk;
 		this.#chunkThrottleMs = chunkThrottleMs;
 	}
 
@@ -700,6 +714,13 @@ export class OutputSink {
 	 */
 	push(chunk: string): void {
 		chunk = sanitizeWithOptionalSixelPassthrough(chunk, sanitizeText);
+
+		// Unthrottled raw-chunk hook fires before any throttle/cap gating so
+		// downstream consumers (e.g. AsyncJobManager.appendOutput) can record
+		// the complete process stream while UI/progress callbacks remain throttled.
+		if (this.#onRawChunk && chunk.length > 0) {
+			this.#onRawChunk(chunk);
+		}
 
 		// Throttled onChunk: only call the callback when enough time has passed.
 		// Live preview gets the raw (pre-cap) chunk so the TUI never lags behind

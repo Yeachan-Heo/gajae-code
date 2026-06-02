@@ -1,0 +1,28 @@
+{
+  "captured_at": "2026-06-02T01:05:00Z",
+  "claude_version": "2.1.152 (Claude Code)",
+  "capture_command": "strings /Users/bellman/.local/share/claude/versions/2.1.152 | grep -E 'CronDelete|buildCronDeletePrompt|Cancel a cron job' + https://code.claude.com/docs/en/scheduled-tasks",
+  "tool_name": "CronDelete",
+  "description": "Cancel a cron job previously scheduled with CronCreate. Removes it from the in-memory session store (and, when durable cron is enabled, from .claude/scheduled_tasks.json). Idempotent: deleting an unknown id reports 'not found' without raising.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "The 8-character job ID returned by CronCreate.",
+        "minLength": 1
+      }
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "observed_returns": [
+    "Cancelled <id>",
+    "No scheduled jobs (when listing after delete)",
+    "Failed to remove scheduled task '<id>' (when id does not exist)"
+  ],
+  "notes": [
+    "Source-of-truth strings extracted verbatim from the local claude binary: var GC=\"CronDelete\"; AW8=\"Cancel a scheduled cron job by ID\"; buildCronDeletePrompt contains the full prompt block.",
+    "CronDelete is the only way to cancel a recurring cron job before its 7-day expiry; one-shot jobs self-delete after firing."
+  ]
+}
