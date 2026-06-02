@@ -67,6 +67,10 @@ const CALLBACK_SERVER_PROVIDERS = new Set<OAuthProvider>([
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
 
+function isThemePreviewSuperseded(result: { success: boolean; error?: string }): boolean {
+	return !result.success && result.error?.includes("superseded by a newer request") === true;
+}
+
 function formatProviderOnboardingCommandGuide(): string {
 	return [
 		"Provider preset setup:",
@@ -139,6 +143,22 @@ export class SelectorController {
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
+						onThemePreview: themeName => {
+							return previewTheme(themeName).then(result => {
+								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+									this.ctx.showError(`Failed to preview theme: ${result.error}`);
+								}
+								this.#refreshThemeUi();
+							});
+						},
+						onThemePreviewCancel: themeName => {
+							return restoreThemePreview(themeName).then(result => {
+								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+									this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+								}
+								this.#refreshThemeUi();
+							});
+						},
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({

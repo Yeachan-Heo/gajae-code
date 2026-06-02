@@ -21,7 +21,7 @@ import type {
 	StatusLineSeparatorStyle,
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
-import { getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
+import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
@@ -200,6 +200,10 @@ export interface StatusLinePreviewSettings {
 export interface SettingsCallbacks {
 	/** Called when any setting value changes */
 	onChange: (path: SettingPath, newValue: unknown) => void;
+	/** Called for theme preview while browsing theme settings */
+	onThemePreview?: (theme: string) => void | Promise<void>;
+	/** Called to restore the rendered theme when theme settings preview is cancelled */
+	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
@@ -217,7 +221,6 @@ export interface SettingsCallbacks {
 export class SettingsSelectorComponent extends Container {
 	#tabBar: TabBar;
 	#currentList: SettingsList | null = null;
-	#currentSubmenu: Container | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
 	#statusPreviewContainer: Container | null = null;
 	#statusPreviewText: Text | null = null;
@@ -374,10 +377,15 @@ export class SettingsSelectorComponent extends Container {
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
 		let onPreviewCancel: (() => void) | undefined;
 
-		// Theme selection is confirm-only: moving through the list must not mutate
-		// the rendered theme while the displayed/persisted setting still names
-		// the previous value. Confirmation persists through Settings hooks.
-		if (def.path === "statusLine.preset") {
+		if (def.path === "theme.dark" || def.path === "theme.light") {
+			const activeThemeBeforePreview = getCurrentThemeName() ?? currentValue;
+			onPreview = value => {
+				return this.callbacks.onThemePreview?.(value);
+			};
+			onPreviewCancel = () => {
+				return this.callbacks.onThemePreviewCancel?.(activeThemeBeforePreview);
+			};
+		} else if (def.path === "statusLine.preset") {
 			onPreview = value => {
 				const presetDef = getPreset(
 					value as "default" | "minimal" | "compact" | "full" | "nerd" | "ascii" | "custom",
@@ -612,17 +620,20 @@ export class SettingsSelectorComponent extends Container {
 			return;
 		}
 
-		// Escape at top level cancels
-		if (matchesAppInterrupt(data) && !this.#currentSubmenu) {
-			this.callbacks.onCancel();
+		// Pass to current content. SettingsList owns Escape routing so open
+		// submenus can run their cancel/restore callbacks before closing.
+		if (this.#currentList) {
+			this.#currentList.handleInput(data);
+			return;
+		}
+		if (this.#pluginComponent) {
+			this.#pluginComponent.handleInput(data);
 			return;
 		}
 
-		// Pass to current content
-		if (this.#currentList) {
-			this.#currentList.handleInput(data);
-		} else if (this.#pluginComponent) {
-			this.#pluginComponent.handleInput(data);
+		// Fallback for future top-level content that does not own cancellation.
+		if (matchesAppInterrupt(data)) {
+			this.callbacks.onCancel();
 		}
 	}
 }

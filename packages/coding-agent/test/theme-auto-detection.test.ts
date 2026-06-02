@@ -165,6 +165,20 @@ describe("theme auto-detection", () => {
 		expect(themeModule.theme.getFgAnsi("accent")).toBe(darkAccent);
 	});
 
+	it("auto theme remapping supersedes an in-flight preview", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+
+		const preview = themeModule.previewTheme("light");
+		themeModule.setAutoThemeMapping("dark", "dark");
+		await preview;
+		await Bun.sleep(0);
+
+		expect(themeModule.getCurrentThemeName()).toBe("dark");
+		expect(themeModule.theme.getFgAnsi("accent")).toBe(darkAccent);
+	});
+
 	it("Zellij fallback stays macOS-only (Linux + Zellij = honor terminal)", async () => {
 		using _globals = withThemeTestGlobals({ platform: "linux", zellij: "1" });
 		const detectSpy = vi.spyOn(nativesModule, "detectMacOSAppearance").mockReturnValue(MacOSAppearance.Light);

@@ -2091,10 +2091,12 @@ async function startThemeWatcher(): Promise<void> {
 function reevaluateAutoTheme(debugLabel: string): void {
 	if (!autoDetectedTheme) return;
 	const resolved = getDefaultTheme();
+	const requestId = ++themeLoadRequestId;
 	if (resolved === currentThemeName && !previewThemeActive) return;
 	currentThemeName = resolved;
 	loadTheme(resolved, getCurrentThemeOptions())
 		.then(loadedTheme => {
+			if (requestId !== themeLoadRequestId) return;
 			theme = loadedTheme;
 			previewThemeActive = false;
 			if (onThemeChangeCallback) {
@@ -2102,6 +2104,7 @@ function reevaluateAutoTheme(debugLabel: string): void {
 			}
 		})
 		.catch(err => {
+			if (requestId !== themeLoadRequestId) return;
 			logger.debug(`Theme switch on ${debugLabel} failed`, { error: String(err) });
 		});
 }

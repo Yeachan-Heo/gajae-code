@@ -1,9 +1,22 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { SettingPath } from "@gajae-code/coding-agent/config/settings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 
 const THEMES = ["red-claw", "anthracite", "light"];
+
+type ChangedSetting = {
+	path: SettingPath;
+	value: unknown;
+};
+
+type SelectorHarness = {
+	component: SettingsSelectorComponent;
+	previewedThemes: string[];
+	restoredThemes: string[];
+	changedSettings: ChangedSetting[];
+};
 
 beforeAll(async () => {
 	await initTheme(false, undefined, undefined, "red-claw", "light");
@@ -18,10 +31,14 @@ beforeEach(async () => {
 
 afterEach(() => {
 	resetSettingsForTest();
+	vi.restoreAllMocks();
 });
 
-function createSelector(): SettingsSelectorComponent {
-	return new SettingsSelectorComponent(
+function createSelector(): SelectorHarness {
+	const previewedThemes: string[] = [];
+	const restoredThemes: string[] = [];
+	const changedSettings: ChangedSetting[] = [];
+	const component = new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
@@ -29,55 +46,85 @@ function createSelector(): SettingsSelectorComponent {
 			cwd: process.cwd(),
 		},
 		{
-			onChange: () => {},
+			onChange: (path, value) => {
+				changedSettings.push({ path, value });
+			},
+			onThemePreview: themeName => {
+				previewedThemes.push(themeName);
+			},
+			onThemePreviewCancel: themeName => {
+				restoredThemes.push(themeName);
+			},
 			onCancel: () => {},
 			getStatusLinePreview: () => "status-preview",
 		},
 	);
+	return { component, previewedThemes, restoredThemes, changedSettings };
 }
 
 describe("SettingsSelectorComponent theme selection", () => {
-	it("does not preview or persist a dark theme while browsing, and cancel leaves the displayed value unchanged", () => {
-		const comp = createSelector();
+	it("previews a dark theme while browsing without persisting it", () => {
+		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
-		comp.handleInput("\n"); // Open Dark Theme submenu; red-claw is preselected.
-		comp.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\n"); // Open Dark Theme submenu; red-claw is preselected.
+		component.handleInput("\x1b[B"); // Browse to anthracite.
 
+		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(restoredThemes).toEqual([]);
+		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
+	});
 
-		comp.handleInput("\x1b"); // Cancel submenu.
+	it("restores the pre-preview rendered theme on cancel and leaves dark settings unchanged", () => {
+		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
+		component.handleInput("\n"); // Open Dark Theme submenu; red-claw is preselected.
+		component.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\x1b"); // Cancel submenu.
+
+		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(restoredThemes).toEqual(["red-claw"]);
+		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
-		expect(comp.render(120).join("\n")).toContain("red-claw");
+		expect(component.render(120).join("\n")).toContain("red-claw");
 	});
 
 	it("persists and displays the selected dark theme only after confirmation", () => {
-		const comp = createSelector();
+		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
-		comp.handleInput("\n"); // Open Dark Theme submenu.
-		comp.handleInput("\x1b[B"); // Browse to anthracite.
-		comp.handleInput("\n"); // Confirm.
+		component.handleInput("\n"); // Open Dark Theme submenu.
+		component.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\n"); // Confirm.
 
+		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(restoredThemes).toEqual([]);
+		expect(changedSettings).toEqual([{ path: "theme.dark", value: "anthracite" }]);
 		expect(settings.get("theme.dark")).toBe("anthracite");
-		const rendered = comp.render(120).join("\n");
+		const rendered = component.render(120).join("\n");
 		expect(rendered).toContain("Dark Theme");
 		expect(rendered).toContain("anthracite");
 	});
 
-	it("keeps light theme browsing confirm-only as well", () => {
-		const comp = createSelector();
+	it("keeps light theme preview independent from persisted light settings", () => {
+		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
-		comp.handleInput("\x1b[B"); // Move from Dark Theme to Light Theme.
-		comp.handleInput("\n"); // Open Light Theme submenu; light is preselected.
-		comp.handleInput("\x1b[B"); // Wrap to red-claw.
-		comp.handleInput("\x1b"); // Cancel.
+		component.handleInput("\x1b[B"); // Move from Dark Theme to Light Theme.
+		component.handleInput("\n"); // Open Light Theme submenu; light is preselected.
+		component.handleInput("\x1b[B"); // Wrap to red-claw.
+		component.handleInput("\x1b"); // Cancel.
 
+		expect(previewedThemes).toEqual(["red-claw"]);
+		expect(restoredThemes).toEqual(["red-claw"]);
+		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.light")).toBe("light");
 
-		comp.handleInput("\n"); // Reopen Light Theme submenu.
-		comp.handleInput("\x1b[B"); // Wrap to red-claw.
-		comp.handleInput("\n"); // Confirm.
+		component.handleInput("\n"); // Reopen Light Theme submenu.
+		component.handleInput("\x1b[B"); // Wrap to red-claw.
+		component.handleInput("\n"); // Confirm.
 
+		expect(previewedThemes).toEqual(["red-claw", "red-claw"]);
+		expect(restoredThemes).toEqual(["red-claw"]);
+		expect(changedSettings).toEqual([{ path: "theme.light", value: "red-claw" }]);
 		expect(settings.get("theme.light")).toBe("red-claw");
 	});
 });
