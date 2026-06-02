@@ -590,7 +590,7 @@ describe("AskTool custom input", () => {
 		expect(result.content[0].text).toContain("alpha");
 		expect(result.content[0].text).toContain("custom detail");
 
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
@@ -645,7 +645,7 @@ describe("AskTool custom input", () => {
 
 describe("AskTool option rendering", () => {
 	it("wraps long single-question option labels without ellipsis", async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const longLabel =
 			"Wrap this long option label across multiple indented lines so the entire choice remains visible to the user";
@@ -667,7 +667,7 @@ describe("AskTool option rendering", () => {
 	});
 
 	it("wraps long multi-question option labels under their option prefix", async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const longLabel =
 			"Keep every multi question option fully readable by wrapping continuation text under the checkbox prefix";
@@ -722,7 +722,7 @@ describe("AskTool multiline custom input rendering", () => {
 
 		expect(result.details?.customInput).toBe(multilineText);
 
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
@@ -777,7 +777,7 @@ describe("AskTool multiline custom input rendering", () => {
 			context,
 		);
 
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));

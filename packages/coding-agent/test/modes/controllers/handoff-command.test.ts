@@ -17,7 +17,7 @@ function createContainer() {
 
 describe("/handoff command", () => {
 	beforeAll(async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		if (!theme) throw new Error("Expected dark theme");
 		setThemeInstance(theme);
 	});

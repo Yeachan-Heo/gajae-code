@@ -76,7 +76,7 @@ retry:
 
 ## Default TUI identity
 
-The default dark TUI identity is the GJC red-claw theme: a red/orange crustacean look for Gajae-Code terminals. Explicit user theme settings still win.
+The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Explicit user theme settings still win.
 
 ## Why Gajae-Code?
 
@@ -163,7 +163,7 @@ Thanks to the people and agents helping shape the early Gajae-Code releases, inc
 
 ## Inspirations and lineage
 
-Gajae-Code's default dark TUI identity is the GJC red-claw theme. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
+Gajae-Code's default TUI identity is the crustacean pair: red-claw for dark appearance and blue-crab for light appearance. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
 
 ## License
 

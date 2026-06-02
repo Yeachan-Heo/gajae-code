@@ -34,6 +34,8 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 	const settings = await readText("packages/coding-agent/src/config/settings-schema.ts");
 	const themeRuntime = await readText("packages/coding-agent/src/modes/theme/theme.ts");
 	const redClaw = await readJson("packages/coding-agent/src/modes/theme/defaults/red-claw.json");
+	const blueCrab = await readJson("packages/coding-agent/src/modes/theme/defaults/blue-crab.json");
+	const defaultIndex = await readText("packages/coding-agent/src/modes/theme/defaults/index.ts");
 	const colors = isRecord(redClaw.colors) ? redClaw.colors : {};
 	const vars = isRecord(redClaw.vars) ? redClaw.vars : {};
 
@@ -48,11 +50,23 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 		.filter(([left, right]) => resolveColor(colors[left], vars) === resolveColor(colors[right], vars))
 		.map(([left, right]) => `${left} matches ${right}`);
 
+	const retainedBuiltIns =
+		[...defaultIndex.matchAll(/^import /gm)].length === 2 &&
+		[...defaultIndex.matchAll(/^\t"/gm)].length === 2 &&
+		defaultIndex.includes('"blue-crab": blue_crab') &&
+		defaultIndex.includes('"red-claw": red_claw') &&
+		!defaultIndex.includes("dark_") &&
+		!defaultIndex.includes("light_") &&
+		isRecord(blueCrab.colors);
+
 	return {
-		name: "red-claw theme defaults and semantic token split",
+		name: "red-claw/blue-crab theme defaults and semantic token split",
 		passed:
 			settings.includes('default: "red-claw"') &&
+			settings.includes('default: "blue-crab"') &&
 			themeRuntime.includes('autoDarkTheme: string = "red-claw"') &&
+			themeRuntime.includes('autoLightTheme: string = "blue-crab"') &&
+			retainedBuiltIns &&
 			resolveColor(colors.accent, vars) === resolveColor(vars.claw, vars) &&
 			resolveColor(colors.error, vars) === resolveColor(vars.dangerRed, vars) &&
 			resolveColor(colors.warning, vars) === resolveColor(vars.warningAmber, vars) &&
@@ -60,7 +74,10 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 			semanticFindings.length === 0,
 		details: [
 			`settings default red-claw: ${settings.includes('default: "red-claw"')}`,
+			`settings default blue-crab: ${settings.includes('default: "blue-crab"')}`,
 			`runtime autoDarkTheme red-claw: ${themeRuntime.includes('autoDarkTheme: string = "red-claw"')}`,
+			`runtime autoLightTheme blue-crab: ${themeRuntime.includes('autoLightTheme: string = "blue-crab"')}`,
+			`retained built-ins only: ${retainedBuiltIns}`,
 			`semantic collisions: ${semanticFindings.join("; ") || "<none>"}`,
 		],
 	};
@@ -146,15 +163,21 @@ async function verifyDocsBranding(): Promise<GateResult> {
 	const packageReadme = await readText("packages/coding-agent/README.md");
 	const themeDoc = await readText("docs/theme.md");
 	return {
-		name: "public docs current GJC/red-claw direction",
+		name: "public docs current GJC crustacean theme direction",
 		passed:
 			rootReadme.includes("default dark TUI identity is the GJC red-claw theme") &&
+			rootReadme.includes("light-appearance terminals default to the bundled blue-crab theme") &&
 			packageReadme.includes("defaults to the bundled `red-claw`") &&
-			themeDoc.includes('theme.dark = "red-claw"'),
+			packageReadme.includes("bundled `blue-crab` theme") &&
+			themeDoc.includes('theme.dark = "red-claw"') &&
+			themeDoc.includes('theme.light = "blue-crab"'),
 		details: [
 			`README GJC red-claw default: ${rootReadme.includes("default dark TUI identity is the GJC red-claw theme")}`,
+			`README blue-crab light default: ${rootReadme.includes("light-appearance terminals default to the bundled blue-crab theme")}`,
 			`package README default red-claw: ${packageReadme.includes("defaults to the bundled `red-claw`")}`,
+			`package README default blue-crab: ${packageReadme.includes("bundled `blue-crab` theme")}`,
 			`theme docs default red-claw: ${themeDoc.includes('theme.dark = "red-claw"')}`,
+			`theme docs default blue-crab: ${themeDoc.includes('theme.light = "blue-crab"')}`,
 		],
 	};
 }

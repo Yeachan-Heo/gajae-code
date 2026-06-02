@@ -14,16 +14,17 @@ describe("GJC red-claw redesign defaults", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("uses red-claw as the default dark theme without overriding explicit light settings", async () => {
+	it("uses red-claw as the default dark theme and blue-crab as the default light theme", async () => {
 		themeModule.onTerminalAppearanceChange("dark");
 		await themeModule.initTheme(false);
 
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
+		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
 		expect(themeModule.getCurrentThemeName()).toBe("red-claw");
 
 		themeModule.onTerminalAppearanceChange("light");
 		await themeModule.initTheme(false);
-		expect(themeModule.getCurrentThemeName()).toBe("light");
+		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
 	});
 
 	it("keeps red-claw brand tokens separate from semantic warning/error/diff tokens", async () => {
@@ -46,11 +47,12 @@ describe("GJC red-claw redesign defaults", () => {
 		expect(new Set([colors.accent, colors.error, colors.warning, colors.toolDiffRemoved]).size).toBe(4);
 	});
 
-	it("registers blue-crab as a bundled selectable theme without changing red-claw defaults", async () => {
+	it("exposes only red-claw and blue-crab as bundled selectable themes", async () => {
 		const themes = await themeModule.getAvailableThemes();
 
-		expect(themes).toContain("blue-crab");
+		expect(themes).toEqual(["blue-crab", "red-claw"]);
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
+		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
 	});
 
 	it("keeps blue-crab coastal tokens separate from semantic warning/error/diff tokens", async () => {

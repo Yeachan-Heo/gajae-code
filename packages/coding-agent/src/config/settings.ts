@@ -5,7 +5,7 @@
  *   import { settings } from "./settings";
  *
  *   const enabled = settings.get("compaction.enabled");  // sync read
- *   settings.set("theme.dark", "titanium");               // sync write, saves in background
+ *   settings.set("theme.dark", "red-claw");              // sync write, saves in background
  *
  * For tests:
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
@@ -17,6 +17,7 @@ import * as path from "node:path";
 import {
 	getAgentDbPath,
 	getAgentDir,
+	getCustomThemesDir,
 	getProjectDir,
 	isEnoent,
 	logger,
@@ -100,6 +101,14 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 }
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
+const LEGACY_THEME_NAME_REPLACEMENTS = {
+	dark: "red-claw",
+	light: "blue-crab",
+} as const;
+
+function isLegacyThemeName(name: string): name is keyof typeof LEGACY_THEME_NAME_REPLACEMENTS {
+	return name === "dark" || name === "light";
+}
 
 type PathScopedStringArrayEntry = {
 	path?: unknown;
@@ -587,6 +596,25 @@ export class Settings {
 		}
 	}
 
+	#hasCustomThemeFile(name: string): boolean {
+		try {
+			return fs.existsSync(path.join(getCustomThemesDir(this.#agentDir), `${name}.json`));
+		} catch {
+			return false;
+		}
+	}
+
+	#migrateLegacyBuiltInThemeName(name: string): string {
+		if (isLegacyThemeName(name) && !this.#hasCustomThemeFile(name)) {
+			return LEGACY_THEME_NAME_REPLACEMENTS[name];
+		}
+		return name;
+	}
+
+	#getThemeSlotForName(name: string): "dark" | "light" {
+		return isLightTheme(name, this.#agentDir) ? "light" : "dark";
+	}
+
 	/** Apply schema migrations to raw settings */
 	#migrateRawSettings(raw: RawSettings): RawSettings {
 		// queueMode -> steeringMode
@@ -606,13 +634,22 @@ export class Settings {
 		// Migrate old flat "theme" string to nested theme.dark/theme.light
 		if (typeof raw.theme === "string") {
 			const oldTheme = raw.theme;
-			if (oldTheme === "light" || oldTheme === "dark") {
-				// Built-in defaults — just remove, let new defaults apply
-				delete raw.theme;
+			const migratedTheme = this.#migrateLegacyBuiltInThemeName(oldTheme);
+			if (oldTheme === "dark" && migratedTheme === "red-claw") {
+				raw.theme = { dark: migratedTheme };
+			} else if (oldTheme === "light" && migratedTheme === "blue-crab") {
+				raw.theme = { light: migratedTheme };
 			} else {
-				// Custom theme — detect luminance to place in correct slot
-				const slot = isLightTheme(oldTheme) ? "light" : "dark";
-				raw.theme = { [slot]: oldTheme };
+				const slot = this.#getThemeSlotForName(migratedTheme);
+				raw.theme = { [slot]: migratedTheme };
+			}
+		} else if (raw.theme && typeof raw.theme === "object" && !Array.isArray(raw.theme)) {
+			const themeObj = raw.theme as Record<string, unknown>;
+			if (typeof themeObj.dark === "string") {
+				themeObj.dark = this.#migrateLegacyBuiltInThemeName(themeObj.dark);
+			}
+			if (typeof themeObj.light === "string") {
+				themeObj.light = this.#migrateLegacyBuiltInThemeName(themeObj.light);
 			}
 		}
 

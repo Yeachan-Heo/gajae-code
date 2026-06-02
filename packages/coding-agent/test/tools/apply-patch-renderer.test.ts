@@ -1,18 +1,28 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
 import type { TUI } from "@gajae-code/tui";
 
 async function getUiTheme() {
-	await themeModule.initTheme(false, undefined, undefined, "dark", "light");
-	const theme = await themeModule.getThemeByName("dark");
+	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+	const theme = await themeModule.getThemeByName("red-claw");
 	expect(theme).toBeDefined();
 	return theme!;
 }
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+});
 
 describe("apply_patch rendering", () => {
 	it("registers apply_patch to use the edit renderer", () => {

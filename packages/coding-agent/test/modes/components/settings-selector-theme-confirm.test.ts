@@ -4,7 +4,7 @@ import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-age
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 
-const THEMES = ["red-claw", "anthracite", "light"];
+const THEMES = ["red-claw", "blue-crab"];
 
 type ChangedSetting = {
 	path: SettingPath;
@@ -19,14 +19,14 @@ type SelectorHarness = {
 };
 
 beforeAll(async () => {
-	await initTheme(false, undefined, undefined, "red-claw", "light");
+	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
 });
 
 beforeEach(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
 	settings.set("theme.dark", "red-claw");
-	settings.set("theme.light", "light");
+	settings.set("theme.light", "blue-crab");
 });
 
 afterEach(() => {
@@ -67,9 +67,9 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
 		component.handleInput("\n"); // Open Dark Theme submenu; red-claw is preselected.
-		component.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\x1b[B"); // Browse to blue-crab.
 
-		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(previewedThemes).toEqual(["blue-crab"]);
 		expect(restoredThemes).toEqual([]);
 		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
@@ -79,10 +79,10 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
 		component.handleInput("\n"); // Open Dark Theme submenu; red-claw is preselected.
-		component.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\x1b[B"); // Browse to blue-crab.
 		component.handleInput("\x1b"); // Cancel submenu.
 
-		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(previewedThemes).toEqual(["blue-crab"]);
 		expect(restoredThemes).toEqual(["red-claw"]);
 		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
@@ -93,30 +93,30 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
 		component.handleInput("\n"); // Open Dark Theme submenu.
-		component.handleInput("\x1b[B"); // Browse to anthracite.
+		component.handleInput("\x1b[B"); // Browse to blue-crab.
 		component.handleInput("\n"); // Confirm.
 
-		expect(previewedThemes).toEqual(["anthracite"]);
+		expect(previewedThemes).toEqual(["blue-crab"]);
 		expect(restoredThemes).toEqual([]);
-		expect(changedSettings).toEqual([{ path: "theme.dark", value: "anthracite" }]);
-		expect(settings.get("theme.dark")).toBe("anthracite");
+		expect(changedSettings).toEqual([{ path: "theme.dark", value: "blue-crab" }]);
+		expect(settings.get("theme.dark")).toBe("blue-crab");
 		const rendered = component.render(120).join("\n");
 		expect(rendered).toContain("Dark Theme");
-		expect(rendered).toContain("anthracite");
+		expect(rendered).toContain("blue-crab");
 	});
 
 	it("keeps light theme preview independent from persisted light settings", () => {
 		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 
 		component.handleInput("\x1b[B"); // Move from Dark Theme to Light Theme.
-		component.handleInput("\n"); // Open Light Theme submenu; light is preselected.
+		component.handleInput("\n"); // Open Light Theme submenu; blue-crab is preselected.
 		component.handleInput("\x1b[B"); // Wrap to red-claw.
 		component.handleInput("\x1b"); // Cancel.
 
 		expect(previewedThemes).toEqual(["red-claw"]);
 		expect(restoredThemes).toEqual(["red-claw"]);
 		expect(changedSettings).toEqual([]);
-		expect(settings.get("theme.light")).toBe("light");
+		expect(settings.get("theme.light")).toBe("blue-crab");
 
 		component.handleInput("\n"); // Reopen Light Theme submenu.
 		component.handleInput("\x1b[B"); // Wrap to red-claw.

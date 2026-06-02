@@ -12,8 +12,8 @@ beforeAll(async () => {
 });
 
 async function getUiTheme() {
-	await themeModule.initTheme(false, undefined, undefined, "dark", "light");
-	const theme = await themeModule.getThemeByName("dark");
+	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+	const theme = await themeModule.getThemeByName("red-claw");
 	expect(theme).toBeDefined();
 	return theme!;
 }

@@ -18,7 +18,7 @@ function normalizeRenderedText(text: string): string {
 		.trim();
 }
 
-let testTheme = await getThemeByName("dark");
+let testTheme = await getThemeByName("red-claw");
 
 function installTestTheme(): void {
 	if (!testTheme) {
@@ -63,7 +63,7 @@ describe("issue #970 custom provider discovery", () => {
 	let authStorage: AuthStorage;
 
 	beforeAll(async () => {
-		testTheme = await getThemeByName("dark");
+		testTheme = await getThemeByName("red-claw");
 		if (!testTheme) {
 			throw new Error("Failed to load dark theme for issue-970 selector test");
 		}

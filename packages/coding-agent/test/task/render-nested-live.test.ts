@@ -10,7 +10,7 @@ import { taskToolRenderer } from "@gajae-code/coding-agent/task/render";
 // output — same way it surfaces in the finished result.
 describe("task renderer: nested live rendering", () => {
 	beforeAll(async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});
@@ -73,7 +73,7 @@ describe("task renderer: nested live rendering", () => {
 	}
 
 	async function render(progress: AgentProgress): Promise<string> {
-		const theme = (await getThemeByName("dark"))!;
+		const theme = (await getThemeByName("red-claw"))!;
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
 			results: [],

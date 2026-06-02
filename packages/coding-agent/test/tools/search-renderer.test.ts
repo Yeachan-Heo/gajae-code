@@ -5,7 +5,7 @@ import { searchToolRenderer } from "../../src/tools/search";
 
 describe("searchToolRenderer", () => {
 	it("keeps summary and truncation rows inside the collapsed line budget", async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 

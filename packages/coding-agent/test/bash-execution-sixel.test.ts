@@ -13,7 +13,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 	const ui = { requestRender: () => {} } as unknown as TUI;
 
 	beforeEach(async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});
@@ -84,7 +84,7 @@ describe("BashExecutionComponent streaming throttle", () => {
 	const ui = { requestRender: () => {} } as unknown as TUI;
 
 	beforeEach(async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});

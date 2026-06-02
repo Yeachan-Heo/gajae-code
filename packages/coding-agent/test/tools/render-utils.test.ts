@@ -152,7 +152,7 @@ describe("formatScreenshot", () => {
 
 describe("formatDiagnostics", () => {
 	it("replaces tabs in rendered diagnostic text", async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 
 		const formatted = formatDiagnostics(

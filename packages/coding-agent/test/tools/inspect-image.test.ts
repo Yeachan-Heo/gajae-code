@@ -159,7 +159,7 @@ describe("InspectImageTool", () => {
 	});
 
 	it("registers custom renderer and shows question in terminal output", async () => {
-		const theme = await getThemeByName("dark");
+		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		expect(toolRenderers.inspect_image).toBeDefined();

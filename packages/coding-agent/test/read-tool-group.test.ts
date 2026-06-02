@@ -5,7 +5,7 @@ import * as themeModule from "../src/modes/theme/theme";
 
 describe("ReadToolGroupComponent", () => {
 	beforeAll(async () => {
-		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
 	});
 
 	afterEach(() => {

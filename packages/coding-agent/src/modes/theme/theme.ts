@@ -14,9 +14,7 @@ import { adjustHsv, getCustomThemesDir, isEnoent, logger } from "@gajae-code/uti
 import chalk from "chalk";
 import * as z from "zod/v4";
 // Embed theme JSON files at build time
-import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
-import lightThemeJson from "./light.json" with { type: "json" };
 import { resolveMermaidAscii } from "./mermaid-cache";
 
 export { getLanguageFromPath } from "../../utils/lang-from-path";
@@ -1547,8 +1545,6 @@ export class Theme {
 // ============================================================================
 
 const BUILTIN_THEMES: Record<string, ThemeJson> = {
-	dark: darkThemeJson as ThemeJson,
-	light: lightThemeJson as ThemeJson,
 	...(defaultThemes as Record<string, ThemeJson>),
 };
 
@@ -1646,7 +1642,7 @@ async function loadThemeJson(name: string): Promise<ThemeJson> {
 			errorMessage += `\nMissing required color tokens:\n`;
 			errorMessage += missingColors.map(c => `  - ${c}`).join("\n");
 			errorMessage += `\n\nPlease add these colors to your theme's "colors" object.`;
-			errorMessage += `\nSee the built-in themes (dark.json, light.json) for reference values.`;
+			errorMessage += `\nSee the built-in themes (red-claw.json, blue-crab.json) for reference values.`;
 		}
 		if (otherErrors.length > 0) {
 			errorMessage += `\n\nOther errors:\n${otherErrors.join("\n")}`;
@@ -1780,7 +1776,7 @@ var themeReloadTimer: NodeJS.Timeout | undefined;
 var sigwinchHandler: (() => void) | undefined;
 var autoDetectedTheme: boolean = false;
 var autoDarkTheme: string = "red-claw";
-var autoLightTheme: string = "light";
+var autoLightTheme: string = "blue-crab";
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
 var previewThemeActive: boolean = false;
@@ -1801,7 +1797,7 @@ export async function initTheme(
 ): Promise<void> {
 	autoDetectedTheme = true;
 	autoDarkTheme = darkTheme ?? "red-claw";
-	autoLightTheme = lightTheme ?? "light";
+	autoLightTheme = lightTheme ?? "blue-crab";
 	const name = getDefaultTheme();
 	previewThemeActive = false;
 	currentThemeName = name;
@@ -1814,9 +1810,9 @@ export async function initTheme(
 			startSigwinchListener();
 		}
 	} catch (err) {
-		logger.debug("Theme loading failed, falling back to dark theme", { error: String(err) });
-		currentThemeName = "dark";
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		logger.debug("Theme loading failed, falling back to red-claw theme", { error: String(err) });
+		currentThemeName = "red-claw";
+		theme = await loadTheme("red-claw", getCurrentThemeOptions());
 		// Don't start watcher for fallback theme
 	}
 }
@@ -1846,9 +1842,9 @@ export async function setTheme(
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
-		// Theme is invalid - fall back to dark theme
-		currentThemeName = "dark";
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		// Theme is invalid - fall back to red-claw theme
+		currentThemeName = "red-claw";
+		theme = await loadTheme("red-claw", getCurrentThemeOptions());
 		// Don't start watcher for fallback theme
 		return {
 			success: false,
@@ -1956,8 +1952,8 @@ export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
 		try {
 			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
 		} catch {
-			// Fall back to dark theme with new preset
-			theme = await loadTheme("dark", getCurrentThemeOptions());
+			// Fall back to red-claw theme with new preset
+			theme = await loadTheme("red-claw", getCurrentThemeOptions());
 		}
 		if (onThemeChangeCallback) {
 			onThemeChangeCallback();
@@ -1982,8 +1978,8 @@ export async function setColorBlindMode(enabled: boolean): Promise<void> {
 		try {
 			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
 		} catch {
-			// Fall back to dark theme
-			theme = await loadTheme("dark", getCurrentThemeOptions());
+			// Fall back to red-claw theme
+			theme = await loadTheme("red-claw", getCurrentThemeOptions());
 		}
 		if (onThemeChangeCallback) {
 			onThemeChangeCallback();
@@ -2019,8 +2015,8 @@ export function isValidSymbolPreset(preset: string): preset is SymbolPreset {
 async function startThemeWatcher(): Promise<void> {
 	stopThemeWatcher();
 
-	// Only watch if it's a custom theme (not built-in)
-	if (!currentThemeName || currentThemeName === "dark" || currentThemeName === "light") {
+	// Only watch custom themes (not built-ins)
+	if (!currentThemeName || currentThemeName in getBuiltinThemes()) {
 		return;
 	}
 
@@ -2230,8 +2226,8 @@ function ansi256ToHex(index: number): string {
  */
 export async function getResolvedThemeColors(themeName?: string): Promise<Record<string, string>> {
 	const name = themeName ?? getDefaultTheme();
-	const isLight = name === "light";
 	const themeJson = await loadThemeJson(name);
+	const isLight = isThemeJsonLight(themeJson);
 	const resolved = resolveThemeColors(themeJson.colors, themeJson.vars);
 
 	// Default text color for empty values (terminal uses default fg color)
@@ -2255,21 +2251,7 @@ export async function getResolvedThemeColors(themeName?: string): Promise<Record
  * Check if a theme is a "light" theme by analyzing its background color luminance.
  * Loads theme JSON synchronously (built-in or custom file) and resolves userMessageBg.
  */
-export function isLightTheme(themeName?: string): boolean {
-	const name = themeName ?? "dark";
-	const builtinThemes = getBuiltinThemes();
-	let themeJson: ThemeJson | undefined;
-	if (name in builtinThemes) {
-		themeJson = builtinThemes[name];
-	} else {
-		try {
-			const customPath = path.join(getCustomThemesDir(), `${name}.json`);
-			const content = fs.readFileSync(customPath, "utf-8");
-			themeJson = JSON.parse(content) as ThemeJson;
-		} catch {
-			return false;
-		}
-	}
+function isThemeJsonLight(themeJson: ThemeJson): boolean {
 	try {
 		const resolved = resolveVarRefs(themeJson.colors.userMessageBg, themeJson.vars ?? {});
 		if (typeof resolved !== "string" || !resolved.startsWith("#") || resolved.length !== 7) return false;
@@ -2282,6 +2264,24 @@ export function isLightTheme(themeName?: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+export function isLightTheme(themeName?: string, agentDir?: string): boolean {
+	const name = themeName ?? "red-claw";
+	const builtinThemes = getBuiltinThemes();
+	let themeJson: ThemeJson | undefined;
+	if (name in builtinThemes) {
+		themeJson = builtinThemes[name];
+	} else {
+		try {
+			const customPath = path.join(getCustomThemesDir(agentDir), `${name}.json`);
+			const content = fs.readFileSync(customPath, "utf-8");
+			themeJson = JSON.parse(content) as ThemeJson;
+		} catch {
+			return false;
+		}
+	}
+	return isThemeJsonLight(themeJson);
 }
 
 /**

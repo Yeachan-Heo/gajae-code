@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { getProjectAgentDir, Snowflake } from "@gajae-code/utils";
+import { getCustomThemesDir, getProjectAgentDir, Snowflake } from "@gajae-code/utils";
 import { YAML } from "bun";
 
 describe("Settings", () => {
@@ -49,6 +49,15 @@ describe("Settings", () => {
 		}
 	});
 
+	const writeCustomTheme = async (name: string, userMessageBg: string) => {
+		const themesDir = getCustomThemesDir(agentDir);
+		fs.mkdirSync(themesDir, { recursive: true });
+		await Bun.write(
+			path.join(themesDir, `${name}.json`),
+			JSON.stringify({ vars: { surface: userMessageBg }, colors: { userMessageBg: "surface" } }),
+		);
+	};
+
 	// Tests that SettingsManager merges with DB state on save rather than blindly overwriting.
 	// This ensures external edits (via AgentStorage directly) aren't lost when the app saves.
 	describe("preserves externally added settings", () => {
@@ -64,7 +73,7 @@ describe("Settings", () => {
 
 			// Simulate external edit (e.g., user modifying DB directly or another process)
 			await writeSettings({
-				theme: { dark: "anthracite" },
+				theme: { dark: "custom-dark" },
 				modelRoles: { default: "claude-sonnet" },
 				enabledModels: ["claude-opus-4-5", "gpt-5.2-codex"],
 			});
@@ -76,7 +85,7 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.enabledModels).toEqual(["claude-opus-4-5", "gpt-5.2-codex"]);
 			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
-			expect(savedSettings.theme).toEqual({ dark: "anthracite" });
+			expect(savedSettings.theme).toEqual({ dark: "custom-dark" });
 			expect((savedSettings.modelRoles as { default?: string } | undefined)?.default).toBe("claude-sonnet");
 		});
 
@@ -122,24 +131,24 @@ describe("Settings", () => {
 				extensions: ["/path/to/extension.ts"],
 			});
 
-			settings.set("theme.dark", "anthracite");
+			settings.set("theme.dark", "custom-dark");
 			await settings.flush();
 
 			const savedSettings = await readSettings();
 			expect(savedSettings.shellPath).toBe("/bin/zsh");
 			expect(savedSettings.extensions).toEqual(["/path/to/extension.ts"]);
-			expect(savedSettings.theme).toEqual({ dark: "anthracite" });
+			expect(savedSettings.theme).toEqual({ dark: "custom-dark" });
 		});
 
 		it("should let in-memory changes override file changes for same key", async () => {
 			await writeSettings({
-				theme: { dark: "anthracite" },
+				theme: { dark: "custom-dark" },
 			});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
 			await writeSettings({
-				theme: { dark: "anthracite" },
+				theme: { dark: "custom-dark" },
 				defaultThinkingLevel: Effort.Low,
 			});
 
@@ -252,6 +261,63 @@ describe("Settings", () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
 			expect(settings.get("hindsight.bankId")).toBe("ada-cli");
+		});
+
+		it("maps legacy flat built-in theme names to retained defaults", async () => {
+			await writeSettings({ theme: "dark" });
+
+			let settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect(settings.get("theme.light")).toBe("blue-crab");
+
+			resetSettingsForTest();
+			await writeSettings({ theme: "light" });
+
+			settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect(settings.get("theme.light")).toBe("blue-crab");
+		});
+
+		it("maps legacy nested built-in theme names to retained defaults", async () => {
+			await writeSettings({ theme: { dark: "dark", light: "light" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect(settings.get("theme.light")).toBe("blue-crab");
+		});
+
+		it("preserves custom dark and light theme names in nested settings", async () => {
+			await writeCustomTheme("dark", "#ffffff");
+			await writeCustomTheme("light", "#ffffff");
+			await writeSettings({ theme: { dark: "dark", light: "light" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("theme.dark")).toBe("dark");
+			expect(settings.get("theme.light")).toBe("light");
+		});
+
+		it("classifies flat custom theme names using the configured agentDir", async () => {
+			await writeCustomTheme("dark", "#ffffff");
+			await writeSettings({ theme: "dark" });
+
+			let settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("theme.light")).toBe("dark");
+
+			resetSettingsForTest();
+			await writeCustomTheme("custom-light", "#ffffff");
+			await writeSettings({ theme: "custom-light" });
+
+			settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("theme.light")).toBe("custom-light");
+
+			resetSettingsForTest();
+			await writeCustomTheme("light", "#ffffff");
+			await writeSettings({ theme: "light" });
+
+			settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("theme.light")).toBe("light");
 		});
 	});
 });

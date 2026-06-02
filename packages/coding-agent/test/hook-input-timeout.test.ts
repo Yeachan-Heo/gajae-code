@@ -5,7 +5,7 @@ import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes
 import type { TUI } from "@gajae-code/tui";
 
 beforeAll(async () => {
-	const theme = await getThemeByName("dark");
+	const theme = await getThemeByName("red-claw");
 	if (!theme) {
 		throw new Error("Failed to load dark theme for tests");
 	}

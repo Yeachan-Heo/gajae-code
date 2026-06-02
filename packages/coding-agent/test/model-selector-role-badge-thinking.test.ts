@@ -126,7 +126,7 @@ function createOllamaCloudModel(id: string): Model {
 		maxTokens: 8192,
 	};
 }
-let testTheme = await getThemeByName("dark");
+let testTheme = await getThemeByName("red-claw");
 
 function installTestTheme(): void {
 	if (!testTheme) {
@@ -137,7 +137,7 @@ function installTestTheme(): void {
 
 describe("ModelSelector canonical model selection", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("dark");
+		testTheme = await getThemeByName("red-claw");
 		if (!testTheme) {
 			throw new Error("Failed to load dark theme for ModelSelector tests");
 		}

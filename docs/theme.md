@@ -98,7 +98,7 @@ Invalid override keys are ignored and logged (`logger.debug`).
 
 Theme lookup order (`loadThemeJson`):
 
-1. built-in embedded themes (`dark.json`, `light.json`, and all `defaults/*.json` compiled into `defaultThemes`, including the red-claw crustacean theme)
+1. built-in embedded themes (`red-claw.json` and `blue-crab.json` compiled into `defaultThemes`)
 2. custom theme file: `<customThemesDir>/<name>.json`
 
 Custom themes directory comes from `getCustomThemesDir()`:
@@ -163,12 +163,12 @@ Auto theme slot selection uses terminal appearance in this order:
 3. macOS appearance fallback only for the known-broken macOS/Zellij OSC 11 path
 4. dark slot fallback
 
-Built-in theme note: `red-claw` is the default dark GJC theme, with red/orange brand tokens, separate semantic error/warning/diff-removal tokens, and crab-oriented symbol overrides.
+Built-in theme note: `red-claw` is the default dark GJC theme, and `blue-crab` is the default light-slot theme. Both are crustacean brand themes with separate semantic error/warning/diff-removal tokens and crab-oriented symbol overrides.
 
 Current defaults from settings schema:
 
 - `theme.dark = "red-claw"`
-- `theme.light = "light"`
+- `theme.light = "blue-crab"`
 - `symbolPreset = "unicode"`
 - `colorBlindMode = false`
 
@@ -227,14 +227,14 @@ Persisted keys:
 - `symbolPreset`
 - `colorBlindMode`
 
-Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.dark` or `theme.light` based on luminance detection.
+Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.dark` or `theme.light` based on luminance detection; legacy built-in names `dark`/`light` map to `red-claw`/`blue-crab` unless matching custom theme files exist.
 
 ## Creating a custom theme (practical)
 
 1. Create file in custom themes dir, e.g. `~/.gjc/agent/themes/my-theme.json`.
 2. Include `name`, optional `vars`, and **all required** `colors` tokens.
 3. Optionally include `symbols` and `export`.
-4. Select the theme in Settings (`Display -> Dark theme` or `Display -> Light theme`) depending on which auto slot you want. For the bundled crustacean look, choose `red-claw`.
+4. Select the theme in Settings (`Display -> Dark theme` or `Display -> Light theme`) depending on which auto slot you want. For bundled crustacean themes, choose `red-claw` or `blue-crab`.
 
 Minimal skeleton:
 
