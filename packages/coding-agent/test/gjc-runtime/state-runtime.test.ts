@@ -44,7 +44,7 @@ function envelopeState(stdout: string | undefined): Record<string, unknown> {
 describe("native gjc state runtime", () => {
 	it("reads an empty receipt as {}", async () => {
 		const root = await tempDir();
-		const result = await runNativeStateCommand(["read"], root);
+		const result = await runNativeStateCommand(["read", "--json"], root);
 		expect(result.status).toBe(0);
 		expect(envelopeState(result.stdout)).toEqual({});
 	});
@@ -75,7 +75,7 @@ describe("native gjc state runtime", () => {
 		await runNativeStateCommand(["write", "--input", JSON.stringify({ active: true }), "--mode", "ralplan"], root);
 
 		const result = await runNativeStateCommand(
-			["read", "--input", JSON.stringify({ mode: "deep-interview" }), "--mode", "ralplan"],
+			["read", "--input", JSON.stringify({ mode: "deep-interview" }), "--mode", "ralplan", "--json"],
 			root,
 		);
 

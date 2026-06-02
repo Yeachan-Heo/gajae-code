@@ -61,6 +61,8 @@ export interface SkillActiveState {
 	session_id?: string;
 	thread_id?: string;
 	turn_id?: string;
+	initialized_mode?: CanonicalGjcWorkflowSkill;
+	initialized_state_path?: string;
 	active_skills?: SkillActiveEntry[];
 	[key: string]: unknown;
 }

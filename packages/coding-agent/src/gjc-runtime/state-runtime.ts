@@ -24,6 +24,7 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState } from "./state-migrations";
+import { renderStateMarkdown } from "./state-renderer";
 import {
 	type GenericHardPruneTarget,
 	hardPrune,
@@ -31,6 +32,7 @@ import {
 	softDelete,
 	writeJsonAtomic as writeStateJsonAtomic,
 } from "./state-writer";
+import { getSkillManifest, typedArgsFor } from "./workflow-manifest";
 
 /**
  * Native implementation of the `gjc state read|write|clear` command surface.
@@ -84,6 +86,43 @@ const FLAGS_WITH_VALUES = new Set([
 	"--status",
 ]);
 const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate"]);
+const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate"]);
+const VERB_SPECIFIC_FLAGS = new Set(["--skill", "--format", "--older-than", "--status"]);
+
+function flagName(arg: string): string | undefined {
+	if (!arg.startsWith("--")) return undefined;
+	const equalsIndex = arg.indexOf("=");
+	return equalsIndex >= 0 ? arg.slice(0, equalsIndex) : arg;
+}
+
+function manifestFlagNames(action: ParsedInvocation["action"], positionalSkill: string | undefined): Set<string> {
+	const names = new Set<string>();
+	const skills =
+		positionalSkill && KNOWN_MODES.includes(positionalSkill)
+			? [positionalSkill as CanonicalGjcWorkflowSkill]
+			: CANONICAL_GJC_WORKFLOW_SKILLS;
+	for (const skill of skills) {
+		for (const arg of typedArgsFor(skill, action)) names.add(`--${arg.name}`);
+	}
+	return names;
+}
+
+function assertKnownFlags(args: readonly string[], parsed: ParsedInvocation): void {
+	const manifestFlags = manifestFlagNames(parsed.action, parsed.positionalSkill);
+	for (const arg of args) {
+		const flag = flagName(arg);
+		if (!flag) continue;
+		if (
+			FLAGS_WITH_VALUES.has(flag) ||
+			BOOLEAN_FLAGS.has(flag) ||
+			VERB_SPECIFIC_FLAGS.has(flag) ||
+			manifestFlags.has(flag)
+		) {
+			continue;
+		}
+		throw new StateCommandError(2, `unknown gjc state flag: ${flag}`);
+	}
+}
 
 interface ParsedInvocation {
 	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "migrate";
@@ -433,6 +472,14 @@ async function syncWorkflowSkillState(options: {
 		// HUD sync is best-effort and must not change command semantics.
 	}
 }
+export async function readWorkflowStateJson(
+	cwd: string,
+	skill: CanonicalGjcWorkflowSkill,
+	sessionId?: string,
+): Promise<Record<string, unknown>> {
+	return (await readJsonFile(modeStateFile(cwd, skill, sessionId))) ?? {};
+}
+
 async function handleRead(
 	args: readonly string[],
 	cwd: string,
@@ -442,10 +489,13 @@ async function handleRead(
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
 	if (mode) {
 		const filePath = modeStateFile(cwd, mode, selectors.sessionId);
-		const existing = await readJsonFile(filePath);
+		const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
+		const envelope = { skill: mode, state: existing, storage_path: filePath };
 		return {
 			status: 0,
-			stdout: `${JSON.stringify({ skill: mode, state: existing, storage_path: filePath }, null, 2)}\n`,
+			stdout: hasFlag(args, "--json")
+				? `${JSON.stringify(envelope, null, 2)}\n`
+				: renderStateMarkdown(mode, envelope, getSkillManifest(mode)),
 		};
 	}
 	const filePath = activeStateFile(cwd, selectors.sessionId);
@@ -857,6 +907,7 @@ async function handleMigrate(
 export async function runNativeStateCommand(args: string[], cwd = process.cwd()): Promise<StateCommandResult> {
 	try {
 		const parsed = parsePositionalArgs(args);
+		assertKnownFlags(args, parsed);
 		switch (parsed.action) {
 			case "read":
 				if (hasFlag(args, "--migrate")) return await handleMigrate(args, cwd, parsed.positionalSkill);
