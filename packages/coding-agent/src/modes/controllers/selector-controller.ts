@@ -239,7 +239,7 @@ export class SelectorController {
 						});
 					},
 				);
-				return { component: selector, focus: selector };
+				return { component: selector, focus: selector.getSelectList() };
 			});
 		});
 	}
