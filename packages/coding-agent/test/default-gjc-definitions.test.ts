@@ -252,6 +252,8 @@ Project executor override body.
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden");
 		expect(content).toContain("do not edit `.gjc/state` directly without force override");
 		expect(content).toContain("default `0.05`");
+		expect(content).toContain("language.instruction");
+		expect(content).toContain("Do not surprise a Korean session with English questions");
 		expect(content).not.toContain("default `0.2`");
 		expect(content).not.toContain("20%");
 

@@ -131,7 +131,15 @@ interface ResolvedDeepInterviewArgs {
 	thresholdSource: string;
 	sessionId?: string;
 	idea: string;
+	language?: DeepInterviewLanguagePreference;
 	json: boolean;
+}
+
+interface DeepInterviewLanguagePreference {
+	code: "en" | "ko";
+	label: "English" | "Korean";
+	source: "explicit-user-request" | "initial-idea";
+	instruction: string;
 }
 
 export interface ResolvedDeepInterviewSpecWriteArgs {
@@ -203,6 +211,35 @@ async function resolveConfiguredAmbiguityThreshold(
 	const configDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
 	const userSettings = path.join(configDir, "settings.json");
 	return await readSettingsAmbiguityThreshold(userSettings);
+}
+
+function englishLanguagePreference(): DeepInterviewLanguagePreference {
+	return {
+		code: "en",
+		label: "English",
+		source: "explicit-user-request",
+		instruction:
+			"Ask every user-facing deep-interview question in English because the user explicitly requested English.",
+	};
+}
+
+function resolveDeepInterviewLanguagePreference(idea: string): DeepInterviewLanguagePreference | undefined {
+	if (/\b(?:answer|ask|respond|reply|write|use|speak)\s+(?:only\s+)?in\s+English\b/i.test(idea)) {
+		return englishLanguagePreference();
+	}
+	if (/(?:영어로|영문으로|영어\s*(?:질문|답변|응답)|English\s+only)/i.test(idea)) {
+		return englishLanguagePreference();
+	}
+	if (/\p{Script=Hangul}/u.test(idea)) {
+		return {
+			code: "ko",
+			label: "Korean",
+			source: "initial-idea",
+			instruction:
+				"Ask every user-facing deep-interview question in Korean unless the user explicitly requests another language.",
+		};
+	}
+	return undefined;
 }
 
 function isDeepInterviewSpecWriteInvocation(args: readonly string[]): boolean {
@@ -327,6 +364,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 		thresholdSource,
 		sessionId,
 		idea,
+		language: resolveDeepInterviewLanguagePreference(idea),
 		json: hasFlag(args, "--json"),
 	};
 }
@@ -405,6 +443,10 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		},
 		updated_at: now,
 	};
+	if (resolved.language) {
+		payload.language = resolved.language;
+		(payload.state as Record<string, unknown>).language = resolved.language;
+	}
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
 	await fs.writeFile(statePath, `${JSON.stringify(payload, null, 2)}\n`);
 	return statePath;
@@ -528,6 +570,7 @@ export async function runNativeDeepInterviewCommand(
 			threshold: resolved.threshold,
 			threshold_source: resolved.thresholdSource,
 			idea: resolved.idea,
+			language: resolved.language,
 			state_path: statePath,
 			handoff: "Run `/skill:deep-interview` inside the GJC agent to drive the Socratic interview loop.",
 		};
