@@ -1893,6 +1893,15 @@ export class AgentSession {
 						attempt: this.#retryAttempt,
 					});
 					this.#retryAttempt = 0;
+					// Settle the retry gate here, colocated with the success event, rather
+					// than relying on the generic #resolveRetry() at the end of the
+					// agent_end branch. That tail resolver is bypassed by every early
+					// return in agent_end (successful `yield`, handoff-abort skip-maintenance,
+					// missing assistant message), so a retry that recovers on a yield turn
+					// would otherwise leave #retryPromise unresolved — wedging
+					// #waitForPostPromptRecovery and the session as permanently busy.
+					// #resolveRetry() is idempotent, so the later tail call is a no-op.
+					this.#resolveRetry();
 				}
 			}
 
@@ -7565,7 +7574,19 @@ export class AgentSession {
 		}
 
 		// Retry via continue() outside the agent_end event callback chain.
-		this.#scheduleAgentContinue({ delayMs: 1, generation });
+		// If the scheduled continue cannot run — it throws (e.g. AgentBusyError from a
+		// concurrent turn, or "Cannot continue ...") or is skipped because a newer
+		// generation took over — the agent_end that normally resolves #retryPromise
+		// never arrives. Finalize the retry in that case so #waitForPostPromptRecovery
+		// (and the in-flight prompt holding it open) cannot wedge the session as
+		// permanently busy, which would turn every later prompt() into a
+		// non-recoverable AgentBusyError loop.
+		this.#scheduleAgentContinue({
+			delayMs: 1,
+			generation,
+			onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
+			onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
+		});
 
 		return true;
 	}
@@ -7576,6 +7597,27 @@ export class AgentSession {
 	abortRetry(): void {
 		this.#retryAbortController?.abort();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
+		this.#resolveRetry();
+	}
+
+	/**
+	 * Finalize a pending auto-retry that can no longer reach a resolving agent_end
+	 * (the scheduled continue threw or was superseded). Without this, #retryPromise
+	 * stays unresolved, #waitForPostPromptRecovery never returns, the owning
+	 * prompt's in-flight count is never released, and the session reports
+	 * `isStreaming === true` forever — turning every later prompt() into a
+	 * non-recoverable AgentBusyError. No-op once the retry has already settled.
+	 */
+	#failRetryRecovery(reason: string): void {
+		if (!this.#retryPromise) return;
+		const attempt = this.#retryAttempt;
+		this.#retryAttempt = 0;
+		void this.#emitSessionEvent({
+			type: "auto_retry_end",
+			success: false,
+			attempt,
+			finalError: reason,
+		});
 		this.#resolveRetry();
 	}
 
