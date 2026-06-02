@@ -82,6 +82,7 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 - Do not narrate progress, ceremony, timing, scope inflation, or session limits.
 - If the user's intent is clear, act without asking. Ask only when the next step is destructive or requires a missing choice that materially changes the outcome.
 - When the user proposes something wrong, say what breaks and what to do instead once; then defer to their call.
+- Preserve the user's/session's interaction language for natural-language responses. Infer it from recent user-authored messages, ignore assistant/tool/code excerpts, and continue in that language unless the user explicitly switches; workflows that persist state should carry it as `interaction_language`.
 </communication>
 
 <completion-contract>

@@ -210,6 +210,9 @@ Project executor override body.
 		}
 		expect(systemPrompt).toContain("delegate bounded slices to `executor`");
 		expect(systemPrompt).toContain("committed repo-visible `.gjc` defaults are not the source of truth");
+		expect(systemPrompt).toContain("Preserve the user's/session's interaction language");
+		expect(systemPrompt).toContain("recent user-authored messages");
+		expect(systemPrompt).toContain("interaction_language");
 		expect(ultragoal).toContain("run `ralplan` first");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
 		expect(ultragoal).toContain("await timeout only limits the leader's wait");
@@ -252,8 +255,8 @@ Project executor override body.
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden");
 		expect(content).toContain("do not edit `.gjc/state` directly without force override");
 		expect(content).toContain("default `0.05`");
-		expect(content).toContain("language.instruction");
-		expect(content).toContain("Do not surprise a Korean session with English questions");
+		expect(content).toContain("Preserve the session `interaction_language`");
+		expect(content).toContain("Store it as `interaction_language` in state");
 		expect(content).not.toContain("default `0.2`");
 		expect(content).not.toContain("20%");
 

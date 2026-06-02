@@ -48,6 +48,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - Score ambiguity after every answer -- display the score transparently
 - When the locked topology has multiple active components, score and target each component explicitly so depth-first clarity on one component cannot hide ambiguity in siblings
 - Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
+- Preserve the session `interaction_language` for all user-facing interview text.
 - If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
 - Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
 - Allow early exit with a clear warning if ambiguity is still high
@@ -93,11 +94,16 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
    - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/state` files directly unless an explicit force override is active.
    - Include both threshold and source in the final spec metadata.
-- Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, infer the user/session language from `{{ARGUMENTS}}` only when it is obvious. Do not surprise a Korean session with English questions.
+
 
 ## Phase 1: Initialize
 
 1. **Parse the user's idea** from `{{ARGUMENTS}}`
+1.5. **Carry interaction language**:
+   - Use the GJC session interaction language inferred from recent user-authored messages.
+   - Store it as `interaction_language` in state before the first interview question.
+   - Render natural-language announcements, questions, option labels, ambiguity explanations, and spec prose in `interaction_language`; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
+   - Treat English examples in this skill as semantic templates, not required wording.
 2. **Detect brownfield vs greenfield**:
    - Run `explore` agent (haiku): check if cwd has existing source code, package files, or git history
    - If source files exist AND the user's idea references modifying/extending something: **brownfield**
@@ -135,6 +141,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
     "current_ambiguity": 1.0,
     "threshold": <resolvedThreshold>,
     "threshold_source": "<resolvedThresholdSource>",
+    "interaction_language": "<interaction_language>",
     "codebase_context": null,
     "topology": {
       "status": "pending|confirmed|legacy_missing",
@@ -241,6 +248,7 @@ Build the question generation prompt with:
 - Brownfield codebase context (if applicable), summarized to cited paths/symbols/patterns instead of raw dumps
 - Locked topology from Round 0, including active components, deferred components, prior per-component scores, and `last_targeted_component_id`
 
+- Resolved `interaction_language`; render the question frame and options in this language while preserving code/path/setting tokens verbatim
 If any prompt input is too large, summarize it first and then continue from the summary. Do not ask the next the `ask` tool, score ambiguity, or hand off to execution from an over-budget raw transcript.
 
 **Question targeting strategy:**
@@ -268,7 +276,7 @@ Auto-research must never add a public skill entrypoint, never be slash-command/d
 
 ### Step 2b: Ask the Question
 
-Use the `ask` tool with the generated question. Before rendering the prompt/options, apply `language.instruction` from state when present so the entire user-facing question remains in the preserved session language. Present it clearly with the current ambiguity context:
+Use the `ask` tool with the generated question. Present it clearly with the current ambiguity context in `interaction_language`:
 
 ```
 Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} | Why now: {one_sentence_targeting_rationale} | Ambiguity: {score}%
@@ -276,7 +284,7 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 {question}
 ```
 
-Options should include contextually relevant choices plus free-text.
+Options should include contextually relevant choices plus free-text in `interaction_language`.
 
 ### Step 2b′: Auto-Answer Opted-Out Questions
 
@@ -718,6 +726,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 <Final_Checklist>
 - [ ] Phase 0 completed before Phase 1: settings files were read, threshold was resolved, and the first user-visible line was `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`
 - [ ] State includes both `threshold` and `threshold_source`, and the final spec metadata records both values
+- [ ] GJC session `interaction_language` was persisted in deep-interview state and preserved in follow-up questions
 - [ ] Interview completed (ambiguity ≤ threshold OR user chose early exit)
 - [ ] Oversized initial context/history was summarized before scoring, question generation, spec generation, or execution handoff
 - [ ] Ambiguity score displayed after every round
