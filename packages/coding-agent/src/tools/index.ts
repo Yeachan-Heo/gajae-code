@@ -164,6 +164,8 @@ export interface ToolSession {
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
+	/** Optional restricted bash command prefixes for read-only role agents. */
+	bashAllowedPrefixes?: string[];
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */

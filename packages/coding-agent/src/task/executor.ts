@@ -1186,6 +1186,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentTaskPrefix: id,
 					agentId: id,
 					agentDisplayName: agent.name,
+					bashAllowedPrefixes: agent.bashAllowedPrefixes,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,

@@ -217,6 +217,7 @@ export interface ParsedAgentFields {
 	blocking?: boolean;
 	hide?: boolean;
 	forkContext?: ForkContextPolicy;
+	bashAllowedPrefixes?: string[];
 }
 
 /**
@@ -274,6 +275,9 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
+	const bashAllowedPrefixes = parseArrayOrCSV(frontmatter.bashAllowedPrefixes)
+		?.map(prefix => prefix.trim())
+		.filter(Boolean);
 	return {
 		name,
 		description,
@@ -286,6 +290,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		autoloadSkills,
 		hide,
 		forkContext,
+		bashAllowedPrefixes,
 	};
 }
 

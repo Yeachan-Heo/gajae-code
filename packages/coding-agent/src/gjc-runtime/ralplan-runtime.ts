@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
+import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -110,6 +111,7 @@ function defaultRunId(now: Date = new Date()): string {
 }
 
 async function resolveArtifactContent(rawArtifact: string, cwd: string): Promise<string> {
+	if (isRestrictedRoleAgentBash()) return rawArtifact;
 	const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);
 	try {
 		const stat = await fs.stat(candidate);

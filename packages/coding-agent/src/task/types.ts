@@ -181,6 +181,7 @@ export interface AgentDefinition {
 	autoloadSkills?: string[];
 	hide?: boolean;
 	forkContext?: ForkContextPolicy;
+	bashAllowedPrefixes?: string[];
 	source: AgentSource;
 	filePath?: string;
 }

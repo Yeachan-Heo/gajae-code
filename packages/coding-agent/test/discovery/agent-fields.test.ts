@@ -109,4 +109,14 @@ describe("parseAgentFields", () => {
 		expect(fields).toBeDefined();
 		expect(fields?.autoloadSkills).toBeUndefined();
 	});
+	test("parses bashAllowedPrefixes from array frontmatter", () => {
+		const fields = parseAgentFields({
+			name: "reviewer",
+			description: "desc",
+			bashAllowedPrefixes: ["gjc ralplan --write", " gjc state "],
+		});
+
+		expect(fields).toBeDefined();
+		expect(fields?.bashAllowedPrefixes).toEqual(["gjc ralplan --write", "gjc state"]);
+	});
 });

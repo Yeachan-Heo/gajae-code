@@ -294,6 +294,8 @@ export interface CreateAgentSessionOptions {
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
 	agentDisplayName?: string;
+	/** Optional restricted bash command prefixes for read-only role agents. */
+	bashAllowedPrefixes?: string[];
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
@@ -1166,6 +1168,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return agent?.state.model ?? model;
 			},
 			getAgentId: () => resolvedAgentId,
+			bashAllowedPrefixes: options.bashAllowedPrefixes,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",

@@ -11,6 +11,15 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 - Use `async: true` for long-running commands when you don't need immediate output; the call returns a background job ID and the result is delivered automatically as a follow-up.
 {{/if}}
 </instruction>
+{{#if restrictedAllowedPrefixes}}
+<restricted-role-agent-mode>
+This session's bash tool is restricted. It only accepts commands beginning with:
+{{#each restrictedAllowedPrefixes}}
+- `{{this}}`
+{{/each}}
+Use it only for sanctioned GJC workflow CLI persistence or state read/write/contract operations; per-command env overrides and all other shell command shapes are blocked before execution.
+</restricted-role-agent-mode>
+{{/if}}
 
 <critical>
 - NEVER use Linux coreutils (`cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `awk`, `sed`, `find`, `fd`, etc.) when a dedicated tool suffices — ALWAYS prefer `read`, `search`, `find`, `edit`, `write`.

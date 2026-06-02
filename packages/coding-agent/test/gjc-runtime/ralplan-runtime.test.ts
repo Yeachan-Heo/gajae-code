@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
 
 const tempRoots: string[] = [];
 
@@ -128,6 +129,42 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 			"utf-8",
 		);
 		expect(content).toBe("# Draft\nbody\n");
+	});
+
+	it("restricted role-agent bash treats --artifact paths as inline text", async () => {
+		const root = await tempDir();
+		const artifactPath = path.join(root, "secret.md");
+		await fs.writeFile(artifactPath, "# Secret\nshould-not-be-read\n");
+		const previous = process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV];
+		process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV] = "1";
+		try {
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"architect",
+					"--stage_n",
+					"2",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					"restricted-file-run",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const content = await fs.readFile(
+				path.join(root, ".gjc", "plans", "ralplan", "restricted-file-run", "stage-02-architect.md"),
+				"utf-8",
+			);
+			expect(content).toBe(`${artifactPath}\n`);
+		} finally {
+			if (previous === undefined) {
+				delete process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV];
+			} else {
+				process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV] = previous;
+			}
+		}
 	});
 
 	it("final stage emits pending-approval.md alongside the stage artifact", async () => {

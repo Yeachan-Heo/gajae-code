@@ -45,6 +45,8 @@ gjc ralplan --write --stage <type> --stage_n <N> --artifact "markdown file path 
 
 Use stage values that match the producer or artifact kind, such as `planner`, `architect`, `critic`, `revision`, `adr`, or `final`. Increment `--stage_n` for each consensus-loop pass. The `--artifact` value may be either a markdown file path prepared outside `.gjc/` for ingestion or the markdown content string itself. The native `--write` handler persists markdown under `.gjc/plans/ralplan/<run-id>/stage-<NN>-<stage>.md`, maintains an `index.jsonl` audit log, and for `final` stages additionally writes a `pending-approval.md` copy. Direct `write`, `edit`, or `ast_edit` calls against `.gjc/specs`, `.gjc/plans`, `.gjc/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
 
+Restricted read-only role agents (`planner`, `architect`, and `critic`) must pass markdown content directly in `--artifact`; their restricted bash environment intentionally disables artifact file-path ingestion so a verdict command cannot persist arbitrary file contents.
+
 This skill runs GJC planning in consensus mode for the provided arguments.
 
 The consensus workflow:

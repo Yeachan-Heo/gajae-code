@@ -8,6 +8,7 @@ import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
+import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "../gjc-runtime/restricted-role-agent-bash";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
@@ -18,6 +19,7 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
+import { checkBashAllowedPrefixes } from "./bash-allowed-prefixes";
 import { applyBashFixups } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
@@ -253,6 +255,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasAstEdit: this.session.settings.get("astEdit.enabled"),
 			hasSearch: this.session.settings.get("search.enabled"),
 			hasFind: this.session.settings.get("find.enabled"),
+			restrictedAllowedPrefixes: this.session.bashAllowedPrefixes,
 		});
 	}
 
@@ -496,6 +499,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
+		const allowedPrefixes = this.session.bashAllowedPrefixes;
+		if (allowedPrefixes && allowedPrefixes.length > 0) {
+			if (env && Object.keys(env).length > 0) {
+				throw new ToolError("Restricted role-agent bash does not allow per-command env overrides.");
+			}
+			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
+			for (const commandToCheck of commandsToCheck) {
+				const allowlist = checkBashAllowedPrefixes(commandToCheck, allowedPrefixes);
+				if (!allowlist.allowed) {
+					throw new ToolError(allowlist.reason ?? "Command blocked by restricted role-agent bash allowlist.");
+				}
+			}
+		}
+
 		// Check both the original command and the cwd-normalized command so
 		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
 		// or the dedicated-tool command that follows the directory change.
@@ -541,6 +558,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				cwd: this.session.cwd,
 			}),
 			...expandedEnv,
+			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
 
 		// Resolve protocol URLs (agent://, artifact://, etc.) in extracted cwd.

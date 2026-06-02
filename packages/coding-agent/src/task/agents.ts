@@ -30,6 +30,7 @@ interface AgentFrontmatter {
 	blocking?: boolean;
 	hide?: boolean;
 	forkContext?: "forbidden" | "allowed";
+	bashAllowedPrefixes?: string[];
 }
 
 interface EmbeddedAgentDef {
