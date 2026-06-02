@@ -254,6 +254,9 @@ Project executor override body.
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain("Do not surprise a Korean session with English questions");
+		expect(content).toContain('"language": "<existing language object from active state, if present>"');
+		expect(content).toContain("progress reports, and spec prose");
+		expect(content).toContain("translated/localized according to `language.instruction`");
 		expect(content).not.toContain("default `0.2`");
 		expect(content).not.toContain("20%");
 
