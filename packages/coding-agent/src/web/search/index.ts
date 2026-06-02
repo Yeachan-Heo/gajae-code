@@ -8,6 +8,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { AuthStorage } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { parseModelString } from "../../config/model-resolver";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
@@ -16,7 +17,7 @@ import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
-import { getSearchProvider, getSearchProviderLabel, resolveProviderChain, type SearchProvider } from "./provider";
+import { getSearchProviderLabel, resolveProviderChain, type SearchProvider } from "./provider";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import type { SearchProviderId, SearchResponse } from "./types";
 import { SearchProviderError } from "./types";
@@ -115,10 +116,21 @@ function formatForLLM(response: SearchResponse): string {
 	return parts.join("\n");
 }
 
+/** Best-effort active model provider: prefer the resolved Model, fall back to parsing the model string. */
+function resolveActiveModelProvider(
+	modelProvider: string | undefined,
+	modelString: string | undefined,
+): string | undefined {
+	if (modelProvider) return modelProvider;
+	if (modelString) return parseModelString(modelString)?.provider;
+	return undefined;
+}
+
 interface ExecuteSearchOptions {
 	authStorage: AuthStorage;
 	sessionId?: string;
 	signal?: AbortSignal;
+	activeModelProvider?: string;
 }
 
 /** Execute web search */
@@ -127,20 +139,11 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal } = options;
-	const providers =
-		params.provider && params.provider !== "auto"
-			? await getSearchProvider(params.provider).then(async provider =>
-					(await provider.isAvailable(authStorage)) ? [provider] : resolveProviderChain(authStorage, "auto"),
-				)
-			: await resolveProviderChain(authStorage);
-	if (providers.length === 0) {
-		const message = "No web search provider configured.";
-		return {
-			content: [{ type: "text" as const, text: `Error: ${message}` }],
-			details: { response: { provider: "none", sources: [] }, error: message },
-		};
-	}
+	const { authStorage, sessionId, signal, activeModelProvider } = options;
+	// Pass `params.provider` straight through: when omitted (the normal model-facing
+	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
+	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
+	const providers = await resolveProviderChain(authStorage, params.provider, activeModelProvider);
 
 	const failures: Array<{ provider: SearchProvider; error: unknown }> = [];
 	let lastProvider = providers[0];
@@ -207,13 +210,14 @@ async function executeSearch(
  */
 export async function runSearchQuery(
 	params: SearchQueryParams,
-	options: { authStorage?: AuthStorage; sessionId?: string; signal?: AbortSignal } = {},
+	options: { authStorage?: AuthStorage; sessionId?: string; signal?: AbortSignal; activeModelProvider?: string } = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
 	const authStorage = options.authStorage ?? (await discoverAuthStorage());
 	return executeSearch("cli-web-search", params, {
 		authStorage,
 		sessionId: options.sessionId,
 		signal: options.signal,
+		activeModelProvider: options.activeModelProvider,
 	});
 }
 
@@ -247,7 +251,11 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 	): Promise<AgentToolResult<SearchRenderDetails>> {
 		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
 		const sessionId = this.#session.getSessionId?.() ?? undefined;
-		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal });
+		const activeModelProvider = resolveActiveModelProvider(
+			this.#session.model?.provider,
+			this.#session.getActiveModelString?.(),
+		);
+		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal, activeModelProvider });
 	}
 }
 
@@ -267,7 +275,12 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 	) {
 		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
 		const sessionId = ctx.sessionManager.getSessionId();
-		return executeSearch(toolCallId, params, { authStorage, sessionId, signal });
+		return executeSearch(toolCallId, params, {
+			authStorage,
+			sessionId,
+			signal,
+			activeModelProvider: ctx.model?.provider,
+		});
 	},
 
 	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {

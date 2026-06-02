@@ -13,6 +13,7 @@
   - `packages/coding-agent/src/web/search/providers/utils.ts` — credential lookup; source normalization.
   - `packages/coding-agent/src/web/search/providers/anthropic.ts` — Anthropic model web-search provider.
   - `packages/coding-agent/src/web/search/providers/brave.ts` — Brave Search API adapter.
+  - `packages/coding-agent/src/web/search/providers/duckduckgo.ts` — keyless DuckDuckGo html/lite scrape adapter (permissionless default/fallback).
   - `packages/coding-agent/src/web/search/providers/openai-code.ts` — OpenAI code provider SSE adapter.
   - `packages/coding-agent/src/web/search/providers/exa.ts` — Exa API adapter.
   - `packages/coding-agent/src/web/search/providers/gemini.ts` — Gemini grounding SSE adapter.
@@ -69,11 +70,12 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 
 ## Flow
 1. `WebSearchTool.execute()` in `packages/coding-agent/src/web/search/index.ts` delegates directly to `executeSearch()`.
-2. `executeSearch()` chooses a provider list:
-   - if `params.provider` is set and not `"auto"`, it loads that provider with `getSearchProvider()`; if `isAvailable()` returns true, the list is `[that provider]`, otherwise it falls back to `resolveProviderChain("auto")`.
-   - otherwise it calls `resolveProviderChain()` with the module-global preferred provider from `packages/coding-agent/src/web/search/provider.ts`.
-3. `resolveProviderChain()` lazily loads each provider module on demand, checks `isAvailable()`, and returns only available providers. If a preferred provider is set, it is tried first, then the static `SEARCH_PROVIDER_ORDER` excluding that provider.
-4. If no providers are available, `executeSearch()` returns `Error: No web search provider configured.` with `details.response.provider = "none"`.
+2. `executeSearch()` resolves the provider list via a single `resolveProviderChain(authStorage, params.provider ?? "auto", activeModelProvider)` call. The active model's provider is threaded in from `WebSearchTool` (`this.#session.model?.provider`, falling back to parsing `getActiveModelString()`) and from the CustomTool path (`ctx.model?.provider`).
+3. `resolveProviderChain()` is active-model-gated, not credential-scanning:
+   - an explicitly preferred/selected provider that is `isAvailable()` becomes the primary;
+   - otherwise the active model's own native search (`MODEL_PROVIDER_TO_SEARCH`) becomes the primary, but only when that provider's own credentials exist (`isAvailable()`);
+   - keyed standalone providers are never auto-selected — explicit selection only.
+4. DuckDuckGo (keyless, `isAvailable()` always true) is always appended as the terminal fallback, so a missing primary — or a primary runtime failure — still returns results with zero configuration. There is no longer a "No web search provider configured" path.
 5. For each provider in order, `executeSearch()` calls `provider.search()` with:
    - `query` after year-rewrite,
    - `limit`, `recency`, `temperature`, `maxOutputTokens`, `numSearchResults`,
@@ -88,9 +90,9 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 
 ## Modes / Variants
 - **Provider selection**
-  - **Forced provider**: internal callers may pass `provider`; unavailable forced providers fall back to the auto chain instead of hard-failing (`packages/coding-agent/src/web/search/index.ts`). This field is not in the model-facing schema.
-  - **Preferred provider**: `setPreferredSearchProvider()` sets a module-global default used by `resolveProviderChain()`. `packages/coding-agent/src/sdk.ts` and `packages/coding-agent/src/modes/controllers/selector-controller.ts` wire this from settings.
-  - **Auto chain order**: `tavily`, `perplexity`, `brave`, `jina`, `kimi`, `anthropic`, `gemini`, `openai-code`, `zai`, `exa`, `parallel`, `kagi`, `synthetic`, `searxng` (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`).
+  - **Forced provider**: internal callers may pass `provider`; an unavailable forced provider falls back to the chain (which always ends in DuckDuckGo) instead of hard-failing (`packages/coding-agent/src/web/search/index.ts`). This field is not in the model-facing schema.
+  - **Preferred provider**: `setPreferredSearchProvider()` sets a module-global default consumed by `resolveProviderChain()`. `packages/coding-agent/src/sdk.ts` and `packages/coding-agent/src/modes/controllers/selector-controller.ts` wire this from settings.
+  - **Active-model-gated auto**: in `auto` mode, resolution maps the active model's provider to its own native search via `MODEL_PROVIDER_TO_SEARCH` (`openai|openai-codex→codex`, `anthropic→anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`), used only if that provider's creds exist; everything else falls to DuckDuckGo. `SEARCH_PROVIDER_ORDER` no longer drives auto credential scanning — it is retained for explicit selection, labels, and CLI option lists.
 - **Provider adapters**
   - **Tavily** — `packages/coding-agent/src/web/search/providers/tavily.ts`
     - Availability: API key from env or `agent.db` via `findCredential()`.
@@ -188,7 +190,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
   - Many provider adapters accept `AbortSignal`, but `WebSearchTool.execute()` does not pass its `_signal` into `executeSearch()`. Internal callers can still use cancellation by calling `runSearchQuery()` / `executeSearch()` with `signal` embedded in params.
 
 ## Limits & Caps
-- Provider auto-order length: 14 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`).
+- Provider registry size: 15 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
 - `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).
@@ -202,7 +204,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - Gemini retries: up to `3` retries per endpoint, base delay `1000` ms, rate-limit delay budget `5 * 60 * 1000` ms (`packages/coding-agent/src/web/search/providers/gemini.ts`).
 
 ## Errors
-- Tool-level no-provider case returns a normal tool result with `Error: No web search provider configured.`; it does not throw.
+- There is no "no provider configured" case: DuckDuckGo (keyless) is always appended as the terminal fallback, so the chain is never empty.
 - Tool-level all-failed case also returns a normal tool result with `Error: ...`; failures are summarized from the last attempted provider.
 - Provider adapters usually throw `SearchProviderError(provider, message, status)` for HTTP or protocol failures.
 - Availability probes intentionally swallow lookup errors and report `false` in many providers via `isApiKeyAvailable()`.

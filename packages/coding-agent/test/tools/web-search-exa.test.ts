@@ -360,15 +360,22 @@ describe("searchExa", () => {
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
-	it.skip("runSearchQuery with provider=exa fails closed without EXA_API_KEY", async () => {
+	it("runSearchQuery with provider=exa falls back to DuckDuckGo without EXA_API_KEY", async () => {
 		delete process.env.EXA_API_KEY;
-		const fetchSpy = vi.fn(async () => new Response(JSON.stringify(makeMockExaResponse()), { status: 200 }));
-		using _hook = hookFetch(fetchSpy);
+		using _hook = hookFetch(input => {
+			const url = input.toString();
+			if (url.startsWith("https://html.duckduckgo.com")) {
+				return new Response(
+					'<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx">X</a>',
+					{ status: 200 },
+				);
+			}
+			return new Response("", { status: 500 });
+		});
 
 		const result = await runSearchQuery({ query: "provider exa", provider: "exa" });
-		expect(result.details.error).toBeDefined();
-		expect(String(result.details.error)).toContain("No web search provider configured");
-		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(result.details.response.provider).toBe("duckduckgo");
+		expect(result.details.error).toBeUndefined();
 	});
 
 	it("throws SearchProviderError on non-ok HTTP response", async () => {

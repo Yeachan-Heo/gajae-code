@@ -93,6 +93,11 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		label: "SearXNG",
 		load: async () => new (await import("./providers/searxng")).SearXNGProvider(),
 	},
+	duckduckgo: {
+		id: "duckduckgo",
+		label: "DuckDuckGo",
+		load: async () => new (await import("./providers/duckduckgo")).DuckDuckGoProvider(),
+	},
 };
 
 const instanceCache = new Map<SearchProviderId, SearchProvider>();
@@ -119,6 +124,7 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 }
 
 export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
+	"duckduckgo",
 	"tavily",
 	"perplexity",
 	"brave",
@@ -135,6 +141,30 @@ export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"searxng",
 ];
 
+/**
+ * Map an active model's provider string to its own native web-search provider.
+ * Keys are real model provider ids (see packages/ai/src/types.ts KnownProvider);
+ * a few aliases (gemini/kimi) and API strings (openai-responses) are tolerated
+ * defensively. Providers absent from this map (custom/unknown) fall through to
+ * DuckDuckGo.
+ */
+const MODEL_PROVIDER_TO_SEARCH: Record<string, SearchProviderId> = {
+	openai: "codex",
+	"openai-codex": "codex",
+	"openai-responses": "codex",
+	anthropic: "anthropic",
+	google: "gemini",
+	"google-gemini-cli": "gemini",
+	"google-antigravity": "gemini",
+	gemini: "gemini",
+	moonshot: "kimi",
+	"kimi-code": "kimi",
+	kimi: "kimi",
+	zai: "zai",
+	perplexity: "perplexity",
+	synthetic: "synthetic",
+};
+
 /** Preferred provider set via settings (default: auto) */
 let preferredProvId: SearchProviderId | "auto" = "auto";
 
@@ -144,30 +174,45 @@ export function setPreferredSearchProvider(provider: SearchProviderId | "auto"):
 }
 
 /**
- * Determine which providers are configured and currently available.
- * Each candidate is loaded (and its `isAvailable()` called) only as the chain
- * is walked, so unconfigured providers never pay the load cost.
+ * Resolve the ordered provider chain for a search request.
+ *
+ * Resolution is active-model-gated, never credential-scanning:
+ *   1. An explicitly preferred provider (settings) that is available is primary.
+ *   2. Otherwise the active model's own native search is primary, but only when
+ *      that provider's own credentials are present (its `isAvailable()`).
+ *   3. DuckDuckGo (keyless) is always appended as the terminal fallback, so a
+ *      missing primary — or a primary runtime failure — still returns results
+ *      with zero configuration. Keyed standalone providers are never
+ *      auto-selected; they are reachable only via explicit selection (step 1).
  */
 export async function resolveProviderChain(
 	authStorage: AuthStorage,
 	preferredProvider: SearchProviderId | "auto" = preferredProvId,
+	activeModelProvider?: string,
 ): Promise<SearchProvider[]> {
-	const providers: SearchProvider[] = [];
+	const chain: SearchProviderId[] = [];
 
 	if (preferredProvider !== "auto") {
 		const provider = await getSearchProvider(preferredProvider);
 		if (await provider.isAvailable(authStorage)) {
-			providers.push(provider);
+			chain.push(preferredProvider);
+		}
+	} else if (activeModelProvider) {
+		const nativeId = MODEL_PROVIDER_TO_SEARCH[activeModelProvider.toLowerCase()];
+		if (nativeId) {
+			const provider = await getSearchProvider(nativeId);
+			if (await provider.isAvailable(authStorage)) {
+				chain.push(nativeId);
+			}
 		}
 	}
 
-	for (const id of SEARCH_PROVIDER_ORDER) {
-		if (id === preferredProvider) continue;
-		const provider = await getSearchProvider(id);
-		if (await provider.isAvailable(authStorage)) {
-			providers.push(provider);
-		}
-	}
+	// DuckDuckGo is the permissionless terminal fallback (deduped).
+	if (!chain.includes("duckduckgo")) chain.push("duckduckgo");
 
+	const providers: SearchProvider[] = [];
+	for (const id of chain) {
+		providers.push(await getSearchProvider(id));
+	}
 	return providers;
 }

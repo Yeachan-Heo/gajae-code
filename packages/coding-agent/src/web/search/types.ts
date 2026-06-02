@@ -6,6 +6,7 @@
 
 /** Supported web search providers */
 export type SearchProviderId =
+	| "duckduckgo"
 	| "exa"
 	| "brave"
 	| "jina"
@@ -23,6 +24,7 @@ export type SearchProviderId =
 
 export function isSearchProviderId(value: string): value is SearchProviderId {
 	return [
+		"duckduckgo",
 		"exa",
 		"brave",
 		"jina",

@@ -1044,18 +1044,18 @@ This tool is intentionally distinct from `fetch`: it executes page interactions 
 
 ### Search abstraction and fallback (`web/search/index.ts`, `provider.ts`)
 
-Provider registry (`SEARCH_PROVIDERS`) and fallback order (`SEARCH_PROVIDER_ORDER`) are defined in `provider.ts`:
+Provider registry (`PROVIDER_META`) and the explicit-selection/label/CLI order (`SEARCH_PROVIDER_ORDER`) are defined in `provider.ts`.
 
-`perplexity → brave → jina → kimi → anthropic → gemini → openai-code → zai → exa → tavily → kagi → synthetic`
+`resolveProviderChain(authStorage, preferredProvider, activeModelProvider?)` is active-model-gated, not credential-scanning:
 
-`resolveProviderChain(preferredProvider)` behavior:
-
-- If preferred is explicit (not `auto`) and `isAvailable()` is true, it is added first.
-- Remaining available providers are appended in fixed order, skipping duplicates.
+- If `preferredProvider` is explicit (not `auto`) and `isAvailable()` is true, it becomes the primary.
+- Otherwise the active model's own native search (`MODEL_PROVIDER_TO_SEARCH`: `openai|openai-codex→codex`, `anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`) becomes the primary, but only when that provider's own creds exist (`isAvailable()`).
+- Keyed standalone providers (brave/tavily/exa/kagi/jina/parallel/searxng) are never auto-selected — explicit selection only.
+- `duckduckgo` (keyless, always available) is appended as the terminal fallback, so a missing primary or a primary runtime failure still returns results with zero configuration.
 
 `executeSearch(...)` in `index.ts` then tries providers sequentially until one succeeds; it returns formatted text (`formatForLLM`) on first success. If all fail, it returns a synthesized error including provider list and last error.
 
-Explicit no-fallback path exists: if `params.provider !== "auto"` and `params.no_fallback` is true, only that provider is attempted (or none if unavailable).
+Explicit provider selection is not fail-closed: an explicitly selected provider that is unavailable or fails at runtime still falls back to the keyless `duckduckgo` terminal provider, which `resolveProviderChain` appends unconditionally.
 
 ### Auth/availability signals represented in code
 

@@ -2530,6 +2530,7 @@ export const SETTINGS_SCHEMA = {
 		type: "enum",
 		values: [
 			"auto",
+			"duckduckgo",
 			"exa",
 			"brave",
 			"jina",
@@ -2554,7 +2555,12 @@ export const SETTINGS_SCHEMA = {
 				{
 					value: "auto",
 					label: "Auto",
-					description: "Preferred web-search provider",
+					description: "Active model's native search if its creds exist, else keyless DuckDuckGo",
+				},
+				{
+					value: "duckduckgo",
+					label: "DuckDuckGo",
+					description: "Keyless default — no API key or OAuth required",
 				},
 				{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set" },
 				{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
