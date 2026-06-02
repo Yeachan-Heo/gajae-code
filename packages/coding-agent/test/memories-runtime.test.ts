@@ -400,16 +400,31 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		createdDirs.clear();
 	});
 
-	test("returns undefined for missing or empty summaries", async () => {
+	test("returns undefined when local memory is disabled", async () => {
+		const agentDir = await makeTempDir("memories-runtime-instructions");
+		const settings = Settings.isolated({ "memory.backend": "off" });
+
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+	});
+
+	test("renders unconfirmed guidance for missing or empty local summaries", async () => {
 		const agentDir = await makeTempDir("memories-runtime-instructions");
 		const settings = Settings.isolated({ "memory.backend": "local" });
 
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+		const missingPayload = await buildMemoryToolDeveloperInstructions(agentDir, settings);
+		expect(missingPayload).toBeDefined();
+		expect(missingPayload).toContain("no confirmed memory payload");
+		expect(missingPayload).toContain("Do not claim");
+		expect(missingPayload).toContain("memory://root");
+		expect(missingPayload).not.toContain(agentDir);
 
 		const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
 		await fs.mkdir(memoryRoot, { recursive: true });
 		await fs.writeFile(path.join(memoryRoot, "memory_summary.md"), "   \n\t\n");
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+		const emptyPayload = await buildMemoryToolDeveloperInstructions(agentDir, settings);
+		expect(emptyPayload).toBeDefined();
+		expect(emptyPayload).toContain("durable memory is not confirmed");
+		expect(emptyPayload).not.toContain(memoryRoot);
 	});
 
 	test("renders payload with truncation for non-empty summary", async () => {

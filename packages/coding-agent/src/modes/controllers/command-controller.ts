@@ -585,7 +585,7 @@ export class CommandController {
 		if (action === "view") {
 			const payload = await backend.buildDeveloperInstructions(agentDir, this.ctx.settings, this.ctx.session);
 			if (!payload) {
-				this.ctx.showWarning("Memory payload is empty (memory backend off, disabled, or no memory available).");
+				this.ctx.showWarning("Memory payload is empty; durable memory is unavailable or unconfirmed.");
 				return;
 			}
 			this.ctx.chatContainer.addChild(new Spacer(1));

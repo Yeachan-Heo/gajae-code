@@ -646,6 +646,19 @@ describe("wave 3 commands", () => {
 		expect(output.length).toBeGreaterThan(0);
 	});
 
+	it("/memory view: local empty payload is explicit and not success-coded", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.set("memory.backend", "local");
+
+		const result = await executeAcpBuiltinSlashCommand("/memory view", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("no confirmed memory payload");
+		expect(output[0]).toContain("Do not claim");
+		expect(output[0]).toContain("unless a backend operation or a non-empty memory payload confirms it");
+		expect(output[0]).toContain("not confirmed");
+	});
+
 	it("/memory (no args): defaults to view", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/memory", runtime);

@@ -12,6 +12,7 @@ import consolidationTemplate from "../prompts/memories/consolidation.md" with { 
 import readPathTemplate from "../prompts/memories/read-path.md" with { type: "text" };
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
+import unavailableTemplate from "../prompts/memories/unavailable.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import {
 	claimStage1Jobs,
@@ -153,20 +154,20 @@ export async function buildMemoryToolDeveloperInstructions(
 ): Promise<string | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryRoot(agentDir, session?.sessionManager.getCwd() ?? settings.getCwd());
+	const memoryRoot = getMemoryRoot(agentDir, session?.sessionManager?.getCwd() ?? settings.getCwd());
 	const summaryPath = path.join(memoryRoot, "memory_summary.md");
 
 	let text: string;
 	try {
 		text = await Bun.file(summaryPath).text();
 	} catch {
-		return undefined;
+		return unavailableTemplate;
 	}
 
 	const summary = text.trim();
-	if (!summary) return undefined;
+	if (!summary) return unavailableTemplate;
 	const truncated = truncateByApproxTokens(summary, cfg.summaryInjectionTokenLimit);
-	if (!truncated.trim()) return undefined;
+	if (!truncated.trim()) return unavailableTemplate;
 
 	return prompt.render(readPathTemplate, {
 		memory_summary: truncated,
