@@ -2,9 +2,16 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { replaceBinaryForUpdate, resolveUpdateMethodForTest } from "../src/cli/update-cli";
+import {
+	buildReleaseBinaryUrlForTest,
+	formatBinaryDownloadFailureMessageForTest,
+	formatManualUpdateInstructionsForTest,
+	replaceBinaryForUpdate,
+	resolveUpdateMethodForTest,
+} from "../src/cli/update-cli";
 
 const tempDirs: string[] = [];
+const repoRoot = path.resolve(import.meta.dir, "../../..");
 
 async function makeTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-update-test-"));
@@ -32,6 +39,72 @@ describe("update-cli install target detection", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.local/bin/gjc", undefined);
 
 		expect(method).toBe("binary");
+	});
+});
+
+describe("update-cli binary release assets", () => {
+	it("downloads fallback binaries from the current owner release repository", () => {
+		expect(buildReleaseBinaryUrlForTest("0.2.3", "linux", "x64")).toBe(
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64",
+		);
+	});
+
+	it("uses the existing Windows .exe release asset name", () => {
+		expect(buildReleaseBinaryUrlForTest("0.2.3", "win32", "x64")).toBe(
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-windows-x64.exe",
+		);
+	});
+
+	it("reports actionable Unix manual update commands for unsupported fallback paths", () => {
+		const instructions = formatManualUpdateInstructionsForTest("linux");
+
+		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(instructions).toContain("npm, pnpm, or another package manager");
+		expect(instructions).toContain(
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --binary",
+		);
+	});
+
+	it("reports actionable Windows manual update commands for unsupported fallback paths", () => {
+		const instructions = formatManualUpdateInstructionsForTest("win32");
+
+		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(instructions).toContain("npm, pnpm, or another package manager");
+		expect(instructions).toContain(
+			"irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex",
+		);
+	});
+
+	it("keeps manual reinstall guidance aligned with bundled installer repositories", async () => {
+		const instructions = formatManualUpdateInstructionsForTest("linux");
+		const shellInstaller = await Bun.file(path.join(repoRoot, "scripts/install.sh")).text();
+		const windowsInstaller = await Bun.file(path.join(repoRoot, "scripts/install.ps1")).text();
+
+		expect(instructions).toContain("raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh");
+		expect(shellInstaller).toContain('REPO="Yeachan-Heo/gajae-code"');
+		expect(windowsInstaller).toContain('$Repo = "Yeachan-Heo/gajae-code"');
+		expect(formatManualUpdateInstructionsForTest("win32")).toContain(
+			"raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1",
+		);
+	});
+
+	it("includes actionable guidance when a release asset download fails", () => {
+		const message = formatBinaryDownloadFailureMessageForTest(
+			"gjc-linux-x64",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64",
+			"Not Found",
+			"linux",
+		);
+
+		expect(message).toContain("Download failed for gjc-linux-x64");
+		expect(message).toContain("Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64");
+		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+	});
+
+	it("includes actionable guidance when the platform has no release asset", () => {
+		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "freebsd", "x64")).toThrow(
+			"bun install -g @gajae-code/coding-agent@latest",
+		);
 	});
 });
 

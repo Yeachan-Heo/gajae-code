@@ -12,7 +12,7 @@ import { $ } from "bun";
 import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 
-const REPO = "can1357/gajae-code";
+const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
 
 interface ReleaseInfo {
@@ -122,7 +122,7 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 
 	if (bunBinDir) return { method: "bun" };
 
-	throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
+	throw new Error(formatUnsupportedTargetMessage(`Could not resolve ${APP_NAME} binary path in PATH`));
 }
 
 /**
@@ -166,10 +166,7 @@ function compareVersions(a: string, b: string): number {
 /**
  * Get the appropriate binary name for this platform.
  */
-function getBinaryName(): string {
-	const platform = process.platform;
-	const arch = process.arch;
-
+function getBinaryName(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
 	let os: string;
 	switch (platform) {
 		case "linux":
@@ -182,7 +179,7 @@ function getBinaryName(): string {
 			os = "windows";
 			break;
 		default:
-			throw new Error(`Unsupported platform: ${platform}`);
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported platform: ${platform}`));
 	}
 
 	let archName: string;
@@ -194,7 +191,7 @@ function getBinaryName(): string {
 			archName = "arm64";
 			break;
 		default:
-			throw new Error(`Unsupported architecture: ${arch}`);
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported architecture: ${arch}`));
 	}
 
 	if (os === "windows") {
@@ -233,6 +230,65 @@ function printVerifiedVersion(expectedVersion: string): void {
 	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
 }
 
+function formatBinaryInstallInstruction(platform: NodeJS.Platform = process.platform): string {
+	if (platform === "win32") {
+		return `For a supported binary install, reinstall with PowerShell: irm https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.ps1 | iex`;
+	}
+	return `For a supported binary install, reinstall with: curl -fsSL https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.sh | sh -s -- --binary`;
+}
+
+function formatManualUpdateInstructions(platform: NodeJS.Platform = process.platform): string {
+	return [
+		`If ${APP_NAME} was installed with Bun, run: bun install -g ${PACKAGE}@latest`,
+		`If ${APP_NAME} was installed with npm, pnpm, or another package manager, update it with that same manager.`,
+		formatBinaryInstallInstruction(platform),
+	].join("\n");
+}
+
+function formatUnsupportedTargetMessage(reason: string, platform: NodeJS.Platform = process.platform): string {
+	return `${reason}.\n${formatManualUpdateInstructions(platform)}`;
+}
+
+function buildReleaseBinaryUrl(
+	version: string,
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string {
+	const binaryName = getBinaryName(platform, arch);
+	const tag = `v${version}`;
+	return `https://github.com/${RELEASE_REPO}/releases/download/${tag}/${binaryName}`;
+}
+
+function formatBinaryDownloadFailureMessage(
+	binaryName: string,
+	url: string,
+	status: string | number,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return `Download failed for ${binaryName} from ${url}: ${status}.\n${formatManualUpdateInstructions(platform)}`;
+}
+
+export function formatBinaryDownloadFailureMessageForTest(
+	binaryName: string,
+	url: string,
+	status: string | number,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return formatBinaryDownloadFailureMessage(binaryName, url, status, platform);
+}
+
+export function buildReleaseBinaryUrlForTest(
+	version: string,
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string {
+	return buildReleaseBinaryUrl(version, platform, arch);
+}
+
+export function formatManualUpdateInstructionsForTest(platform: NodeJS.Platform = process.platform): string {
+	return formatManualUpdateInstructions(platform);
+}
+
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
 	if (result.actual) {
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
@@ -250,11 +306,7 @@ async function printVerification(expectedVersion: string): Promise<void> {
 		return;
 	}
 	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(
-		chalk.yellow(
-			`You may need to reinstall: curl -fsSL https://raw.githubusercontent.com/can1357/gajae-code/main/scripts/install.sh | sh`,
-		),
-	);
+	console.log(chalk.yellow(formatManualUpdateInstructions()));
 }
 
 async function unlinkIfExists(filePath: string): Promise<void> {
@@ -314,8 +366,7 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
  */
 async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
 	const binaryName = getBinaryName();
-	const tag = `v${expectedVersion}`;
-	const url = `https://github.com/${REPO}/releases/download/${tag}/${binaryName}`;
+	const url = buildReleaseBinaryUrl(expectedVersion);
 
 	const tempPath = `${targetPath}.new`;
 	const backupPath = `${targetPath}.bak`;
@@ -323,7 +374,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
-		throw new Error(`Download failed: ${response.statusText}`);
+		throw new Error(formatBinaryDownloadFailureMessage(binaryName, url, response.statusText || response.status));
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
