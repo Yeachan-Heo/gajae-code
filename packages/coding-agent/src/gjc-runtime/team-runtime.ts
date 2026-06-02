@@ -577,6 +577,38 @@ async function writePhase(dir: string, phase: GjcTeamPhase): Promise<void> {
 	await writeJsonFile(path.join(dir, "phase.json"), { current_phase: phase, updated_at: now() });
 }
 
+function teamModeStatePath(): string {
+	return path.join(".gjc", "state", "team-state.json");
+}
+
+export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, cwd = process.cwd()): Promise<void> {
+	const active = snapshot.phase !== "complete" && snapshot.phase !== "cancelled";
+	const updatedAt = now();
+	await writeJsonAtomic(
+		teamModeStatePath(),
+		{
+			skill: "team",
+			version: 1,
+			active,
+			current_phase: snapshot.phase,
+			team_name: snapshot.team_name,
+			task_counts: snapshot.task_counts,
+			updated_at: updatedAt,
+		},
+		{
+			cwd,
+			receipt: {
+				cwd,
+				skill: "team",
+				owner: "gjc-runtime",
+				command: "gjc team sync-team-summary",
+				nowIso: updatedAt,
+			},
+			audit: { category: "state", verb: "sync-team-summary", owner: "gjc-runtime", skill: "team" },
+		},
+	);
+}
+
 function normalizeTask(raw: GjcTeamTask): GjcTeamTask {
 	const status = raw.status === ("complete" as GjcTeamTaskStatus) ? "completed" : raw.status;
 	return {

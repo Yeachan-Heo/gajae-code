@@ -6,6 +6,7 @@ import {
 	listGjcTeams,
 	monitorGjcTeam,
 	parseTeamLaunchArgs,
+	persistGjcTeamModeStateSummary,
 	readGjcTeamEvents,
 	readGjcTeamSnapshot,
 	shutdownGjcTeam,
@@ -31,6 +32,7 @@ async function syncTeamHud(snapshot: GjcTeamSnapshot): Promise<void> {
 			hud: await buildTeamHudSummary(snapshot, events.at(-1)),
 			source: "gjc-team",
 		});
+		await persistGjcTeamModeStateSummary(snapshot, process.cwd());
 	} catch {
 		// HUD sync is best-effort and must not change command semantics.
 	}
