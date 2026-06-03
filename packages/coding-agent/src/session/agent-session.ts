@@ -2024,6 +2024,18 @@ export class AgentSession {
 				const didRetry = await this.#handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
+			if (this.#retryAttempt > 0) {
+				// A prior retry ended on a non-retryable (terminal) message: emit
+				// the terminal retry-end and reset so observers clear retry state.
+				const attempt = this.#retryAttempt;
+				this.#retryAttempt = 0;
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: msg.errorMessage,
+				});
+			}
 			this.#resolveRetry();
 
 			const compactionTask = this.#checkCompaction(msg);
@@ -7212,7 +7224,7 @@ export class AgentSession {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
 		// than retry forever.
-		return /\b(401|403|404)\b|unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
+		return /\b(401|402|403|404|413|422)\b|unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
 			errorMessage,
 		);
 	}
@@ -7601,6 +7613,15 @@ export class AgentSession {
 			return false;
 		}
 
+		// Create and install the backoff abort controller BEFORE emitting
+		// auto_retry_start, so a synchronous retryNow()/abortRetry() invoked from
+		// an event subscriber (e.g. the TUI Esc handler) is not lost in the gap
+		// between the event and the controller assignment.
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
+		this.#retryNowRequested = false;
+
 		await this.#emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
@@ -7617,10 +7638,6 @@ export class AgentSession {
 		}
 
 		// Wait with exponential backoff (abortable).
-		const retryAbortController = new AbortController();
-		this.#retryAbortController?.abort();
-		this.#retryAbortController = retryAbortController;
-		this.#retryNowRequested = false;
 		try {
 			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
 		} catch {
@@ -8428,6 +8445,7 @@ export class AgentSession {
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.agent.clearAllQueues();
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);

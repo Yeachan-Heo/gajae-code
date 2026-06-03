@@ -264,4 +264,58 @@ describe("AgentSession resilient retry", () => {
 		// so cancellation simply returns to idle (the error remains in session history).
 		expect(session.isRetrying).toBe(false);
 	});
+	it("surfaces 400 bad-request errors without retrying", async () => {
+		session = buildSession({ responses: [{ throw: "400 Bad Request: malformed messages" }] });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger bad request");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("emits auto_retry_end when a retry ends on a terminal error", async () => {
+		// First a transient error (retries), then a terminal 401 that must not
+		// retry — the retry session must emit a terminal auto_retry_end.
+		session = buildSession({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ throw: "401 unauthorized: invalid api key" },
+			],
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("transient then terminal");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false });
+		expect(session.isRetrying).toBe(false);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("honors retryNow() invoked synchronously from the auto_retry_start subscriber", async () => {
+		// Regression for the controller-assignment race: retryNow() fired the
+		// instant auto_retry_start arrives must still skip the (huge) backoff.
+		session = buildSession({
+			responses: [{ throw: "503 service unavailable: overloaded_error" }, { content: ["recovered now"] }],
+			settingsOverrides: { "retry.baseDelayMs": 600_000, "retry.maxDelayMs": 600_000 },
+		});
+		const { retryEndEvents } = track(session);
+		const sess = session;
+		sess.subscribe(event => {
+			if (event.type === "auto_retry_start") sess.retryNow();
+		});
+
+		await sess.prompt("retry-now race");
+		await sess.waitForIdle();
+
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(sess).stopReason).toBe("stop");
+	});
 });

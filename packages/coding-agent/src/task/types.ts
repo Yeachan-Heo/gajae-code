@@ -230,6 +230,7 @@ export interface AgentProgress {
 	retryState?: {
 		attempt: number;
 		maxAttempts: number;
+		unbounded?: boolean;
 		delayMs: number;
 		errorMessage: string;
 		startedAtMs: number;

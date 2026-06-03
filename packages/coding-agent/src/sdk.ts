@@ -657,6 +657,7 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 					reason: "auto_retry_start",
 					attempt: event.attempt,
 					maxAttempts: event.maxAttempts,
+					unbounded: event.unbounded,
 					delayMs: event.delayMs,
 					errorMessage: event.errorMessage,
 				},

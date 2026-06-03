@@ -1,6 +1,7 @@
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import { calculatePromptTokens } from "@gajae-code/agent-core/compaction/compaction";
 import type { AssistantMessage, ImageContent } from "@gajae-code/ai";
+import { parseRateLimitReason } from "@gajae-code/ai";
 import { type Component, Loader, TERMINAL, Text } from "@gajae-code/tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -26,12 +27,20 @@ const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 
 function friendlyRetryReason(errorMessage: string | undefined): string {
 	if (!errorMessage) return "";
-	const e = errorMessage.toLowerCase();
-	if (/rate.?limit|too many requests|429/.test(e)) return "rate limited";
-	if (/overloaded/.test(e)) return "overloaded";
-	if (/\b(500|502|503|504)\b|server.?error|internal.?error|service.?unavailable/.test(e)) return "server error";
-	if (/network|connection|socket|fetch failed|terminated|timeout|timed out|stream/.test(e)) return "connection error";
-	return "transient error";
+	switch (parseRateLimitReason(errorMessage)) {
+		case "RATE_LIMIT_EXCEEDED":
+			return "rate limited";
+		case "QUOTA_EXHAUSTED":
+			return "usage limit";
+		case "MODEL_CAPACITY_EXHAUSTED":
+			return "overloaded";
+		case "SERVER_ERROR":
+			return "server error";
+		default:
+			return /network|connection|socket|fetch failed|terminated|timeout|timed out|stream/i.test(errorMessage)
+				? "connection error"
+				: "transient error";
+	}
 }
 
 type AgentSessionEventHandlers = {
@@ -81,6 +90,15 @@ export class EventController {
 
 	dispose(): void {
 		this.#cancelIdleCompaction();
+		this.#clearRetryCountdown();
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
+		}
+		if (this.ctx.retryLoader) {
+			this.ctx.retryLoader.stop();
+			this.ctx.retryLoader = undefined;
+		}
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
 		}
