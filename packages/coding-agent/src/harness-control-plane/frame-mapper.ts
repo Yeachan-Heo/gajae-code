@@ -24,6 +24,21 @@ export interface MappedFrame {
 }
 
 const TEST_RE = /\b(bun test|npm test|yarn test|pnpm test|jest|vitest|pytest|go test|cargo test|mocha|ava)\b/i;
+const TOOL_STATUS_CODES = new Set([
+	"aborted",
+	"blocked",
+	"cancelled",
+	"complete",
+	"completed",
+	"error",
+	"failed",
+	"ok",
+	"pending",
+	"running",
+	"skipped",
+	"success",
+	"timeout",
+]);
 
 export function isTestRunnerTool(toolName?: unknown, command?: unknown): boolean {
 	const name = typeof toolName === "string" ? toolName : "";
@@ -41,6 +56,35 @@ function num(v: unknown): number | undefined {
 function boundedMessage(v: unknown): string | undefined {
 	const s = typeof v === "string" ? v : undefined;
 	return s === undefined ? undefined : s.slice(0, 200);
+}
+function boundedStatus(v: unknown): string | undefined {
+	if (typeof v !== "string") return undefined;
+	const status = v.trim().toLowerCase();
+	return TOOL_STATUS_CODES.has(status) ? status : undefined;
+}
+function recordObject(v: unknown): Record<string, unknown> | undefined {
+	return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+}
+/** Extract a tool command from real AgentSessionEvent `args` or a flat fixture frame. Bounded use only — never persisted. */
+function toolCommand(frame: Record<string, unknown>): string | undefined {
+	const args = recordObject(frame.args);
+	const c = args?.command ?? args?.cmd ?? args?.commandLine;
+	if (typeof c === "string") return c;
+	return str(frame.command) ?? str(frame.commandLine);
+}
+/** Derive a tool status, honoring real `isError` booleans as well as bounded status strings. */
+function toolStatus(frame: Record<string, unknown>): string | undefined {
+	if (frame.isError === true) return "error";
+	const flatStatus = boundedStatus(frame.status);
+	if (flatStatus) return flatStatus;
+	for (const candidate of [frame.result, frame.partialResult]) {
+		const result = recordObject(candidate);
+		if (!result) continue;
+		if (result.isError === true) return "error";
+		const status = boundedStatus(result.status) ?? boundedStatus(recordObject(result.details)?.status);
+		if (status) return status;
+	}
+	return undefined;
 }
 
 /**
@@ -92,7 +136,7 @@ export function mapRpcFrame(frame: Record<string, unknown>): MappedFrame | null 
 			};
 		case "tool_execution_start": {
 			const toolName = str(frame.toolName);
-			const test = isTestRunnerTool(toolName, frame.command ?? frame.commandLine);
+			const test = isTestRunnerTool(toolName, toolCommand(frame));
 			return {
 				kind: "rpc_tool_started",
 				signal: test ? "test-running" : "tool-call",
@@ -104,11 +148,11 @@ export function mapRpcFrame(frame: Record<string, unknown>): MappedFrame | null 
 		}
 		case "tool_execution_update": {
 			const toolName = str(frame.toolName);
-			const test = isTestRunnerTool(toolName, frame.command);
+			const test = isTestRunnerTool(toolName, toolCommand(frame));
 			return {
 				kind: "rpc_tool_updated",
 				signal: test ? "test-running" : null,
-				evidence: { toolId: str(frame.toolCallId) ?? null, status: str(frame.status) ?? null },
+				evidence: { toolId: str(frame.toolCallId) ?? null, status: toolStatus(frame) ?? null },
 				severity: "info",
 				semantic: false,
 				coalesceKey: `tool:${str(frame.toolCallId) ?? "tool"}`,
@@ -116,17 +160,18 @@ export function mapRpcFrame(frame: Record<string, unknown>): MappedFrame | null 
 		}
 		case "tool_execution_end": {
 			const toolName = str(frame.toolName);
-			const test = isTestRunnerTool(toolName, frame.command);
+			const test = isTestRunnerTool(toolName, toolCommand(frame));
+			const status = toolStatus(frame);
 			return {
 				kind: "rpc_tool_ended",
 				signal: test ? "test-running" : "tool-call",
 				evidence: {
 					toolId: str(frame.toolCallId) ?? null,
 					toolName: toolName ?? null,
-					status: str(frame.status) ?? null,
+					status: status ?? null,
 					exitCode: num(frame.exitCode) ?? null,
 				},
-				severity: str(frame.status) === "error" ? "warn" : "info",
+				severity: status === "error" ? "warn" : "info",
 				semantic: true,
 				coalesceKey: null,
 			};
