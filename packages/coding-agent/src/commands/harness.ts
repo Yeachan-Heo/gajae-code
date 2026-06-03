@@ -110,6 +110,7 @@ interface OwnerSpawnResult {
 	runtime: "tmux" | "detached" | "manual";
 	tmuxSessionName: string | null;
 	fallbackReason: string | null;
+	blockerReason: string | null;
 }
 
 function shellQuote(value: string): string {
@@ -292,14 +293,16 @@ export default class Harness extends Command {
 	/** Spawn the owner daemon. Prefer a tmux-resident owner, then explicitly fall back to detached. */
 	async #spawnDetachedOwner(root: string, sessionId: string, cwd: string): Promise<OwnerSpawnResult> {
 		const tmux = this.#startTmuxResidentOwner(root, sessionId, cwd);
-		if (tmux.started) {
+		if (tmux.started && (await this.#waitForOwner(root, sessionId))) {
 			return {
-				live: await this.#waitForOwner(root, sessionId),
+				live: true,
 				runtime: "tmux",
 				tmuxSessionName: tmux.sessionName,
 				fallbackReason: null,
+				blockerReason: null,
 			};
 		}
+		const fallbackReason = tmux.started ? "tmux new-session exited 0 but owner did not become live" : tmux.reason;
 		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,
@@ -309,11 +312,13 @@ export default class Harness extends Command {
 			stdin: "ignore",
 		});
 		child.unref();
+		const live = await this.#waitForOwner(root, sessionId);
 		return {
-			live: await this.#waitForOwner(root, sessionId),
+			live,
 			runtime: "detached",
 			tmuxSessionName: null,
-			fallbackReason: tmux.reason,
+			fallbackReason,
+			blockerReason: live ? null : "detached-owner-not-live",
 		};
 	}
 
@@ -364,11 +369,13 @@ export default class Harness extends Command {
 		let ownerLive = false;
 		let ownerRuntime: OwnerSpawnResult["runtime"] = "manual";
 		let ownerFallbackReason: string | null = null;
+		let ownerBlockerReason: string | null = null;
 		if (input.detach === true) {
 			const ownerSpawn = await this.#spawnDetachedOwner(root, sessionId, workspace);
 			ownerLive = ownerSpawn.live;
-			ownerRuntime = ownerLive ? ownerSpawn.runtime : "manual";
+			ownerRuntime = ownerSpawn.runtime;
 			ownerFallbackReason = ownerSpawn.fallbackReason;
+			ownerBlockerReason = ownerSpawn.blockerReason;
 			handle.viewportHandle = {
 				kind: "event-monitor",
 				tmuxSessionName: ownerSpawn.tmuxSessionName,
@@ -390,13 +397,27 @@ export default class Harness extends Command {
 				await writeSessionState(root, state);
 			}
 		}
+		if (ownerBlockerReason) {
+			state.lifecycle = "blocked";
+			state.blockers = [...state.blockers, ownerBlockerReason];
+			state.handle = handle;
+			state.updatedAt = nowIso();
+			await writeSessionState(root, state);
+		}
 		writeJson(
-			buildResponse(state, ownerLive, {
-				handle,
-				ownerRuntime,
-				...(ownerFallbackReason ? { ownerFallbackReason } : {}),
-			}),
+			buildResponse(
+				state,
+				ownerLive,
+				{
+					handle,
+					ownerRuntime,
+					...(ownerFallbackReason ? { ownerFallbackReason } : {}),
+					...(ownerBlockerReason ? { reason: ownerBlockerReason } : {}),
+				},
+				!ownerBlockerReason,
+			),
 		);
+		if (ownerBlockerReason) process.exitCode = 1;
 	}
 
 	/** Returns true if a live owner handled the verb (response already printed). */

@@ -14,7 +14,10 @@ let root: string;
 let workspace: string;
 let tmuxCommand: string;
 
-async function createFakeTmuxBin(rootDir: string, options: { failNewSession?: boolean } = {}): Promise<string> {
+async function createFakeTmuxBin(
+	rootDir: string,
+	options: { failNewSession?: boolean; skipOwnerLaunch?: boolean } = {},
+): Promise<string> {
 	const binDir = path.join(rootDir, ".test-bin");
 	const tmuxPath = path.join(binDir, "tmux");
 	const logPath = path.join(rootDir, "tmux.log");
@@ -34,7 +37,7 @@ case "$1" in
       fi
     done
     cmd="\${@: -1}"
-    (cd "$cwd" && bash -lc "$cmd") >/dev/null 2>&1 &
+    ${options.skipOwnerLaunch ? "exit 0" : '(cd "$cwd" && bash -lc "$cmd") >/dev/null 2>&1 &'}
     exit 0
     ;;
   *)
@@ -148,6 +151,24 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			after = await resolveOwner(root, SID);
 		}
 		expect(after.live).toBe(false);
+	}, 60_000);
+
+	it("falls back explicitly when tmux exits zero without launching the owner", async () => {
+		tmuxCommand = await createFakeTmuxBin(root, { skipOwnerLaunch: true });
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID, detach: true }),
+		]);
+		expect(started.code).toBe(0);
+		const evidence = started.json?.evidence as Record<string, unknown>;
+		expect(evidence.ownerRuntime).toBe("detached");
+		expect(evidence.ownerFallbackReason).toBe("tmux new-session exited 0 but owner did not become live");
+		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect(evidence.ownerRuntime).not.toBe("manual");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
 	}, 60_000);
 
 	it("falls back explicitly when tmux cannot start", async () => {
