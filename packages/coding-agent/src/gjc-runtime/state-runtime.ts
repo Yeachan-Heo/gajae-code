@@ -18,6 +18,7 @@ import {
 } from "../skill-state/workflow-hud";
 import {
 	buildWorkflowStateReceipt,
+	type AuditEntry,
 	canonicalWorkflowSkill,
 	describeWorkflowStateContract,
 	type WorkflowStateReceipt,
@@ -36,11 +37,16 @@ import {
 } from "./state-renderer";
 import { validateWorkflowStateEnvelope } from "./state-validation";
 import {
+	appendAuditEntry,
+	beginWorkflowTransactionJournal,
+	completeWorkflowTransactionJournal,
+	detectWorkflowEnvelopeIntegrityMismatch,
 	type GenericHardPruneTarget,
 	hardPrune,
 	type StateWriterAuditContext,
 	softDelete,
-	writeJsonAtomic as writeStateJsonAtomic,
+	updateWorkflowTransactionJournal,
+	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor } from "./workflow-manifest";
 
@@ -351,16 +357,51 @@ async function readJsonValue(filePath: string): Promise<unknown | null> {
 	}
 }
 
+async function warnAndAuditOutOfBandIfNeeded(
+	cwd: string,
+	filePath: string,
+	skill: CanonicalGjcWorkflowSkill,
+	mutationId?: string,
+): Promise<string | undefined> {
+	const mismatch = await detectWorkflowEnvelopeIntegrityMismatch(filePath);
+	if (!mismatch) return undefined;
+	const message = `WARNING: workflow mode-state out-of-band edit detected for ${skill}: ${filePath} expected sha256 ${mismatch.expected} but found ${mismatch.actual}`;
+	await appendAuditEntry(cwd, {
+		ts: new Date().toISOString(),
+		skill,
+		category: "state",
+		verb: "out_of_band_detected",
+		owner: "gjc-state-cli",
+		mutation_id: mutationId ?? `${skill}:out-of-band:${new Date().toISOString()}`,
+		forced: false,
+		paths: [filePath],
+		expected_sha256: mismatch.expected,
+		actual_sha256: mismatch.actual,
+	} as AuditEntry);
+	return message;
+}
+
 async function writeJsonAtomic(
 	cwd: string,
 	filePath: string,
 	value: unknown,
 	verb: "write" | "clear" | "handoff" = "write",
-): Promise<void> {
-	await writeStateJsonAtomic(filePath, value, {
+	options?: { skill?: CanonicalGjcWorkflowSkill; mutationId?: string },
+): Promise<string | undefined> {
+	const warning = options?.skill
+		? await warnAndAuditOutOfBandIfNeeded(cwd, filePath, options.skill, options.mutationId)
+		: undefined;
+	await writeWorkflowEnvelopeAtomic(filePath, value, {
 		cwd,
-		audit: { category: "state", verb, owner: "gjc-state-cli" },
+		audit: {
+			category: "state",
+			verb,
+			owner: "gjc-state-cli",
+			skill: options?.skill,
+			mutationId: options?.mutationId,
+		},
 	});
+	return warning;
 }
 
 function parseFieldsFlag(args: readonly string[]): StateProjectionField[] | undefined {
@@ -689,6 +730,7 @@ async function handleWrite(
 	const existingRaw = await readJsonValue(filePath);
 	const existing = isPlainObject(existingRaw) ? existingRaw : null;
 	const nowIsoStr = nowIso();
+	const mutationId = `${mode}:${nowIsoStr}`;
 	const receipt = buildWorkflowStateReceipt({
 		cwd,
 		skill: mode,
@@ -696,6 +738,7 @@ async function handleWrite(
 		command: `gjc state ${mode} write`,
 		sessionId,
 		nowIso: nowIsoStr,
+		mutationId,
 	});
 	if (existingRaw !== null && !isPlainObject(existingRaw)) {
 		throw new StateCommandError(2, `existing state for ${mode} must be a JSON object before write`);
@@ -754,7 +797,7 @@ async function handleWrite(
 	const validation = validateWorkflowStateEnvelope(mode, merged);
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
-	await writeJsonAtomic(cwd, filePath, merged, "write");
+	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, merged, "write", { skill: mode, mutationId });
 
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
 	const active = merged.active !== false;
@@ -763,6 +806,7 @@ async function handleWrite(
 	return {
 		status: 0,
 		stdout: `${JSON.stringify({ skill: mode, state: merged, receipt }, null, 2)}\n`,
+		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
 	};
 }
 
@@ -788,7 +832,7 @@ async function handleClear(
 		current_phase: "complete",
 		updated_at: nowIso(),
 	};
-	await writeJsonAtomic(cwd, filePath, cleared, "clear");
+	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, cleared, "clear", { skill: mode });
 
 	await syncWorkflowSkillState({
 		cwd,
@@ -800,8 +844,11 @@ async function handleClear(
 		phase: "complete",
 		payload: cleared,
 	});
-
-	return { status: 0, stdout: `${JSON.stringify(cleared, null, 2)}\n` };
+	return {
+		status: 0,
+		stdout: `${JSON.stringify(cleared, null, 2)}\n`,
+		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
+	};
 }
 
 /**
@@ -859,6 +906,7 @@ async function handleHandoff(
 	const existingCallee = (await readJsonFile(calleePath)) ?? {};
 
 	const handoffAt = nowIso();
+	const mutationId = `${caller}:handoff:${callee}:${handoffAt}`;
 	const callerReceipt = buildWorkflowStateReceipt({
 		cwd,
 		skill: caller,
@@ -866,6 +914,7 @@ async function handleHandoff(
 		command: `gjc state ${caller} handoff --to ${callee}`,
 		sessionId,
 		nowIso: handoffAt,
+		mutationId,
 	});
 	const calleeReceipt = buildWorkflowStateReceipt({
 		cwd,
@@ -874,6 +923,7 @@ async function handleHandoff(
 		command: `gjc state ${caller} handoff --to ${callee}`,
 		sessionId,
 		nowIso: handoffAt,
+		mutationId,
 	});
 
 	const calleeInitial = initialPhaseForSkill(callee);
@@ -902,6 +952,14 @@ async function handleHandoff(
 		receipt: callerReceipt,
 	};
 
+	await beginWorkflowTransactionJournal({
+		cwd,
+		mutationId,
+		caller,
+		callee,
+		paths: [calleePath, callerPath, activeStateFile(cwd, sessionId)],
+	});
+
 	// Atomic write order (architecture blocker AR-3): mode-state files first,
 	// then a single atomic active-state mutation per file (session before root)
 	// via applyHandoffToActiveState. The single-write transaction prevents the
@@ -909,8 +967,18 @@ async function handleHandoff(
 	// and write order keeps the session-scoped source of truth ahead of the
 	// root aggregate. strict:true on the active-state read tolerates ENOENT
 	// only; corrupt JSON / IO failures propagate as non-zero CLI status.
-	await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff");
-	await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff");
+	const warnings = [
+		await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff", { skill: callee, mutationId }),
+		await updateWorkflowTransactionJournal(cwd, mutationId, { steps: ["callee-mode-state"] }).then(() => undefined),
+		await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", { skill: caller, mutationId }),
+		await updateWorkflowTransactionJournal(cwd, mutationId, {
+			steps: ["callee-mode-state", "caller-mode-state"],
+		}).then(() => undefined),
+	].filter((warning): warning is string => typeof warning === "string");
+	for (const warning of warnings) process.stderr.write(`${warning}\n`);
+	if (process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER === mutationId) {
+		throw new StateCommandError(1, `injected handoff failure after caller write for ${mutationId}`);
+	}
 	await applyHandoffToActiveState({
 		cwd,
 		nowIso: handoffAt,
@@ -944,6 +1012,10 @@ async function handleHandoff(
 			receipt: calleeReceipt,
 		},
 	});
+	await updateWorkflowTransactionJournal(cwd, mutationId, {
+		steps: ["callee-mode-state", "caller-mode-state", "active-state"],
+	});
+	await completeWorkflowTransactionJournal(cwd, mutationId);
 
 	return {
 		status: 0,
