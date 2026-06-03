@@ -17,8 +17,8 @@ import {
 	buildUltragoalHudSummary,
 } from "../skill-state/workflow-hud";
 import {
-	buildWorkflowStateReceipt,
 	type AuditEntry,
+	buildWorkflowStateReceipt,
 	canonicalWorkflowSkill,
 	describeWorkflowStateContract,
 	type WorkflowStateReceipt,
@@ -27,6 +27,7 @@ import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState } from "./state-migrations";
 import {
 	buildStateStatusSummary,
+	compactProjectStateJson,
 	projectStateFields,
 	renderContractMarkdown,
 	renderHistoryMarkdown,
@@ -197,7 +198,7 @@ function parsePositionalArgs(args: readonly string[]): ParsedInvocation {
 	const first = positional[0];
 	const second = positional[1];
 	if (first && ACTION_NAMES.has(first)) {
-		return { action: first as ParsedInvocation["action"] };
+		return { action: first as ParsedInvocation["action"], positionalSkill: second };
 	}
 	if (first && second && ACTION_NAMES.has(second)) {
 		return { action: second as ParsedInvocation["action"], positionalSkill: first };
@@ -361,7 +362,7 @@ async function warnAndAuditOutOfBandIfNeeded(
 	cwd: string,
 	filePath: string,
 	skill: CanonicalGjcWorkflowSkill,
-	mutationId?: string,
+	options?: { mutationId?: string; forced?: boolean },
 ): Promise<string | undefined> {
 	const mismatch = await detectWorkflowEnvelopeIntegrityMismatch(filePath);
 	if (!mismatch) return undefined;
@@ -372,8 +373,8 @@ async function warnAndAuditOutOfBandIfNeeded(
 		category: "state",
 		verb: "out_of_band_detected",
 		owner: "gjc-state-cli",
-		mutation_id: mutationId ?? `${skill}:out-of-band:${new Date().toISOString()}`,
-		forced: false,
+		mutation_id: options?.mutationId ?? `${skill}:out-of-band:${new Date().toISOString()}`,
+		forced: options?.forced ?? false,
 		paths: [filePath],
 		expected_sha256: mismatch.expected,
 		actual_sha256: mismatch.actual,
@@ -386,11 +387,23 @@ async function writeJsonAtomic(
 	filePath: string,
 	value: unknown,
 	verb: "write" | "clear" | "handoff" = "write",
-	options?: { skill?: CanonicalGjcWorkflowSkill; mutationId?: string },
+	options?: {
+		skill?: CanonicalGjcWorkflowSkill;
+		mutationId?: string;
+		force?: boolean;
+		fromPhase?: string;
+		toPhase?: string;
+	},
 ): Promise<string | undefined> {
 	const warning = options?.skill
-		? await warnAndAuditOutOfBandIfNeeded(cwd, filePath, options.skill, options.mutationId)
+		? await warnAndAuditOutOfBandIfNeeded(cwd, filePath, options.skill, {
+				mutationId: options.mutationId,
+				forced: options.force ?? false,
+			})
 		: undefined;
+	if (warning && !options?.force) {
+		throw new StateCommandError(2, `${warning}; use --force to overwrite tampered mode-state`);
+	}
 	await writeWorkflowEnvelopeAtomic(filePath, value, {
 		cwd,
 		audit: {
@@ -399,6 +412,9 @@ async function writeJsonAtomic(
 			owner: "gjc-state-cli",
 			skill: options?.skill,
 			mutationId: options?.mutationId,
+			fromPhase: options?.fromPhase,
+			toPhase: options?.toPhase,
+			forced: options?.force ?? false,
 		},
 	});
 	return warning;
@@ -671,6 +687,15 @@ async function handleRead(
 					: renderStateMarkdown(mode, projected, manifest),
 			};
 		}
+		if (hasFlag(args, "--compact")) {
+			const compact = compactProjectStateJson(mode, envelope, manifest);
+			return {
+				status: 0,
+				stdout: hasFlag(args, "--json")
+					? `${JSON.stringify(compact, null, 2)}\n`
+					: renderStateMarkdown(mode, envelope, manifest),
+			};
+		}
 		return {
 			status: 0,
 			stdout: hasFlag(args, "--json")
@@ -797,7 +822,13 @@ async function handleWrite(
 	const validation = validateWorkflowStateEnvelope(mode, merged);
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
-	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, merged, "write", { skill: mode, mutationId });
+	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, merged, "write", {
+		skill: mode,
+		mutationId,
+		force: forced,
+		fromPhase,
+		toPhase,
+	});
 
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
 	const active = merged.active !== false;
@@ -832,7 +863,12 @@ async function handleClear(
 		current_phase: "complete",
 		updated_at: nowIso(),
 	};
-	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, cleared, "clear", { skill: mode });
+	const outOfBandWarning = await writeJsonAtomic(cwd, filePath, cleared, "clear", {
+		skill: mode,
+		force: hasFlag(args, "--force"),
+		fromPhase: typeof existing.current_phase === "string" ? existing.current_phase : undefined,
+		toPhase: "complete",
+	});
 
 	await syncWorkflowSkillState({
 		cwd,
@@ -967,10 +1003,23 @@ async function handleHandoff(
 	// and write order keeps the session-scoped source of truth ahead of the
 	// root aggregate. strict:true on the active-state read tolerates ENOENT
 	// only; corrupt JSON / IO failures propagate as non-zero CLI status.
+	const force = hasFlag(args, "--force");
 	const warnings = [
-		await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff", { skill: callee, mutationId }),
+		await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff", {
+			skill: callee,
+			mutationId,
+			force,
+			fromPhase: typeof existingCallee.current_phase === "string" ? existingCallee.current_phase : undefined,
+			toPhase: calleeInitial,
+		}),
 		await updateWorkflowTransactionJournal(cwd, mutationId, { steps: ["callee-mode-state"] }).then(() => undefined),
-		await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", { skill: caller, mutationId }),
+		await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", {
+			skill: caller,
+			mutationId,
+			force,
+			fromPhase: typeof existingCaller.current_phase === "string" ? existingCaller.current_phase : undefined,
+			toPhase: "handoff",
+		}),
 		await updateWorkflowTransactionJournal(cwd, mutationId, {
 			steps: ["callee-mode-state", "caller-mode-state"],
 		}).then(() => undefined),
@@ -1343,13 +1392,20 @@ async function handleMigrate(
 		);
 	}
 	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const mismatchWarning = await warnAndAuditOutOfBandIfNeeded(cwd, filePath, mode, {
+		forced: hasFlag(args, "--force"),
+	});
 	const result = await migrateAndPersistLegacyState({
 		cwd,
 		skill: mode,
 		statePath: filePath,
 		sessionId: selectors.sessionId,
 	});
-	return { status: 0, stdout: `${JSON.stringify({ skill: mode, ...result }, null, 2)}\n` };
+	return {
+		status: 0,
+		stdout: `${JSON.stringify({ skill: mode, ...result, integrity_mismatch: Boolean(mismatchWarning) }, null, 2)}\n`,
+		...(mismatchWarning ? { stderr: `${mismatchWarning}\n` } : {}),
+	};
 }
 
 export async function runNativeStateCommand(args: string[], cwd = process.cwd()): Promise<StateCommandResult> {

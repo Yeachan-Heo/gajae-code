@@ -32,6 +32,18 @@ export function validateWorkflowStateEnvelope(skill: CanonicalGjcWorkflowSkill, 
 			error: `state.current_phase must be a string when present, got ${typeName(state.current_phase)}`,
 		};
 	}
+	if ("version" in state && typeof state.version !== "number") {
+		return { valid: false, error: `state.version must be a number when present, got ${typeName(state.version)}` };
+	}
+	if ("updated_at" in state && typeof state.updated_at !== "string") {
+		return {
+			valid: false,
+			error: `state.updated_at must be a string when present, got ${typeName(state.updated_at)}`,
+		};
+	}
+	if ("receipt" in state && state.receipt !== undefined && !isPlainObject(state.receipt)) {
+		return { valid: false, error: `state.receipt must be an object when present, got ${typeName(state.receipt)}` };
+	}
 
 	return { valid: true };
 }

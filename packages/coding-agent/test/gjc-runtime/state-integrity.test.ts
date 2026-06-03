@@ -31,7 +31,7 @@ async function readAuditEntries(cwd: string): Promise<Array<Record<string, unkno
 }
 
 describe("gjc state integrity", () => {
-	it("detects out-of-band edits on the next mode-state write and audits evidence", async () => {
+	it("blocks out-of-band edits on the next mode-state write unless forced", async () => {
 		await withTempCwd(async cwd => {
 			const first = await runNativeStateCommand(
 				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "planner" })],
@@ -45,14 +45,22 @@ describe("gjc state integrity", () => {
 			stamped.tampered = true;
 			await fs.writeFile(statePath, `${JSON.stringify(stamped, null, 2)}\n`, "utf-8");
 
-			const second = await runNativeStateCommand(
+			const rejected = await runNativeStateCommand(
 				["write", "--mode", "ralplan", "--input", JSON.stringify({ verdict: "continue" })],
 				cwd,
 			);
-			expect(second.status).toBe(0);
-			expect(second.stderr).toContain("out-of-band edit detected");
+			expect(rejected.status).not.toBe(0);
+			expect(rejected.stderr).toContain("out-of-band edit detected");
+			expect((await readJson(statePath)).tampered).toBe(true);
+
+			const forced = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--force", "--input", JSON.stringify({ verdict: "continue" })],
+				cwd,
+			);
+			expect(forced.status).toBe(0);
+			expect(forced.stderr).toContain("out-of-band edit detected");
 			const entries = await readAuditEntries(cwd);
-			const mismatch = entries.find(entry => entry.verb === "out_of_band_detected");
+			const mismatch = entries.find(entry => entry.verb === "out_of_band_detected" && entry.forced === true);
 			expect(mismatch).toMatchObject({ skill: "ralplan", category: "state", owner: "gjc-state-cli" });
 			expect(typeof mismatch?.expected_sha256).toBe("string");
 			expect(typeof mismatch?.actual_sha256).toBe("string");

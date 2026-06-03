@@ -120,9 +120,25 @@ function compactStateFields(state: Record<string, unknown>): Array<[string, stri
 	const fields: Array<[string, string]> = [];
 	for (const key of COMPACT_ELIDE_KEYS) {
 		const value = state[key];
-		if (Array.isArray(value)) fields.push([key, `${value.length} entries (--json for full)`]);
+		if (Array.isArray(value)) fields.push([key, `${value.length} entries (elided)`]);
 	}
 	return fields;
+}
+
+export function compactProjectStateJson(
+	skill: CanonicalGjcWorkflowSkill,
+	stateJson: Record<string, unknown>,
+	manifest: SkillManifest,
+): Record<string, unknown> {
+	const state = stateObject(stateJson);
+	const compact = projectStateFields(skill, stateJson, manifest, STATE_FIELD_ALLOWLIST);
+	const elisions: Record<string, unknown> = {};
+	for (const key of COMPACT_ELIDE_KEYS) {
+		const value = state[key];
+		if (Array.isArray(value)) elisions[key] = { type: "array", count: value.length, pointer: `/${key}` };
+	}
+	if (Object.keys(elisions).length) compact.elided = elisions;
+	return compact;
 }
 
 export function projectStateFields(

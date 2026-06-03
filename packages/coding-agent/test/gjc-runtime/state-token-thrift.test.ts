@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 
 describe("GJC state token thrift", () => {
-	it("elides large arrays in default read while --json and readWorkflowStateJson stay full", async () => {
+	it("elides large arrays only for --compact while plain --json and readWorkflowStateJson stay full", async () => {
 		const root = await tempDir();
 		const payload = {
 			current_phase: "interviewing",
@@ -36,11 +36,23 @@ describe("GJC state token thrift", () => {
 			root,
 		);
 
-		const markdown = await runNativeStateCommand(["read", "--mode", "deep-interview", "--session-id", ""], root);
-		expect(markdown.status).toBe(0);
-		expect(markdown.stdout).toContain("rounds: 2 entries (--json for full)");
-		expect(markdown.stdout).toContain("ontology_snapshots: 1 entries (--json for full)");
-		expect(markdown.stdout).not.toContain("transcript");
+		const compactMarkdown = await runNativeStateCommand(
+			["read", "--mode", "deep-interview", "--session-id", "", "--compact"],
+			root,
+		);
+		expect(compactMarkdown.status).toBe(0);
+		expect(compactMarkdown.stdout).toContain("rounds: 2 entries (elided)");
+		expect(compactMarkdown.stdout).toContain("ontology_snapshots: 1 entries (elided)");
+		expect(compactMarkdown.stdout).not.toContain("transcript");
+
+		const compactJson = await runNativeStateCommand(
+			["read", "--mode", "deep-interview", "--session-id", "", "--compact", "--json"],
+			root,
+		);
+		expect(compactJson.status).toBe(0);
+		const parsedCompact = JSON.parse(compactJson.stdout ?? "{}");
+		expect(parsedCompact.rounds).toBeUndefined();
+		expect(parsedCompact.elided.rounds).toEqual({ type: "array", count: 2, pointer: "/rounds" });
 
 		const json = await runNativeStateCommand(
 			["read", "--mode", "deep-interview", "--session-id", "", "--json"],
@@ -83,6 +95,52 @@ describe("GJC state token thrift", () => {
 		expect(result.stdout?.trim().split("\n")).toHaveLength(1);
 		expect(result.stdout).toContain("deep-interview: phase=interviewing");
 		expect(result.stdout).toContain("next=");
+	});
+
+	it("resolves explicit skill for both status positional forms", async () => {
+		const root = await tempDir();
+		await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "planner" })],
+			root,
+		);
+		const actionFirst = await runNativeStateCommand(["status", "ralplan"], root);
+		const skillFirst = await runNativeStateCommand(["ralplan", "status"], root);
+		expect(actionFirst.status).toBe(0);
+		expect(skillFirst.status).toBe(0);
+		expect(actionFirst.stdout).toContain("ralplan: phase=planner");
+		expect(skillFirst.stdout).toContain("ralplan: phase=planner");
+	});
+
+	it("rejects wrong typed consumed scalars while preserving extension fields", async () => {
+		const root = await tempDir();
+		const wrongVersion = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ version: "1", current_phase: "planner" })],
+			root,
+		);
+		expect(wrongVersion.status).not.toBe(0);
+		expect(wrongVersion.stderr).toContain("state.version must be a number");
+
+		const wrongUpdatedAt = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ updated_at: 123, current_phase: "planner" })],
+			root,
+		);
+		expect(wrongUpdatedAt.status).not.toBe(0);
+		expect(wrongUpdatedAt.stderr).toContain("state.updated_at must be a string");
+
+		const extension = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"ralplan",
+				"--input",
+				JSON.stringify({ current_phase: "planner", rounds: [{ n: 1 }], topology: { free: ["form"] } }),
+			],
+			root,
+		);
+		expect(extension.status).toBe(0);
+		const parsed = JSON.parse(extension.stdout ?? "{}");
+		expect(parsed.state.rounds).toEqual([{ n: 1 }]);
+		expect(parsed.state.topology).toEqual({ free: ["form"] });
 	});
 
 	it("windows audit history with --limit", async () => {
