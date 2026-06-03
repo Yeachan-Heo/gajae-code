@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
@@ -102,6 +103,21 @@ function resolveRetryBudget(input: Record<string, unknown>): RetryBudget {
 		return { ...DEFAULT_RETRY_BUDGET, ...(supplied as Partial<RetryBudget>) };
 	}
 	return { ...DEFAULT_RETRY_BUDGET };
+}
+
+interface OwnerSpawnResult {
+	live: boolean;
+	runtime: "tmux" | "detached" | "manual";
+	tmuxSessionName: string | null;
+	fallbackReason: string | null;
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function deterministicHarnessTmuxSessionName(sessionId: string): string {
+	return `gajae_code_harness_${sanitizeTmuxToken(sessionId)}`;
 }
 
 async function loadState(root: string, sessionId: string): Promise<SessionState> {
@@ -228,12 +244,63 @@ export default class Harness extends Command {
 		process.exit(0);
 	}
 
-	/** Spawn the detached owner daemon and poll until it holds the lease. */
-	async #spawnDetachedOwner(root: string, sessionId: string, cwd: string): Promise<boolean> {
+	#buildOwnerCommand(sessionId: string): string[] {
 		const argv1 = process.argv[1];
-		const cmd = argv1
+		return argv1
 			? [process.execPath, argv1, "harness", "__owner", "--session", sessionId]
 			: [process.execPath, "harness", "__owner", "--session", sessionId];
+	}
+
+	async #waitForOwner(root: string, sessionId: string): Promise<boolean> {
+		for (let i = 0; i < 100; i++) {
+			if ((await resolveOwner(root, sessionId)).live) return true;
+			await new Promise(r => setTimeout(r, 50));
+		}
+		return false;
+	}
+
+	#startTmuxResidentOwner(
+		root: string,
+		sessionId: string,
+		cwd: string,
+	): { started: boolean; sessionName: string; reason: string | null } {
+		const tmuxCommand = resolveGjcTmuxCommand();
+		if (Bun.which(tmuxCommand) === null) {
+			return {
+				started: false,
+				sessionName: deterministicHarnessTmuxSessionName(sessionId),
+				reason: "tmux-unavailable",
+			};
+		}
+		const sessionName = deterministicHarnessTmuxSessionName(sessionId);
+		const envAssignments = [`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`];
+		if (process.env.GJC_HARNESS_RPC_COMMAND) {
+			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
+		}
+		const ownerCommand = this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ");
+		const shellCommand = `exec env ${envAssignments.join(" ")} ${ownerCommand}`;
+		const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, "-c", cwd, shellCommand], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: process.env,
+		});
+		if (created.exitCode === 0) return { started: true, sessionName, reason: null };
+		const stderr = created.stderr.toString().trim();
+		return { started: false, sessionName, reason: stderr || "tmux-start-failed" };
+	}
+
+	/** Spawn the owner daemon. Prefer a tmux-resident owner, then explicitly fall back to detached. */
+	async #spawnDetachedOwner(root: string, sessionId: string, cwd: string): Promise<OwnerSpawnResult> {
+		const tmux = this.#startTmuxResidentOwner(root, sessionId, cwd);
+		if (tmux.started) {
+			return {
+				live: await this.#waitForOwner(root, sessionId),
+				runtime: "tmux",
+				tmuxSessionName: tmux.sessionName,
+				fallbackReason: null,
+			};
+		}
+		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,
 			env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
@@ -242,11 +309,12 @@ export default class Harness extends Command {
 			stdin: "ignore",
 		});
 		child.unref();
-		for (let i = 0; i < 100; i++) {
-			if ((await resolveOwner(root, sessionId)).live) return true;
-			await new Promise(r => setTimeout(r, 50));
-		}
-		return false;
+		return {
+			live: await this.#waitForOwner(root, sessionId),
+			runtime: "detached",
+			tmuxSessionName: null,
+			fallbackReason: tmux.reason,
+		};
 	}
 
 	async #start(root: string, input: Record<string, unknown>): Promise<void> {
@@ -294,8 +362,18 @@ export default class Harness extends Command {
 		};
 		await writeSessionState(root, state);
 		let ownerLive = false;
+		let ownerRuntime: OwnerSpawnResult["runtime"] = "manual";
+		let ownerFallbackReason: string | null = null;
 		if (input.detach === true) {
-			ownerLive = await this.#spawnDetachedOwner(root, sessionId, workspace);
+			const ownerSpawn = await this.#spawnDetachedOwner(root, sessionId, workspace);
+			ownerLive = ownerSpawn.live;
+			ownerRuntime = ownerLive ? ownerSpawn.runtime : "manual";
+			ownerFallbackReason = ownerSpawn.fallbackReason;
+			handle.viewportHandle = {
+				kind: "event-monitor",
+				tmuxSessionName: ownerSpawn.tmuxSessionName,
+				viewOnly: true,
+			};
 			if (ownerLive) {
 				const resolved = await resolveOwner(root, sessionId);
 				handle.processHandle = {
@@ -312,7 +390,13 @@ export default class Harness extends Command {
 				await writeSessionState(root, state);
 			}
 		}
-		writeJson(buildResponse(state, ownerLive, { handle, ownerRuntime: ownerLive ? "detached" : "manual" }));
+		writeJson(
+			buildResponse(state, ownerLive, {
+				handle,
+				ownerRuntime,
+				...(ownerFallbackReason ? { ownerFallbackReason } : {}),
+			}),
+		);
 	}
 
 	/** Returns true if a live owner handled the verb (response already printed). */
