@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/stats",
-	"version": "0.2.4",
+	"version": "0.2.5",
 	"description": "Local observability dashboard for pi AI usage statistics",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",

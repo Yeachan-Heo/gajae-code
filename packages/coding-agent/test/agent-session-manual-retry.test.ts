@@ -12,7 +12,7 @@ import { TempDir } from "@gajae-code/utils";
 
 function lastAgentMessage(session: AgentSession): AssistantMessage {
 	const message = session.agent.state.messages.at(-1);
-	if (!message || message.role !== "assistant") {
+	if (message?.role !== "assistant") {
 		throw new Error("Expected trailing assistant message");
 	}
 	return message as AssistantMessage;

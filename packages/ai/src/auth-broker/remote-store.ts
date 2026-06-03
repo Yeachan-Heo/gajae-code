@@ -281,7 +281,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async prepareForRequest(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
 		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
-		if (!entry || entry.credential.type !== "oauth" || entry.rotatesInMs === null) return false;
+		if (entry?.credential.type !== "oauth" || entry.rotatesInMs === null) return false;
 		const remainingMs = this.#snapshotReceivedAt + entry.rotatesInMs - Date.now();
 		if (remainingMs > WAIT_THRESHOLD_MS) return false;
 		return this.waitForFreshSnapshot(MAX_WAIT_MS, opts);

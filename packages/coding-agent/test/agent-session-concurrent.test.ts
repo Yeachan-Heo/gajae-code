@@ -15,6 +15,7 @@ import type { Rule } from "@gajae-code/coding-agent/capability/rule";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -299,6 +300,51 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		expect(mock.calls).toHaveLength(0);
 		expect(session.queuedMessageCount).toBe(1);
+	});
+
+	it("keeps session_switch hook-queued steering deliverable after clearing pre-switch queues", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+		});
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const targetSessionManager = SessionManager.create(tempDir, tempDir);
+		targetSessionManager.appendMessage({ role: "user", content: "target session", timestamp: Date.now() });
+		await targetSessionManager.flush();
+		const targetSessionFile = targetSessionManager.getSessionFile();
+		await targetSessionManager.close();
+		if (!targetSessionFile) throw new Error("Expected target session file");
+
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-switch-hook.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-switch-hook.yml"));
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_switch") {
+					await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
+				}
+			}),
+		} as unknown as ExtensionRunner;
+
+		session = new AgentSession({
+			agent,
+			sessionManager: currentSessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+		await session.steer("pre-switch steering");
+		expect(session.getQueuedMessages().steering).toEqual(["pre-switch steering"]);
+		expect(agent.snapshotSteering()).toHaveLength(1);
+
+		expect(await session.switchSession(targetSessionFile)).toBe(true);
+
+		expect(session.getQueuedMessages().steering).toEqual(["queued by switch hook"]);
+		expect(agent.snapshotSteering()).toHaveLength(1);
 	});
 
 	// Regression: a subscriber that fires the next prompt synchronously from the

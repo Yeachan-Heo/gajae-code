@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 import { canonicalWorkflowSkill, WORKFLOW_STATE_RECEIPT_VERSION } from "../skill-state/workflow-state-contract";
-import { writeJsonAtomic } from "./state-writer";
+import { writeWorkflowEnvelopeAtomic } from "./state-writer";
 import { getSkillManifest } from "./workflow-manifest";
 
 export interface NormalizeLegacyStateResult {
@@ -111,7 +111,7 @@ export async function migrateAndPersistLegacyState(
 	const { state, changed } = normalizeLegacyState(raw as Record<string, unknown>, canonicalSkill);
 	if (!changed) return { migrated: false, path: args.statePath };
 
-	const persistedPath = await writeJsonAtomic(args.statePath, state, {
+	const persistedPath = await writeWorkflowEnvelopeAtomic(args.statePath, state, {
 		cwd: args.cwd,
 		receipt: {
 			cwd: args.cwd,

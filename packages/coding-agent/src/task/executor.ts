@@ -1306,6 +1306,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
+						unbounded: event.unbounded,
 						delayMs: event.delayMs,
 						errorMessage: event.errorMessage,
 						startedAtMs: Date.now(),

@@ -916,7 +916,7 @@ export class WorkerCore {
 						dispatchEvent: (event: unknown) => boolean;
 					}
 					const select = el as unknown as SelectLike;
-					if (!select || select.tagName !== "SELECT") throw new Error("tab.select() requires a <select> element");
+					if (select?.tagName !== "SELECT") throw new Error("tab.select() requires a <select> element");
 					const EventCtor = (
 						globalThis as unknown as { Event: new (type: string, init?: { bubbles: boolean }) => unknown }
 					).Event;

@@ -136,7 +136,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_2_4(): void
+export declare function __piNativesV0_2_5(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.

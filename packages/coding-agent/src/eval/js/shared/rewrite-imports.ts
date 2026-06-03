@@ -174,8 +174,7 @@ export function rewriteImports(code: string): string {
 		if (node.type !== "CallExpression") return;
 		const call = node as unknown as { callee?: { type?: string; start?: number; end?: number } };
 		const callee = call.callee;
-		if (!callee || callee.type !== "Import" || typeof callee.start !== "number" || typeof callee.end !== "number")
-			return;
+		if (callee?.type !== "Import" || typeof callee.start !== "number" || typeof callee.end !== "number") return;
 		edits.push({ start: callee.start, end: callee.end, text: "__gjc_import__" });
 	});
 

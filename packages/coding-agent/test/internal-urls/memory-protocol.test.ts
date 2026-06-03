@@ -111,7 +111,8 @@ describe("MemoryProtocolHandler", () => {
 			expect(resource.content).toBe("session-agent summary");
 			const sourcePath = resource.sourcePath;
 			if (sourcePath === undefined) throw new Error("Expected memory resource source path");
-			expect(sourcePath.startsWith(sessionMemoryRoot)).toBe(true);
+			const realSessionMemoryRoot = await fs.realpath(sessionMemoryRoot);
+			expect(sourcePath.startsWith(realSessionMemoryRoot)).toBe(true);
 		} finally {
 			setAgentDir(previousAgentDir);
 			await fs.rm(cleanupRoot, { recursive: true, force: true });

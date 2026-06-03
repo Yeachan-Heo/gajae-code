@@ -24,7 +24,7 @@ async function main() {
 	const thinkingContent = fixtureMessage.content.find(c => c.type === "thinking");
 	const textContent = fixtureMessage.content.find(c => c.type === "text");
 
-	if (!thinkingContent || thinkingContent.type !== "thinking") {
+	if (thinkingContent?.type !== "thinking") {
 		console.error("No thinking content in fixture");
 		process.exit(1);
 	}
