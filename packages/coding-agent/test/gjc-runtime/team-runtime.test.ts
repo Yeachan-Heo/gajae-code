@@ -1309,8 +1309,7 @@ describe("native gjc team runtime", () => {
 		expect(commandSource).toContain("monitorGjcTeam(teamName)");
 		expect(commandSource).toContain("listGjcTeams()");
 		expect(commandSource).toContain("formatTaskCounts(snapshot.task_counts)");
-		expect(commandSource).toContain("formatIntegrationSummary(snapshot)");
-		expect(commandSource).toContain("formatNotificationSummary(snapshot)");
+		expect(commandSource).toContain("renderTeamStatusMarkdown(snapshot)");
 
 		const runtimeSource = await Bun.file(path.join(import.meta.dir, "../../src/gjc-runtime/team-runtime.ts")).text();
 		for (const disallowedGitStrategy of ['"-X"', '"--strategy-option"', "-X theirs", "-X ours"]) {

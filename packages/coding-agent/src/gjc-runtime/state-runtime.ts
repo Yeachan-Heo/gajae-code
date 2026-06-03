@@ -24,7 +24,16 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState } from "./state-migrations";
-import { renderStateMarkdown } from "./state-renderer";
+import {
+	buildStateStatusSummary,
+	projectStateFields,
+	renderContractMarkdown,
+	renderHistoryMarkdown,
+	renderStateMarkdown,
+	renderStateStatusLine,
+	STATE_FIELD_ALLOWLIST,
+	type StateProjectionField,
+} from "./state-renderer";
 import {
 	type GenericHardPruneTarget,
 	hardPrune,
@@ -84,10 +93,22 @@ const FLAGS_WITH_VALUES = new Set([
 	"--format",
 	"--older-than",
 	"--status",
+	"--fields",
+	"--since",
+	"--limit",
 ]);
-const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate"]);
-const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate"]);
-const VERB_SPECIFIC_FLAGS = new Set(["--skill", "--format", "--older-than", "--status"]);
+const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate", "status"]);
+const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate", "--compact", "--history"]);
+const VERB_SPECIFIC_FLAGS = new Set([
+	"--skill",
+	"--format",
+	"--older-than",
+	"--status",
+	"--fields",
+	"--since",
+	"--limit",
+	"--history",
+]);
 
 function flagName(arg: string): string | undefined {
 	if (!arg.startsWith("--")) return undefined;
@@ -125,7 +146,7 @@ function assertKnownFlags(args: readonly string[], parsed: ParsedInvocation): vo
 }
 
 interface ParsedInvocation {
-	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "migrate";
+	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "migrate" | "status";
 	positionalSkill?: string;
 }
 
@@ -311,6 +332,82 @@ async function writeJsonAtomic(
 	});
 }
 
+function parseFieldsFlag(args: readonly string[]): StateProjectionField[] | undefined {
+	const raw = flagValue(args, "--fields");
+	if (raw === undefined) return undefined;
+	const allowed = new Set<string>(STATE_FIELD_ALLOWLIST);
+	const fields = raw
+		.split(",")
+		.map(field => field.trim())
+		.filter(Boolean);
+	const unknown = fields.filter(field => !allowed.has(field));
+	if (unknown.length) {
+		throw new StateCommandError(
+			2,
+			`unknown --fields value(s): ${unknown.join(", ")}. Allowed fields: ${STATE_FIELD_ALLOWLIST.join(", ")}`,
+		);
+	}
+	return fields as StateProjectionField[];
+}
+
+function parseLimitFlag(args: readonly string[], defaultLimit = 50): number {
+	const raw = flagValue(args, "--limit");
+	if (raw === undefined) return defaultLimit;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 500) {
+		throw new StateCommandError(2, "gjc state --limit requires an integer from 1 to 500");
+	}
+	return parsed;
+}
+
+function parseSinceFlag(args: readonly string[]): string | undefined {
+	const raw = flagValue(args, "--since")?.trim();
+	if (!raw) return undefined;
+	const duration = raw.match(/^(\d+)(m|h|d)$/);
+	if (duration) {
+		const amount = Number(duration[1]);
+		const unit = duration[2];
+		const multiplier = unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
+		return new Date(Date.now() - amount * multiplier).toISOString();
+	}
+	if (Number.isNaN(Date.parse(raw)))
+		throw new StateCommandError(2, "gjc state --since requires an ISO timestamp or duration like 30m, 6h, 7d");
+	return new Date(raw).toISOString();
+}
+
+async function readAuditWindow(
+	cwd: string,
+	args: readonly string[],
+): Promise<{ entries: unknown[]; limit: number; since?: string; truncated: boolean }> {
+	const limit = parseLimitFlag(args);
+	const since = parseSinceFlag(args);
+	const auditPath = path.join(cwd, ".gjc", "state", "audit.jsonl");
+	let raw = "";
+	try {
+		raw = await fs.readFile(auditPath, "utf-8");
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code !== "ENOENT") throw error;
+	}
+	const selected: unknown[] = [];
+	let matched = 0;
+	const lines = raw.split(/\r?\n/).filter(line => line.trim().length > 0);
+	for (let index = lines.length - 1; index >= 0; index -= 1) {
+		const line = lines[index];
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (since && isPlainObject(entry) && typeof entry.ts === "string" && Date.parse(entry.ts) < Date.parse(since))
+			break;
+		matched += 1;
+		if (selected.length < limit) selected.push(entry);
+	}
+	return { entries: selected.reverse(), limit, ...(since ? { since } : {}), truncated: matched > limit };
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -487,20 +584,58 @@ async function handleRead(
 ): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, positionalSkill);
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	const fields = parseFieldsFlag(args);
 	if (mode) {
 		const filePath = modeStateFile(cwd, mode, selectors.sessionId);
 		const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
 		const envelope = { skill: mode, state: existing, storage_path: filePath };
+		const manifest = getSkillManifest(mode);
+		if (fields) {
+			const projected = projectStateFields(mode, envelope, manifest, fields);
+			return {
+				status: 0,
+				stdout: hasFlag(args, "--json")
+					? `${JSON.stringify(projected, null, 2)}\n`
+					: renderStateMarkdown(mode, projected, manifest),
+			};
+		}
 		return {
 			status: 0,
 			stdout: hasFlag(args, "--json")
 				? `${JSON.stringify(envelope, null, 2)}\n`
-				: renderStateMarkdown(mode, envelope, getSkillManifest(mode)),
+				: renderStateMarkdown(mode, envelope, manifest),
 		};
 	}
 	const filePath = activeStateFile(cwd, selectors.sessionId);
 	const existing = await readJsonFile(filePath);
 	return { status: 0, stdout: `${JSON.stringify(existing ?? {}, null, 2)}\n` };
+}
+
+async function handleStatus(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill);
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	if (!mode) {
+		throw new StateCommandError(
+			2,
+			"gjc state status requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+		);
+	}
+	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
+	const summary = buildStateStatusSummary(
+		mode,
+		{ skill: mode, state: existing, storage_path: filePath },
+		getSkillManifest(mode),
+		filePath,
+	);
+	return {
+		status: 0,
+		stdout: hasFlag(args, "--json") ? `${JSON.stringify(summary, null, 2)}\n` : renderStateStatusLine(summary),
+	};
 }
 
 async function handleWrite(
@@ -780,7 +915,12 @@ async function handleContract(
 		throw new StateCommandError(2, "gjc state contract requires --mode <skill>, positional <skill>, or input.skill");
 	}
 	const payload = { skill: mode, contract: describeWorkflowStateContract(mode) };
-	return { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` };
+	return {
+		status: 0,
+		stdout: hasFlag(args, "--json")
+			? `${JSON.stringify(payload, null, 2)}\n`
+			: renderContractMarkdown(mode, payload.contract),
+	};
 }
 
 function parseNonNegativeIntegerFlag(args: readonly string[], flag: string): number | undefined {
@@ -809,6 +949,13 @@ async function handleGraph(
 	_cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
+	if (hasFlag(args, "--history")) {
+		const history = await readAuditWindow(_cwd, args);
+		return {
+			status: 0,
+			stdout: hasFlag(args, "--json") ? `${JSON.stringify(history, null, 2)}\n` : renderHistoryMarkdown(history),
+		};
+	}
 	const rawSkill = flagValue(args, "--skill")?.trim() || positionalSkill?.trim() || "all";
 	if (rawSkill !== "all") assertKnownMode(rawSkill);
 	const format = flagValue(args, "--format")?.trim() || "ascii";
@@ -918,6 +1065,8 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return await handleClear(args, cwd, parsed.positionalSkill);
 			case "contract":
 				return await handleContract(args, cwd, parsed.positionalSkill);
+			case "status":
+				return await handleStatus(args, cwd, parsed.positionalSkill);
 			case "handoff":
 				return await handleHandoff(args, cwd, parsed.positionalSkill);
 			case "graph":

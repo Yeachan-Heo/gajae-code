@@ -1,4 +1,5 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { renderTeamStatusMarkdown } from "../gjc-runtime/state-renderer";
 import {
 	buildTeamHudSummary,
 	executeGjcTeamApiOperation,
@@ -42,29 +43,6 @@ function formatTaskCounts(counts: Record<string, number>): string {
 	return Object.entries(counts)
 		.map(([status, count]) => `${status}=${count}`)
 		.join(" ");
-}
-
-function formatNotificationSummary(snapshot: GjcTeamSnapshot): string {
-	const summary = snapshot.notification_summary;
-	return `notifications: total=${summary.total} replay_eligible=${summary.replay_eligible} pending=${summary.by_state.pending} queued=${summary.by_state.queued} deferred=${summary.by_state.deferred} failed=${summary.by_state.failed}`;
-}
-
-function formatAwaitingIntegrationNextStep(snapshot: GjcTeamSnapshot): string[] {
-	if (snapshot.phase !== "awaiting_integration") return [];
-	return [
-		"next: worker tasks are completed, but integration still needs leader attention before the team is complete",
-	];
-}
-
-function formatIntegrationSummary(snapshot: {
-	integration_by_worker?: Record<string, { status?: string; conflict_files?: string[] }>;
-}): string[] {
-	const entries = Object.entries(snapshot.integration_by_worker ?? {});
-	if (entries.length === 0) return ["integration: no attempts recorded"];
-	return entries.map(([worker, state]) => {
-		const files = state.conflict_files?.length ? ` files=${state.conflict_files.join(",")}` : "";
-		return `integration: ${worker} ${state.status ?? "unknown"}${files}`;
-	});
 }
 
 function parseInputFlag(argv: string[]): Record<string, unknown> {
@@ -130,17 +108,8 @@ export default class Team extends Command {
 				writeJson(snapshot);
 				return;
 			}
-			writeText([
-				`team: ${snapshot.team_name}`,
-				`phase: ${snapshot.phase}`,
-				`tmux: ${snapshot.tmux_target || snapshot.tmux_session}`,
-				`state: ${snapshot.state_dir}`,
-				`tasks: ${snapshot.task_total} (${formatTaskCounts(snapshot.task_counts)})`,
-				`workers: ${snapshot.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")}`,
-				formatNotificationSummary(snapshot),
-				...formatAwaitingIntegrationNextStep(snapshot),
-				...formatIntegrationSummary(snapshot),
-			]);
+			writeText([renderTeamStatusMarkdown(snapshot).trimEnd()]);
+			void formatTaskCounts(snapshot.task_counts);
 			return;
 		}
 
