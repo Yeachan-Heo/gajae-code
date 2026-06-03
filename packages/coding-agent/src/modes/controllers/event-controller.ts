@@ -685,7 +685,12 @@ export class EventController {
 	}
 
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
-		this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
+		// Preserve the ORIGINAL editor Escape handler across repeated retry
+		// starts: auto_retry_end only fires at final success/failure, so a
+		// second auto_retry_start must not snapshot the prior retry handler.
+		if (!this.ctx.retryEscapeHandler) {
+			this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
+		}
 		let escPressed = false;
 		this.ctx.editor.onEscape = () => {
 			if (!escPressed) {
@@ -698,14 +703,17 @@ export class EventController {
 			}
 		};
 		this.ctx.statusContainer.clear();
+		// Stop any prior retry loader/timer before installing a new one.
+		this.ctx.retryLoader?.stop();
+		this.#clearRetryCountdown();
 		const reason = friendlyRetryReason(event.errorMessage);
 		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
-		const escHint = event.unbounded ? "esc to retry now" : "esc to cancel";
 		const reasonSuffix = reason ? ` — ${reason}` : "";
 		const deadline = Date.now() + event.delayMs;
 		const buildMessage = () => {
 			const remainingSeconds = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-			return `Retrying (${attemptLabel})${reasonSuffix}, next in ${remainingSeconds}s… (${escHint})`;
+			// First Esc retries immediately; a second Esc cancels.
+			return `Retrying (${attemptLabel})${reasonSuffix}, next in ${remainingSeconds}s… (esc to retry now)`;
 		};
 		const retryLoader = new Loader(
 			this.ctx.ui,
@@ -715,7 +723,6 @@ export class EventController {
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.retryLoader = retryLoader;
-		this.#clearRetryCountdown();
 		this.ctx.retryCountdownTimer = setInterval(() => {
 			retryLoader.setMessage(buildMessage());
 		}, 1000);

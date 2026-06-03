@@ -106,6 +106,7 @@ export interface ForkContextSeedOptions {
 
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
+	extractHttpStatusFromError,
 	extractRetryHint,
 	isEnoent,
 	isUnexpectedSocketCloseMessage,
@@ -7224,7 +7225,7 @@ export class AgentSession {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
 		// than retry forever.
-		return /\b(401|402|403|404|413|422)\b|unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
+		return /unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
 			errorMessage,
 		);
 	}
@@ -7244,6 +7245,13 @@ export class AgentSession {
 		// variant; any other envelope failure is structural and must surface.
 		if (/anthropic stream envelope error:/i.test(err)) {
 			return this.#isTransientEnvelopeErrorMessage(err) ? "transient" : "terminal";
+		}
+		// HTTP status is the most reliable terminal signal: a 4xx client error
+		// (other than 408/425 timeout and 429 rate limit) will not succeed on
+		// retry, so surface it instead of looping forever as "unknown".
+		const status = message.errorStatus ?? extractHttpStatusFromError({ message: err });
+		if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429) {
+			return "terminal";
 		}
 		if (this.#isTerminalErrorMessage(err)) return "terminal";
 		if (isUsageLimitError(err)) return "usage_limit";
@@ -8445,7 +8453,6 @@ export class AgentSession {
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.agent.clearAllQueues();
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -8523,6 +8530,10 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				this.#resetHindsightConversationTrackingIfHindsight();
 			}
+			// Clear the agent delivery queues only once the switch has committed,
+			// so a rollback (catch) leaves them intact alongside the restored UI
+			// queues instead of silently dropping queued messages.
+			this.agent.clearAllQueues();
 			this.#reconnectToAgent();
 			return true;
 		} catch (error) {

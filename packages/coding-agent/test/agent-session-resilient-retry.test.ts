@@ -276,6 +276,20 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 
+	it("surfaces numeric HTTP 4xx (status context) without retrying", async () => {
+		// No "bad request" keyword — relies on HTTP-status extraction so a bare
+		// numeric 4xx is treated terminal instead of looping as "unknown".
+		session = buildSession({ responses: [{ throw: "HTTP 400: malformed request payload" }] });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger numeric 400");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
 	it("emits auto_retry_end when a retry ends on a terminal error", async () => {
 		// First a transient error (retries), then a terminal 401 that must not
 		// retry — the retry session must emit a terminal auto_retry_end.

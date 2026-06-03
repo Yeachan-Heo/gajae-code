@@ -568,6 +568,14 @@ export class InputController {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
 		}
+		if (this.ctx.retryCountdownTimer) {
+			clearInterval(this.ctx.retryCountdownTimer);
+			this.ctx.retryCountdownTimer = undefined;
+		}
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
+		}
 		this.ctx.statusContainer.clear();
 		this.ctx.statusLine.dispose();
 
