@@ -1029,3 +1029,115 @@ describe("AskTool multi-question navigation", () => {
 		expect(editor).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("AskTool deep-interview rendering middleware", () => {
+	it("uses a readable selector prompt while preserving raw question details", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 3 | Component: Review UI | Targeting: Success Criteria | Why now: the approval criteria are not yet testable | Ambiguity: 38%",
+			"",
+			"What exact conditions must be satisfied before a reviewer can approve an item?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
+
+		const result = await tool.execute(
+			"call-deep-interview",
+			{
+				questions: [
+					{
+						id: "round-3",
+						question: rawQuestion,
+						options: [{ label: "Condition A" }, { label: "Condition B" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(select).toHaveBeenCalledTimes(1);
+		const prompt = select.mock.calls[0]?.[0] ?? "";
+		expect(prompt).toContain("Deep Interview · Round 3 · Ambiguity 38%");
+		expect(prompt).toContain("Component: Review UI");
+		expect(prompt).toContain("Target: Success Criteria");
+		expect(prompt).toContain("Why now: the approval criteria are not yet testable");
+		expect(prompt).toContain("What exact conditions must be satisfied before a reviewer can approve an item?");
+		expect(result.details?.question).toBe(rawQuestion);
+	});
+
+	it("recognizes topology questions even when the agent prepends an intro", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Starting deep interview. I'll show a clarity score after each answer.",
+			"",
+			'**Your idea:** "Refresh the GJC UX"',
+			"**Project type:** brownfield",
+			"",
+			"Round 0 | Topology confirmation | Ambiguity: not scored yet",
+			"",
+			"I'm currently reading the scope as these 2 top-level components.",
+			"1. Brand and theme system: red-claw/GJC default theme and semantic color separation.",
+			"2. Tool card UX: readability of ask/approval cards and tool output styling.",
+			"",
+			"Is that topology right? Should any component be added, removed, merged, split, or explicitly deferred?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
+
+		await tool.execute(
+			"call-deep-interview-topology",
+			{
+				questions: [
+					{
+						id: "round-0",
+						question: rawQuestion,
+						options: [{ label: "Looks right" }, { label: "Revise it" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		const prompt = select.mock.calls[0]?.[0] ?? "";
+		expect(prompt).toContain("Deep Interview · Round 0 · Topology confirmation");
+		expect(prompt).toContain("Ambiguity: not scored yet");
+		expect(prompt).toContain("Reading:");
+		expect(prompt).toContain("I'm currently reading the scope as these 2 top-level components.");
+		expect(prompt).toContain("1. Brand and theme system — red-claw/GJC default theme and semantic color separation.");
+		expect(prompt).toContain("Question:");
+		expect(prompt).not.toContain("Context:");
+		expect(prompt).not.toContain('**Your idea:** "Refresh the GJC UX"');
+		expect(prompt).not.toContain("Round 0 | Topology confirmation");
+	});
+
+	it("renders round questions as structured cards in history", async () => {
+		const theme = await getThemeByName("red-claw");
+		expect(theme).toBeDefined();
+		const rawQuestion = [
+			"Round 2 | Component: Export | Targeting: Constraints | Why now: output boundaries are unclear | Ambiguity: 42%",
+			"",
+			"Which export formats are in scope?",
+		].join("\n");
+
+		const rendered = askToolRenderer.renderCall(
+			{
+				question: rawQuestion,
+				options: [{ label: "CSV" }, { label: "PDF" }],
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const renderedText = stripAnsi(rendered.render(100).join("\n"));
+
+		expect(renderedText).toContain("Deep Interview · Round 2 · Ambiguity 42%");
+		expect(renderedText).toContain("Component");
+		expect(renderedText).toContain("Export");
+		expect(renderedText).toContain("Why now");
+		expect(renderedText).toContain("Question");
+		expect(renderedText).not.toContain("Round 2 | Component:");
+	});
+});

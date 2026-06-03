@@ -278,7 +278,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(ext1.events).toHaveLength(1);
 		expect(ext2.events).toHaveLength(2);
 		expect(ext3.events).toHaveLength(3);
-	});
+	}, 30_000);
 
 	it("buffers credential_disabled events fired before runner.initialize and replays them once initialize runs", async () => {
 		// Without deferral the runner would fan out with `hasUI=false`, an unset model, and

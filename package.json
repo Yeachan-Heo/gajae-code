@@ -116,6 +116,7 @@
     "ci:release:publish": "bun scripts/ci-release-publish.ts",
     "bench:gen-fixtures": "bun --cwd=packages/typescript-edit-benchmark run src/generate.ts --typescript-dir /tmp/typescript-source --count-per-type 8",
     "bench:edit": "bun --cwd=packages/typescript-edit-benchmark run start",
+    "bench:orchestration-tokens": "bun --cwd=packages/orchestration-token-benchmark run start",
     "stats:sync": "python3 scripts/session-stats/sync.py",
     "stats:tools": "python3 scripts/session-stats/analyze.py tools",
     "stats:edits": "python3 scripts/session-stats/analyze.py edits",

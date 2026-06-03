@@ -99,6 +99,8 @@ export interface AgentOptions {
 	 * - "wait": defer steering until the current turn completes
 	 */
 	interruptMode?: "immediate" | "wait";
+	/** Cooperative pause checkpoint passed through to AgentLoopConfig.shouldPause. */
+	shouldPause?: AgentLoopConfig["shouldPause"];
 
 	/**
 	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
@@ -309,6 +311,7 @@ export class Agent {
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
+	#shouldPause?: AgentLoopConfig["shouldPause"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
@@ -371,6 +374,7 @@ export class Agent {
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
+		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
@@ -625,6 +629,10 @@ export class Agent {
 		this.#onBeforeYield = fn;
 	}
 
+	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
+		this.#shouldPause = fn;
+	}
+
 	emitExternalEvent(event: AgentEvent) {
 		switch (event.type) {
 			case "message_start":
@@ -857,6 +865,38 @@ export class Agent {
 
 	hasQueuedMessages(): boolean {
 		return this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
+	}
+
+	hasQueuedSteering(): boolean {
+		return this.#steeringQueue.length > 0;
+	}
+
+	/**
+	 * Snapshot the steering queue without mutating it. Used to preserve queued
+	 * steering across maintenance ops (compaction/handoff) that call reset().
+	 */
+	snapshotSteering(): AgentMessage[] {
+		return this.#steeringQueue.slice();
+	}
+
+	/**
+	 * Restore previously snapshotted steering messages ahead of any newly
+	 * queued ones. No-op for an empty snapshot.
+	 */
+	restoreSteering(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#steeringQueue = [...messages, ...this.#steeringQueue];
+	}
+
+	/** Snapshot the follow-up queue without mutating it. */
+	snapshotFollowUp(): AgentMessage[] {
+		return this.#followUpQueue.slice();
+	}
+
+	/** Restore previously snapshotted follow-up messages ahead of any newly queued ones. */
+	restoreFollowUp(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#followUpQueue = [...messages, ...this.#followUpQueue];
 	}
 
 	#dequeueSteeringMessages(): AgentMessage[] {
@@ -1195,6 +1235,10 @@ export class Agent {
 			onBeforeYield: async () => {
 				if (this.#activeRunId !== runId) return;
 				await this.#onBeforeYield?.();
+			},
+			shouldPause: () => {
+				if (this.#activeRunId !== runId) return false;
+				return this.#shouldPause?.() === true;
 			},
 			telemetry: this.#telemetry,
 		};

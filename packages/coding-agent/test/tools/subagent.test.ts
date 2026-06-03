@@ -186,4 +186,130 @@ describe("SubagentTool", () => {
 		expect(manager.getJob("job-cancel")?.status).toBe("cancelled");
 		await manager.dispose({ timeoutMs: 100 });
 	});
+
+	it("pause requests a running registered subagent and returns a running snapshot", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		let pauseRequested = false;
+		manager.registerSubagentRecord({
+			subagentId: "0-Pause",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Pause.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-Pause", {
+			requestPause() {
+				pauseRequested = true;
+			},
+			async injectMessage() {},
+		});
+
+		const result = await tool.execute("subagent-pause", { action: "pause", ids: ["0-Pause"] });
+
+		expect(pauseRequested).toBe(true);
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(getText(result)).toContain("0-Pause");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("resume starts a paused subagent through the manager runner", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.setResumeRunner(subagentId =>
+			manager.register("task", subagentId, async () => "resumed", {
+				id: "job-resumed",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			}),
+		);
+		manager.registerSubagentRecord({
+			subagentId: "0-Resume",
+			ownerId: "0-Main",
+			currentJobId: "job-paused",
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/0-Resume.jsonl",
+			resumable: true,
+		});
+
+		const result = await tool.execute("subagent-resume", { action: "resume", ids: ["0-Resume"] });
+
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.jobId).toBe("job-resumed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer running injects a message and optionally requests pause", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		let injected: string | undefined;
+		let pauseRequested = false;
+		manager.registerSubagentRecord({
+			subagentId: "0-Steer",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Steer.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-Steer", {
+			requestPause() {
+				pauseRequested = true;
+			},
+			async injectMessage(content) {
+				injected = content;
+			},
+		});
+
+		const result = await tool.execute("subagent-steer", {
+			action: "steer",
+			ids: ["0-Steer"],
+			message: "tighten scope",
+			pause: true,
+		});
+
+		expect(injected).toBe("tighten scope");
+		expect(pauseRequested).toBe(true);
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer non-active auto-resumes with message and ignores pause flag", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		let resumedMessage: string | undefined;
+		manager.setResumeRunner((subagentId, message) => {
+			resumedMessage = message;
+			return manager.register("task", subagentId, async () => "resumed", {
+				id: "job-auto-resumed",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		manager.registerSubagentRecord({
+			subagentId: "0-Auto",
+			ownerId: "0-Main",
+			currentJobId: "job-completed",
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/0-Auto.jsonl",
+			resumable: true,
+		});
+
+		const result = await tool.execute("subagent-steer-auto", {
+			action: "steer",
+			ids: ["0-Auto"],
+			message: "follow up",
+			pause: true,
+		});
+
+		expect(resumedMessage).toBe("follow up");
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.jobId).toBe("job-auto-resumed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
 });

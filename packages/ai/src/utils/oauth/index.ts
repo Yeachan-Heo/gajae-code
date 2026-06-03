@@ -61,6 +61,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "xai",
+		name: "xAI",
+		available: true,
+	},
+	{
 		id: "fireworks",
 		name: "Fireworks",
 		available: true,
@@ -308,6 +313,11 @@ export async function refreshOAuthToken(
 		case "cursor": {
 			const { refreshCursorToken } = await import("./cursor");
 			newCredentials = await refreshCursorToken(credentials.refresh);
+			break;
+		}
+		case "xai": {
+			const { refreshXaiToken } = await import("./xai");
+			newCredentials = await refreshXaiToken(credentials.refresh);
 			break;
 		}
 		case "kilo":

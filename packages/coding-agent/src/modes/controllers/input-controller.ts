@@ -31,7 +31,7 @@ export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#abortInteractive(): Promise<void> {
-		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS });
+		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS, cause: "user_interrupt" });
 	}
 
 	setupKeyHandlers(): void {
@@ -567,6 +567,14 @@ export class InputController {
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
+		}
+		if (this.ctx.retryCountdownTimer) {
+			clearInterval(this.ctx.retryCountdownTimer);
+			this.ctx.retryCountdownTimer = undefined;
+		}
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
 		}
 		this.ctx.statusContainer.clear();
 		this.ctx.statusLine.dispose();

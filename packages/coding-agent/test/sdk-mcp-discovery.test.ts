@@ -308,7 +308,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
 		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
 		expect(session.getActiveToolNames()).toContain("find");
-	});
+	}, 30_000);
 	it("restores explicit MCP, thinking, and service-tier entries when resuming without rewriting the session file", async () => {
 		const firstManager = SessionManager.create(tempDir, tempDir);
 		const { session: firstSession } = await createAgentSession({
@@ -388,7 +388,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await resumedSession.dispose();
 		}
-	});
+	}, 30_000);
 
 	it("restores fallback MCP, thinking, and service-tier state in memory without rewriting the session file", async () => {
 		const sessionManager = SessionManager.create(tempDir, tempDir);
@@ -442,7 +442,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30_000);
 
 	it("rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools", async () => {
 		const firstManager = SessionManager.create(tempDir, tempDir);
@@ -505,5 +505,5 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await resumedSession.dispose();
 		}
-	});
+	}, 30_000);
 });

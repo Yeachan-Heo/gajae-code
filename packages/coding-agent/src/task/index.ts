@@ -65,6 +65,18 @@ import {
 	type WorktreeBaseline,
 } from "./worktree";
 
+interface TaskResumeDescriptor {
+	toolCallId: string;
+	params: TaskParams;
+	task: TaskItem & { id: string };
+	sessionFile: string | null;
+	forkContextSeed?: ForkContextSeed;
+	agentSource: AgentDefinition["source"];
+}
+
+function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
+	return typeof value === "object" && value !== null && "task" in value && "params" in value;
+}
 function renderSubagentUserPrompt(assignment: string, simpleMode: TaskSimpleMode): string {
 	return prompt.render(subagentUserPromptTemplate, {
 		assignment: assignment.trim(),
@@ -416,6 +428,50 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		if (typeof manager.setResumeRunner === "function") {
+			manager.setResumeRunner((_subagentId, message, resumeDescriptor) => {
+				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
+				if (!descriptor) return undefined;
+				const forkSeeds = descriptor.forkContextSeed
+					? new Map([[descriptor.task.id, descriptor.forkContextSeed]])
+					: undefined;
+				return manager.register(
+					"task",
+					descriptor.task.id,
+					async ({ signal: runSignal }) => {
+						const result = await this.#executeSync(
+							descriptor.toolCallId,
+							{ ...descriptor.params, tasks: [descriptor.task] },
+							runSignal,
+							undefined,
+							[descriptor.task.id],
+							forkSeeds,
+							{
+								runMode: message ? "message" : "resume",
+								resumeMessage: message,
+								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+							},
+						);
+						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
+						const singleResult = result.details?.results[0];
+						return singleResult?.paused ? { kind: "paused" } : finalText;
+					},
+					{
+						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
+						ownerId: this.session.getAgentId?.() ?? undefined,
+						metadata: {
+							subagent: {
+								id: descriptor.task.id,
+								agent: descriptor.params.agent,
+								agentSource: descriptor.agentSource,
+								description: descriptor.task.description,
+								assignment: descriptor.task.assignment.trim(),
+							},
+						},
+					},
+				);
+			});
+		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
 			if (task.inheritContext !== true) return undefined;
@@ -431,6 +487,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 		const frozenForkSeeds = new Map<string, ForkContextSeed>();
+		const parentSessionFileForBatch = this.session.getSessionFile();
+		const batchArtifactsDir = parentSessionFileForBatch ? parentSessionFileForBatch.slice(0, -6) : null;
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -449,6 +507,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {
+				const subtaskSessionFile = batchArtifactsDir ? path.join(batchArtifactsDir, `${uniqueId}.jsonl`) : null;
 				const jobId = manager.register(
 					"task",
 					label,
@@ -478,15 +537,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								undefined,
 								[uniqueId],
 								frozenForkSeeds,
+								{
+									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
+								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 							const singleResult = result.details?.results[0];
 							if (progress) {
-								progress.status = singleResult?.aborted
-									? "aborted"
-									: (singleResult?.exitCode ?? 0) === 0
-										? "completed"
-										: "failed";
+								progress.status = singleResult?.paused
+									? "paused"
+									: singleResult?.aborted
+										? "aborted"
+										: (singleResult?.exitCode ?? 0) === 0
+											? "completed"
+											: "failed";
 								progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
 								progress.tokens = singleResult?.tokens ?? 0;
 								progress.contextTokens = singleResult?.contextTokens;
@@ -516,6 +580,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									failedJobs > 0 || failedSchedules.length > 0 ? "failed" : "completed",
 									`Background task batch complete: ${completedJobs}/${taskItems.length} finished.`,
 								);
+							}
+							if (singleResult?.paused) {
+								return { kind: "paused" };
 							}
 							return finalText;
 						} catch (error) {
@@ -568,6 +635,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
+				if (typeof manager.registerResumeDescriptor === "function") {
+					manager.registerResumeDescriptor({
+						subagentId: uniqueId,
+						ownerId: this.session.getAgentId?.() ?? undefined,
+						data: {
+							toolCallId: _toolCallId,
+							params,
+							task: { ...taskItem, id: uniqueId },
+							sessionFile: subtaskSessionFile,
+							forkContextSeed: frozenForkSeed,
+							agentSource: fallbackAgentSource,
+						} satisfies TaskResumeDescriptor,
+					});
+				}
+				if (typeof manager.registerSubagentRecord === "function") {
+					manager.registerSubagentRecord({
+						subagentId: uniqueId,
+						ownerId: this.session.getAgentId?.() ?? undefined,
+						currentJobId: jobId,
+						historicalJobIds: [],
+						status: manager.getJob(jobId)?.status ?? "running",
+						sessionFile: subtaskSessionFile,
+						resumable: !!batchArtifactsDir,
+					});
+				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				failedSchedules.push(`${taskItem.id}: ${message}`);
@@ -637,6 +729,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedIds?: string[],
 		prebuiltForkContextSeeds?: ReadonlyMap<string, ForkContextSeed>,
+		executionOverrides?: {
+			runMode?: "initial" | "resume" | "message";
+			resumeMessage?: string;
+			sessionFiles?: ReadonlyMap<string, string | null>;
+		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
@@ -996,8 +1093,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				});
 			};
 
-			const runTask = async (task: (typeof tasksWithUniqueIds)[number], index: number) => {
+			const runTask = async (
+				task: (typeof tasksWithUniqueIds)[number],
+				index: number,
+				overrides?: {
+					runMode?: "initial" | "resume" | "message";
+					resumeMessage?: string;
+					sessionFile?: string | null;
+				},
+			) => {
 				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
+				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
 				if (!isIsolated) {
 					return runSubprocess({
 						cwd: this.session.cwd,
@@ -1008,12 +1114,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						description: task.description,
 						index,
 						id: task.id,
+						runMode: overrides?.runMode ?? executionOverrides?.runMode,
+						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
+						subagentId: task.id,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
-						sessionFile,
+						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
 						contextFile: contextFilePath,
@@ -1063,12 +1172,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						description: task.description,
 						index,
 						id: task.id,
+						runMode: overrides?.runMode ?? executionOverrides?.runMode,
+						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
+						subagentId: task.id,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
-						sessionFile,
+						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
 						contextFile: contextFilePath,

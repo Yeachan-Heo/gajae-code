@@ -327,6 +327,8 @@ export interface CreateAgentSessionOptions {
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
 	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Cooperative pause checkpoint passed through to Agent. */
+	shouldPause?: () => boolean;
 }
 
 /** Result from createAgentSession */
@@ -657,6 +659,7 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 					reason: "auto_retry_start",
 					attempt: event.attempt,
 					maxAttempts: event.maxAttempts,
+					unbounded: event.unbounded,
 					delayMs: event.delayMs,
 					errorMessage: event.errorMessage,
 				},
@@ -1797,6 +1800,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			requestMaxRetries: retrySettings.requestMaxRetries,
 			streamMaxRetries: retrySettings.streamMaxRetries,
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
+			shouldPause: options.shouldPause,
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: async provider => {

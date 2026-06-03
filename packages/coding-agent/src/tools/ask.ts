@@ -28,6 +28,7 @@ import {
 } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { formatDeepInterviewSelectorPrompt, renderDeepInterviewAskQuestion } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
@@ -454,9 +455,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		) => {
 			const optionLabels = q.options.map(o => o.label);
 			try {
+				const displayQuestion = formatDeepInterviewSelectorPrompt(q.question) ?? q.question;
 				const { selectedOptions, customInput, navigation, cancelled, timedOut } = await askSingleQuestion(
 					ui,
-					q.question,
+					displayQuestion,
 					optionLabels,
 					q.multi ?? false,
 					{
@@ -659,7 +661,10 @@ export const askToolRenderer = {
 				container.addChild(
 					new Text(` ${uiTheme.fg("dim", qBranch)} ${uiTheme.fg("dim", `[${q.id}]`)}${metaStr}`, 0, 0),
 				);
-				container.addChild(new Markdown(q.question, 3, 0, mdTheme, accentStyle));
+				container.addChild(
+					renderDeepInterviewAskQuestion(q.question, uiTheme) ??
+						new Markdown(q.question, 3, 0, mdTheme, accentStyle),
+				);
 
 				const qOptions = q.options;
 				if (qOptions?.length) {
@@ -688,7 +693,10 @@ export const askToolRenderer = {
 		if (args.multi) meta.push("multi");
 		if (args.options?.length) meta.push(`options:${args.options.length}`);
 		container.addChild(new Text(`${label}${formatMeta(meta, uiTheme)}`, 0, 0));
-		container.addChild(new Markdown(args.question, 1, 0, mdTheme, accentStyle));
+		container.addChild(
+			renderDeepInterviewAskQuestion(args.question, uiTheme) ??
+				new Markdown(args.question, 1, 0, mdTheme, accentStyle),
+		);
 
 		const options = args.options;
 		if (options?.length) {
@@ -752,7 +760,10 @@ export const askToolRenderer = {
 				container.addChild(
 					new Text(` ${uiTheme.fg("dim", branch)} ${statusIcon} ${uiTheme.fg("dim", `[${r.id}]`)}`, 0, 0),
 				);
-				container.addChild(new Markdown(r.question, 3, 0, mdTheme, accentStyle));
+				container.addChild(
+					renderDeepInterviewAskQuestion(r.question, uiTheme) ??
+						new Markdown(r.question, 3, 0, mdTheme, accentStyle),
+				);
 
 				const answerLines: string[] = [];
 				for (let j = 0; j < r.selectedOptions.length; j++) {
@@ -795,7 +806,10 @@ export const askToolRenderer = {
 		const header = renderStatusLine({ icon: hasSelection ? "success" : "warning", title: "Ask" }, uiTheme);
 		const container = new Container();
 		container.addChild(new Text(header, 0, 0));
-		container.addChild(new Markdown(details.question, 1, 0, mdTheme, accentStyle));
+		container.addChild(
+			renderDeepInterviewAskQuestion(details.question, uiTheme) ??
+				new Markdown(details.question, 1, 0, mdTheme, accentStyle),
+		);
 
 		const answerLines: string[] = [];
 		if (details.selectedOptions && details.selectedOptions.length > 0) {

@@ -38,6 +38,8 @@ Start the recommended tmux-backed experience:
 gjc --tmux
 ```
 
+`gjc --tmux` creates or attaches a GJC-managed tmux-backed leader session for interactive use. Run `gjc team ...` from inside that session when you want tmux worker panes; `gjc team` does not create the leader session itself.
+
 Bare `gjc` launches directly without creating or attaching a tmux session:
 
 ```sh
@@ -117,7 +119,7 @@ A concrete bug-fix pass might look like this:
 /skill:deep-interview clarify the bug, affected behavior, non-goals, and acceptance checks
 /skill:ralplan turn the clarified bug report into a reviewed fix plan
 gjc ultragoal create-goals --brief-file <approved-plan>
-# Optional only for parallel work:
+# Optional only for parallel work, from inside `gjc --tmux`:
 gjc team 2:executor "split implementation and verification for this bug fix"
 gjc ultragoal complete-goals
 ```
