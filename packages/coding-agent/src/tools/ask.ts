@@ -194,8 +194,7 @@ async function askSingleQuestion(
 		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
 			: "up/down navigate  enter select  esc cancel";
-		const helpText =
-			scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  PgUp/PgDn scroll question`;
+		const helpText = scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  PgUp/PgDn scroll question`;
 		const dialogOptions = {
 			initialIndex,
 			timeout,
@@ -474,8 +473,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						signal,
 						initialSelection: options?.previous,
 						navigation: options?.navigation,
-						scrollTitleRows:
-							deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
+						scrollTitleRows: deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					},
 				);
 				return { optionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };

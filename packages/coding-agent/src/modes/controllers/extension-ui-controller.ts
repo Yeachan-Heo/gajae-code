@@ -594,9 +594,7 @@ export class ExtensionUiController {
 		const selectorChromeRows = 7;
 		const availableTitleRows = this.ctx.ui.terminal.rows - maxVisible - selectorChromeRows;
 		const scrollTitleRows =
-			requestedTitleRows === undefined
-				? undefined
-				: Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
+			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
 		this.ctx.hookSelector = new HookSelectorComponent(
 			title,
 			options,

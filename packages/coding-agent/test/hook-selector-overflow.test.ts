@@ -67,7 +67,13 @@ const BASELINE_OUTLINED_RENDER_80_STRIPPED = [
 
 function renderStripped(
 	width: number,
-	opts: { outline?: boolean; wrapFocused?: boolean; scrollTitleRows?: number; initialIndex?: number; maxVisible?: number },
+	opts: {
+		outline?: boolean;
+		wrapFocused?: boolean;
+		scrollTitleRows?: number;
+		initialIndex?: number;
+		maxVisible?: number;
+	},
 	options: string[] = [BASELINE_LONG_FOCUSED, BASELINE_LONG_NON_FOCUSED, BASELINE_SHORT],
 ): string {
 	const component = new HookSelectorComponent(

@@ -1077,7 +1077,10 @@ describe("AskTool deep-interview rendering middleware", () => {
 			"",
 			"What evidence proves the answer options remain visible while the question scrolls?",
 		].join("\n");
-		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const select = vi.fn(
+			async (_prompt: string, options: string[], _dialogOptions?: { scrollTitleRows?: number; helpText?: string }) =>
+				options[0],
+		);
 		const context = createContext({ select });
 
 		await tool.execute(
@@ -1103,7 +1106,10 @@ describe("AskTool deep-interview rendering middleware", () => {
 
 	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {
 		const tool = new AskTool(createSession());
-		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const select = vi.fn(
+			async (_prompt: string, options: string[], _dialogOptions?: { scrollTitleRows?: number; helpText?: string }) =>
+				options[0],
+		);
 		const context = createContext({ select });
 
 		await tool.execute(

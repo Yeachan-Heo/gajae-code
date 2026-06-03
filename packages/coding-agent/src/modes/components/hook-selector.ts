@@ -285,7 +285,8 @@ export class HookSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 
-		const scrollTitleRows = opts?.scrollTitleRows === undefined ? undefined : Math.max(1, Math.floor(opts.scrollTitleRows));
+		const scrollTitleRows =
+			opts?.scrollTitleRows === undefined ? undefined : Math.max(1, Math.floor(opts.scrollTitleRows));
 		this.#scrollTitleRows = scrollTitleRows;
 		if (scrollTitleRows === undefined) {
 			this.#titleComponent = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
