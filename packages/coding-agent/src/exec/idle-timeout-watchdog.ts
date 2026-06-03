@@ -83,6 +83,8 @@ export class IdleTimeoutWatchdog {
 			this.#signal.removeEventListener("abort", this.#signalAbortHandler);
 			this.#signalAbortHandler = undefined;
 		}
+		//resolve hardTimeoutDeferred on dispose to prevent promise leak
+		this.#hardTimeoutDeferred.resolve("hard-timeout");
 	}
 
 	#abort(reason: ExecutionAbortReason): void {
