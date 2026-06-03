@@ -109,6 +109,7 @@ export type CustomToolSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			unbounded?: boolean;
 	  }
 	| {
 			reason: "auto_retry_end";

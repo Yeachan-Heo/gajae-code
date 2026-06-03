@@ -116,7 +116,7 @@ describe("openai-completions compatibility", () => {
 		const messages = convertMessages(model, { messages: [assistantMessage] }, compat);
 		const assistant = messages.find(message => message.role === "assistant");
 		expect(assistant).toBeDefined();
-		if (!assistant || assistant.role !== "assistant") {
+		if (assistant?.role !== "assistant") {
 			throw new Error("assistant message missing");
 		}
 		expect(typeof assistant.content).toBe("string");

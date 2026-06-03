@@ -922,6 +922,7 @@ mod tests {
 	use std::{
 		fs,
 		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
@@ -929,16 +930,19 @@ mod tests {
 		GrepConfig, GrepOutputMode, escape_unescaped_parentheses, grep_sync, sanitize_braces,
 	};
 	use crate::task;
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 	struct TempDirGuard(PathBuf);
 
 	impl TempDirGuard {
 		fn new() -> Self {
-			let unique = SystemTime::now()
+			let timestamp = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.expect("system time is after UNIX_EPOCH")
 				.as_nanos();
-			let path = std::env::temp_dir().join(format!("pi-grep-test-{unique}"));
+			let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+			let path = std::env::temp_dir()
+				.join(format!("pi-grep-test-{}-{timestamp}-{sequence}", std::process::id()));
 			fs::create_dir_all(&path).expect("create temp test directory");
 			Self(path)
 		}

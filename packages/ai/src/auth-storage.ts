@@ -2733,7 +2733,7 @@ export class AuthStorage {
 		if (!prepare) return true;
 		const stored = this.#getStoredCredentials(provider);
 		const selected = stored[selection.index];
-		if (!selected || selected.credential.type !== "oauth") return false;
+		if (selected?.credential.type !== "oauth") return false;
 
 		const prepared = await prepare(selected.id, { signal: options?.signal });
 		if (!prepared) return true;
@@ -2745,7 +2745,7 @@ export class AuthStorage {
 		const latestIndex = latestRows.findIndex(row => row.id === selected.id);
 		if (latestIndex === -1) return false;
 		const latest = latestRows[latestIndex];
-		if (!latest || latest.credential.type !== "oauth") return false;
+		if (latest?.credential.type !== "oauth") return false;
 		selection.index = latestIndex;
 		selection.credential = latest.credential;
 		return true;

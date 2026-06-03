@@ -121,7 +121,7 @@ function findRuntimeAssistant(session: AgentSession, text: string): AssistantMes
 	const message = session.messages.find(
 		candidate => candidate.role === "assistant" && getTextContent(candidate) === text,
 	);
-	if (!message || message.role !== "assistant") {
+	if (message?.role !== "assistant") {
 		throw new Error(`Expected runtime assistant message with text: ${text}`);
 	}
 	return message;
@@ -133,19 +133,19 @@ function expectAssistantReplayMetadataSanitized(message: AssistantMessage): void
 	expect(message.providerPayload).toBeUndefined();
 
 	const thinkingBlock = message.content.find(block => block.type === "thinking");
-	if (!thinkingBlock || thinkingBlock.type !== "thinking") {
+	if (thinkingBlock?.type !== "thinking") {
 		throw new Error("Expected assistant thinking block");
 	}
 	expect(thinkingBlock.thinkingSignature).toBeUndefined();
 
 	const textBlock = message.content.find(block => block.type === "text");
-	if (!textBlock || textBlock.type !== "text") {
+	if (textBlock?.type !== "text") {
 		throw new Error("Expected assistant text block");
 	}
 	expect(textBlock.textSignature).toBe("text_sig_preserved");
 
 	const toolCallBlock = message.content.find(block => block.type === "toolCall");
-	if (!toolCallBlock || toolCallBlock.type !== "toolCall") {
+	if (toolCallBlock?.type !== "toolCall") {
 		throw new Error("Expected assistant tool call block");
 	}
 	expect(toolCallBlock).toMatchObject({
@@ -278,7 +278,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const runtimeUser = session.messages.find(
 			message => message.role === "user" && getTextContent(message) === "Preserved summary",
 		);
-		if (!runtimeUser || runtimeUser.role !== "user") {
+		if (runtimeUser?.role !== "user") {
 			throw new Error("Expected runtime user message");
 		}
 		expect(runtimeUser.providerPayload).toEqual(preservedUserPayload);
@@ -732,7 +732,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const customEntry = snapshot.fileEntries.find(
 			entry => entry.type === "custom_message" && entry.customType === "proxy-details",
 		);
-		if (!customEntry || customEntry.type !== "custom_message") {
+		if (customEntry?.type !== "custom_message") {
 			throw new Error("Expected captured custom message entry");
 		}
 		expect(customEntry.details).toEqual({ ok: true, nested: { value: "preserved" } });

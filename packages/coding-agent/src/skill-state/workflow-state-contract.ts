@@ -9,6 +9,13 @@ export const WORKFLOW_STATE_RECEIPT_FRESH_MS = 30 * 60 * 1000;
 export type WorkflowStateMutationOwner = "gjc-state-cli" | "gjc-runtime" | "gjc-hook";
 export type WorkflowStateReceiptStatus = "fresh" | "stale";
 
+export interface WorkflowStateContentChecksum {
+	algorithm: "sha256";
+	value: string;
+	covered_path: string;
+	computed_at: string;
+}
+
 export interface WorkflowStateReceipt {
 	version: 1;
 	skill: CanonicalGjcWorkflowSkill;
@@ -25,6 +32,7 @@ export interface WorkflowStateReceipt {
 	to_phase?: string;
 	forced?: boolean;
 	paths?: string[];
+	content_sha256?: WorkflowStateContentChecksum;
 }
 
 export interface AuditEntry {

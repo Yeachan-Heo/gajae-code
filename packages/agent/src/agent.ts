@@ -859,6 +859,38 @@ export class Agent {
 		return this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
 	}
 
+	hasQueuedSteering(): boolean {
+		return this.#steeringQueue.length > 0;
+	}
+
+	/**
+	 * Snapshot the steering queue without mutating it. Used to preserve queued
+	 * steering across maintenance ops (compaction/handoff) that call reset().
+	 */
+	snapshotSteering(): AgentMessage[] {
+		return this.#steeringQueue.slice();
+	}
+
+	/**
+	 * Restore previously snapshotted steering messages ahead of any newly
+	 * queued ones. No-op for an empty snapshot.
+	 */
+	restoreSteering(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#steeringQueue = [...messages, ...this.#steeringQueue];
+	}
+
+	/** Snapshot the follow-up queue without mutating it. */
+	snapshotFollowUp(): AgentMessage[] {
+		return this.#followUpQueue.slice();
+	}
+
+	/** Restore previously snapshotted follow-up messages ahead of any newly queued ones. */
+	restoreFollowUp(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#followUpQueue = [...messages, ...this.#followUpQueue];
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
 		if (this.#steeringMode === "one-at-a-time") {
 			if (this.#steeringQueue.length > 0) {
@@ -1334,7 +1366,7 @@ export class Agent {
 
 	/** Calculate total text length from an assistant message's content blocks */
 	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
 			return 0;
 		}
 		let length = 0;

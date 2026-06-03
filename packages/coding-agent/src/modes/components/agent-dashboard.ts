@@ -121,7 +121,7 @@ function matchAgent(agent: DashboardAgent, query: string): boolean {
 function extractAssistantText(messages: AgentMessage[]): string | null {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (!message || message.role !== "assistant") continue;
+		if (message?.role !== "assistant") continue;
 		const blocks = message.content;
 		if (!Array.isArray(blocks)) continue;
 		const text = blocks

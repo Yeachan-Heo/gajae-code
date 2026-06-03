@@ -20,7 +20,7 @@ const SKILL_TYPE = "skill-prompt";
 function readPersistedCustomMessageEntry<T>(session: SessionManager, id: string): CustomMessageEntry<T> {
 	const branch = session.getBranch();
 	const entry = branch.find(e => e.id === id);
-	if (!entry || entry.type !== "custom_message") {
+	if (entry?.type !== "custom_message") {
 		throw new Error(`Expected custom_message entry with id ${id}, got ${entry?.type ?? "none"}`);
 	}
 	return entry as CustomMessageEntry<T>;

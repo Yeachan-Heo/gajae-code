@@ -103,7 +103,7 @@ export function renderResult(
 	args?: LspParams,
 ): Component {
 	const content = result.content?.[0];
-	if (!content || content.type !== "text" || !("text" in content) || !content.text) {
+	if (content?.type !== "text" || !("text" in content) || !content.text) {
 		const icon = formatStatusIcon("warning", theme, options.spinnerFrame);
 		const header = `${icon} LSP`;
 		return new Text([header, theme.fg("dim", "No result")].join("\n"), 0, 0);
