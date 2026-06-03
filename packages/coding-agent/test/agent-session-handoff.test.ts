@@ -105,6 +105,12 @@ describe("AgentSession handoff", () => {
 		).toHaveLength(0);
 	});
 
+	it("persists active model when starting a new session", async () => {
+		const created = await session.newSession();
+		expect(created).toBe(true);
+		expect(sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-5");
+	});
+
 	it("does not run auto-compaction after handoff turn completes", async () => {
 		const handoffText = "## Goal\nContinue from here";
 		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
@@ -193,6 +199,7 @@ describe("AgentSession handoff", () => {
 			parentSession?: string;
 			customType?: string;
 			display?: boolean;
+			model?: string;
 		};
 		const handoffEntries = (await Bun.file(handoffSessionFile).text())
 			.trim()
@@ -211,6 +218,9 @@ describe("AgentSession handoff", () => {
 			handoffEntries.some(
 				entry => entry.type === "custom_message" && entry.customType === "handoff" && entry.display,
 			),
+		).toBe(true);
+		expect(
+			handoffEntries.some(entry => entry.type === "model_change" && entry.model === "anthropic/claude-sonnet-4-5"),
 		).toBe(true);
 
 		const previousSessionText = await Bun.file(previousSessionFile).text();

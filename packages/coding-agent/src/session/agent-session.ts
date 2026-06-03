@@ -5188,6 +5188,9 @@ export class AgentSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+		if (this.model) {
+			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+		}
 		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 		if (nextDiscoverySessionToolNames) {
 			await this.#applyActiveToolsByName(nextDiscoverySessionToolNames, { persistMCPSelection: false });
@@ -5979,6 +5982,11 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#todoReminderCount = 0;
+			if (model) {
+				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+			}
+			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 
 			// Inject the handoff document as a custom message
 			const handoffContent = createHandoffContext(handoffText);
