@@ -43,8 +43,20 @@ function handle(line: string): void {
 		if (process.env.GJC_FAKE_RPC_STORM === "1") {
 			for (let i = 0; i < 200; i++) w({ type: "message_update", messageId: "m1", delta: "noise" });
 		}
-		w({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", command: "echo hi" });
-		w({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", status: "ok" });
+		w({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "echo hi" } });
+		w({
+			type: "tool_execution_update",
+			toolCallId: "t1",
+			toolName: "bash",
+			args: { command: "echo hi" },
+			partialResult: { status: "running" },
+		});
+		w({
+			type: "tool_execution_end",
+			toolCallId: "t1",
+			toolName: "bash",
+			result: { content: [{ type: "text", text: "hi" }], details: { status: "ok" } },
+		});
 		w({ type: "agent_end" });
 	}
 }

@@ -56,6 +56,7 @@ requiring a separate linked execution loop up front. GJC team supports current-w
 
 - **Canonical launch:** use plain `gjc team ...` / `$team ...` for the coordinated worker.
 - **Verification ownership:** keep one lane focused on tests, regression coverage, and evidence before shutdown.
+- **Typed lanes:** model delivery, verification, architecture, or specialist work as task `lane` metadata plus `required_role` / `allowed_roles`; claiming enforces owner, role, dependency, and lease order.
 - **Escalation:** use a new explicit follow-up task only when later manual work still needs a persistent single-owner fix/verification loop.
 - **Deprecation:** nested team execution commands have been removed. Use plain `gjc team ...` for coordinated execution.
 
@@ -135,6 +136,9 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
    - `.gjc/state/team/<team>/manifest.v2.json`
    - `.gjc/state/team/<team>/tasks/task-1.json`
    - `.gjc/state/team/<team>/mailbox/worker-1.json`
+   - `.gjc/state/team/<team>/workers/<worker>/status.json`
+   - `.gjc/state/team/<team>/workers/<worker>/lifecycle.json`
+   - `.gjc/state/team/<team>/workers/<worker>/heartbeat.json`
 4. Resolve the worker command from `GJC_TEAM_WORKER_COMMAND` or the active `gjc` entrypoint.
 5. Split the current tmux window like GJC team: worker 1 is split horizontally to the right of the leader, workers 2..N are vertically stacked in the right column, then `select-layout main-vertical` and `main-pane-width` keep leader-left/worker-right at roughly 50/50.
 6. Launch the worker with:
@@ -148,7 +152,7 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
    - diverged worker history is cherry-picked into the leader
    - idle/done/failed worker worktrees are cross-rebased onto the updated leader after integration; working workers are skipped
    - conflicts are aborted, recorded, and reported to the leader mailbox without falsely advancing `last_integrated_head`
-8. Store pane/target/integration evidence in config/manifest/snapshot: `tmux_session`, `tmux_session_name`, `tmux_target`, leader pane id, worker pane ids, and `integration_by_worker`.
+8. Store pane/target/integration/lifecycle evidence in config/manifest/snapshot: `tmux_session`, `tmux_session_name`, `tmux_target`, leader pane id, worker pane ids, `worker_lifecycle_by_id`, and `integration_by_worker`.
 9. Return control to the leader; follow-up uses `status`, `resume`, `shutdown`, and `gjc team api`.
 
 Important:
@@ -163,14 +167,15 @@ Important:
 
 Follow this exact lifecycle when running `$team`:
 
-1. Start team and verify startup evidence (team line, tmux target, worker pane id, state dir).
+1. Start team and verify startup evidence (team line, tmux target, worker pane id, state dir, `worker_lifecycle_by_id.<worker>.lifecycle_state=ready` after startup ACK).
 2. Monitor task progress with runtime/state tools first (`gjc team status <team>`, `gjc team resume <team>`, task files).
-3. Wait for terminal task state before shutdown:
+3. Wait for terminal task state and integration settlement before shutdown:
    - `pending=0`
    - `in_progress=0`
    - `failed=0` (or explicitly acknowledged failure path)
+   - no pending integration request/conflict (`status` / `resume` must not report `phase=awaiting_integration`)
 4. Only then run `gjc team shutdown <team>`.
-5. Verify shutdown evidence and preserved state (`phase=complete`, worker status `stopped`). If shutdown is forced before task completion, expect `phase=cancelled` or `phase=failed`, not `complete`.
+5. Verify shutdown evidence and preserved state (`phase=complete`, worker runtime status `stopped`, lifecycle `stopped` with a matching graceful shutdown request id). If shutdown is forced before evidence-backed task completion, expect `phase=cancelled` or `phase=failed`; if tasks are complete but integration is still pending or conflicted, expect `phase=awaiting_integration`, not `complete`.
 
 Do not run `shutdown` while the worker is actively writing updates unless user explicitly requested abort/cancel. Do not treat ad-hoc pane typing as primary control flow when runtime/state evidence is available.
 
@@ -181,24 +186,28 @@ While a team is running, keep checking live team state until terminal completion
 Minimum acceptable loop:
 
 ```bash
-sleep 30 && gjc team status <team-name>
+sleep 30 && gjc team monitor <team-name>
 ```
+The mutating monitor path also performs bounded liveness recovery: expired task claims, stale heartbeat claims, and missing recorded worker panes are requeued instead of leaving work permanently `in_progress`.
 
 ## Operational Commands
 
 ```bash
 gjc team status <team-name>
+gjc team monitor <team-name>
 gjc team resume <team-name>
 gjc team shutdown <team-name>
 ```
 
 Semantics:
 
-- `status`: mutating monitor path; reads team snapshot and applies pending worker worktree integration before returning task counts, worker state, tmux target/pane evidence, and `integration_by_worker`.
-- `resume`: mutating monitor path; performs the same integration-aware live snapshot for reconnect/inspection flows.
+- `status`: read-only snapshot path; it does not recover claims, replay notifications, integrate worker commits, or sync HUD state.
+- `monitor`: mutating monitor path; reads team snapshot, recovers expired/stale worker claims, applies pending worker worktree integration, replays notifications, syncs HUD state, and returns task counts, worker state, tmux target/pane evidence, `worker_lifecycle_by_id`, and `integration_by_worker`.
+- `resume`: mutating monitor path; performs the same liveness-recovery and integration-aware live snapshot for reconnect/inspection flows.
 - `list`: pure read path; lists known teams without integrating worker commits.
-- API/read-only snapshot operations are pure unless explicitly documented as a monitor/status path.
-- `shutdown`: kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker stopped, and sets phase from task state: `complete` only when all tasks completed, `failed` when tasks failed/blocked, and `cancelled` when work remains pending or in progress. It preserves `.gjc/state/team/<team>` as evidence.
+- API/read-only snapshot operations are pure unless explicitly documented as a monitor path.
+- `claim-task`: mutating task path; before granting a new claim, it recovers expired claims and rejects claims from workers already classified as not live.
+- `shutdown`: writes per-worker graceful `shutdown-request.json`, moves lifecycle through `draining` to `stopped`, kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker runtime status stopped, and sets phase from task, lifecycle, and integration state: `complete` only when all tasks have verified `completion_evidence`, every worker has matching graceful shutdown lifecycle evidence, and no integration request/conflict is pending; `awaiting_integration` when tasks and lifecycle are complete but leader integration still requires action; `failed` when tasks failed/blocked or completed tasks lack valid evidence; and `cancelled` when work remains pending or in progress. It preserves `.gjc/state/team/<team>` as evidence.
 
 ## Data Plane and Control Plane
 
@@ -214,15 +223,20 @@ Semantics:
 - `.gjc/state/team/<team>/manifest.v2.json`
 - `.gjc/state/team/<team>/phase.json`
 - `.gjc/state/team/<team>/events.jsonl`
+- `.gjc/state/team/<team>/trace.jsonl`
+- `.gjc/state/team/<team>/trace-errors.jsonl`
 - `.gjc/state/team/<team>/telemetry.jsonl`
 - `.gjc/state/team/<team>/monitor-snapshot.json`
 - `.gjc/state/team/<team>/integration-report.md`
-- `.gjc/state/team/<team>/tasks/task-1.json`
-- `.gjc/state/team/<team>/evidence/tasks/task-1.json`
+- `.gjc/state/team/<team>/tasks/task-1.json` (includes structured `completion_evidence` after completed transitions)
 - `.gjc/state/team/<team>/mailbox/worker-1/<message-id>.json`
 - `.gjc/state/team/<team>/mailbox/worker-1.json` (legacy compatibility view)
 - `.gjc/state/team/<team>/notifications/<notification-id>.json`
 - `.gjc/state/team/<team>/workers/<worker>/startup-ack.json`
+- `.gjc/state/team/<team>/workers/<worker>/status.json`
+- `.gjc/state/team/<team>/workers/<worker>/lifecycle.json`
+- `.gjc/state/team/<team>/workers/<worker>/heartbeat.json`
+- `.gjc/state/team/<team>/workers/<worker>/shutdown-request.json`
 - `.gjc/state/team/<team>/workers/<worker>/nudges/<fingerprint>.json`
 - `.gjc/reports/team-commit-hygiene/<team>.ledger.json`
 
@@ -233,17 +247,28 @@ Use `gjc team api` for machine-readable task lifecycle operations.
 ```bash
 gjc team api worker-startup-ack --input '{"team_name":"my-team","worker_id":"worker-1","protocol_version":"1"}' --json
 gjc team api claim-task --input '{"team_name":"my-team","worker_id":"worker-1"}' --json
-gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","evidence":"summary of completed work and validation"}' --json
+gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","completion_evidence":{"summary":"Completed requested work and verified it locally.","items":[{"kind":"command","status":"passed","summary":"Focused test passed","command":"bun test packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"}],"files":["packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"],"notes":"Include at least one passed command or verified inspection/artifact item."}}' --json
+gjc team api update-worker-status --input '{"team_name":"my-team","worker_id":"worker-1","status":"working","current_task_id":"task-1"}' --json
+gjc team api recover-stale-claims --input '{"team_name":"my-team"}' --json
+gjc team api read-traces --input '{"team_name":"my-team"}' --json
+gjc team api create-task --input '{"team_name":"my-team","subject":"Verify delivery","description":"Run verification","owner":"worker-1","lane":"verification","required_role":"executor","depends_on":["task-1"]}' --json
 ```
 
 Canonical worker lifecycle operations:
 
-- `worker-startup-ack` before task work
+- `worker-startup-ack` before task work; this records startup ACK and moves `workers/<worker>/lifecycle.json` to `ready`
 - `claim-task`
-- `transition-task-status` with the claim token, worker id, and completion evidence
+- `update-worker-status` when the worker starts/stops a task-local activity; this updates worker-reported `status.json` without replacing the runtime lifecycle source of truth
+- `recover-stale-claims` is leader/runtime-owned; it clears expired claim files, requeues in-progress tasks claimed by stale workers, and records `task_claim_recovered` events without modifying terminal task records or completion evidence
+- `transition-task-status` with the claim token, worker id, and structured `completion_evidence` object
 - `release-task-claim`
+Claim eligibility is ordered and must not be bypassed: explicit task id selection, task status/terminal checks, owner/assignee checks, lane/role checks, dependency/blocked checks, then active lease creation. `lane` is descriptive metadata; `required_role` and `allowed_roles` are the enforced worker role gates.
 
-GJC-team interop operations are also available for mailbox, native notification, worker heartbeat/status, startup ACK, events, monitor snapshots, approvals, and shutdown request/ack flows; run `gjc team api --help` for the full operation list.
+Completion evidence is stored inline on the task record as `completion_evidence`. It must include a non-empty `summary`, an `items` array, and at least one item with `status: "passed"` or `status: "verified"`. Valid item kinds are `command`, `inspection`, and `artifact`; command items require `command`. The camel-case alias `completionEvidence` is accepted by the API input, but legacy string `evidence` and separate evidence files are not part of the public completion contract.
+
+GJC-team interop operations are also available for mailbox, native notification, worker heartbeat/status, stale-claim recovery, startup ACK, events, monitor snapshots, approvals, and shutdown request/ack flows; run `gjc team api --help` for the full operation list.
+
+Structured trace records in `trace.jsonl` are append-only schema version 1 entries. Each trace references the legacy `events.jsonl` source via `source_event_id`, keeps `event_type`, worker/task ids, and includes `evidence_refs` for completion evidence or claim recovery when available. Trace append failures are isolated in `trace-errors.jsonl` and do not break `events.jsonl` compatibility.
 
 ## GJC-native concept parity
 
@@ -262,9 +287,10 @@ Forbidden assumptions: do not copy OMX paths, Codex notify payload formats, OMX 
 Worker protocol:
 
 - Send startup ACK with `worker-startup-ack` before task work.
+- Report worker activity with `update-worker-status`; this is the worker-reported status plane, not the runtime lifecycle state.
 - Claim pending work with `claim-task`.
 - Transition the task to `completed`, `failed`, or `blocked` with `transition-task-status`, including claim token and evidence for completion.
-- Commit or leave worktree changes in the worker worktree; the leader `status`/`resume` monitor path will auto-checkpoint dirty worktrees and integrate committed history where possible.
+- Commit or leave worktree changes in the worker worktree; the leader `monitor`/`resume` path will auto-checkpoint dirty worktrees and integrate committed history where possible.
 - Record implementation/verification evidence in normal task output and state files; leader integration/conflict notifications are delivered through `.gjc/state/team/<team>/mailbox/leader-fixed.json`.
 
 ## Environment Knobs
@@ -291,7 +317,7 @@ Operator note (important for GJC panes):
 - **Split failure:** startup records a failed phase if state was already initialized, rolls back created worktrees, and never kills the leader tmux session.
 - **Worker API ENOENT:** team state is missing or `GJC_TEAM_STATE_ROOT` points somewhere else. Check `.gjc/state/team/<team>/` before assuming worker failure.
 - **Stale pane on shutdown:** shutdown only kills a recorded worker pane when it still belongs to the stored `tmux_target` and is not the leader pane. Stale panes outside that target require manual inspection.
-- **Integration conflict:** `gjc team status <team>` / `resume` aborts the failing merge, cherry-pick, or worker rebase; inspect `.gjc/state/team/<team>/integration-report.md`, `.gjc/state/team/<team>/events.jsonl`, `.gjc/state/team/<team>/mailbox/leader-fixed.json`, and `.gjc/reports/team-commit-hygiene/<team>.ledger.json`.
+- **Integration conflict:** `gjc team monitor <team>` / `resume` aborts the failing merge, cherry-pick, or worker rebase; `gjc team status <team>` is read-only inspection. Inspect `.gjc/state/team/<team>/integration-report.md`, `.gjc/state/team/<team>/events.jsonl`, `.gjc/state/team/<team>/mailbox/leader-fixed.json`, and `.gjc/reports/team-commit-hygiene/<team>.ledger.json`.
 
 ### Safe Manual Intervention (last resort)
 
@@ -349,8 +375,8 @@ When operating this skill, provide concrete progress evidence:
 
 1. Team started line (`Team started: <name>`)
 2. tmux target and worker pane id
-3. task state from `gjc team status <team>` or `.gjc/state/team/<team>/tasks/task-1.json`
-4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete shutdowns must report `phase=cancelled`/`failed`
+3. task state from read-only `gjc team status <team>`, mutating `gjc team monitor <team>`, or `.gjc/state/team/<team>/tasks/task-1.json`
+4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete shutdowns must report `phase=cancelled`/`failed`, and integration-blocked shutdowns must report `phase=awaiting_integration`
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.

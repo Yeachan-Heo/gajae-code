@@ -88,8 +88,13 @@ describe("owner frame -> observability", () => {
 		owner = new RuntimeOwner({ root, sessionId: SID, rpc });
 		const info = await owner.start();
 		rpc.emit({ type: "agent_start" });
-		rpc.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", command: "bun test x" });
-		rpc.emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", status: "ok" });
+		rpc.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "bun test x" } });
+		rpc.emit({
+			type: "tool_execution_end",
+			toolCallId: "t1",
+			toolName: "bash",
+			result: { details: { status: "ok" } },
+		});
 		rpc.emit({ type: "agent_end" });
 		await flush();
 
@@ -111,6 +116,49 @@ describe("owner frame -> observability", () => {
 		expect(obs.lifecycle).toBe("finalizing");
 	});
 
+	it("maps real partial/error tool frames without persisting raw args or output", async () => {
+		const rpc = new FrameRpc();
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc });
+		const info = await owner.start();
+		rpc.emit({
+			type: "tool_execution_start",
+			toolCallId: "t-secret",
+			toolName: "bash",
+			args: { command: "bun test SECRET_COMMAND" },
+		});
+		rpc.emit({
+			type: "tool_execution_update",
+			toolCallId: "t-secret",
+			toolName: "bash",
+			args: { command: "bun test SECRET_COMMAND" },
+			partialResult: { status: "running", content: [{ type: "text", text: "SECRET_PARTIAL" }] },
+		});
+		rpc.emit({
+			type: "tool_execution_end",
+			toolCallId: "t-secret",
+			toolName: "bash",
+			args: { command: "bun test SECRET_COMMAND" },
+			result: { content: [{ type: "text", text: "SECRET_OUTPUT" }], details: { status: "failed" } },
+			isError: true,
+		});
+		await flush();
+
+		const events = await readEvents(root, SID, 0);
+		const ended = events.find(e => e.kind === "rpc_tool_ended");
+		expect(ended).toMatchObject({ severity: "warn", evidence: { status: "error", signal: "test-running" } });
+		expect(events.every(e => e.writer.ownerId === info.ownerId)).toBe(true);
+		const eventJson = JSON.stringify(events);
+		expect(eventJson).not.toContain("SECRET_COMMAND");
+		expect(eventJson).not.toContain("SECRET_PARTIAL");
+		expect(eventJson).not.toContain("SECRET_OUTPUT");
+
+		const res = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>;
+		const obsJson = JSON.stringify((res.evidence as Record<string, unknown>).observation);
+		expect(obsJson).toContain("test-running");
+		expect(obsJson).not.toContain("SECRET_COMMAND");
+		expect(obsJson).not.toContain("SECRET_PARTIAL");
+		expect(obsJson).not.toContain("SECRET_OUTPUT");
+	});
 	it("AC-6: a message_update storm cannot starve agent_end (completed) or bloat the event log", async () => {
 		const rpc = new FrameRpc();
 		owner = new RuntimeOwner({ root, sessionId: SID, rpc });
@@ -135,8 +183,13 @@ describe("owner frame -> observability", () => {
 		owner = new RuntimeOwner({ root, sessionId: SID, rpc });
 		const info = await owner.start();
 		// frames happen BETWEEN observe polls
-		rpc.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read" });
-		rpc.emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "read", status: "ok" });
+		rpc.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "x" } });
+		rpc.emit({
+			type: "tool_execution_end",
+			toolCallId: "t1",
+			toolName: "read",
+			result: { details: { status: "ok" } },
+		});
 		rpc.emit({ type: "agent_end" });
 		await flush();
 		// getState reports idle now, but the later observe still shows the transient signals.

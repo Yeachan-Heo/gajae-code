@@ -29,7 +29,7 @@ export interface WorkflowVerb {
 
 export interface TypedArgSpec {
 	name: string;
-	type: "string" | "number" | "boolean" | "enum";
+	type: "string" | "number" | "boolean" | "enum" | "object";
 	enumValues?: string[];
 	required?: boolean;
 	appliesToVerbs?: string[];
@@ -308,7 +308,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		],
 		verbs: [
 			...stateVerbs(),
-			...positionalVerbs(["start", "list", "status", "resume", "shutdown", "api"]),
+			...positionalVerbs(["start", "list", "status", "monitor", "resume", "shutdown", "api"]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
 		typedArgs: [
@@ -367,7 +367,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				enumValues: ["pending", "blocked", "in_progress", "completed", "failed"],
 				appliesToVerbs: ["api"],
 			},
-			{ name: "evidence", type: "string", appliesToVerbs: ["api"] },
+			{ name: "completion_evidence", type: "object", appliesToVerbs: ["api"] },
+			{ name: "completionEvidence", type: "object", appliesToVerbs: ["api"] },
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],

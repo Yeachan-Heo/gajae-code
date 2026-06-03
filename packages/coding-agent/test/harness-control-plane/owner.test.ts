@@ -98,6 +98,49 @@ describe("RuntimeOwner (in-process integration)", () => {
 		expect(events.map(e => e.cursor)).toEqual([...events.map(e => e.cursor)].sort((a, b) => a - b));
 	});
 
+	it("routes operate through the owner lease-guarded event writer", async () => {
+		const rpc = new FakeRpc();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			rpc,
+			acceptanceTimeoutMs: 100,
+			finalizeChecks: {
+				async runValidation(spec) {
+					return { exactCommand: spec.command, cwd: root, exitStatus: 0, pass: true };
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					return { prUrl: "https://example.invalid/pr/1", issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "bun test" }],
+		});
+		const info = await owner.start();
+		await writeSessionState(root, { ...seedState(root), lifecycle: "finalizing" });
+
+		const res = (await callEndpoint(info.socketPath, {
+			verb: "operate",
+			input: { goal: "finish", maxIterations: 1 },
+		})) as Record<string, unknown>;
+
+		expect(res.ok).toBe(true);
+		expect(((res.evidence as Record<string, unknown>).operate as Record<string, unknown>).completed).toBe(true);
+		const events = await readEvents(root, SID, 0);
+		expect(events.map(e => e.kind)).toContain("operate_started");
+		expect(events.map(e => e.kind)).toContain("operate_finalized");
+		const finalized = events.find(e => e.kind === "operate_finalized");
+		expect(finalized?.state.lifecycle).toBe("completed");
+		expect(finalized?.nextAllowedActions.some(action => action.verb === "observe" && action.available)).toBe(true);
+		expect(events.every(e => e.writer.ownerId === info.ownerId)).toBe(true);
+		expect(events.every(e => e.writer.leaseEpoch === info.leaseEpoch)).toBe(true);
+	});
+
 	it("blocks submit when the harness acks but never starts (no false-positive acceptance)", async () => {
 		const rpc = new FakeRpc();
 		rpc.accept = false; // ack only, no agent_start

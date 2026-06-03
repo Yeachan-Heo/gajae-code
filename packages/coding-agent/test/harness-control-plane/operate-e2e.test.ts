@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -6,8 +7,9 @@ import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { operate } from "../../src/harness-control-plane/operate";
 import type { VanishEvidence } from "../../src/harness-control-plane/receipts";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
-import { readEvents, readReceiptIndex } from "../../src/harness-control-plane/storage";
-import type { Observation } from "../../src/harness-control-plane/types";
+import { nextAllowedActions } from "../../src/harness-control-plane/state-machine";
+import { appendEvent, readEvents, readReceiptIndex } from "../../src/harness-control-plane/storage";
+import type { EventEnvelope, HarnessLifecycle, Observation, Severity } from "../../src/harness-control-plane/types";
 
 class FakeRpc implements HarnessRpc {
 	cursor = 0;
@@ -66,6 +68,9 @@ let root: string;
 const SID = "op";
 
 function baseOpts(observer: () => Promise<Observation>) {
+	let cursor = 0;
+	let lifecycle: HarnessLifecycle = "started";
+	const blockers: string[] = [];
 	return {
 		root,
 		sessionId: SID,
@@ -86,6 +91,26 @@ function baseOpts(observer: () => Promise<Observation>) {
 		validationCommands: [{ name: "test", command: "bun test" }],
 		acceptanceTimeoutMs: 100,
 		maxIterations: 6,
+		emit: async (severity: Severity, kind: string, evidence: Record<string, unknown>) => {
+			if (kind === "operate_blocked") lifecycle = "blocked";
+			if (kind === "operate_finalized") {
+				lifecycle = evidence.completed === true ? "completed" : "blocked";
+				if (Array.isArray(evidence.blockers))
+					blockers.push(...evidence.blockers.filter((b): b is string => typeof b === "string"));
+			}
+			const event: EventEnvelope = {
+				eventId: randomUUID(),
+				cursor: ++cursor,
+				createdAt: new Date().toISOString(),
+				severity,
+				kind,
+				state: { sessionId: SID, lifecycle, harness: "gajae-code", ownerLive: true, blockers },
+				evidence,
+				nextAllowedActions: nextAllowedActions(lifecycle, true),
+				writer: { ownerId: "test-owner", leaseEpoch: 1 },
+			};
+			await appendEvent(root, SID, event);
+		},
 	};
 }
 

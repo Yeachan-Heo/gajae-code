@@ -406,6 +406,25 @@ export class RuntimeOwner {
 		const goal = typeof input.goal === "string" ? input.goal : "";
 		let state = await this.#loadState();
 		if (!goal) return this.#response(state, { error: "empty-goal" }, false);
+		const emitOperateEvent = async (
+			severity: Severity,
+			kind: string,
+			evidence: Record<string, unknown>,
+		): Promise<void> => {
+			if (kind === "operate_blocked" || kind === "operate_finalized") {
+				const terminalState = await this.#loadState();
+				terminalState.lifecycle =
+					kind === "operate_finalized" && evidence.completed === true ? "completed" : "blocked";
+				terminalState.blockers = Array.isArray(evidence.blockers)
+					? evidence.blockers.filter((blocker): blocker is string => typeof blocker === "string")
+					: terminalState.lifecycle === "completed"
+						? []
+						: terminalState.blockers;
+				terminalState.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+				await writeSessionState(this.#opts.root, terminalState);
+			}
+			await this.#emit(severity, kind, evidence);
+		};
 		const result: OperateResult = await operate(goal, {
 			root: this.#opts.root,
 			sessionId: this.#opts.sessionId,
@@ -416,7 +435,7 @@ export class RuntimeOwner {
 			finalizeChecks: this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace),
 			validationCommands: this.#validationCommands,
 			maxIterations: typeof input.maxIterations === "number" ? input.maxIterations : 5,
-			emit: (severity, kind, evidence) => this.#emit(severity, kind, evidence),
+			emit: emitOperateEvent,
 		});
 		// Persist the loop's terminal lifecycle/blockers so the response state is not stale.
 		state = await this.#loadState();
