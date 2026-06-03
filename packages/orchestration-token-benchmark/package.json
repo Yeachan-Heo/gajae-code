@@ -2,7 +2,7 @@
 	"type": "module",
 	"private": true,
 	"name": "@gajae-code/orchestration-token-benchmark",
-	"version": "0.0.1",
+	"version": "0.2.5",
 	"description": "Deterministic internal benchmark for orchestration token efficiency (token metrics, prompt-prefix stability, spawn-gate decisions). No live-model calls.",
 	"author": "Yeachan-Heo",
 	"license": "MIT",
