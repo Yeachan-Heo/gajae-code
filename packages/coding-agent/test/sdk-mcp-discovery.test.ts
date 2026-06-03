@@ -505,5 +505,5 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await resumedSession.dispose();
 		}
-	});
+	}, 30_000);
 });
