@@ -7,6 +7,7 @@ import {
 	monitorGjcTeam,
 	parseTeamLaunchArgs,
 	readGjcTeamEvents,
+	readGjcTeamReport,
 	readGjcTeamSnapshot,
 	shutdownGjcTeam,
 	startGjcTeam,
@@ -65,6 +66,12 @@ function formatIntegrationSummary(snapshot: {
 	});
 }
 
+function formatMonitorReasons(snapshot: { monitor_reasons?: Array<{ kind: string; reason: string }> }): string[] {
+	const reasons = snapshot.monitor_reasons ?? [];
+	if (reasons.length === 0) return [];
+	return reasons.map(reason => `reason: ${reason.kind} ${reason.reason}`);
+}
+
 function parseInputFlag(argv: string[]): Record<string, unknown> {
 	const index = argv.indexOf("--input");
 	if (index < 0) return {};
@@ -81,7 +88,7 @@ export default class Team extends Command {
 
 	static args = {
 		action: Args.string({
-			description: "start (default), status, list, shutdown, resume, or api",
+			description: "start (default), status, report, list, shutdown, resume, or api",
 			required: false,
 		}),
 	};
@@ -138,6 +145,29 @@ export default class Team extends Command {
 				formatNotificationSummary(snapshot),
 				...formatAwaitingIntegrationNextStep(snapshot),
 				...formatIntegrationSummary(snapshot),
+				...formatMonitorReasons(snapshot),
+			]);
+			return;
+		}
+
+		if (action === "report") {
+			const teamName = rest.find(arg => !arg.startsWith("--"));
+			if (!teamName) throw new Error("missing_team_name");
+			const report = await readGjcTeamReport(teamName);
+			if (json) {
+				writeJson(report);
+				return;
+			}
+			writeText([
+				`team: ${report.team_name}`,
+				`phase: ${report.phase}`,
+				`tasks: ${formatTaskCounts(report.task_counts)}`,
+				`workers: ${report.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")}`,
+				...report.tasks.map(
+					task =>
+						`task: ${task.id} ${task.status} ${task.subject}${task.completion_evidence ? ` evidence=${task.completion_evidence.summary}` : ""}`,
+				),
+				...report.monitor_reasons.map(reason => `reason: ${reason.kind} ${reason.reason}`),
 			]);
 			return;
 		}
@@ -161,9 +191,9 @@ export default class Team extends Command {
 				writeText([
 					"Supported operations:",
 					"send-message broadcast mailbox-list mailbox-mark-delivered mailbox-mark-notified notification-list notification-read notification-replay notification-mark-pane-attempt worker-startup-ack",
-					"create-task read-task list-tasks update-task claim-task transition-task-status release-task-claim",
+					"create-task read-task list-tasks update-task claim-task complete-task transition-task-status release-task-claim",
 					"read-config read-manifest read-worker-status read-worker-heartbeat update-worker-heartbeat write-worker-inbox write-worker-identity",
-					"append-event read-events await-event write-shutdown-request read-shutdown-ack read-monitor-snapshot write-monitor-snapshot read-task-approval write-task-approval",
+					"append-event read-events await-event write-shutdown-request read-shutdown-ack read-monitor-snapshot write-monitor-snapshot read-task-approval write-task-approval read-report",
 				]);
 				return;
 			}

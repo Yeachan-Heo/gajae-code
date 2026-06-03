@@ -309,7 +309,7 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id}");
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("protocol_version");
-		expect(tmuxLog).toContain("claim-task/transition-task-status");
+		expect(tmuxLog).toContain("claim-task/complete-task");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
 		expect(tmuxLog).toContain("set-option -t test-session:0 mouse on");
 		expect(tmuxLog).toContain("set-option -t test-session:0 set-clipboard on");
@@ -575,6 +575,10 @@ describe("native gjc team runtime", () => {
 				to: "completed",
 				claim_token: workerTwoClaim.claim_token,
 				evidence: "worker-2 completed the task",
+				completion_evidence: {
+					summary: "worker-2 completed the task",
+					items: [{ kind: "inspection", status: "verified", summary: "worker-2 completed the task" }],
+				},
 			},
 			cleanupRoot,
 			{ PATH: "" },
@@ -685,7 +689,16 @@ describe("native gjc team runtime", () => {
 		)) as { claim_token: string };
 		await executeGjcTeamApiOperation(
 			"transition-task-status",
-			{ team_name: "api-team", task_id: created.task.id, to: "completed", claim_token: claimed.claim_token },
+			{
+				team_name: "api-team",
+				task_id: created.task.id,
+				to: "completed",
+				claim_token: claimed.claim_token,
+				completion_evidence: {
+					summary: "done",
+					items: [{ kind: "inspection", status: "verified", summary: "checked" }],
+				},
+			},
 			cleanupRoot,
 			{ PATH: "" },
 		);
@@ -1316,5 +1329,241 @@ describe("native gjc team runtime", () => {
 		for (const disallowedGitStrategy of ['"-X"', '"--strategy-option"', "-X theirs", "-X ours"]) {
 			expect(runtimeSource).not.toContain(disallowedGitStrategy);
 		}
+	});
+	it("preflights real worktree launches while preserving non-git dry-run teams", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Real launch requires git",
+				teamName: "preflight-fail-team",
+				cwd: cleanupRoot,
+				env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true" },
+			}),
+		).rejects.toThrow("team_preflight_requires_git_repo");
+		expect(await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "preflight-fail-team")).exists()).toBe(
+			false,
+		);
+
+		const dryRun = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Dry run remains allowed",
+			teamName: "preflight-dry-run-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		expect(dryRun.phase).toBe("running");
+	});
+
+	it("completes the active worker claim through the safe complete-task API with evidence", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Complete safely",
+			teamName: "complete-api-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		await executeGjcTeamApiOperation(
+			"claim-task",
+			{ team_name: "complete-api-team", worker: "worker-1" },
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		await expect(
+			executeGjcTeamApiOperation(
+				"complete-task",
+				{ team_name: "complete-api-team", worker: "worker-1", summary: "done", items: [] },
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("complete_task_evidence_items_required:task-1");
+		const completed = (await executeGjcTeamApiOperation(
+			"complete-task",
+			{
+				team_name: "complete-api-team",
+				worker: "worker-1",
+				summary: "done",
+				items: [{ kind: "inspection", status: "verified", summary: "checked" }],
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		)) as { task: { status: string; completion_evidence?: { recorded_by: string } } };
+		expect(completed.task.status).toBe("completed");
+		expect(completed.task.completion_evidence?.recorded_by).toBe("worker-1");
+	});
+
+	it("rejects completion paths without passing evidence", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Reject bad evidence",
+			teamName: "bad-evidence-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const claim = await claimGjcTeamTask("bad-evidence-team", "worker-1", cleanupRoot, { PATH: "" });
+		await expect(
+			executeGjcTeamApiOperation(
+				"transition-task-status",
+				{ team_name: "bad-evidence-team", task_id: "task-1", to: "completed", claim_token: claim.claim_token },
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("completion_evidence_required:task-1");
+		await expect(
+			executeGjcTeamApiOperation(
+				"complete-task",
+				{
+					team_name: "bad-evidence-team",
+					worker: "worker-1",
+					summary: "done",
+					items: [{ kind: "inspection", status: "rejected", summary: "not good" }],
+				},
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("complete_task_evidence_not_passing:task-1");
+	});
+
+	it("keeps expired claims suspect first and records monitor reasons before recovery", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Recover stale claim",
+			teamName: "liveness-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const claim = await claimGjcTeamTask("liveness-team", "worker-1", cleanupRoot, { PATH: "" });
+		const taskPath = path.join(cleanupRoot, ".gjc", "state", "team", "liveness-team", "tasks", "task-1.json");
+		const task = await Bun.file(taskPath).json();
+		task.claim.leased_until = new Date(Date.now() - 120_000).toISOString();
+		await Bun.write(taskPath, `${JSON.stringify(task, null, 2)}\n`);
+		await Bun.write(
+			path.join(cleanupRoot, ".gjc", "state", "team", "liveness-team", "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 0, last_turn_at: new Date(Date.now() - 120_000).toISOString(), turn_count: 1, alive: true }, null, 2)}\n`,
+		);
+		await Bun.write(
+			path.join(cleanupRoot, ".gjc", "state", "team", "liveness-team", "workers", "worker-1", "status.json"),
+			`${JSON.stringify({ state: "working", updated_at: new Date(Date.now() - 120_000).toISOString() }, null, 2)}\n`,
+		);
+
+		const suspect = await monitorGjcTeam("liveness-team", cleanupRoot, { PATH: "" });
+		expect(suspect.task_counts.in_progress).toBe(1);
+		expect(suspect.monitor_reasons?.[0]?.kind).toBe("claim_suspect");
+		const eventsPath = path.join(cleanupRoot, ".gjc", "state", "team", "liveness-team", "events.jsonl");
+		const agedEvents = (await Bun.file(eventsPath).text()).replace(
+			/"ts":"[^"]+"/g,
+			`"ts":"${new Date(Date.now() - 120_000).toISOString()}"`,
+		);
+		await Bun.write(eventsPath, agedEvents);
+
+		const stillSuspect = await monitorGjcTeam("liveness-team", cleanupRoot, { PATH: "" });
+		expect(stillSuspect.task_counts.in_progress).toBe(1);
+		expect(stillSuspect.monitor_reasons?.[0]?.kind).toBe("claim_suspect");
+		expect(await readEvents(path.join(cleanupRoot, ".gjc", "state", "team", "liveness-team"))).toContain(
+			"task_claim_suspect",
+		);
+		expect(claim.ok).toBe(true);
+	});
+
+	it("recovers expired real-worktree claims after the suspect window", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Recover real stale claim",
+			teamName: "real-liveness-team",
+			cwd: cleanupRoot,
+			env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+		});
+		await claimGjcTeamTask("real-liveness-team", "worker-1", cleanupRoot, { PATH: process.env.PATH ?? "" });
+		const taskPath = path.join(snapshot.state_dir, "tasks", "task-1.json");
+		const task = await Bun.file(taskPath).json();
+		task.claim.leased_until = new Date(Date.now() - 120_000).toISOString();
+		await Bun.write(taskPath, `${JSON.stringify(task, null, 2)}\n`);
+		await Bun.write(
+			path.join(snapshot.state_dir, "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 0, last_turn_at: new Date(Date.now() - 120_000).toISOString(), turn_count: 1, alive: true }, null, 2)}\n`,
+		);
+		await Bun.write(
+			path.join(snapshot.state_dir, "workers", "worker-1", "status.json"),
+			`${JSON.stringify({ state: "working", updated_at: new Date(Date.now() - 120_000).toISOString() }, null, 2)}\n`,
+		);
+		expect(
+			(
+				await monitorGjcTeam("real-liveness-team", cleanupRoot, {
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				})
+			).task_counts.in_progress,
+		).toBe(1);
+		const eventsPath = path.join(snapshot.state_dir, "events.jsonl");
+		await Bun.write(
+			eventsPath,
+			(await Bun.file(eventsPath).text()).replace(
+				/"ts":"[^"]+"/g,
+				`"ts":"${new Date(Date.now() - 120_000).toISOString()}"`,
+			),
+		);
+		const recovered = await monitorGjcTeam("real-liveness-team", cleanupRoot, {
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+		});
+		expect(recovered.task_counts.pending).toBe(1);
+		expect(recovered.monitor_reasons?.[0]?.kind).toBe("claim_recovered");
+	});
+
+	it("decomposes listed briefs, carries forbidden metadata, and reports terminal evidence", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "1. Fix preflight\n2. Fix completion\nDo not install packages",
+			teamName: "report-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const tasks = await executeGjcTeamApiOperation("list-tasks", { team_name: "report-team" }, cleanupRoot, {
+			PATH: "",
+		});
+		expect(JSON.stringify(tasks)).toContain("Fix preflight");
+		expect(JSON.stringify(tasks)).toContain("Do not install packages");
+
+		const claim = await claimGjcTeamTask("report-team", "worker-1", cleanupRoot, { PATH: "" }, "task-1");
+		await executeGjcTeamApiOperation(
+			"complete-task",
+			{
+				team_name: "report-team",
+				worker: "worker-1",
+				task_id: "task-1",
+				claim_token: claim.claim_token,
+				summary: "done",
+				items: [{ kind: "inspection", status: "verified", summary: "checked" }],
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		const stopped = await shutdownGjcTeam("report-team", cleanupRoot, { PATH: "" });
+		expect(stopped.workers[0]?.status).toBe("stopped");
+		const workerStatus = await Bun.file(path.join(snapshot.state_dir, "workers", "worker-1", "status.json")).json();
+		expect(workerStatus.state).toBe("done");
+		const report = await executeGjcTeamApiOperation("read-report", { team_name: "report-team" }, cleanupRoot, {
+			PATH: "",
+		});
+		expect(JSON.stringify(report)).toContain("completion_evidence");
+		expect(JSON.stringify(stopped.monitor_reasons)).toContain("shutdown_sync");
 	});
 });

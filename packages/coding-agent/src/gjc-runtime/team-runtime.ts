@@ -11,6 +11,8 @@ export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "fa
 
 export const GJC_TEAM_DEFAULT_WORKERS = 3;
 export const GJC_TEAM_MAX_WORKERS = 20;
+const GJC_TEAM_HEARTBEAT_STALE_MS = 60_000;
+const GJC_TEAM_SUSPECT_WINDOW_MS = 30_000;
 const GJC_TEAM_WORKER_CLI_ENV = "GJC_TEAM_WORKER_CLI";
 const GJC_TEAM_WORKER_CLI_MAP_ENV = "GJC_TEAM_WORKER_CLI_MAP";
 
@@ -66,6 +68,9 @@ export interface GjcTeamTask {
 	created_at: string;
 	updated_at: string;
 	completed_at?: string;
+	completion_evidence?: GjcTeamTaskCompletionEvidence;
+	forbidden_actions?: string[];
+	allowed_actions?: string[];
 }
 
 export type GjcTeamWorktreeMode =
@@ -120,6 +125,22 @@ export interface GjcTeamWorkerIntegrationState {
 export interface GjcTeamMonitorSnapshot {
 	integration_by_worker: Record<string, GjcTeamWorkerIntegrationState>;
 	updated_at: string;
+	monitor_reasons?: GjcTeamMonitorReason[];
+}
+
+export interface GjcTeamMonitorReason {
+	kind:
+		| "preflight"
+		| "claim_suspect"
+		| "claim_recovered"
+		| "task_completed"
+		| "shutdown_sync"
+		| "notification_obsolete";
+	task_id?: string;
+	worker_id?: string;
+	reason: string;
+	event_id?: string;
+	at: string;
 }
 
 export type GjcTeamNotificationDeliveryState =
@@ -169,6 +190,7 @@ export interface GjcTeamSnapshot {
 	integration_by_worker?: Record<string, GjcTeamWorkerIntegrationState>;
 	notification_summary: GjcTeamNotificationSummary;
 	updated_at: string;
+	monitor_reasons?: GjcTeamMonitorReason[];
 }
 
 export interface GjcTeamStartOptions {
@@ -199,6 +221,34 @@ export interface GjcTeamMailboxMessage {
 	delivered_at?: string;
 	notified_at?: string;
 	idempotency_key?: string;
+	obsolete_at?: string;
+	obsolete_reason?: "team_complete" | "task_terminal" | "worker_stopped";
+}
+
+export interface GjcTeamTaskCompletionEvidenceItem {
+	kind: "command" | "inspection" | "artifact";
+	status: "passed" | "failed" | "not_run" | "verified" | "rejected";
+	summary: string;
+	command?: string;
+	artifact?: string;
+	location?: string;
+	output?: string;
+}
+
+export interface GjcTeamTaskCompletionEvidence {
+	summary: string;
+	items: GjcTeamTaskCompletionEvidenceItem[];
+	recorded_by: string;
+	recorded_at: string;
+}
+
+export interface GjcTeamReport {
+	team_name: string;
+	phase: GjcTeamPhase;
+	task_counts: Record<GjcTeamTaskStatus, number>;
+	tasks: Array<Pick<GjcTeamTask, "id" | "subject" | "status" | "completion_evidence" | "error" | "blocked_by">>;
+	workers: Array<Pick<GjcTeamWorker, "id" | "status" | "last_heartbeat">>;
+	monitor_reasons: GjcTeamMonitorReason[];
 }
 
 interface FsError {
@@ -368,6 +418,7 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"transition-task-status",
 	"transition-task",
 	"release-task-claim",
+	"complete-task",
 	"read-config",
 	"read-manifest",
 	"read-worker-status",
@@ -384,6 +435,7 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-monitor-snapshot",
 	"read-task-approval",
 	"write-task-approval",
+	"read-report",
 ] as const;
 
 function now(): string {
@@ -637,6 +689,67 @@ function isGjcTeamTaskFile(entry: { isFile(): boolean; name: string }): boolean 
 	return entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json");
 }
 
+function trimCompletionString(taskId: string, field: string, value: unknown): string {
+	const trimmed = typeof value === "string" ? value.trim() : "";
+	if (!trimmed) throw new Error(`invalid_completion_evidence:${taskId}:${field}`);
+	return trimmed;
+}
+
+function normalizeCompletionEvidenceItem(taskId: string, raw: unknown): GjcTeamTaskCompletionEvidenceItem {
+	if (typeof raw !== "object" || raw == null || Array.isArray(raw))
+		throw new Error(`invalid_completion_evidence:${taskId}:items`);
+	const value = raw as Record<string, unknown>;
+	const kind = trimCompletionString(taskId, "items.kind", value.kind);
+	if (kind !== "command" && kind !== "inspection" && kind !== "artifact")
+		throw new Error(`invalid_completion_evidence:${taskId}:items.kind`);
+	const status = trimCompletionString(taskId, "items.status", value.status);
+	const commandStatus = status === "passed" || status === "failed" || status === "not_run";
+	const verificationStatus = status === "verified" || status === "rejected";
+	if ((kind === "command" && !commandStatus) || (kind !== "command" && !verificationStatus))
+		throw new Error(`invalid_completion_evidence:${taskId}:items.status`);
+	const normalizedStatus = status as GjcTeamTaskCompletionEvidenceItem["status"];
+	const item: GjcTeamTaskCompletionEvidenceItem = {
+		kind,
+		status: normalizedStatus,
+		summary: trimCompletionString(taskId, "items.summary", value.summary),
+	};
+	for (const field of ["command", "artifact", "location", "output"] as const) {
+		const text = typeof value[field] === "string" ? value[field].trim() : "";
+		if (text) item[field] = text;
+	}
+	if (kind === "command" && !item.command) throw new Error(`invalid_completion_evidence:${taskId}:items.command`);
+	return item;
+}
+
+function normalizeCompletionEvidence(
+	taskId: string,
+	workerId: string,
+	summary: unknown,
+	items: unknown,
+): GjcTeamTaskCompletionEvidence {
+	const normalizedItems = Array.isArray(items) ? items.map(item => normalizeCompletionEvidenceItem(taskId, item)) : [];
+	if (normalizedItems.length === 0) throw new Error(`complete_task_evidence_items_required:${taskId}`);
+	const summaryText = typeof summary === "string" ? summary.trim() : "";
+	if (!summaryText) throw new Error(`complete_task_summary_required:${taskId}`);
+	return {
+		summary: summaryText,
+		items: normalizedItems,
+		recorded_by: workerId,
+		recorded_at: now(),
+	};
+}
+function assertCompletionEvidencePassing(taskId: string, evidence: GjcTeamTaskCompletionEvidence): void {
+	if (evidence.items.some(item => item.status === "failed" || item.status === "rejected"))
+		throw new Error(`complete_task_evidence_not_passing:${taskId}`);
+}
+
+function extractForbiddenActions(task: string): string[] {
+	return task
+		.split(/\r?\n|;/)
+		.map(line => line.trim())
+		.filter(line => /^(do not|don't|never|must not|no )\b/i.test(line))
+		.slice(0, 10);
+}
 async function readTasks(dir: string): Promise<GjcTeamTask[]> {
 	try {
 		const entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
@@ -712,6 +825,12 @@ function tryRunGit(cwd: string, args: string[]): string | null {
 }
 function isGitRepository(cwd: string): boolean {
 	return tryRunGit(cwd, ["rev-parse", "--show-toplevel"]) != null;
+}
+function validateGjcTeamPreflight(cwd: string, worktreeMode: GjcTeamWorktreeMode, dryRun: boolean): void {
+	if (dryRun || !worktreeMode.enabled) return;
+	if (!isGitRepository(cwd)) throw new Error(`team_preflight_requires_git_repo:${cwd}`);
+	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	if (!resolveHead(repoRoot)) throw new Error(`team_preflight_requires_head:${repoRoot}`);
 }
 
 function parseWorktreeMode(args: string[]): { mode: GjcTeamWorktreeMode; remainingArgs: string[] } {
@@ -852,7 +971,7 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		workspace,
 		`Task: ${config.task}`,
 		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api claim-task/transition-task-status with this worker id, record evidence, and do not mutate leader-owned goal state.`,
+		`Use gjc team api claim-task/complete-task with this worker id, record evidence, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
 		`GJC_TEAM_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
@@ -866,19 +985,33 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 	];
 	return `${env.join(" ")} ${config.worker_command} ${shellQuote(prompt)}`;
 }
+function splitTaskBrief(task: string): string[] {
+	const matches = [...task.matchAll(/(?:^|\n)\s*(?:\d+[.)]|[-*])\s+([^\n]+)/g)].map(match => (match[1] ?? "").trim());
+	if (matches.length > 1) return matches;
+	return [];
+}
+
 function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[] {
-	return workers.map(worker => ({
-		id: `task-${worker.index}`,
-		subject: `Execute team brief (${worker.id})`,
-		description: task,
-		title: `Execute team brief (${worker.id})`,
-		objective: task,
-		status: "pending",
-		owner: worker.id,
-		version: 1,
-		created_at: now(),
-		updated_at: now(),
-	}));
+	const parts = splitTaskBrief(task);
+	const forbiddenActions = extractForbiddenActions(task);
+	return workers.map(worker => {
+		const part = parts[worker.index - 1];
+		const subject = part ? part.slice(0, 80) : `Execute team brief (${worker.id})`;
+		const description = part ?? task;
+		return {
+			id: `task-${worker.index}`,
+			subject,
+			description,
+			title: subject,
+			objective: description,
+			status: "pending",
+			owner: worker.id,
+			version: 1,
+			created_at: now(),
+			updated_at: now(),
+			...(forbiddenActions.length > 0 ? { forbidden_actions: forbiddenActions } : {}),
+		};
+	});
 }
 
 async function startTmuxSession(
@@ -1613,6 +1746,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const dir = teamDir(stateRoot, teamName);
 	const createdAt = now();
 	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
+	validateGjcTeamPreflight(cwd, worktreeMode, options.dryRun ?? false);
 	const tmuxCommand = resolveGjcTmuxCommand(env);
 	const tmuxContext = options.dryRun
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
@@ -1751,7 +1885,35 @@ export async function readGjcTeamSnapshot(
 		workers: config.workers,
 		integration_by_worker: monitor?.integration_by_worker,
 		notification_summary: notificationSummary,
+		monitor_reasons: monitor?.monitor_reasons ?? [],
 		updated_at: config.updated_at,
+	};
+}
+export async function readGjcTeamReport(
+	teamName: string,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcTeamReport> {
+	const snapshot = await readGjcTeamSnapshot(teamName, cwd, env);
+	const tasks = await listGjcTeamTasks(teamName, cwd, env);
+	return {
+		team_name: snapshot.team_name,
+		phase: snapshot.phase,
+		task_counts: snapshot.task_counts,
+		tasks: tasks.map(task => ({
+			id: task.id,
+			subject: task.subject,
+			status: task.status,
+			completion_evidence: task.completion_evidence,
+			error: task.error,
+			blocked_by: task.blocked_by,
+		})),
+		workers: snapshot.workers.map(worker => ({
+			id: worker.id,
+			status: worker.status,
+			last_heartbeat: worker.last_heartbeat,
+		})),
+		monitor_reasons: snapshot.monitor_reasons ?? [],
 	};
 }
 function workerIntegrationFingerprint(head: string | null, classification: GjcWorkerCheckpointClassification): string {
@@ -1865,7 +2027,19 @@ export async function monitorGjcTeam(
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
 	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
-	await writeJsonFile(monitorSnapshotPath(dir), { integration_by_worker: integrationByWorker, updated_at: now() });
+	const reasons = await collectClaimMonitorReasons(
+		dir,
+		teamName,
+		await readTasks(dir),
+		config.tmux_session === "dry-run",
+		cwd,
+		env,
+	);
+	await writeJsonFile(monitorSnapshotPath(dir), {
+		integration_by_worker: integrationByWorker,
+		monitor_reasons: reasons,
+		updated_at: now(),
+	});
 	await replayGjcTeamNotifications(teamName, cwd, env);
 	await computeLifecycleNudges(config, dir, cwd, env);
 	return readGjcTeamSnapshot(teamName, cwd, env);
@@ -2041,6 +2215,30 @@ export async function shutdownGjcTeam(
 	};
 	await writeJsonFile(path.join(dir, "config.json"), stopped);
 	await writePhase(dir, shutdownPhase);
+	for (const worker of stopped.workers)
+		await writeJsonFile(path.join(workerDir(dir, worker.id), "status.json"), {
+			state: "done",
+			updated_at: stopped.updated_at,
+			reason: "team_shutdown",
+		});
+	const shutdownReasons = await markTerminalNotificationsObsolete(
+		dir,
+		stopped,
+		shutdownPhase === "complete" ? "team_complete" : "worker_stopped",
+	);
+	await writeJsonFile(monitorSnapshotPath(dir), {
+		integration_by_worker:
+			(await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir)))?.integration_by_worker ?? {},
+		monitor_reasons: [
+			{
+				kind: "shutdown_sync",
+				reason: `team shutdown phase ${shutdownPhase}`,
+				at: stopped.updated_at,
+			},
+			...shutdownReasons,
+		],
+		updated_at: stopped.updated_at,
+	});
 	await appendEvent(dir, {
 		type: "team_shutdown",
 		message:
@@ -2193,6 +2391,7 @@ export async function transitionGjcTeamTaskStatus(
 	claimToken?: string,
 	workerId?: string,
 	evidence?: string,
+	completionEvidence?: GjcTeamTaskCompletionEvidence,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
@@ -2207,13 +2406,15 @@ export async function transitionGjcTeamTaskStatus(
 	const terminal = status === "completed" || status === "failed";
 	if (status === "completed" && evidence !== undefined && evidence.trim().length === 0)
 		throw new Error(`task_evidence_required:${taskId}`);
+	const transitionedAt = now();
 	const updated: GjcTeamTask = {
 		...task,
 		status,
 		claim: terminal ? undefined : task.claim,
 		version: task.version + 1,
-		updated_at: now(),
-		...(terminal ? { completed_at: now() } : {}),
+		updated_at: transitionedAt,
+		...(terminal ? { completed_at: transitionedAt } : {}),
+		...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
 	};
 	await writeTask(dir, updated);
 	if (terminal && evidence)
@@ -2221,7 +2422,7 @@ export async function transitionGjcTeamTaskStatus(
 			task_id: taskId,
 			worker: workerId ?? task.claim.owner,
 			evidence,
-			recorded_at: now(),
+			recorded_at: transitionedAt,
 		});
 	if (terminal) await fs.rm(path.join(dir, "claims", `${taskId}.json`), { force: true });
 	await appendEvent(dir, {
@@ -2241,6 +2442,42 @@ export async function transitionGjcTeamTask(
 	claimToken?: string,
 ): Promise<GjcTeamTask> {
 	return transitionGjcTeamTaskStatus(teamName, taskId, parseGjcTeamTaskStatus(status, true), cwd, env, claimToken);
+}
+export async function completeGjcTeamTask(
+	teamName: string,
+	workerId: string,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+	inputTaskId?: string,
+	inputClaimToken?: string,
+	summary?: unknown,
+	items?: unknown,
+): Promise<GjcTeamTask> {
+	const tasks = await listGjcTeamTasks(teamName, cwd, env);
+	const active = tasks.filter(task => task.claim?.owner === workerId && task.status === "in_progress");
+	const task = inputTaskId
+		? tasks.find(candidate => candidate.id === inputTaskId)
+		: active.length === 1
+			? active[0]
+			: undefined;
+	if (!task)
+		throw new Error(
+			active.length > 1 ? `complete_task_ambiguous_claim:${workerId}` : `complete_task_no_active_claim:${workerId}`,
+		);
+	if (!task.claim || task.claim.owner !== workerId) throw new Error(`complete_task_claim_owner_mismatch:${task.id}`);
+	const evidence = normalizeCompletionEvidence(task.id, workerId, summary, items);
+	assertCompletionEvidencePassing(task.id, evidence);
+	return transitionGjcTeamTaskStatus(
+		teamName,
+		task.id,
+		"completed",
+		cwd,
+		env,
+		inputClaimToken ?? task.claim.token,
+		workerId,
+		undefined,
+		evidence,
+	);
 }
 export async function releaseGjcTeamTaskClaim(
 	teamName: string,
@@ -2271,6 +2508,92 @@ export async function releaseGjcTeamTaskClaim(
 		message: "Task claim released",
 	});
 	return updated;
+}
+function millisecondsSince(value: string | undefined, fallbackMs = Number.POSITIVE_INFINITY): number {
+	if (!value) return fallbackMs;
+	const time = Date.parse(value);
+	return Number.isFinite(time) ? Date.now() - time : fallbackMs;
+}
+
+async function classifyClaimLiveness(
+	dir: string,
+	teamName: string,
+	task: GjcTeamTask,
+	dryRun: boolean,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamMonitorReason | null> {
+	if (!task.claim || task.status === "completed" || task.status === "failed") return null;
+	if (Date.parse(task.claim.leased_until) > Date.now()) return null;
+	const heartbeat = await readGjcWorkerHeartbeat(teamName, task.claim.owner, cwd, env);
+	const status = await readGjcWorkerStatus(teamName, task.claim.owner, cwd, env);
+	const heartbeatFresh = heartbeat != null && millisecondsSince(heartbeat.last_turn_at) <= GJC_TEAM_HEARTBEAT_STALE_MS;
+	const statusFresh = millisecondsSince(status.updated_at) <= GJC_TEAM_HEARTBEAT_STALE_MS;
+	if (heartbeatFresh || statusFresh) {
+		return {
+			kind: "claim_suspect",
+			task_id: task.id,
+			worker_id: task.claim.owner,
+			reason: "claim lease expired but worker status is still fresh",
+			at: now(),
+		};
+	}
+	const events = await readGjcTeamEvents(teamName, cwd, env);
+	const previous = events.findLast(
+		event =>
+			event.type === "task_claim_suspect" &&
+			event.task_id === task.id &&
+			event.data?.claim_token === task.claim?.token,
+	);
+	if (dryRun || !previous || millisecondsSince(previous.ts) < GJC_TEAM_SUSPECT_WINDOW_MS) {
+		const event = await appendEvent(dir, {
+			type: "task_claim_suspect",
+			task_id: task.id,
+			worker: task.claim.owner,
+			message: "Task claim is suspect after expired lease and stale worker signals",
+			data: { claim_token: task.claim.token },
+		});
+		return {
+			kind: "claim_suspect",
+			task_id: task.id,
+			worker_id: task.claim.owner,
+			reason: "claim lease expired; waiting one suspect window before recovery",
+			event_id: event.event_id,
+			at: event.ts,
+		};
+	}
+	const recovered = await releaseGjcTeamTaskClaim(teamName, task.id, task.claim.token, task.claim.owner, cwd, env);
+	const event = await appendEvent(dir, {
+		type: "task_claim_recovered",
+		task_id: recovered.id,
+		worker: task.claim.owner,
+		message: "Recovered stale task claim",
+		data: { claim_token: task.claim.token },
+	});
+	return {
+		kind: "claim_recovered",
+		task_id: recovered.id,
+		worker_id: task.claim.owner,
+		reason: "claim lease expired and worker stayed stale through suspect window",
+		event_id: event.event_id,
+		at: event.ts,
+	};
+}
+
+async function collectClaimMonitorReasons(
+	dir: string,
+	teamName: string,
+	tasks: GjcTeamTask[],
+	dryRun: boolean,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamMonitorReason[]> {
+	const reasons: GjcTeamMonitorReason[] = [];
+	for (const task of tasks) {
+		const reason = await classifyClaimLiveness(dir, teamName, task, dryRun, cwd, env);
+		if (reason) reasons.push(reason);
+	}
+	return reasons;
 }
 
 function emptyNotificationSummary(): GjcTeamNotificationSummary {
@@ -2494,6 +2817,27 @@ export async function replayGjcTeamNotifications(
 		next.push(attempted);
 	}
 	return { notifications: next, summary: summarizeNotifications(next) };
+}
+async function markTerminalNotificationsObsolete(
+	dir: string,
+	config: GjcTeamConfig,
+	reason: "team_complete" | "task_terminal" | "worker_stopped",
+): Promise<GjcTeamMonitorReason[]> {
+	const reasons: GjcTeamMonitorReason[] = [];
+	for (const worker of [...config.workers, { id: "leader-fixed" } as GjcTeamWorker]) {
+		const mailbox = await readMailbox(dir, worker.id);
+		let changed = false;
+		const messages = mailbox.messages.map(message => {
+			if (message.delivered_at || message.obsolete_at) return message;
+			changed = true;
+			return { ...message, obsolete_at: now(), obsolete_reason: reason };
+		});
+		if (changed) {
+			await writeMailbox(dir, worker.id, { messages });
+			reasons.push({ kind: "notification_obsolete", worker_id: worker.id, reason, at: now() });
+		}
+	}
+	return reasons;
 }
 export async function sendGjcTeamMessage(
 	teamName: string,
@@ -2810,13 +3154,26 @@ export async function executeGjcTeamApiOperation(
 				typeof input.task_id === "string" ? input.task_id : undefined,
 			);
 		case "transition-task":
-		case "transition-task-status":
+		case "transition-task-status": {
+			const status = parseGjcTeamTaskStatus(input.to ?? input.status);
+			const evidence =
+				status === "completed" && input.completion_evidence && typeof input.completion_evidence === "object"
+					? normalizeCompletionEvidence(
+							String(input.task_id ?? input.taskId),
+							worker,
+							(input.completion_evidence as Record<string, unknown>).summary,
+							(input.completion_evidence as Record<string, unknown>).items,
+						)
+					: undefined;
+			if (status === "completed" && !evidence)
+				throw new Error(`completion_evidence_required:${String(input.task_id ?? input.taskId)}`);
+			if (evidence) assertCompletionEvidencePassing(String(input.task_id ?? input.taskId), evidence);
 			return {
 				ok: true,
 				task: await transitionGjcTeamTaskStatus(
 					teamName,
 					String(input.task_id ?? input.taskId),
-					parseGjcTeamTaskStatus(input.to ?? input.status),
+					status,
 					cwd,
 					env,
 					typeof input.claim_token === "string" ? input.claim_token : undefined,
@@ -2826,6 +3183,22 @@ export async function executeGjcTeamApiOperation(
 						: typeof input.result === "string"
 							? input.result
 							: undefined,
+					evidence,
+				),
+			};
+		}
+		case "complete-task":
+			return {
+				ok: true,
+				task: await completeGjcTeamTask(
+					teamName,
+					worker,
+					cwd,
+					env,
+					typeof input.task_id === "string" ? input.task_id : undefined,
+					typeof input.claim_token === "string" ? input.claim_token : undefined,
+					input.summary,
+					input.items,
 				),
 			};
 		case "release-task-claim":
@@ -2976,6 +3349,8 @@ export async function executeGjcTeamApiOperation(
 			return writeGjcShutdownRequest(teamName, worker, String(input.requested_by ?? "leader-fixed"), cwd, env);
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
+		case "read-report":
+			return { report: await readGjcTeamReport(teamName, cwd, env) };
 		default:
 			throw new Error(`unknown_team_api_operation:${operation}`);
 	}
