@@ -10,8 +10,10 @@
  * is a documented seam tracked as an ADR follow-up.
  */
 
-import { rm } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import * as path from "node:path";
+import { MAX_UNIX_SOCKET_PATH_BYTES } from "./storage";
 
 export interface EndpointRequest {
 	verb: string;
@@ -32,7 +34,11 @@ export class ControlServer {
 	) {}
 
 	async listen(): Promise<void> {
-		await rm(this.socketPath, { force: true });
+		await fs.mkdir(path.dirname(this.socketPath), { recursive: true });
+		if (Buffer.byteLength(this.socketPath) > MAX_UNIX_SOCKET_PATH_BYTES) {
+			throw new Error(`socket_path_too_long:${this.socketPath}`);
+		}
+		await fs.rm(this.socketPath, { force: true });
 		await new Promise<void>((resolve, reject) => {
 			const server = net.createServer(socket => this.#onConnection(socket));
 			server.once("error", reject);
@@ -77,7 +83,7 @@ export class ControlServer {
 		if (server) {
 			await new Promise<void>(resolve => server.close(() => resolve()));
 		}
-		await rm(this.socketPath, { force: true });
+		await fs.rm(this.socketPath, { force: true });
 	}
 }
 

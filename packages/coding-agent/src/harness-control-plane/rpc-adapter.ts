@@ -30,6 +30,12 @@ export interface HarnessRpc {
 	/** Resolve when an `agent_start` event arrives strictly after `afterCursor`, else null on timeout. */
 	waitForAgentStart(afterCursor: number, timeoutMs: number): Promise<{ cursor: number } | null>;
 	close(): Promise<void>;
+	/** Subscribe to parsed event frames (non-ready, non-response), fired AFTER the cursor advances. Returns unsubscribe. */
+	onEventFrame?(listener: (frame: Record<string, unknown>) => void): () => void;
+	/** Whether the underlying RPC subprocess is still alive. */
+	isLive?(): boolean;
+	/** ISO timestamp of the last observed event frame, or null. */
+	lastFrameAt?(): string | null;
 }
 
 export interface AcceptanceResult {
@@ -114,6 +120,9 @@ export class GajaeCodeRpc implements HarnessRpc {
 		resolve: (v: { cursor: number } | null) => void;
 		timer: ReturnType<typeof setTimeout>;
 	}[] = [];
+	#frameListeners: ((frame: Record<string, unknown>) => void)[] = [];
+	#lastFrameAt: string | null = null;
+	#alive = true;
 
 	constructor(opts: { sessionDir: string; command?: string[]; cwd?: string; env?: NodeJS.ProcessEnv }) {
 		const base = opts.command ?? ["gjc", "--mode", "rpc"];
@@ -125,6 +134,12 @@ export class GajaeCodeRpc implements HarnessRpc {
 		}) as ChildProcessWithoutNullStreams;
 		this.#proc.stdout.setEncoding("utf8");
 		this.#proc.stdout.on("data", chunk => this.#onData(chunk as string));
+		this.#proc.on("exit", () => {
+			this.#alive = false;
+		});
+		this.#proc.on("error", () => {
+			this.#alive = false;
+		});
 	}
 
 	#onData(chunk: string): void {
@@ -158,6 +173,7 @@ export class GajaeCodeRpc implements HarnessRpc {
 		if (type === "ready") return;
 		// Any other frame is a session/agent event: advance the cursor.
 		this.#cursor += 1;
+		this.#lastFrameAt = new Date().toISOString();
 		if (type === "agent_start") {
 			const cursor = this.#cursor;
 			this.#agentStartCursors.push(cursor);
@@ -169,6 +185,14 @@ export class GajaeCodeRpc implements HarnessRpc {
 				}
 				return true;
 			});
+		}
+		// Fire-and-forget frame listeners (owner maps + emits). Never await; never let a listener kill the reader.
+		for (const listener of this.#frameListeners) {
+			try {
+				listener(frame);
+			} catch {
+				// swallow listener errors
+			}
 		}
 	}
 
@@ -183,6 +207,21 @@ export class GajaeCodeRpc implements HarnessRpc {
 				}
 			});
 		});
+	}
+
+	onEventFrame(listener: (frame: Record<string, unknown>) => void): () => void {
+		this.#frameListeners.push(listener);
+		return () => {
+			this.#frameListeners = this.#frameListeners.filter(l => l !== listener);
+		};
+	}
+
+	isLive(): boolean {
+		return this.#alive;
+	}
+
+	lastFrameAt(): string | null {
+		return this.#lastFrameAt;
 	}
 
 	async getState(): Promise<RpcStateSnapshot> {

@@ -57,6 +57,15 @@ describe("control endpoint", () => {
 		);
 	});
 
+	it("rejects overlong socket paths before binding", async () => {
+		const overlong = path.join(dir, "x".repeat(120), "c.sock");
+		server = new ControlServer(overlong, async () => ({ ok: true }));
+		await expect(server.listen()).rejects.toThrow(/socket_path_too_long/);
+		await expect(callEndpoint(overlong, { verb: "submit", input: {} }, 50)).rejects.toBeInstanceOf(
+			EndpointUnreachableError,
+		);
+	});
+
 	it("serves multiple sequential calls on the same socket", async () => {
 		let count = 0;
 		server = new ControlServer(sock, async () => ({ ok: true, count: ++count }));

@@ -33,6 +33,9 @@ export class LeaseError extends Error {
 		this.name = "LeaseError";
 	}
 }
+export type LeaseStatus = "missing" | "live" | "expiredAlive" | "dead" | "epermAlive";
+
+type PidStatus = "alive" | "dead" | "eperm";
 
 function nowMs(clock?: () => number): number {
 	return clock ? clock() : Date.now();
@@ -63,6 +66,39 @@ export function isExpired(lease: SessionLease, clock?: () => number): boolean {
 	return Date.parse(lease.expiresAt) <= nowMs(clock);
 }
 
+function defaultPidStatusProbe(pid: number): PidStatus {
+	try {
+		process.kill(pid, 0);
+		return "alive";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return "dead";
+		if (code === "EPERM") return "eperm";
+		return "dead";
+	}
+}
+
+export function classifyLeaseStatus(
+	lease: SessionLease | null,
+	opts?: { clock?: () => number; probe?: (pid: number) => PidStatus },
+): LeaseStatus {
+	if (!lease) return "missing";
+	const status = (opts?.probe ?? defaultPidStatusProbe)(lease.pid);
+	if (status === "dead") return "dead";
+	if (status === "eperm") return "epermAlive";
+	return isExpired(lease, opts?.clock) ? "expiredAlive" : "live";
+}
+
+function classifyProbeFromBoolean(
+	probe?: (pid: number) => boolean | PidStatus,
+): ((pid: number) => PidStatus) | undefined {
+	if (!probe) return undefined;
+	return pid => {
+		const status = probe(pid);
+		return typeof status === "boolean" ? (status ? "alive" : "dead") : status;
+	};
+}
+
 /** Liveness probe via signal 0. Defaults to the real process table; injectable for tests. */
 export function isOwnerAlive(pid: number, probe?: (pid: number) => boolean): boolean {
 	if (probe) return probe(pid);
@@ -89,7 +125,7 @@ export interface AcquireOptions {
 	eventsPath: string;
 	ttlMs: number;
 	clock?: () => number;
-	probe?: (pid: number) => boolean;
+	probe?: (pid: number) => boolean | PidStatus;
 }
 
 export interface AcquiredLease {
@@ -103,8 +139,20 @@ export interface AcquiredLease {
  */
 export async function acquireLease(root: string, sessionId: string, opts: AcquireOptions): Promise<AcquiredLease> {
 	const existing = await readLease(root, sessionId);
-	if (existing && existing.ownerId !== opts.ownerId && !isStale(existing, opts)) {
-		throw new LeaseError(`lease_held:${sessionId}`, "lease_held");
+	if (existing && existing.ownerId !== opts.ownerId) {
+		const classifiedOwnerId = existing.ownerId;
+		const classifiedEpoch = existing.leaseEpoch;
+		const status = classifyLeaseStatus(existing, {
+			clock: opts.clock,
+			probe: classifyProbeFromBoolean(opts.probe),
+		});
+		if (status !== "dead") {
+			throw new LeaseError(`lease_held:${sessionId}`, "lease_held");
+		}
+		const reread = await readLease(root, sessionId);
+		if (!reread || reread.ownerId !== classifiedOwnerId || reread.leaseEpoch !== classifiedEpoch) {
+			throw new LeaseError(`lease_held:${sessionId}`, "lease_held");
+		}
 	}
 	const priorEpoch = existing?.leaseEpoch ?? 0;
 	const epoch = existing && existing.ownerId === opts.ownerId ? priorEpoch : priorEpoch + 1;
@@ -158,4 +206,20 @@ export async function releaseLease(root: string, sessionId: string, ownerId: str
 	if (!lease) return;
 	if (lease.ownerId !== ownerId) throw new LeaseError(`not_lease_holder:${sessionId}`, "not_lease_holder");
 	await fs.rm(sessionPaths(root, sessionId).lease, { force: true });
+}
+
+export async function reapDeadOwnerArtifacts(
+	root: string,
+	sessionId: string,
+	expectedOwnerId: string,
+	expectedEpoch: number,
+	opts?: { clock?: () => number; probe?: (pid: number) => PidStatus },
+): Promise<boolean> {
+	const lease = await readLease(root, sessionId);
+	if (!lease || lease.ownerId !== expectedOwnerId || lease.leaseEpoch !== expectedEpoch) return false;
+	if (classifyLeaseStatus(lease, opts) !== "dead") return false;
+	const paths = sessionPaths(root, sessionId);
+	await fs.rm(paths.lease, { force: true });
+	await fs.rm(paths.controlSock, { force: true });
+	return true;
 }

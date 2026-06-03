@@ -123,6 +123,30 @@ export interface SessionState {
 	updatedAt: string;
 }
 
+/** Bounded observed-signal vocabulary surfaced by `observe` (the owner only ever emits these). */
+export type ObservedSignal =
+	| "SessionStart"
+	| "prompt-accepted"
+	| "tool-call"
+	| "test-running"
+	| "commit-created"
+	| "completed"
+	| "error"
+	| "streaming"
+	| "idle";
+
+export const OBSERVED_SIGNALS: readonly ObservedSignal[] = [
+	"SessionStart",
+	"prompt-accepted",
+	"tool-call",
+	"test-running",
+	"commit-created",
+	"completed",
+	"error",
+	"streaming",
+	"idle",
+];
+
 /** Bounded observation surfaced by `observe` — never a raw pane/transcript dump. */
 export interface Observation {
 	lifecycle: HarnessLifecycle;
@@ -133,6 +157,10 @@ export interface Observation {
 	lastActivityAt: string | null;
 	observedSignals: string[];
 	risk: RiskKind;
+	/** RPC subprocess liveness, distinct from owner-process/lease liveness. Optional for back-compat. */
+	rpcLive?: boolean;
+	/** ISO timestamp of the most recent RPC frame the owner observed, if any. */
+	rpcLastFrameAt?: string | null;
 }
 
 /** Input to the deterministic recovery classifier. */

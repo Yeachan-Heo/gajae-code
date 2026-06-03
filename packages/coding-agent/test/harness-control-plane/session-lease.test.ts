@@ -1,17 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	acquireLease,
 	canWriteEvents,
+	classifyLeaseStatus,
 	heartbeat,
 	isOwnerAlive,
 	isStale,
 	LeaseError,
 	readLease,
+	reapDeadOwnerArtifacts,
 	releaseLease,
 } from "../../src/harness-control-plane/session-lease";
+import { sessionPaths } from "../../src/harness-control-plane/storage";
 
 let root: string;
 const SID = "h-lease";
@@ -26,6 +29,28 @@ afterEach(async () => {
 });
 
 describe("SessionLease", () => {
+	it("classifies lease status from expiry and injected pid status", () => {
+		const clock = () => 10_000;
+		const liveLease = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: 1,
+			leaseTokenHash: "hash",
+			endpoint: null,
+			eventsPath: "e",
+			heartbeatAt: new Date(9_000).toISOString(),
+			expiresAt: new Date(20_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		const expiredLease = { ...liveLease, expiresAt: new Date(10_000).toISOString() };
+		expect(classifyLeaseStatus(null, { clock })).toBe("missing");
+		expect(classifyLeaseStatus(liveLease, { clock, probe: () => "alive" })).toBe("live");
+		expect(classifyLeaseStatus(expiredLease, { clock, probe: () => "alive" })).toBe("expiredAlive");
+		expect(classifyLeaseStatus(liveLease, { clock, probe: () => "dead" })).toBe("dead");
+		expect(classifyLeaseStatus(liveLease, { clock, probe: () => "eperm" })).toBe("epermAlive");
+	});
+
 	it("acquires a fresh lease at epoch 1 and persists it", async () => {
 		const { lease, token } = await acquireLease(root, SID, {
 			ownerId: "owner-a",
@@ -60,8 +85,8 @@ describe("SessionLease", () => {
 		expect(taken.lease.leaseEpoch).toBe(2);
 	});
 
-	it("allows takeover of an expired lease and increments the epoch", async () => {
-		const past = () => 1_000; // acquire far in the past
+	it("fails closed for an expired lease whose owner is still alive", async () => {
+		const past = () => 1_000;
 		await acquireLease(root, SID, {
 			ownerId: "owner-a",
 			pid: 1,
@@ -70,14 +95,22 @@ describe("SessionLease", () => {
 			clock: past,
 			probe: aliveProbe,
 		});
-		const taken = await acquireLease(root, SID, {
-			ownerId: "owner-b",
-			pid: 2,
-			eventsPath: "e",
-			ttlMs: 10_000,
-			probe: aliveProbe, // alive, but prior lease expired
-		});
-		expect(taken.lease.leaseEpoch).toBe(2);
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("fails closed for a lease whose owner returns eperm", async () => {
+		await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000, probe: aliveProbe });
+		await expect(
+			acquireLease(root, SID, { ownerId: "owner-b", pid: 2, eventsPath: "e", ttlMs: 10_000, probe: () => "eperm" }),
+		).rejects.toThrow(/lease_held/);
 	});
 
 	it("heartbeat is single-writer: only the holder may refresh", async () => {
@@ -106,6 +139,31 @@ describe("SessionLease", () => {
 		await expect(releaseLease(root, SID, "owner-b")).rejects.toThrow(/not_lease_holder/);
 		await releaseLease(root, SID, "owner-a");
 		expect(await readLease(root, SID)).toBeNull();
+	});
+
+	it("reaps dead owner artifacts only for matching dead owner and epoch", async () => {
+		await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000, probe: aliveProbe });
+		const paths = sessionPaths(root, SID);
+		await writeFile(paths.controlSock, "sock", "utf8");
+		expect(await reapDeadOwnerArtifacts(root, SID, "owner-a", 2, { probe: () => "dead" })).toBe(false);
+		expect(await readLease(root, SID)).not.toBeNull();
+		expect(await reapDeadOwnerArtifacts(root, SID, "owner-a", 1, { probe: () => "alive" })).toBe(false);
+		expect(await readLease(root, SID)).not.toBeNull();
+		expect(await reapDeadOwnerArtifacts(root, SID, "owner-a", 1, { probe: () => "dead" })).toBe(true);
+		expect(await readLease(root, SID)).toBeNull();
+	});
+
+	it("does not signal pids while reaping dead owner artifacts", async () => {
+		await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000, probe: aliveProbe });
+		let probes = 0;
+		const reaped = await reapDeadOwnerArtifacts(root, SID, "owner-a", 1, {
+			probe: () => {
+				probes++;
+				return "dead";
+			},
+		});
+		expect(reaped).toBe(true);
+		expect(probes).toBe(1);
 	});
 
 	it("isOwnerAlive returns false for an obviously dead pid", () => {

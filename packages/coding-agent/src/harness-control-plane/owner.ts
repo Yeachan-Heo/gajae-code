@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { classifyRecovery } from "./classifier";
 import { ControlServer, type EndpointRequest } from "./control-endpoint";
 import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
+import { mapRpcFrame } from "./frame-mapper";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
 import {
@@ -32,8 +33,8 @@ import { singleFlightAccept } from "./rpc-adapter";
 import {
 	acquireLease,
 	canWriteEvents,
+	classifyLeaseStatus,
 	heartbeat,
-	isStale,
 	readLease,
 	releaseLease,
 	type SessionLease,
@@ -41,6 +42,7 @@ import {
 import { buildStateView, nextAllowedActions } from "./state-machine";
 import {
 	appendEvent,
+	controlSocketPath,
 	readEvents,
 	readSessionState,
 	sessionPaths,
@@ -48,7 +50,7 @@ import {
 	writeSessionState,
 } from "./storage";
 import type { EventEnvelope, GitDelta, Observation, PrimitiveResponse, SessionState, Severity } from "./types";
-import { DEFAULT_RETRY_BUDGET } from "./types";
+import { DEFAULT_RETRY_BUDGET, OBSERVED_SIGNALS } from "./types";
 
 export interface OwnerOptions {
 	root: string;
@@ -83,10 +85,13 @@ export class RuntimeOwner {
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
+	#unsubscribeFrames: (() => void) | null = null;
+	#framePump: Promise<void> = Promise.resolve();
+	#coalesced = new Map<string, true>();
 
 	constructor(opts: OwnerOptions) {
 		this.ownerId = opts.ownerId ?? `owner-${randomUUID()}`;
-		this.#socketPath = sessionPaths(opts.root, opts.sessionId).controlSock;
+		this.#socketPath = controlSocketPath(opts.root, opts.sessionId);
 		this.#opts = {
 			root: opts.root,
 			sessionId: opts.sessionId,
@@ -118,8 +123,14 @@ export class RuntimeOwner {
 		this.#leaseEpoch = lease.leaseEpoch;
 		await this.#server.listen();
 		await this.#emit("info", "owner_started", { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch });
+		if (this.#opts.rpc.onEventFrame) {
+			this.#unsubscribeFrames = this.#opts.rpc.onEventFrame(frame => this.#handleFrame(frame));
+		}
 		this.#heartbeatTimer = setInterval(() => {
-			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(() => {});
+			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
+				// Self-stop if a legitimate dead-owner takeover revoked our lease.
+				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop();
+			});
 		}, this.#opts.heartbeatMs);
 		this.#heartbeatTimer.unref?.();
 		return { ownerId: this.ownerId, socketPath: this.#socketPath, leaseEpoch: this.#leaseEpoch };
@@ -129,6 +140,67 @@ export class RuntimeOwner {
 		const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 		if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
 		return state;
+	}
+
+	/** Map an RPC frame and route it: semantic/signal-bearing -> serial emit; high-frequency progress -> coalesce. */
+	#handleFrame(frame: Record<string, unknown>): void {
+		const mapped = mapRpcFrame(frame);
+		if (!mapped) return;
+		if (mapped.semantic || (mapped.signal && !mapped.coalesceKey)) {
+			this.#framePump = this.#framePump
+				.then(() => this.#flushCoalesced())
+				.then(() => this.#emitMapped(mapped))
+				.catch(() => {});
+		} else if (mapped.coalesceKey) {
+			// Coalesce progress-noise by key; never enqueues a per-frame emit, so a message_update
+			// storm cannot starve semantic frames. Bound memory.
+			this.#coalesced.set(mapped.coalesceKey, true);
+			if (this.#coalesced.size > 256) {
+				const oldest = this.#coalesced.keys().next().value;
+				if (oldest !== undefined) this.#coalesced.delete(oldest);
+			}
+		}
+	}
+
+	async #flushCoalesced(): Promise<void> {
+		if (this.#coalesced.size === 0) return;
+		const coalescedFrames = this.#coalesced.size;
+		this.#coalesced.clear();
+		await this.#emit("info", "rpc_activity", { coalescedFrames });
+	}
+
+	async #emitMapped(mapped: NonNullable<ReturnType<typeof mapRpcFrame>>): Promise<void> {
+		await this.#emit(
+			mapped.severity,
+			mapped.kind,
+			mapped.signal ? { ...mapped.evidence, signal: mapped.signal } : mapped.evidence,
+		);
+		if (mapped.kind === "rpc_agent_completed") {
+			const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (
+				state &&
+				state.lifecycle !== "completed" &&
+				state.lifecycle !== "retired" &&
+				state.lifecycle !== "finalizing"
+			) {
+				state.lifecycle = "finalizing";
+				state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+				await writeSessionState(this.#opts.root, state);
+			}
+		}
+	}
+
+	#aggregateSignals(events: EventEnvelope[]): string[] {
+		const out: string[] = [];
+		const vocab = OBSERVED_SIGNALS as readonly string[];
+		const add = (s: unknown): void => {
+			if (typeof s === "string" && vocab.includes(s) && !out.includes(s)) out.push(s);
+		};
+		for (const e of events) {
+			add((e.evidence as { signal?: unknown } | undefined)?.signal);
+			if (e.kind === "prompt_accepted") add("prompt-accepted");
+		}
+		return out;
 	}
 
 	async #emit(severity: Severity, kind: string, evidence: Record<string, unknown>): Promise<void> {
@@ -226,15 +298,32 @@ export class RuntimeOwner {
 				gitDelta = "unknown";
 			}
 		}
+		const rpcLive = this.#opts.rpc.isLive
+			? this.#opts.rpc.isLive()
+			: await this.#opts.rpc
+					.getState()
+					.then(() => true)
+					.catch(() => false);
+		const rpcLastFrameAt = this.#opts.rpc.lastFrameAt ? this.#opts.rpc.lastFrameAt() : null;
+		// Sticky semantic signals come from the persisted owner event log -> survive polling gaps.
+		const recent = (await readEvents(this.#opts.root, this.#opts.sessionId, 0)).slice(-200);
+		const observedSignals = this.#aggregateSignals(recent).slice(0, 7);
+		observedSignals.push(streaming ? "streaming" : "idle");
+		const stamps = [state.updatedAt, rpcLastFrameAt, recent.at(-1)?.createdAt].filter(
+			(t): t is string => typeof t === "string",
+		);
+		const lastActivityAt = stamps.length > 0 ? (stamps.sort().at(-1) ?? state.updatedAt) : state.updatedAt;
 		return {
 			lifecycle: state.lifecycle,
 			ownerLive: true,
 			cwd: workspace,
 			branch,
 			gitDelta,
-			lastActivityAt: state.updatedAt,
-			observedSignals: streaming ? ["streaming"] : ["idle"],
+			lastActivityAt,
+			observedSignals,
 			risk: deleted ? "deleted-worktree" : "normal",
+			rpcLive,
+			rpcLastFrameAt,
 		};
 	}
 
@@ -401,20 +490,7 @@ export class RuntimeOwner {
 
 	async #observe(): Promise<PrimitiveResponse> {
 		const state = await this.#loadState();
-		const rpcState = await this.#opts.rpc.getState().catch(() => null);
-		return this.#response(state, {
-			observation: {
-				lifecycle: state.lifecycle,
-				ownerLive: true,
-				cwd: state.handle.workspace,
-				branch: state.handle.branch,
-				gitDelta: "unknown",
-				lastActivityAt: state.updatedAt,
-				observedSignals: rpcState?.isStreaming ? ["streaming"] : ["idle"],
-				risk: "normal",
-			},
-			ownerRouted: true,
-		});
+		return this.#response(state, { observation: await this.#observeGit(), ownerRouted: true });
 	}
 
 	async #retire(): Promise<PrimitiveResponse> {
@@ -428,6 +504,9 @@ export class RuntimeOwner {
 	}
 
 	async stop(): Promise<void> {
+		this.#unsubscribeFrames?.();
+		this.#unsubscribeFrames = null;
+		await this.#framePump.catch(() => {});
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
@@ -448,6 +527,8 @@ export interface ResolvedOwner {
 export async function resolveOwner(root: string, sessionId: string): Promise<ResolvedOwner> {
 	const lease = await readLease(root, sessionId);
 	if (!lease) return { live: false, socketPath: null, lease: null };
-	if (isStale(lease)) return { live: false, socketPath: lease.endpoint?.path ?? null, lease };
-	return { live: true, socketPath: lease.endpoint?.path ?? null, lease };
+	const status = classifyLeaseStatus(lease);
+	// Owner process alive (live / lease-expired-but-alive / EPERM-alive) => endpoint reachable => routable.
+	const live = status === "live" || status === "expiredAlive" || status === "epermAlive";
+	return { live, socketPath: lease.endpoint?.path ?? null, lease };
 }
