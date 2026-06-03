@@ -98,8 +98,28 @@ const FLAGS_WITH_VALUES = new Set([
 	"--since",
 	"--limit",
 ]);
-const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate", "status"]);
-const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate", "--compact", "--history", "--force"]);
+const ACTION_NAMES = new Set([
+	"read",
+	"write",
+	"clear",
+	"contract",
+	"handoff",
+	"graph",
+	"prune",
+	"gc",
+	"migrate",
+	"status",
+]);
+const BOOLEAN_FLAGS = new Set([
+	"--json",
+	"--replace",
+	"--hard",
+	"--dry-run",
+	"--migrate",
+	"--compact",
+	"--history",
+	"--force",
+]);
 const VERB_SPECIFIC_FLAGS = new Set([
 	"--skill",
 	"--format",
@@ -147,7 +167,7 @@ function assertKnownFlags(args: readonly string[], parsed: ParsedInvocation): vo
 }
 
 interface ParsedInvocation {
-	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "migrate" | "status";
+	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "gc" | "migrate" | "status";
 	positionalSkill?: string;
 }
 
@@ -980,6 +1000,170 @@ function statusFromFile(value: unknown): string | undefined {
 	return undefined;
 }
 
+interface RetentionCandidate {
+	path: string;
+	relativePath: string;
+	category: string;
+	mtimeMs: number;
+	policy: { keep?: number; maxAgeDays?: number };
+}
+
+interface GcSummary {
+	skill: CanonicalGjcWorkflowSkill | "all";
+	dry_run: boolean;
+	eligible: string[];
+	pruned: string[];
+	counts: Record<string, number>;
+}
+
+function categoryForStateRelativePath(relativePath: string): string | undefined {
+	const normalized = relativePath.split(path.sep).join("/");
+	if (normalized === "audit.jsonl") return undefined;
+	if (normalized === SKILL_ACTIVE_STATE_FILE || normalized.endsWith(`/${SKILL_ACTIVE_STATE_FILE}`)) return undefined;
+	if (normalized.startsWith("active/") || normalized.includes("/active/")) return undefined;
+	if (
+		/^[^/]+-state\.json$/.test(normalized) ||
+		(normalized.includes("/sessions/") && /\/[^/]+-state\.json$/.test(normalized))
+	)
+		return undefined;
+	if (normalized.startsWith("artifacts/") || normalized.includes("/artifacts/")) return "artifact";
+	if (
+		normalized.startsWith("logs/") ||
+		normalized.includes("/logs/") ||
+		normalized.endsWith(".log") ||
+		normalized.endsWith(".jsonl")
+	)
+		return "log";
+	if (normalized.startsWith("reports/") || normalized.includes("/reports/")) return "report";
+	if (normalized.startsWith("ledgers/") || normalized.includes("/ledgers/")) return "ledger";
+	if (normalized.startsWith("agents/") || normalized.includes("/agents/")) return "agents";
+	if (normalized.startsWith("force/") || normalized.includes("/force/")) return "force";
+	if (
+		normalized.startsWith("prune/") ||
+		normalized.includes("/prune/") ||
+		normalized.startsWith("delete/") ||
+		normalized.includes("/delete/")
+	)
+		return "prune/delete";
+	if (normalized.startsWith("transactions/") || normalized.includes("/transactions/")) return "prune/delete";
+	return undefined;
+}
+
+async function collectRetentionCandidates(
+	cwd: string,
+	skills: readonly CanonicalGjcWorkflowSkill[],
+): Promise<RetentionCandidate[]> {
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const policies = new Map<string, { keep?: number; maxAgeDays?: number }>();
+	for (const skill of skills) {
+		for (const policy of getSkillManifest(skill).retention) {
+			const existing = policies.get(policy.category);
+			policies.set(policy.category, {
+				keep: Math.max(existing?.keep ?? 0, policy.keep ?? 0) || undefined,
+				maxAgeDays:
+					existing?.maxAgeDays === undefined
+						? policy.maxAgeDays
+						: policy.maxAgeDays === undefined
+							? existing.maxAgeDays
+							: Math.max(existing.maxAgeDays, policy.maxAgeDays),
+			});
+		}
+	}
+	const candidates: RetentionCandidate[] = [];
+	async function visit(dir: string): Promise<void> {
+		let entries: string[];
+		try {
+			entries = await fs.readdir(dir);
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code === "ENOENT") return;
+			throw error;
+		}
+		for (const entry of entries) {
+			const filePath = path.join(dir, entry);
+			const stat = await fs.stat(filePath);
+			if (stat.isDirectory()) {
+				await visit(filePath);
+				continue;
+			}
+			if (!stat.isFile()) continue;
+			const relativePath = path.relative(stateRoot, filePath);
+			const category = categoryForStateRelativePath(relativePath);
+			if (!category) continue;
+			const policy = policies.get(category);
+			if (!policy) continue;
+			candidates.push({ path: filePath, relativePath, category, mtimeMs: stat.mtimeMs, policy });
+		}
+	}
+	await visit(stateRoot);
+	return candidates;
+}
+
+function selectRetentionEligible(candidates: readonly RetentionCandidate[]): RetentionCandidate[] {
+	const now = Date.now();
+	const byCategory = new Map<string, RetentionCandidate[]>();
+	for (const candidate of candidates) {
+		const list = byCategory.get(candidate.category) ?? [];
+		list.push(candidate);
+		byCategory.set(candidate.category, list);
+	}
+	const eligible = new Set<RetentionCandidate>();
+	for (const list of byCategory.values()) {
+		list.sort((a, b) => b.mtimeMs - a.mtimeMs || a.relativePath.localeCompare(b.relativePath));
+		for (let index = 0; index < list.length; index += 1) {
+			const candidate = list[index];
+			const keep = candidate.policy.keep ?? 0;
+			if (keep > 0 && index < keep) continue;
+			if (candidate.policy.maxAgeDays !== undefined) {
+				const maxAgeMs = candidate.policy.maxAgeDays * 24 * 60 * 60 * 1000;
+				if (now - candidate.mtimeMs < maxAgeMs) continue;
+			}
+			if (candidate.policy.keep !== undefined || candidate.policy.maxAgeDays !== undefined) eligible.add(candidate);
+		}
+	}
+	return [...eligible].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+async function buildGcSummary(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+	dryRun: boolean,
+): Promise<GcSummary> {
+	const rawSkill =
+		flagValue(args, "--skill")?.trim() || flagValue(args, "--mode")?.trim() || positionalSkill?.trim() || "all";
+	if (rawSkill !== "all") assertKnownMode(rawSkill);
+	const skills = rawSkill === "all" ? CANONICAL_GJC_WORKFLOW_SKILLS : [rawSkill as CanonicalGjcWorkflowSkill];
+	const eligible = selectRetentionEligible(await collectRetentionCandidates(cwd, skills));
+	const counts: Record<string, number> = {};
+	for (const candidate of eligible) counts[candidate.category] = (counts[candidate.category] ?? 0) + 1;
+	const targets: GenericHardPruneTarget[] = eligible.map(candidate => ({
+		path: candidate.path,
+		category: candidate.category,
+	}));
+	let pruned: string[] = [];
+	if (!dryRun && targets.length > 0) {
+		const eligiblePaths = new Set(eligible.map(candidate => path.resolve(candidate.path)));
+		pruned = await hardPrune(targets, context => eligiblePaths.has(path.resolve(context.path)), {
+			cwd,
+			audit: {
+				cwd,
+				skill: rawSkill,
+				category: "prune",
+				verb: "gc",
+				owner: "gjc-state-cli",
+			},
+		});
+	}
+	return {
+		skill: rawSkill as CanonicalGjcWorkflowSkill | "all",
+		dry_run: dryRun,
+		eligible: eligible.map(candidate => candidate.relativePath),
+		pruned: pruned.map(filePath => path.relative(path.join(cwd, ".gjc", "state"), filePath)),
+		counts,
+	};
+}
+
 async function handleGraph(
 	args: readonly string[],
 	_cwd: string,
@@ -1064,6 +1248,15 @@ async function handlePrune(
 	return { status: 0, stdout: `${JSON.stringify({ skill: mode, hard: false, soft_deleted: deleted }, null, 2)}\n` };
 }
 
+async function handleGc(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const summary = await buildGcSummary(args, cwd, positionalSkill, hasFlag(args, "--dry-run"));
+	return { status: 0, stdout: `${JSON.stringify(summary, null, 2)}\n` };
+}
+
 async function handleMigrate(
 	args: readonly string[],
 	cwd: string,
@@ -1109,6 +1302,8 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return await handleGraph(args, cwd, parsed.positionalSkill);
 			case "prune":
 				return await handlePrune(args, cwd, parsed.positionalSkill);
+			case "gc":
+				return await handleGc(args, cwd, parsed.positionalSkill);
 			case "migrate":
 				return await handleMigrate(args, cwd, parsed.positionalSkill);
 			default:
