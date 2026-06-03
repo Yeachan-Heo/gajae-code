@@ -24,35 +24,36 @@ I created an earlier OpenAI code harness and `an earlier Anthropic-code harness`
 
 ## Usage
 
-Gajae-Code is published through the normal npm registry as `gajae-code`; that package installs the `gjc` binary. Install the one-line npm wrapper with Bun for the recommended runtime workflow:
+Gajae-Code is published through the normal npm registry as `gajae-code`; that package installs the standalone `gjc` binary:
 
 ```sh
 bun install -g gajae-code
 ```
 
-The scoped package is also available as `@gajae-code/coding-agent`. For repository development, use the source checkout commands in [Development](#development).
+The scoped package is also available as `@gajae-code/coding-agent`. Install `gjc` once in your shell environment, then launch it from the repository you want it to operate on. Installing GJC does **not** inject it into Codex CLI, Claude Code, OpenCode, Claw Code, or every editor/agent runtime automatically.
 
-Start the recommended tmux-backed experience:
+Recommended launch paths:
 
-```sh
-gjc --tmux
-```
+| Situation                             | Command                        | Notes                                                                                                                                 |
+| ------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Direct interactive session            | `gjc`                          | Runs in the current checkout without creating or attaching a tmux session.                                                            |
+| Long-running or pane-friendly session | `gjc --tmux`                   | Creates or attaches a GJC-managed tmux-backed leader session. Run `gjc team ...` inside that session when parallel tmux workers help. |
+| Branch-local or risky work            | `gjc --tmux --worktree <path>` | Use a dedicated Git worktree path so edits, evidence, and tool output stay isolated from the main checkout.                           |
 
-`gjc --tmux` creates or attaches a GJC-managed tmux-backed leader session for interactive use. Run `gjc team ...` from inside that session when you want tmux worker panes; `gjc team` does not create the leader session itself.
+Use a worktree-backed run when the task may touch many files, needs a clean branch for review, or should not risk polluting your primary checkout. For repository development, use the source checkout commands in [Development](#development).
 
-Bare `gjc` launches directly without creating or attaching a tmux session:
+### Using GJC with other coding agents
 
-```sh
-gjc
-```
+GJC is a harness, not an editor plugin. In practice, start `gjc` from the same repository or Git worktree where your other coding agent is working, then let GJC drive the interview, planning, execution, verification, and evidence loop. Keep the underlying coding tool as the executor surface where that is supported today.
 
-Run inside an isolated Git worktree when you want a safer branch-local workspace:
+| Tool                         | Recommended GJC command                                                         | Boundary / limitation                                                                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex CLI                    | `gjc --tmux --worktree <path>` for branch-local work, or `gjc` for a quick pass | First-class as an external executor surface: run both from the same repo/worktree. GJC is not installed inside Codex CLI.                |
+| Claude Code                  | `gjc --tmux` from the target repo, optionally with `--worktree <path>`          | First-class as an external executor surface: keep Claude Code pointed at the same checkout. GJC does not become a Claude Code extension. |
+| OpenCode                     | `gjc` or `gjc --tmux` from the same checkout OpenCode uses                      | External-runner workflow only today. Treat deeper OpenCode adapter behavior as future work unless documented in a release note.          |
+| Rust `claw-code` / Claw Code | `gjc --tmux --worktree <path>` when you want isolated evidence and review state | External-runner workflow only today. GJC does not install into Claw Code or replace its runtime.                                         |
 
-```sh
-gjc --tmux --worktree <path>
-```
-
-Use a dedicated path for throwaway or branch-specific work so the main checkout stays clean.
+The safe default is: create or choose the repo/worktree first, start the other tool there if you use one, then launch `gjc` in that same directory and let it manage the public workflow surface (`deep-interview`, `ralplan`, `ultragoal`, and optional `team`).
 
 ## Provider retry budgets
 
