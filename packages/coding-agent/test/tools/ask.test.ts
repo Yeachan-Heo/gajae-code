@@ -26,9 +26,12 @@ function createContext(args: {
 			timeout?: number;
 			signal?: AbortSignal;
 			outline?: boolean;
+			wrapFocused?: boolean;
+			scrollTitleRows?: number;
 			onTimeout?: () => void;
 			onLeft?: () => void;
 			onRight?: () => void;
+			helpText?: string;
 		},
 	) => Promise<string | undefined>;
 	editor?: (
@@ -1065,6 +1068,63 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(prompt).toContain("Why now: the approval criteria are not yet testable");
 		expect(prompt).toContain("What exact conditions must be satisfied before a reviewer can approve an item?");
 		expect(result.details?.question).toBe(rawQuestion);
+	});
+
+	it("opts deep-interview selector prompts into local prompt scrolling", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 4 | Component: Selector UI | Targeting: Readability | Why now: long prompts hide answers | Ambiguity: 44%",
+			"",
+			"What evidence proves the answer options remain visible while the question scrolls?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
+
+		await tool.execute(
+			"call-deep-interview-scroll",
+			{
+				questions: [
+					{
+						id: "round-4",
+						question: rawQuestion,
+						options: [{ label: "Visible options" }, { label: "Scrollable prompt" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		const dialogOptions = select.mock.calls[0]?.[2];
+		expect(dialogOptions?.scrollTitleRows).toBe(12);
+		expect(dialogOptions?.helpText).toContain("PgUp/PgDn scroll question");
+	});
+
+	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {
+		const tool = new AskTool(createSession());
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
+
+		await tool.execute(
+			"call-normal-ask",
+			{
+				questions: [
+					{
+						id: "normal",
+						question: "Which ordinary option should be selected?",
+						options: [{ label: "A" }, { label: "B" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		const dialogOptions = select.mock.calls[0]?.[2];
+		expect(dialogOptions?.scrollTitleRows).toBeUndefined();
+		expect(dialogOptions?.helpText).not.toContain("PgUp/PgDn scroll question");
 	});
 
 	it("recognizes topology questions even when the agent prepends an intro", async () => {

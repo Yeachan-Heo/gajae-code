@@ -85,6 +85,7 @@ export interface AskToolDetails {
 
 const OTHER_OPTION = "Other (type your own)";
 const RECOMMENDED_SUFFIX = " (Recommended)";
+const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = 12;
 
 function getDoneOptionLabel(): string {
 	return `${theme.status.success} Done selecting`;
@@ -139,6 +140,7 @@ interface AskSingleQuestionOptions {
 	signal?: AbortSignal;
 	initialSelection?: Pick<SelectionResult, "selectedOptions" | "customInput">;
 	navigation?: NavigationControls;
+	scrollTitleRows?: number;
 }
 
 interface UIContext {
@@ -151,6 +153,7 @@ interface UIContext {
 			signal?: AbortSignal;
 			outline?: boolean;
 			wrapFocused?: boolean;
+			scrollTitleRows?: number;
 			onTimeout?: () => void;
 			onLeft?: () => void;
 			onRight?: () => void;
@@ -172,7 +175,7 @@ async function askSingleQuestion(
 	multi: boolean,
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
-	const { recommended, timeout, signal, initialSelection, navigation } = options;
+	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
 	const doneLabel = getDoneOptionLabel();
 	let selectedOptions = [...(initialSelection?.selectedOptions ?? [])];
 	let customInput = initialSelection?.customInput;
@@ -188,15 +191,18 @@ async function askSingleQuestion(
 			timeoutTriggered = true;
 		};
 		let navigationAction: "back" | "forward" | undefined;
-		const helpText = navigation
+		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
 			: "up/down navigate  enter select  esc cancel";
+		const helpText =
+			scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  PgUp/PgDn scroll question`;
 		const dialogOptions = {
 			initialIndex,
 			timeout,
 			signal,
 			outline: true,
 			wrapFocused: true,
+			scrollTitleRows,
 			onTimeout,
 			helpText,
 			onLeft: navigation?.allowBack
@@ -455,7 +461,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		) => {
 			const optionLabels = q.options.map(o => o.label);
 			try {
-				const displayQuestion = formatDeepInterviewSelectorPrompt(q.question) ?? q.question;
+				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
+				const displayQuestion = deepInterviewPrompt ?? q.question;
 				const { selectedOptions, customInput, navigation, cancelled, timedOut } = await askSingleQuestion(
 					ui,
 					displayQuestion,
@@ -467,6 +474,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						signal,
 						initialSelection: options?.previous,
 						navigation: options?.navigation,
+						scrollTitleRows:
+							deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					},
 				);
 				return { optionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };

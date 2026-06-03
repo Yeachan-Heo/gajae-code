@@ -67,7 +67,7 @@ const BASELINE_OUTLINED_RENDER_80_STRIPPED = [
 
 function renderStripped(
 	width: number,
-	opts: { outline?: boolean; wrapFocused?: boolean; initialIndex?: number; maxVisible?: number },
+	opts: { outline?: boolean; wrapFocused?: boolean; scrollTitleRows?: number; initialIndex?: number; maxVisible?: number },
 	options: string[] = [BASELINE_LONG_FOCUSED, BASELINE_LONG_NON_FOCUSED, BASELINE_SHORT],
 ): string {
 	const component = new HookSelectorComponent(
@@ -278,5 +278,62 @@ describe("HookSelectorComponent", () => {
 		// The truncated row must not contain text from the far end of the
 		// label — it is still one-line behavior.
 		expect(nonFocusedLines[0]).not.toContain("hotel golf");
+	});
+	it("caps scrollable title rows while keeping options and help visible", () => {
+		const title = Array.from({ length: 10 }, (_, index) => `Prompt row ${index + 1}`).join("\n\n");
+		const component = new HookSelectorComponent(
+			title,
+			["answer-a", "answer-b"],
+			() => {},
+			() => {},
+			{
+				outline: true,
+				wrapFocused: true,
+				scrollTitleRows: 3,
+				maxVisible: 2,
+				helpText: "up/down navigate  enter select  esc cancel  PgUp/PgDn scroll question",
+			},
+		);
+
+		const rendered = Bun.stripANSI(component.render(88).join("\n"));
+		const titleRows = rendered.split("\n").filter(line => line.includes("Prompt row"));
+
+		expect(titleRows.length).toBeLessThanOrEqual(3);
+		expect(rendered).toContain("answer-a");
+		expect(rendered).toContain("answer-b");
+		expect(rendered).toContain("PgUp/PgDn scroll question");
+		expect(rendered).toContain("PgDn");
+	});
+
+	it("uses selector-local PageUp/PageDown for title scrolling without moving option focus", () => {
+		const title = Array.from({ length: 8 }, (_, index) => `Question segment ${index + 1}`).join("\n\n");
+		let selected: string | undefined;
+		const component = new HookSelectorComponent(
+			title,
+			["first-choice", "second-choice"],
+			option => {
+				selected = option;
+			},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 2, maxVisible: 2 },
+		);
+
+		const initial = Bun.stripANSI(component.render(56).join("\n"));
+		expect(initial).toContain("Question segment 1");
+		expect(initial).not.toContain("Question segment 8");
+		expect(initial).toContain("first-choice");
+
+		for (let i = 0; i < 8; i++) component.handleInput("\x1b[6~");
+		const afterPageDown = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterPageDown).not.toContain("Question segment 1");
+		expect(afterPageDown).toContain("Question segment 8");
+		expect(afterPageDown).toContain("first-choice");
+
+		component.handleInput("\n");
+		expect(selected).toBe("first-choice");
+
+		for (let i = 0; i < 8; i++) component.handleInput("\x1b[5~");
+		const afterPageUp = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterPageUp).toContain("Question segment 1");
 	});
 });
