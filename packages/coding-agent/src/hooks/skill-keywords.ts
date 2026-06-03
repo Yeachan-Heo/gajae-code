@@ -1,3 +1,5 @@
+import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+
 export interface SkillKeywordDefinition {
 	keyword: string;
 	skill: GjcWorkflowSkill;
@@ -5,9 +7,9 @@ export interface SkillKeywordDefinition {
 	guidance: string;
 }
 
-export const GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
+export const GJC_WORKFLOW_SKILLS = CANONICAL_GJC_WORKFLOW_SKILLS;
 
-export type GjcWorkflowSkill = (typeof GJC_WORKFLOW_SKILLS)[number];
+export type GjcWorkflowSkill = CanonicalGjcWorkflowSkill;
 
 export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = [
 	{

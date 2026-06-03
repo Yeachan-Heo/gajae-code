@@ -118,6 +118,14 @@ describe("GJC native skill-state hooks", () => {
 		expect(blockedProduct.reason).toBe("phase-boundary");
 		expect(blockedProduct.message).toContain("handoff/spec before code edits");
 
+		const allowedReadOnlyBash = await getDeepInterviewMutationDecision({
+			cwd: root,
+			sessionId: "session-rich",
+			tool: { name: "bash" } as never,
+			args: { command: "git status --short" },
+		});
+		expect(allowedReadOnlyBash.blocked).toBe(false);
+
 		const blockedSpec = await getDeepInterviewMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
@@ -125,8 +133,17 @@ describe("GJC native skill-state hooks", () => {
 			args: { path: ".gjc/specs/deep-interview-sample.md", content: "spec" },
 		});
 		expect(blockedSpec.blocked).toBe(true);
-		expect(blockedSpec.reason).toBe("handoff-artifact-tool-target");
-		expect(blockedSpec.message).toContain("gjc deep-interview --write --stage final");
+		expect(blockedSpec.reason).toBe("gjc-target");
+		expect(blockedSpec.message).toContain("runtime-owned");
+
+		const blockedGjcBash = await getDeepInterviewMutationDecision({
+			cwd: root,
+			sessionId: "session-rich",
+			tool: { name: "bash" } as never,
+			args: { command: "cat sample.md > .gjc/specs/deep-interview-sample.md" },
+		});
+		expect(blockedGjcBash.blocked).toBe(true);
+		expect(blockedGjcBash.reason).toBe("gjc-target");
 
 		const blocked = await getDeepInterviewMutationDecision({
 			cwd: root,
@@ -154,14 +171,14 @@ describe("GJC native skill-state hooks", () => {
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/specs/deep-interview-sample.md", content: "spec" },
 		});
-		expect(allowedSpec.blocked).toBe(false);
+		expect(allowedSpec.blocked).toBe(true);
 
 		const allowedPlan = await getDeepInterviewMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/plans/sample.md", content: "plan" },
 		});
-		expect(allowedPlan.blocked).toBe(false);
+		expect(allowedPlan.blocked).toBe(true);
 	});
 
 	it("encodes hook session ids before writing skill and mode state paths", async () => {
@@ -390,7 +407,7 @@ disabledExtensions:
 			sessionId: "session-2",
 			threadId: "thread-2",
 		});
-		expect(blocked.outputJson).toMatchObject({ decision: "block", stopReason: "gjc_skill_ralplan_planning" });
+		expect(blocked.outputJson).toMatchObject({ decision: "block", stopReason: "gjc_skill_ralplan_planner" });
 
 		await Bun.write(
 			path.join(root, ".gjc", "state", "sessions", "session-2", "ralplan-state.json"),

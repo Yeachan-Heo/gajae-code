@@ -8,6 +8,7 @@ import {
 	type ModeChangeEntry,
 	type SessionEntry,
 } from "../session/session-manager";
+import { removeFileAudited, writeJsonAtomic } from "./state-writer";
 
 export const GJC_SESSION_FILE_ENV = "GJC_SESSION_FILE";
 export const GJC_SESSION_ID_ENV = "GJC_SESSION_ID";
@@ -88,8 +89,10 @@ export async function writePendingGoalModeRequest(input: {
 		goalsPath: input.goalsPath,
 	};
 	const filePath = requestPath(input.cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await Bun.write(filePath, `${JSON.stringify(request, null, 2)}\n`);
+	await writeJsonAtomic(filePath, request, {
+		cwd: input.cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime" },
+	});
 	return request;
 }
 
@@ -153,6 +156,8 @@ export async function writeCurrentSessionGoalModeState(input: {
 		mode: "goal",
 		data: { goal: state.goal },
 	};
+	// The session transcript file lives outside `.gjc/` (GJC_SESSION_FILE), so it is not a
+	// sanctioned-writer target; append directly.
 	await fs.appendFile(sessionFile, `${JSON.stringify(entry)}\n`);
 	return { status: "updated", goal: state.goal, sessionFile };
 }
@@ -176,7 +181,10 @@ export async function consumePendingGoalModeRequest(cwd: string): Promise<Pendin
 	) {
 		return null;
 	}
-	await fs.unlink(filePath).catch(error => {
+	await removeFileAudited(filePath, {
+		cwd,
+		audit: { category: "prune", verb: "remove", owner: "gjc-runtime" },
+	}).catch(error => {
 		if (!isEnoent(error)) throw error;
 	});
 	return { ...candidate, objective: candidate.objective.trim() } as PendingGoalModeRequest;

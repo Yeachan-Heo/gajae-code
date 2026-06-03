@@ -1,0 +1,209 @@
+/**
+ * Session-scoped storage for the harness control plane.
+ *
+ * Layout (under the harness state root, default `<cwd>/.gjc/state/harness`):
+ *   sessions/<encoded-id>/state.json        lifecycle + handle (atomic)
+ *   sessions/<encoded-id>/lease.json         owner lease (M3)
+ *   sessions/<encoded-id>/events.jsonl       owner-only severity envelopes
+ *   sessions/<encoded-id>/receipts.jsonl     append-only receipt index
+ *   sessions/<encoded-id>/receipts/<family>/<receiptId>.json  immutable receipts
+ *   sessions/<encoded-id>/artifacts/...      diff/validation artifacts
+ *   sessions/<encoded-id>/gjc-session/       underlying gajae-code --session-dir
+ *
+ * Receipt files are immutable: re-writing an existing receipt id fails closed.
+ * JSON writes are atomic (temp + rename).
+ */
+import { randomBytes } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { EventEnvelope, ReceiptFamily, SessionState } from "./types";
+
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export class StorageError extends Error {
+	constructor(
+		message: string,
+		readonly code: string,
+	) {
+		super(message);
+		this.name = "StorageError";
+	}
+}
+
+/** Resolve the harness state root from explicit value, env, or cwd default. */
+export function resolveHarnessRoot(opts?: { root?: string; cwd?: string; env?: NodeJS.ProcessEnv }): string {
+	const env = opts?.env ?? process.env;
+	if (opts?.root) return path.resolve(opts.root);
+	const fromEnv = env.GJC_HARNESS_STATE_ROOT;
+	if (fromEnv?.trim()) return path.resolve(fromEnv.trim());
+	return path.join(opts?.cwd ?? process.cwd(), ".gjc", "state", "harness");
+}
+
+export function assertSafeSessionId(id: string): void {
+	if (!SESSION_ID_RE.test(id)) {
+		throw new StorageError(`unsafe_session_id:${id}`, "unsafe_session_id");
+	}
+}
+
+export function generateSessionId(prefix = "h"): string {
+	const ts = new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 15);
+	const rand = randomBytes(4).toString("hex");
+	return `${prefix}-${ts}-${rand}`;
+}
+
+export interface SessionPaths {
+	dir: string;
+	state: string;
+	lease: string;
+	events: string;
+	receiptsIndex: string;
+	receiptsDir: string;
+	artifactsDir: string;
+	controlSock: string;
+	controlFifo: string;
+	gjcSessionDir: string;
+}
+
+export function sessionPaths(root: string, sessionId: string): SessionPaths {
+	assertSafeSessionId(sessionId);
+	const dir = path.join(root, "sessions", sessionId);
+	return {
+		dir,
+		state: path.join(dir, "state.json"),
+		lease: path.join(dir, "lease.json"),
+		events: path.join(dir, "events.jsonl"),
+		receiptsIndex: path.join(dir, "receipts.jsonl"),
+		receiptsDir: path.join(dir, "receipts"),
+		artifactsDir: path.join(dir, "artifacts"),
+		controlSock: path.join(dir, "control.sock"),
+		controlFifo: path.join(dir, "control.fifo"),
+		gjcSessionDir: path.join(dir, "gjc-session"),
+	};
+}
+
+async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	await fs.rename(tmp, file);
+}
+
+async function readJson<T>(file: string): Promise<T | null> {
+	try {
+		const raw = await fs.readFile(file, "utf8");
+		return JSON.parse(raw) as T;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+export async function readSessionState(root: string, sessionId: string): Promise<SessionState | null> {
+	return readJson<SessionState>(sessionPaths(root, sessionId).state);
+}
+
+export async function writeSessionState(root: string, state: SessionState): Promise<void> {
+	const paths = sessionPaths(root, state.sessionId);
+	await fs.mkdir(paths.dir, { recursive: true });
+	await writeJsonAtomic(paths.state, state);
+}
+
+export async function sessionExists(root: string, sessionId: string): Promise<boolean> {
+	return (await readSessionState(root, sessionId)) !== null;
+}
+
+/** Append a single severity envelope to events.jsonl. Single-writer discipline is the owner's job (M3). */
+export async function appendEvent(root: string, sessionId: string, envelope: EventEnvelope): Promise<void> {
+	const paths = sessionPaths(root, sessionId);
+	await fs.mkdir(paths.dir, { recursive: true });
+	await fs.appendFile(paths.events, `${JSON.stringify(envelope)}\n`, "utf8");
+}
+
+/** Read events from cursor (exclusive). Tail-only: never mutates the log. */
+export async function readEvents(root: string, sessionId: string, fromCursor = 0): Promise<EventEnvelope[]> {
+	const paths = sessionPaths(root, sessionId);
+	let raw: string;
+	try {
+		raw = await fs.readFile(paths.events, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	const out: EventEnvelope[] = [];
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const env = JSON.parse(trimmed) as EventEnvelope;
+		if (env.cursor > fromCursor) out.push(env);
+	}
+	return out;
+}
+
+export interface ReceiptIndexEntry {
+	receiptId: string;
+	family: ReceiptFamily;
+	valid: boolean;
+	createdAt: string;
+	path: string;
+}
+
+/**
+ * Persist a receipt immutably. Fails closed if the receipt id already exists,
+ * then appends an index entry to receipts.jsonl.
+ */
+export async function writeReceiptImmutable(
+	root: string,
+	sessionId: string,
+	family: ReceiptFamily,
+	receiptId: string,
+	value: { receiptId: string; family: ReceiptFamily; valid: boolean; createdAt: string },
+): Promise<ReceiptIndexEntry> {
+	assertSafeSessionId(sessionId);
+	if (!SESSION_ID_RE.test(receiptId)) {
+		throw new StorageError(`unsafe_receipt_id:${receiptId}`, "unsafe_receipt_id");
+	}
+	const paths = sessionPaths(root, sessionId);
+	const familyDir = path.join(paths.receiptsDir, family);
+	const file = path.join(familyDir, `${receiptId}.json`);
+	await fs.mkdir(familyDir, { recursive: true });
+	try {
+		await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new StorageError(`receipt_immutable_conflict:${family}/${receiptId}`, "receipt_immutable_conflict");
+		}
+		throw error;
+	}
+	const entry: ReceiptIndexEntry = {
+		receiptId,
+		family,
+		valid: value.valid,
+		createdAt: value.createdAt,
+		path: file,
+	};
+	await fs.appendFile(paths.receiptsIndex, `${JSON.stringify(entry)}\n`, "utf8");
+	return entry;
+}
+
+export async function readReceiptIndex(
+	root: string,
+	sessionId: string,
+	family?: ReceiptFamily,
+): Promise<ReceiptIndexEntry[]> {
+	const paths = sessionPaths(root, sessionId);
+	let raw: string;
+	try {
+		raw = await fs.readFile(paths.receiptsIndex, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	const out: ReceiptIndexEntry[] = [];
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const entry = JSON.parse(trimmed) as ReceiptIndexEntry;
+		if (!family || entry.family === family) out.push(entry);
+	}
+	return out;
+}

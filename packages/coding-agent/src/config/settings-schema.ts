@@ -147,6 +147,7 @@ interface StringDef {
 interface NumberDef {
 	type: "number";
 	default: number;
+	validate?: (value: number) => boolean;
 	ui?: UiNumber;
 }
 
@@ -318,6 +319,12 @@ export const SETTINGS_SCHEMA = {
 	modelProviderOrder: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	cycleOrder: { type: "array", default: DEFAULT_CYCLE_ORDER },
+
+	"gjc.deepInterview.ambiguityThreshold": {
+		type: "number",
+		default: 0.05,
+		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance

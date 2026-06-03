@@ -27,6 +27,7 @@ import {
 	Snowflake,
 	toError,
 } from "@gajae-code/utils";
+import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
@@ -56,6 +57,10 @@ import type { SessionStorage, SessionStorageWriter } from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 3;
+function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
+	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
 
 export interface SessionHeader {
 	type: "session";
@@ -384,6 +389,7 @@ const migratedSessionRoots = new Set<string>();
  * Best effort: callers decide whether migration failures should surface.
  */
 function migrateSessionDirPath(oldPath: string, newPath: string): void {
+	// Session-dir lifecycle migration: moves/removes whole directories, not file content writes.
 	const existing = fs.statSync(newPath, { throwIfNoEntry: false });
 	if (existing?.isDirectory()) {
 		for (const file of fs.readdirSync(oldPath)) {
@@ -752,7 +758,13 @@ function writeTerminalBreadcrumb(cwd: string, sessionFile: string): void {
 	const breadcrumbFile = path.join(breadcrumbDir, terminalId);
 	const content = `${cwd}\n${sessionFile}\n`;
 	// Best-effort — don't break session creation if breadcrumb fails
-	Bun.write(breadcrumbFile, content).catch(() => {});
+	const write = isUnderProjectGjc(cwd, breadcrumbFile)
+		? writeTextAtomic(breadcrumbFile, content, {
+				cwd,
+				audit: { category: "artifact", verb: "write", owner: "gjc-runtime" },
+			})
+		: Bun.write(breadcrumbFile, content);
+	write.catch(() => {});
 }
 
 /**

@@ -12,12 +12,12 @@ import {
 	getEnumValues,
 	getType,
 	getUi,
+	SETTINGS_SCHEMA,
 	type SettingPath,
 	Settings,
 	type SettingValue,
 	settings,
 } from "../config/settings";
-import { SETTINGS_SCHEMA } from "../config/settings-schema";
 import { theme } from "../modes/theme/theme";
 import { initXdg } from "./commands/init-xdg";
 
@@ -183,10 +183,18 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 			else throw new Error(`Invalid boolean value: ${rawValue}. Use true/false, yes/no, on/off, or 1/0`);
 			break;
 		}
-		case "number":
+		case "number": {
 			parsedValue = Number(trimmed);
 			if (!Number.isFinite(parsedValue)) throw new Error(`Invalid number: ${rawValue}`);
+			const validate =
+				"validate" in SETTINGS_SCHEMA[path]
+					? (SETTINGS_SCHEMA[path].validate as ((value: number) => boolean) | undefined)
+					: undefined;
+			if (validate?.(parsedValue as number) === false) {
+				throw new Error(`Invalid number for ${path}: ${rawValue}`);
+			}
 			break;
+		}
 		case "enum": {
 			const valid = getEnumValues(path);
 			if (valid && !valid.includes(trimmed)) {

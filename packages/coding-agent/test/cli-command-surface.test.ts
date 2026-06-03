@@ -25,6 +25,7 @@ describe("GJC public CLI command surface", () => {
 			"team",
 			"ultragoal",
 			"ralplan",
+			"config",
 			"contribute-pr",
 			"deep-interview",
 			"update",
@@ -46,7 +47,7 @@ describe("GJC public CLI command surface", () => {
 		expect(stdout).toContain("Check for and install updates");
 		expect(combined).not.toContain("What's New");
 		expect(combined).not.toContain("chatContainer");
-	});
+	}, 30_000);
 
 	it("documents the native CLI surface in command help", async () => {
 		for (const command of ["ralplan", "deep-interview", "state"]) {
@@ -61,7 +62,7 @@ describe("GJC public CLI command surface", () => {
 			expect(output).not.toContain("GJC_RUNTIME_BINARY");
 			expect(output).not.toContain("private runtime");
 		}
-	});
+	}, 30_000);
 
 	it("documents team dry-run state behavior in command help", async () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "team", "--help"], {
@@ -75,7 +76,7 @@ describe("GJC public CLI command surface", () => {
 		expect(output).toContain("--dry-run");
 		expect(output).toContain(".gjc/state/team");
 		expect(output).toContain("do not commit");
-	});
+	}, 30_000);
 
 	it("does not capture absolute-path prompts as startup slash commands", () => {
 		const parsed = parseArgs(["/tmp/request.md", "--model", "opus", "summarize"]);

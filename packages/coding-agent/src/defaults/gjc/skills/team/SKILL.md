@@ -330,8 +330,8 @@ tmux list-panes -F '#{pane_id}	#{pane_current_command}	#{pane_start_command}'
 tmux kill-pane -t %450
 tmux kill-pane -t %451
 
-# 3) Remove stale team state only after preserving needed evidence (example)
-rm -rf .gjc/state/team/<team-name>
+# 3) Remove stale team state only after preserving needed evidence, using the state runtime
+# cleanup verb documented by the current manifest
 
 # 4) Retry
 gjc team executor "fresh retry"

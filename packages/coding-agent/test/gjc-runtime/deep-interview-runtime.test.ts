@@ -1,20 +1,37 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 
+import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { resetSettingsForTest } from "../../src/config/settings";
+
 const tempRoots: string[] = [];
 const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../..");
 
+const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
+const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-runtime-"));
 	tempRoots.push(dir);
 	return dir;
 }
 
+beforeEach(async () => {
+	resetSettingsForTest();
+	setAgentDir(await tempDir());
+});
+
 afterEach(async () => {
+	resetSettingsForTest();
+	if (originalAgentDir) {
+		setAgentDir(originalAgentDir);
+	} else {
+		setAgentDir(fallbackAgentDir);
+		delete process.env.GJC_CODING_AGENT_DIR;
+	}
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -89,7 +106,7 @@ describe("native gjc deep-interview runtime", () => {
 			await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"),
 		);
 		expect(ralplanState.active).toBe(true);
-		expect(ralplanState.current_phase).toBe("planning");
+		expect(ralplanState.current_phase).toBe("planner");
 		expect(ralplanState.mode).toBe("deliberate");
 		expect(ralplanState.task).toBe(specPath);
 		expect(ralplanState.handoff_from).toBe("deep-interview");
@@ -172,6 +189,27 @@ describe("native gjc deep-interview runtime", () => {
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.threshold).toBeCloseTo(0.08);
 		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "settings.json"));
+	});
+
+	it("prefers modern config.yml threshold over legacy project settings.json", async () => {
+		const root = await tempDir();
+		const agentDir = await tempDir();
+		setAgentDir(agentDir);
+		resetSettingsForTest();
+		await fs.writeFile(path.join(agentDir, "config.yml"), "gjc:\n  deepInterview:\n    ambiguityThreshold: 0.2\n");
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+		);
+
+		resetSettingsForTest();
+		const result = await runNativeDeepInterviewCommand(["--standard", "--json", "idea"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.threshold).toBeCloseTo(0.2);
+		expect(payload.threshold_source).toBe(path.join(agentDir, "config.yml"));
 	});
 
 	it("--threshold beats project settings.json", async () => {

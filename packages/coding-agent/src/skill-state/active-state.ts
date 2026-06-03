@@ -1,5 +1,10 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	type ActiveSessionScope,
+	rebuildActiveSnapshot,
+	removeActiveEntry,
+	writeActiveEntry,
+} from "../gjc-runtime/state-writer";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
@@ -56,6 +61,8 @@ export interface SkillActiveState {
 	session_id?: string;
 	thread_id?: string;
 	turn_id?: string;
+	initialized_mode?: CanonicalGjcWorkflowSkill;
+	initialized_state_path?: string;
 	active_skills?: SkillActiveEntry[];
 	[key: string]: unknown;
 }
@@ -286,14 +293,6 @@ export function getSkillActiveStatePaths(cwd: string, sessionId?: string): Skill
 	};
 }
 
-async function readStateFile(filePath: string): Promise<SkillActiveState | null> {
-	try {
-		return normalizeSkillActiveState(JSON.parse(await Bun.file(filePath).text()));
-	} catch {
-		return null;
-	}
-}
-
 /**
  * Raw read for handoff mutations. Returns the *unnormalized* parsed object so
  * inactive entries remain visible to `rawActiveEntries` — `normalizeSkillActiveState`
@@ -516,15 +515,41 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 	};
 }
 
-async function writeStateFile(filePath: string, state: SkillActiveState): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await Bun.write(filePath, `${JSON.stringify(state, null, 2)}\n`);
+function activeStateWriterAudit(verb: string) {
+	return { category: "state" as const, verb, owner: "gjc-runtime" as const };
 }
 
-function upsertEntry(entries: SkillActiveEntry[], entry: SkillActiveEntry, active: boolean): SkillActiveEntry[] {
-	const key = entryKey(entry);
-	const retained = entries.filter(candidate => entryKey(candidate) !== key);
-	return active ? [...retained, entry] : retained;
+async function persistActiveEntry(
+	cwd: string,
+	sessionScope: ActiveSessionScope | undefined,
+	entry: SkillActiveEntry,
+): Promise<void> {
+	if (entry.active === false) {
+		await removeActiveEntry(cwd, sessionScope, entry.skill, {
+			cwd,
+			audit: activeStateWriterAudit("remove-active-entry"),
+		});
+	} else {
+		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
+			cwd,
+			audit: activeStateWriterAudit("write-active-entry"),
+		});
+	}
+}
+
+async function writeHandoffEntry(
+	cwd: string,
+	sessionScope: ActiveSessionScope | undefined,
+	entry: SkillActiveEntry,
+): Promise<void> {
+	await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
+		cwd,
+		audit: activeStateWriterAudit("write-active-entry"),
+	});
+}
+
+async function rebuildActiveState(cwd: string, sessionScope?: ActiveSessionScope): Promise<void> {
+	await rebuildActiveSnapshot(cwd, sessionScope, { cwd, audit: activeStateWriterAudit("rebuild-active-snapshot") });
 }
 
 export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
@@ -545,36 +570,13 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
 	};
-	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, options.sessionId);
-	const rootState = (await readStateFile(rootPath)) ?? { version: 1, active_skills: [] };
-	const rootEntries = upsertEntry(listActiveSkills(rootState), entry, options.active);
-	const nextRoot: SkillActiveState = {
-		...rootState,
-		version: 1,
-		active: rootEntries.length > 0,
-		skill: rootEntries[0]?.skill ?? "",
-		phase: rootEntries[0]?.phase ?? "",
-		updated_at: nowIso,
-		source: options.source,
-		active_skills: rootEntries,
-	};
-	await writeStateFile(rootPath, nextRoot);
+	await persistActiveEntry(options.cwd, undefined, entry);
+	await rebuildActiveState(options.cwd);
 
-	if (!sessionPath) return;
-	const sessionState = (await readStateFile(sessionPath)) ?? { version: 1, active_skills: [] };
-	const sessionEntries = upsertEntry(listActiveSkills(sessionState), entry, options.active);
-	const nextSession: SkillActiveState = {
-		...sessionState,
-		version: 1,
-		active: sessionEntries.length > 0,
-		skill: sessionEntries[0]?.skill ?? "",
-		phase: sessionEntries[0]?.phase ?? "",
-		session_id: options.sessionId,
-		updated_at: nowIso,
-		source: options.source,
-		active_skills: sessionEntries,
-	};
-	await writeStateFile(sessionPath, nextSession);
+	if (!options.sessionId) return;
+	const sessionScope = { sessionId: options.sessionId };
+	await persistActiveEntry(options.cwd, sessionScope, entry);
+	await rebuildActiveState(options.cwd, sessionScope);
 }
 
 export interface ApplyHandoffOptions {
@@ -604,6 +606,7 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 	const sessionId = options.callee.sessionId ?? options.caller.sessionId;
 	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId);
 	const readState = (filePath: string) => readRawActiveStateForHandoff(filePath, options.strict === true);
+	await Promise.all([readState(rootPath), ...(sessionPath ? [readState(sessionPath)] : [])]);
 
 	// A skill can hold more than one visible row in this session's scope — e.g.
 	// it was seeded without a session id (rendered globally) and is now handed
@@ -637,33 +640,23 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 			: callerEntry;
 		return [...kept, mergedCaller, calleeEntry];
 	};
-	const buildNextState = (
+	const writeEntries = async (
+		sessionScope: ActiveSessionScope | undefined,
 		prior: SkillActiveState | null,
-		entries: SkillActiveEntry[],
-		scope: "session" | "root",
-	): SkillActiveState => {
-		const visible = entries.filter(e => e.active !== false);
-		return {
-			...(prior ?? {}),
-			version: 1,
-			active: visible.length > 0,
-			skill: visible[0]?.skill ?? "",
-			phase: visible[0]?.phase ?? "",
-			...(scope === "session" ? { session_id: sessionId } : {}),
-			updated_at: nowIso,
-			source: options.callee.source ?? options.caller.source,
-			active_skills: entries,
-		};
+	): Promise<void> => {
+		const nextEntries = applyEntries(rawActiveEntries(prior));
+		for (const entry of nextEntries) {
+			await writeHandoffEntry(options.cwd, sessionScope, entry);
+		}
+		await rebuildActiveState(options.cwd, sessionScope);
 	};
 
 	if (sessionPath) {
 		const prior = await readState(sessionPath);
-		const next = buildNextState(prior, applyEntries(rawActiveEntries(prior)), "session");
-		await writeStateFile(sessionPath, next);
+		await writeEntries({ sessionId }, prior);
 	}
 	const priorRoot = await readState(rootPath);
-	const nextRoot = buildNextState(priorRoot, applyEntries(rawActiveEntries(priorRoot)), "root");
-	await writeStateFile(rootPath, nextRoot);
+	await writeEntries(undefined, priorRoot);
 }
 
 function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): SkillActiveEntry {

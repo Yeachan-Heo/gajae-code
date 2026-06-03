@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
+import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -173,8 +174,10 @@ async function persistActiveRunId(cwd: string, sessionId: string | undefined, ru
 	if (typeof existing.skill !== "string") existing.skill = "ralplan";
 	if (typeof existing.active !== "boolean") existing.active = true;
 	existing.updated_at = new Date().toISOString();
-	await fs.mkdir(path.dirname(statePath), { recursive: true });
-	await fs.writeFile(statePath, `${JSON.stringify(existing, null, 2)}\n`);
+	await writeJsonAtomic(statePath, existing, {
+		cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+	});
 }
 
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
@@ -220,27 +223,36 @@ interface PersistedArtifact {
 
 async function persistArtifact(resolved: ResolvedArtifactArgs, cwd: string): Promise<PersistedArtifact> {
 	const runDir = path.join(cwd, ".gjc", "plans", "ralplan", resolved.runId);
-	await fs.mkdir(runDir, { recursive: true });
+
 	const fileName = `stage-${pad2(resolved.stageN)}-${resolved.stage}.md`;
 	const filePath = path.join(runDir, fileName);
 	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
-	await fs.writeFile(filePath, content);
+	await writeArtifact(filePath, content, {
+		cwd,
+		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+	});
 
 	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
-	const indexLine = `${JSON.stringify({
+	const indexEntry = {
 		stage: resolved.stage,
 		stage_n: resolved.stageN,
 		path: filePath,
 		created_at: createdAt,
 		sha256,
-	})}\n`;
-	await fs.appendFile(path.join(runDir, "index.jsonl"), indexLine);
+	};
+	await appendJsonl(path.join(runDir, "index.jsonl"), indexEntry, {
+		cwd,
+		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "ralplan" },
+	});
 
 	let pendingApprovalPath: string | undefined;
 	if (resolved.stage === "final") {
 		pendingApprovalPath = path.join(runDir, "pending-approval.md");
-		await fs.writeFile(pendingApprovalPath, content);
+		await writeArtifact(pendingApprovalPath, content, {
+			cwd,
+			audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+		});
 	}
 
 	return {
@@ -382,7 +394,7 @@ async function seedRalplanState(
 	const stateDir = resolved.sessionId
 		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(resolved.sessionId))
 		: path.join(cwd, ".gjc", "state");
-	await fs.mkdir(stateDir, { recursive: true });
+
 	const statePath = path.join(stateDir, "ralplan-state.json");
 	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
 	// orphan in-progress artifacts under a fresh run id.
@@ -403,7 +415,10 @@ async function seedRalplanState(
 	if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
 	if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await fs.writeFile(statePath, `${JSON.stringify(payload, null, 2)}\n`);
+	await writeJsonAtomic(statePath, payload, {
+		cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+	});
 	return { statePath, runId };
 }
 

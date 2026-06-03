@@ -151,7 +151,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(1);
 		const [remaining] = credentials;
 		expect(remaining?.credential.type).toBe("oauth");
-		if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+		if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 		expect(remaining.credential.accountId).toBe("account-b");
 		expect(remaining.credential.email).toBe("shared.user@example.com");
 	});
@@ -168,7 +168,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(1);
 		const [remaining] = credentials;
 		expect(remaining?.credential.type).toBe("oauth");
-		if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+		if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 		expect(remaining.credential.accountId).toBe("account-b");
 	});
 
@@ -207,7 +207,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(1);
 		const [remaining] = credentials;
 		expect(remaining?.credential.type).toBe("oauth");
-		if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+		if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 		expect(remaining.credential.accountId).toBe("account-b");
 		expect(remaining.credential.email).toBe("shared.user@example.com");
 		expect(readDisabledCauses(dbPath, "openai-codex")).toEqual([]);
@@ -300,7 +300,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(1);
 		const [remaining] = credentials;
 		expect(remaining?.credential.type).toBe("oauth");
-		if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+		if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 		expect(remaining.credential.accountId).toBe("account-b");
 	});
 
@@ -319,7 +319,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(1);
 		const [remaining] = credentials;
 		expect(remaining?.credential.type).toBe("oauth");
-		if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+		if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 		expect(remaining.credential.accountId).toBe("account-b");
 		expect(remaining.credential.email).toBe("shared.user@example.com");
 	});
@@ -350,7 +350,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 			expect(credentials).toHaveLength(1);
 			const [remaining] = credentials;
 			expect(remaining?.credential.type).toBe("oauth");
-			if (!remaining || remaining.credential.type !== "oauth") throw new Error("expected oauth credential");
+			if (remaining?.credential.type !== "oauth") throw new Error("expected oauth credential");
 			expect(remaining.credential.accountId).toBe("org-b");
 			expect(remaining.credential.email).toBe("shared.user@example.com");
 		});

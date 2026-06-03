@@ -4,6 +4,16 @@ import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { applyGjcTmuxProfile } from "./launch-tmux";
+import {
+	AlreadyExistsError,
+	appendJsonl as appendJsonlAudited,
+	appendText,
+	createJsonNoClobber,
+	deleteIfOwned,
+	removeFileAudited,
+	writeJsonAtomic,
+	writeReport,
+} from "./state-writer";
 
 export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
@@ -392,9 +402,14 @@ function now(): string {
 function isEnoent(error: unknown): error is FsError {
 	return typeof error === "object" && error !== null && "code" in error && (error as FsError).code === "ENOENT";
 }
-function isEexist(error: unknown): error is FsError {
-	return typeof error === "object" && error !== null && "code" in error && (error as FsError).code === "EEXIST";
+function stateWriterOptions(filePath: string, category: "state" | "ledger" | "report" | "prune", verb: string) {
+	const resolved = path.resolve(filePath);
+	const marker = `${path.sep}.gjc${path.sep}`;
+	const markerIndex = resolved.indexOf(marker);
+	const cwd = markerIndex >= 0 ? resolved.slice(0, markerIndex) : process.cwd();
+	return { cwd, audit: { category, verb, owner: "gjc-runtime" as const } };
 }
+
 function sanitizeName(value: string): string {
 	const sanitized = value
 		.toLowerCase()
@@ -503,29 +518,28 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
 		throw error;
 	}
 }
+function stateCategoryForJsonPath(filePath: string): "state" | "ledger" {
+	return filePath.endsWith(".jsonl") || filePath.includes(`${path.sep}telemetry${path.sep}`) ? "ledger" : "state";
+}
+
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
-	await Bun.write(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
-	await fs.rename(tmpPath, filePath);
+	await writeJsonAtomic(filePath, value, stateWriterOptions(filePath, stateCategoryForJsonPath(filePath), "write"));
 }
 async function writeJsonFileNoClobber(filePath: string, value: unknown): Promise<boolean> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, "wx");
-		await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf-8");
+		await createJsonNoClobber(
+			filePath,
+			value,
+			stateWriterOptions(filePath, stateCategoryForJsonPath(filePath), "create"),
+		);
 		return true;
 	} catch (error) {
-		if (isEexist(error)) return false;
+		if (error instanceof AlreadyExistsError) return false;
 		throw error;
-	} finally {
-		await handle?.close();
 	}
 }
 async function appendJsonl(filePath: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(value)}\n`, "utf-8");
+	await appendJsonlAudited(filePath, value, stateWriterOptions(filePath, "ledger", "append"));
 }
 async function appendEvent(dir: string, event: Omit<GjcTeamEvent, "ts" | "event_id">): Promise<GjcTeamEvent> {
 	const full = { event_id: `evt-${Date.now()}-${Math.random().toString(16).slice(2)}`, ts: now(), ...event };
@@ -561,6 +575,38 @@ async function readPhase(dir: string): Promise<GjcTeamPhase> {
 }
 async function writePhase(dir: string, phase: GjcTeamPhase): Promise<void> {
 	await writeJsonFile(path.join(dir, "phase.json"), { current_phase: phase, updated_at: now() });
+}
+
+function teamModeStatePath(): string {
+	return path.join(".gjc", "state", "team-state.json");
+}
+
+export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, cwd = process.cwd()): Promise<void> {
+	const active = snapshot.phase !== "complete" && snapshot.phase !== "cancelled";
+	const updatedAt = now();
+	await writeJsonAtomic(
+		teamModeStatePath(),
+		{
+			skill: "team",
+			version: 1,
+			active,
+			current_phase: snapshot.phase,
+			team_name: snapshot.team_name,
+			task_counts: snapshot.task_counts,
+			updated_at: updatedAt,
+		},
+		{
+			cwd,
+			receipt: {
+				cwd,
+				skill: "team",
+				owner: "gjc-runtime",
+				command: "gjc team sync-team-summary",
+				nowIso: updatedAt,
+			},
+			audit: { category: "state", verb: "sync-team-summary", owner: "gjc-runtime", skill: "team" },
+		},
+	);
 }
 
 function normalizeTask(raw: GjcTeamTask): GjcTeamTask {
@@ -1032,9 +1078,18 @@ async function appendIntegrationReport(
 	entry: { worker: string; operation: "merge" | "cherry-pick" | "rebase"; files: string[]; detail: string },
 ): Promise<void> {
 	const line = `- [${now()}] ${entry.worker}: ${entry.operation}; files=${entry.files.join(",") || "unknown"}; ${entry.detail}\n`;
-	await fs.mkdir(path.dirname(integrationReportPath(dir)), { recursive: true });
-	if (await pathExists(integrationReportPath(dir))) await fs.appendFile(integrationReportPath(dir), line, "utf-8");
-	else await Bun.write(integrationReportPath(dir), `# Integration Report\n\n${line}`);
+	if (await pathExists(integrationReportPath(dir)))
+		await appendText(
+			integrationReportPath(dir),
+			line,
+			stateWriterOptions(integrationReportPath(dir), "report", "append"),
+		);
+	else
+		await writeReport(
+			integrationReportPath(dir),
+			`# Integration Report\n\n${line}`,
+			stateWriterOptions(integrationReportPath(dir), "report", "write"),
+		);
 }
 async function appendCommitHygieneEntries(config: GjcTeamConfig, entries: GjcTeamCommitHygieneEntry[]): Promise<void> {
 	if (entries.length === 0) return;
@@ -1583,10 +1638,9 @@ async function integrateGjcWorkerCommits(
 }
 
 async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promise<void> {
-	for (const folder of ["tasks", "claims", "mailbox", "notifications", "dispatch", "approvals", "workers"])
-		await fs.mkdir(path.join(dir, folder), { recursive: true });
+	// Empty mailbox directories are runtime state, so they must exist before messages arrive.
+	await fs.mkdir(path.join(dir, "mailbox"), { recursive: true });
 	for (const worker of workers) {
-		await fs.mkdir(workerDir(dir, worker.id), { recursive: true });
 		await fs.mkdir(mailboxDirPath(dir, worker.id), { recursive: true });
 		await writeJsonFile(mailboxPath(dir, worker.id), { messages: [] });
 		await writeJsonFile(path.join(workerDir(dir, worker.id), "status.json"), { state: "idle", updated_at: now() });
@@ -1597,6 +1651,7 @@ async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promi
 			alive: true,
 		});
 	}
+	// Empty leader mailbox directory is runtime state, so it must exist before messages arrive.
 	await fs.mkdir(mailboxDirPath(dir, "leader-fixed"), { recursive: true });
 	await writeJsonFile(mailboxPath(dir, "leader-fixed"), { messages: [] });
 }
@@ -2145,20 +2200,14 @@ export async function claimGjcTeamTask(
 		leased_until: new Date(Date.now() + 30 * 60_000).toISOString(),
 	};
 	const claimPath = path.join(dir, "claims", `${task.id}.json`);
-	await fs.mkdir(path.dirname(claimPath), { recursive: true });
-	let claimFile: fs.FileHandle | undefined;
-	try {
-		claimFile = await fs.open(claimPath, "wx");
-		await claimFile.writeFile(`${JSON.stringify(claim, null, 2)}\n`, "utf-8");
-	} catch (error) {
-		if (isEexist(error)) return { ok: false, reason: `task_already_claimed:${task.id}` };
-		throw error;
-	} finally {
-		await claimFile?.close();
-	}
+	const created = await writeJsonFileNoClobber(claimPath, claim);
+	if (!created) return { ok: false, reason: `task_already_claimed:${task.id}` };
 	const current = await readGjcTeamTask(teamName, task.id, cwd, env);
 	if (current.status !== "pending") {
-		await fs.rm(claimPath, { force: true });
+		await deleteIfOwned(claimPath, {
+			...stateWriterOptions(claimPath, "prune", "rollback"),
+			predicate: current => (current as GjcTeamTaskClaim).token === token,
+		});
 		return { ok: false, reason: `task_not_pending:${task.id}` };
 	}
 	const updated: GjcTeamTask = {
@@ -2173,7 +2222,10 @@ export async function claimGjcTeamTask(
 	try {
 		await writeTask(dir, updated);
 	} catch (error) {
-		await fs.rm(claimPath, { force: true });
+		await deleteIfOwned(claimPath, {
+			...stateWriterOptions(claimPath, "prune", "rollback"),
+			predicate: current => (current as GjcTeamTaskClaim).token === token,
+		});
 		throw error;
 	}
 	await appendEvent(dir, {
@@ -2223,7 +2275,10 @@ export async function transitionGjcTeamTaskStatus(
 			evidence,
 			recorded_at: now(),
 		});
-	if (terminal) await fs.rm(path.join(dir, "claims", `${taskId}.json`), { force: true });
+	if (terminal) {
+		const claimPath = path.join(dir, "claims", `${taskId}.json`);
+		await removeFileAudited(claimPath, stateWriterOptions(claimPath, "prune", "terminal"));
+	}
 	await appendEvent(dir, {
 		type: "task_transitioned",
 		task_id: taskId,
@@ -2263,7 +2318,11 @@ export async function releaseGjcTeamTaskClaim(
 		updated_at: now(),
 	};
 	await writeTask(dir, updated);
-	await fs.rm(path.join(dir, "claims", `${taskId}.json`), { force: true });
+	const claimPath = path.join(dir, "claims", `${taskId}.json`);
+	await deleteIfOwned(claimPath, {
+		...stateWriterOptions(claimPath, "prune", "release"),
+		predicate: current => (current as GjcTeamTaskClaim).token === claimToken,
+	});
 	await appendEvent(dir, {
 		type: "task_claim_released",
 		task_id: taskId,
@@ -2646,7 +2705,7 @@ export async function writeGjcWorkerInbox(
 	const config = await readConfig(dir);
 	assertKnownWorker(config, worker);
 	const filePath = path.join(workerDir(dir, worker), "inbox.md");
-	await Bun.write(filePath, content);
+	await writeReport(filePath, content, stateWriterOptions(filePath, "report", "write"));
 	return { path: filePath };
 }
 export async function writeGjcWorkerIdentity(

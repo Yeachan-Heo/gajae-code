@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
@@ -23,6 +22,17 @@ import {
 	describeWorkflowStateContract,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
+import { renderStateGraph, type StateGraphFormat } from "./state-graph";
+import { migrateAndPersistLegacyState } from "./state-migrations";
+import { renderStateMarkdown } from "./state-renderer";
+import {
+	type GenericHardPruneTarget,
+	hardPrune,
+	type StateWriterAuditContext,
+	softDelete,
+	writeJsonAtomic as writeStateJsonAtomic,
+} from "./state-writer";
+import { getSkillManifest, typedArgsFor } from "./workflow-manifest";
 
 /**
  * Native implementation of the `gjc state read|write|clear` command surface.
@@ -62,11 +72,60 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
 
-const FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id", "--to"]);
-const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff"]);
+const GRAPH_FORMATS = new Set(["ascii", "mermaid", "dot"]);
+const FLAGS_WITH_VALUES = new Set([
+	"--input",
+	"--mode",
+	"--session-id",
+	"--thread-id",
+	"--turn-id",
+	"--to",
+	"--skill",
+	"--format",
+	"--older-than",
+	"--status",
+]);
+const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate"]);
+const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate"]);
+const VERB_SPECIFIC_FLAGS = new Set(["--skill", "--format", "--older-than", "--status"]);
+
+function flagName(arg: string): string | undefined {
+	if (!arg.startsWith("--")) return undefined;
+	const equalsIndex = arg.indexOf("=");
+	return equalsIndex >= 0 ? arg.slice(0, equalsIndex) : arg;
+}
+
+function manifestFlagNames(action: ParsedInvocation["action"], positionalSkill: string | undefined): Set<string> {
+	const names = new Set<string>();
+	const skills =
+		positionalSkill && KNOWN_MODES.includes(positionalSkill)
+			? [positionalSkill as CanonicalGjcWorkflowSkill]
+			: CANONICAL_GJC_WORKFLOW_SKILLS;
+	for (const skill of skills) {
+		for (const arg of typedArgsFor(skill, action)) names.add(`--${arg.name}`);
+	}
+	return names;
+}
+
+function assertKnownFlags(args: readonly string[], parsed: ParsedInvocation): void {
+	const manifestFlags = manifestFlagNames(parsed.action, parsed.positionalSkill);
+	for (const arg of args) {
+		const flag = flagName(arg);
+		if (!flag) continue;
+		if (
+			FLAGS_WITH_VALUES.has(flag) ||
+			BOOLEAN_FLAGS.has(flag) ||
+			VERB_SPECIFIC_FLAGS.has(flag) ||
+			manifestFlags.has(flag)
+		) {
+			continue;
+		}
+		throw new StateCommandError(2, `unknown gjc state flag: ${flag}`);
+	}
+}
 
 interface ParsedInvocation {
-	action: "read" | "write" | "clear" | "contract" | "handoff";
+	action: "read" | "write" | "clear" | "contract" | "handoff" | "graph" | "prune" | "migrate";
 	positionalSkill?: string;
 }
 
@@ -240,11 +299,16 @@ async function readJsonFile(filePath: string): Promise<Record<string, unknown> |
 	}
 }
 
-async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	const tmp = `${filePath}.tmp-${randomBytes(6).toString("hex")}`;
-	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`);
-	await fs.rename(tmp, filePath);
+async function writeJsonAtomic(
+	cwd: string,
+	filePath: string,
+	value: unknown,
+	verb: "write" | "clear" | "handoff" = "write",
+): Promise<void> {
+	await writeStateJsonAtomic(filePath, value, {
+		cwd,
+		audit: { category: "state", verb, owner: "gjc-state-cli" },
+	});
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -408,6 +472,14 @@ async function syncWorkflowSkillState(options: {
 		// HUD sync is best-effort and must not change command semantics.
 	}
 }
+export async function readWorkflowStateJson(
+	cwd: string,
+	skill: CanonicalGjcWorkflowSkill,
+	sessionId?: string,
+): Promise<Record<string, unknown>> {
+	return (await readJsonFile(modeStateFile(cwd, skill, sessionId))) ?? {};
+}
+
 async function handleRead(
 	args: readonly string[],
 	cwd: string,
@@ -417,10 +489,13 @@ async function handleRead(
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
 	if (mode) {
 		const filePath = modeStateFile(cwd, mode, selectors.sessionId);
-		const existing = await readJsonFile(filePath);
+		const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
+		const envelope = { skill: mode, state: existing, storage_path: filePath };
 		return {
 			status: 0,
-			stdout: `${JSON.stringify({ skill: mode, state: existing, storage_path: filePath }, null, 2)}\n`,
+			stdout: hasFlag(args, "--json")
+				? `${JSON.stringify(envelope, null, 2)}\n`
+				: renderStateMarkdown(mode, envelope, getSkillManifest(mode)),
 		};
 	}
 	const filePath = activeStateFile(cwd, selectors.sessionId);
@@ -488,7 +563,7 @@ async function handleWrite(
 	merged.updated_at = nowIsoStr;
 	merged.receipt = receipt;
 	if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
-	await writeJsonAtomic(filePath, merged);
+	await writeJsonAtomic(cwd, filePath, merged, "write");
 
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
 	const active = merged.active !== false;
@@ -522,7 +597,7 @@ async function handleClear(
 		current_phase: "complete",
 		updated_at: nowIso(),
 	};
-	await writeJsonAtomic(filePath, cleared);
+	await writeJsonAtomic(cwd, filePath, cleared, "clear");
 
 	await syncWorkflowSkillState({
 		cwd,
@@ -643,8 +718,8 @@ async function handleHandoff(
 	// and write order keeps the session-scoped source of truth ahead of the
 	// root aggregate. strict:true on the active-state read tolerates ENOENT
 	// only; corrupt JSON / IO failures propagate as non-zero CLI status.
-	await writeJsonAtomic(calleePath, mergedCalleeState);
-	await writeJsonAtomic(callerPath, mergedCallerState);
+	await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff");
+	await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff");
 	await applyHandoffToActiveState({
 		cwd,
 		nowIso: handoffAt,
@@ -708,11 +783,134 @@ async function handleContract(
 	return { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` };
 }
 
+function parseNonNegativeIntegerFlag(args: readonly string[], flag: string): number | undefined {
+	const value = flagValue(args, flag);
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		throw new StateCommandError(2, `gjc state ${flag} requires a non-negative integer value`);
+	}
+	return parsed;
+}
+
+function statusFromFile(value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (typeof record.status === "string") return record.status;
+	if (record.receipt && typeof record.receipt === "object" && !Array.isArray(record.receipt)) {
+		const receiptStatus = (record.receipt as Record<string, unknown>).status;
+		if (typeof receiptStatus === "string") return receiptStatus;
+	}
+	return undefined;
+}
+
+async function handleGraph(
+	args: readonly string[],
+	_cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const rawSkill = flagValue(args, "--skill")?.trim() || positionalSkill?.trim() || "all";
+	if (rawSkill !== "all") assertKnownMode(rawSkill);
+	const format = flagValue(args, "--format")?.trim() || "ascii";
+	if (!GRAPH_FORMATS.has(format)) {
+		throw new StateCommandError(2, `Invalid graph format: ${format}. Expected one of: ascii, mermaid, dot.`);
+	}
+	return {
+		status: 0,
+		stdout: renderStateGraph(rawSkill as CanonicalGjcWorkflowSkill | "all", format as StateGraphFormat),
+	};
+}
+
+async function handlePrune(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill);
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	if (!mode) {
+		throw new StateCommandError(
+			2,
+			"gjc state prune requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+		);
+	}
+	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const olderThanDays = parseNonNegativeIntegerFlag(args, "--older-than");
+	const status = flagValue(args, "--status")?.trim();
+	const targets: GenericHardPruneTarget[] = [{ path: filePath, category: "prune" }];
+	const audit: StateWriterAuditContext = {
+		cwd,
+		skill: mode,
+		category: "prune",
+		verb: hasFlag(args, "--hard") ? "hard-prune" : "soft-delete",
+		owner: "gjc-state-cli",
+	};
+	const olderThanMs = olderThanDays === undefined ? undefined : olderThanDays * 24 * 60 * 60 * 1000;
+	const matchesSelector = async (
+		stat: { mtimeMs: number | bigint },
+		readJson: () => Promise<unknown>,
+	): Promise<boolean> => {
+		const mtimeMs = typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs;
+		if (olderThanMs !== undefined && Date.now() - mtimeMs < olderThanMs) return false;
+		if (status) return statusFromFile(await readJson()) === status;
+		return true;
+	};
+	if (hasFlag(args, "--hard")) {
+		const pruned = await hardPrune(
+			targets,
+			context => (context.stat ? matchesSelector(context.stat, context.readJson) : false),
+			{ cwd, audit },
+		);
+		return { status: 0, stdout: `${JSON.stringify({ skill: mode, hard: true, pruned }, null, 2)}\n` };
+	}
+	let deleted: string[] = [];
+	try {
+		const stat = await fs.stat(filePath);
+		if (await matchesSelector(stat, async () => JSON.parse(await fs.readFile(filePath, "utf-8")))) {
+			const archivedPath = await softDelete(
+				filePath,
+				{ skill: mode, reason: "gjc state prune", status: status ?? null, older_than_days: olderThanDays ?? null },
+				{ cwd, audit },
+			);
+			deleted = [archivedPath];
+		}
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code !== "ENOENT") throw error;
+	}
+	return { status: 0, stdout: `${JSON.stringify({ skill: mode, hard: false, soft_deleted: deleted }, null, 2)}\n` };
+}
+
+async function handleMigrate(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill);
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	if (!mode) {
+		throw new StateCommandError(
+			2,
+			"gjc state migrate requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+		);
+	}
+	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const result = await migrateAndPersistLegacyState({
+		cwd,
+		skill: mode,
+		statePath: filePath,
+		sessionId: selectors.sessionId,
+	});
+	return { status: 0, stdout: `${JSON.stringify({ skill: mode, ...result }, null, 2)}\n` };
+}
+
 export async function runNativeStateCommand(args: string[], cwd = process.cwd()): Promise<StateCommandResult> {
 	try {
 		const parsed = parsePositionalArgs(args);
+		assertKnownFlags(args, parsed);
 		switch (parsed.action) {
 			case "read":
+				if (hasFlag(args, "--migrate")) return await handleMigrate(args, cwd, parsed.positionalSkill);
 				return await handleRead(args, cwd, parsed.positionalSkill);
 			case "write":
 				return await handleWrite(args, cwd, parsed.positionalSkill);
@@ -722,6 +920,12 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return await handleContract(args, cwd, parsed.positionalSkill);
 			case "handoff":
 				return await handleHandoff(args, cwd, parsed.positionalSkill);
+			case "graph":
+				return await handleGraph(args, cwd, parsed.positionalSkill);
+			case "prune":
+				return await handlePrune(args, cwd, parsed.positionalSkill);
+			case "migrate":
+				return await handleMigrate(args, cwd, parsed.positionalSkill);
 			default:
 				return { status: 2, stderr: `Unknown gjc state command: ${parsed.action}\n` };
 		}

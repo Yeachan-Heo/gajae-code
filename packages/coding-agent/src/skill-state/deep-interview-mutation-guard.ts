@@ -14,12 +14,16 @@ import {
 export const DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE =
 	"Deep-interview phase boundary: continue gathering context/questions/risks and emit a handoff/spec before code edits. Mutation tools and patch execution are blocked while deep-interview is active; finalize specs through `gjc deep-interview --write --stage final` or hand off to an execution phase.";
 export const WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE =
-	"Workflow state JSON is runtime-owned. Use `gjc state <skill> read|write --input '<json>'` for deep-interview, ralplan, ultragoal, and team. Planning artifacts under `.gjc/specs/` and `.gjc/plans/` remain allowed.";
+	".gjc workflow state and artifacts are runtime-owned. Agent mutation tools cannot edit `.gjc/**`; use the sanctioned `gjc` CLI instead.";
 
-const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit"]);
+const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit", "bash"]);
 const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|tar|db))(?:$|:)/i;
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
+const BASH_TOKEN_RE = /'[^']*'|"(?:\\.|[^"\\])*"|\S+/g;
+const BASH_REDIRECT_RE = /^(?:\d*)>>?$/;
+const BASH_HEREDOC_RE = /^(?:\d*)<<-?$/;
+const BASH_MUTATION_COMMANDS = new Set(["rm", "mv", "cp", "touch", "mkdir", "ln", "tee"]);
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -219,10 +223,75 @@ function extractEditTargets(args: unknown, tool: ToolWithEditMode): ExtractedTar
 	return targets;
 }
 
+function extractBashTargets(args: unknown): ExtractedTargets {
+	const record = getRecord(args);
+	const command = safeString(record?.command).trim();
+	const targets: ExtractedTargets = { paths: [], unknown: false };
+	if (!command) {
+		targets.unknown = true;
+		return targets;
+	}
+	if (/^gjc(?:\s|$)/.test(command)) return targets;
+
+	const tokens = command.match(BASH_TOKEN_RE)?.map(unquoteBashToken) ?? [];
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index] ?? "";
+		if (BASH_REDIRECT_RE.test(token)) {
+			addPath(targets, tokens[index + 1]);
+			index++;
+			continue;
+		}
+		const redirectMatch = token.match(/^(?:\d*)>>?(.+)$/);
+		if (redirectMatch?.[1]) {
+			addPath(targets, redirectMatch[1]);
+			continue;
+		}
+		if (BASH_HEREDOC_RE.test(token)) {
+			addPath(targets, tokens[index + 1]);
+			index++;
+			continue;
+		}
+		const heredocMatch = token.match(/^(?:\d*)<<-?(.+)$/);
+		if (heredocMatch?.[1]) {
+			addPath(targets, heredocMatch[1]);
+			continue;
+		}
+		if (isMutationBashCommand(tokens, index)) {
+			for (let targetIndex = index + 1; targetIndex < tokens.length; targetIndex++) {
+				const target = tokens[targetIndex] ?? "";
+				if (isBashCommandBoundary(target)) break;
+				if (target.startsWith("-")) continue;
+				addPath(targets, target);
+			}
+		}
+	}
+	return targets;
+}
+
+function unquoteBashToken(token: string): string {
+	if (token.length < 2) return token;
+	const quote = token[0];
+	if ((quote === "'" || quote === '"') && token.at(-1) === quote) return token.slice(1, -1);
+	return token;
+}
+
+function isBashCommandBoundary(token: string): boolean {
+	return [";", "&&", "||", "|"].includes(token);
+}
+
+function isMutationBashCommand(tokens: string[], index: number): boolean {
+	const token = path.basename(tokens[index] ?? "");
+	if (BASH_MUTATION_COMMANDS.has(token)) return true;
+	if (token !== "sed") return false;
+	const next = tokens[index + 1] ?? "";
+	return next === "-i" || next.startsWith("-i") || next.includes("i");
+}
+
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);
 	if (tool.name === "edit") return extractEditTargets(args, tool);
+	if (tool.name === "bash") return extractBashTargets(args);
 	return { paths: [], unknown: true };
 }
 
@@ -289,6 +358,14 @@ function isAllowlistedPath(cwd: string, rawPath: string): boolean {
 	if (segments?.[0] !== ".gjc") return false;
 	return segments[1] === "specs" || segments[1] === "plans";
 }
+function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
+	const segments = relativeGjcSegments(cwd, rawPath);
+	return segments?.[0] === ".gjc";
+}
+
+function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
+	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
+}
 
 function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean {
 	return (
@@ -315,18 +392,16 @@ export async function getDeepInterviewMutationDecision(
 ): Promise<DeepInterviewMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);
-	if (input.enforceWorkflowState !== false) {
+	if (input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
-		if (stateSkill) {
-			const command = sanctionedWorkflowStateCommand(stateSkill);
-			return {
-				blocked: true,
-				message: `${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`,
-				targets: targets.paths,
-				reason: "workflow-state-target",
-				command,
-			};
-		}
+		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
+		return {
+			blocked: true,
+			message: `${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`,
+			targets: targets.paths,
+			reason: stateSkill ? "workflow-state-target" : "gjc-target",
+			command,
+		};
 	}
 	if (!(await isActiveDeepInterview(input.cwd, input.sessionId, input.threadId))) {
 		return { blocked: false, targets: [] };
@@ -339,6 +414,9 @@ export async function getDeepInterviewMutationDecision(
 			targets: targets.paths,
 			reason: "unknown-target",
 		};
+	}
+	if (input.tool.name === "bash") {
+		return { blocked: false, targets: targets.paths };
 	}
 	return {
 		blocked: true,

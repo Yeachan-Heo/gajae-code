@@ -1355,7 +1355,7 @@ export class Agent {
 
 	/** Calculate total text length from an assistant message's content blocks */
 	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
 			return 0;
 		}
 		let length = 0;

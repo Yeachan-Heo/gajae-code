@@ -297,6 +297,11 @@ export class Settings {
 		return getDefault(path);
 	}
 
+	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
+	has(path: SettingPath): boolean {
+		return getByPath(this.#merged, path.split(".")) !== undefined;
+	}
+
 	/**
 	 * Set a setting value (sync).
 	 * Updates global settings and queues a background save.

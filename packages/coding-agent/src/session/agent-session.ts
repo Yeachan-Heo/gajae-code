@@ -167,6 +167,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -288,6 +289,11 @@ export type AgentSessionEvent =
  * `gjc state` runtime selector resolver.
  */
 const SAFE_PATH_COMPONENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
+
+function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
+	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -1895,6 +1901,15 @@ export class AgentSession {
 						attempt: this.#retryAttempt,
 					});
 					this.#retryAttempt = 0;
+					// Settle the retry gate here, colocated with the success event, rather
+					// than relying on the generic #resolveRetry() at the end of the
+					// agent_end branch. That tail resolver is bypassed by every early
+					// return in agent_end (successful `yield`, handoff-abort skip-maintenance,
+					// missing assistant message), so a retry that recovers on a yield turn
+					// would otherwise leave #retryPromise unresolved — wedging
+					// #waitForPostPromptRecovery and the session as permanently busy.
+					// #resolveRetry() is idempotent, so the later tail call is a no-op.
+					this.#resolveRetry();
 				}
 			}
 
@@ -3494,7 +3509,7 @@ export class AgentSession {
 	 * prompts or tool execution can run.
 	 */
 	#wrapToolForDeepInterviewMutationGuard<T extends AgentTool>(tool: T): T {
-		if (!["edit", "write", "ast_edit"].includes(tool.name)) return tool;
+		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
@@ -5963,7 +5978,14 @@ export class AgentSession {
 				if (artifactsDir) {
 					const handoffFilePath = path.join(artifactsDir, createHandoffFileName());
 					try {
-						await Bun.write(handoffFilePath, `${handoffText}\n`);
+						if (isUnderProjectGjc(this.sessionManager.getCwd(), handoffFilePath)) {
+							await writeArtifact(handoffFilePath, `${handoffText}\n`, {
+								cwd: this.sessionManager.getCwd(),
+								audit: { category: "artifact", verb: "write", owner: "gjc-runtime" },
+							});
+						} else {
+							await Bun.write(handoffFilePath, `${handoffText}\n`);
+						}
 						savedPath = handoffFilePath;
 					} catch (error) {
 						logger.warn("Failed to save handoff document to disk", {
@@ -7629,7 +7651,19 @@ export class AgentSession {
 		}
 
 		// Retry via continue() outside the agent_end event callback chain.
-		this.#scheduleAgentContinue({ delayMs: 1, generation });
+		// If the scheduled continue cannot run — it throws (e.g. AgentBusyError from a
+		// concurrent turn, or "Cannot continue ...") or is skipped because a newer
+		// generation took over — the agent_end that normally resolves #retryPromise
+		// never arrives. Finalize the retry in that case so #waitForPostPromptRecovery
+		// (and the in-flight prompt holding it open) cannot wedge the session as
+		// permanently busy, which would turn every later prompt() into a
+		// non-recoverable AgentBusyError loop.
+		this.#scheduleAgentContinue({
+			delayMs: 1,
+			generation,
+			onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
+			onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
+		});
 
 		return true;
 	}
@@ -7653,6 +7687,27 @@ export class AgentSession {
 		if (!this.#retryAbortController) return;
 		this.#retryNowRequested = true;
 		this.#retryAbortController.abort();
+	}
+
+	/**
+	 * Finalize a pending auto-retry that can no longer reach a resolving agent_end
+	 * (the scheduled continue threw or was superseded). Without this, #retryPromise
+	 * stays unresolved, #waitForPostPromptRecovery never returns, the owning
+	 * prompt's in-flight count is never released, and the session reports
+	 * `isStreaming === true` forever — turning every later prompt() into a
+	 * non-recoverable AgentBusyError. No-op once the retry has already settled.
+	 */
+	#failRetryRecovery(reason: string): void {
+		if (!this.#retryPromise) return;
+		const attempt = this.#retryAttempt;
+		this.#retryAttempt = 0;
+		void this.#emitSessionEvent({
+			type: "auto_retry_end",
+			success: false,
+			attempt,
+			finalError: reason,
+		});
+		this.#resolveRetry();
 	}
 
 	async #promptAgentWithIdleRetry(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {

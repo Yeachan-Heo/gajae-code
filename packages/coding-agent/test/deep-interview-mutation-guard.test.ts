@@ -104,8 +104,8 @@ describe("deep-interview mutation guard", () => {
 				args: { path: rawPath, content: "x" },
 			});
 			expect(decision.blocked).toBe(true);
-			expect(decision.reason).toBe("handoff-artifact-tool-target");
-			expect(decision.message).toContain("gjc deep-interview --write --stage final");
+			expect(decision.reason).toBe("gjc-target");
+			expect(decision.message).toContain("runtime-owned");
 		}
 
 		const blockedCases: Array<[string, AgentTool, unknown]> = [
@@ -150,8 +150,8 @@ describe("deep-interview mutation guard", () => {
 				args,
 			});
 			expect(decision.blocked).toBe(true);
-			if (decision.reason === "workflow-state-target") {
-				expect(decision.message).toContain("Workflow state JSON is runtime-owned");
+			if (decision.reason === "workflow-state-target" || decision.reason === "gjc-target") {
+				expect(decision.message).toContain("runtime-owned");
 			} else {
 				expect(decision.message).toBe(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
 			}
@@ -187,7 +187,7 @@ describe("deep-interview mutation guard", () => {
 				args: { path: rawPath, content: "x" },
 			});
 			expect(decision.blocked).toBe(true);
-			expect(decision.message).toBe(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+			expect(decision.message).toContain("runtime-owned");
 		}
 
 		const mixed = await getDeepInterviewMutationDecision({
@@ -197,6 +197,51 @@ describe("deep-interview mutation guard", () => {
 			args: { paths: [".gjc/state/deep-interview-state.json", "packages/**"], ops: [{ pat: "foo", out: "bar" }] },
 		});
 		expect(mixed.blocked).toBe(true);
+	});
+
+	it("allows read-only bash during active deep-interview when no mutation target is extracted", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			"git status --short",
+			"rg deep-interview packages/coding-agent/src",
+			"cat packages/coding-agent/package.json",
+			"sed -n '1,80p' packages/coding-agent/src/skill-state/deep-interview-mutation-guard.ts",
+			"bun test packages/coding-agent/test/deep-interview-mutation-guard.test.ts",
+		]) {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+			expect(decision.targets).toEqual([]);
+		}
+	});
+
+	it("blocks mutating bash that targets .gjc during active deep-interview", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			"rm .gjc/state/deep-interview-state.json",
+			"mkdir -p .gjc/specs",
+			"cp source.md .gjc/specs/deep-interview-x.md",
+			"sed -i 's/a/b/' .gjc/plans/plan.md",
+			"cat source.md > .gjc/specs/deep-interview-x.md",
+		]) {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.message).toContain("runtime-owned");
+			expect(["gjc-target", "workflow-state-target"]).toContain(decision.reason ?? "");
+		}
 	});
 
 	it("blocks vim file-switches into .gjc", async () => {
@@ -214,7 +259,7 @@ describe("deep-interview mutation guard", () => {
 		});
 
 		expect(decision.blocked).toBe(true);
-		expect(decision.message).toBe(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+		expect(decision.message).toContain("runtime-owned");
 	});
 
 	it("does not block after deep-interview reaches a terminal phase", async () => {

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-06-02
+
 ### Added
 
 - Added Claude Code parity `monitor` plus `CronCreate`, `CronList`, and `CronDelete` tools with frozen upstream schema fixtures, inline scheduling, background output monitoring, and ACP permission coverage.

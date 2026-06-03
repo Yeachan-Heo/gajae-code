@@ -1,0 +1,186 @@
+/**
+ * Core types for the gajae-code-native coding-harness operations control plane (v1).
+ *
+ * See the approved consensus plan at
+ * `.gjc/plans/ralplan/2026-06-02-0853-3e33/stage-02-revision.md` and the spec at
+ * `.gjc/specs/deep-interview-harness-control-plane.md`.
+ *
+ * v1 implements the gajae-code adapter only. omx/codex/remote/auth are deferred seams.
+ */
+
+/** Harnesses the control plane can operate. v1 implements `gajae-code` only. */
+export type Harness = "gajae-code" | "codex" | "omx";
+
+/** Lifecycle states of an operated session. */
+export type HarnessLifecycle =
+	| "new"
+	| "started"
+	| "submitted"
+	| "observing"
+	| "recovering"
+	| "validating"
+	| "finalizing"
+	| "completed"
+	| "blocked"
+	| "retired";
+
+/** Event severities emitted by the owner. */
+export type Severity = "info" | "warn" | "critical";
+
+/** Bounded git delta classification surfaced by `observe`. */
+export type GitDelta = "clean" | "dirty" | "zero-delta" | "unknown";
+
+/** Risk classification surfaced by `observe`. */
+export type RiskKind = "normal" | "prompt-not-accepted" | "deleted-worktree" | "vanished-dirty";
+
+/** Deterministic recovery classifications. */
+export type RecoveryClassification =
+	| "continue"
+	| "send-enter"
+	| "reinject-prompt"
+	| "restart-clean"
+	| "restart-preserve-delta"
+	| "fallback-codex-exec"
+	| "human-check";
+
+/** Receipt families persisted under the session storage dir. */
+export type ReceiptFamily = "vanish" | "prompt-acceptance" | "validation" | "completion";
+
+/** The CLI verbs / primitives exposed by `gjc harness <verb>`. */
+export type HarnessVerb =
+	| "start"
+	| "submit"
+	| "observe"
+	| "classify"
+	| "recover"
+	| "validate"
+	| "finalize"
+	| "retire"
+	| "events"
+	| "monitor"
+	| "operate";
+
+/** Submission transports. */
+export type SubmitMode = "paste-buffer" | "stdin" | "file";
+
+/** A single entry in the forcing-function `nextAllowedActions` list. */
+export interface NextAllowedAction {
+	verb: HarnessVerb;
+	available: boolean;
+	/** Present when `available` is false; explains why the verb is currently disallowed. */
+	reason?: string;
+}
+
+/** Compact, model-facing view of session state included in every response. */
+export interface SessionStateView {
+	sessionId: string;
+	lifecycle: HarnessLifecycle;
+	harness: Harness;
+	ownerLive: boolean;
+	blockers: string[];
+}
+
+/**
+ * The universal contract: EVERY primitive response carries `{state, evidence, nextAllowedActions}`.
+ * `ok` is a transport-level convenience; semantic blocking is expressed via state + nextAllowedActions.
+ */
+export interface PrimitiveResponse<E = Record<string, unknown>> {
+	ok: boolean;
+	state: SessionStateView;
+	evidence: E;
+	nextAllowedActions: NextAllowedAction[];
+}
+
+/** Re-grabbable session handle returned by `start` / `operate`. */
+export interface SessionHandle {
+	sessionId: string;
+	harness: Harness;
+	repo: string | null;
+	workspace: string;
+	branch: string | null;
+	base: string | null;
+	issueOrPr: string | null;
+	processHandle: { kind: "runtime-owner"; ownerId: string | null; pid: number | null };
+	rpcHandle: { kind: "rpc-subprocess"; pid: number | null; sessionDir: string };
+	ownerHandle: { leasePath: string; endpoint: string | null; heartbeatAt: string | null };
+	routerHandle: { kind: "default-in-owner"; policy: string; eventsPath: string };
+	viewportHandle: { kind: "event-monitor"; tmuxSessionName: string | null; viewOnly: true };
+	startedAt: string;
+	updatedAt: string;
+}
+
+/** Persisted per-session record (state.json). */
+export interface SessionState {
+	schemaVersion: number;
+	sessionId: string;
+	lifecycle: HarnessLifecycle;
+	harness: Harness;
+	handle: SessionHandle;
+	/** Per-classification retry counters consumed by the recovery policy. */
+	retries: Record<string, number>;
+	blockers: string[];
+	createdAt: string;
+	updatedAt: string;
+}
+
+/** Bounded observation surfaced by `observe` — never a raw pane/transcript dump. */
+export interface Observation {
+	lifecycle: HarnessLifecycle;
+	ownerLive: boolean;
+	cwd: string;
+	branch: string | null;
+	gitDelta: GitDelta;
+	lastActivityAt: string | null;
+	observedSignals: string[];
+	risk: RiskKind;
+}
+
+/** Input to the deterministic recovery classifier. */
+export interface ClassifyInput {
+	observation: Observation;
+	/** Remaining retry budget per classification family. */
+	retryBudget: RetryBudget;
+	/** Whether an accepted prompt was in flight when the owner/RPC was last seen. */
+	acceptedPromptActive?: boolean;
+}
+
+/** Default and supplied retry budgets. */
+export interface RetryBudget {
+	reinjectPrompt: number;
+	zeroDeltaVanish: number;
+	dirtyVanishPreserve: number;
+	validationRepair: number;
+}
+
+/** Result of the deterministic recovery classifier. */
+export interface RecoveryDecision {
+	classification: RecoveryClassification;
+	reason: string;
+	severity: Severity;
+	/** Whether executing the recommended action requires a live owner. */
+	ownerRequired: boolean;
+	/** Receipt family that MUST be valid before the action may proceed (e.g. `vanish`). */
+	requiredReceiptFamily: ReceiptFamily | null;
+}
+
+/** Severity-tagged event envelope written exclusively by the owner. */
+export interface EventEnvelope<E = Record<string, unknown>> {
+	eventId: string;
+	cursor: number;
+	createdAt: string;
+	severity: Severity;
+	kind: string;
+	state: SessionStateView;
+	evidence: E;
+	nextAllowedActions: NextAllowedAction[];
+	writer: { ownerId: string; leaseEpoch: number };
+}
+
+export const SESSION_SCHEMA_VERSION = 1 as const;
+
+export const DEFAULT_RETRY_BUDGET: RetryBudget = {
+	reinjectPrompt: 2,
+	zeroDeltaVanish: 1,
+	dirtyVanishPreserve: 1,
+	validationRepair: 2,
+};

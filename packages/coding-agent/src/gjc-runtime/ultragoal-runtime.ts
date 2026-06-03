@@ -1,9 +1,9 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
@@ -143,19 +143,17 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
-async function ensureUltragoalDir(paths: UltragoalPaths): Promise<void> {
-	await fs.mkdir(paths.dir, { recursive: true });
-}
-
 async function appendLedger(cwd: string, event: JsonObject): Promise<UltragoalLedgerEvent> {
 	const paths = getUltragoalPaths(cwd);
-	await ensureUltragoalDir(paths);
 	const entry: UltragoalLedgerEvent = {
 		eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
 		...event,
 		timestamp: new Date().toISOString(),
 	};
-	await fs.appendFile(paths.ledgerPath, `${JSON.stringify(entry)}\n`);
+	await appendJsonl(paths.ledgerPath, entry, {
+		cwd,
+		audit: { category: "ledger", verb: "append", owner: "gjc-runtime" },
+	});
 	return entry;
 }
 
@@ -175,9 +173,14 @@ export async function readUltragoalLedger(cwd: string): Promise<UltragoalLedgerE
 
 async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
 	const paths = getUltragoalPaths(cwd);
-	await ensureUltragoalDir(paths);
-	await Bun.write(paths.briefPath, `${plan.brief.trim()}\n`);
-	await Bun.write(paths.goalsPath, `${JSON.stringify(plan, null, 2)}\n`);
+	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
+		cwd,
+		audit: { category: "artifact", verb: "write", owner: "gjc-runtime" },
+	});
+	await writeJsonAtomic(paths.goalsPath, plan, {
+		cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime" },
+	});
 }
 
 function requiredUltragoalGoals(plan: UltragoalPlan): UltragoalGoal[] {

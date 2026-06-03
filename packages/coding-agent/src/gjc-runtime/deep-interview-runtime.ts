@@ -2,10 +2,12 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildDeepInterviewHudSummary } from "../skill-state/workflow-hud";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { runNativeStateCommand } from "./state-runtime";
+import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 /**
  * Native implementation of `gjc deep-interview`.
@@ -104,13 +106,6 @@ async function readJsonObject(filePath: string): Promise<Record<string, unknown>
 	return {};
 }
 
-async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	const tmp = `${filePath}.tmp-${randomBytes(6).toString("hex")}`;
-	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`);
-	await fs.rename(tmp, filePath);
-}
-
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
 	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
 	try {
@@ -202,9 +197,29 @@ async function readSettingsAmbiguityThreshold(
 	return { threshold: candidate, source: settingsPath };
 }
 
+async function readModernSettingsAmbiguityThreshold(
+	cwd: string,
+): Promise<{ threshold: number; source: string } | undefined> {
+	const settings = await Settings.init({ cwd });
+	const modernConfigPath = path.join(settings.getAgentDir(), "config.yml");
+	let parsed: unknown;
+	try {
+		parsed = (await import("bun")).YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
+	} catch {
+		return undefined;
+	}
+	const candidate = (parsed as { gjc?: { deepInterview?: { ambiguityThreshold?: unknown } } })?.gjc?.deepInterview
+		?.ambiguityThreshold;
+	if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0 || candidate > 1)
+		return undefined;
+	return { threshold: candidate, source: modernConfigPath };
+}
+
 async function resolveConfiguredAmbiguityThreshold(
 	cwd: string,
 ): Promise<{ threshold: number; source: string } | undefined> {
+	const modernValue = await readModernSettingsAmbiguityThreshold(cwd);
+	if (modernValue) return modernValue;
 	const projectSettings = path.join(cwd, ".gjc", "settings.json");
 	const projectValue = await readSettingsAmbiguityThreshold(projectSettings);
 	if (projectValue) return projectValue;
@@ -373,17 +388,19 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
-	const specsDir = path.join(cwd, ".gjc", "specs");
-	await fs.mkdir(specsDir, { recursive: true });
-	const specPath = path.join(specsDir, `deep-interview-${resolved.slug}.md`);
+	const specPath = path.join(cwd, ".gjc", "specs", `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
-	await fs.writeFile(specPath, content);
+	await writeArtifact(specPath, content, {
+		cwd,
+		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+	});
 
 	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
-	await fs.appendFile(
-		path.join(specsDir, "deep-interview-index.jsonl"),
-		`${JSON.stringify({ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 })}\n`,
+	await appendJsonl(
+		path.join(cwd, ".gjc", "specs", "deep-interview-index.jsonl"),
+		{ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 },
+		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview" } },
 	);
 
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
@@ -402,7 +419,10 @@ export async function persistDeepInterviewSpec(
 		updated_at: createdAt,
 	};
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeJsonAtomic(statePath, payload);
+	await writeJsonAtomic(statePath, payload, {
+		cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+	});
 	await syncDeepInterviewHud({
 		cwd,
 		sessionId: resolved.sessionId,
@@ -421,11 +441,7 @@ export async function persistDeepInterviewSpec(
 }
 
 async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
-	const stateDir = resolved.sessionId
-		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(resolved.sessionId))
-		: path.join(cwd, ".gjc", "state");
-	await fs.mkdir(stateDir, { recursive: true });
-	const statePath = path.join(stateDir, "deep-interview-state.json");
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
 	const now = new Date().toISOString();
 	const payload: Record<string, unknown> = {
 		active: true,
@@ -448,7 +464,10 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		(payload.state as Record<string, unknown>).language = resolved.language;
 	}
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await fs.writeFile(statePath, `${JSON.stringify(payload, null, 2)}\n`);
+	await writeJsonAtomic(statePath, payload, {
+		cwd,
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+	});
 	return statePath;
 }
 

@@ -858,7 +858,7 @@ export class VimEngine {
 			}
 			case "r": {
 				const replacement = tokens[nextIndex + 1];
-				if (!replacement || replacement.value.length !== 1) {
+				if (replacement?.value.length !== 1) {
 					throw new VimError("Visual replace requires a literal character", opToken);
 				}
 				const visual = expandVisualOffsets(
@@ -1109,7 +1109,7 @@ export class VimEngine {
 				return nextIndex + 1;
 			case "r": {
 				const replacement = tokens[nextIndex + 1];
-				if (!replacement || replacement.value.length !== 1) {
+				if (replacement?.value.length !== 1) {
 					throw new VimError("r requires a replacement character", token);
 				}
 				await this.#applyAtomicChange(["r", replacement.value], () => {
@@ -1746,7 +1746,7 @@ export class VimEngine {
 			case "t":
 			case "T": {
 				const searchToken = tokens[index + 1];
-				if (!searchToken || searchToken.value.length !== 1) {
+				if (searchToken?.value.length !== 1) {
 					throw new VimError(`${token.value} requires a literal character`, token);
 				}
 				this.lastCharFind = { char: searchToken.value, mode: token.value as "f" | "F" | "t" | "T" };
