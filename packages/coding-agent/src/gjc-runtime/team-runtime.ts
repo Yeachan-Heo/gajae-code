@@ -866,17 +866,21 @@ async function ensureWorkerWorktree(
 export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): string {
 	return env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
 }
+function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
+	const suffix = detail?.trim() ? `:${detail.trim()}` : "";
+	return `gjc_team_requires_tmux_leader: run \`gjc --tmux\` first, then run \`gjc team ...\` inside that tmux-backed leader session, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
+}
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	const paneTarget = env.TMUX_PANE?.trim();
 	const args = paneTarget
 		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) throw new Error(result.stderr.toString().trim() || "team_requires_current_tmux_context");
+	if (result.exitCode !== 0) throw new Error(buildTeamTmuxLeaderRequirementMessage(result.stderr.toString()));
 	const [sessionAndWindow = "", leaderPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
-		throw new Error(`invalid_tmux_context:${result.stdout.toString().trim()}`);
+		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
 export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {

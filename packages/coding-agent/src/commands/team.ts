@@ -56,7 +56,8 @@ function parseInputFlag(argv: string[]): Record<string, unknown> {
 }
 
 export default class Team extends Command {
-	static description = "Run native GJC tmux team orchestration; --dry-run writes ephemeral .gjc/state/team state only";
+	static description =
+		"Run native GJC tmux team orchestration from inside an existing tmux/GJC --tmux session; --dry-run writes ephemeral .gjc/state/team state only";
 	static strict = false;
 
 	static args = {
@@ -76,6 +77,7 @@ export default class Team extends Command {
 	};
 
 	static examples = [
+		"gjc --tmux  # start/attach the required tmux-backed leader session first",
 		'gjc team 3:executor "Implement the approved plan"',
 		"gjc team status <team-name> --json",
 		'gjc team api claim-task --input \'{"team_name":"demo","worker_id":"worker-1"}\' --json',

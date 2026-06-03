@@ -353,7 +353,7 @@ describe("native gjc team runtime", () => {
 				cwd: cleanupRoot,
 				env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
 			}),
-		).rejects.toThrow(/no current tmux|team_requires_current_tmux_context/);
+		).rejects.toThrow(/gjc_team_requires_tmux_leader: run `gjc --tmux` first/);
 
 		expect(await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "fail-team", "phase.json")).exists()).toBe(
 			false,
