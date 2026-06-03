@@ -321,3 +321,54 @@ export interface TaskToolDetails {
 		type: "task";
 	};
 }
+/**
+ * Persisted per-turn / per-subagent token record (Phase 0 instrumentation).
+ *
+ * Additive: this does not alter any existing task result shape. It is the
+ * durable, model-independent unit the deterministic orchestration-token
+ * benchmark (`@gajae-code/orchestration-token-benchmark`) consumes to measure
+ * token efficiency without any live-model calls.
+ */
+export interface TaskTokenLog {
+	/** Subagent id, or "root" for the orchestrator's own turn. */
+	subagentId: string;
+	/** Agent name for attribution, when known. */
+	agent?: string;
+	/** 1-based turn index within the subagent's session. */
+	turn: number;
+	/** ISO-8601 timestamp the turn completed. */
+	at: string;
+	/** Cost-bearing input tokens (excludes cache reads), mirrors `Usage.input`. */
+	input: number;
+	/** Total output tokens for the turn, mirrors `Usage.output`. */
+	output: number;
+	/** Tokens read from the prompt cache, mirrors `Usage.cacheRead`. */
+	cacheRead: number;
+	/** Tokens written to the prompt cache, mirrors `Usage.cacheWrite`. */
+	cacheWrite: number;
+	/** input + output + cacheRead + cacheWrite. */
+	totalTokens: number;
+	/** Latest per-turn context-window occupancy, when known. */
+	contextTokens?: number;
+	/** Estimated USD cost for the turn, when known. */
+	cost?: number;
+	/** Model id used for the turn, when known. */
+	model?: string;
+}
+
+/**
+ * Deterministic aggregate token metrics computed from a set of `TaskTokenLog`
+ * entries. The cache-hit-rate field is the primary prompt-cache signal called
+ * out by the prefix-stability invariant (see the approved plan).
+ */
+export interface TaskTokenMetrics {
+	/** Number of token-log entries aggregated. */
+	turns: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	totalTokens: number;
+	/** cacheRead / (input + cacheRead); 0 when there is no input-class traffic. */
+	cacheHitRate: number;
+}

@@ -99,6 +99,13 @@
         "@types/bun": "catalog:",
       },
     },
+    "packages/orchestration-token-benchmark": {
+      "name": "@gajae-code/orchestration-token-benchmark",
+      "version": "0.0.1",
+      "devDependencies": {
+        "@types/bun": "catalog:",
+      },
+    },
     "packages/stats": {
       "name": "@gajae-code/stats",
       "version": "0.2.5",
@@ -404,6 +411,8 @@
     "@gajae-code/coding-agent": ["@gajae-code/coding-agent@workspace:packages/coding-agent"],
 
     "@gajae-code/natives": ["@gajae-code/natives@workspace:packages/natives"],
+
+    "@gajae-code/orchestration-token-benchmark": ["@gajae-code/orchestration-token-benchmark@workspace:packages/orchestration-token-benchmark"],
 
     "@gajae-code/stats": ["@gajae-code/stats@workspace:packages/stats"],
 
