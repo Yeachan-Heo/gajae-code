@@ -880,6 +880,17 @@ export class Agent {
 		this.#steeringQueue = [...messages, ...this.#steeringQueue];
 	}
 
+	/** Snapshot the follow-up queue without mutating it. */
+	snapshotFollowUp(): AgentMessage[] {
+		return this.#followUpQueue.slice();
+	}
+
+	/** Restore previously snapshotted follow-up messages ahead of any newly queued ones. */
+	restoreFollowUp(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#followUpQueue = [...messages, ...this.#followUpQueue];
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
 		if (this.#steeringMode === "one-at-a-time") {
 			if (this.#steeringQueue.length > 0) {

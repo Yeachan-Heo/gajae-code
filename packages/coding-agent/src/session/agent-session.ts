@@ -106,7 +106,6 @@ export interface ForkContextSeedOptions {
 
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
-	extractHttpStatusFromError,
 	extractRetryHint,
 	isEnoent,
 	isUnexpectedSocketCloseMessage,
@@ -7230,6 +7229,16 @@ export class AgentSession {
 		);
 	}
 
+	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
+		// Parse only explicit HTTP/status wording. Do not treat generic
+		// `error: 400` as an HTTP status because rate-limit copy can say
+		// "rate limit error: 400 requests per minute".
+		const match = /\b(?:http(?:\s+status)?|status(?:[\s_-]+code)?)(?:\s+|[:=]\s*)(\d{3})\b/i.exec(errorMessage);
+		if (!match) return undefined;
+		const status = Number(match[1]);
+		return Number.isFinite(status) && status >= 100 && status <= 599 ? status : undefined;
+	}
+
 	/**
 	 * Ordered retry classification: overflow (compaction) -> terminal (surface)
 	 * -> usage_limit (rotation) -> transient (retry) -> unknown (retry).
@@ -7246,16 +7255,17 @@ export class AgentSession {
 		if (/anthropic stream envelope error:/i.test(err)) {
 			return this.#isTransientEnvelopeErrorMessage(err) ? "transient" : "terminal";
 		}
-		// HTTP status is the most reliable terminal signal: a 4xx client error
-		// (other than 408/425 timeout and 429 rate limit) will not succeed on
-		// retry, so surface it instead of looping forever as "unknown".
-		const status = message.errorStatus ?? extractHttpStatusFromError({ message: err });
-		if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429) {
-			return "terminal";
-		}
+		// Structured provider HTTP status is usually authoritative, but providers
+		// may derive errorStatus from broad message parsing. Classify text first so
+		// deterministic terminal copy still surfaces, while retry/rate-limit copy
+		// like "rate limit error: 400 requests/min" is not terminalized as HTTP 400.
 		if (this.#isTerminalErrorMessage(err)) return "terminal";
 		if (isUsageLimitError(err)) return "usage_limit";
 		if (this.#isTransientErrorMessage(err)) return "transient";
+		const status = message.errorStatus ?? this.#extractExplicitHttpStatusFromErrorMessage(err);
+		if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429) {
+			return "terminal";
+		}
 		return "unknown";
 	}
 
@@ -8448,6 +8458,8 @@ export class AgentSession {
 		const previousFallbackSelectedMCPToolNames = previousSessionFile
 			? this.#getSessionDefaultSelectedMCPToolNames(previousSessionFile)
 			: undefined;
+		const previousAgentSteeringQueue = this.agent.snapshotSteering();
+		const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
 
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
@@ -8465,6 +8477,12 @@ export class AgentSession {
 				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
 			const fallbackSelectedMCPToolNames = this.#getSessionDefaultSelectedMCPToolNames(sessionPath);
 			await this.#restoreMCPSelectionsForSessionContext(sessionContext, { fallbackSelectedMCPToolNames });
+
+			// The target session is loaded and MCP selections are restored: the
+			// switch is committed far enough to discard pre-switch delivery queues.
+			// Clear before session_switch hooks, so messages enqueued by hooks belong
+			// to the new session and remain deliverable.
+			this.agent.clearAllQueues();
 
 			// Emit session_switch event to hooks
 			if (this.#extensionRunner) {
@@ -8530,10 +8548,6 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				this.#resetHindsightConversationTrackingIfHindsight();
 			}
-			// Clear the agent delivery queues only once the switch has committed,
-			// so a rollback (catch) leaves them intact alongside the restored UI
-			// queues instead of silently dropping queued messages.
-			this.agent.clearAllQueues();
 			this.#reconnectToAgent();
 			return true;
 		} catch (error) {
@@ -8564,6 +8578,9 @@ export class AgentSession {
 			this.#followUpMessages = previousFollowUpMessages;
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+			this.agent.clearAllQueues();
+			this.agent.restoreSteering(previousAgentSteeringQueue);
+			this.agent.restoreFollowUp(previousAgentFollowUpQueue);
 			if (previousModel) {
 				this.agent.setModel(previousModel);
 			}
