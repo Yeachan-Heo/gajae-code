@@ -840,6 +840,7 @@ function validateContractCoverage(
 ): void {
 	const rows = requireObjectArray(executorQa.contractCoverage, "executorQa.contractCoverage");
 	buildRowIdMap(rows, "executorQa.contractCoverage");
+	let hasSuccessfulContractCoverage = false;
 	for (const [index, row] of rows.entries()) {
 		const fieldName = `executorQa.contractCoverage[${index}]`;
 		requiredStringField(row, "contractRef", fieldName);
@@ -851,6 +852,7 @@ function validateContractCoverage(
 		requiredStringField(row, "obligation", fieldName);
 		if (!status) throw new Error(`qualityGate ${fieldName}.status must be a non-empty string`);
 		requireSuccessStatus(status, fieldName);
+		hasSuccessfulContractCoverage = true;
 		const surfaceIds = optionalStringLinks(row, "surfaceEvidenceRefs", fieldName);
 		const adversarialIds = optionalStringLinks(row, "adversarialCaseRefs", fieldName);
 		const artifactIds = optionalStringLinks(row, "artifactRefs", fieldName);
@@ -880,6 +882,11 @@ function validateContractCoverage(
 		if (successfulProofLinks === 0) {
 			throw new Error(`qualityGate ${fieldName} must link to at least one successful proof row or artifact`);
 		}
+	}
+	if (!hasSuccessfulContractCoverage) {
+		throw new Error(
+			"qualityGate executorQa.contractCoverage must include at least one row with status covered, passed, or verified",
+		);
 	}
 }
 

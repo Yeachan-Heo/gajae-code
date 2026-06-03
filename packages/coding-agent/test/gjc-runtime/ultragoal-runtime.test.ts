@@ -486,6 +486,28 @@ describe("native GJC ultragoal runtime", () => {
 		expect(emptyMatrixError).toContain("executorQa.surfaceEvidence");
 	});
 
+	it("rejects all-not-applicable contract coverage before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const allNotApplicableCoverage = mutateQualityGate(gate => {
+			gate.executorQa!.contractCoverage = [
+				{
+					id: "contract-goal",
+					contractRef: "approved-plan:goal",
+					status: "not_applicable",
+					reason: "Incorrectly claimed the approved goal contract is not applicable",
+				},
+			];
+		});
+
+		const coverageError = await expectRejectedCompleteGate(root, created, allNotApplicableCoverage);
+
+		expect(coverageError).toContain(
+			"executorQa.contractCoverage must include at least one row with status covered, passed, or verified",
+		);
+	});
+
 	it("rejects missing red-team artifact references before mutation", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
