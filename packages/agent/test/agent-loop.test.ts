@@ -458,7 +458,7 @@ describe("agentLoop with AgentMessage", () => {
 				e.type === "message_end" && e.message.role === "toolResult",
 		);
 		expect(toolResultEvent).toBeDefined();
-		if (!toolResultEvent || toolResultEvent.message.role !== "toolResult") return;
+		if (toolResultEvent?.message.role !== "toolResult") return;
 		expect(toolResultEvent.message.isError).toBe(true);
 		expect(toolResultEvent.message.toolCallId).toBe("tool-1");
 		expect(toolResultEvent.message.content[0]?.type).toBe("text");

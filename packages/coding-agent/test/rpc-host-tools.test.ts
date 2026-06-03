@@ -53,7 +53,7 @@ describe("RpcHostToolBridge", () => {
 
 		expect(frames).toHaveLength(1);
 		const request = frames[0];
-		if (!request || request.type !== "host_tool_call") {
+		if (request?.type !== "host_tool_call") {
 			throw new Error("Expected host_tool_call frame");
 		}
 
@@ -100,7 +100,7 @@ describe("RpcHostToolBridge", () => {
 		const controller = new AbortController();
 		const execution = tool.execute("toolu_2", {}, controller.signal);
 		const request = frames[0];
-		if (!request || request.type !== "host_tool_call") {
+		if (request?.type !== "host_tool_call") {
 			throw new Error("Expected host_tool_call frame");
 		}
 

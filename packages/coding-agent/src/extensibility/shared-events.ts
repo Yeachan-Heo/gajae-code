@@ -226,6 +226,7 @@ export interface AutoRetryStartEvent {
 	maxAttempts: number;
 	delayMs: number;
 	errorMessage: string;
+	unbounded?: boolean;
 }
 
 /** Fired when auto-retry ends */

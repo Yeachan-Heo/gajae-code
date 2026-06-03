@@ -328,7 +328,7 @@ describe("gjc state handoff", () => {
 
 			// Step 2: R -> U.
 			const step2 = await runNativeStateCommand(
-				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json", "--force"],
 				cwd,
 			);
 			expect(step2.status).toBe(0);

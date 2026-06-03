@@ -113,7 +113,7 @@ describe("SessionManager signature persistence", () => {
 		const reloadedUserEntry = reloaded
 			.getEntries()
 			.find(entry => entry.type === "message" && entry.message.role === "user");
-		if (!reloadedUserEntry || reloadedUserEntry.type !== "message" || reloadedUserEntry.message.role !== "user") {
+		if (reloadedUserEntry?.type !== "message" || reloadedUserEntry.message.role !== "user") {
 			throw new Error("Expected user message");
 		}
 

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
@@ -899,11 +900,7 @@ async function readBrief(cwd: string, args: readonly string[]): Promise<string> 
 
 function renderStatus(summary: UltragoalStatusSummary, json: boolean): string {
 	if (json) return `${JSON.stringify(summary, null, 2)}\n`;
-	if (!summary.exists) {
-		return `No ultragoal plan found at ${summary.paths.goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
-	}
-	const current = summary.currentGoal ? ` Current: ${summary.currentGoal.id} (${summary.currentGoal.status}).` : "";
-	return `Ultragoal ${summary.status}: ${summary.counts.complete}/${summary.goals.length} complete.${current}\n`;
+	return renderUltragoalStatusMarkdown(summary);
 }
 
 function renderCompleteHandoff(

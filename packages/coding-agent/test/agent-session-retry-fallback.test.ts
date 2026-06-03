@@ -33,7 +33,7 @@ function trackRetryEvents(session: AgentSession): {
 
 function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 	const lastMessage = session.messages.at(-1);
-	if (!lastMessage || lastMessage.role !== "assistant") {
+	if (lastMessage?.role !== "assistant") {
 		throw new Error("Expected final assistant message");
 	}
 	return lastMessage;

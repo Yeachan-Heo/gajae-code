@@ -422,7 +422,7 @@ export async function getRequestDetails(id: number): Promise<RequestDetails | nu
 	if (!msg) return null;
 
 	const entry = await getSessionEntry(msg.sessionFile, msg.entryId);
-	if (!entry || entry.type !== "message") return null;
+	if (entry?.type !== "message") return null;
 
 	// TODO: Get parent/context messages?
 	// For now we return the single entry which contains the assistant response.

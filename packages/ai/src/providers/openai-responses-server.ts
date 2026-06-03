@@ -954,7 +954,7 @@ export function encodeStream(
 							break;
 						}
 						case "text_delta": {
-							if (!state.open || state.open.kind !== "message") break;
+							if (state.open?.kind !== "message") break;
 							const cur: OpenMessage = state.open;
 							cur.currentPartText += ev.delta;
 							emit("response.output_text.delta", {
@@ -970,7 +970,7 @@ export function encodeStream(
 							break;
 						}
 						case "text_end": {
-							if (!state.open || state.open.kind !== "message") break;
+							if (state.open?.kind !== "message") break;
 							const cur: OpenMessage = state.open;
 							const text = ev.content ?? cur.currentPartText;
 							emit("response.output_text.done", {
@@ -997,7 +997,7 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_delta": {
-							if (!state.open || state.open.kind !== "reasoning") break;
+							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
 							cur.reasoningText += ev.delta;
 							emit("response.reasoning_summary_text.delta", {
@@ -1009,7 +1009,7 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_end": {
-							if (!state.open || state.open.kind !== "reasoning") break;
+							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
 							const text = ev.content ?? cur.reasoningText;
 							cur.reasoningText = text;
@@ -1034,7 +1034,7 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_delta": {
-							if (!state.open || state.open.kind !== "function_call") break;
+							if (state.open?.kind !== "function_call") break;
 							const cur: OpenFunctionCall = state.open;
 							cur.argsText += ev.delta;
 							if (cur.customWireName) {
@@ -1053,7 +1053,7 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_end": {
-							if (!state.open || state.open.kind !== "function_call") break;
+							if (state.open?.kind !== "function_call") break;
 							const cur: OpenFunctionCall = state.open;
 							// Promote possibly-late info from the canonical ToolCall.
 							const tc = ev.toolCall;

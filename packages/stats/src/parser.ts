@@ -109,7 +109,7 @@ function extractStats(
 	currentServiceTier: ServiceTier | undefined,
 ): MessageStats | null {
 	const msg = entry.message as AssistantMessage;
-	if (!msg || msg.role !== "assistant") return null;
+	if (msg?.role !== "assistant") return null;
 
 	// Backfill: when the session recorded `priority` as the active service tier
 	// at this point but the AI usage payload was captured before priority

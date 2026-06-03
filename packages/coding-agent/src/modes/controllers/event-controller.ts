@@ -1,6 +1,7 @@
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import { calculatePromptTokens } from "@gajae-code/agent-core/compaction/compaction";
 import type { AssistantMessage, ImageContent } from "@gajae-code/ai";
+import { parseRateLimitReason } from "@gajae-code/ai";
 import { type Component, Loader, TERMINAL, Text } from "@gajae-code/tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -23,6 +24,24 @@ import { interruptHint } from "../shared";
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
+
+function friendlyRetryReason(errorMessage: string | undefined): string {
+	if (!errorMessage) return "";
+	switch (parseRateLimitReason(errorMessage)) {
+		case "RATE_LIMIT_EXCEEDED":
+			return "rate limited";
+		case "QUOTA_EXHAUSTED":
+			return "usage limit";
+		case "MODEL_CAPACITY_EXHAUSTED":
+			return "overloaded";
+		case "SERVER_ERROR":
+			return "server error";
+		default:
+			return /network|connection|socket|fetch failed|terminated|timeout|timed out|stream/i.test(errorMessage)
+				? "connection error"
+				: "transient error";
+	}
+}
 
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
@@ -71,6 +90,15 @@ export class EventController {
 
 	dispose(): void {
 		this.#cancelIdleCompaction();
+		this.#clearRetryCountdown();
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
+		}
+		if (this.ctx.retryLoader) {
+			this.ctx.retryLoader.stop();
+			this.ctx.retryLoader = undefined;
+		}
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -166,6 +194,7 @@ export class EventController {
 		}
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
+			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
@@ -648,21 +677,56 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
+	#clearRetryCountdown(): void {
+		if (this.ctx.retryCountdownTimer) {
+			clearInterval(this.ctx.retryCountdownTimer);
+			this.ctx.retryCountdownTimer = undefined;
+		}
+	}
+
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
-		this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
+		// Preserve the ORIGINAL editor Escape handler across repeated retry
+		// starts: auto_retry_end only fires at final success/failure, so a
+		// second auto_retry_start must not snapshot the prior retry handler.
+		if (!this.ctx.retryEscapeHandler) {
+			this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
+		}
+		let escPressed = false;
 		this.ctx.editor.onEscape = () => {
-			this.ctx.session.abortRetry();
+			if (!escPressed) {
+				// First Esc: skip the backoff and retry immediately.
+				escPressed = true;
+				this.ctx.session.retryNow();
+			} else {
+				// Second Esc: cancel the retry entirely.
+				this.ctx.session.abortRetry();
+			}
 		};
 		this.ctx.statusContainer.clear();
-		const delaySeconds = Math.round(event.delayMs / 1000);
-		this.ctx.retryLoader = new Loader(
+		// Stop any prior retry loader/timer before installing a new one.
+		this.ctx.retryLoader?.stop();
+		this.#clearRetryCountdown();
+		const reason = friendlyRetryReason(event.errorMessage);
+		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
+		const reasonSuffix = reason ? ` — ${reason}` : "";
+		const deadline = Date.now() + event.delayMs;
+		const buildMessage = () => {
+			const remainingSeconds = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+			// First Esc retries immediately; a second Esc cancels.
+			return `Retrying (${attemptLabel})${reasonSuffix}, next in ${remainingSeconds}s… (esc to retry now)`;
+		};
+		const retryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
 			text => theme.fg("muted", text),
-			`Retrying (${event.attempt}/${event.maxAttempts}) in ${delaySeconds}s… (esc to cancel)`,
+			buildMessage(),
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.retryLoader = retryLoader;
+		this.ctx.retryCountdownTimer = setInterval(() => {
+			retryLoader.setMessage(buildMessage());
+		}, 1000);
+		this.ctx.statusContainer.addChild(retryLoader);
 		this.ctx.ui.requestRender();
 	}
 
@@ -673,6 +737,7 @@ export class EventController {
 		}
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
+			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}

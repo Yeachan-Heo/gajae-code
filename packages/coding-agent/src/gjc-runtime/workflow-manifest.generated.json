@@ -144,6 +144,15 @@
       },
       {
         "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
           "kickoff"
         ],
         "name": "quick",
@@ -340,10 +349,15 @@
       {
         "id": "final",
         "terminal": true
+      },
+      {
+        "id": "handoff",
+        "terminal": true
       }
     ],
     "terminalStates": [
-      "final"
+      "final",
+      "handoff"
     ],
     "transitions": [
       {
@@ -370,6 +384,31 @@
         "from": "adr",
         "to": "final",
         "verb": "write-artifact"
+      },
+      {
+        "from": "planner",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "architect",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "critic",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "revision",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "adr",
+        "to": "handoff",
+        "verb": "handoff"
       }
     ],
     "typedArgs": [
@@ -449,6 +488,15 @@
           "write"
         ],
         "name": "replace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
         "type": "boolean"
       },
       {
@@ -651,12 +699,17 @@
       {
         "id": "cancelled",
         "terminal": true
+      },
+      {
+        "id": "handoff",
+        "terminal": true
       }
     ],
     "terminalStates": [
       "complete",
       "failed",
-      "cancelled"
+      "cancelled",
+      "handoff"
     ],
     "transitions": [
       {
@@ -698,6 +751,21 @@
         "from": "awaiting_integration",
         "to": "complete",
         "verb": "shutdown"
+      },
+      {
+        "from": "starting",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "running",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "awaiting_integration",
+        "to": "handoff",
+        "verb": "handoff"
       }
     ],
     "typedArgs": [
@@ -777,6 +845,15 @@
           "write"
         ],
         "name": "replace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
         "type": "boolean"
       },
       {
@@ -1025,11 +1102,16 @@
       {
         "id": "complete",
         "terminal": true
+      },
+      {
+        "id": "handoff",
+        "terminal": true
       }
     ],
     "terminalStates": [
       "failed",
-      "complete"
+      "complete",
+      "handoff"
     ],
     "transitions": [
       {
@@ -1066,6 +1148,26 @@
         "from": "failed",
         "to": "active",
         "verb": "complete-goals"
+      },
+      {
+        "from": "goal-planning",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "pending",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "active",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "blocked",
+        "to": "handoff",
+        "verb": "handoff"
       }
     ],
     "typedArgs": [
@@ -1145,6 +1247,15 @@
           "write"
         ],
         "name": "replace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
         "type": "boolean"
       },
       {

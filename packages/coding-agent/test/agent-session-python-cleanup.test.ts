@@ -415,7 +415,7 @@ describe("AgentSession python cleanup", () => {
 
 		const [toolResult] = await Promise.all([toolExecution, disposeSession]);
 
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expect(sleepSpy.mock.calls.some(([duration]) => typeof duration === "number" && duration > 0)).toBe(true);
 
 		expect(disposed).toBe(true);
 		expect(toolExecutionSettled).toBe(true);

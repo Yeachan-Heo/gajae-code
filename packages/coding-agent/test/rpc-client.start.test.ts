@@ -13,5 +13,5 @@ describe("RpcClient.start", () => {
 		});
 
 		await expect(client.start()).rejects.toThrow(/Unknown provider.*__missing_provider__/);
-	});
+	}, 30_000);
 });

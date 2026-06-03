@@ -189,7 +189,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 		try {
 			const artifactPath = path.join(root, "secret.md");
 			await fs.writeFile(artifactPath, "# Secret\nshould-not-be-read\n");
-			const cliPath = path.resolve(process.cwd(), "packages/coding-agent/src/cli.ts");
+			const cliPath = path.resolve(import.meta.dir, "..", "..", "src", "cli.ts");
 			const bunPath = process.execPath;
 			const tool = createRestrictedBashTool(root, [`${bunPath} ${cliPath} ralplan --write`]);
 			const result = await tool.execute("tool-call", {
