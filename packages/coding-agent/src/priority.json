@@ -10,6 +10,11 @@
 		"mini"
 	],
 	"slow": [
+		"opus-4.8",
+		"opus-4-8",
+		"opus-4.7",
+		"opus-4-7",
+		"gpt-5.5",
 		"gpt-5.4",
 		"gpt-5.3-codex",
 		"gpt-5.3",

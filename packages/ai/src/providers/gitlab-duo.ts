@@ -28,6 +28,26 @@ export type GitLabModelMapping = {
 };
 
 export const MODEL_MAPPINGS: Record<string, GitLabModelMapping> = {
+	"duo-chat-opus-4-8": {
+		provider: "anthropic",
+		model: "claude-opus-4-8",
+		name: "Duo Chat Opus 4.8",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200000,
+		maxTokens: 64000,
+	},
+	"duo-chat-opus-4-7": {
+		provider: "anthropic",
+		model: "claude-opus-4-7",
+		name: "Duo Chat Opus 4.7",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200000,
+		maxTokens: 64000,
+	},
 	"duo-chat-opus-4-6": {
 		provider: "anthropic",
 		model: "claude-opus-4-6",

@@ -26,9 +26,9 @@ describe("zenmux provider support", () => {
 	test("registers built-in descriptor and default model", () => {
 		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "zenmux");
 		expect(descriptor).toBeDefined();
-		expect(descriptor?.defaultModel).toBe("anthropic/claude-opus-4.6");
+		expect(descriptor?.defaultModel).toBe("anthropic/claude-opus-4.8");
 		expect(descriptor?.catalogDiscovery?.envVars).toContain("ZENMUX_API_KEY");
-		expect(DEFAULT_MODEL_PER_PROVIDER.zenmux).toBe("anthropic/claude-opus-4.6");
+		expect(DEFAULT_MODEL_PER_PROVIDER.zenmux).toBe("anthropic/claude-opus-4.8");
 	});
 
 	test("registers ZenMux in OAuth provider selector", () => {

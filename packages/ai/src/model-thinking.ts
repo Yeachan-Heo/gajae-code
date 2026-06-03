@@ -50,9 +50,12 @@ const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> 
 
 const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxTokens: number }> = {
 	"claude-opus-4.6": { contextWindow: 168000, maxTokens: 32000 },
+	"claude-opus-4.7": { contextWindow: 168000, maxTokens: 32000 },
+	"claude-opus-4.8": { contextWindow: 168000, maxTokens: 32000 },
 	"gpt-5.2": { contextWindow: 272000, maxTokens: 128000 },
 	"gpt-5.4": { contextWindow: 272000, maxTokens: 128000 },
 	"gpt-5.4-mini": { contextWindow: 272000, maxTokens: 128000 },
+	"gpt-5.5": { contextWindow: 272000, maxTokens: 128000 },
 	"grok-code-fast-1": { contextWindow: 192000, maxTokens: 64000 },
 };
 
@@ -307,9 +310,13 @@ export function mapEffortToAnthropicAdaptiveEffort<TApi extends Api>(
 }
 
 /**
- * Returns true for Anthropic models with Opus 4.7 API restrictions:
+ * Returns true for Anthropic Opus models 4.7+ that enforce the modern API
+ * restrictions:
  * - Sampling parameters (temperature/top_p/top_k) return 400 error
  * - Thinking content is omitted by default (needs display: "summarized")
+ *
+ * Applies to Opus 4.7, 4.8, and any future Opus 4.x release (the upstream
+ * Anthropic policy is "Opus 4.7+", inherited by all later 4.x models).
  */
 export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));

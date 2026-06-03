@@ -126,14 +126,14 @@ function catalogDescriptor(
  * OpenAI code provider) are handled separately because they require different config shapes.
  */
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
-	descriptor("anthropic", "claude-sonnet-4-6", config => anthropicModelManagerOptions(config)),
+	descriptor("anthropic", "claude-opus-4-8", config => anthropicModelManagerOptions(config)),
 	catalogDescriptor(
 		"alibaba-coding-plan",
 		"qwen3.5-plus",
 		config => alibabaCodingPlanModelManagerOptions(config),
 		catalog("Alibaba Coding Plan", ["ALIBABA_CODING_PLAN_API_KEY"]),
 	),
-	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
+	descriptor("openai", "gpt-5.5", config => openaiModelManagerOptions(config)),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
 	catalogDescriptor(
 		"huggingface",
@@ -174,23 +174,23 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => nanoGptModelManagerOptions(config),
 		catalog("NanoGPT", ["NANO_GPT_API_KEY"]),
 	),
-	descriptor("opencode-zen", "claude-sonnet-4-6", config => opencodeZenModelManagerOptions(config)),
+	descriptor("opencode-zen", "claude-opus-4-8", config => opencodeZenModelManagerOptions(config)),
 	descriptor("opencode-go", "kimi-k2.5", config => opencodeGoModelManagerOptions(config)),
 	catalogDescriptor(
 		"openrouter",
-		"openai/gpt-5.4",
+		"openai/gpt-5.5",
 		config => openrouterModelManagerOptions(config),
 		catalog("OpenRouter", ["OPENROUTER_API_KEY"], { allowUnauthenticated: true }),
 	),
 	catalogDescriptor(
 		"kilo",
-		"anthropic/claude-sonnet-4.5",
+		"anthropic/claude-opus-4.8",
 		config => kiloModelManagerOptions(config),
 		catalog("Kilo Gateway", ["KILO_API_KEY"], { allowUnauthenticated: true }),
 	),
 	catalogDescriptor(
 		"vercel-ai-gateway",
-		"anthropic/claude-sonnet-4-6",
+		"anthropic/claude-opus-4.8",
 		config => vercelAiGatewayModelManagerOptions(config),
 		catalog("Vercel AI Gateway", ["VERCEL_AI_GATEWAY_API_KEY"], { allowUnauthenticated: true }),
 	),
@@ -209,7 +209,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	catalogDescriptor(
 		"cloudflare-ai-gateway",
-		"claude-sonnet-4-5",
+		"anthropic/claude-opus-4-8",
 		config => cloudflareAiGatewayModelManagerOptions(config),
 		catalog("Cloudflare AI Gateway", ["CLOUDFLARE_AI_GATEWAY_API_KEY"]),
 	),
@@ -239,7 +239,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	catalogDescriptor(
 		"litellm",
-		"claude-opus-4-6",
+		"claude-opus-4-8",
 		config => litellmModelManagerOptions(config),
 		catalog("LiteLLM", ["LITELLM_API_KEY"], { allowUnauthenticated: true }),
 	),
@@ -276,7 +276,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	catalogDescriptor(
 		"zenmux",
-		"anthropic/claude-opus-4.6",
+		"anthropic/claude-opus-4.8",
 		config => zenmuxModelManagerOptions(config),
 		catalog("ZenMux", ["ZENMUX_API_KEY"]),
 	),
@@ -297,13 +297,13 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	// Providers not in PROVIDER_DESCRIPTORS (special auth or no standard discovery)
 	"azure-openai": "gpt-4.1",
 	"alibaba-coding-plan": "qwen3.5-plus",
-	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
+	"amazon-bedrock": "us.anthropic.claude-opus-4-8",
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-vertex": "gemini-3-pro-preview",
 	minimax: "MiniMax-M2.5",
 	"minimax-code": "MiniMax-M2.5",
 	"minimax-code-cn": "MiniMax-M2.5",
-	"openai-codex": "gpt-5.4",
+	"openai-codex": "gpt-5.5",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;
