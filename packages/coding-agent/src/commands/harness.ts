@@ -27,6 +27,7 @@ import {
 } from "../harness-control-plane/storage";
 import {
 	DEFAULT_RETRY_BUDGET,
+	type EventEnvelope,
 	type GitDelta,
 	type Harness as HarnessKind,
 	type Observation,
@@ -77,23 +78,58 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 	}
 }
 
-/** Owner liveness — always false in the foundation build (RuntimeOwner is M3). */
+/** Fallback liveness after owner routing failed: no reachable owner handled this CLI call. */
 function ownerLiveFor(_state: SessionState): boolean {
 	return false;
 }
 
-function buildObservation(state: SessionState, ownerLive: boolean): Observation {
+function pushUnique(out: string[], value: unknown): void {
+	if (typeof value === "string" && !out.includes(value)) out.push(value);
+}
+
+function completedTerminalEvent(events: EventEnvelope[]): {
+	cursor: number;
+	createdAt: string;
+	kind: string;
+} | null {
+	for (const event of [...events].reverse()) {
+		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
+		if (event.kind === "rpc_agent_completed" || signal === "completed") {
+			return { cursor: event.cursor, createdAt: event.createdAt, kind: event.kind };
+		}
+	}
+	return null;
+}
+
+async function buildObservation(
+	root: string,
+	state: SessionState,
+	ownerLive: boolean,
+): Promise<{
+	observation: Observation;
+	completedTerminalEvent: { cursor: number; createdAt: string; kind: string } | null;
+}> {
 	const workspace = state.handle.workspace;
 	const { gitDelta, branch, deleted } = gitDeltaFor(workspace);
+	const events = await readEvents(root, state.sessionId, 0);
+	const observedSignals = ["SessionStart"];
+	for (const event of events.slice(-200)) {
+		pushUnique(observedSignals, (event.evidence as { signal?: unknown } | undefined)?.signal);
+	}
+	const terminalEvent = completedTerminalEvent(events);
+	const lastEventAt = events.at(-1)?.createdAt;
 	return {
-		lifecycle: state.lifecycle,
-		ownerLive,
-		cwd: workspace,
-		branch: branch ?? state.handle.branch,
-		gitDelta,
-		lastActivityAt: state.updatedAt,
-		observedSignals: ["SessionStart"],
-		risk: deleted ? "deleted-worktree" : "normal",
+		observation: {
+			lifecycle: state.lifecycle,
+			ownerLive,
+			cwd: workspace,
+			branch: branch ?? state.handle.branch,
+			gitDelta,
+			lastActivityAt: lastEventAt ?? state.updatedAt,
+			observedSignals,
+			risk: deleted ? "deleted-worktree" : "normal",
+		},
+		completedTerminalEvent: terminalEvent,
 	};
 }
 
@@ -455,8 +491,16 @@ export default class Harness extends Command {
 		if (await this.#tryOwnerRoute(root, sessionId, "observe", { ...input, sessionId })) return;
 		const state = await loadState(root, sessionId);
 		const ownerLive = ownerLiveFor(state);
-		const observation = buildObservation(state, ownerLive);
-		writeJson(buildResponse(state, ownerLive, { observation, readOnly: !ownerLive }));
+		const { observation, completedTerminalEvent } = await buildObservation(root, state, ownerLive);
+		writeJson(
+			buildResponse(state, ownerLive, {
+				observation,
+				readOnly: !ownerLive,
+				...(completedTerminalEvent && !ownerLive
+					? { completedOwnerExited: true, terminalResult: completedTerminalEvent }
+					: {}),
+			}),
+		);
 	}
 
 	async #classify(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
@@ -466,7 +510,7 @@ export default class Harness extends Command {
 		const sessionId = flagSession ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
 		if (sessionId) {
 			stateView = await loadState(root, sessionId);
-			if (!observation) observation = buildObservation(stateView, ownerLiveFor(stateView));
+			if (!observation) observation = (await buildObservation(root, stateView, ownerLiveFor(stateView))).observation;
 		}
 		if (!observation) throw new Error("classify_requires_observation_or_session");
 		const full: Observation = {
@@ -531,7 +575,7 @@ export default class Harness extends Command {
 		const sessionId = requireSessionId(input, flagSession);
 		if (await this.#tryOwnerRoute(root, sessionId, "retire", { ...input, sessionId })) return;
 		const state = await loadState(root, sessionId);
-		const observation = buildObservation(state, ownerLiveFor(state));
+		const { observation } = await buildObservation(root, state, ownerLiveFor(state));
 		if (observation.gitDelta === "dirty" || observation.gitDelta === "unknown") {
 			writeJson(
 				buildResponse(

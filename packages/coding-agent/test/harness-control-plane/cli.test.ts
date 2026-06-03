@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { appendEvent, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -84,6 +85,44 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.json.evidence.observation).toHaveProperty("gitDelta");
 		expect(res.json.evidence.observation).toHaveProperty("risk");
 		expect(res.json.evidence.observation).not.toHaveProperty("pane");
+	});
+
+	it("observe exposes durable completion evidence after the owner has exited", async () => {
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "finalizing";
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendEvent(root, sessionId, {
+			eventId: "evt-completed",
+			cursor: 1,
+			createdAt: "2026-06-03T00:00:01.000Z",
+			severity: "info",
+			kind: "rpc_agent_completed",
+			state: { sessionId, lifecycle: "finalizing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { signal: "completed", outcome: "completed" },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-exited", leaseEpoch: 1 },
+		});
+
+		const res = runHarness(["observe", "--session", sessionId]);
+
+		expect(res.code).toBe(0);
+		assertContract(res.json);
+		expect(res.json.state.ownerLive).toBe(false);
+		expect(res.json.state.lifecycle).toBe("finalizing");
+		expect(res.json.evidence.readOnly).toBe(true);
+		expect(res.json.evidence.completedOwnerExited).toBe(true);
+		expect(res.json.evidence.terminalResult).toEqual({
+			cursor: 1,
+			createdAt: "2026-06-03T00:00:01.000Z",
+			kind: "rpc_agent_completed",
+		});
+		expect(res.json.evidence.observation.observedSignals).toContain("completed");
+		expect(res.json.evidence.observation.lastActivityAt).toBe("2026-06-03T00:00:01.000Z");
 	});
 
 	it("submit is blocked (accepted:false, owner-not-live) and never echoed-as-accepted", () => {
