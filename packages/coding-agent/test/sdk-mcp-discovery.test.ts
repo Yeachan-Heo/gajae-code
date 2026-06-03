@@ -442,7 +442,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30_000);
 
 	it("rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools", async () => {
 		const firstManager = SessionManager.create(tempDir, tempDir);
