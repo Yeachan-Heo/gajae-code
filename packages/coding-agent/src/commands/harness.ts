@@ -254,7 +254,15 @@ export default class Harness extends Command {
 
 	async #waitForOwner(root: string, sessionId: string): Promise<boolean> {
 		for (let i = 0; i < 100; i++) {
-			if ((await resolveOwner(root, sessionId)).live) return true;
+			const owner = await resolveOwner(root, sessionId);
+			if (owner.live && owner.socketPath) {
+				try {
+					await callEndpoint(owner.socketPath, { verb: "observe", input: { sessionId } }, 250);
+					return true;
+				} catch (error) {
+					if (!(error instanceof EndpointUnreachableError)) throw error;
+				}
+			}
 			await new Promise(r => setTimeout(r, 50));
 		}
 		return false;
@@ -302,7 +310,9 @@ export default class Harness extends Command {
 				blockerReason: null,
 			};
 		}
-		const fallbackReason = tmux.started ? "tmux new-session exited 0 but owner did not become live" : tmux.reason;
+		const fallbackReason = tmux.started
+			? "tmux new-session exited 0 but owner endpoint did not become routable"
+			: tmux.reason;
 		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,

@@ -13,6 +13,7 @@ const FAKE_RPC = path.join(import.meta.dir, "fixtures", "fake-rpc.ts");
 let root: string;
 let workspace: string;
 let tmuxCommand: string;
+let rpcCommandEnv: string;
 
 async function createFakeTmuxBin(
 	rootDir: string,
@@ -57,7 +58,7 @@ async function runHarness(args: string[]): Promise<{ code: number; json: Record<
 			...process.env,
 			GJC_HARNESS_STATE_ROOT: root,
 			// Drive the REAL GajaeCodeRpc against a protocol fixture (no shipped fake seam).
-			GJC_HARNESS_RPC_COMMAND: JSON.stringify(["bun", FAKE_RPC]),
+			GJC_HARNESS_RPC_COMMAND: rpcCommandEnv,
 			GJC_TMUX_COMMAND: tmuxCommand,
 		},
 		stdout: "pipe",
@@ -81,6 +82,7 @@ beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
 	tmuxCommand = await createFakeTmuxBin(root);
+	rpcCommandEnv = JSON.stringify(["bun", FAKE_RPC]);
 });
 
 afterEach(async () => {
@@ -163,7 +165,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect(started.code).toBe(0);
 		const evidence = started.json?.evidence as Record<string, unknown>;
 		expect(evidence.ownerRuntime).toBe("detached");
-		expect(evidence.ownerFallbackReason).toBe("tmux new-session exited 0 but owner did not become live");
+		expect(evidence.ownerFallbackReason).toBe("tmux new-session exited 0 but owner endpoint did not become routable");
 		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(true);
 		expect(evidence.ownerRuntime).not.toBe("manual");
 
@@ -171,6 +173,41 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
 	}, 60_000);
 
+	it("blocks start when tmux ghosts and detached owner endpoint is not routable", async () => {
+		tmuxCommand = await createFakeTmuxBin(root, { skipOwnerLaunch: true });
+		const originalRpcCommandEnv = rpcCommandEnv;
+		rpcCommandEnv = "{";
+		try {
+			const started = await runHarness([
+				"start",
+				"--input",
+				JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID, detach: true }),
+			]);
+			expect(started.code).toBe(1);
+			expect(started.json?.ok).toBe(false);
+			const state = started.json?.state as Record<string, unknown>;
+			const evidence = started.json?.evidence as Record<string, unknown>;
+			expect(state.lifecycle).toBe("blocked");
+			expect(state.ownerLive).toBe(false);
+			expect(state.blockers).toContain("detached-owner-not-live");
+			expect(evidence.ownerRuntime).toBe("detached");
+			expect(evidence.reason).toBe("detached-owner-not-live");
+
+			const submit = await runHarness(["submit", "--session", SID, "--input", JSON.stringify({ prompt: "go" })]);
+			expect(submit.code).toBe(1);
+			expect(submit.json?.ok).toBe(false);
+			expect((submit.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+			expect((submit.json?.evidence as Record<string, unknown>).accepted).toBe(false);
+			expect((submit.json?.evidence as Record<string, unknown>).reason).toBe("owner-not-live");
+			expect(submit.json?.nextAllowedActions).toContainEqual({
+				verb: "submit",
+				available: false,
+				reason: "owner-not-live",
+			});
+		} finally {
+			rpcCommandEnv = originalRpcCommandEnv;
+		}
+	}, 60_000);
 	it("falls back explicitly when tmux cannot start", async () => {
 		tmuxCommand = await createFakeTmuxBin(root, { failNewSession: true });
 		const started = await runHarness([
