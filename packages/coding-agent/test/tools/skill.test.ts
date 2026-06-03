@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Model } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
@@ -75,6 +76,21 @@ async function readModeState(cwd: string, skill: string, sessionId?: string): Pr
 		if (e.code === "ENOENT") return null;
 		throw err;
 	}
+}
+
+function createTestModel(id: string): Model {
+	return {
+		id,
+		name: id,
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 8192,
+	};
 }
 
 function createSession(
@@ -249,6 +265,45 @@ describe("SkillTool", () => {
 		const ug = await readModeState(cwd, "ultragoal", "s1");
 		expect(ug?.active).toBe(true);
 		expect(ug?.handoff_from).toBe("ralplan");
+	});
+
+	it("keeps explicit default model selection stable across workflow handoffs", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nInterview");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const explicitModel = createTestModel("gpt-5.5");
+		const staleDefaultModel = createTestModel("gpt-5.4");
+		const settings = Settings.isolated();
+		settings.setModelRole("default", `${explicitModel.provider}/${explicitModel.id}`);
+		settings.setModelRole("plan", `${staleDefaultModel.provider}/${staleDefaultModel.id}`);
+
+		let activeSkill = "deep-interview";
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan, ultragoal], captured, {
+			settings,
+			model: explicitModel,
+			getActiveModelString: () => `${explicitModel.provider}/${explicitModel.id}`,
+			getActiveSkillState: () => ({ skill: activeSkill, session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "ralplan" });
+		activeSkill = "ralplan";
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		await tool.execute("call-2", { name: "ultragoal" });
+
+		expect(session.model).toBe(explicitModel);
+		expect(session.getActiveModelString?.()).toBe("openai-codex/gpt-5.5");
+		expect(settings.getModelRole("default")).toBe("openai-codex/gpt-5.5");
+		expect(settings.getModelRole("plan")).toBe("openai-codex/gpt-5.4");
+		expect(captured).toHaveLength(2);
+		expect(captured.map(item => item.message.details)).toEqual([
+			expect.objectContaining({ name: "ralplan" }),
+			expect.objectContaining({ name: "ultragoal" }),
+		]);
 	});
 
 	it("supports backward U->R chain (ultragoal in handoff phase chains to ralplan)", async () => {
