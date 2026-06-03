@@ -4,6 +4,7 @@ import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -16,7 +17,7 @@ type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
 function lastAssistant(session: AgentSession): AssistantMessage {
 	const message = session.agent.state.messages.at(-1);
-	if (!message || message.role !== "assistant") {
+	if (message?.role !== "assistant") {
 		throw new Error("Expected trailing assistant message");
 	}
 	return message as AssistantMessage;
@@ -76,6 +77,63 @@ describe("AgentSession resilient retry", () => {
 			"retry.maxDelayMs": 10,
 			"retry.maxRetries": 1,
 			...options.settingsOverrides,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+	}
+
+	function buildStatusErrorSession(options: {
+		errorMessage: string;
+		errorStatus: number;
+		recoveredContent?: string;
+	}): AgentSession {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, opts) => {
+				calls++;
+				if (calls > 1 && options.recoveredContent) {
+					return createMockModel({ responses: [{ content: [options.recoveredContent] }] }).stream(
+						requestedModel,
+						context,
+						opts,
+					);
+				}
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: requestedModel.api,
+						provider: requestedModel.provider,
+						model: requestedModel.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage: options.errorMessage,
+						errorStatus: options.errorStatus,
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "error", reason: "error", error: message });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 1,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
@@ -274,6 +332,111 @@ describe("AgentSession resilient retry", () => {
 
 		expect(retryStartEvents).toHaveLength(0);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("surfaces numeric HTTP 4xx (status context) without retrying", async () => {
+		// No "bad request" keyword — relies on HTTP-status extraction so a bare
+		// numeric 4xx is treated terminal instead of looping as "unknown".
+		session = buildSession({ responses: [{ throw: "HTTP 400: malformed request payload" }] });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger numeric 400");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("surfaces explicit HTTP 400 messages even when text contains transient substrings", async () => {
+		for (const errorMessage of [
+			"HTTP 400: provider returned error",
+			"HTTP 400: max 500 tool calls exceeded",
+			"HTTP 400: request timed out during validation",
+		] as const) {
+			if (session) {
+				await session.dispose();
+				session = undefined;
+			}
+			session = buildSession({ responses: [{ throw: errorMessage }] });
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`trigger explicit terminal 400: ${errorMessage}`);
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(lastAssistant(session).stopReason).toBe("error");
+		}
+	});
+
+	it("surfaces structured HTTP 400 even when text contains transient substrings", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "provider returned error",
+			errorStatus: 400,
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger structured terminal 400");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("surfaces explicit status-code 4xx errors without retrying", async () => {
+		session = buildSession({ responses: [{ throw: "provider returned status code 400 for malformed payload" }] });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger status-code 400");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("retries rate-limit text with incidental 4xx numbers even when provider status extraction says 400", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "rate limit error: 400 requests per minute",
+			errorStatus: 400,
+			recoveredContent: "recovered after rate-limit retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("trigger misleading rate limit status");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+
+	it("does not terminalize retryable explicit HTTP statuses", async () => {
+		for (const [status, message] of [
+			[408, "HTTP 408 request timeout"],
+			[425, "HTTP 425 too early retry your request"],
+			[429, "HTTP 429 rate limit exceeded"],
+			[503, "HTTP 503 service unavailable"],
+		] as const) {
+			if (session) {
+				await session.dispose();
+				session = undefined;
+			}
+			session = buildSession({ responses: [{ throw: message }, { content: [`recovered ${status}`] }] });
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`trigger retryable HTTP ${status}`);
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("stop");
+		}
 	});
 
 	it("emits auto_retry_end when a retry ends on a terminal error", async () => {

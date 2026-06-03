@@ -69,6 +69,7 @@ const CALLBACK_PORTS: Record<string, number> = {
 	"google-gemini-cli": 8085,
 	"google-antigravity": 51121,
 	"gitlab-duo": 8080,
+	xai: 56121,
 };
 
 function getTokenFilePath(): string {

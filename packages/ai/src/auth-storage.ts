@@ -1484,6 +1484,14 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "xai": {
+				const { loginXai } = await import("./utils/oauth/xai");
+				credentials = await loginXai({
+					...ctrl,
+					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+				});
+				break;
+			}
 			case "fireworks": {
 				const { loginFireworks } = await import("./utils/oauth/fireworks");
 				const apiKey = await loginFireworks(ctrl);
@@ -1637,6 +1645,13 @@ export class AuthStorage {
 			}
 		}
 		const newCredential: OAuthCredential = { type: "oauth", ...credentials };
+		if (provider === "xai") {
+			const existingOAuthCredentials = this.#getCredentialsForProvider(provider).filter(
+				(credential): credential is OAuthCredential => credential.type === "oauth",
+			);
+			await this.set(provider, [...existingOAuthCredentials, newCredential]);
+			return;
+		}
 		await this.#upsertOAuthCredential(provider, newCredential);
 	}
 

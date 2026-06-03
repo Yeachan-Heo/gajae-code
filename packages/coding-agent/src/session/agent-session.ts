@@ -7224,9 +7224,19 @@ export class AgentSession {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
 		// than retry forever.
-		return /\b(401|402|403|404|413|422)\b|unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
+		return /unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
 			errorMessage,
 		);
+	}
+
+	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
+		// Parse only explicit HTTP/status wording. Do not treat generic
+		// `error: 400` as an HTTP status because rate-limit copy can say
+		// "rate limit error: 400 requests per minute".
+		const match = /\b(?:http(?:\s+status)?|status(?:[\s_-]+code)?)(?:\s+|[:=]\s*)(\d{3})\b/i.exec(errorMessage);
+		if (!match) return undefined;
+		const status = Number(match[1]);
+		return Number.isFinite(status) && status >= 100 && status <= 599 ? status : undefined;
 	}
 
 	/**
@@ -7245,8 +7255,24 @@ export class AgentSession {
 		if (/anthropic stream envelope error:/i.test(err)) {
 			return this.#isTransientEnvelopeErrorMessage(err) ? "transient" : "terminal";
 		}
+		const explicitStatus = this.#extractExplicitHttpStatusFromErrorMessage(err);
+		const structuredStatus = message.errorStatus;
+		const terminalStatus = explicitStatus ?? structuredStatus;
+		const isTerminalHttp4xx =
+			terminalStatus !== undefined &&
+			terminalStatus >= 400 &&
+			terminalStatus < 500 &&
+			terminalStatus !== 408 &&
+			terminalStatus !== 425 &&
+			terminalStatus !== 429;
 		if (this.#isTerminalErrorMessage(err)) return "terminal";
 		if (isUsageLimitError(err)) return "usage_limit";
+		// Explicit HTTP/status wording is authoritative. Structured provider status
+		// is also authoritative except for rate-limit copy where providers may have
+		// parsed an incidental quota number such as "400 requests per minute".
+		if (isTerminalHttp4xx && (explicitStatus !== undefined || !/rate.?limit|too many requests/i.test(err))) {
+			return "terminal";
+		}
 		if (this.#isTransientErrorMessage(err)) return "transient";
 		return "unknown";
 	}
@@ -8440,12 +8466,13 @@ export class AgentSession {
 		const previousFallbackSelectedMCPToolNames = previousSessionFile
 			? this.#getSessionDefaultSelectedMCPToolNames(previousSessionFile)
 			: undefined;
+		const previousAgentSteeringQueue = this.agent.snapshotSteering();
+		const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
 
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.agent.clearAllQueues();
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -8458,6 +8485,12 @@ export class AgentSession {
 				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
 			const fallbackSelectedMCPToolNames = this.#getSessionDefaultSelectedMCPToolNames(sessionPath);
 			await this.#restoreMCPSelectionsForSessionContext(sessionContext, { fallbackSelectedMCPToolNames });
+
+			// The target session is loaded and MCP selections are restored: the
+			// switch is committed far enough to discard pre-switch delivery queues.
+			// Clear before session_switch hooks, so messages enqueued by hooks belong
+			// to the new session and remain deliverable.
+			this.agent.clearAllQueues();
 
 			// Emit session_switch event to hooks
 			if (this.#extensionRunner) {
@@ -8553,6 +8586,9 @@ export class AgentSession {
 			this.#followUpMessages = previousFollowUpMessages;
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+			this.agent.clearAllQueues();
+			this.agent.restoreSteering(previousAgentSteeringQueue);
+			this.agent.restoreFollowUp(previousAgentFollowUpQueue);
 			if (previousModel) {
 				this.agent.setModel(previousModel);
 			}

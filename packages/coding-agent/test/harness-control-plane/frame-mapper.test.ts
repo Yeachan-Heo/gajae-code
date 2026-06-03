@@ -116,7 +116,6 @@ describe("mapRpcFrame", () => {
 		expect(JSON.stringify(mapped?.evidence)).not.toContain("SECRET_STATUS_OUTPUT");
 		expect(mapped).toMatchObject({ evidence: { status: null } });
 	});
-
 	it("bounds extension_error message length", () => {
 		const big = "x".repeat(5000);
 		const e = mapRpcFrame({ type: "extension_error", error: big });

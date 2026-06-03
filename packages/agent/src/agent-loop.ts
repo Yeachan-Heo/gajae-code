@@ -203,13 +203,15 @@ function buildAgentEndEvent(
 	messages: AgentMessage[],
 	telemetry: AgentTelemetry | undefined,
 	stepCount: number,
+	stopReason: "completed" | "paused" = "completed",
 ): Extract<AgentEvent, { type: "agent_end" }> {
-	if (!telemetry) return { type: "agent_end", messages };
+	const base = { type: "agent_end" as const, messages, stopReason };
+	if (!telemetry) return base;
 	const snapshot = telemetry.collector.snapshot({ stepCount });
 	if (telemetry.collector.markRunEnded()) {
 		fireOnRunEnd(telemetry, snapshot.summary, snapshot.coverage);
 	}
-	return { type: "agent_end", messages, telemetry: snapshot.summary, coverage: snapshot.coverage };
+	return { ...base, telemetry: snapshot.summary, coverage: snapshot.coverage };
 }
 
 /**
@@ -585,11 +587,26 @@ async function runLoopBody(
 
 			stream.push({ type: "turn_end", message, toolResults });
 
-			pendingMessages = steeringMessagesFromExecution ?? ((await config.getSteeringMessages?.()) || []);
+			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
+				pendingMessages = steeringMessagesFromExecution;
+				continue;
+			}
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (pendingMessages.length > 0) continue;
+			if (config.shouldPause?.()) {
+				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+				stream.end(newMessages);
+				return;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
 		await config.onBeforeYield?.();
+		if (config.shouldPause?.()) {
+			stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+			stream.end(newMessages);
+			return;
+		}
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them

@@ -159,7 +159,6 @@ describe("owner frame -> observability", () => {
 		expect(obsJson).not.toContain("SECRET_PARTIAL");
 		expect(obsJson).not.toContain("SECRET_OUTPUT");
 	});
-
 	it("AC-6: a message_update storm cannot starve agent_end (completed) or bloat the event log", async () => {
 		const rpc = new FrameRpc();
 		owner = new RuntimeOwner({ root, sessionId: SID, rpc });

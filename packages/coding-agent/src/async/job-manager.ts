@@ -10,7 +10,7 @@ const DEFAULT_MAX_RUNNING_JOBS = 15;
 export interface AsyncJob {
 	id: string;
 	type: "bash" | "task";
-	status: "running" | "completed" | "failed" | "cancelled";
+	status: "running" | "completed" | "failed" | "cancelled" | "paused";
 	startTime: number;
 	label: string;
 	abortController: AbortController;
@@ -35,6 +35,64 @@ export interface AsyncJobMetadata {
 		description?: string;
 		assignment?: string;
 	};
+}
+
+/**
+ * Typed outcome a subagent task run may produce. A `paused` outcome is
+ * non-terminal and non-delivering: the run suspended at a safe boundary and the
+ * subagent can be resumed from its persisted sessionFile. `completed` always
+ * wins a race with a late pause because the run returns it once it has actually
+ * finished.
+ */
+export type SubagentRunOutcome = { kind: "completed"; text: string } | { kind: "paused"; note?: string };
+
+/** Canonical lifecycle of a subagent across pause/resume cycles. */
+export type SubagentLifecycle = "running" | "paused" | "queued" | "completed" | "failed" | "cancelled";
+
+/**
+ * Live, executor-owned control handle for a RUNNING subagent. Registered when a
+ * subagent run starts and removed on pause/terminal so a paused subagent retains
+ * no live `AgentSession` reference (leak-free).
+ */
+export interface SubagentLiveHandle {
+	/** Request a cooperative safe-boundary pause (never aborts the in-flight tool). */
+	requestPause(): void;
+	/** Inject a steering message into the live session. */
+	injectMessage(content: string, deliverAs: "steer" | "followUp" | "nextTurn"): Promise<void>;
+}
+
+/**
+ * Canonical, stable-id-keyed record for a subagent. Survives `AsyncJob`
+ * eviction so resume stays addressable by subagent id, and is the single source
+ * of truth for control-plane status and identity.
+ */
+export interface SubagentRecord {
+	subagentId: string;
+	ownerId?: string;
+	/** Current live/last AsyncJob id; null while queued with no active job. */
+	currentJobId: string | null;
+	historicalJobIds: string[];
+	status: SubagentLifecycle;
+	sessionFile: string | null;
+	/** False for ephemeral sessions (no persistent artifacts dir). */
+	resumable: boolean;
+	queued?: { ownerId?: string; seq: number; message?: string; createdAt: number };
+}
+
+/** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
+export interface ResumeDescriptor {
+	subagentId: string;
+	ownerId?: string;
+	data: unknown;
+}
+
+/** A pending resume awaiting a free concurrency slot. */
+interface ResumeQueueEntry {
+	subagentId: string;
+	ownerId?: string;
+	seq: number;
+	message?: string;
+	createdAt: number;
 }
 
 export interface AsyncJobManagerOptions {
@@ -160,6 +218,12 @@ export class AsyncJobManager {
 	readonly #retentionMs: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
+	readonly #subagentRecords = new Map<string, SubagentRecord>();
+	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
+	readonly #resumeQueue: ResumeQueueEntry[] = [];
+	#resumeSeq = 0;
+	#resumeRunner?: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
+	readonly #resumeDescriptors = new Map<string, ResumeDescriptor>();
 
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
 		const ownerId = filter?.ownerId;
@@ -184,7 +248,7 @@ export class AsyncJobManager {
 			jobId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
-		}) => Promise<string>,
+		}) => Promise<string | SubagentRunOutcome>,
 		options?: AsyncJobRegisterOptions,
 	): string {
 		if (this.#disposed) {
@@ -227,20 +291,38 @@ export class AsyncJobManager {
 		};
 		job.promise = (async () => {
 			try {
-				const text = await run({ jobId: id, signal: abortController.signal, reportProgress });
+				const result = await run({ jobId: id, signal: abortController.signal, reportProgress });
+				const outcome: SubagentRunOutcome =
+					typeof result === "string" ? { kind: "completed", text: result } : result;
 				if (job.status === "cancelled") {
-					job.resultText = text;
+					job.resultText = outcome.kind === "completed" ? outcome.text : outcome.note;
 					this.#scheduleEviction(id);
+					this.#markRecordTerminal(id, "cancelled");
+					this.#drainResumeQueue();
+					return;
+				}
+				if (outcome.kind === "paused") {
+					// Sole canonical writer of the running -> paused transition. No
+					// delivery and no eviction scheduling: a paused subagent stays
+					// listed and resumable from its sessionFile.
+					job.status = "paused";
+					if (outcome.note) job.resultText = outcome.note;
+					this.#markRecordPaused(id);
+					this.#drainResumeQueue();
 					return;
 				}
 				job.status = "completed";
-				job.resultText = text;
-				this.#enqueueDelivery(id, text);
+				job.resultText = outcome.text;
+				this.#enqueueDelivery(id, outcome.text);
 				this.#scheduleEviction(id);
+				this.#markRecordTerminal(id, "completed");
+				this.#drainResumeQueue();
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
 					this.#scheduleEviction(id);
+					this.#markRecordTerminal(id, "cancelled");
+					this.#drainResumeQueue();
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
@@ -248,6 +330,8 @@ export class AsyncJobManager {
 				job.errorText = errorText;
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
+				this.#markRecordTerminal(id, "failed");
+				this.#drainResumeQueue();
 			}
 		})();
 
@@ -264,11 +348,214 @@ export class AsyncJobManager {
 		const job = this.#jobs.get(id);
 		if (!job) return false;
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (job.status === "paused") {
+			// Paused jobs have no running promise to abort; transition directly.
+			// The session file is kept, so the record stays resumable by id.
+			job.status = "cancelled";
+			this.#markRecordTerminal(id, "cancelled");
+			this.#scheduleEviction(id);
+			this.#drainResumeQueue();
+			return true;
+		}
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
 		this.#scheduleEviction(id);
 		return true;
+	}
+
+	// ── Subagent control plane (pause / resume / steer support) ──────────
+
+	/** Register or replace the canonical record for a subagent. */
+	registerSubagentRecord(record: SubagentRecord): void {
+		this.#subagentRecords.set(record.subagentId, record);
+	}
+
+	getSubagentRecord(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {
+		const rec = this.#subagentRecords.get(subagentId.trim());
+		if (!rec) return undefined;
+		if (filter?.ownerId && rec.ownerId !== filter.ownerId) return undefined;
+		return rec;
+	}
+
+	getSubagentRecords(filter?: AsyncJobFilter): SubagentRecord[] {
+		const ownerId = filter?.ownerId;
+		const out: SubagentRecord[] = [];
+		for (const rec of this.#subagentRecords.values()) {
+			if (ownerId && rec.ownerId !== ownerId) continue;
+			out.push(rec);
+		}
+		return out;
+	}
+
+	registerLiveHandle(subagentId: string, handle: SubagentLiveHandle): void {
+		this.#liveHandles.set(subagentId, handle);
+	}
+
+	getLiveHandle(subagentId: string): SubagentLiveHandle | undefined {
+		return this.#liveHandles.get(subagentId);
+	}
+
+	removeLiveHandle(subagentId: string): void {
+		this.#liveHandles.delete(subagentId);
+	}
+
+	/** Install the TaskTool-owned resume runner. Returns the new job id, or undefined on failure. */
+	setResumeRunner(
+		runner: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined,
+	): void {
+		this.#resumeRunner = runner;
+	}
+
+	registerResumeDescriptor(descriptor: ResumeDescriptor): void {
+		this.#resumeDescriptors.set(descriptor.subagentId, descriptor);
+	}
+
+	getResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): ResumeDescriptor | undefined {
+		const descriptor = this.#resumeDescriptors.get(subagentId.trim());
+		if (!descriptor) return undefined;
+		if (filter?.ownerId && descriptor.ownerId !== filter.ownerId) return undefined;
+		return descriptor;
+	}
+
+	#recordByJobId(jobId: string): SubagentRecord | undefined {
+		for (const rec of this.#subagentRecords.values()) {
+			if (rec.currentJobId === jobId) return rec;
+		}
+		return undefined;
+	}
+
+	#markRecordPaused(jobId: string): void {
+		const rec = this.#recordByJobId(jobId);
+		if (rec) {
+			rec.status = "paused";
+			this.#liveHandles.delete(rec.subagentId);
+		}
+	}
+
+	#markRecordTerminal(jobId: string, status: "completed" | "failed" | "cancelled"): void {
+		const rec = this.#recordByJobId(jobId);
+		if (!rec) return;
+		rec.status = status;
+		this.#liveHandles.delete(rec.subagentId);
+	}
+
+	/** Request a graceful safe-boundary pause of a running subagent. */
+	pauseSubagent(
+		subagentId: string,
+		filter?: AsyncJobFilter,
+	): { ok: boolean; status?: SubagentLifecycle; reason?: string } {
+		const rec = this.getSubagentRecord(subagentId, filter);
+		if (!rec) return { ok: false, reason: "not_found" };
+		if (rec.status !== "running") return { ok: false, status: rec.status, reason: "not_running" };
+		const handle = this.#liveHandles.get(rec.subagentId);
+		if (!handle) return { ok: false, status: rec.status, reason: "no_live_handle" };
+		handle.requestPause();
+		return { ok: true, status: rec.status };
+	}
+
+	/** Resume a non-running subagent from its sessionFile, optionally injecting a message first. */
+	resumeSubagent(
+		subagentId: string,
+		filter?: AsyncJobFilter,
+		message?: string,
+	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; queued?: boolean; reason?: string } {
+		const rec = this.getSubagentRecord(subagentId, filter);
+		if (!rec) return { ok: false, reason: "not_found" };
+		if (rec.status === "running") return { ok: false, status: "running", reason: "already_running" };
+		if (rec.status === "queued") {
+			if (message !== undefined && rec.queued) {
+				rec.queued.message = message;
+				const queued = this.#resumeQueue.find(entry => entry.subagentId === rec.subagentId);
+				if (queued) queued.message = message;
+				return { ok: true, queued: true, status: "queued" };
+			}
+			return { ok: false, status: "queued", reason: "already_queued" };
+		}
+		if (!rec.resumable || !rec.sessionFile) return { ok: false, reason: "context_unavailable" };
+		if (!this.#resumeRunner) return { ok: false, reason: "no_runner" };
+		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
+			const seq = ++this.#resumeSeq;
+			rec.status = "queued";
+			rec.queued = { ownerId: rec.ownerId, seq, message, createdAt: Date.now() };
+			this.#resumeQueue.push({
+				subagentId: rec.subagentId,
+				ownerId: rec.ownerId,
+				seq,
+				message,
+				createdAt: rec.queued.createdAt,
+			});
+			return { ok: true, queued: true, status: "queued" };
+		}
+		return this.#startResume(rec, message);
+	}
+
+	#startResume(
+		rec: SubagentRecord,
+		message?: string,
+	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
+		const prevJobId = rec.currentJobId;
+		const newJobId = this.#resumeRunner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
+		if (!newJobId) return { ok: false, reason: "resume_failed" };
+		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
+		rec.currentJobId = newJobId;
+		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
+		rec.queued = undefined;
+		return { ok: true, status: rec.status, jobId: newJobId };
+	}
+
+	/** Drain queued resumes (FIFO by seq) while concurrency slots are available. */
+	#drainResumeQueue(): void {
+		if (this.#resumeQueue.length === 0) return;
+		this.#resumeQueue.sort((a, b) => a.seq - b.seq);
+		while (this.#resumeQueue.length > 0 && this.getRunningJobs().length < this.#maxRunningJobs) {
+			const entry = this.#resumeQueue.shift();
+			if (!entry) return;
+			const rec = this.#subagentRecords.get(entry.subagentId);
+			if (rec?.status !== "queued") continue;
+			this.#startResume(rec, entry.message);
+		}
+	}
+
+	/** Cancel a subagent by stable id across running/paused/queued states (keeps the session file). */
+	cancelSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
+		const rec = this.getSubagentRecord(subagentId, filter);
+		if (!rec) return false;
+		if (rec.status === "running" && rec.currentJobId) return this.cancel(rec.currentJobId, filter);
+		if (rec.status === "paused") {
+			if (rec.currentJobId) {
+				const job = this.#jobs.get(rec.currentJobId);
+				if (job && job.status === "paused") {
+					job.status = "cancelled";
+					this.#scheduleEviction(rec.currentJobId);
+				}
+			}
+			rec.status = "cancelled";
+			this.#liveHandles.delete(rec.subagentId);
+			this.#drainResumeQueue();
+			return true;
+		}
+		if (rec.status === "queued") {
+			const idx = this.#resumeQueue.findIndex(e => e.subagentId === rec.subagentId);
+			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
+			rec.status = "cancelled";
+			rec.queued = undefined;
+			return true;
+		}
+		return false;
+	}
+
+	#purgeOwnerSubagentState(ownerId?: string): void {
+		for (let i = this.#resumeQueue.length - 1; i >= 0; i--) {
+			if (!ownerId || this.#resumeQueue[i].ownerId === ownerId) this.#resumeQueue.splice(i, 1);
+		}
+		for (const [sid, rec] of this.#subagentRecords) {
+			if (!ownerId || rec.ownerId === ownerId) {
+				this.#liveHandles.delete(sid);
+				this.#resumeDescriptors.delete(sid);
+				this.#subagentRecords.delete(sid);
+			}
+		}
 	}
 
 	getJob(id: string): AsyncJob | undefined {
@@ -451,6 +738,7 @@ export class AsyncJobManager {
 				}
 			}
 		}
+		this.#purgeOwnerSubagentState(ownerId);
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
@@ -588,6 +876,10 @@ export class AsyncJobManager {
 		this.#watchedJobs.clear();
 		this.#outputState.clear();
 		this.#ownerCleanups.clear();
+		this.#subagentRecords.clear();
+		this.#liveHandles.clear();
+		this.#resumeDescriptors.clear();
+		this.#resumeQueue.length = 0;
 		return drained;
 	}
 

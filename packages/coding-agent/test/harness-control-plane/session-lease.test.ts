@@ -203,7 +203,6 @@ describe("SessionLease", () => {
 
 		expect(await readFile(fifoPath, "utf8")).toBe("fifo");
 	});
-
 	it("fails closed for an expired lease whose owner is still alive", async () => {
 		const past = () => 1_000;
 		await acquireLease(root, SID, {

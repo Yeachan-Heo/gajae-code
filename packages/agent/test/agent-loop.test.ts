@@ -226,6 +226,111 @@ describe("agentLoop with AgentMessage", () => {
 		expect(contexts[1]?.index).toBe(1);
 	});
 
+	it("pauses at the safe boundary after a tool call without aborting the tool", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		let abortSeen = false;
+		let toolCompleted = false;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params, signal) {
+				abortSeen = signal?.aborted ?? false;
+				toolCompleted = true;
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		let pauseChecks = 0;
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }] },
+				{ content: ["should not be requested after pause"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			shouldPause: () => {
+				pauseChecks += 1;
+				return toolCompleted;
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, mock.stream);
+		for await (const event of stream) events.push(event);
+
+		const agentEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(toolCompleted).toBe(true);
+		expect(abortSeen).toBe(false);
+		expect(pauseChecks).toBeGreaterThan(0);
+		expect(agentEnd?.stopReason).toBe("paused");
+	});
+
+	it("processes queued steering before honoring a pause request", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		let steeringDelivered = false;
+		let pauseRequested = false;
+		let steeringPolls = 0;
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }] },
+				{ content: ["ack steer"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			shouldPause: () => pauseRequested,
+			getSteeringMessages: async () => {
+				steeringPolls += 1;
+				if (steeringPolls === 1 || pauseRequested || steeringDelivered) return [];
+				steeringDelivered = true;
+				pauseRequested = true;
+				return [createUserMessage("steer before pause")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, mock.stream);
+		for await (const event of stream) events.push(event);
+
+		const agentEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		const messages = await stream.result();
+		expect(messages.some(message => message.role === "user" && message.content === "steer before pause")).toBe(true);
+		expect(
+			messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content[0]?.type === "text" &&
+					message.content[0].text === "ack steer",
+			),
+		).toBe(true);
+		expect(agentEnd?.stopReason).toBe("paused");
+	});
+
 	it("should handle tool calls and results", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executed: string[] = [];
