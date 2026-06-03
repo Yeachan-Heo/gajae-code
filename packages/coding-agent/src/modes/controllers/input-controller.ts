@@ -31,7 +31,7 @@ export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#abortInteractive(): Promise<void> {
-		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS });
+		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS, cause: "user_interrupt" });
 	}
 
 	setupKeyHandlers(): void {

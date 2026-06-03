@@ -23,15 +23,13 @@ function lastAssistant(session: AgentSession): AssistantMessage {
 }
 
 /**
- * Contract: when the provider asks us to wait longer than `retry.maxDelayMs`
- * and we have no credential/model fallback to switch to, the auto-retry
- * loop MUST fail fast — preserving the terminal error message in agent
- * state and skipping the long sleep entirely.
- *
- * Without this defense, an Anthropic `429 rate_limit_error` with
- * `retry-after-ms=11180000` (≈3 hours) pinned a subagent in the retry
- * sleep, leaving the parent task tool stuck on the review phase for hours
- * (see GitHub issue #607).
+ * Contract: transient/unknown errors (rate limit, overloaded, 5xx, network)
+ * retry forever with exponential backoff. A provider-supplied `retry-after`
+ * is honored even when it exceeds `retry.maxDelayMs` (the cap is a ceiling for
+ * the exponential backoff, not a give-up trigger). Observability is provided
+ * via `auto_retry_start`/`auto_retry_end` events (with `unbounded: true`) so a
+ * subagent is never silently hung. Terminal coded errors (auth/400/not-found)
+ * and the usage-limit rotation path keep their bounded behavior.
  */
 describe("AgentSession retry delay cap", () => {
 	let tempDir: TempDir;
@@ -56,17 +54,20 @@ describe("AgentSession retry delay cap", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("bails immediately when retry-after exceeds retry.maxDelayMs", async () => {
+	it("retries transient rate limits past retry.maxDelayMs, honoring retry-after", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
 		// 11.18M ms == ~3.1 hours, matching the report on the original incident.
+		// Under the resilient-retry contract this is honored, not bailed on.
 		const rateLimitError =
-			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}} retry-after-ms=11180000';
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit. Please try again later."}} retry-after-ms=11180000';
 
-		const mock = createMockModel({ handler: () => ({ throw: rateLimitError }) });
+		const mock = createMockModel({
+			responses: [{ throw: rateLimitError }, { content: ["recovered after honoring retry-after"] }],
+		});
 		const requestedModels: string[] = [];
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
@@ -108,24 +109,18 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Trigger rate limit with long retry-after");
 		await session.waitForIdle();
 
-		// Only one model call: the auto-retry MUST NOT loop into a fresh attempt
-		// because the cap fired before scheduler.wait was even reached.
-		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
-		expect(retryStartEvents).toHaveLength(0);
+		// The retry loop runs (does NOT bail): original call + one retry.
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].unbounded).toBe(true);
+		// The long provider retry-after is honored, not capped to maxDelayMs.
+		expect(retryStartEvents[0].delayMs).toBe(11180000);
+		expect(waitSpy).toHaveBeenCalledWith(11180000, expect.anything());
+		// Successful retry emits a success end event and recovers.
 		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: false });
-		expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
-		expect(retryEndEvents[0].finalError).toContain("11180000");
-		// No multi-hour (or any) sleep — the cap path skips scheduler.wait entirely.
-		for (const call of waitSpy.mock.calls) {
-			expect(call[0]).toBeLessThanOrEqual(100);
-		}
-
-		// The terminal error stays as the last assistant message so the caller
-		// (interactive UI, parent task tool, SDK consumer) can act on it.
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		const last = lastAssistant(session);
-		expect(last.stopReason).toBe("error");
-		expect(last.errorMessage).toContain("rate_limit_error");
+		expect(last.stopReason).toBe("stop");
 		expect(session.isRetrying).toBe(false);
 	});
 

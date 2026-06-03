@@ -859,6 +859,27 @@ export class Agent {
 		return this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
 	}
 
+	hasQueuedSteering(): boolean {
+		return this.#steeringQueue.length > 0;
+	}
+
+	/**
+	 * Snapshot the steering queue without mutating it. Used to preserve queued
+	 * steering across maintenance ops (compaction/handoff) that call reset().
+	 */
+	snapshotSteering(): AgentMessage[] {
+		return this.#steeringQueue.slice();
+	}
+
+	/**
+	 * Restore previously snapshotted steering messages ahead of any newly
+	 * queued ones. No-op for an empty snapshot.
+	 */
+	restoreSteering(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#steeringQueue = [...messages, ...this.#steeringQueue];
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
 		if (this.#steeringMode === "one-at-a-time") {
 			if (this.#steeringQueue.length > 0) {

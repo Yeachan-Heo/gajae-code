@@ -24,6 +24,16 @@ type AgentSessionEventKind = AgentSessionEvent["type"];
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 
+function friendlyRetryReason(errorMessage: string | undefined): string {
+	if (!errorMessage) return "";
+	const e = errorMessage.toLowerCase();
+	if (/rate.?limit|too many requests|429/.test(e)) return "rate limited";
+	if (/overloaded/.test(e)) return "overloaded";
+	if (/\b(500|502|503|504)\b|server.?error|internal.?error|service.?unavailable/.test(e)) return "server error";
+	if (/network|connection|socket|fetch failed|terminated|timeout|timed out|stream/.test(e)) return "connection error";
+	return "transient error";
+}
+
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
 };
@@ -166,6 +176,7 @@ export class EventController {
 		}
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
+			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
@@ -648,21 +659,49 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
+	#clearRetryCountdown(): void {
+		if (this.ctx.retryCountdownTimer) {
+			clearInterval(this.ctx.retryCountdownTimer);
+			this.ctx.retryCountdownTimer = undefined;
+		}
+	}
+
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
 		this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
+		let escPressed = false;
 		this.ctx.editor.onEscape = () => {
-			this.ctx.session.abortRetry();
+			if (!escPressed) {
+				// First Esc: skip the backoff and retry immediately.
+				escPressed = true;
+				this.ctx.session.retryNow();
+			} else {
+				// Second Esc: cancel the retry entirely.
+				this.ctx.session.abortRetry();
+			}
 		};
 		this.ctx.statusContainer.clear();
-		const delaySeconds = Math.round(event.delayMs / 1000);
-		this.ctx.retryLoader = new Loader(
+		const reason = friendlyRetryReason(event.errorMessage);
+		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
+		const escHint = event.unbounded ? "esc to retry now" : "esc to cancel";
+		const reasonSuffix = reason ? ` — ${reason}` : "";
+		const deadline = Date.now() + event.delayMs;
+		const buildMessage = () => {
+			const remainingSeconds = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+			return `Retrying (${attemptLabel})${reasonSuffix}, next in ${remainingSeconds}s… (${escHint})`;
+		};
+		const retryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
 			text => theme.fg("muted", text),
-			`Retrying (${event.attempt}/${event.maxAttempts}) in ${delaySeconds}s… (esc to cancel)`,
+			buildMessage(),
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.retryLoader = retryLoader;
+		this.#clearRetryCountdown();
+		this.ctx.retryCountdownTimer = setInterval(() => {
+			retryLoader.setMessage(buildMessage());
+		}, 1000);
+		this.ctx.statusContainer.addChild(retryLoader);
 		this.ctx.ui.requestRender();
 	}
 
@@ -673,6 +712,7 @@ export class EventController {
 		}
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
+			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
