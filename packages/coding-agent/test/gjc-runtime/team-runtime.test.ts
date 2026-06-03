@@ -30,7 +30,7 @@ function runGit(cwd: string, args: string[]): string {
 
 async function createFakeTmuxBin(
 	root: string,
-	options: { failDisplay?: boolean; failSplit?: boolean } = {},
+	options: { failDisplay?: boolean; failSplit?: boolean; gjcProfile?: boolean } = {},
 ): Promise<string> {
 	const binDir = path.join(root, ".test-bin");
 	await fs.mkdir(binDir, { recursive: true });
@@ -58,6 +58,10 @@ case "$1" in
     esac
     `
 }
+    ;;
+  show-options)
+    if [ "${options.gjcProfile === false ? "0" : "1"}" = "1" ]; then echo "1"; exit 0; fi
+    exit 1
     ;;
   split-window)
     ${options.failSplit ? "echo split failed >&2; exit 1" : ""}
@@ -363,6 +367,36 @@ describe("native gjc team runtime", () => {
 				path.join(cleanupRoot, ".gjc", "state", "team", "fail-team", "worktrees", "worker-1", ".git"),
 			).exists(),
 		).toBe(false);
+	});
+
+	it("rejects unmanaged tmux sessions before state, worktree, split, or profile mutation", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { gjcProfile: false });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Do not hijack tmux",
+				teamName: "unmanaged-team",
+				cwd: cleanupRoot,
+				env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+			}),
+		).rejects.toThrow(/unmanaged_tmux_session:test-session/);
+
+		expect(
+			await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "unmanaged-team", "phase.json")).exists(),
+		).toBe(false);
+		expect(
+			await Bun.file(
+				path.join(cleanupRoot, ".gjc", "state", "team", "unmanaged-team", "worktrees", "worker-1", ".git"),
+			).exists(),
+		).toBe(false);
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).toContain("show-options -qv -t =test-session @gjc-profile");
+		expect(tmuxLog).not.toContain("split-window");
+		expect(tmuxLog).not.toContain("set-option -t test-session:0");
 	});
 
 	it("cleans partial worker worktrees without killing the leader session when pane startup fails", async () => {

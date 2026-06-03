@@ -14,6 +14,7 @@ import {
 	writeJsonAtomic,
 	writeReport,
 } from "./state-writer";
+import { GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE } from "./tmux-common";
 
 export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
@@ -870,6 +871,18 @@ function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
 	const suffix = detail?.trim() ? `:${detail.trim()}` : "";
 	return `gjc_team_requires_tmux_leader: run \`gjc --tmux\` first, then run \`gjc team ...\` inside that tmux-backed leader session, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
 }
+function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): string {
+	const result = Bun.spawnSync(
+		[tmuxCommand, "show-options", "-qv", "-t", `=${sessionName}`, GJC_TMUX_PROFILE_OPTION],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	if (result.exitCode !== 0) return "";
+	return result.stdout.toString().trim();
+}
+
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	const paneTarget = env.TMUX_PANE?.trim();
 	const args = paneTarget
@@ -881,6 +894,8 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
+	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
+		throw new Error(buildTeamTmuxLeaderRequirementMessage(`unmanaged_tmux_session:${sessionName}`));
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
 export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
