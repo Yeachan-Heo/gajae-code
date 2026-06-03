@@ -17,6 +17,7 @@ import {
 	resolveGjcTeamWorkerCli,
 	resolveGjcTeamWorkerCliPlan,
 	resolveGjcWorkerCommand,
+	sendGjcTeamMessage,
 	shutdownGjcTeam,
 	startGjcTeam,
 	transitionGjcTeamTask,
@@ -778,6 +779,49 @@ describe("native gjc team runtime", () => {
 		expect(completionTrace?.source_event_id).toBeTruthy();
 		expect(completionTrace?.evidence_refs).toContain("task:task-1:completion_evidence");
 		expect(await Bun.file(path.join(stateDir, "trace-errors.jsonl")).exists()).toBe(false);
+	});
+
+	it("sanitizes mailbox bodies from structured traces", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Trace sanitizer runtime events",
+			teamName: "trace-sanitized-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const secretBody = "SECRET_TOKEN=abc123";
+		const message = await sendGjcTeamMessage(
+			"trace-sanitized-team",
+			"worker-1",
+			"leader-fixed",
+			secretBody,
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		const traceJsonl = await Bun.file(path.join(snapshot.state_dir, "trace.jsonl")).text();
+		expect(traceJsonl).not.toContain(secretBody);
+		expect(traceJsonl).not.toContain("SECRET_TOKEN");
+
+		const traceRead = (await executeGjcTeamApiOperation(
+			"read-traces",
+			{ team_name: "trace-sanitized-team" },
+			cleanupRoot,
+			{ PATH: "" },
+		)) as { traces: Array<{ event_type: string; message?: string; data?: Record<string, unknown> }> };
+		const serializedTraces = JSON.stringify(traceRead);
+		expect(serializedTraces).not.toContain(secretBody);
+		expect(serializedTraces).not.toContain("SECRET_TOKEN");
+		const sentTrace = traceRead.traces.find(trace => trace.event_type === "message_sent");
+		expect(sentTrace?.message).toBeUndefined();
+		expect(sentTrace?.data?.to_worker).toBe("leader-fixed");
+		expect(sentTrace?.data?.message_id).toBe(message.message_id);
+		expect(sentTrace?.data?.body_byte_length).toBe(Buffer.byteLength(secretBody, "utf8"));
+		expect(typeof sentTrace?.data?.body_sha256).toBe("string");
+		expect(String(sentTrace?.data?.body_sha256)).toHaveLength(64);
+		expect(sentTrace?.data?.body).toBeUndefined();
 	});
 
 	it("stores structured completion evidence in task listings and honors claim tokens without implicit worker defaults", async () => {

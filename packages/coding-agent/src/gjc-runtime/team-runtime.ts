@@ -655,9 +655,106 @@ function evidenceRefsForEvent(event: GjcTeamEvent): string[] | undefined {
 	if (event.worker && event.type.startsWith("worker_")) refs.push(`worker:${event.worker}`);
 	return refs.length > 0 ? refs : undefined;
 }
+function pickString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+function pickNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+function pickBoolean(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+function pickStringArray(value: unknown): string[] | undefined {
+	return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
+}
+function setIfDefined(record: Record<string, unknown>, key: string, value: unknown): void {
+	if (value !== undefined) record[key] = value;
+}
+function messageBodyTraceProjection(body: string | undefined): Record<string, unknown> {
+	if (body === undefined) return {};
+	return {
+		body_byte_length: Buffer.byteLength(body, "utf8"),
+		body_sha256: createHash("sha256").update(body).digest("hex"),
+	};
+}
+function traceDataForEvent(event: GjcTeamEvent): Record<string, unknown> | undefined {
+	const source = event.data ?? {};
+	const data: Record<string, unknown> = {};
+	switch (event.type) {
+		case "message_sent": {
+			setIfDefined(data, "to_worker", pickString(source.to_worker));
+			setIfDefined(data, "message_id", pickString(source.message_id));
+			Object.assign(data, messageBodyTraceProjection(pickString(event.message)));
+			break;
+		}
+		case "message_acknowledged":
+		case "message_notified": {
+			setIfDefined(data, "message_id", pickString(event.message));
+			break;
+		}
+		case "team_started": {
+			setIfDefined(data, "worker_count", pickNumber(source.worker_count));
+			setIfDefined(data, "agent_type", pickString(source.agent_type));
+			setIfDefined(data, "workspace_mode", pickString(source.workspace_mode));
+			setIfDefined(data, "dry_run", pickBoolean(source.dry_run));
+			break;
+		}
+		case "task_claim_recovered": {
+			setIfDefined(data, "reasons", pickStringArray(source.reasons));
+			break;
+		}
+		case "task_transitioned": {
+			setIfDefined(data, "status", pickString(source.status));
+			const evidence = source.completion_evidence;
+			if (typeof evidence === "object" && evidence !== null) {
+				const evidenceRecord = evidence as Record<string, unknown>;
+				data.completion_evidence = {
+					recorded_by: pickString(evidenceRecord.recorded_by),
+					item_count: pickNumber(evidenceRecord.item_count),
+					verified_item_count: pickNumber(evidenceRecord.verified_item_count),
+				};
+			}
+			break;
+		}
+		case "worker_integration_attempt_requested": {
+			setIfDefined(data, "worker_name", pickString(source.worker_name));
+			setIfDefined(data, "worker_head", pickString(source.worker_head));
+			setIfDefined(data, "status", pickString(source.status));
+			if (Array.isArray(source.files)) data.file_count = source.files.length;
+			break;
+		}
+		case "worker_lifecycle_nudge": {
+			setIfDefined(data, "condition", pickString(source.condition));
+			setIfDefined(data, "severity", pickString(source.severity));
+			setIfDefined(data, "fingerprint", pickString(source.fingerprint));
+			setIfDefined(data, "auto_action_taken", pickBoolean(source.auto_action_taken));
+			break;
+		}
+		case "team_shutdown": {
+			setIfDefined(data, "phase", pickString(source.phase));
+			setIfDefined(data, "shutdown_request_id", pickString(source.shutdown_request_id));
+			setIfDefined(data, "graceful_shutdown_complete", pickBoolean(source.graceful_shutdown_complete));
+			if (Array.isArray(source.evidence_failures)) data.evidence_failure_count = source.evidence_failures.length;
+			break;
+		}
+		case "worker_status_updated": {
+			setIfDefined(data, "status", pickString(source.status));
+			setIfDefined(data, "current_task_id", pickString(source.current_task_id));
+			break;
+		}
+		case "worker_shutdown_requested": {
+			setIfDefined(data, "requested_by", pickString(source.requested_by));
+			setIfDefined(data, "request_id", pickString(source.request_id));
+			setIfDefined(data, "mode", pickString(source.mode));
+			break;
+		}
+	}
+	return Object.keys(data).length > 0 ? data : undefined;
+}
 
 async function appendTraceForEvent(dir: string, event: GjcTeamEvent): Promise<void> {
 	const evidenceRefs = evidenceRefsForEvent(event);
+	const traceData = traceDataForEvent(event);
 	const trace: GjcTeamTraceEvent = {
 		schema_version: 1,
 		trace_id: traceIdForTeam(dir),
@@ -667,8 +764,7 @@ async function appendTraceForEvent(dir: string, event: GjcTeamEvent): Promise<vo
 		ts: event.ts,
 		...(event.worker ? { worker: event.worker } : {}),
 		...(event.task_id ? { task_id: event.task_id } : {}),
-		...(event.message ? { message: event.message } : {}),
-		...(event.data ? { data: event.data } : {}),
+		...(traceData ? { data: traceData } : {}),
 		...(evidenceRefs ? { evidence_refs: evidenceRefs } : {}),
 	};
 	try {
