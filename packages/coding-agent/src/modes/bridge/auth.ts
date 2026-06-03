@@ -1,3 +1,5 @@
+import * as crypto from "node:crypto";
+
 export interface BridgeAuthConfig {
 	token: string;
 }
@@ -17,7 +19,11 @@ export function extractBearerToken(authorization: string | null | undefined): st
 }
 
 export function isBridgeTokenAuthorized(authorization: string | null | undefined, config: BridgeAuthConfig): boolean {
-	return extractBearerToken(authorization) === config.token;
+	const candidate = extractBearerToken(authorization);
+	if (candidate === undefined) return false;
+	const candidateBytes = Buffer.from(candidate, "utf8");
+	const expectedBytes = Buffer.from(config.token, "utf8");
+	return candidateBytes.length === expectedBytes.length && crypto.timingSafeEqual(candidateBytes, expectedBytes);
 }
 
 export function isLoopbackHost(hostname: string): boolean {

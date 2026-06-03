@@ -17,6 +17,8 @@ describe("bridge auth helpers", () => {
 	it("authorizes only the configured bearer token", () => {
 		expect(isBridgeTokenAuthorized("Bearer secret", { token: "secret" })).toBe(true);
 		expect(isBridgeTokenAuthorized("Bearer wrong", { token: "secret" })).toBe(false);
+		expect(isBridgeTokenAuthorized("Bearer secret-extra", { token: "secret" })).toBe(false);
+		expect(isBridgeTokenAuthorized("Bearer sec", { token: "secret" })).toBe(false);
 		expect(isBridgeTokenAuthorized(null, { token: "secret" })).toBe(false);
 	});
 
