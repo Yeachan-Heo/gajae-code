@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	appendEvent,
 	assertSafeSessionId,
+	controlSocketPath,
 	generateSessionId,
+	MAX_UNIX_SOCKET_PATH_BYTES,
 	readEvents,
 	readReceiptIndex,
 	readSessionState,
@@ -115,5 +118,69 @@ describe("harness storage", () => {
 
 	it("generateSessionId produces safe ids", () => {
 		expect(() => assertSafeSessionId(generateSessionId())).not.toThrow();
+	});
+
+	it("controlSocketPath is stable, short, and records metadata", async () => {
+		const id = "h-socket";
+		const socketDir = await mkdtemp(path.join(tmpdir(), "h-"));
+		const first = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
+		const second = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
+		expect(first).toBe(second);
+		expect(Buffer.byteLength(first)).toBeLessThanOrEqual(MAX_UNIX_SOCKET_PATH_BYTES);
+		expect(first.startsWith(socketDir)).toBe(true);
+		expect(path.basename(first)).toMatch(/^c-[0-9a-f]{16}\.sock$/);
+		const metadata = JSON.parse(await readFile(first.replace(/\.sock$/, ".json"), "utf8")) as Record<string, unknown>;
+		expect(metadata).toEqual({ root, sessionId: id });
+	});
+
+	it("controlSocketPath uses GJC_HARNESS_SOCKET_DIR when set", async () => {
+		const socketDir = await mkdtemp(path.join(tmpdir(), "e-"));
+		const socketPath = controlSocketPath(root, "h-env", { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
+		expect(socketPath.startsWith(socketDir)).toBe(true);
+	});
+
+	it("controlSocketPath falls back to tmp base when override is too long", async () => {
+		const oldTmpdir = process.env.TMPDIR;
+		process.env.TMPDIR = "/tmp";
+		try {
+			const longDir = path.join(root, "x".repeat(80));
+			const socketPath = controlSocketPath(root, "h-fallback", {
+				GJC_HARNESS_SOCKET_DIR: longDir,
+			} as NodeJS.ProcessEnv);
+			expect(socketPath.startsWith(longDir)).toBe(false);
+			expect(socketPath.includes("gjch")).toBe(true);
+			expect(Buffer.byteLength(socketPath)).toBeLessThanOrEqual(MAX_UNIX_SOCKET_PATH_BYTES);
+		} finally {
+			if (oldTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = oldTmpdir;
+		}
+	});
+
+	it("controlSocketPath throws socket_path_too_long when tmp base is too long", async () => {
+		const oldTmpdir = process.env.TMPDIR;
+		process.env.TMPDIR = path.join(root, "t".repeat(80));
+		try {
+			expect(() =>
+				controlSocketPath(root, "h-too-long", {
+					GJC_HARNESS_SOCKET_DIR: path.join(root, "o".repeat(80)),
+				} as NodeJS.ProcessEnv),
+			).toThrow(/socket_path_too_long/);
+		} finally {
+			if (oldTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = oldTmpdir;
+		}
+	});
+
+	it("controlSocketPath extends the hash on metadata collision", async () => {
+		const id = "h-collision";
+		const socketDir = path.join("/tmp", `c-${process.pid}`);
+		const digest = createHash("sha256").update(`${root}\0${id}`).digest("hex");
+		await mkdir(socketDir, { recursive: true });
+		await writeFile(
+			path.join(socketDir, `c-${digest.slice(0, 16)}.json`),
+			`${JSON.stringify({ root: "other", sessionId: id })}\n`,
+		);
+		const socketPath = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
+		expect(path.basename(socketPath)).toBe(`c-${digest.slice(0, 24)}.sock`);
 	});
 });

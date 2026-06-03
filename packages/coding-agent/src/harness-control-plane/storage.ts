@@ -13,12 +13,60 @@
  * Receipt files are immutable: re-writing an existing receipt id fails closed.
  * JSON writes are atomic (temp + rename).
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { EventEnvelope, ReceiptFamily, SessionState } from "./types";
 
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+
+interface SocketPathMetadata {
+	root: string;
+	sessionId: string;
+}
+
+function socketBase(env: NodeJS.ProcessEnv, allowOverride: boolean): { base: string; fromOverride: boolean } {
+	const override = env.GJC_HARNESS_SOCKET_DIR?.trim();
+	if (allowOverride && override) return { base: path.resolve(override), fromOverride: true };
+	return { base: path.join(os.tmpdir(), `gjch${process.getuid?.() ?? "u"}`), fromOverride: false };
+}
+
+function socketPathForBase(root: string, sessionId: string, base: string): string {
+	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex");
+	fsSync.mkdirSync(base, { recursive: true });
+	for (const len of [16, 24, 32, 48, 64]) {
+		const stem = `c-${digest.slice(0, len)}`;
+		const metadataPath = path.join(base, `${stem}.json`);
+		const metadata: SocketPathMetadata = { root, sessionId };
+		try {
+			const existing = JSON.parse(fsSync.readFileSync(metadataPath, "utf8")) as SocketPathMetadata;
+			if (existing.root === root && existing.sessionId === sessionId) return path.join(base, `${stem}.sock`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+			return path.join(base, `${stem}.sock`);
+		}
+	}
+	throw new StorageError(`socket_path_collision:${sessionId}`, "socket_path_collision");
+}
+
+export function controlSocketPath(root: string, sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+	assertSafeSessionId(sessionId);
+	let { base, fromOverride } = socketBase(env, true);
+	let finalPath = socketPathForBase(root, sessionId, base);
+	if (Buffer.byteLength(finalPath) > MAX_UNIX_SOCKET_PATH_BYTES && fromOverride) {
+		base = socketBase(env, false).base;
+		finalPath = socketPathForBase(root, sessionId, base);
+	}
+	const finalBytes = Buffer.byteLength(finalPath);
+	if (finalBytes > MAX_UNIX_SOCKET_PATH_BYTES) {
+		throw new StorageError(`socket_path_too_long:${finalBytes}`, "socket_path_too_long");
+	}
+	return finalPath;
+}
 
 export class StorageError extends Error {
 	constructor(

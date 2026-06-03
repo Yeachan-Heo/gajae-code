@@ -36,6 +36,16 @@ function handle(line: string): void {
 	} else if (frame.type === "prompt") {
 		process.stdout.write(`${JSON.stringify({ type: "response", id: frame.id, command: "prompt", success: true })}\n`);
 		process.stdout.write(`${JSON.stringify({ type: "agent_start" })}\n`);
+		// Emit a realistic tool turn so the owner can surface tool-call -> completed.
+		const w = (f: Record<string, unknown>): void => {
+			process.stdout.write(`${JSON.stringify(f)}\n`);
+		};
+		if (process.env.GJC_FAKE_RPC_STORM === "1") {
+			for (let i = 0; i < 200; i++) w({ type: "message_update", messageId: "m1", delta: "noise" });
+		}
+		w({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", command: "echo hi" });
+		w({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", status: "ok" });
+		w({ type: "agent_end" });
 	}
 }
 

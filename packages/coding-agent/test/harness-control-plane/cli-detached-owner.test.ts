@@ -78,6 +78,19 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect((sub.json?.evidence as Record<string, unknown>).accepted).toBe(true);
 		expect((sub.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
 
+		// AC-9: the detached owner maps the real RPC frame stream -> observe surfaces tool-call -> completed.
+		let signals: string[] = [];
+		for (let i = 0; i < 40; i++) {
+			const o = await runHarness(["observe", "--session", SID]);
+			signals =
+				((o.json?.evidence as Record<string, unknown>)?.observation as { observedSignals?: string[] })
+					?.observedSignals ?? [];
+			if (signals.includes("completed")) break;
+			await sleep(50);
+		}
+		expect(signals).toContain("tool-call");
+		expect(signals).toContain("completed");
+
 		// Owner-backed finalize: the evidence gate HONESTLY refuses without real commit/PR/tests
 		// (no fake completion evidence in shipped code).
 		const fin = await runHarness(["finalize", "--session", SID]);

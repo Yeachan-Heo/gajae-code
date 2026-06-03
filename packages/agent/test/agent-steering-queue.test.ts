@@ -56,4 +56,32 @@ describe("Agent steering queue introspection", () => {
 		agent.restoreSteering([]);
 		expect(agent.snapshotSteering()).toHaveLength(1);
 	});
+
+	it("snapshots follow-ups without mutating the queue", () => {
+		const agent = new Agent();
+		agent.followUp(userMessage("a"));
+		agent.followUp(userMessage("b"));
+
+		const snap = agent.snapshotFollowUp();
+		expect(snap).toHaveLength(2);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.snapshotFollowUp()).toHaveLength(2);
+	});
+
+	it("restores snapshotted follow-ups ahead of newly queued messages", () => {
+		const agent = new Agent();
+		agent.followUp(userMessage("a"));
+		const snap = agent.snapshotFollowUp();
+
+		agent.clearFollowUpQueue();
+		expect(agent.hasQueuedMessages()).toBe(false);
+
+		agent.followUp(userMessage("b"));
+		agent.restoreFollowUp(snap);
+
+		const after = agent.snapshotFollowUp();
+		expect(after).toHaveLength(2);
+		expect(after[0]).toMatchObject({ content: "a" });
+		expect(after[1]).toMatchObject({ content: "b" });
+	});
 });

@@ -614,8 +614,7 @@ function renderAgentProgress(
 		const attemptLabel = progress.retryState.unbounded
 			? `attempt ${progress.retryState.attempt}`
 			: `${progress.retryState.attempt}/${progress.retryState.maxAttempts}`;
-		const summary =
-			`retrying ${attemptLabel} ${waitLabel}: ` + truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60);
+		const summary = `retrying ${attemptLabel} ${waitLabel}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
