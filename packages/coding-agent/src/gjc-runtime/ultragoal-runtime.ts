@@ -106,6 +106,8 @@ const PASSED_STATUS = "passed";
 const NOT_APPLICABLE_STATUS = "not_applicable";
 const COVERED_STATUS = "covered";
 const ACCEPTED_PROOF_STATUSES = new Set([COVERED_STATUS, "passed", "verified"]);
+const MIN_SUBSTANTIVE_EVIDENCE_WORDS = 5;
+const MIN_SUBSTANTIVE_EVIDENCE_CHARS = 32;
 
 const GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS = 10 * 60 * 1000;
 const GJC_GOAL_SNAPSHOT_MAX_FUTURE_SKEW_MILLISECONDS = 60 * 1000;
@@ -725,14 +727,55 @@ function validateSurfaceArtifactCompatibility(
 	}
 }
 
-function validateArtifactRefs(executorQa: JsonObject): Map<string, JsonObject> {
+function isSubstantiveEvidence(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+	const trimmed = value.trim();
+	if (trimmed.length < MIN_SUBSTANTIVE_EVIDENCE_CHARS) return false;
+	const words = trimmed.split(/\s+/).filter(word => /[a-z0-9]/i.test(word));
+	if (words.length < MIN_SUBSTANTIVE_EVIDENCE_WORDS) return false;
+	const normalized = trimmed.toLowerCase();
+	return !["todo", "tbd", "n/a", "na", "none", "placeholder", "empty", "stub"].includes(normalized);
+}
+
+function hasTypedVerifiedReceipt(value: unknown): boolean {
+	const receipt = qualityGateObject(value);
+	if (!receipt) return false;
+	const type = nonEmptyString(receipt.type) ?? nonEmptyString(receipt.kind) ?? nonEmptyString(receipt.receiptType);
+	const id = nonEmptyString(receipt.id) ?? nonEmptyString(receipt.receiptId) ?? nonEmptyString(receipt.ref);
+	const status = (nonEmptyString(receipt.status) ?? nonEmptyString(receipt.verdict) ?? "").toLowerCase();
+	return Boolean(type && id && (status === "verified" || status === "passed"));
+}
+
+async function hasExistingNonEmptyArtifact(cwd: string, value: unknown): Promise<boolean> {
+	const artifactPath = nonEmptyString(value);
+	if (!artifactPath) return false;
+	const resolved = path.resolve(cwd, artifactPath);
+	try {
+		const file = Bun.file(resolved);
+		return (await file.exists()) && file.size > 0;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
+async function requireSubstantiveArtifactEvidence(cwd: string, row: JsonObject, fieldName: string): Promise<void> {
+	if (isSubstantiveEvidence(row.inlineEvidence) || isSubstantiveEvidence(row.evidence)) return;
+	if (hasTypedVerifiedReceipt(row.verifiedReceipt) || hasTypedVerifiedReceipt(row.receipt)) return;
+	if (await hasExistingNonEmptyArtifact(cwd, row.path)) return;
+	throw new Error(
+		`qualityGate ${fieldName} must reference an existing non-empty artifact path, substantive inlineEvidence, or a typed verifiedReceipt`,
+	);
+}
+
+async function validateArtifactRefs(cwd: string, executorQa: JsonObject): Promise<Map<string, JsonObject>> {
 	const rows = requireObjectArray(executorQa.artifactRefs, "executorQa.artifactRefs");
 	const idMap = buildRowIdMap(rows, "executorQa.artifactRefs");
 	for (const [index, row] of rows.entries()) {
 		const fieldName = `executorQa.artifactRefs[${index}]`;
 		requiredStringField(row, "kind", fieldName);
-		requiredStringField(row, "path", fieldName);
 		requiredStringField(row, "description", fieldName);
+		await requireSubstantiveArtifactEvidence(cwd, row, fieldName);
 	}
 	return idMap;
 }
@@ -840,14 +883,14 @@ function validateContractCoverage(
 	}
 }
 
-function validateExecutorQaRedTeamEvidence(executorQa: JsonObject): void {
-	const artifactRefs = validateArtifactRefs(executorQa);
+async function validateExecutorQaRedTeamEvidence(cwd: string, executorQa: JsonObject): Promise<void> {
+	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = validateSurfaceEvidence(executorQa, artifactRefs);
 	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
 	validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
 }
 
-function validateCompletionQualityGate(gate: JsonObject): void {
+async function validateCompletionQualityGate(cwd: string, gate: JsonObject): Promise<void> {
 	const codeReview = qualityGateObject(gate.codeReview);
 	if (codeReview) {
 		throw new Error(
@@ -892,7 +935,7 @@ function validateCompletionQualityGate(gate: JsonObject): void {
 	}
 	requireNonEmptyString(executorQa.evidence, "executorQa.evidence");
 	requireEmptyBlockers(executorQa.blockers, "executorQa.blockers");
-	validateExecutorQaRedTeamEvidence(executorQa);
+	await validateExecutorQaRedTeamEvidence(cwd, executorQa);
 	if (iteration.status !== PASSED_STATUS || iteration.fullRerun !== true) {
 		throw new Error("qualityGate iteration must be passed with fullRerun true");
 	}
@@ -912,7 +955,7 @@ async function readRequiredCompletionQualityGate(cwd: string, value: string | un
 	const gate = await readStructuredValue(cwd, value);
 	const gateObject = qualityGateObject(gate);
 	if (!gateObject) throw new Error("qualityGate must be a JSON object");
-	validateCompletionQualityGate(gateObject);
+	await validateCompletionQualityGate(cwd, gateObject);
 	return gate;
 }
 

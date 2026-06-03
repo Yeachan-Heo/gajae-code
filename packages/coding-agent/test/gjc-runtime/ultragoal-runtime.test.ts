@@ -50,18 +50,24 @@ function passingQualityGate(): string {
 					kind: "browser-automation",
 					path: "artifacts/browser-run.json",
 					description: "Playwright/Pandawright browser run that invokes the approved user-facing flow",
+					inlineEvidence:
+						"Browser automation executed the approved flow, asserted the expected visible result, and captured the final DOM state.",
 				},
 				{
 					id: "gui-screenshot",
 					kind: "screenshot",
 					path: "artifacts/gui-screenshot.png",
 					description: "Screenshot evidence for the GUI/web surface verdict",
+					inlineEvidence:
+						"Screenshot review confirmed the approved screen state, including the success message and absence of regression indicators.",
 				},
 				{
 					id: "adversarial-report",
 					kind: "failure-mode-test",
 					path: "artifacts/adversarial-report.txt",
 					description: "Adversarial boundary and failure-mode test output",
+					inlineEvidence:
+						"Adversarial boundary cases exercised invalid input, missing state, and repeated submission without violating the contract.",
 				},
 			],
 			contractCoverage: [
@@ -478,6 +484,105 @@ describe("native GJC ultragoal runtime", () => {
 
 		expect(missingMatrixError).toContain("executorQa.contractCoverage");
 		expect(emptyMatrixError).toContain("executorQa.surfaceEvidence");
+	});
+
+	it("rejects missing red-team artifact references before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const missingArtifact = mutateQualityGate(gate => {
+			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
+			delete refs[0]!.inlineEvidence;
+			refs[0]!.path = "artifacts/missing-browser-run.json";
+		});
+
+		const artifactError = await expectRejectedCompleteGate(root, created, missingArtifact);
+
+		expect(artifactError).toContain("executorQa.artifactRefs[0]");
+		expect(artifactError).toContain("existing non-empty artifact path");
+	});
+
+	it("rejects empty red-team evidence artifacts before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+		await Bun.write(path.join(root, "artifacts", "empty-browser-run.json"), "");
+		const emptyArtifact = mutateQualityGate(gate => {
+			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
+			delete refs[0]!.inlineEvidence;
+			refs[0]!.path = "artifacts/empty-browser-run.json";
+		});
+
+		const artifactError = await expectRejectedCompleteGate(root, created, emptyArtifact);
+
+		expect(artifactError).toContain("executorQa.artifactRefs[0]");
+		expect(artifactError).toContain("existing non-empty artifact path");
+	});
+
+	it("accepts substantive inline evidence, non-empty artifacts, and typed verified receipt references", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+		await Bun.write(
+			path.join(root, "artifacts", "gui-screenshot.txt"),
+			"approved screenshot artifact contains visible success-state verification",
+		);
+		const mixedProof = mutateQualityGate(gate => {
+			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
+			refs[0] = {
+				id: "browser-run",
+				kind: "browser-automation",
+				description: "Browser automation inline proof",
+				inlineEvidence:
+					"Browser automation completed the approved flow, asserted the result, and recorded the runtime state transitions.",
+			};
+			refs[1] = {
+				id: "gui-screenshot",
+				kind: "screenshot",
+				path: "artifacts/gui-screenshot.txt",
+				description: "Existing non-empty screenshot artifact",
+			};
+			refs[2] = {
+				id: "adversarial-report",
+				kind: "failure-mode-test",
+				description: "Typed verified receipt from adversarial runner",
+				verifiedReceipt: {
+					type: "red-team-adversarial-run",
+					id: "receipt-adversarial-001",
+					status: "verified",
+				},
+			};
+		});
+
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
+			qualityGateJson: mixedProof,
+		});
+
+		expect(plan.goals[0]?.status).toBe("complete");
+	});
+
+	it("rejects empty or degenerate red-team receipts before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const degenerateReceipt = mutateQualityGate(gate => {
+			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
+			delete refs[0]!.inlineEvidence;
+			delete refs[0]!.path;
+			refs[0]!.verifiedReceipt = { status: "verified" };
+		});
+
+		const receiptError = await expectRejectedCompleteGate(root, created, degenerateReceipt);
+
+		expect(receiptError).toContain("executorQa.artifactRefs[0]");
+		expect(receiptError).toContain("typed verifiedReceipt");
 	});
 
 	it("rejects fake or unlinked executor QA red-team evidence before mutation", async () => {
