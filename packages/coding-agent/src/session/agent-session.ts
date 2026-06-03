@@ -7255,17 +7255,25 @@ export class AgentSession {
 		if (/anthropic stream envelope error:/i.test(err)) {
 			return this.#isTransientEnvelopeErrorMessage(err) ? "transient" : "terminal";
 		}
-		// Structured provider HTTP status is usually authoritative, but providers
-		// may derive errorStatus from broad message parsing. Classify text first so
-		// deterministic terminal copy still surfaces, while retry/rate-limit copy
-		// like "rate limit error: 400 requests/min" is not terminalized as HTTP 400.
+		const explicitStatus = this.#extractExplicitHttpStatusFromErrorMessage(err);
+		const structuredStatus = message.errorStatus;
+		const terminalStatus = explicitStatus ?? structuredStatus;
+		const isTerminalHttp4xx =
+			terminalStatus !== undefined &&
+			terminalStatus >= 400 &&
+			terminalStatus < 500 &&
+			terminalStatus !== 408 &&
+			terminalStatus !== 425 &&
+			terminalStatus !== 429;
 		if (this.#isTerminalErrorMessage(err)) return "terminal";
 		if (isUsageLimitError(err)) return "usage_limit";
-		if (this.#isTransientErrorMessage(err)) return "transient";
-		const status = message.errorStatus ?? this.#extractExplicitHttpStatusFromErrorMessage(err);
-		if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429) {
+		// Explicit HTTP/status wording is authoritative. Structured provider status
+		// is also authoritative except for rate-limit copy where providers may have
+		// parsed an incidental quota number such as "400 requests per minute".
+		if (isTerminalHttp4xx && (explicitStatus !== undefined || !/rate.?limit|too many requests/i.test(err))) {
 			return "terminal";
 		}
+		if (this.#isTransientErrorMessage(err)) return "transient";
 		return "unknown";
 	}
 

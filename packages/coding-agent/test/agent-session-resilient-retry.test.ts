@@ -348,6 +348,44 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 
+	it("surfaces explicit HTTP 400 messages even when text contains transient substrings", async () => {
+		for (const errorMessage of [
+			"HTTP 400: provider returned error",
+			"HTTP 400: max 500 tool calls exceeded",
+			"HTTP 400: request timed out during validation",
+		] as const) {
+			if (session) {
+				await session.dispose();
+				session = undefined;
+			}
+			session = buildSession({ responses: [{ throw: errorMessage }] });
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`trigger explicit terminal 400: ${errorMessage}`);
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(lastAssistant(session).stopReason).toBe("error");
+		}
+	});
+
+	it("surfaces structured HTTP 400 even when text contains transient substrings", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "provider returned error",
+			errorStatus: 400,
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger structured terminal 400");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
 	it("surfaces explicit status-code 4xx errors without retrying", async () => {
 		session = buildSession({ responses: [{ throw: "provider returned status code 400 for malformed payload" }] });
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
