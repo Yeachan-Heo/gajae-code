@@ -81,6 +81,7 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 		appliesToVerbs: ["handoff"],
 	},
 	{ name: "replace", type: "boolean", appliesToVerbs: ["write"] },
+	{ name: "force", type: "boolean", appliesToVerbs: ["write", "clear", "handoff"] },
 ];
 
 function verb(name: string, surface: WorkflowVerb["surface"]): WorkflowVerb {
@@ -170,14 +171,19 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ralplan: manifest({
 		skill: "ralplan",
-		states: ["planner", "architect", "critic", "revision", "adr", "final"],
-		terminalStates: ["final"],
+		states: ["planner", "architect", "critic", "revision", "adr", "final", "handoff"],
+		terminalStates: ["final", "handoff"],
 		transitions: [
 			{ from: "planner", to: "architect", verb: "write-artifact" },
 			{ from: "architect", to: "critic", verb: "write-artifact" },
 			{ from: "critic", to: "revision", verb: "write-artifact" },
 			{ from: "revision", to: "adr", verb: "write-artifact" },
 			{ from: "adr", to: "final", verb: "write-artifact" },
+			{ from: "planner", to: "handoff", verb: "handoff" },
+			{ from: "architect", to: "handoff", verb: "handoff" },
+			{ from: "critic", to: "handoff", verb: "handoff" },
+			{ from: "revision", to: "handoff", verb: "handoff" },
+			{ from: "adr", to: "handoff", verb: "handoff" },
 		],
 		verbs: [...stateVerbs(), ...flagVerbs(["kickoff", "write-artifact"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
 		typedArgs: [
@@ -204,8 +210,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",
-		states: ["goal-planning", "pending", "active", "blocked", "failed", "complete"],
-		terminalStates: ["failed", "complete"],
+		states: ["goal-planning", "pending", "active", "blocked", "failed", "complete", "handoff"],
+		terminalStates: ["failed", "complete", "handoff"],
 		transitions: [
 			{ from: "goal-planning", to: "pending", verb: "create-goals" },
 			{ from: "pending", to: "active", verb: "complete-goals" },
@@ -214,6 +220,10 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "active", to: "complete", verb: "checkpoint" },
 			{ from: "blocked", to: "active", verb: "checkpoint" },
 			{ from: "failed", to: "active", verb: "complete-goals" },
+			{ from: "goal-planning", to: "handoff", verb: "handoff" },
+			{ from: "pending", to: "handoff", verb: "handoff" },
+			{ from: "active", to: "handoff", verb: "handoff" },
+			{ from: "blocked", to: "handoff", verb: "handoff" },
 		],
 		verbs: [
 			...stateVerbs(),
@@ -281,8 +291,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	team: manifest({
 		skill: "team",
-		states: ["starting", "running", "awaiting_integration", "complete", "failed", "cancelled"],
-		terminalStates: ["complete", "failed", "cancelled"],
+		states: ["starting", "running", "awaiting_integration", "complete", "failed", "cancelled", "handoff"],
+		terminalStates: ["complete", "failed", "cancelled", "handoff"],
 		transitions: [
 			{ from: "starting", to: "running", verb: "start" },
 			{ from: "starting", to: "failed", verb: "start" },
@@ -292,6 +302,9 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "running", to: "cancelled", verb: "shutdown" },
 			{ from: "awaiting_integration", to: "running", verb: "resume" },
 			{ from: "awaiting_integration", to: "complete", verb: "shutdown" },
+			{ from: "starting", to: "handoff", verb: "handoff" },
+			{ from: "running", to: "handoff", verb: "handoff" },
+			{ from: "awaiting_integration", to: "handoff", verb: "handoff" },
 		],
 		verbs: [
 			...stateVerbs(),
@@ -377,7 +390,12 @@ export function getSkillManifest(skill: CanonicalGjcWorkflowSkill): SkillManifes
 	return WORKFLOW_MANIFEST[skill];
 }
 
+export function isKnownWorkflowState(skill: CanonicalGjcWorkflowSkill, state: string): boolean {
+	return WORKFLOW_MANIFEST[skill].states.some(entry => entry.id === state);
+}
+
 export function isValidTransition(skill: CanonicalGjcWorkflowSkill, from: string, to: string): boolean {
+	if (from === to) return true;
 	return WORKFLOW_MANIFEST[skill].transitions.some(transition => transition.from === from && transition.to === to);
 }
 

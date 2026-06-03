@@ -34,6 +34,7 @@ import {
 	STATE_FIELD_ALLOWLIST,
 	type StateProjectionField,
 } from "./state-renderer";
+import { validateWorkflowStateEnvelope } from "./state-validation";
 import {
 	type GenericHardPruneTarget,
 	hardPrune,
@@ -41,7 +42,7 @@ import {
 	softDelete,
 	writeJsonAtomic as writeStateJsonAtomic,
 } from "./state-writer";
-import { getSkillManifest, typedArgsFor } from "./workflow-manifest";
+import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor } from "./workflow-manifest";
 
 /**
  * Native implementation of the `gjc state read|write|clear` command surface.
@@ -98,7 +99,7 @@ const FLAGS_WITH_VALUES = new Set([
 	"--limit",
 ]);
 const ACTION_NAMES = new Set(["read", "write", "clear", "contract", "handoff", "graph", "prune", "migrate", "status"]);
-const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate", "--compact", "--history"]);
+const BOOLEAN_FLAGS = new Set(["--json", "--replace", "--hard", "--migrate", "--compact", "--history", "--force"]);
 const VERB_SPECIFIC_FLAGS = new Set([
 	"--skill",
 	"--format",
@@ -313,6 +314,16 @@ async function readJsonFile(filePath: string): Promise<Record<string, unknown> |
 			return parsed as Record<string, unknown>;
 		}
 		return null;
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return null;
+		throw new StateCommandError(1, `failed to read ${filePath}: ${err.message}`);
+	}
+}
+
+async function readJsonValue(filePath: string): Promise<unknown | null> {
+	try {
+		return JSON.parse(await fs.readFile(filePath, "utf-8"));
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT") return null;
@@ -607,7 +618,8 @@ async function handleRead(
 		};
 	}
 	const filePath = activeStateFile(cwd, selectors.sessionId);
-	const existing = await readJsonFile(filePath);
+	const existingRaw = await readJsonValue(filePath);
+	const existing = isPlainObject(existingRaw) ? existingRaw : null;
 	return { status: 0, stdout: `${JSON.stringify(existing ?? {}, null, 2)}\n` };
 }
 
@@ -654,7 +666,8 @@ async function handleWrite(
 		);
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
-	const existing = await readJsonFile(filePath);
+	const existingRaw = await readJsonValue(filePath);
+	const existing = isPlainObject(existingRaw) ? existingRaw : null;
 	const nowIsoStr = nowIso();
 	const receipt = buildWorkflowStateReceipt({
 		cwd,
@@ -664,6 +677,9 @@ async function handleWrite(
 		sessionId,
 		nowIso: nowIsoStr,
 	});
+	if (existingRaw !== null && !isPlainObject(existingRaw)) {
+		throw new StateCommandError(2, `existing state for ${mode} must be a JSON object before write`);
+	}
 	const existingPayload = existing ?? {};
 	const innerState = (payload.state as Record<string, unknown> | undefined) ?? {};
 	const incomingPhase =
@@ -686,6 +702,10 @@ async function handleWrite(
 			delete merged.state;
 		}
 	}
+	const preDefaultValidation = validateWorkflowStateEnvelope(mode, merged);
+	if (!preDefaultValidation.valid) {
+		throw new StateCommandError(2, preDefaultValidation.error ?? `invalid ${mode} state envelope`);
+	}
 	merged.skill = mode;
 	if (incomingPhase) {
 		merged.current_phase = incomingPhase;
@@ -698,6 +718,22 @@ async function handleWrite(
 	merged.updated_at = nowIsoStr;
 	merged.receipt = receipt;
 	if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
+
+	const fromPhase = typeof existingPayload.current_phase === "string" ? existingPayload.current_phase : undefined;
+	const toPhase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
+	const forced = hasFlag(args, "--force");
+	if (fromPhase && toPhase && isKnownWorkflowState(mode, fromPhase) && isKnownWorkflowState(mode, toPhase)) {
+		if (!isValidTransition(mode, fromPhase, toPhase) && !forced) {
+			throw new StateCommandError(
+				2,
+				`invalid ${mode} phase transition from ${fromPhase} to ${toPhase}; use --force to bypass`,
+			);
+		}
+	}
+
+	const validation = validateWorkflowStateEnvelope(mode, merged);
+	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
+
 	await writeJsonAtomic(cwd, filePath, merged, "write");
 
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
