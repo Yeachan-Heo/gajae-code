@@ -33,7 +33,7 @@ describe("RpcHostUriBridge", () => {
 		const pending = bridge.requestRead("db", parseInternalUrl("db://users/42"));
 		expect(out.frames).toHaveLength(1);
 		const request = out.frames[0];
-		if (!request || request.type !== "host_uri_request") {
+		if (request?.type !== "host_uri_request") {
 			throw new Error("Expected host_uri_request frame");
 		}
 		expect(request.operation).toBe("read");
@@ -71,7 +71,7 @@ describe("RpcHostUriBridge", () => {
 		const pending = bridge.requestWrite("db", url, "new content");
 		expect(out.frames).toHaveLength(1);
 		const request = out.frames[0];
-		if (!request || request.type !== "host_uri_request") {
+		if (request?.type !== "host_uri_request") {
 			throw new Error("Expected host_uri_request frame");
 		}
 		expect(request.operation).toBe("write");
@@ -90,7 +90,7 @@ describe("RpcHostUriBridge", () => {
 		const url = parseInternalUrl("db://users/42");
 		const pending = bridge.requestRead("db", url);
 		const request = out.frames[0];
-		if (!request || request.type !== "host_uri_request") {
+		if (request?.type !== "host_uri_request") {
 			throw new Error("Expected host_uri_request frame");
 		}
 		bridge.handleResult({

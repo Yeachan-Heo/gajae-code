@@ -428,7 +428,7 @@ describe("anthropic stream envelope handling", () => {
 
 		const toolCall = result.content[0];
 		expect(toolCall?.type).toBe("toolCall");
-		if (!toolCall || toolCall.type !== "toolCall") {
+		if (toolCall?.type !== "toolCall") {
 			throw new Error("Expected toolCall content in terminal error payload");
 		}
 		expect("partialJson" in toolCall).toBe(false);

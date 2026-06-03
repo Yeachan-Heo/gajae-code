@@ -1959,12 +1959,9 @@ describe("ACP agent", () => {
 			// only `"sessionId" in call` picks the session-scoped variant — and
 			// loop-style narrows don't propagate to the assertions below.
 			const [first, second, third] = calls;
-			if (!first || first.mode !== "form" || !("sessionId" in first))
-				throw new Error("first call missing sessionId");
-			if (!second || second.mode !== "form" || !("sessionId" in second))
-				throw new Error("second call missing sessionId");
-			if (!third || third.mode !== "form" || !("sessionId" in third))
-				throw new Error("third call missing sessionId");
+			if (first?.mode !== "form" || !("sessionId" in first)) throw new Error("first call missing sessionId");
+			if (second?.mode !== "form" || !("sessionId" in second)) throw new Error("second call missing sessionId");
+			if (third?.mode !== "form" || !("sessionId" in third)) throw new Error("third call missing sessionId");
 			expect(first.sessionId).toBe("session-before-switch");
 			expect(second.sessionId).toBe("session-after-switch");
 			expect(third.sessionId).toBe("session-after-switch");

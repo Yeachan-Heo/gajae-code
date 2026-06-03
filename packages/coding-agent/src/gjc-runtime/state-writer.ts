@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
@@ -19,9 +19,21 @@ import {
  * supplied mutation context. No lockfiles are used; isolation is by atomic rename,
  * append, O_EXCL creates, conditional deletes, per-entry active-state files,
  * and derived active-state snapshots.
+ * Transaction journals are per mutation id under `.gjc/state/transactions/`;
+ * they are recovery evidence only, never global locks or waiters, so stale
+ * journals do not block unrelated state reads or writes.
  */
 
-export type WriterCategory = "state" | "artifact" | "ledger" | "log" | "report" | "agents" | "prune" | "force";
+export type WriterCategory =
+	| "state"
+	| "artifact"
+	| "ledger"
+	| "log"
+	| "report"
+	| "agents"
+	| "prune"
+	| "force"
+	| "transaction";
 
 export interface StateWriterReceiptContext {
 	cwd?: string;
@@ -43,6 +55,24 @@ export interface StateWriterAuditContext {
 	fromPhase?: string;
 	toPhase?: string;
 	forced?: boolean;
+}
+
+export interface WorkflowEnvelopeIntegrityMismatch {
+	path: string;
+	expected: string;
+	actual: string;
+}
+
+export interface WorkflowTransactionJournal {
+	version: 1;
+	mutation_id: string;
+	status: "pending" | "committed";
+	created_at: string;
+	updated_at: string;
+	caller?: CanonicalGjcWorkflowSkill;
+	callee?: CanonicalGjcWorkflowSkill;
+	paths: string[];
+	steps: string[];
 }
 
 export interface StateWriterOptions {
@@ -127,6 +157,68 @@ function tempPathFor(filePath: string): string {
 
 function jsonText(value: unknown): string {
 	return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (!value || typeof value !== "object") return value;
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+		const v = (value as Record<string, unknown>)[key];
+		if (v !== undefined) out[key] = canonicalizeJson(v);
+	}
+	return out;
+}
+
+function withoutReceiptChecksum(value: unknown): unknown {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+	const clone: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+	if (clone.receipt && typeof clone.receipt === "object" && !Array.isArray(clone.receipt)) {
+		const receipt = { ...(clone.receipt as Record<string, unknown>) };
+		delete receipt.content_sha256;
+		clone.receipt = receipt;
+	}
+	return clone;
+}
+
+export function workflowEnvelopeContentSha256(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(canonicalizeJson(withoutReceiptChecksum(value))))
+		.digest("hex");
+}
+
+export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, computedAt = new Date().toISOString()): T {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+	const envelope = { ...(value as Record<string, unknown>) };
+	const receipt =
+		envelope.receipt && typeof envelope.receipt === "object" && !Array.isArray(envelope.receipt)
+			? { ...(envelope.receipt as Record<string, unknown>) }
+			: {};
+	envelope.receipt = {
+		...receipt,
+		content_sha256: {
+			algorithm: "sha256",
+			value: workflowEnvelopeContentSha256(envelope),
+			covered_path: filePath,
+			computed_at: computedAt,
+		},
+	};
+	return envelope as T;
+}
+
+export async function detectWorkflowEnvelopeIntegrityMismatch(
+	filePath: string,
+): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
+	const current = await readJsonIfPresent(filePath);
+	if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+	const receipt = (current as Record<string, unknown>).receipt;
+	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
+	const checksum = (receipt as Record<string, unknown>).content_sha256;
+	if (!checksum || typeof checksum !== "object" || Array.isArray(checksum)) return undefined;
+	const expected = (checksum as Record<string, unknown>).value;
+	if (typeof expected !== "string" || !expected) return undefined;
+	const actual = workflowEnvelopeContentSha256(current);
+	return actual === expected ? undefined : { path: filePath, expected, actual };
 }
 
 function safeString(value: unknown): string {
@@ -254,6 +346,18 @@ export async function writeJsonAtomic(
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
 	await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))));
+	await maybeAudit(filePath, options);
+	return filePath;
+}
+
+export async function writeWorkflowEnvelopeAtomic(
+	targetPath: string,
+	value: unknown,
+	options?: StateWriterOptions,
+): Promise<string> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
+	await atomicWrite(filePath, jsonText(stampWorkflowEnvelopeChecksum(withReceipt, filePath)));
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -554,4 +658,61 @@ export async function appendAuditEntry(cwd: string, entry: AuditEntry): Promise<
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
 	return filePath;
+}
+
+function transactionJournalPath(cwd: string, mutationId: string): string {
+	return path.join(path.resolve(cwd), ".gjc", "state", "transactions", `${encodePathSegment(mutationId)}.json`);
+}
+
+export async function readWorkflowTransactionJournal(
+	cwd: string,
+	mutationId: string,
+): Promise<WorkflowTransactionJournal | undefined> {
+	return (await readJsonIfPresent(transactionJournalPath(cwd, mutationId))) as WorkflowTransactionJournal | undefined;
+}
+
+export async function beginWorkflowTransactionJournal(input: {
+	cwd: string;
+	mutationId: string;
+	caller?: CanonicalGjcWorkflowSkill;
+	callee?: CanonicalGjcWorkflowSkill;
+	paths: string[];
+}): Promise<string> {
+	const now = new Date().toISOString();
+	const journal: WorkflowTransactionJournal = {
+		version: 1,
+		mutation_id: input.mutationId,
+		status: "pending",
+		created_at: now,
+		updated_at: now,
+		caller: input.caller,
+		callee: input.callee,
+		paths: input.paths,
+		steps: [],
+	};
+	try {
+		return await createJsonNoClobber(transactionJournalPath(input.cwd, input.mutationId), journal, {
+			cwd: input.cwd,
+		});
+	} catch (error) {
+		if (error instanceof AlreadyExistsError) return error.path;
+		throw error;
+	}
+}
+
+export async function updateWorkflowTransactionJournal(
+	cwd: string,
+	mutationId: string,
+	patch: Partial<WorkflowTransactionJournal>,
+): Promise<string> {
+	const filePath = transactionJournalPath(cwd, mutationId);
+	const current = ((await readJsonIfPresent(filePath)) ?? {}) as WorkflowTransactionJournal;
+	const next = { ...current, ...patch, updated_at: new Date().toISOString() } as WorkflowTransactionJournal;
+	await atomicWrite(filePath, jsonText(next));
+	return filePath;
+}
+
+export async function completeWorkflowTransactionJournal(cwd: string, mutationId: string): Promise<void> {
+	await updateWorkflowTransactionJournal(cwd, mutationId, { status: "committed" });
+	await atomicRemove(transactionJournalPath(cwd, mutationId)).catch(() => false);
 }

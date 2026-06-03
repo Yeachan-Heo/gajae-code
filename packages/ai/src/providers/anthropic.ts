@@ -1684,7 +1684,7 @@ function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming)
 
 function ensureMaxTokensForThinking(params: MessageCreateParamsStreaming, model: Model<"anthropic-messages">): void {
 	const thinking = params.thinking;
-	if (!thinking || thinking.type !== "enabled") return;
+	if (thinking?.type !== "enabled") return;
 
 	const budgetTokens = thinking.budget_tokens ?? 0;
 	if (budgetTokens <= 0) return;

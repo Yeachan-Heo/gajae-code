@@ -328,7 +328,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {
-	if (!state || state.active !== true) return true;
+	if (state?.active !== true) return true;
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();

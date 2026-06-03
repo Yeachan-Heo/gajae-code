@@ -109,6 +109,7 @@ export interface InteractiveModeContext {
 	retryLoader: Loader | undefined;
 	autoCompactionEscapeHandler?: () => void;
 	retryEscapeHandler?: () => void;
+	retryCountdownTimer?: ReturnType<typeof setInterval>;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;

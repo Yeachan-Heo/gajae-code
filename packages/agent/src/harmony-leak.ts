@@ -230,7 +230,7 @@ export function recoverHarmonyToolCall(
 ): HarmonyRecoveredToolCall | undefined {
 	if (detection.surface !== "tool_arg" || detection.contentIndex === undefined) return undefined;
 	const block = message.content[detection.contentIndex];
-	if (!block || block.type !== "toolCall") return undefined;
+	if (block?.type !== "toolCall") return undefined;
 
 	const config = RECOVERY_REGISTRY[block.name];
 	if (!config) return undefined;

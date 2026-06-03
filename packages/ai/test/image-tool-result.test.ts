@@ -63,7 +63,7 @@ async function handleToolWithImageResult<TApi extends Api>(model: Model<TApi>, o
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle");
@@ -152,7 +152,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(model: Model<T
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle_with_description");

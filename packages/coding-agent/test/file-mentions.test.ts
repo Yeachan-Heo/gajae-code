@@ -28,7 +28,7 @@ describe("generateFileMentionMessages path resolution", () => {
 		const messages = await generateFileMentionMessages(["httpserap"], cwd);
 		expect(messages).toHaveLength(1);
 		const message = messages[0];
-		if (!message || message.role !== "fileMention") {
+		if (message?.role !== "fileMention") {
 			throw new Error("expected file mention message");
 		}
 		expect(message.files).toHaveLength(1);
@@ -44,7 +44,7 @@ describe("generateFileMentionMessages path resolution", () => {
 		const messages = await generateFileMentionMessages(["docs/rea"], cwd);
 		expect(messages).toHaveLength(1);
 		const message = messages[0];
-		if (!message || message.role !== "fileMention") {
+		if (message?.role !== "fileMention") {
 			throw new Error("expected file mention message");
 		}
 		expect(message.files[0]?.path).toBe("docs/readme.md");
@@ -59,7 +59,7 @@ describe("generateFileMentionMessages path resolution", () => {
 		const messages = await generateFileMentionMessages(["httpserap"], cwd);
 		expect(messages).toHaveLength(1);
 		const message = messages[0];
-		if (!message || message.role !== "fileMention") {
+		if (message?.role !== "fileMention") {
 			throw new Error("expected file mention message");
 		}
 		expect(message.files[0]?.path).toBe("http_server_api_tests");
