@@ -39,6 +39,7 @@ export interface HookSelectorOptions {
 	 * byte-identical to the previous implementation for all consumers.
 	 */
 	wrapFocused?: boolean;
+	scrollTitleRows?: number;
 }
 
 class OutlinedList extends Container {
@@ -60,6 +61,57 @@ class OutlinedList extends Container {
 			return `${borderColor(theme.boxSharp.vertical)}${fitted}${padding(pad)}${borderColor(theme.boxSharp.vertical)}`;
 		});
 		return [horizontal, ...content, horizontal];
+	}
+}
+
+class ScrollableTitle extends Container {
+	#markdown: Markdown;
+	#maxRows: number;
+	#scrollOffset = 0;
+	#lastMaxScrollOffset = 0;
+
+	constructor(title: string, maxRows: number) {
+		super();
+		this.#maxRows = Math.max(1, Math.floor(maxRows));
+		this.#markdown = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
+	}
+
+	setText(text: string): void {
+		this.#markdown.setText(text);
+		this.#scrollOffset = 0;
+		this.invalidate();
+	}
+
+	scrollBy(rows: number): void {
+		if (rows === 0) return;
+		const nextOffset = Math.max(0, Math.min(this.#lastMaxScrollOffset, this.#scrollOffset + rows));
+		if (nextOffset === this.#scrollOffset) return;
+		this.#scrollOffset = nextOffset;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		const lines = this.#markdown.render(width);
+		const maxScrollOffset = Math.max(0, lines.length - this.#maxRows);
+		this.#lastMaxScrollOffset = maxScrollOffset;
+		this.#scrollOffset = Math.max(0, Math.min(this.#scrollOffset, maxScrollOffset));
+
+		const visibleLines = lines.slice(this.#scrollOffset, this.#scrollOffset + this.#maxRows);
+		if (maxScrollOffset === 0 || visibleLines.length === 0) {
+			return visibleLines;
+		}
+
+		const indicator =
+			this.#scrollOffset === 0
+				? theme.fg("dim", " PgDn↓")
+				: this.#scrollOffset >= maxScrollOffset
+					? theme.fg("dim", " PgUp↑")
+					: theme.fg("dim", " PgUp/PgDn↕");
+		const lastIndex = visibleLines.length - 1;
+		const availableWidth = Math.max(1, width - visibleWidth(indicator));
+		const fittedLine = truncateToWidth(visibleLines[lastIndex] ?? "", availableWidth);
+		visibleLines[lastIndex] = `${fittedLine}${indicator}`;
+		return visibleLines;
 	}
 }
 
@@ -199,7 +251,8 @@ export class HookSelectorComponent extends Container {
 	#focusAwareList: FocusAwareList | undefined;
 	#onSelectCallback: (option: string) => void;
 	#onCancelCallback: () => void;
-	#titleComponent: Markdown;
+	#titleComponent: Markdown | ScrollableTitle;
+	#scrollableTitle: ScrollableTitle | undefined;
 	#baseTitle: string;
 	#countdown: CountdownTimer | undefined;
 	#onLeftCallback: (() => void) | undefined;
@@ -207,6 +260,7 @@ export class HookSelectorComponent extends Container {
 	#onExternalEditorCallback: (() => void) | undefined;
 	#wrapFocused: boolean;
 	#outline: boolean;
+	#scrollTitleRows: number | undefined;
 	constructor(
 		title: string,
 		options: string[],
@@ -231,7 +285,15 @@ export class HookSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 
-		this.#titleComponent = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
+		const scrollTitleRows =
+			opts?.scrollTitleRows === undefined ? undefined : Math.max(1, Math.floor(opts.scrollTitleRows));
+		this.#scrollTitleRows = scrollTitleRows;
+		if (scrollTitleRows === undefined) {
+			this.#titleComponent = new Markdown(title, 1, 0, getMarkdownTheme(), { color: t => theme.fg("accent", t) });
+		} else {
+			this.#scrollableTitle = new ScrollableTitle(title, scrollTitleRows);
+			this.#titleComponent = this.#scrollableTitle;
+		}
 		this.addChild(this.#titleComponent);
 		this.addChild(new Spacer(1));
 
@@ -319,6 +381,14 @@ export class HookSelectorComponent extends Container {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();
 
+		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageUp")) {
+			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
+			return;
+		}
+		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageDown")) {
+			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
+			return;
+		}
 		if (matchesKey(keyData, "up") || keyData === "k") {
 			this.#selectedIndex = Math.max(0, this.#selectedIndex - 1);
 			this.#updateList();

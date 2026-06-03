@@ -31,6 +31,19 @@ Explore just enough context, implement the smallest correct change, and leave co
 5. Remove debug leftovers and report changed files plus evidence.
 </execution_loop>
 
+<ultragoal_red_team_mode>
+This mode activates only when the assignment explicitly labels Executor as Ultragoal completion QA/red-team or asks for `executorQa` red-team evidence. Otherwise, preserve ordinary Executor behavior.
+
+When active:
+- Start from the approved plan/spec/acceptance criteria, then user-facing contracts, then implementation code only as supporting evidence. Treat plan/code mismatches as blockers.
+- Exercise the real user-facing invocation rather than inspecting internals alone: GUI/web uses browser automation plus screenshot or image verdict; CLI uses logs or terminal transcripts; API/package uses external consumer or black-box tests through the public interface; algorithm/math uses boundary, property, adversarial, and failure-mode cases.
+- Try to break the work with adversarial cases, not just happy-path confirmations.
+- Report the QA matrix with the final field names `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`.
+- Include artifact refs for every executed surface and adversarial case: transcript ids, log paths, screenshots, image verdicts, test outputs, or other durable evidence.
+- Use `status: "not_applicable"` only for rows in `executorQa.contractCoverage` and `executorQa.surfaceEvidence`; each not-applicable row requires `contractRef` plus `reason`. `executorQa.adversarialCases` rows cannot be not-applicable.
+- Report blockers for any missing plan/spec/acceptance source, contract ambiguity, plan/code mismatch, untestable surface, failed adversarial case, shallow evidence, or missing artifact ref.
+</ultragoal_red_team_mode>
+
 <success_criteria>
 - Requested behavior is implemented in the assigned scope.
 - Modified files match existing style and contracts.

@@ -1,7 +1,7 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager } from "../async";
+import { type AsyncJob, AsyncJobManager, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
@@ -16,14 +16,26 @@ const MAX_LIST_LIMIT = 50;
 const TEXT_PREVIEW_WIDTH = 12_000;
 
 const subagentSchema = z.object({
-	action: z.enum(["list", "inspect", "await", "cancel"]).describe("subagent control action"),
+	action: z
+		.enum(["list", "inspect", "await", "cancel", "pause", "resume", "steer"])
+		.describe("subagent control action"),
 	ids: z.array(z.string()).optional().describe("subagent ids or backing job ids"),
+	message: z.string().optional().describe("message to deliver when resuming or steering a subagent"),
+	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
 });
 
 type SubagentParams = z.infer<typeof subagentSchema>;
-type SubagentStatus = "running" | "completed" | "failed" | "cancelled" | "not_found" | "already_completed";
+type SubagentStatus =
+	| "running"
+	| "paused"
+	| "queued"
+	| "completed"
+	| "failed"
+	| "cancelled"
+	| "not_found"
+	| "already_completed";
 
 export interface SubagentSnapshot {
 	id: string;
@@ -77,17 +89,17 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const limit = Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(params.limit ?? DEFAULT_LIST_LIMIT)));
 
 		if (params.action === "list") {
-			const jobs = this.#listSubagentJobs(manager, ownerFilter, limit);
-			return this.#buildResult(manager, jobs, { title: "Subagents" });
+			const records = this.#listSubagentRecords(manager, ownerFilter, limit);
+			return this.#buildRecordResult(manager, records, { title: "Subagents" });
 		}
 
 		if (params.action === "inspect") {
-			const jobs = params.ids?.length
-				? this.#visibleJobsByIds(manager, params.ids, ownerId)
-				: manager.getRunningJobs(ownerFilter).filter(isSubagentJob);
-			return this.#buildResult(manager, jobs, {
+			const records = params.ids?.length
+				? this.#visibleRecordsByIds(manager, params.ids, ownerFilter)
+				: this.#runningRecords(manager, ownerFilter);
+			return this.#buildRecordResult(manager, records, {
 				title: "Subagent inspection",
-				notFoundIds: this.#notFoundIds(manager, params.ids ?? [], ownerId),
+				notFoundIds: this.#notFoundRecordIds(manager, params.ids ?? [], ownerFilter),
 			});
 		}
 
@@ -98,46 +110,146 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			}
 			const snapshots: SubagentSnapshot[] = [];
 			for (const id of ids) {
-				const job = this.#findVisibleJob(manager, id, ownerId);
-				if (!job) {
+				const record = this.#findVisibleRecord(manager, id, ownerFilter);
+				if (!record) {
 					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
-				if (job.status !== "running") {
-					snapshots.push({ ...this.#snapshot(job), status: "already_completed" });
-					continue;
-				}
-				manager.cancel(job.id, ownerFilter);
-				snapshots.push(this.#snapshot(manager.getJob(job.id) ?? job));
+				const cancelled = manager.cancelSubagent(record.subagentId, ownerFilter);
+				if (!cancelled && record.currentJobId) manager.cancel(record.currentJobId, ownerFilter);
+				const updated = this.#findVisibleRecord(manager, id, ownerFilter) ?? record;
+				snapshots.push(this.#recordSnapshot(manager, updated));
 			}
 			return this.#buildSnapshotResult(snapshots, "Subagent cancellation");
 		}
 
-		return this.#awaitSubagents(manager, params, ownerId, ownerFilter, signal, onUpdate);
+		if (params.action === "pause") {
+			const ids = params.ids ?? [];
+			if (ids.length === 0) {
+				throw new ToolError("`pause` requires at least one subagent id.");
+			}
+			const snapshots: SubagentSnapshot[] = [];
+			for (const id of ids) {
+				const record = this.#findVisibleRecord(manager, id, ownerFilter);
+				if (!record) {
+					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					continue;
+				}
+				const result = manager.pauseSubagent(record.subagentId, ownerFilter);
+				if (!result.ok && result.reason === "not_found") {
+					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					continue;
+				}
+				snapshots.push(
+					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
+				);
+			}
+			return this.#buildSnapshotResult(snapshots, "Subagent pause");
+		}
+
+		if (params.action === "resume") {
+			const ids = params.ids ?? [];
+			if (ids.length === 0) {
+				throw new ToolError("`resume` requires at least one subagent id.");
+			}
+			const snapshots: SubagentSnapshot[] = [];
+			for (const id of ids) {
+				const record = this.#findVisibleRecord(manager, id, ownerFilter);
+				if (!record) {
+					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					continue;
+				}
+				if (record.status === "running") {
+					snapshots.push(this.#recordSnapshot(manager, record));
+					continue;
+				}
+				if (params.message === undefined && isTerminalStatus(record.status)) {
+					snapshots.push({
+						...this.#recordSnapshot(manager, record),
+						guidance:
+							"This subagent is terminal. Provide `message` to start a follow-up resume run from its saved context.",
+					});
+					continue;
+				}
+				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
+				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
+				if (!result.ok && result.reason === "not_found") {
+					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					continue;
+				}
+				snapshots.push(
+					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
+				);
+			}
+			return this.#buildSnapshotResult(snapshots, "Subagent resume");
+		}
+
+		if (params.action === "steer") {
+			const ids = params.ids ?? [];
+			const message = params.message;
+			if (ids.length === 0) {
+				throw new ToolError("`steer` requires at least one subagent id.");
+			}
+			if (message === undefined || message.trim() === "") {
+				throw new ToolError("`steer` requires a non-empty message.");
+			}
+			const snapshots: SubagentSnapshot[] = [];
+			for (const id of ids) {
+				const record = this.#findVisibleRecord(manager, id, ownerFilter);
+				if (!record) {
+					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					continue;
+				}
+				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
+				if (record.status === "running") {
+					const handle = manager.getLiveHandle(record.subagentId);
+					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
+					await handle.injectMessage(message, "steer");
+					if (params.pause === true) manager.pauseSubagent(record.subagentId, ownerFilter);
+				} else {
+					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
+					if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
+					if (!result.ok && result.reason === "not_found") {
+						snapshots.push(
+							this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
+						);
+						continue;
+					}
+				}
+				snapshots.push(
+					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
+				);
+			}
+			return this.#buildSnapshotResult(snapshots, "Subagent steer");
+		}
+
+		return this.#awaitSubagents(manager, params, ownerFilter, signal, onUpdate);
 	}
 
 	async #awaitSubagents(
 		manager: AsyncJobManager,
 		params: SubagentParams,
-		ownerId: string | undefined,
 		ownerFilter: { ownerId: string } | undefined,
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		const jobs = params.ids?.length
-			? this.#visibleJobsByIds(manager, params.ids, ownerId)
-			: manager.getRunningJobs(ownerFilter).filter(isSubagentJob);
-		const notFoundIds = this.#notFoundIds(manager, params.ids ?? [], ownerId);
-		if (jobs.length === 0) {
+		const records = params.ids?.length
+			? this.#visibleRecordsByIds(manager, params.ids, ownerFilter)
+			: this.#runningRecords(manager, ownerFilter);
+		const notFoundIds = this.#notFoundRecordIds(manager, params.ids ?? [], ownerFilter);
+		if (records.length === 0) {
 			const missing = notFoundIds.map(id =>
 				this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
 			);
 			return this.#buildSnapshotResult(missing, "Subagent await");
 		}
 
-		const runningJobs = jobs.filter(job => job.status === "running");
+		const runningJobs = records
+			.filter(record => record.status === "running" && record.currentJobId)
+			.map(record => manager.getJob(record.currentJobId!))
+			.filter((job): job is AsyncJob => job !== undefined);
 		if (runningJobs.length === 0) {
-			return this.#buildResult(manager, jobs, { title: "Subagent await", notFoundIds });
+			return this.#buildRecordResult(manager, records, { title: "Subagent await", notFoundIds });
 		}
 
 		const timeoutMs = Math.min(
@@ -148,10 +260,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		manager.watchJobs(watchedJobIds);
 		const progressTimer = onUpdate
 			? setInterval(() => {
-					onUpdate(this.#progressResult(manager, jobs));
+					onUpdate(this.#progressResult(manager, records));
 				}, 500)
 			: undefined;
-		onUpdate?.(this.#progressResult(manager, jobs));
+		onUpdate?.(this.#progressResult(manager, records));
 
 		let timedOut = false;
 		try {
@@ -176,70 +288,124 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (progressTimer) clearInterval(progressTimer);
 		}
 
-		return this.#buildResult(manager, jobs, { title: "Subagent await", notFoundIds, timedOut });
+		return this.#buildRecordResult(manager, records, { title: "Subagent await", notFoundIds, timedOut });
 	}
 
-	#listSubagentJobs(
+	#mergedRecords(
 		manager: AsyncJobManager,
 		ownerFilter: { ownerId: string } | undefined,
 		limit: number,
-	): AsyncJob[] {
-		const running = manager.getRunningJobs(ownerFilter).filter(isSubagentJob);
-		const recent = manager.getRecentJobs(limit, ownerFilter).filter(isSubagentJob);
-		const jobs = [...running, ...recent];
-		return this.#dedupeJobs(jobs).slice(0, limit);
-	}
-
-	#visibleJobsByIds(manager: AsyncJobManager, ids: string[], ownerId: string | undefined): AsyncJob[] {
-		const jobs: AsyncJob[] = [];
-		for (const id of ids) {
-			const job = this.#findVisibleJob(manager, id, ownerId);
-			if (job) jobs.push(job);
+	): SubagentRecord[] {
+		const merged = [...manager.getSubagentRecords(ownerFilter)];
+		const known = new Set(merged.map(record => record.subagentId));
+		const jobs = [...manager.getRunningJobs(ownerFilter), ...manager.getRecentJobs(limit, ownerFilter)].filter(
+			isSubagentJob,
+		);
+		for (const job of jobs) {
+			const subagentId = job.metadata?.subagent?.id ?? job.id;
+			if (known.has(subagentId)) continue;
+			known.add(subagentId);
+			merged.push(this.#jobToRecord(job));
 		}
-		return this.#dedupeJobs(jobs);
-	}
-
-	#findVisibleJob(manager: AsyncJobManager, id: string, ownerId: string | undefined): AsyncJob | undefined {
-		const trimmedId = id.trim();
-		if (!trimmedId) return undefined;
-		const direct = manager.getJob(trimmedId);
-		if (direct && isSubagentJob(direct) && (!ownerId || direct.ownerId === ownerId)) return direct;
-		return manager
-			.getAllJobs(ownerId ? { ownerId } : undefined)
-			.find(job => isSubagentJob(job) && job.metadata?.subagent?.id === trimmedId);
-	}
-
-	#notFoundIds(manager: AsyncJobManager, ids: string[], ownerId: string | undefined): string[] {
-		return ids.filter(id => !this.#findVisibleJob(manager, id, ownerId));
-	}
-
-	#dedupeJobs(jobs: AsyncJob[]): AsyncJob[] {
-		const seen = new Set<string>();
-		return jobs.filter(job => {
-			if (seen.has(job.id)) return false;
-			seen.add(job.id);
-			return true;
+		merged.sort((a, b) => {
+			const aJob = a.currentJobId ? manager.getJob(a.currentJobId) : undefined;
+			const bJob = b.currentJobId ? manager.getJob(b.currentJobId) : undefined;
+			return (bJob?.startTime ?? 0) - (aJob?.startTime ?? 0);
 		});
+		return merged.slice(0, limit);
 	}
 
-	#progressResult(manager: AsyncJobManager, jobs: AsyncJob[]): AgentToolResult<SubagentToolDetails> {
+	#listSubagentRecords(
+		manager: AsyncJobManager,
+		ownerFilter: { ownerId: string } | undefined,
+		limit: number,
+	): SubagentRecord[] {
+		return this.#mergedRecords(manager, ownerFilter, limit);
+	}
+
+	#runningRecords(manager: AsyncJobManager, ownerFilter: { ownerId: string } | undefined): SubagentRecord[] {
+		return this.#mergedRecords(manager, ownerFilter, MAX_LIST_LIMIT).filter(record => record.status === "running");
+	}
+
+	/** Synthesize a record from a subagent job that has no registered SubagentRecord (backward compat). */
+	#jobToRecord(job: AsyncJob): SubagentRecord {
 		return {
-			content: [{ type: "text", text: "" }],
-			details: { subagents: this.#snapshots(manager, jobs) },
+			subagentId: job.metadata?.subagent?.id ?? job.id,
+			ownerId: job.ownerId,
+			currentJobId: job.id,
+			historicalJobIds: [],
+			status: job.status,
+			sessionFile: null,
+			resumable: false,
 		};
 	}
 
-	#buildResult(
+	#findSubagentJob(manager: AsyncJobManager, id: string, ownerId: string | undefined): AsyncJob | undefined {
+		const direct = manager.getJob(id);
+		if (direct && isSubagentJob(direct) && (!ownerId || direct.ownerId === ownerId)) return direct;
+		return manager
+			.getAllJobs(ownerId ? { ownerId } : undefined)
+			.find(job => isSubagentJob(job) && job.metadata?.subagent?.id === id);
+	}
+
+	#visibleRecordsByIds(
 		manager: AsyncJobManager,
-		jobs: AsyncJob[],
+		ids: string[],
+		ownerFilter: { ownerId: string } | undefined,
+	): SubagentRecord[] {
+		const records: SubagentRecord[] = [];
+		const seen = new Set<string>();
+		for (const id of ids) {
+			const record = this.#findVisibleRecord(manager, id, ownerFilter);
+			if (!record || seen.has(record.subagentId)) continue;
+			seen.add(record.subagentId);
+			records.push(record);
+		}
+		return records;
+	}
+
+	#findVisibleRecord(
+		manager: AsyncJobManager,
+		id: string,
+		ownerFilter: { ownerId: string } | undefined,
+	): SubagentRecord | undefined {
+		const trimmedId = id.trim();
+		if (!trimmedId) return undefined;
+		const direct = manager.getSubagentRecord(trimmedId, ownerFilter);
+		if (direct) return direct;
+		const byJobId = manager.getSubagentRecords(ownerFilter).find(record => record.currentJobId === trimmedId);
+		if (byJobId) return byJobId;
+		const job = this.#findSubagentJob(manager, trimmedId, ownerFilter?.ownerId);
+		return job ? this.#jobToRecord(job) : undefined;
+	}
+
+	#notFoundRecordIds(manager: AsyncJobManager, ids: string[], ownerFilter: { ownerId: string } | undefined): string[] {
+		return ids.filter(id => !this.#findVisibleRecord(manager, id, ownerFilter));
+	}
+
+	#progressResult(manager: AsyncJobManager, records: SubagentRecord[]): AgentToolResult<SubagentToolDetails> {
+		return {
+			content: [{ type: "text", text: "" }],
+			details: { subagents: this.#recordSnapshots(manager, records) },
+		};
+	}
+
+	#buildRecordResult(
+		manager: AsyncJobManager,
+		records: SubagentRecord[],
 		options: { title: string; notFoundIds?: string[]; timedOut?: boolean },
 	): AgentToolResult<SubagentToolDetails> {
-		const snapshots = this.#snapshots(manager, jobs, options.timedOut);
+		const snapshots = this.#recordSnapshots(manager, records, options.timedOut);
 		for (const id of options.notFoundIds ?? []) {
 			snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 		}
 		manager.acknowledgeDeliveries(
-			snapshots.filter(s => s.status !== "running" && s.status !== "not_found").map(s => s.jobId),
+			snapshots
+				.filter(
+					s =>
+						s.status !== "running" && s.status !== "paused" && s.status !== "queued" && s.status !== "not_found",
+				)
+				.map(s => s.jobId),
 		);
 		return this.#buildSnapshotResult(snapshots, options.title);
 	}
@@ -263,8 +429,29 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		};
 	}
 
-	#snapshots(manager: AsyncJobManager, jobs: AsyncJob[], timedOut = false): SubagentSnapshot[] {
-		return jobs.map(job => this.#snapshot(manager.getJob(job.id) ?? job, timedOut));
+	#recordSnapshots(manager: AsyncJobManager, records: SubagentRecord[], timedOut = false): SubagentSnapshot[] {
+		return records.map(record => this.#recordSnapshot(manager, record, timedOut));
+	}
+
+	#recordSnapshot(manager: AsyncJobManager, record: SubagentRecord, timedOut = false): SubagentSnapshot {
+		const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
+		if (job) {
+			return {
+				...this.#snapshot(job, timedOut),
+				id: record.subagentId,
+				jobId: record.currentJobId ?? job.id,
+				status: record.status,
+			};
+		}
+		return {
+			id: record.subagentId,
+			jobId: record.currentJobId ?? record.subagentId,
+			status: record.status,
+			label: "subagent",
+			agent: "unknown",
+			agentSource: "bundled",
+			durationMs: 0,
+		};
 	}
 
 	#snapshot(job: AsyncJob, timedOut = false): SubagentSnapshot {
@@ -301,6 +488,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			guidance,
 		};
 	}
+}
+
+function isTerminalStatus(status: SubagentStatus): boolean {
+	return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 function isSubagentJob(job: AsyncJob): boolean {

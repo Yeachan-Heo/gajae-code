@@ -590,6 +590,11 @@ export class ExtensionUiController {
 			dialogOptions?.signal,
 		);
 		const maxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
+		const requestedTitleRows = dialogOptions?.scrollTitleRows;
+		const selectorChromeRows = 7;
+		const availableTitleRows = this.ctx.ui.terminal.rows - maxVisible - selectorChromeRows;
+		const scrollTitleRows =
+			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
 		this.ctx.hookSelector = new HookSelectorComponent(
 			title,
 			options,
@@ -624,6 +629,7 @@ export class ExtensionUiController {
 				tui: this.ctx.ui,
 				outline: dialogOptions?.outline,
 				wrapFocused: dialogOptions?.wrapFocused,
+				scrollTitleRows,
 				maxVisible,
 			},
 		);

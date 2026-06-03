@@ -137,26 +137,29 @@ Workers do not own ultragoal goal state, do not create worker ultragoal ledgers,
 
 ## Mandatory completion cleanup and review gate
 
-An ultragoal story cannot be checkpointed `complete` until the active agent has run the quality gate:
-
-1. Run targeted verification for the story.
-2. Run a cleanup/refactor review pass on changed files only; if there are no relevant edits, the cleaner still runs and records a passed/no-op report.
-3. Rerun verification after the cleaner pass.
-4. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, or non-empty blockers are non-clean.
-5. If review is non-clean, do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
+An ultragoal story cannot be checkpointed `complete` until the active agent has run the quality gate. The gate is plan-first, contract-driven, and surface-based:
 
 1. Run targeted implementation verification for the story.
-2. Delegate an `architect` review covering all three lanes:
+2. Run a cleanup/refactor review pass on changed files only; if there are no relevant edits, the cleaner still runs and records a passed/no-op report.
+3. Rerun verification after the cleaner pass.
+4. Delegate an `architect` review covering all three lanes:
    - architecture-side: system boundaries, layering, data/control flow, operational risks.
    - product-side: user-visible behavior, acceptance criteria, edge cases, regressions.
    - code-side: maintainability, tests, integration points, and unsafe shortcuts.
-3. Delegate an `executor` QA/red-team lane to build and run the e2e/read-teaming QA suite appropriate for the story. This lane must try to break the change, not just confirm the happy path.
-4. If any lane finds an issue, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
+5. Delegate an `executor` QA/red-team lane to build and run the e2e/read-teaming QA suite appropriate for the story. This lane must try to break the change, not just confirm the happy path. It must start from the approved plan/spec/acceptance criteria, then user-facing contracts, and only then implementation code as supporting evidence. Plan/code mismatches are blockers, not items to paper over with implementation intent.
+6. The executor QA/red-team lane must prove evidence by the real surface under test:
+   - GUI/web surfaces require browser automation plus a screenshot or image verdict.
+   - CLI surfaces require logs or terminal transcripts from real invocation.
+   - API/package surfaces require external consumer or black-box tests through the public interface.
+   - Algorithm/math surfaces require boundary, property, adversarial, and failure-mode cases.
+7. The executor QA/red-team lane must report a matrix using `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`. Not-applicable rows are allowed only in `contractCoverage` and `surfaceEvidence`; each `status: "not_applicable"` row requires `contractRef` plus `reason`. `adversarialCases` rows cannot be not-applicable.
+8. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
+9. If any lane finds an issue, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
    ```sh
    gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<architect/executor findings>" --gjc-goal-json <active-goal-get-json-or-path>
    ```
-5. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
-6. Only after the loop is clean, checkpoint the story as complete with a structured quality gate and a fresh active `goal({"op":"get"})` snapshot. The checkpoint creates a receipt; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before `goal({"op":"complete"})` is allowed.
+10. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
+11. Only after the loop is clean, checkpoint the story as complete with a structured quality gate and a fresh active `goal({"op":"get"})` snapshot. The checkpoint creates a receipt; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before `goal({"op":"complete"})` is allowed.
 
 The native `checkpoint --status complete` command rejects missing or shallow gates. `--quality-gate-json` must include:
 
@@ -178,6 +181,70 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
     "evidence": "executor-built e2e and red-team QA commands/results",
     "e2eCommands": ["bun test:e2e"],
     "redTeamCommands": ["bun test:red-team"],
+    "artifactRefs": [
+      {
+        "id": "browser-run",
+        "kind": "browser-automation",
+        "path": "artifacts/browser-run.json",
+        "description": "browser automation transcript invoking the approved user-facing flow"
+      },
+      {
+        "id": "gui-screenshot",
+        "kind": "screenshot",
+        "path": "artifacts/gui-screenshot.png",
+        "description": "screenshot or image-verdict evidence for the GUI/web result"
+      },
+      {
+        "id": "adversarial-report",
+        "kind": "failure-mode-test",
+        "path": "artifacts/adversarial-report.txt",
+        "description": "boundary, property, adversarial, or failure-mode result"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "contract-goal",
+        "contractRef": "approved plan/spec/acceptance criterion or user-facing contract id",
+        "obligation": "required behavior from the approved contract",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["surface-gui"],
+        "adversarialCaseRefs": ["case-invalid-input"]
+      },
+      {
+        "id": "contract-out-of-scope",
+        "contractRef": "contract intentionally outside this story",
+        "obligation": "explicitly omitted approved-contract surface",
+        "status": "not_applicable",
+        "reason": "why this contract does not apply to the current story"
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "surface-gui",
+        "contractRef": "user-facing surface or public interface under test",
+        "surface": "gui|web|cli|api|package|algorithm|math",
+        "invocation": "real browser action, CLI command, API/package consumer call, or algorithm/property check",
+        "verdict": "passed",
+        "artifactRefs": ["browser-run", "gui-screenshot"]
+      },
+      {
+        "id": "surface-out-of-scope",
+        "contractRef": "surface intentionally outside this story",
+        "surface": "gui|web|cli|api|package|algorithm|math",
+        "status": "not_applicable",
+        "reason": "why this surface does not apply to the current story"
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "case-invalid-input",
+        "contractRef": "approved plan/spec/acceptance criterion or user-facing contract id",
+        "scenario": "boundary/property/adversarial/failure-mode input or user action",
+        "expectedBehavior": "contract-required rejection, handling, or invariant preservation",
+        "verdict": "passed",
+        "artifactRefs": ["adversarial-report"]
+      }
+    ],
     "blockers": []
   },
   "iteration": {

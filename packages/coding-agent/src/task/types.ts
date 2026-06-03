@@ -53,7 +53,7 @@ export interface SubagentLifecyclePayload {
 	agent: string;
 	agentSource: AgentSource;
 	description?: string;
-	status: "started" | "completed" | "failed" | "aborted";
+	status: "started" | "completed" | "failed" | "aborted" | "paused";
 	sessionFile?: string;
 	index: number;
 }
@@ -192,7 +192,7 @@ export interface AgentProgress {
 	id: string;
 	agent: string;
 	agentSource: AgentSource;
-	status: "pending" | "running" | "completed" | "failed" | "aborted";
+	status: "pending" | "running" | "completed" | "failed" | "aborted" | "paused";
 	task: string;
 	assignment?: string;
 	description?: string;
@@ -280,6 +280,7 @@ export interface SingleResult {
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
+	paused?: boolean;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
 	/** Output path for the task result */
@@ -316,7 +317,7 @@ export interface TaskToolDetails {
 	outputPaths?: string[];
 	progress?: AgentProgress[];
 	async?: {
-		state: "running" | "completed" | "failed";
+		state: "running" | "paused" | "queued" | "completed" | "failed";
 		jobId: string;
 		type: "task";
 	};

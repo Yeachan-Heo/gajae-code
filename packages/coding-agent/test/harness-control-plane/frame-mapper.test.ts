@@ -33,25 +33,54 @@ describe("mapRpcFrame", () => {
 		});
 	});
 
-	it("maps tool execution to tool-call, and test runners to test-running", () => {
+	it("maps real tool execution frames to tool-call, test-running, and error status", () => {
 		const start = mapRpcFrame({
 			type: "tool_execution_start",
 			toolCallId: "t1",
 			toolName: "bash",
-			command: "bun test foo",
+			args: { command: "bun test foo" },
 		});
 		expect(start).toMatchObject({ kind: "rpc_tool_started", signal: "test-running", semantic: true });
-		const plain = mapRpcFrame({ type: "tool_execution_start", toolCallId: "t2", toolName: "read" });
+		const plain = mapRpcFrame({ type: "tool_execution_start", toolCallId: "t2", toolName: "read", args: {} });
 		expect(plain).toMatchObject({ signal: "tool-call", semantic: true });
-		const end = mapRpcFrame({ type: "tool_execution_end", toolCallId: "t2", toolName: "read", status: "ok" });
+		const end = mapRpcFrame({
+			type: "tool_execution_end",
+			toolCallId: "t2",
+			toolName: "read",
+			result: { details: { status: "ok" } },
+		});
 		expect(end).toMatchObject({ kind: "rpc_tool_ended", signal: "tool-call", semantic: true });
+		const failed = mapRpcFrame({
+			type: "tool_execution_end",
+			toolCallId: "t3",
+			toolName: "bash",
+			args: { command: "bun test foo" },
+			result: { content: [{ type: "text", text: "failure output" }] },
+			isError: true,
+		});
+		expect(failed).toMatchObject({ signal: "test-running", severity: "warn", evidence: { status: "error" } });
 	});
 
 	it("marks message_update + tool_execution_update as coalescible (non-semantic) with keys", () => {
 		const m = mapRpcFrame({ type: "message_update", messageId: "m1" });
 		expect(m).toMatchObject({ signal: null, semantic: false, coalesceKey: "message:m1" });
-		const u = mapRpcFrame({ type: "tool_execution_update", toolCallId: "t9", status: "running" });
-		expect(u).toMatchObject({ semantic: false, coalesceKey: "tool:t9" });
+		const u = mapRpcFrame({
+			type: "tool_execution_update",
+			toolCallId: "t9",
+			toolName: "bash",
+			args: { command: "bun test SECRET_COMMAND" },
+			partialResult: { status: "running", content: [{ type: "text", text: "SECRET_UPDATE" }] },
+		});
+		expect(u).toEqual({
+			kind: "rpc_tool_updated",
+			signal: "test-running",
+			evidence: { toolId: "t9", status: "running" },
+			severity: "info",
+			semantic: false,
+			coalesceKey: "tool:t9",
+		});
+		expect(JSON.stringify(u)).not.toContain("SECRET_COMMAND");
+		expect(JSON.stringify(u)).not.toContain("SECRET_UPDATE");
 	});
 
 	it("redacts: evidence carries no assistant text / message deltas / command output", () => {
@@ -68,15 +97,25 @@ describe("mapRpcFrame", () => {
 			type: "tool_execution_end",
 			toolCallId: "t1",
 			toolName: "bash",
-			command: "echo SECRET",
-			output: "SECRET OUTPUT",
-			status: "ok",
+			args: { command: "echo SECRET" },
+			result: { content: [{ type: "text", text: "SECRET OUTPUT" }], details: { status: "ok" } },
 		}) ?? { evidence: {} };
 		const tj = JSON.stringify(t.evidence);
 		expect(tj).not.toContain("SECRET OUTPUT");
 		expect(tj).not.toContain("echo SECRET");
 	});
 
+	it("does not persist arbitrary tool-result status text", () => {
+		const mapped = mapRpcFrame({
+			type: "tool_execution_end",
+			toolCallId: "t1",
+			toolName: "bash",
+			args: { command: "bun test x" },
+			result: { details: { status: "SECRET_STATUS_OUTPUT" } },
+		});
+		expect(JSON.stringify(mapped?.evidence)).not.toContain("SECRET_STATUS_OUTPUT");
+		expect(mapped).toMatchObject({ evidence: { status: null } });
+	});
 	it("bounds extension_error message length", () => {
 		const big = "x".repeat(5000);
 		const e = mapRpcFrame({ type: "extension_error", error: big });

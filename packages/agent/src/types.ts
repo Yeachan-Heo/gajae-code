@@ -133,6 +133,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
 	/**
+	 * Cooperative pause checkpoint evaluated at safe loop boundaries.
+	 *
+	 * Called after completed tool execution has been emitted and before the loop
+	 * polls steering/follow-up queues or schedules another assistant response.
+	 * Returning true ends the current loop with `agent_end.stopReason === "paused"`
+	 * without aborting any in-flight model or tool work.
+	 */
+	shouldPause?: () => boolean;
+	/**
 	 * Hook fired right before the loop would exit.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages,
@@ -458,6 +467,8 @@ export type AgentEvent =
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
+			/** Indicates whether the loop ended normally or suspended at a pause checkpoint. */
+			stopReason?: "completed" | "paused";
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;

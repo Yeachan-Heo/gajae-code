@@ -110,6 +110,7 @@ Providers:
   tavily            Tavily
   zai               Z.AI (GLM Coding Plan)
   deepseek          DeepSeek
+  xai               xAI
   nanogpt           NanoGPT
   minimax-code      MiniMax Coding Plan (International)
   minimax-code-cn   MiniMax Coding Plan (China)

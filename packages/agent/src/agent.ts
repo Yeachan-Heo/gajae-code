@@ -99,6 +99,8 @@ export interface AgentOptions {
 	 * - "wait": defer steering until the current turn completes
 	 */
 	interruptMode?: "immediate" | "wait";
+	/** Cooperative pause checkpoint passed through to AgentLoopConfig.shouldPause. */
+	shouldPause?: AgentLoopConfig["shouldPause"];
 
 	/**
 	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
@@ -309,6 +311,7 @@ export class Agent {
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
+	#shouldPause?: AgentLoopConfig["shouldPause"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
@@ -371,6 +374,7 @@ export class Agent {
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
+		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
@@ -623,6 +627,10 @@ export class Agent {
 
 	setOnBeforeYield(fn: (() => Promise<void> | void) | undefined): void {
 		this.#onBeforeYield = fn;
+	}
+
+	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
+		this.#shouldPause = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -1227,6 +1235,10 @@ export class Agent {
 			onBeforeYield: async () => {
 				if (this.#activeRunId !== runId) return;
 				await this.#onBeforeYield?.();
+			},
+			shouldPause: () => {
+				if (this.#activeRunId !== runId) return false;
+				return this.#shouldPause?.() === true;
 			},
 			telemetry: this.#telemetry,
 		};

@@ -968,8 +968,15 @@
         "appliesToVerbs": [
           "api"
         ],
-        "name": "evidence",
-        "type": "string"
+        "name": "completion_evidence",
+        "type": "object"
+      },
+      {
+        "appliesToVerbs": [
+          "api"
+        ],
+        "name": "completionEvidence",
+        "type": "object"
       },
       {
         "name": "args",
@@ -1013,6 +1020,10 @@
       },
       {
         "name": "status",
+        "surface": "command-positional"
+      },
+      {
+        "name": "monitor",
         "surface": "command-positional"
       },
       {

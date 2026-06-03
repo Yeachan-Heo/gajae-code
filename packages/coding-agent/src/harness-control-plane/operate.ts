@@ -9,7 +9,7 @@
  * External effects (RPC, observation, validation/git/gh) are injected so the whole lifecycle is
  * unit/e2e-testable with a fake harness.
  */
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { type FinalizeChecks, type FinalizeResult, runFinalize, type ValidationCommandSpec } from "./finalize";
 import { type PreserveResult, preserveDirtyWorktree } from "./preserve";
 import {
@@ -20,16 +20,13 @@ import {
 	validateReceipt,
 } from "./receipts";
 import { type HarnessRpc, singleFlightAccept } from "./rpc-adapter";
-import { nextAllowedActions } from "./state-machine";
-import { appendEvent, readEvents, writeReceiptImmutable } from "./storage";
+import { writeReceiptImmutable } from "./storage";
 import {
 	DEFAULT_RETRY_BUDGET,
-	type EventEnvelope,
 	type HarnessLifecycle,
 	type Observation,
 	type RecoveryClassification,
 	type RetryBudget,
-	type SessionStateView,
 	type Severity,
 } from "./types";
 
@@ -50,10 +47,8 @@ export interface OperateOptions {
 	retryBudget?: Partial<RetryBudget>;
 	acceptanceTimeoutMs?: number;
 	maxIterations?: number;
-	/** Identity stamped on emitted events; the owner passes its lease identity so events stay single-writer-consistent. */
-	eventWriter?: { ownerId: string; leaseEpoch: number };
-	/** Injected event emitter (the owner passes its single-writer #emit so events share cursor/lease/state). */
-	emit?: (severity: Severity, kind: string, evidence: Record<string, unknown>) => Promise<void>;
+	/** Injected event emitter. Production owner calls must pass the lease-guarded single-writer #emit. */
+	emit: (severity: Severity, kind: string, evidence: Record<string, unknown>) => Promise<void>;
 	clock?: () => number;
 }
 
@@ -75,33 +70,12 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 	const classifications: RecoveryClassification[] = [];
 	const vanishReceiptIds: string[] = [];
 	const blockers: string[] = [];
-	let cursor = (await readEvents(opts.root, opts.sessionId, 0)).reduce((m, e) => Math.max(m, e.cursor), 0);
+
 	let rpc = opts.rpc;
 
 	const now = (): string => new Date(opts.clock ? opts.clock() : Date.now()).toISOString();
 	let lifecycle: HarnessLifecycle = "started";
-	const defaultEmit = async (severity: Severity, kind: string, evidence: Record<string, unknown>): Promise<void> => {
-		const state: SessionStateView = {
-			sessionId: opts.sessionId,
-			lifecycle,
-			harness: "gajae-code",
-			ownerLive: true,
-			blockers,
-		};
-		const envelope: EventEnvelope = {
-			eventId: randomUUID(),
-			cursor: ++cursor,
-			createdAt: now(),
-			severity,
-			kind,
-			state,
-			evidence,
-			nextAllowedActions: nextAllowedActions(lifecycle, true),
-			writer: opts.eventWriter ?? { ownerId: "operate", leaseEpoch: 0 },
-		};
-		await appendEvent(opts.root, opts.sessionId, envelope);
-	};
-	const emit = opts.emit ?? defaultEmit;
+	const emit = opts.emit;
 
 	const writeVanish = async (obs: Observation, classification: RecoveryClassification): Promise<boolean> => {
 		const dirty = obs.gitDelta === "dirty" || obs.gitDelta === "unknown";

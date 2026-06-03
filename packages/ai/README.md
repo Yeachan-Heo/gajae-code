@@ -1014,6 +1014,7 @@ Several providers support OAuth authentication (some also support static API key
 - **Google Gemini CLI** (Gemini 2.0/2.5 via Google Cloud Code Assist; free tier or paid subscription)
 - **Antigravity** (Free Gemini 3, Anthropic model, GPT-OSS via Google Cloud)
 - **Qwen Portal** (Qwen OAuth token or API key)
+- **xAI** (Grok OAuth login via xAI account)
 
 For paid Cloud Code Assist subscriptions, set `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_PROJECT_ID` to your project ID.
 
@@ -1063,12 +1064,13 @@ The quickest way to authenticate:
 bunx @gajae-code/ai login              # interactive provider selection
 bunx @gajae-code/ai login anthropic    # login to specific provider
 bunx @gajae-code/ai login vllm         # store vLLM API key (or placeholder for local no-auth)
+bunx @gajae-code/ai login xai          # sign in with xAI/Grok OAuth
 bunx @gajae-code/ai list               # list available providers
 ```
 
-Credentials are saved to `agent.db` in the agent directory. `/login qianfan` opens the Qianfan console and stores the pasted API key.
+Credentials are saved to `agent.db` in the agent directory. `/login qianfan` opens the Qianfan console and stores the pasted API key; `/login xai` opens xAI/Grok OAuth login and stores refreshable OAuth credentials.
 
-`login` supports OAuth providers (Anthropic, OpenAI code provider, GitHub Copilot, Gemini CLI, Antigravity) and API-key onboarding flows.
+`login` supports OAuth providers (Anthropic, OpenAI code provider, GitHub Copilot, Gemini CLI, Antigravity, xAI) and API-key onboarding flows.
 
 For the current API-key onboarding flows, the library covers Together, Moonshot, Qianfan, NVIDIA, NanoGPT, Hugging Face, Venice, Xiaomi, vLLM, LiteLLM, Cloudflare AI Gateway, Qwen Portal, and Ollama Cloud. Ollama remains the local runtime integration; set `OLLAMA_API_KEY` only when your local or self-hosted deployment enforces bearer auth.
 

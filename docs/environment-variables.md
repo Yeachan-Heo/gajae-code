@@ -224,7 +224,9 @@ providers:
 | `GJC_RUNTIME_BINARY` | Private runtime bridge binary for `gjc ralplan`, `gjc deep-interview`, and `gjc state` |
 | `GJC_LEGACY_RUNTIME_BINARY` | Legacy fallback bridge binary name |
 
-### Team dry-run and state paths
+### Team tmux backend, dry-run, and state paths
+
+`gjc team ...` starts tmux worker panes from the current tmux-backed leader session. Start that leader with `gjc --tmux` first; `gjc team` intentionally does not create or attach the leader session itself.
 
 `gjc team ... --dry-run --json` creates the same machine-readable state tree as a team launch without starting tmux panes. By default that state is written under `<cwd>/.gjc/state/team/<team>/`; treat it as ephemeral smoke-test/review state. Do not commit generated `.gjc/state/team` contents. Remove the generated team directory after a dry-run when the harness no longer needs it.
 

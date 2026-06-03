@@ -116,6 +116,12 @@ export interface ExtensionUIDialogOptions {
 	 * hint; non-TUI bridges (RPC, ACP) drop it and do not serialize it.
 	 */
 	wrapFocused?: boolean;
+	/**
+	 * For interactive TUI select dialogs, cap the title/prompt area to this
+	 * many rows and let PageUp/PageDown scroll that prompt locally. This is a
+	 * select-only rendering hint; non-TUI bridges drop it and do not serialize it.
+	 */
+	scrollTitleRows?: number;
 }
 
 /** Raw terminal input listener for extensions. */

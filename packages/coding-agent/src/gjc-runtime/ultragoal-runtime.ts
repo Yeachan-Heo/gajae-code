@@ -104,6 +104,12 @@ const TERMINAL_OR_SKIPPED_STATUSES = new Set<UltragoalGoalStatus>(["complete", "
 const CLEAN_ARCHITECT_STATUS = "CLEAR";
 const APPROVE_RECOMMENDATION = "APPROVE";
 const PASSED_STATUS = "passed";
+const NOT_APPLICABLE_STATUS = "not_applicable";
+const COVERED_STATUS = "covered";
+const ACCEPTED_PROOF_STATUSES = new Set([COVERED_STATUS, "passed", "verified"]);
+const MIN_SUBSTANTIVE_EVIDENCE_WORDS = 5;
+const MIN_SUBSTANTIVE_EVIDENCE_CHARS = 32;
+
 const GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS = 10 * 60 * 1000;
 const GJC_GOAL_SNAPSHOT_MAX_FUTURE_SKEW_MILLISECONDS = 60 * 1000;
 
@@ -569,8 +575,330 @@ function requireEmptyBlockers(value: unknown, fieldName: string): void {
 		throw new Error(`qualityGate ${fieldName} must be an empty blockers array`);
 	}
 }
+function requireQualityGateObject(value: unknown, fieldName: string): JsonObject {
+	const object = qualityGateObject(value);
+	if (!object) throw new Error(`qualityGate ${fieldName} must be an object`);
+	return object;
+}
 
-function validateCompletionQualityGate(gate: JsonObject): void {
+function requireObjectArray(value: unknown, fieldName: string): JsonObject[] {
+	if (!Array.isArray(value) || value.length === 0) {
+		throw new Error(`qualityGate ${fieldName} must be a non-empty object array`);
+	}
+	return value.map((item, index) => requireQualityGateObject(item, `${fieldName}[${index}]`));
+}
+
+function requiredStringField(row: JsonObject, key: string, fieldName: string): string {
+	const value = row[key];
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new Error(`qualityGate ${fieldName}.${key} must be a non-empty string`);
+	}
+	return value.trim();
+}
+
+function optionalStatusField(row: JsonObject, fieldName: string): string | null {
+	if (row.status === undefined) return null;
+	const status = requiredStringField(row, "status", fieldName).toLowerCase();
+	if (status === "todo") throw new Error(`qualityGate ${fieldName}.status must not be todo`);
+	return status;
+}
+
+function requireProofStatus(status: string, fieldName: string): void {
+	if (!ACCEPTED_PROOF_STATUSES.has(status) && status !== NOT_APPLICABLE_STATUS) {
+		throw new Error(`qualityGate ${fieldName}.status must be covered, passed, verified, or not_applicable`);
+	}
+}
+function requireSuccessStatus(status: string, fieldName: string): void {
+	requireProofStatus(status, fieldName);
+	if (status === NOT_APPLICABLE_STATUS) {
+		throw new Error(`qualityGate ${fieldName}.status must be covered, passed, or verified`);
+	}
+}
+
+function rowOutcomeStatuses(row: JsonObject, fieldName: string): string[] {
+	const statuses: string[] = [];
+	const status = optionalStatusField(row, fieldName);
+	if (status) statuses.push(status);
+	const verdict = row.verdict;
+	if (typeof verdict === "string" && verdict.trim().length > 0) statuses.push(verdict.trim().toLowerCase());
+	const result = row.result;
+	if (typeof result === "string" && result.trim().length > 0) statuses.push(result.trim().toLowerCase());
+	if (statuses.length === 0) throw new Error(`qualityGate ${fieldName}.verdict must be a non-empty string`);
+	return statuses;
+}
+
+function requireSuccessfulRowOutcome(row: JsonObject, fieldName: string): void {
+	for (const status of rowOutcomeStatuses(row, fieldName)) {
+		requireSuccessStatus(status, fieldName);
+	}
+}
+
+function requireStringLinks(value: unknown, fieldName: string): string[] {
+	const strings = nonEmptyStringArray(value);
+	if (!strings) throw new Error(`qualityGate ${fieldName} must be a non-empty string array`);
+	return strings.map(item => item.trim());
+}
+
+function optionalStringLinks(row: JsonObject, key: string, fieldName: string): string[] | null {
+	if (row[key] === undefined) return null;
+	return requireStringLinks(row[key], `${fieldName}.${key}`);
+}
+
+function buildRowIdMap(rows: JsonObject[], fieldName: string): Map<string, JsonObject> {
+	const ids = new Map<string, JsonObject>();
+	for (const [index, row] of rows.entries()) {
+		const id = requiredStringField(row, "id", `${fieldName}[${index}]`);
+		if (ids.has(id)) throw new Error(`qualityGate ${fieldName} contains duplicate id ${id}`);
+		ids.set(id, row);
+	}
+	return ids;
+}
+
+function requireResolvedLinks(ids: string[], map: Map<string, JsonObject>, fieldName: string): void {
+	for (const id of ids) {
+		if (!map.has(id)) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
+	}
+}
+function successfulLinkedRows(ids: string[], map: Map<string, JsonObject>, fieldName: string): JsonObject[] {
+	const rows: JsonObject[] = [];
+	for (const id of ids) {
+		const row = map.get(id);
+		if (!row) throw new Error(`qualityGate ${fieldName} references unknown id ${id}`);
+		requireSuccessfulRowOutcome(row, `${fieldName}.${id}`);
+		rows.push(row);
+	}
+	return rows;
+}
+
+function normalizedEvidenceKind(row: JsonObject): string {
+	return requiredStringField(row, "kind", "executorQa.artifactRefs[]").toLowerCase().replaceAll("_", "-");
+}
+
+function evidenceKindMatches(kind: string, words: string[]): boolean {
+	return words.some(word => kind.includes(word));
+}
+
+function validateSurfaceArtifactCompatibility(
+	surface: string,
+	artifactIds: string[],
+	artifactRefs: Map<string, JsonObject>,
+	fieldName: string,
+): void {
+	const normalizedSurface = surface.toLowerCase().replaceAll("_", "-");
+	const kinds = artifactIds.map(id => normalizedEvidenceKind(artifactRefs.get(id)!));
+	const isGuiOrWeb = ["gui", "web", "browser", "ui", "visual"].some(word => normalizedSurface.includes(word));
+	if (isGuiOrWeb) {
+		const hasBrowser = kinds.some(kind =>
+			evidenceKindMatches(kind, ["browser", "playwright", "pandawright", "automation"]),
+		);
+		const hasVisual = kinds.some(kind => evidenceKindMatches(kind, ["screenshot", "image", "visual"]));
+		if (!hasBrowser || !hasVisual) {
+			throw new Error(
+				`qualityGate ${fieldName} for GUI/web surfaces must reference browser automation plus screenshot or image-verdict artifacts`,
+			);
+		}
+		return;
+	}
+	const surfaceFamilies: Array<{ surface: string[]; evidence: string[]; label: string }> = [
+		{
+			surface: ["cli", "terminal", "command"],
+			evidence: ["cli", "log", "transcript", "terminal", "command", "test-report"],
+			label: "CLI",
+		},
+		{
+			surface: ["api", "package", "library", "sdk"],
+			evidence: ["api", "package", "consumer", "black-box", "test-report"],
+			label: "API/package",
+		},
+		{
+			surface: ["algorithm", "math", "mathematical", "equation"],
+			evidence: ["property", "boundary", "edge", "adversarial", "failure", "math", "algorithm", "test-report"],
+			label: "algorithm/math",
+		},
+	];
+	for (const family of surfaceFamilies) {
+		if (family.surface.some(word => normalizedSurface.includes(word))) {
+			if (!kinds.some(kind => evidenceKindMatches(kind, family.evidence))) {
+				throw new Error(
+					`qualityGate ${fieldName} for ${family.label} surfaces must reference compatible artifact kinds`,
+				);
+			}
+			return;
+		}
+	}
+}
+
+function isSubstantiveEvidence(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+	const trimmed = value.trim();
+	if (trimmed.length < MIN_SUBSTANTIVE_EVIDENCE_CHARS) return false;
+	const words = trimmed.split(/\s+/).filter(word => /[a-z0-9]/i.test(word));
+	if (words.length < MIN_SUBSTANTIVE_EVIDENCE_WORDS) return false;
+	const normalized = trimmed.toLowerCase();
+	return !["todo", "tbd", "n/a", "na", "none", "placeholder", "empty", "stub"].includes(normalized);
+}
+
+function hasTypedVerifiedReceipt(value: unknown): boolean {
+	const receipt = qualityGateObject(value);
+	if (!receipt) return false;
+	const type = nonEmptyString(receipt.type) ?? nonEmptyString(receipt.kind) ?? nonEmptyString(receipt.receiptType);
+	const id = nonEmptyString(receipt.id) ?? nonEmptyString(receipt.receiptId) ?? nonEmptyString(receipt.ref);
+	const status = (nonEmptyString(receipt.status) ?? nonEmptyString(receipt.verdict) ?? "").toLowerCase();
+	return Boolean(type && id && (status === "verified" || status === "passed"));
+}
+
+async function hasExistingNonEmptyArtifact(cwd: string, value: unknown): Promise<boolean> {
+	const artifactPath = nonEmptyString(value);
+	if (!artifactPath) return false;
+	const resolved = path.resolve(cwd, artifactPath);
+	try {
+		const file = Bun.file(resolved);
+		return (await file.exists()) && file.size > 0;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
+async function requireSubstantiveArtifactEvidence(cwd: string, row: JsonObject, fieldName: string): Promise<void> {
+	if (isSubstantiveEvidence(row.inlineEvidence) || isSubstantiveEvidence(row.evidence)) return;
+	if (hasTypedVerifiedReceipt(row.verifiedReceipt) || hasTypedVerifiedReceipt(row.receipt)) return;
+	if (await hasExistingNonEmptyArtifact(cwd, row.path)) return;
+	throw new Error(
+		`qualityGate ${fieldName} must reference an existing non-empty artifact path, substantive inlineEvidence, or a typed verifiedReceipt`,
+	);
+}
+
+async function validateArtifactRefs(cwd: string, executorQa: JsonObject): Promise<Map<string, JsonObject>> {
+	const rows = requireObjectArray(executorQa.artifactRefs, "executorQa.artifactRefs");
+	const idMap = buildRowIdMap(rows, "executorQa.artifactRefs");
+	for (const [index, row] of rows.entries()) {
+		const fieldName = `executorQa.artifactRefs[${index}]`;
+		requiredStringField(row, "kind", fieldName);
+		requiredStringField(row, "description", fieldName);
+		await requireSubstantiveArtifactEvidence(cwd, row, fieldName);
+	}
+	return idMap;
+}
+
+function validateSurfaceEvidence(
+	executorQa: JsonObject,
+	artifactRefs: Map<string, JsonObject>,
+): Map<string, JsonObject> {
+	const rows = requireObjectArray(executorQa.surfaceEvidence, "executorQa.surfaceEvidence");
+	const idMap = buildRowIdMap(rows, "executorQa.surfaceEvidence");
+	for (const [index, row] of rows.entries()) {
+		const fieldName = `executorQa.surfaceEvidence[${index}]`;
+		const status = optionalStatusField(row, fieldName);
+		requiredStringField(row, "contractRef", fieldName);
+		if (status === NOT_APPLICABLE_STATUS) {
+			requiredStringField(row, "reason", fieldName);
+			continue;
+		}
+		const surface = requiredStringField(row, "surface", fieldName);
+		requireSuccessfulRowOutcome(row, fieldName);
+		requiredStringField(row, "invocation", fieldName);
+		if (typeof row.verdict !== "string" || row.verdict.trim().length === 0) {
+			requiredStringField(row, "result", fieldName);
+		}
+		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
+		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+		validateSurfaceArtifactCompatibility(surface, artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+	}
+	return idMap;
+}
+
+function validateAdversarialCases(
+	executorQa: JsonObject,
+	artifactRefs: Map<string, JsonObject>,
+): Map<string, JsonObject> {
+	const rows = requireObjectArray(executorQa.adversarialCases, "executorQa.adversarialCases");
+	const idMap = buildRowIdMap(rows, "executorQa.adversarialCases");
+	for (const [index, row] of rows.entries()) {
+		const fieldName = `executorQa.adversarialCases[${index}]`;
+		const status = optionalStatusField(row, fieldName);
+		if (status === NOT_APPLICABLE_STATUS) {
+			throw new Error(`qualityGate ${fieldName}.status must not be not_applicable`);
+		}
+		requireSuccessfulRowOutcome(row, fieldName);
+		requiredStringField(row, "contractRef", fieldName);
+		requiredStringField(row, "scenario", fieldName);
+		requiredStringField(row, "expectedBehavior", fieldName);
+		if (typeof row.verdict !== "string" || row.verdict.trim().length === 0) {
+			requiredStringField(row, "result", fieldName);
+		}
+		const artifactIds = requireStringLinks(row.artifactRefs, `${fieldName}.artifactRefs`);
+		requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+	}
+	return idMap;
+}
+
+function validateContractCoverage(
+	executorQa: JsonObject,
+	surfaceEvidence: Map<string, JsonObject>,
+	adversarialCases: Map<string, JsonObject>,
+	artifactRefs: Map<string, JsonObject>,
+): void {
+	const rows = requireObjectArray(executorQa.contractCoverage, "executorQa.contractCoverage");
+	buildRowIdMap(rows, "executorQa.contractCoverage");
+	let hasSuccessfulContractCoverage = false;
+	for (const [index, row] of rows.entries()) {
+		const fieldName = `executorQa.contractCoverage[${index}]`;
+		requiredStringField(row, "contractRef", fieldName);
+		const status = optionalStatusField(row, fieldName);
+		if (status === NOT_APPLICABLE_STATUS) {
+			requiredStringField(row, "reason", fieldName);
+			continue;
+		}
+		requiredStringField(row, "obligation", fieldName);
+		if (!status) throw new Error(`qualityGate ${fieldName}.status must be a non-empty string`);
+		requireSuccessStatus(status, fieldName);
+		hasSuccessfulContractCoverage = true;
+		const surfaceIds = optionalStringLinks(row, "surfaceEvidenceRefs", fieldName);
+		const adversarialIds = optionalStringLinks(row, "adversarialCaseRefs", fieldName);
+		const artifactIds = optionalStringLinks(row, "artifactRefs", fieldName);
+		if (!surfaceIds && !adversarialIds && !artifactIds) {
+			throw new Error(
+				`qualityGate ${fieldName} must link to surfaceEvidenceRefs, adversarialCaseRefs, or artifactRefs`,
+			);
+		}
+		let successfulProofLinks = 0;
+		if (surfaceIds)
+			successfulProofLinks += successfulLinkedRows(
+				surfaceIds,
+				surfaceEvidence,
+				`${fieldName}.surfaceEvidenceRefs`,
+			).length;
+		if (adversarialIds) {
+			successfulProofLinks += successfulLinkedRows(
+				adversarialIds,
+				adversarialCases,
+				`${fieldName}.adversarialCaseRefs`,
+			).length;
+		}
+		if (artifactIds) {
+			requireResolvedLinks(artifactIds, artifactRefs, `${fieldName}.artifactRefs`);
+			successfulProofLinks += artifactIds.length;
+		}
+		if (successfulProofLinks === 0) {
+			throw new Error(`qualityGate ${fieldName} must link to at least one successful proof row or artifact`);
+		}
+	}
+	if (!hasSuccessfulContractCoverage) {
+		throw new Error(
+			"qualityGate executorQa.contractCoverage must include at least one row with status covered, passed, or verified",
+		);
+	}
+}
+
+async function validateExecutorQaRedTeamEvidence(cwd: string, executorQa: JsonObject): Promise<void> {
+	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
+	const surfaceEvidence = validateSurfaceEvidence(executorQa, artifactRefs);
+	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
+	validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
+}
+
+async function validateCompletionQualityGate(cwd: string, gate: JsonObject): Promise<void> {
 	const codeReview = qualityGateObject(gate.codeReview);
 	if (codeReview) {
 		throw new Error(
@@ -615,6 +943,7 @@ function validateCompletionQualityGate(gate: JsonObject): void {
 	}
 	requireNonEmptyString(executorQa.evidence, "executorQa.evidence");
 	requireEmptyBlockers(executorQa.blockers, "executorQa.blockers");
+	await validateExecutorQaRedTeamEvidence(cwd, executorQa);
 	if (iteration.status !== PASSED_STATUS || iteration.fullRerun !== true) {
 		throw new Error("qualityGate iteration must be passed with fullRerun true");
 	}
@@ -634,7 +963,7 @@ async function readRequiredCompletionQualityGate(cwd: string, value: string | un
 	const gate = await readStructuredValue(cwd, value);
 	const gateObject = qualityGateObject(gate);
 	if (!gateObject) throw new Error("qualityGate must be a JSON object");
-	validateCompletionQualityGate(gateObject);
+	await validateCompletionQualityGate(cwd, gateObject);
 	return gate;
 }
 
@@ -914,8 +1243,8 @@ function renderCompleteHandoff(
 		`Ultragoal handoff: ${result.goal.id} — ${result.goal.title}`,
 		`Objective: ${result.goal.objective}`,
 		`GJC objective: ${result.plan.gjcObjective}`,
-		'Call goal({"op":"get"}); call goal({"op":"create","objective":"<printed objective>"}) only if no active GJC goal exists, then complete this GJC story with goal({"op":"complete"}) after verification.',
-		"Before checkpointing complete, obtain a passing architectReview (architecture/product/code CLEAR + APPROVE) and executorQa (e2e/red-team passed); record blockers instead of completing on any finding.",
+		'Call goal({"op":"get"}); call goal({"op":"create","objective":"<printed objective>"}) only if no active GJC goal exists, then keep the GJC goal active while this Ultragoal story is verified and checkpointed.',
+		'Before checkpointing complete, obtain a passing architectReview (architecture/product/code CLEAR + APPROVE) and executorQa (e2e/red-team passed with contractCoverage, surfaceEvidence, adversarialCases, and artifactRefs matrix evidence), then checkpoint with --quality-gate-json and a fresh active goal snapshot; record blockers instead of completing on any finding, plan/code mismatch, shallow evidence, or missing artifact link; call goal({"op":"complete"}) only after the final aggregate receipt exists.',
 		"",
 	].join("\n");
 }

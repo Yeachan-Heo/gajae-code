@@ -28,6 +28,7 @@ import {
 } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { formatDeepInterviewSelectorPrompt, renderDeepInterviewAskQuestion } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
@@ -84,6 +85,7 @@ export interface AskToolDetails {
 
 const OTHER_OPTION = "Other (type your own)";
 const RECOMMENDED_SUFFIX = " (Recommended)";
+const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = 12;
 
 function getDoneOptionLabel(): string {
 	return `${theme.status.success} Done selecting`;
@@ -138,6 +140,7 @@ interface AskSingleQuestionOptions {
 	signal?: AbortSignal;
 	initialSelection?: Pick<SelectionResult, "selectedOptions" | "customInput">;
 	navigation?: NavigationControls;
+	scrollTitleRows?: number;
 }
 
 interface UIContext {
@@ -150,6 +153,7 @@ interface UIContext {
 			signal?: AbortSignal;
 			outline?: boolean;
 			wrapFocused?: boolean;
+			scrollTitleRows?: number;
 			onTimeout?: () => void;
 			onLeft?: () => void;
 			onRight?: () => void;
@@ -171,7 +175,7 @@ async function askSingleQuestion(
 	multi: boolean,
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
-	const { recommended, timeout, signal, initialSelection, navigation } = options;
+	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
 	const doneLabel = getDoneOptionLabel();
 	let selectedOptions = [...(initialSelection?.selectedOptions ?? [])];
 	let customInput = initialSelection?.customInput;
@@ -187,15 +191,17 @@ async function askSingleQuestion(
 			timeoutTriggered = true;
 		};
 		let navigationAction: "back" | "forward" | undefined;
-		const helpText = navigation
+		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
 			: "up/down navigate  enter select  esc cancel";
+		const helpText = scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  PgUp/PgDn scroll question`;
 		const dialogOptions = {
 			initialIndex,
 			timeout,
 			signal,
 			outline: true,
 			wrapFocused: true,
+			scrollTitleRows,
 			onTimeout,
 			helpText,
 			onLeft: navigation?.allowBack
@@ -454,9 +460,11 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		) => {
 			const optionLabels = q.options.map(o => o.label);
 			try {
+				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
+				const displayQuestion = deepInterviewPrompt ?? q.question;
 				const { selectedOptions, customInput, navigation, cancelled, timedOut } = await askSingleQuestion(
 					ui,
-					q.question,
+					displayQuestion,
 					optionLabels,
 					q.multi ?? false,
 					{
@@ -465,6 +473,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						signal,
 						initialSelection: options?.previous,
 						navigation: options?.navigation,
+						scrollTitleRows: deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					},
 				);
 				return { optionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };
@@ -659,7 +668,10 @@ export const askToolRenderer = {
 				container.addChild(
 					new Text(` ${uiTheme.fg("dim", qBranch)} ${uiTheme.fg("dim", `[${q.id}]`)}${metaStr}`, 0, 0),
 				);
-				container.addChild(new Markdown(q.question, 3, 0, mdTheme, accentStyle));
+				container.addChild(
+					renderDeepInterviewAskQuestion(q.question, uiTheme) ??
+						new Markdown(q.question, 3, 0, mdTheme, accentStyle),
+				);
 
 				const qOptions = q.options;
 				if (qOptions?.length) {
@@ -688,7 +700,10 @@ export const askToolRenderer = {
 		if (args.multi) meta.push("multi");
 		if (args.options?.length) meta.push(`options:${args.options.length}`);
 		container.addChild(new Text(`${label}${formatMeta(meta, uiTheme)}`, 0, 0));
-		container.addChild(new Markdown(args.question, 1, 0, mdTheme, accentStyle));
+		container.addChild(
+			renderDeepInterviewAskQuestion(args.question, uiTheme) ??
+				new Markdown(args.question, 1, 0, mdTheme, accentStyle),
+		);
 
 		const options = args.options;
 		if (options?.length) {
@@ -752,7 +767,10 @@ export const askToolRenderer = {
 				container.addChild(
 					new Text(` ${uiTheme.fg("dim", branch)} ${statusIcon} ${uiTheme.fg("dim", `[${r.id}]`)}`, 0, 0),
 				);
-				container.addChild(new Markdown(r.question, 3, 0, mdTheme, accentStyle));
+				container.addChild(
+					renderDeepInterviewAskQuestion(r.question, uiTheme) ??
+						new Markdown(r.question, 3, 0, mdTheme, accentStyle),
+				);
 
 				const answerLines: string[] = [];
 				for (let j = 0; j < r.selectedOptions.length; j++) {
@@ -795,7 +813,10 @@ export const askToolRenderer = {
 		const header = renderStatusLine({ icon: hasSelection ? "success" : "warning", title: "Ask" }, uiTheme);
 		const container = new Container();
 		container.addChild(new Text(header, 0, 0));
-		container.addChild(new Markdown(details.question, 1, 0, mdTheme, accentStyle));
+		container.addChild(
+			renderDeepInterviewAskQuestion(details.question, uiTheme) ??
+				new Markdown(details.question, 1, 0, mdTheme, accentStyle),
+		);
 
 		const answerLines: string[] = [];
 		if (details.selectedOptions && details.selectedOptions.length > 0) {

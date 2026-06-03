@@ -47,6 +47,8 @@ function getStatusIcon(status: AgentProgress["status"], theme: Theme, spinnerFra
 			return formatStatusIcon("error", theme);
 		case "aborted":
 			return formatStatusIcon("aborted", theme);
+		case "paused":
+			return formatStatusIcon("pending", theme);
 	}
 }
 

@@ -14,9 +14,12 @@ import * as path from "node:path";
 const repoRoot = path.join(import.meta.dir, "..");
 const EXPECTED_DEFINITIONS = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 const EXPECTED_ROLE_AGENTS = ["architect", "critic", "executor", "planner"] as const;
-const EXPECTED_PUBLIC_PACKAGE_VERSION = "0.2.4";
+const EXPECTED_PUBLIC_PACKAGE_VERSION_CATALOG_KEY = "@gajae-code/coding-agent";
 const ALLOWED_PUBLIC_PACKAGE_VERSIONS = new Map<string, string>();
-const ALLOWED_PRIVATE_PACKAGE_VERSIONS = new Map<string, string>([["@gajae-code/typescript-edit-benchmark", "0.0.1"]]);
+const ALLOWED_PRIVATE_PACKAGE_VERSIONS = new Map<string, string>([
+	["@gajae-code/orchestration-token-benchmark", "0.0.1"],
+	["@gajae-code/typescript-edit-benchmark", "0.0.1"],
+]);
 const ALLOWED_UNSCOPED_PACKAGE_NAMES = new Set<string>(["gajae-code"]);
 const ALLOWED_PACKAGE_BINARIES = new Map<string, readonly string[]>([
 	["@gajae-code/ai", ["pi-ai"]],
@@ -194,12 +197,24 @@ async function verifyRebrandSurface(): Promise<GateResult> {
 }
 
 
+async function readExpectedPublicPackageVersion(): Promise<string> {
+	const rootPackageJson = await readJson("package.json");
+	const workspaces = isRecord(rootPackageJson.workspaces) ? rootPackageJson.workspaces : null;
+	const catalog = isRecord(workspaces?.catalog) ? workspaces.catalog : null;
+	const version = catalog?.[EXPECTED_PUBLIC_PACKAGE_VERSION_CATALOG_KEY];
+	if (typeof version !== "string" || version.trim().length === 0) {
+		throw new Error(`Missing ${EXPECTED_PUBLIC_PACKAGE_VERSION_CATALOG_KEY} in root workspace catalog`);
+	}
+	return version;
+}
+
 async function verifyPackageVersionAndBinaryAllowlist(): Promise<GateResult> {
 	const packagePaths = listPackageJsonPaths();
 	const versionFindings: string[] = [];
 	const nameFindings: string[] = [];
 	const binaryFindings: string[] = [];
 
+	const expectedPublicPackageVersion = await readExpectedPublicPackageVersion();
 	for (const relativePath of packagePaths) {
 		const packageJson = await readJson(relativePath);
 		const packageName = typeof packageJson.name === "string" ? packageJson.name : "<missing>";
@@ -218,9 +233,7 @@ async function verifyPackageVersionAndBinaryAllowlist(): Promise<GateResult> {
 		const allowedPrivateVersion = ALLOWED_PRIVATE_PACKAGE_VERSIONS.get(packageName);
 		const allowedPublicVersion = ALLOWED_PUBLIC_PACKAGE_VERSIONS.get(packageName);
 		const expectedVersion =
-			isPrivate && allowedPrivateVersion
-				? allowedPrivateVersion
-				: allowedPublicVersion ?? EXPECTED_PUBLIC_PACKAGE_VERSION;
+			isPrivate && allowedPrivateVersion ? allowedPrivateVersion : allowedPublicVersion ?? expectedPublicPackageVersion;
 		if (packageVersion !== expectedVersion) {
 			versionFindings.push(`${relativePath}: ${packageName} version ${packageVersion} != ${expectedVersion}`);
 		}
@@ -240,8 +253,8 @@ async function verifyPackageVersionAndBinaryAllowlist(): Promise<GateResult> {
 
 	const cargoWorkspace = await readText("Cargo.toml");
 	const cargoVersion = /^version\s*=\s*"([^"]+)"/mu.exec(cargoWorkspace)?.[1] ?? "<missing>";
-	if (cargoVersion !== EXPECTED_PUBLIC_PACKAGE_VERSION) {
-		versionFindings.push(`Cargo.toml workspace.package version ${cargoVersion} != ${EXPECTED_PUBLIC_PACKAGE_VERSION}`);
+	if (cargoVersion !== expectedPublicPackageVersion) {
+		versionFindings.push(`Cargo.toml workspace.package version ${cargoVersion} != ${expectedPublicPackageVersion}`);
 	}
 
 	return {

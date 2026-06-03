@@ -9,6 +9,7 @@ import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } f
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { AsyncJobManager } from "../async";
 import { ModelRegistry } from "../config/model-registry";
 import { resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -112,6 +113,9 @@ export interface ExecutorOptions {
 	index: number;
 	id: string;
 	modelOverride?: string | string[];
+	runMode?: "initial" | "resume" | "message";
+	resumeMessage?: string;
+	subagentId?: string;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -550,8 +554,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	// Set up artifact paths and write input file upfront if artifacts dir provided
-	let subtaskSessionFile: string | undefined;
-	if (options.artifactsDir) {
+	let subtaskSessionFile: string | undefined = options.sessionFile ?? undefined;
+	if (!subtaskSessionFile && options.artifactsDir) {
 		subtaskSessionFile = path.join(options.artifactsDir, `${id}.jsonl`);
 	}
 
@@ -617,6 +621,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let activeSession: AgentSession | null = null;
 	let unsubscribe: (() => void) | null = null;
 	let yieldCalled = false;
+	let pauseRequested = false;
+	let paused = false;
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -1006,6 +1012,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						}
 					}
 				}
+				paused = (event as { stopReason?: string }).stopReason === "paused";
 				flushProgress = true;
 				break;
 		}
@@ -1193,10 +1200,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
 					forkContextSeed: options.forkContextSeed,
+					shouldPause: () => pauseRequested,
 				}),
 			);
 
 			activeSession = session;
+			const liveSubagentId = options.subagentId ?? id;
+			const manager = AsyncJobManager.instance();
+			if (manager) {
+				manager.registerLiveHandle(liveSubagentId, {
+					requestPause: () => {
+						pauseRequested = true;
+					},
+					injectMessage: async (content, deliverAs) => {
+						if (deliverAs === "nextTurn") {
+							await session.prompt(content, { attribution: "agent" });
+							return;
+						}
+						await session.sendUserMessage(content, { deliverAs });
+					},
+				});
+			}
 
 			// Emit lifecycle start event
 			if (options.eventBus) {
@@ -1355,13 +1379,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					);
 				}
 			}
-			await awaitAbortable(session.prompt(task, { attribution: "agent" }));
-			await awaitAbortable(session.waitForIdle());
+			const runMode = options.runMode ?? "initial";
+			if (runMode === "message") {
+				await awaitAbortable(session.prompt(options.resumeMessage ?? "", { attribution: "agent" }));
+				await awaitAbortable(session.waitForIdle());
+			} else if (runMode === "resume") {
+				await awaitAbortable(
+					session.prompt("Continue from the paused subagent session state.", { attribution: "agent" }),
+				);
+				await awaitAbortable(session.waitForIdle());
+			} else {
+				await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+				await awaitAbortable(session.waitForIdle());
+			}
 
 			const reminderToolChoice = buildNamedToolChoice("yield", session.model);
 
 			let retryCount = 0;
-			while (!yieldCalled && retryCount < MAX_YIELD_RETRIES && !abortSignal.aborted) {
+			while (!paused && !yieldCalled && retryCount < MAX_YIELD_RETRIES && !abortSignal.aborted) {
 				// Skip reminders when the model returned a terminal error (e.g.
 				// rate-limit cap hit, auth failure). Re-prompting would just
 				// hit the same wall, multiplying the failure noise without
@@ -1391,7 +1426,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			await awaitAbortable(session.waitForIdle());
-			if (!yieldCalled && !abortSignal.aborted) {
+			if (!paused && !yieldCalled && !abortSignal.aborted) {
 				exitCode = 0;
 			}
 
@@ -1406,6 +1441,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				} else if (lastAssistant.stopReason === "error") {
 					exitCode = 1;
 					error ??= lastAssistant.errorMessage || "Subagent failed";
+				}
+				if (paused) {
+					exitCode = 0;
+					error = undefined;
 				}
 			}
 		} catch (err) {
@@ -1422,6 +1461,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
+			AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id);
 			if (unsubscribe) {
 				try {
 					unsubscribe();
@@ -1528,7 +1568,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? yieldAbortReason
 				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : resolveAbortReasonText()))
 		: undefined;
-	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+	progress.status = paused ? "paused" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
 	// Emit lifecycle end event after finalization so yield status is reflected
@@ -1538,7 +1578,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agent: agent.name,
 			agentSource: agent.source,
 			description: options.description,
-			status: progress.status as "completed" | "failed" | "aborted",
+			status: progress.status as "completed" | "failed" | "aborted" | "paused",
 			sessionFile: subtaskSessionFile,
 			index,
 		});
@@ -1565,6 +1605,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
+		paused,
 		usage: hasUsage ? accumulatedUsage : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,

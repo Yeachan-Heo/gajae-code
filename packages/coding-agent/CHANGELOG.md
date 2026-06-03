@@ -6,6 +6,14 @@
 - Started the GJC backend bridge foundation with a shared agent-wire protocol module, event envelopes, RPC command scope matrix, UI request broker, typed unsupported UI results, a guarded `--mode bridge` handshake surface, and RPC mode dispatch refactored onto the shared command dispatcher.
 - Documented the experimental `--mode bridge` protocol in `docs/bridge.md` and the `GJC_BRIDGE_*` environment variables in `docs/environment-variables.md` (TLS-mandatory startup, bearer auth, coarse command scopes with a `prompt` floor, single live `AgentSession` per process, bounded event-stream replay with `reset`, and the semantic-not-pixel UI capability matrix), and added bridge event-stream/idempotency regression tests plus a docs-conformance check that pins the docs against the protocol version, scope/command catalog, negotiated capabilities/frame types, and unsupported UI surfaces. The bridge protocol/SDK are experimental (`BRIDGE_PROTOCOL_VERSION` 1) and may change in additive, version-negotiated ways.
 
+### Added
+
+- Added runtime-enforced Ultragoal executor QA/red-team evidence matrices for completion checkpoints, with plan-first contract coverage, user-surface evidence, adversarial cases, artifact references, scoped Executor red-team guidance, and focused rejection tests for shallow or contradictory QA evidence.
+### Fixed
+
+- Clarified that `gjc team` requires an existing tmux-backed leader session from `gjc --tmux`, with actionable help, docs, and failure text.
+- Kept deep-interview ask options visible for long prompts by adding an opt-in scrollable selector title panel with selector-local `PageUp`/`PageDown` prompt scrolling, while leaving normal ask dialogs and global keybinding configuration unchanged.
+
 ## [0.2.5] - 2026-06-02
 
 ### Added
