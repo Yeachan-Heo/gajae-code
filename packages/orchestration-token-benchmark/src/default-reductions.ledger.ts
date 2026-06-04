@@ -1,4 +1,8 @@
-import type { DefaultReductionEvidence } from "./default-reduction-gate";
+import type {
+	DefaultReductionBenchmarkEvidence,
+	DefaultReductionEvidence,
+	DefaultReductionHumanApprovalEvidence,
+} from "./default-reduction-gate";
 
 export interface AppliedDefaultReduction {
 	evidence: DefaultReductionEvidence;
@@ -13,6 +17,22 @@ export interface HeldDefaultReduction {
 	requiresLiveEvidenceVia: "pr9-live-runner";
 }
 
+const PR272_BENCHMARK_EVIDENCE: DefaultReductionBenchmarkEvidence = {
+	suite: "orchestration-token-benchmark",
+	command: "bun --cwd=packages/orchestration-token-benchmark test",
+	fixtureSuccessCriterion: "after>=before",
+	tokenMetricCriterion: "after<before",
+	status: "passed",
+};
+
+const PR272_HUMAN_APPROVAL_EVIDENCE: DefaultReductionHumanApprovalEvidence = {
+	approved: true,
+	source: "github-pr",
+	prNumber: 272,
+	approver: "Yeachan-Heo",
+	reference: "https://github.com/Yeachan-Heo/gajae-code/pull/272#issue-272-human-signoff-requester",
+};
+
 export const APPLIED_DEFAULT_REDUCTIONS: ReadonlyArray<AppliedDefaultReduction> = [
 	{
 		evidence: {
@@ -25,6 +45,8 @@ export const APPLIED_DEFAULT_REDUCTIONS: ReadonlyArray<AppliedDefaultReduction> 
 			fixtureSuccessRateAfter: 1,
 			latencyRegressionWithinBudget: true,
 			humanApproved: true,
+			benchmarkEvidence: PR272_BENCHMARK_EVIDENCE,
+			humanApprovalEvidence: PR272_HUMAN_APPROVAL_EVIDENCE,
 		},
 		rationale:
 			"Reduce default subagent fan-out from 32 to 8 so deterministic orchestration uses fewer simultaneous cloned prompt prefixes while preserving fixture success.",
@@ -43,6 +65,8 @@ export const APPLIED_DEFAULT_REDUCTIONS: ReadonlyArray<AppliedDefaultReduction> 
 			fixtureSuccessRateAfter: 1,
 			latencyRegressionWithinBudget: true,
 			humanApproved: true,
+			benchmarkEvidence: PR272_BENCHMARK_EVIDENCE,
+			humanApprovalEvidence: PR272_HUMAN_APPROVAL_EVIDENCE,
 		},
 		rationale:
 			"Reduce full-mode fork-context unknown-window fallback from 25k to 15k and record the paired percentage default reduction from 25% to 15%.",
@@ -61,6 +85,8 @@ export const APPLIED_DEFAULT_REDUCTIONS: ReadonlyArray<AppliedDefaultReduction> 
 			fixtureSuccessRateAfter: 1,
 			latencyRegressionWithinBudget: true,
 			humanApproved: true,
+			benchmarkEvidence: PR272_BENCHMARK_EVIDENCE,
+			humanApprovalEvidence: PR272_HUMAN_APPROVAL_EVIDENCE,
 		},
 		rationale:
 			"Reduce full-mode fork-context percentage cap from 25% to 15% for known context windows, matching the 15k unknown-window fallback reduction.",

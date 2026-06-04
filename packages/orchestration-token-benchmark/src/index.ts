@@ -8,8 +8,10 @@
  */
 
 export {
+	type DefaultReductionBenchmarkEvidence,
 	type DefaultReductionDecision,
 	type DefaultReductionEvidence,
+	type DefaultReductionHumanApprovalEvidence,
 	evaluateDefaultReduction,
 } from "./default-reduction-gate";
 export {
