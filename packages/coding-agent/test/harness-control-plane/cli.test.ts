@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appendEvent, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
@@ -52,6 +52,34 @@ function assertContract(res: any): void {
 
 function action(res: any, verb: string) {
 	return (res.nextAllowedActions as any[]).find(a => a.verb === verb);
+}
+
+function git(args: string[]): void {
+	const proc = Bun.spawnSync(["git", ...args], { cwd: workspace, stdout: "pipe", stderr: "pipe" });
+	if (proc.exitCode !== 0) throw new Error(proc.stderr.toString() || `git ${args.join(" ")} failed`);
+}
+
+async function initCleanGitWorkspace(): Promise<void> {
+	git(["init"]);
+	git(["config", "user.email", "test@example.com"]);
+	git(["config", "user.name", "Test User"]);
+	await writeFile(path.join(workspace, "README.md"), "fixture\n", "utf8");
+	git(["add", "README.md"]);
+	git(["commit", "-m", "init"]);
+}
+
+async function appendSignal(sessionId: string, cursor: number, signal: string): Promise<void> {
+	await appendEvent(root, sessionId, {
+		eventId: `evt-${signal}-${cursor}`,
+		cursor,
+		createdAt: `2026-06-03T00:00:0${cursor}.000Z`,
+		severity: "info",
+		kind: `rpc_${signal.replaceAll("-", "_")}`,
+		state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+		evidence: { signal },
+		nextAllowedActions: [],
+		writer: { ownerId: "owner-exited", leaseEpoch: 1 },
+	});
 }
 
 describe("gjc harness CLI (foundation)", () => {
@@ -125,6 +153,67 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.json.evidence.observation.lastActivityAt).toBe("2026-06-03T00:00:01.000Z");
 	});
 
+	it("observe marks vanished owner after prompt/tool activity instead of silently observing clean worktree", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendSignal(sessionId, 1, "prompt-accepted");
+		await appendSignal(sessionId, 2, "tool-call");
+		await appendSignal(sessionId, 3, "streaming");
+
+		const res = runHarness(["observe", "--session", sessionId]);
+
+		expect(res.code).toBe(0);
+		assertContract(res.json);
+		expect(res.json.state.ownerLive).toBe(false);
+		expect(res.json.state.lifecycle).toBe("blocked");
+		expect(res.json.state.blockers).toContain("owner-vanished:clean");
+		expect(res.json.evidence.ownerVanished).toBe(true);
+		expect(res.json.evidence.blockerReason).toBe("owner-vanished:clean");
+		expect(res.json.evidence.observation.lifecycle).toBe("blocked");
+		expect(res.json.evidence.observation.gitDelta).toBe("clean");
+		expect(res.json.evidence.observation.observedSignals).toEqual(
+			expect.arrayContaining(["prompt-accepted", "tool-call", "streaming"]),
+		);
+		expect(action(res.json, "recover").available).toBe(true);
+
+		const persisted = await readSessionState(root, sessionId);
+		expect(persisted?.lifecycle).toBe("blocked");
+		expect(persisted?.blockers).toContain("owner-vanished:clean");
+	});
+
+	it("recover without owner classifies vanished clean sessions instead of returning pending-only", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendSignal(sessionId, 1, "prompt-accepted");
+		await appendSignal(sessionId, 2, "tool-call");
+
+		const res = runHarness(["recover", "--session", sessionId]);
+
+		expect(res.code).toBe(1);
+		assertContract(res.json);
+		expect(res.json.evidence.pending).toBe(false);
+		expect(res.json.evidence.reason).toBe("owner-not-live");
+		expect(res.json.evidence.decision.classification).toBe("restart-clean");
+		expect(res.json.evidence.decision.requiredReceiptFamily).toBe("vanish");
+		expect(res.json.evidence.observation.lifecycle).toBe("blocked");
+		expect(res.json.state.lifecycle).toBe("blocked");
+		expect(res.json.state.blockers).toContain("owner-vanished:clean");
+	});
+
 	it("submit is blocked (accepted:false, owner-not-live) and never echoed-as-accepted", () => {
 		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
 		const sessionId = started.json.evidence.handle.sessionId as string;
@@ -158,13 +247,13 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(String(res.json.evidence.reason)).toContain("retire-blocked");
 	});
 
-	it("owner-runtime verbs report an honest pending milestone", () => {
+	it("non-recover owner-runtime verbs report an honest pending milestone", () => {
 		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
 		const sessionId = started.json.evidence.handle.sessionId as string;
-		const res = runHarness(["recover", "--session", sessionId]);
+		const res = runHarness(["validate", "--session", sessionId]);
 		expect(res.code).toBe(1);
 		expect(res.json.ok).toBe(false);
 		expect(res.json.evidence.pending).toBe(true);
-		expect(typeof res.json.evidence.milestone).toBe("string");
+		expect(res.json.evidence.verb).toBe("validate");
 	});
 });
