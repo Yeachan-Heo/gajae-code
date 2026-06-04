@@ -10,7 +10,7 @@ interface FileSnapshot {
 	mtimeMs: number;
 }
 
-const repoRoot = process.cwd();
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const skillFiles = CANONICAL_GJC_WORKFLOW_SKILLS.map(skill =>
 	path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", skill, "SKILL.md"),
 );

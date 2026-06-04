@@ -12,6 +12,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/mess
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const roots: string[] = [];
 
 async function tempDir(prefix = "gjc-handoff-thrift-"): Promise<string> {
@@ -29,6 +30,7 @@ function scrub(text: string): string {
 	return text
 		.replaceAll(/\/var\/folders\/[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/private\/var\/[^\n"]+/g, "/tmp/SCRUBBED")
+		.replaceAll(/\/tmp\/skill-tool-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/tmp\/gjc-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/[0-9a-f]{64}/g, "<sha256>")
 		.replaceAll(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<iso>");
@@ -232,7 +234,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 
 	it("documents the ralplan receipt-only guideline for role agents", async () => {
 		const skillDoc = await fs.readFile(
-			path.join(process.cwd(), "packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md"),
+			path.join(repoRoot, "packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md"),
 			"utf-8",
 		);
 		expect(skillDoc).toContain("RECEIPT-ONLY guideline");
