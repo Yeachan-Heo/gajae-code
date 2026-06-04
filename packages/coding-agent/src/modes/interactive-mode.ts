@@ -528,11 +528,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender();
 		});
 
-		// Event-driven monitor/cron jobs widget. Scoped to all background work in
-		// the process so the top-level bar reflects every ongoing monitor + cron job.
+		// Event-driven monitor/cron jobs widget. Scoped to this session's owner so
+		// overlay actions cannot mutate another agent's background work.
 		const jobManager = AsyncJobManager.instance();
 		if (jobManager) {
-			const jobsObserver = new JobsObserver(jobManager, undefined);
+			const jobsObserver = new JobsObserver(jobManager, this.session.getAgentId());
 			this.#jobsObserver = jobsObserver;
 			this.statusLine.setJobs(jobsObserver.getSnapshot());
 			jobsObserver.onChange(() => {

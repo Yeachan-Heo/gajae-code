@@ -178,9 +178,9 @@ export class JobsObserver {
 		return this.#manager.cancel(id);
 	}
 
-	/** Delete a scheduled cron job. Returns true when removed. */
+	/** Delete a visible scheduled cron job. Returns true when removed. */
 	deleteCron(id: string): boolean {
-		return deleteCronJobById(id);
+		return deleteCronJobById(this.#ownerId, id);
 	}
 
 	/** Bounded tail of a monitor job's captured output (for the detail view). */

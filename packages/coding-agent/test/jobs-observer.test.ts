@@ -27,12 +27,12 @@ function registerMonitor(manager: AsyncJobManager, label: string, ownerId = OWNE
 	});
 }
 
-function createCronSession(): ToolSession {
+function createCronSession(ownerId = OWNER): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionId: () => "test-session",
-		getAgentId: () => OWNER,
+		getAgentId: () => ownerId,
 		steer: () => {},
 		sendCustomMessage: async () => {},
 		allocateOutputArtifact: async () => ({}),
@@ -164,6 +164,36 @@ describe("JobsObserver", () => {
 		expect(snapshot.worstState).toBe("running");
 		expect(fires).toBeGreaterThanOrEqual(1);
 
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("deleteCron only removes jobs owned by the observer", async () => {
+		const manager = makeManager();
+		AsyncJobManager.setInstance(manager);
+		const observer = new JobsObserver(manager, OWNER);
+		const ownTool = new CronCreateTool(createCronSession(OWNER));
+		const otherTool = new CronCreateTool(createCronSession("0-Other"));
+
+		const own = await ownTool.execute("own", { cron_expression: "*/5 * * * *", prompt: "own", recurring: true });
+		const other = await otherTool.execute("other", {
+			cron_expression: "*/5 * * * *",
+			prompt: "other",
+			recurring: true,
+		});
+		if (!own.details || !other.details) throw new Error("Expected cron create details");
+		await flush();
+
+		expect(observer.getSnapshot().crons.map(cron => cron.id)).toEqual([own.details.id]);
+		expect(observer.deleteCron(other.details.id)).toBe(false);
+		expect(observer.getSnapshot().crons.map(cron => cron.id)).toEqual([own.details.id]);
+		expect(observer.deleteCron(own.details.id)).toBe(true);
+		await flush();
+		expect(observer.getSnapshot().crons).toHaveLength(0);
+
+		const otherObserver = new JobsObserver(manager, "0-Other");
+		expect(otherObserver.getSnapshot().crons.map(cron => cron.id)).toEqual([other.details.id]);
+		otherObserver.dispose();
 		observer.dispose();
 		await manager.dispose();
 	});

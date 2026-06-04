@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, test } from "bun:test";
+import { StatusLineComponent } from "../src/modes/components/status-line";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
 import { renderSegment, type SegmentContext } from "../src/modes/components/status-line/segments";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../src/modes/jobs-observer";
@@ -33,6 +34,36 @@ function makeCtx(jobs: JobsSnapshot): SegmentContext {
 		git: { branch: null, status: null, pr: null },
 		usage: null,
 	};
+}
+
+function makeStatusLineSession(running: Array<{ id: string; type: "bash" | "task"; metadata?: { monitor?: true } }>) {
+	return {
+		state: { messages: [] },
+		isStreaming: false,
+		getAsyncJobSnapshot: () => ({
+			running: running.map(job => ({
+				...job,
+				status: "running" as const,
+				label: job.id,
+				startTime: Date.now(),
+			})),
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		}),
+		getCurrentModel: () => undefined,
+		isFastModeEnabled: () => false,
+		sessionManager: {
+			getSessionName: () => "test",
+			getUsageStatistics: () => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				premiumRequests: 0,
+				cost: 0,
+			}),
+		},
+	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
 }
 
 describe("jobs status-line segment", () => {
@@ -74,5 +105,39 @@ describe("jobs status-line segment", () => {
 		for (const [name, preset] of Object.entries(STATUS_LINE_PRESETS)) {
 			expect(preset.rightSegments, `preset ${name} should include jobs`).toContain("jobs");
 		}
+	});
+
+	test("status line does not append legacy job count for a monitor already shown in jobs segment", () => {
+		const component = new StatusLineComponent(
+			makeStatusLineSession([{ id: "monitor-1", type: "bash", metadata: { monitor: true } }]),
+		);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["jobs"],
+			showSkillHud: false,
+		});
+		component.setJobs({
+			...EMPTY_JOBS_SNAPSHOT,
+			activeMonitorCount: 1,
+			worstState: "running",
+		});
+
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		expect(rendered).toContain("1");
+		expect(rendered).not.toContain("job running");
+	});
+
+	test("status line keeps legacy job count for non-monitor background jobs", () => {
+		const component = new StatusLineComponent(makeStatusLineSession([{ id: "task-1", type: "task" }]));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["jobs"],
+			showSkillHud: false,
+		});
+
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		expect(rendered).toContain("job running");
 	});
 });

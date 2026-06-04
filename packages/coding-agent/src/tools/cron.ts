@@ -211,16 +211,9 @@ export function listCronSnapshots(ownerId?: string): CronJobSnapshot[] {
 	return out;
 }
 
-/** Delete a scheduled cron job by id across all owners. Returns true when removed. */
-export function deleteCronJobById(id: string): boolean {
-	for (const key of schedulesByOwner.keys()) {
-		const ownerId = key === "__legacy__" ? undefined : key;
-		const state = schedulesByOwner.get(key);
-		if (state?.jobs.has(id)) {
-			return deleteRecord(ownerId, id);
-		}
-	}
-	return false;
+/** Delete a scheduled cron job by owner-scoped id. Returns true when removed. */
+export function deleteCronJobById(ownerId: string | undefined, id: string): boolean {
+	return deleteRecord(ownerId, id);
 }
 
 const CRON_FIELD_BOUNDS: Array<{ name: string; min: number; max: number }> = [

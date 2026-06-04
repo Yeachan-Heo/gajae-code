@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { JobsOverlayComponent, type JobsOverlayController } from "../src/modes/components/jobs-overlay";
 import {
 	buildConfirmItems,
 	buildJobDetailItems,
@@ -17,6 +18,43 @@ function snapshot(over: Partial<JobsSnapshot> = {}): JobsSnapshot {
 		worstState: "none",
 		failedUnacknowledged: false,
 		...over,
+	};
+}
+
+function makeOverlayController(over: Partial<JobsSnapshot> = {}) {
+	const calls: string[] = [];
+	const controller: JobsOverlayController = {
+		acknowledgeFailures: () => calls.push("ack"),
+		getSnapshot: () => snapshot(over),
+		getMonitorOutput: () => "line one\nlast line\n",
+		cancelMonitor: id => {
+			calls.push(`cancel:${id}`);
+			return true;
+		},
+		deleteCron: id => {
+			calls.push(`delete:${id}`);
+			return true;
+		},
+	};
+	let closed = 0;
+	let renders = 0;
+	const overlay = new JobsOverlayComponent(controller, {
+		close: () => {
+			closed += 1;
+		},
+		requestRender: () => {
+			renders += 1;
+		},
+	});
+	return {
+		overlay,
+		calls,
+		get closed() {
+			return closed;
+		},
+		get renders() {
+			return renders;
+		},
 	};
 }
 
@@ -107,6 +145,65 @@ describe("jobs overlay model", () => {
 		expect(items[0]?.value).toBe("no");
 		expect(items[1]?.value).toBe("yes");
 		expect(items[1]?.label).toContain("delete this cron");
+	});
+
+	test("JobsOverlayComponent closes detail on Escape instead of reopening a stale list", () => {
+		const harness = makeOverlayController({
+			monitors: [{ id: "m1", label: "tail server.log", status: "running", startTime: Date.now() }],
+		});
+
+		harness.overlay.handleInput("\n");
+		expect(harness.overlay.render(100).join("\n")).toContain("Cancel this monitor");
+		harness.overlay.handleInput("\x1b");
+
+		expect(harness.closed).toBe(1);
+		expect(harness.calls).toEqual(["ack"]);
+	});
+
+	test("JobsOverlayComponent confirm accepts y and returns to list", () => {
+		const harness = makeOverlayController({
+			monitors: [{ id: "m1", label: "tail server.log", status: "running", startTime: Date.now() }],
+		});
+
+		harness.overlay.handleInput("\n");
+		harness.overlay.handleInput("\u001b[B");
+		harness.overlay.handleInput("\u001b[B");
+		harness.overlay.handleInput("\u001b[B");
+		harness.overlay.handleInput("\u001b[B");
+		harness.overlay.handleInput("\n");
+		expect(harness.overlay.render(100).join("\n")).toContain("Yes, cancel this monitor");
+		harness.overlay.handleInput("y");
+
+		expect(harness.calls).toEqual(["ack", "cancel:m1"]);
+		expect(harness.overlay.render(100).join("\n")).toContain("monitor · tail server.log");
+	});
+
+	test("JobsOverlayComponent confirm rejects n and Escape", () => {
+		for (const key of ["n", "\x1b"]) {
+			const harness = makeOverlayController({
+				crons: [
+					{
+						id: "c1",
+						humanSchedule: "every 5m",
+						cronExpression: "*/5 * * * *",
+						prompt: "poll deploys",
+						recurring: true,
+						createdAt: Date.now(),
+					},
+				],
+			});
+
+			harness.overlay.handleInput("\n");
+			harness.overlay.handleInput("\u001b[B");
+			harness.overlay.handleInput("\u001b[B");
+			harness.overlay.handleInput("\u001b[B");
+			harness.overlay.handleInput("\u001b[B");
+			harness.overlay.handleInput("\n");
+			harness.overlay.handleInput(key);
+
+			expect(harness.calls).toEqual(["ack"]);
+			expect(harness.overlay.render(100).join("\n")).toContain("Delete this cron");
+		}
 	});
 
 	test("formatRelative renders future/past/unknown", () => {

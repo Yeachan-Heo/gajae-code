@@ -41,14 +41,7 @@ import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
-import { JobsSelectorComponent } from "../components/jobs-overlay";
-import {
-	buildConfirmItems,
-	buildJobDetailItems,
-	buildJobsListItems,
-	type JobRef,
-	parseJobRef,
-} from "../components/jobs-overlay-model";
+import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent, type ModelSelectorSelection } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
@@ -1167,68 +1160,23 @@ export class SelectorController {
 	 * stays on the active SelectList.
 	 */
 	showJobsOverlay(observer: JobsObserver): void {
-		observer.acknowledgeFailures();
-
-		const openConfirm = (ref: JobRef, action: "cancel" | "delete"): void => {
-			this.showSelector(() => {
-				const label = action === "cancel" ? "cancel this monitor" : "delete this cron";
-				const component = new JobsSelectorComponent(
-					buildConfirmItems(label),
-					item => {
-						if (item.value === "yes") {
-							if (action === "cancel") observer.cancelMonitor(ref.id);
-							else observer.deleteCron(ref.id);
-							openList();
-						} else {
-							openDetail(ref);
-						}
-					},
-					() => openDetail(ref),
-					4,
-				);
-				return { component, focus: component.getSelectList() };
-			});
+		let overlay: JobsOverlayComponent | undefined;
+		const close = () => {
+			this.ctx.editorContainer.clear();
+			this.ctx.editorContainer.addChild(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.requestRender();
 		};
-
-		const openDetail = (ref: JobRef): void => {
-			this.showSelector(done => {
-				const output = ref.kind === "monitor" ? observer.getMonitorOutput(ref.id) : "";
-				const items = buildJobDetailItems(observer.getSnapshot(), ref, output);
-				const component = new JobsSelectorComponent(
-					items,
-					item => {
-						if (item.value === "action:cancel") openConfirm(ref, "cancel");
-						else if (item.value === "action:delete") openConfirm(ref, "delete");
-						else if (item.value === "back") openList();
-						// "noop" info rows: stay on the detail view.
-					},
-					() => {
-						done();
-						openList();
-					},
-				);
-				return { component, focus: component.getSelectList() };
-			});
-		};
-
-		const openList = (): void => {
-			this.showSelector(done => {
-				const snapshot = observer.getSnapshot();
-				const built = buildJobsListItems(snapshot);
-				const items = built.length > 0 ? built : [{ value: "back", label: "No active monitor or cron jobs" }];
-				const component = new JobsSelectorComponent(
-					items,
-					item => {
-						const ref = parseJobRef(item.value);
-						if (ref) openDetail(ref);
-						else done();
-					},
-					done,
-				);
-				return { component, focus: component.getSelectList() };
-			});
-		};
-
-		openList();
+		overlay = new JobsOverlayComponent(observer, {
+			close,
+			requestRender: () => {
+				if (overlay) this.ctx.ui.setFocus(overlay.getFocus());
+				this.ctx.ui.requestRender();
+			},
+		});
+		this.ctx.editorContainer.clear();
+		this.ctx.editorContainer.addChild(overlay);
+		this.ctx.ui.setFocus(overlay.getFocus());
+		this.ctx.ui.requestRender();
 	}
 }
