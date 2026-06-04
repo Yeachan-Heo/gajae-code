@@ -1,4 +1,5 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { StatusLineComponent } from "../src/modes/components/status-line";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
 import { renderSegment, type SegmentContext } from "../src/modes/components/status-line/segments";
@@ -7,6 +8,10 @@ import { initTheme } from "../src/modes/theme/theme";
 
 beforeAll(async () => {
 	await initTheme();
+	await Settings.init({ inMemory: true, cwd: process.cwd() });
+});
+afterAll(() => {
+	resetSettingsForTest();
 });
 
 function makeCtx(jobs: JobsSnapshot): SegmentContext {
