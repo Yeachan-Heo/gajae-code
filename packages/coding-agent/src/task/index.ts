@@ -301,10 +301,10 @@ function validateForkContextRequests(
 	return undefined;
 }
 
-function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
+export function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
 	if (configured > 0) return Math.trunc(configured);
 	const contextWindow = model?.contextWindow ?? 0;
-	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.25)) : 25_000;
+	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.15)) : 15_000;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

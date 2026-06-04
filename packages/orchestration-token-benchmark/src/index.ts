@@ -8,6 +8,17 @@
  */
 
 export {
+	type DefaultReductionDecision,
+	type DefaultReductionEvidence,
+	evaluateDefaultReduction,
+} from "./default-reduction-gate";
+export {
+	APPLIED_DEFAULT_REDUCTIONS,
+	type AppliedDefaultReduction,
+	HELD_DEFAULT_REDUCTIONS,
+	type HeldDefaultReduction,
+} from "./default-reductions.ledger";
+export {
 	assertTokenLogShape,
 	cacheHitRate,
 	computeTokenMetrics,
