@@ -17,6 +17,10 @@ async function makeTempDir(): Promise<string> {
 	return dir;
 }
 
+async function modeOf(targetPath: string): Promise<number> {
+	return (await fs.stat(targetPath)).mode & 0o777;
+}
+
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -53,6 +57,52 @@ describe("crash diagnostics", () => {
 		expect(report.kind).toBe("python");
 		expect(report.class).toBe("non_zero_exit");
 		expect(report.stderrPreview).toBe("segmentation fault");
+	});
+
+	it("creates private diagnostics directories and reports under umask 022", async () => {
+		const dir = await makeTempDir();
+		await fs.chmod(dir, 0o755);
+		const env = { GJC_CRASH_DIAGNOSTICS: "1", GJC_CRASH_DIAGNOSTICS_DIR: dir } as NodeJS.ProcessEnv;
+		const previousUmask = process.umask(0o022);
+		try {
+			const crashed = await writeCrashReport(
+				{ kind: "python", exitCode: 139, stderr: "secret-token" },
+				{ env, cwd: dir, now: new Date("2026-06-04T00:00:01.000Z") },
+			);
+
+			expect(crashed.path).not.toBeNull();
+			expect(await modeOf(dir)).toBe(0o700);
+			expect(await modeOf(crashed.path as string)).toBe(0o600);
+		} finally {
+			process.umask(previousUmask);
+		}
+	});
+
+	it("creates the default diagnostics directory and reports privately under umask 022", async () => {
+		const tempRoot = await makeTempDir();
+		const previousTmpdir = process.env.TMPDIR;
+		const previousUmask = process.umask(0o022);
+		process.env.TMPDIR = tempRoot;
+		try {
+			const env = { GJC_CRASH_DIAGNOSTICS: "1" } as NodeJS.ProcessEnv;
+			const crashed = await writeCrashReport(
+				{ kind: "worker", exitCode: 1, stderr: "secret-token" },
+				{ env, cwd: tempRoot, now: new Date("2026-06-04T00:00:02.000Z") },
+			);
+
+			expect(crashed.path).not.toBeNull();
+			const defaultDir = path.join(tempRoot, "gjc-crash-diagnostics");
+			expect(crashed.path?.startsWith(`${defaultDir}${path.sep}`)).toBe(true);
+			expect(await modeOf(defaultDir)).toBe(0o700);
+			expect(await modeOf(crashed.path as string)).toBe(0o600);
+		} finally {
+			process.umask(previousUmask);
+			if (previousTmpdir === undefined) {
+				delete process.env.TMPDIR;
+			} else {
+				process.env.TMPDIR = previousTmpdir;
+			}
+		}
 	});
 
 	it("appends a bash crash notice and artifact when diagnostics are enabled", async () => {

@@ -5,6 +5,8 @@ import * as path from "node:path";
 const CRASH_DIAGNOSTICS_ENV = "GJC_CRASH_DIAGNOSTICS";
 const CRASH_DIAGNOSTICS_DIR_ENV = "GJC_CRASH_DIAGNOSTICS_DIR";
 const STDERR_PREVIEW_BYTES = 4096;
+const DIRECTORY_MODE = 0o700;
+const REPORT_FILE_MODE = 0o600;
 
 export type CrashProcessKind = "bash" | "python" | "lsp" | "dap" | "mcp" | "browser" | "worker" | "native" | "unknown";
 
@@ -178,10 +180,10 @@ export async function writeCrashReport(
 
 	try {
 		const dir = getCrashDiagnosticsDirectory(options.env);
-		await fs.mkdir(dir, { recursive: true });
+		await ensurePrivateDiagnosticsDirectory(dir);
 		const filename = `${report.createdAt.replace(/[:.]/g, "-")}-${report.kind}-${report.class}-${process.pid}.json`;
 		const reportPath = path.join(dir, filename);
-		await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+		await writePrivateCrashReport(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 		return { report, path: reportPath, enabled };
 	} catch {
 		return { report, path: null, enabled };
@@ -192,6 +194,21 @@ export function formatCrashDiagnosticNotice(result: CrashReportWriteResult): str
 	if (!result.report.crashed || !result.enabled) return null;
 	const location = result.path ? ` report=${result.path}` : "";
 	return `[crash:${result.report.kind}:${result.report.class}] ${result.report.reason}${location}`;
+}
+
+async function ensurePrivateDiagnosticsDirectory(dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true, mode: DIRECTORY_MODE });
+	await fs.chmod(dir, DIRECTORY_MODE);
+}
+
+async function writePrivateCrashReport(reportPath: string, contents: string): Promise<void> {
+	const file = await fs.open(reportPath, "wx", REPORT_FILE_MODE);
+	try {
+		await file.writeFile(contents);
+	} finally {
+		await file.close();
+	}
+	await fs.chmod(reportPath, REPORT_FILE_MODE);
 }
 
 function stringifyError(error: unknown): string {
