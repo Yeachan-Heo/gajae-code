@@ -161,7 +161,7 @@ For a package-by-package map, see [`docs/codebase-overview.md`](docs/codebase-ov
 
 ## Contributors
 
-Thanks to the people and agents helping shape the early Gajae-Code releases, including [Yeachan-Heo](https://github.com/Yeachan-Heo) and [IYENTeam](https://github.com/IYENTeam). Contributions, bug reports, and release validation are welcome through GitHub and the Discord community.
+Thanks to the people and agents helping shape the early Gajae-Code releases, including [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), and [HaD0Yun](https://github.com/HaD0Yun). Contributions, bug reports, and release validation are welcome through GitHub and the Discord community.
 
 ## Inspirations and lineage
 
