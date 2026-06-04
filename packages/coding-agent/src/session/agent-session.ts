@@ -1056,6 +1056,7 @@ export class AgentSession {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
 		}
 	}
@@ -1063,6 +1064,7 @@ export class AgentSession {
 	#resetInFlight(): void {
 		this.#promptInFlightCount = 0;
 		this.#releasePowerAssertion();
+		this.#flushPendingBackgroundExchanges();
 		this.#flushPendingAgentEnd();
 	}
 
