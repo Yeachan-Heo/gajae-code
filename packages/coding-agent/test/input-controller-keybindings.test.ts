@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import { InputController } from "../src/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "../src/modes/types";
 
@@ -16,6 +17,7 @@ type FakeEditor = {
 	onHistorySearch?: () => void;
 	onShowHotkeys?: () => void;
 	onPasteImage?: () => Promise<boolean>;
+	onPasteText?: (text: string) => boolean | Promise<boolean>;
 	onCopyPrompt?: () => void;
 	onExpandTools?: () => void;
 	onToggleThinking?: () => void;
@@ -25,6 +27,7 @@ type FakeEditor = {
 	onSubmit?: (text: string) => void | Promise<void>;
 	setText(text: string): void;
 	getText(): string;
+	insertText(text: string): void;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
@@ -42,12 +45,16 @@ async function createContext() {
 	const prompt = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
+	const showStatus = vi.fn();
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
 		},
 		getText() {
 			return editorText;
+		},
+		insertText(text: string) {
+			editorText += text;
 		},
 		addToHistory: vi.fn(),
 		setActionKeys,
@@ -78,6 +85,17 @@ async function createContext() {
 			},
 		} as InteractiveModeContext["keybindings"],
 		pendingImages: [],
+		settings: {
+			get(path: string) {
+				if (path === "images.autoResize") return false;
+				return undefined;
+			},
+		} as unknown as InteractiveModeContext["settings"],
+		sessionManager: {
+			getCwd() {
+				return "/";
+			},
+		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: () => false,
 		recordLocalSubmission(this: InteractiveModeContext, text: string, imageCount = 0) {
@@ -123,6 +141,7 @@ async function createContext() {
 		updateEditorBorderColor: vi.fn(),
 		handleBashCommand,
 		showWarning: vi.fn(),
+		showStatus,
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
 
@@ -136,6 +155,7 @@ async function createContext() {
 			prompt,
 			updatePendingMessagesDisplay,
 			handleBashCommand,
+			showStatus,
 		},
 	};
 }
@@ -218,6 +238,43 @@ describe("InputController keybinding setup", () => {
 		await expect(controller.handleFollowUp()).rejects.toThrow("queue full");
 
 		expect(ctx.locallySubmittedUserSignatures.has("queued during stream\u00000")).toBe(false);
+	});
+});
+
+describe("InputController pasted clipboard image paths", () => {
+	const RED_1X1_PNG_BASE64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+	it("attaches terminal-pasted clipboard temp images and inserts a compact placeholder", async () => {
+		const imagePath = `/tmp/clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`;
+		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const controller = new InputController(ctx);
+
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.(`${imagePath}\n`);
+
+			expect(handled).toBe(true);
+			expect(editor.getText()).toBe("[image 1] ");
+			expect(ctx.pendingImages).toHaveLength(1);
+			expect(ctx.pendingImages[0]?.mimeType).toBe("image/png");
+			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${imagePath.split("/").at(-1)}`, { dim: true });
+		} finally {
+			await fs.rm(imagePath, { force: true });
+		}
+	});
+
+	it("leaves ordinary pasted text for the editor", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const handled = await editor.onPasteText?.("/tmp/not-a-clipboard-image.png");
+
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toHaveLength(0);
 	});
 });
 

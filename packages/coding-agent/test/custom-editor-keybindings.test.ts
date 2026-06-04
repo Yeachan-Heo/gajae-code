@@ -37,3 +37,29 @@ describe("CustomEditor temporary model selector keybinding", () => {
 		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("CustomEditor bracketed paste interception", () => {
+	it("lets coding-agent consume pasted content before the base editor stores it", async () => {
+		const editor = createEditor();
+		const onPasteText = vi.fn(() => true);
+		editor.onPasteText = onPasteText;
+
+		editor.handleInput("\x1b[200~/tmp/clipboard-2026-06-04-120441-CAC144E7.png\x1b[201~");
+		await Bun.sleep(0);
+
+		expect(onPasteText).toHaveBeenCalledWith("/tmp/clipboard-2026-06-04-120441-CAC144E7.png");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("falls back to normal paste handling when coding-agent does not consume it", async () => {
+		const editor = createEditor();
+		const onPasteText = vi.fn(() => false);
+		editor.onPasteText = onPasteText;
+
+		editor.handleInput("\x1b[200~hello\x1b[201~");
+		await Bun.sleep(0);
+
+		expect(onPasteText).toHaveBeenCalledWith("hello");
+		expect(editor.getText()).toBe("hello");
+	});
+});

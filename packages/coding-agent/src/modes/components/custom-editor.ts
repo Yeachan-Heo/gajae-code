@@ -1,4 +1,5 @@
 import { Editor, type KeyId, matchesKey, parseKittySequence } from "@gajae-code/tui";
+import { BracketedPasteHandler } from "@gajae-code/tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
 
 type ConfigurableEditorAction = Extract<
@@ -63,6 +64,8 @@ export class CustomEditor extends Editor {
 	onCopyPrompt?: () => void;
 	/** Called when the configured image-paste shortcut is pressed. */
 	onPasteImage?: () => Promise<boolean>;
+	/** Called before bracketed paste content is inserted. Return true to consume it. */
+	onPasteText?: (text: string) => boolean | Promise<boolean>;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
 	/** Called when Caps Lock is pressed. */
@@ -73,6 +76,7 @@ export class CustomEditor extends Editor {
 	#actionKeys = new Map<ConfigurableEditorAction, KeyId[]>(
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
+	#pasteHandler = new BracketedPasteHandler();
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
 		this.#actionKeys.set(action, [...keys]);
@@ -108,6 +112,24 @@ export class CustomEditor extends Editor {
 		this.#customKeyHandlers.clear();
 	}
 
+	#handleBracketedPaste(pasteContent: string, remaining: string): void {
+		const pasteResult = this.onPasteText?.(pasteContent);
+		const applyPasteResult = (handled: boolean | undefined) => {
+			if (!handled) {
+				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
+			}
+			if (remaining.length > 0) {
+				this.handleInput(remaining);
+			}
+		};
+
+		if (pasteResult instanceof Promise) {
+			void pasteResult.then(applyPasteResult, () => applyPasteResult(false));
+		} else {
+			applyPasteResult(pasteResult);
+		}
+	}
+
 	handleInput(data: string): void {
 		const parsed = parseKittySequence(data);
 		if (parsed && (parsed.modifier & 64) !== 0 && this.onCapsLock) {
@@ -116,6 +138,15 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		if (this.onPasteText) {
+			const paste = this.#pasteHandler.process(data);
+			if (paste.handled) {
+				if (paste.pasteContent !== undefined) {
+					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
+				}
+				return;
+			}
+		}
 		// Intercept configured image paste (async - fires and handles result)
 		if (this.#matchesAction(data, "app.clipboard.pasteImage") && this.onPasteImage) {
 			void this.onPasteImage();
