@@ -3,15 +3,15 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { prompt } from "@gajae-code/utils";
 import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
+import taskSummaryTemplate from "../../src/prompts/tools/task-summary.md" with { type: "text" };
 import {
 	assertNoRawTaskFields,
 	buildTaskReceipt,
 	findRawTaskLeakKeys,
 	type RawTaskToolDetails,
 	sanitizeTaskToolDetails,
-	TASK_PREVIEW_MAX_BYTES,
-	TASK_PREVIEW_MAX_LINES,
 } from "../../src/task/receipt";
 import type { SingleResult, TaskToolDetails } from "../../src/task/types";
 
@@ -63,10 +63,8 @@ afterEach(async () => {
 });
 
 describe("task result receipts", () => {
-	it("buildTaskReceipt omits banned keys, bounds preview, and exposes outputRef when metadata is present", () => {
-		const output = Array.from({ length: TASK_PREVIEW_MAX_LINES + 5 }, (_, i) => `line ${i} ${"x".repeat(300)}`).join(
-			"\n",
-		);
+	it("buildTaskReceipt omits banned keys, omits raw output, and exposes outputRef when metadata is present", () => {
+		const output = Array.from({ length: 17 }, (_, i) => `line ${i} ${"x".repeat(300)}`).join("\n");
 		const sha256 = createHash("sha256").update(output).digest("hex");
 		const receipt = buildTaskReceipt(
 			makeRaw({
@@ -86,9 +84,9 @@ describe("task result receipts", () => {
 			}),
 		);
 
-		expect(receipt.previewTruncated).toBe(true);
-		expect(Buffer.byteLength(receipt.preview)).toBeLessThanOrEqual(TASK_PREVIEW_MAX_BYTES);
-		expect(receipt.preview.split("\n").length).toBeLessThanOrEqual(TASK_PREVIEW_MAX_LINES);
+		expect(receipt.previewTruncated).toBe(false);
+		expect(receipt.preview).toContain("agent://9-Agent");
+		expect(receipt.preview).not.toContain("line 0");
 		expect(receipt.outputRef).toEqual({
 			uri: "agent://9-Agent",
 			sizeBytes: Buffer.byteLength(output),
@@ -130,16 +128,19 @@ describe("task result receipts", () => {
 	});
 
 	it("sanitizeTaskToolDetails maps raw results to receipts and preserves usage", () => {
-		const raw: RawTaskToolDetails = {
+		const raw = {
 			projectAgentsDir: null,
 			results: [makeRaw()],
 			totalDurationMs: 10,
 			usage: CANONICAL_USAGE,
-		};
+			outputPaths: ["/tmp/LEAK_SENTINEL_DO_NOT_DIGEST/0-Test.md"],
+		} as RawTaskToolDetails & { outputPaths: string[] };
 		const sanitized = sanitizeTaskToolDetails(raw);
 		expect(sanitized.usage).toBe(CANONICAL_USAGE);
-		expect(sanitized.results[0]?.preview).toBe("hello\nworld");
+		expect(sanitized.results[0]?.preview).toBe("Task completed; output artifact unavailable.");
 		expect(findRawTaskLeakKeys(sanitized)).toEqual([]);
+		expect("outputPaths" in sanitized).toBe(false);
+		expect(JSON.stringify(sanitized)).not.toContain("/tmp/");
 	});
 
 	it("does not flag numeric output token counts on a canonical Usage record", () => {
@@ -149,16 +150,69 @@ describe("task result receipts", () => {
 		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
 	});
 
-	it("keeps the full raw output out of the receipt, exposing only a bounded preview", () => {
+	it("keeps raw output, stderr, error text, and filesystem paths out of public receipts", () => {
 		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
-		const bigOutput = `head line\n${sentinel}${"A".repeat(64 * 1024)}`;
-		const receipt = buildTaskReceipt(makeRaw({ output: bigOutput }));
-		expect(Buffer.byteLength(receipt.preview)).toBeLessThanOrEqual(TASK_PREVIEW_MAX_BYTES);
+		const secretPath = `/tmp/${sentinel}/0-Test.md`;
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				output: `stdout ${sentinel}`,
+				stderr: `stderr ${sentinel}`,
+				error: `error ${sentinel}`,
+				abortReason: `abort ${sentinel}`,
+				retryFailure: { attempt: 2, errorMessage: `retry ${sentinel}` },
+				outputPath: secretPath,
+				patchPath: secretPath.replace(/\.md$/, ".patch"),
+			}),
+		);
+
 		const serialized = JSON.stringify(receipt);
-		expect(serialized.length).toBeLessThan(bigOutput.length);
-		// The bulk 64KB run never survives beyond the bounded preview budget.
-		expect(serialized).not.toContain("A".repeat(TASK_PREVIEW_MAX_BYTES + 1));
+		expect(serialized).not.toContain(sentinel);
+		expect(serialized).not.toContain(secretPath);
+		expect(serialized).not.toContain("/tmp/");
+		expect(serialized).not.toContain("stdout");
+		expect(serialized).not.toContain("stderr");
+		expect(receipt.preview).toBe("Task merge_failed; retry stopped after attempt 2.");
+		expect(receipt.errorSummary).toBe("Error recorded.");
+		expect(receipt.abortSummary).toBe("Abort reason recorded.");
+		expect(receipt.retryFailure?.errorSummary).toBe("Retry failure recorded.");
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("renders task-summary with synopsis refs and without raw payloads or paths", () => {
+		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				id: "7-Agent",
+				output: `raw ${sentinel}`,
+				stderr: `stderr ${sentinel}`,
+				outputPath: `/tmp/${sentinel}/7-Agent.md`,
+				outputMeta: { lineCount: 2, charCount: 64, byteSize: 64, sha256: "f".repeat(64) },
+			}),
+		);
+		const rendered = prompt.render(taskSummaryTemplate, {
+			successCount: 1,
+			totalCount: 1,
+			cancelledCount: 0,
+			hasCancelledNote: false,
+			duration: "10ms",
+			summaries: [
+				{
+					agent: receipt.agent,
+					status: receipt.status,
+					id: receipt.id,
+					synopsis: receipt.preview,
+					meta: { lineCount: receipt.outputRef?.lineCount, charSize: "64 B" },
+				},
+			],
+		});
+
+		expect(rendered).toContain('<synopsis ref="agent://7-Agent">');
+		expect(rendered).not.toContain("<preview");
+		expect(rendered).not.toContain("<result>");
+		expect(rendered).not.toContain(sentinel);
+		expect(rendered).not.toContain("/tmp/");
+		expect(rendered).not.toContain("raw ");
+		expect(rendered).not.toContain("stderr");
 	});
 });
 

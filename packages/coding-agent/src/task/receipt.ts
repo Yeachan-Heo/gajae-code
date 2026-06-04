@@ -1,8 +1,5 @@
 import type { SingleResult, TaskToolDetails } from "./types";
 
-export const TASK_PREVIEW_MAX_BYTES = 2000;
-export const TASK_PREVIEW_MAX_LINES = 12;
-
 export interface TaskResultReceipt {
 	index: number;
 	id: string;
@@ -23,7 +20,6 @@ export interface TaskResultReceipt {
 	modelOverride?: string | string[];
 	usage?: SingleResult["usage"];
 	cost?: number;
-	patchPath?: string;
 	branchName?: string;
 	retryFailure?: { attempt: number; errorSummary: string };
 	errorSummary?: string;
@@ -66,15 +62,21 @@ function truncateText(value: string | undefined, maxChars: number): string | und
 	return value.length > maxChars ? value.slice(0, maxChars) : value;
 }
 
-function boundedPreview(value: string): { preview: string; truncated: boolean } {
-	const lines = value.split("\n");
-	let preview = lines.slice(0, TASK_PREVIEW_MAX_LINES).join("\n");
-	let truncated = lines.length > TASK_PREVIEW_MAX_LINES;
-	while (Buffer.byteLength(preview, "utf8") > TASK_PREVIEW_MAX_BYTES) {
-		preview = preview.slice(0, Math.max(0, preview.length - 1));
-		truncated = true;
+function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
+	const status = getStatus(raw);
+	if (raw.retryFailure) {
+		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
 	}
-	return { preview, truncated };
+	if (raw.abortReason) {
+		return `Task ${status}; abort reason recorded.`;
+	}
+	if (raw.error) {
+		return `Task ${status}; error recorded.`;
+	}
+	if (outputRef) {
+		return `Task ${status}; output stored in ${outputRef.uri} (${outputRef.lineCount} lines, ${outputRef.sizeBytes} bytes).`;
+	}
+	return `Task ${status}; output artifact unavailable.`;
 }
 
 function getStatus(raw: SingleResult): TaskResultReceipt["status"] {
@@ -116,16 +118,6 @@ function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined
 }
 
 export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
-	const sourceOutput = raw.output.trim() ? raw.output : raw.stderr;
-	const { preview, truncated: previewTruncated } = boundedPreview(sourceOutput.trim() || "(no output)");
-	const extractedToolCounts = raw.extractedToolData
-		? Object.fromEntries(
-				Object.entries(raw.extractedToolData).map(([tool, values]) => [
-					tool,
-					Array.isArray(values) ? values.length : 0,
-				]),
-			)
-		: undefined;
 	const outputRef = raw.outputMeta
 		? {
 				uri: `agent://${raw.id}`,
@@ -133,6 +125,15 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 				lineCount: raw.outputMeta.lineCount,
 				sha256: raw.outputMeta.sha256,
 			}
+		: undefined;
+	const preview = buildSafeSynopsis(raw, outputRef);
+	const extractedToolCounts = raw.extractedToolData
+		? Object.fromEntries(
+				Object.entries(raw.extractedToolData).map(([tool, values]) => [
+					tool,
+					Array.isArray(values) ? values.length : 0,
+				]),
+			)
 		: undefined;
 	return {
 		index: raw.index,
@@ -154,15 +155,14 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		modelOverride: raw.modelOverride,
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
-		patchPath: raw.patchPath,
 		branchName: raw.branchName,
 		retryFailure: raw.retryFailure
-			? { attempt: raw.retryFailure.attempt, errorSummary: truncateText(raw.retryFailure.errorMessage, 300) ?? "" }
+			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
-		errorSummary: truncateText(raw.error, 300),
-		abortSummary: truncateText(raw.abortReason, 300),
+		errorSummary: raw.error ? "Error recorded." : undefined,
+		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,
-		previewTruncated: previewTruncated || raw.truncated,
+		previewTruncated: false,
 		outputRef,
 		outputUnavailable: outputRef ? undefined : true,
 		review: buildReview(raw),
@@ -180,7 +180,6 @@ export interface RawTaskToolDetails {
 	results: SingleResult[];
 	totalDurationMs: number;
 	usage?: TaskToolDetails["usage"];
-	outputPaths?: string[];
 	async?: TaskToolDetails["async"];
 }
 
@@ -191,7 +190,6 @@ export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetail
 		results: raw.results.map(buildTaskReceipt),
 		totalDurationMs: raw.totalDurationMs,
 		usage: raw.usage,
-		outputPaths: raw.outputPaths,
 		async: raw.async,
 	};
 }

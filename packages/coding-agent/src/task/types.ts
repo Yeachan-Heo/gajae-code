@@ -315,7 +315,6 @@ export interface TaskToolDetails {
 	totalDurationMs: number;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
-	outputPaths?: string[];
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

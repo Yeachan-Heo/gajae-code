@@ -134,8 +134,6 @@ export {
 	buildTaskReceipt,
 	findRawTaskLeakKeys,
 	sanitizeTaskToolDetails,
-	TASK_PREVIEW_MAX_BYTES,
-	TASK_PREVIEW_MAX_LINES,
 } from "./receipt";
 export type {
 	AgentDefinition,
@@ -1344,13 +1342,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 			}
 
-			// Collect output paths (artifacts already written by executor in real-time)
-			const outputPaths: string[] = [];
 			const patchPaths: string[] = [];
 			for (const result of results) {
-				if (result.outputPath) {
-					outputPaths.push(result.outputPath);
-				}
 				if (result.patchPath) {
 					patchPaths.push(result.patchPath);
 				}
@@ -1446,7 +1439,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								"<system-notification>Patches were not applied and must be handled manually.</system-notification>";
 							const patchList =
 								patchPaths.length > 0
-									? `\n\nPatch artifacts:\n${patchPaths.map(patch => `- ${patch}`).join("\n")}`
+									? `\n\nPatch artifacts: ${patchPaths.length} preserved for internal merge recovery.`
 									: "";
 							mergeSummary = `\n\n${notification}${patchList}`;
 						}
@@ -1509,8 +1502,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: r.agent,
 					status,
 					id: r.id,
-					preview: r.preview,
-					truncated: r.previewTruncated,
+					synopsis: r.preview,
 					meta: r.outputRef
 						? {
 								lineCount: r.outputRef.lineCount,
@@ -1520,7 +1512,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 			});
 
-			const outputIds = receipts.filter(r => r.outputRef).map(r => r.outputRef!.uri);
 			const summary = prompt.render(taskSummaryTemplate, {
 				successCount,
 				totalCount: results.length,
@@ -1528,7 +1519,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				hasCancelledNote: aborted && cancelledCount > 0,
 				duration: formatDuration(totalDuration),
 				summaries,
-				outputIds,
 				agentName,
 				mergeSummary,
 			});
@@ -1545,7 +1535,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				results: receipts,
 				totalDurationMs: totalDuration,
 				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
-				outputPaths,
 			};
 			assertNoRawTaskFields(details, "task.return.details");
 			return {

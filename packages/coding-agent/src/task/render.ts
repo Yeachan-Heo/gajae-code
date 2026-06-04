@@ -850,9 +850,6 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 		}
 	} else {
 		lines.push(...renderOutputSection(result.preview, continuePrefix, expanded, theme, 3, 12));
-		if (result.previewTruncated) {
-			lines.push(`${continuePrefix}${theme.fg("warning", "Preview truncated; read outputRef for full artifact.")}`);
-		}
 	}
 
 	if (result.outputRef) {
@@ -866,9 +863,7 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 		lines.push(`${continuePrefix}${theme.fg("dim", "Output artifact unavailable")}`);
 	}
 
-	if (result.patchPath && success) {
-		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${result.patchPath}`)}`);
-	} else if (result.branchName && success) {
+	if (result.branchName && success) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}
 	if (result.abortSummary) {
