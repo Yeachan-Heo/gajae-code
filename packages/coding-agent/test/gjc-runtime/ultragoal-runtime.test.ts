@@ -1117,6 +1117,14 @@ describe("ultragoal @goal decomposition", () => {
 		expect(plan.goals[0]?.title).toBe("Tabbed title");
 	});
 
+	it("does not treat a non-breaking space after @goal as a boundary", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: Real\n@goal\u00a0NotADelimiter still body" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.title).toBe("Real");
+		expect(plan.goals[0]?.objective).toContain("@goal\u00a0NotADelimiter still body");
+	});
+
 	it("keeps an indented @goal line inside the objective", async () => {
 		const root = await tempDir();
 		const brief = "@goal: Story\nUse a literal like:\n    @goal: not a real delimiter\ndone.";
@@ -1237,5 +1245,53 @@ describe("ultragoal @goal decomposition", () => {
 		const status = await getUltragoalStatus(root);
 		expect(status.counts.complete).toBe(1);
 		expect(status.currentGoal?.id).toBe("G002");
+	});
+
+	it("splits CRLF briefs without retaining carriage returns", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Parse\r\nstep one\r\n\r\n@goal: Normalize\r\nstep two",
+		});
+		expect(plan.goals.map(goal => goal.title)).toEqual(["Parse", "Normalize"]);
+		expect(plan.goals.map(goal => goal.objective)).toEqual(["step one", "step two"]);
+		for (const goal of plan.goals) {
+			expect(goal.title).not.toContain("\r");
+			expect(goal.objective).not.toContain("\r");
+		}
+	});
+
+	it("trims trailing whitespace on delimiter lines", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: First   \nbody\n@goal   \nSecond body" });
+		expect(plan.goals.map(goal => goal.title)).toEqual(["First", "Second body"]);
+		expect(plan.goals.map(goal => goal.objective)).toEqual(["body", "Second body"]);
+	});
+
+	it("collapses multiple blank lines between stories", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First\nfirst body\n\n\n\n@goal: Second\nsecond body",
+		});
+		expect(plan.goals.map(goal => goal.id)).toEqual(["G001", "G002"]);
+		expect(plan.goals[0]?.objective).toBe("first body");
+		expect(plan.goals[1]?.objective).toBe("second body");
+	});
+
+	it("ignores a single trailing blank line", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: First\nfirst body\n" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]).toMatchObject({ title: "First", objective: "first body" });
+	});
+
+	it("preserves a very long objective without clamping it", async () => {
+		const root = await tempDir();
+		const longBody = "x".repeat(5000);
+		const plan = await createUltragoalPlan({ cwd: root, brief: `@goal: Long\n${longBody}` });
+		expect(plan.goals[0]?.title).toBe("Long");
+		expect(plan.goals[0]?.objective).toBe(longBody);
+		expect(plan.goals[0]?.objective).toHaveLength(5000);
 	});
 });

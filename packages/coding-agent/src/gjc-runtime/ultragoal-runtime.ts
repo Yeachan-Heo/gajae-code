@@ -492,10 +492,11 @@ function titleFromBrief(brief: string): string {
 }
 
 // A reserved, column-0 (unindented) `@goal` line opens a story. The character
-// right after `@goal` must be `:`, whitespace, or end-of-line, so `@goalish`,
-// `@goals:`, `@goal-foo`, `@goal.foo`, and `@goal/foo` are ordinary objective
-// text, and indented or mid-line `@goal:` is never a delimiter.
-const GOAL_DELIMITER = /^@goal(?::|\s+|$)\s*(.*)$/;
+// right after `@goal` must be `:`, an ASCII space or tab, or end-of-line, so
+// `@goalish`, `@goals:`, `@goal-foo`, `@goal.foo`, `@goal/foo`, a non-breaking
+// space, and indented or mid-line `@goal:` are all ordinary objective text and
+// never delimiters.
+const GOAL_DELIMITER = /^@goal(?::|[ \t]+|$)[ \t]*(.*)$/;
 
 interface ParsedGoal {
 	title: string;
