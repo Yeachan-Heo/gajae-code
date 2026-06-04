@@ -97,6 +97,14 @@ describe("task result receipts", () => {
 		expect(receipt.review?.overallCorrectness).toBe("patch is correct");
 		expect(receipt.review?.findingCount).toBe(1);
 		expect(receipt.extractedToolCounts).toEqual({ yield: 1, report_finding: 1 });
+		expect(receipt.roi).toMatchObject({
+			tokens: 20,
+			outputBytes: Buffer.byteLength(output),
+			outputLines: output.split("\n").length,
+			producedChanges: false,
+			materialContribution: true,
+			lowRoi: false,
+		});
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
@@ -138,6 +146,7 @@ describe("task result receipts", () => {
 		const sanitized = sanitizeTaskToolDetails(raw);
 		expect(sanitized.usage).toBe(CANONICAL_USAGE);
 		expect(sanitized.results[0]?.preview).toBe("Task completed; output artifact unavailable.");
+		expect(sanitized.roiSummary).toEqual({ childCount: 1, totalTokens: 20, lowRoiChildIds: [] });
 		expect(findRawTaskLeakKeys(sanitized)).toEqual([]);
 		expect("outputPaths" in sanitized).toBe(false);
 		expect(JSON.stringify(sanitized)).not.toContain("/tmp/");

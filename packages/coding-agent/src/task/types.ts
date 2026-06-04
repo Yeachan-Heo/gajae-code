@@ -334,6 +334,13 @@ export interface TaskToolDetails {
 	usage?: Usage;
 	/** Aggregate cloned tokens copied into fork-context seeds across subagents. */
 	forkContextClonedTokens?: number;
+	roiSummary?: {
+		childCount: number;
+		totalTokens: number;
+		totalCostTotal?: number;
+		totalClonedTokens?: number;
+		lowRoiChildIds: string[];
+	};
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

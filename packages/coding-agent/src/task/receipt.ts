@@ -1,5 +1,16 @@
 import type { SingleResult, TaskToolDetails } from "./types";
 
+export interface TaskRoi {
+	tokens: number;
+	contextTokens?: number;
+	clonedTokens?: number;
+	costTotal?: number;
+	outputBytes?: number;
+	outputLines?: number;
+	producedChanges: boolean;
+	materialContribution: boolean;
+	lowRoi: boolean;
+}
 export interface TaskResultReceipt {
 	index: number;
 	id: string;
@@ -35,6 +46,7 @@ export interface TaskResultReceipt {
 	};
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
+	roi?: TaskRoi;
 }
 
 const BANNED_RAW_TASK_KEYS = new Set([
@@ -118,6 +130,59 @@ function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined
 	};
 }
 
+function hasReviewFindings(raw: SingleResult): boolean {
+	const findings = raw.extractedToolData?.report_finding;
+	return Array.isArray(findings) && findings.length > 0;
+}
+
+function hasNonEmptyPreview(raw: SingleResult): boolean {
+	return Boolean((raw.output.trim() || raw.stderr.trim()).trim());
+}
+
+/**
+ * Heuristic task ROI signal built only from receipt-safe accounting fields.
+ * Advisory only: these flags never change task success/failure semantics.
+ */
+export function buildTaskRoi(raw: SingleResult): TaskRoi {
+	const outputBytes = raw.outputMeta?.byteSize ?? (raw.outputMeta ? Buffer.byteLength(raw.output, "utf8") : undefined);
+	const outputLines = raw.outputMeta?.lineCount;
+	const producedChanges = Boolean(
+		raw.patchPath || raw.branchName || (Array.isArray(raw.nestedPatches) && raw.nestedPatches.length > 0),
+	);
+	const status = getStatus(raw);
+	const terminal = status !== "paused" && !raw.aborted;
+	const materialContribution = Boolean(
+		producedChanges ||
+			(outputBytes !== undefined && outputBytes > 0) ||
+			hasReviewFindings(raw) ||
+			(status === "completed" && raw.tokens > 0 && hasNonEmptyPreview(raw)),
+	);
+	const lowRoi = terminal && raw.tokens > 0 && !materialContribution;
+	return {
+		tokens: raw.tokens,
+		contextTokens: raw.contextTokens,
+		clonedTokens: raw.forkContext?.clonedTokens,
+		costTotal: raw.usage?.cost.total,
+		outputBytes,
+		outputLines,
+		producedChanges,
+		materialContribution,
+		lowRoi,
+	};
+}
+
+export function buildTaskRoiSummary(receipts: readonly TaskResultReceipt[]): TaskToolDetails["roiSummary"] {
+	const totalCostTotal = receipts.reduce((total, receipt) => total + (receipt.roi?.costTotal ?? 0), 0);
+	const totalClonedTokens = receipts.reduce((total, receipt) => total + (receipt.roi?.clonedTokens ?? 0), 0);
+	return {
+		childCount: receipts.length,
+		totalTokens: receipts.reduce((total, receipt) => total + (receipt.roi?.tokens ?? receipt.tokens), 0),
+		totalCostTotal: totalCostTotal > 0 ? totalCostTotal : undefined,
+		totalClonedTokens: totalClonedTokens > 0 ? totalClonedTokens : undefined,
+		lowRoiChildIds: receipts.filter(receipt => receipt.roi?.lowRoi).map(receipt => receipt.id),
+	};
+}
+
 export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 	const outputRef = raw.outputMeta
 		? {
@@ -169,6 +234,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		review: buildReview(raw),
 		extractedToolCounts,
 		forkContext: raw.forkContext,
+		roi: buildTaskRoi(raw),
 	};
 }
 
@@ -184,6 +250,7 @@ export interface RawTaskToolDetails {
 	usage?: TaskToolDetails["usage"];
 	async?: TaskToolDetails["async"];
 	forkContextClonedTokens?: number;
+	roiSummary?: TaskToolDetails["roiSummary"];
 }
 
 /** Central converter from raw task details to receipt-only public details. */
@@ -194,6 +261,7 @@ export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetail
 		totalDurationMs: raw.totalDurationMs,
 		usage: raw.usage,
 		forkContextClonedTokens: raw.forkContextClonedTokens,
+		roiSummary: raw.roiSummary ?? buildTaskRoiSummary(raw.results.map(buildTaskReceipt)),
 		async: raw.async,
 	};
 }

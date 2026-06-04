@@ -49,7 +49,7 @@ import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
-import { assertNoRawTaskFields, buildTaskReceipt } from "./receipt";
+import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateReviewerExploreGate, evaluateSpawnGate } from "./spawn-gate";
@@ -134,6 +134,8 @@ export type { TaskResultReceipt } from "./receipt";
 export {
 	assertNoRawTaskFields,
 	buildTaskReceipt,
+	buildTaskRoi,
+	buildTaskRoiSummary,
 	findRawTaskLeakKeys,
 	sanitizeTaskToolDetails,
 } from "./receipt";
@@ -1628,6 +1630,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const totalDuration = Date.now() - startTime;
 
 			const receipts = results.map(buildTaskReceipt);
+			const roiSummary = buildTaskRoiSummary(receipts);
 			const summaries = receipts.map(r => {
 				const status = r.status === "merge_failed" ? "merge failed" : r.status;
 				return {
@@ -1668,6 +1671,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				totalDurationMs: totalDuration,
 				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
 				forkContextClonedTokens: forkContextClonedTokens > 0 ? forkContextClonedTokens : undefined,
+				roiSummary,
 			};
 			assertNoRawTaskFields(details, "task.return.details");
 			return {
