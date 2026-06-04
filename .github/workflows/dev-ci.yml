@@ -1,65 +1,68 @@
 name: Dev CI
 
 on:
-   push:
-      branches: [dev]
-   pull_request:
-      branches: [dev]
-   workflow_dispatch:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
 
 concurrency:
-   group: ${{ github.workflow }}-${{ github.ref }}
-   cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-   affected:
-      name: Affected path validation
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
-      timeout-minutes: 30
-      env:
-         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-         GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      steps:
-         - uses: actions/checkout@v4
-           with:
-              fetch-depth: 0
-         - uses: actions/setup-node@v4
-           with:
-              node-version: "24"
-         - uses: oven-sh/setup-bun@v2
-           with:
-              bun-version: "1.3"
-         - uses: dtolnay/rust-toolchain@nightly
-           with:
-              toolchain: nightly-2026-04-29
-         - uses: Swatinem/rust-cache@v2
-           with:
-              shared-key: dev-affected-linux-x64
-              cache-on-failure: true
-              save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-              cache-workspace-crates: true
-         - name: Cache bun dependencies
-           uses: actions/cache@v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - name: Install system deps
-           run: |
-              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                 sudo apt-get update
-                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
-                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
-              else
-                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
-                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-                 for tool in fd rg convert tmux gh; do
-                    if ! command -v "$tool" >/dev/null 2>&1; then
-                       echo "warning: optional helper not on PATH: $tool"
-                    fi
-                 done
-              fi
-         - run: bun install --frozen-lockfile
-         - name: Run affected path checks and tests
-           run: bun scripts/ci-dev-affected.ts
+  affected:
+    name: Affected path validation
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    timeout-minutes: 30
+    env:
+      GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev-affected-linux-x64
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - name: Install system deps
+        run: |
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+             sudo apt-get update
+             sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+             sudo ln -sf $(which fdfind) /usr/local/bin/fd
+             sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+          else
+             echo "sudo unavailable on this runner; skipping apt-based system dependency install."
+             echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
+             for tool in fd rg convert tmux gh; do
+                if ! command -v "$tool" >/dev/null 2>&1; then
+                   echo "warning: optional helper not on PATH: $tool"
+                fi
+             done
+          fi
+      - run: bun install --frozen-lockfile
+      - name: Run affected path checks and tests
+        run: bun scripts/ci-dev-affected.ts
