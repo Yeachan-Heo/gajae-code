@@ -972,6 +972,13 @@ export class AgentSession {
 	 *  without producing an aborted message_end). */
 	#planCompactAbortPending = false;
 
+	/** One-shot flag armed by `abort({ silent: true })` (e.g. Esc consuming a
+	 *  queued steer). Consumed in #handleAgentEvent to stamp `SILENT_ABORT_MARKER`
+	 *  on the resulting aborted assistant `message_end` so the interrupt does not
+	 *  surface a red "Operation aborted" line; cleared in `abort` as a safety net
+	 *  when the abort produces no aborted message_end. */
+	#silentAbortPending = false;
+
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -1644,10 +1651,11 @@ export class AgentSession {
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
 			event.message.stopReason === "aborted" &&
-			this.#planCompactAbortPending
+			(this.#planCompactAbortPending || this.#silentAbortPending)
 		) {
 			(event.message as AssistantMessage).errorMessage = SILENT_ABORT_MARKER;
 			this.#planCompactAbortPending = false;
+			this.#silentAbortPending = false;
 		}
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
@@ -4978,6 +4986,13 @@ export class AgentSession {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
 	}
 
+	/** Whether the agent has queued steering messages that a `user_interrupt`
+	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	get hasQueuedSteering(): boolean {
+		return this.agent.hasQueuedSteering();
+	}
+
 	/** Get pending messages (read-only). Returns the public text-only view;
 	 *  internal `{text, tag?}` records are mapped to `.text` so callers
 	 *  (`updatePendingMessagesDisplay`, `restoreQueuedMessagesToEditor`) see
@@ -5074,7 +5089,15 @@ export class AgentSession {
 			| "handoff"
 			| "tool_abort"
 			| "internal";
+		/** Suppress the "Operation aborted" line on the resulting aborted message
+		 *  by stamping `SILENT_ABORT_MARKER`. Used when Esc consumes a queued steer
+		 *  and resumes via steer-on-interrupt, so the interrupt reads as a quiet
+		 *  hand-off rather than a failure. */
+		silent?: boolean;
 	}): Promise<void> {
+		if (options?.silent) {
+			this.#silentAbortPending = true;
+		}
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -5114,6 +5137,10 @@ export class AgentSession {
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
 		this.#resetInFlight();
+		// Safety net: clear the silent-abort flag if it was never consumed (the
+		// abort produced no aborted assistant message_end to stamp). Prevents the
+		// marker from leaking onto a later, unrelated abort.
+		this.#silentAbortPending = false;
 		// Safety net: if the agent loop aborted without producing an assistant
 		// message (e.g. failed before the first stream), the in-flight yield was
 		// never resolved or rejected by the normal message_end path. Reject it now

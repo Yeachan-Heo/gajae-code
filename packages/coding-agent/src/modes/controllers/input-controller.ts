@@ -30,8 +30,17 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
-	#abortInteractive(): Promise<void> {
-		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS, cause: "user_interrupt" });
+	/** Set while a first Esc is silently consuming a queued steer (abort +
+	 *  steer-on-interrupt continue). A second Esc within that window does a real
+	 *  abort instead of consuming the steer again. */
+	#steerConsumePending = false;
+
+	#abortInteractive(options?: { silent?: boolean }): Promise<void> {
+		return this.ctx.session.abort({
+			timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS,
+			cause: "user_interrupt",
+			silent: options?.silent,
+		});
 	}
 
 	setupKeyHandlers(): void {
@@ -73,7 +82,22 @@ export class InputController {
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isStreaming) {
-				void this.#abortInteractive();
+				if (this.ctx.session.hasQueuedSteering && !this.#steerConsumePending) {
+					// First Esc with a queued steer: silently consume it and
+					// auto-continue via steer-on-interrupt instead of stalling on
+					// "Operation aborted".
+					this.#steerConsumePending = true;
+					void this.#abortInteractive({ silent: true }).finally(() => {
+						this.#steerConsumePending = false;
+					});
+				} else if (this.#steerConsumePending) {
+					// Second Esc before the steer-continue lands: drop the still-queued
+					// steer (restoring its text to the editor) and do a real abort.
+					this.#steerConsumePending = false;
+					this.restoreQueuedMessagesToEditor({ abort: true });
+				} else {
+					void this.#abortInteractive();
+				}
 			} else if (!this.ctx.editor.getText().trim()) {
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
 				const action = settings.get("doubleEscapeAction");
