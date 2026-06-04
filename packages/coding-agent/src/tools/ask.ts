@@ -28,7 +28,11 @@ import {
 } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { formatDeepInterviewSelectorPrompt, renderDeepInterviewAskQuestion } from "../deep-interview/render-middleware";
+import {
+	formatDeepInterviewSelectorPrompt,
+	isDeepInterviewAskQuestion,
+	renderDeepInterviewAskQuestion,
+} from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
@@ -117,6 +121,17 @@ function stripRecommendedSuffix(label: string): string {
 	return label.endsWith(RECOMMENDED_SUFFIX) ? label.slice(0, -RECOMMENDED_SUFFIX.length) : label;
 }
 
+function formatNumberedOptionLabel(label: string, index: number): string {
+	if (/^\s*\d+[.)]\s+/.test(label)) {
+		return label;
+	}
+	return `${index + 1}. ${label}`;
+}
+
+function numberOptionLabels(labels: string[]): string[] {
+	return labels.map(formatNumberedOptionLabel);
+}
+
 // =============================================================================
 // Question Selection Logic
 // =============================================================================
@@ -141,6 +156,7 @@ interface AskSingleQuestionOptions {
 	initialSelection?: Pick<SelectionResult, "selectedOptions" | "customInput">;
 	navigation?: NavigationControls;
 	scrollTitleRows?: number;
+	otherOptionLabel?: string;
 }
 
 interface UIContext {
@@ -231,6 +247,7 @@ async function askSingleQuestion(
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
 	};
+	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
 	if (multi) {
@@ -252,7 +269,7 @@ async function askSingleQuestion(
 			if (!navigation?.allowForward && selected.size > 0) {
 				opts.push(doneLabel);
 			}
-			opts.push(OTHER_OPTION);
+			opts.push(otherOptionLabel);
 
 			const prefix = selected.size > 0 ? `(${selected.size} selected) ` : "";
 			const {
@@ -273,7 +290,7 @@ async function askSingleQuestion(
 			}
 			if (choice === doneLabel) break;
 
-			if (choice === OTHER_OPTION) {
+			if (choice === otherOptionLabel) {
 				if (selectTimedOut) {
 					timedOut = true;
 					break;
@@ -315,7 +332,7 @@ async function askSingleQuestion(
 		selectedOptions = Array.from(selected);
 	} else {
 		const displayLabels = addRecommendedSuffix(optionLabels, recommended);
-		const optionsWithNavigation = [...displayLabels, OTHER_OPTION];
+		const optionsWithNavigation = [...displayLabels, otherOptionLabel];
 
 		let initialIndex = recommended;
 		const previouslySelected = selectedOptions[0];
@@ -344,7 +361,7 @@ async function askSingleQuestion(
 			if (!timedOut) {
 				return { selectedOptions, customInput, timedOut, cancelled: true };
 			}
-		} else if (choice === OTHER_OPTION) {
+		} else if (choice === otherOptionLabel) {
 			if (!selectTimedOut) {
 				const customResult = await promptForCustomInput();
 				if (customResult.input !== undefined) {
@@ -458,25 +475,46 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			q: AskParams["questions"][number],
 			options?: { previous?: QuestionResult; navigation?: NavigationControls },
 		) => {
-			const optionLabels = q.options.map(o => o.label);
+			const rawOptionLabels = q.options.map(o => o.label);
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const displayQuestion = deepInterviewPrompt ?? q.question;
-				const { selectedOptions, customInput, navigation, cancelled, timedOut } = await askSingleQuestion(
-					ui,
-					displayQuestion,
-					optionLabels,
-					q.multi ?? false,
-					{
-						recommended: q.recommended,
-						timeout: timeout ?? undefined,
-						signal,
-						initialSelection: options?.previous,
-						navigation: options?.navigation,
-						scrollTitleRows: deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
-					},
-				);
-				return { optionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };
+				const shouldNumberOptions = isDeepInterviewAskQuestion(q.question);
+				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
+				const initialSelection =
+					shouldNumberOptions && options?.previous
+						? {
+								...options.previous,
+								selectedOptions: options.previous.selectedOptions.map(selected => {
+									const rawIndex = rawOptionLabels.indexOf(selected);
+									return rawIndex >= 0 ? (optionLabels[rawIndex] ?? selected) : selected;
+								}),
+							}
+						: options?.previous;
+				const {
+					selectedOptions: displaySelectedOptions,
+					customInput,
+					navigation,
+					cancelled,
+					timedOut,
+				} = await askSingleQuestion(ui, displayQuestion, optionLabels, q.multi ?? false, {
+					recommended: q.recommended,
+					timeout: timeout ?? undefined,
+					signal,
+					initialSelection,
+					navigation: options?.navigation,
+					scrollTitleRows: deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
+					otherOptionLabel: shouldNumberOptions
+						? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
+						: undefined,
+				});
+				const selectedOptions = shouldNumberOptions
+					? displaySelectedOptions.map(selected => {
+							const displayIndex = optionLabels.indexOf(selected);
+							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
+						})
+					: displaySelectedOptions;
+				return { optionLabels: rawOptionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");
@@ -668,17 +706,17 @@ export const askToolRenderer = {
 				container.addChild(
 					new Text(` ${uiTheme.fg("dim", qBranch)} ${uiTheme.fg("dim", `[${q.id}]`)}${metaStr}`, 0, 0),
 				);
-				container.addChild(
-					renderDeepInterviewAskQuestion(q.question, uiTheme) ??
-						new Markdown(q.question, 3, 0, mdTheme, accentStyle),
-				);
+				const deepInterviewQuestion = renderDeepInterviewAskQuestion(q.question, uiTheme);
+				container.addChild(deepInterviewQuestion ?? new Markdown(q.question, 3, 0, mdTheme, accentStyle));
 
 				const qOptions = q.options;
 				if (qOptions?.length) {
 					const entries = qOptions.map((opt, j) => {
 						const isLastOpt = j === qOptions.length - 1;
 						const optBranch = isLastOpt ? uiTheme.tree.last : uiTheme.tree.branch;
-						const optLabel = renderInlineMarkdown(opt.label, mdTheme, t => uiTheme.fg("muted", t));
+						const shouldNumberOption = deepInterviewQuestion !== null || isDeepInterviewAskQuestion(q.question);
+						const displayLabel = shouldNumberOption ? formatNumberedOptionLabel(opt.label, j) : opt.label;
+						const optLabel = renderInlineMarkdown(displayLabel, mdTheme, t => uiTheme.fg("muted", t));
 						return {
 							prefix: ` ${uiTheme.fg("dim", continuation)}   ${uiTheme.fg("dim", optBranch)} ${uiTheme.fg("dim", uiTheme.checkbox.unchecked)} `,
 							label: optLabel,
@@ -694,23 +732,24 @@ export const askToolRenderer = {
 		if (!args.question) {
 			return new Text(formatErrorMessage("No question provided", uiTheme), 0, 0);
 		}
+		const question = args.question;
 
 		const container = new Container();
 		const meta: string[] = [];
 		if (args.multi) meta.push("multi");
 		if (args.options?.length) meta.push(`options:${args.options.length}`);
 		container.addChild(new Text(`${label}${formatMeta(meta, uiTheme)}`, 0, 0));
-		container.addChild(
-			renderDeepInterviewAskQuestion(args.question, uiTheme) ??
-				new Markdown(args.question, 1, 0, mdTheme, accentStyle),
-		);
+		const deepInterviewQuestion = renderDeepInterviewAskQuestion(question, uiTheme);
+		container.addChild(deepInterviewQuestion ?? new Markdown(question, 1, 0, mdTheme, accentStyle));
 
 		const options = args.options;
 		if (options?.length) {
 			const entries = options.map((opt, i) => {
 				const isLast = i === options.length - 1;
 				const branch = isLast ? uiTheme.tree.last : uiTheme.tree.branch;
-				const optLabel = renderInlineMarkdown(opt.label, mdTheme, t => uiTheme.fg("muted", t));
+				const shouldNumberOption = deepInterviewQuestion !== null || isDeepInterviewAskQuestion(question);
+				const displayLabel = shouldNumberOption ? formatNumberedOptionLabel(opt.label, i) : opt.label;
+				const optLabel = renderInlineMarkdown(displayLabel, mdTheme, t => uiTheme.fg("muted", t));
 				return {
 					prefix: ` ${uiTheme.fg("dim", branch)} ${uiTheme.fg("dim", uiTheme.checkbox.unchecked)} `,
 					label: optLabel,

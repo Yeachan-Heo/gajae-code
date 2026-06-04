@@ -1061,6 +1061,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		);
 
 		expect(select).toHaveBeenCalledTimes(1);
+		expect(select.mock.calls[0]?.[1]).toEqual(["1. Condition A", "2. Condition B", "3. Other (type your own)"]);
 		const prompt = select.mock.calls[0]?.[0] ?? "";
 		expect(prompt).toContain("Deep Interview · Round 3 · Ambiguity 38%");
 		expect(prompt).toContain("Component: Review UI");
@@ -1068,6 +1069,107 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(prompt).toContain("Why now: the approval criteria are not yet testable");
 		expect(prompt).toContain("What exact conditions must be satisfied before a reviewer can approve an item?");
 		expect(result.details?.question).toBe(rawQuestion);
+		expect(result.details?.options).toEqual(["Condition A", "Condition B"]);
+		expect(result.details?.selectedOptions).toEqual(["Condition A"]);
+		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Condition A" });
+	});
+
+	it("does not double-number pre-numbered deep-interview options", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 6 | Component: Review UI | Targeting: Success Criteria | Why now: answer labels might already be numbered | Ambiguity: 29%",
+			"",
+			"Which acceptance shape should be used?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[1]);
+		const context = createContext({ select });
+
+		const result = await tool.execute(
+			"call-deep-interview-pre-numbered",
+			{
+				questions: [
+					{
+						id: "round-6",
+						question: rawQuestion,
+						options: [{ label: "1. Checklist" }, { label: "2) Scenario" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(select.mock.calls[0]?.[1]).toEqual(["1. Checklist", "2) Scenario", "3. Other (type your own)"]);
+		expect(result.details?.selectedOptions).toEqual(["2) Scenario"]);
+	});
+
+	it("numbers loosely formatted deep-interview questions that are not structurally rendered", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 7 | Component Review UI | Target Success Criteria | Why now option labels must remain scannable | Ambiguity is 34%",
+			"",
+			"What outcome proves the numbering is visible?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
+
+		const result = await tool.execute(
+			"call-deep-interview-loose",
+			{
+				questions: [
+					{
+						id: "round-7",
+						question: rawQuestion,
+						options: [{ label: "Numbered choices are visible" }, { label: "Raw answer labels are preserved" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(select.mock.calls[0]?.[0]).toBe(rawQuestion);
+		expect(select.mock.calls[0]?.[1]).toEqual([
+			"1. Numbered choices are visible",
+			"2. Raw answer labels are preserved",
+			"3. Other (type your own)",
+		]);
+		expect(result.details?.selectedOptions).toEqual(["Numbered choices are visible"]);
+	});
+
+	it("accepts the numbered deep-interview free-text option as custom input", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 5 | Component: Review UI | Targeting: Constraints | Why now: boundaries are still unclear | Ambiguity: 31%",
+			"",
+			"Which boundary matters most?",
+		].join("\n");
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[2]);
+		const editor = vi.fn(async () => "Use my own boundary");
+		const context = createContext({ select, editor });
+
+		const result = await tool.execute(
+			"call-deep-interview-other",
+			{
+				questions: [
+					{
+						id: "round-5",
+						question: rawQuestion,
+						options: [{ label: "Performance" }, { label: "Security" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(select.mock.calls[0]?.[1]).toEqual(["1. Performance", "2. Security", "3. Other (type your own)"]);
+		expect(editor).toHaveBeenCalledTimes(1);
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(result.details?.customInput).toBe("Use my own boundary");
 	});
 
 	it("opts deep-interview selector prompts into local prompt scrolling", async () => {
@@ -1204,6 +1306,8 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(renderedText).toContain("Export");
 		expect(renderedText).toContain("Why now");
 		expect(renderedText).toContain("Question");
+		expect(renderedText).toContain("1. CSV");
+		expect(renderedText).toContain("2. PDF");
 		expect(renderedText).not.toContain("Round 2 | Component:");
 	});
 });

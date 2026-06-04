@@ -180,7 +180,25 @@ function rootScriptAllowlistFor(line: string): string | undefined {
 }
 
 function scanLegacyHits(): LegacyHit[] {
-	const roots = ["README.md", "docs", "packages", "python", "scripts", ".gjc", "assets", "package.json", "Cargo.toml", "Dockerfile", "Dockerfile.robogjc", "Dockerfile.dockerignore", "Dockerfile.robogjc.dockerignore"];
+	const roots = [
+		"README.md",
+		"docs",
+		"packages",
+		"python",
+		"scripts",
+		".gjc/skills",
+		".gjc/agents",
+		".gjc/commands",
+		".gjc/rules",
+		".gjc/settings.json",
+		"assets",
+		"package.json",
+		"Cargo.toml",
+		"Dockerfile",
+		"Dockerfile.robogjc",
+		"Dockerfile.dockerignore",
+		"Dockerfile.robogjc.dockerignore",
+	];
 	const files = roots.flatMap(root => {
 		const full = path.join(repoRoot, root);
 		if (!fs.existsSync(full)) return [];
