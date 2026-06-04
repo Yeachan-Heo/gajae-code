@@ -48,6 +48,7 @@ import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
+import { assertNoRawTaskFields, buildTaskReceipt } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import {
@@ -127,6 +128,15 @@ export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
+export type { TaskResultReceipt } from "./receipt";
+export {
+	assertNoRawTaskFields,
+	buildTaskReceipt,
+	findRawTaskLeakKeys,
+	sanitizeTaskToolDetails,
+	TASK_PREVIEW_MAX_BYTES,
+	TASK_PREVIEW_MAX_LINES,
+} from "./receipt";
 export type {
 	AgentDefinition,
 	AgentProgress,
@@ -548,7 +558,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									? "paused"
 									: singleResult?.aborted
 										? "aborted"
-										: (singleResult?.exitCode ?? 0) === 0
+										: singleResult?.status === "completed"
 											? "completed"
 											: "failed";
 								progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
@@ -556,8 +566,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								progress.contextTokens = singleResult?.contextTokens;
 								progress.contextWindow = singleResult?.contextWindow;
 								progress.cost = singleResult?.usage?.cost.total ?? 0;
-								progress.extractedToolData = singleResult?.extractedToolData;
-								progress.retryFailure = singleResult?.retryFailure;
+								progress.extractedToolData = undefined;
+								progress.retryFailure = singleResult?.retryFailure
+									? {
+											attempt: singleResult.retryFailure.attempt,
+											errorMessage: singleResult.retryFailure.errorSummary,
+										}
+									: undefined;
 								progress.retryState = undefined;
 							}
 							completedJobs += 1;
@@ -1487,41 +1502,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const successCount = results.filter(r => r.exitCode === 0 && !r.error && !r.aborted).length;
 			const totalDuration = Date.now() - startTime;
 
-			const summaries = results.map(r => {
-				const status = r.aborted
-					? "cancelled"
-					: r.exitCode === 0 && r.error
-						? "merge failed"
-						: r.exitCode === 0
-							? "completed"
-							: `failed (exit ${r.exitCode})`;
-				const output = r.output.trim() || r.stderr.trim() || "(no output)";
-				const outputCharCount = r.outputMeta?.charCount ?? output.length;
-				const fullOutputThreshold = 5000;
-				let preview = output;
-				let truncated = false;
-				if (outputCharCount > fullOutputThreshold) {
-					const slice = output.slice(0, fullOutputThreshold);
-					const lastNewline = slice.lastIndexOf("\n");
-					preview = lastNewline >= 0 ? slice.slice(0, lastNewline) : slice;
-					truncated = true;
-				}
+			const receipts = results.map(buildTaskReceipt);
+			const summaries = receipts.map(r => {
+				const status = r.status === "merge_failed" ? "merge failed" : r.status;
 				return {
 					agent: r.agent,
 					status,
 					id: r.id,
-					preview,
-					truncated,
-					meta: r.outputMeta
+					preview: r.preview,
+					truncated: r.previewTruncated,
+					meta: r.outputRef
 						? {
-								lineCount: r.outputMeta.lineCount,
-								charSize: formatBytes(r.outputMeta.charCount),
+								lineCount: r.outputRef.lineCount,
+								charSize: formatBytes(r.outputRef.sizeBytes),
 							}
 						: undefined,
 				};
 			});
 
-			const outputIds = results.filter(r => !r.aborted || r.output.trim()).map(r => `agent://${r.id}`);
+			const outputIds = receipts.filter(r => r.outputRef).map(r => r.outputRef!.uri);
 			const summary = prompt.render(taskSummaryTemplate, {
 				successCount,
 				totalCount: results.length,
@@ -1541,15 +1540,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				await fs.rm(tempArtifactsDir, { recursive: true, force: true });
 			}
 
+			const details: TaskToolDetails = {
+				projectAgentsDir,
+				results: receipts,
+				totalDurationMs: totalDuration,
+				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
+				outputPaths,
+			};
+			assertNoRawTaskFields(details, "task.return.details");
 			return {
 				content: [{ type: "text", text: summary }],
-				details: {
-					projectAgentsDir,
-					results: results,
-					totalDurationMs: totalDuration,
-					usage: hasAggregatedUsage ? aggregatedUsage : undefined,
-					outputPaths,
-				},
+				details,
 			};
 		} catch (err) {
 			return {
