@@ -41,6 +41,7 @@ describe("performance gates (structural, always on)", () => {
 		expect(r.metrics.rss.heapReturnBytes).not.toBeNull();
 		expect(r.metrics.rss.returnWithinBaselineFraction).not.toBeNull();
 		expect(r.metrics.helperStats.renderTree?.count ?? 0).toBeGreaterThan(0);
+		expect(r.metrics.helperStats["text.visibleWidth"]?.count ?? 0).toBeGreaterThan(0);
 		expect(r.metrics.repaintStorms).toBe(PERF_GATES.repaintStormsMax);
 	}, 60000);
 
@@ -62,11 +63,15 @@ if (HARD_GATES) {
 			const m = r.metrics;
 			const rssGrowthMB = (m.rss.growthBytes / 1048576).toFixed(1);
 			const heapReturnMB = ((m.rss.heapReturnBytes ?? 0) / 1048576).toFixed(1);
+			const helperSummary = Object.entries(m.helperStats)
+				.filter(([name]) => name === "renderTree" || name.startsWith("text."))
+				.map(([name, stat]) => `${name}=${stat.totalMs.toFixed(2)}ms/${stat.count}`)
+				.join(" ");
 			// Surface the measured baseline for calibration / Stage-2 tracking.
 			console.log(
 				`[perf-gates] p95=${m.renderDurations.p95Ms.toFixed(2)}ms storms=${m.repaintStorms} ` +
 					`rssGrowth=${rssGrowthMB}MB (target ${PERF_GATES.rssGrowthTargetBytes / 1048576}MB) ` +
-					`heapReturn=${heapReturnMB}MB`,
+					`heapReturn=${heapReturnMB}MB helpers=[${helperSummary}]`,
 			);
 
 			// Enforced gates (current renderer satisfies these).

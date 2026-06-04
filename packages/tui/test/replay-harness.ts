@@ -256,13 +256,15 @@ export async function measureIdleCpuFraction(idleMs = 1000): Promise<number> {
 	await term.waitForRender();
 	await new Promise<void>(resolve => setTimeout(resolve, 50)); // settle
 
-	const cpu0 = process.cpuUsage();
-	const t0 = performance.now();
-	await new Promise<void>(resolve => setTimeout(resolve, idleMs));
-	const elapsedMs = performance.now() - t0;
-	const cpu = process.cpuUsage(cpu0);
-	tui.stop();
-
-	const cpuMicros = cpu.user + cpu.system;
-	return cpuMicros / (elapsedMs * 1000);
+	try {
+		const cpu0 = process.cpuUsage();
+		const t0 = performance.now();
+		await new Promise<void>(resolve => setTimeout(resolve, idleMs));
+		const elapsedMs = performance.now() - t0;
+		const cpu = process.cpuUsage(cpu0);
+		const cpuMicros = cpu.user + cpu.system;
+		return cpuMicros / (elapsedMs * 1000);
+	} finally {
+		tui.stop();
+	}
 }
