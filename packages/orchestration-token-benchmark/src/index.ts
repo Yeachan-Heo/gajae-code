@@ -8,6 +8,20 @@
  */
 
 export {
+	type DeltaReport,
+	LIVE_RUNNER_SCHEMA_VERSION,
+	type LiveRunDelta,
+	LiveRunnerError,
+	type LiveRunnerOptions,
+	type LiveRunRegression,
+	type LiveRunReport,
+	type LiveRunTotals,
+	type RunOneBinaryOptions,
+	renderMarkdownReport,
+	runLiveComparison,
+	runOneBinary,
+} from "./live-runner";
+export {
 	assertTokenLogShape,
 	cacheHitRate,
 	computeTokenMetrics,

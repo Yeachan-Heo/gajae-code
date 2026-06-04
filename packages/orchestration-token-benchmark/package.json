@@ -19,7 +19,8 @@
 		"test": "bun test",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write .",
-		"start": "bun run src/index.ts"
+		"start": "bun run src/index.ts",
+		"bench:live": "bun run src/live-runner.ts"
 	},
 	"devDependencies": {
 		"@types/bun": "catalog:"
