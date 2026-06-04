@@ -52,6 +52,7 @@ describe("SearchTool internal URL resolution", () => {
 			cwd: tmpDir,
 			hasUI: false,
 			getSessionFile: () => null,
+			getArtifactsDir: () => artifactsDir,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated({ "search.contextBefore": 0, "search.contextAfter": 0 }),
 			...overrides,

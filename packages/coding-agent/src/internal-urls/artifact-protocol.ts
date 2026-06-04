@@ -13,13 +13,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class ArtifactProtocolHandler implements ProtocolHandler {
 	readonly scheme = "artifact";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const id = url.rawHost || url.hostname;
 		if (!id) {
 			throw new Error("artifact:// URL requires a numeric ID: artifact://0");
@@ -28,7 +28,8 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error(`artifact:// ID must be numeric, got: ${id}`);
 		}
 
-		const dirs = artifactsDirsFromRegistry();
+		const contextDir = context?.getArtifactsDir?.();
+		const dirs = contextDir ? [contextDir] : artifactsDirsFromRegistry(context);
 
 		if (dirs.length === 0) {
 			throw new Error("No session - artifacts unavailable");

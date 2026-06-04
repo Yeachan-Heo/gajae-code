@@ -3,6 +3,7 @@
  * registered agent sessions.
  */
 import { AgentRegistry } from "../registry/agent-registry";
+import type { ResolveContext } from "./types";
 
 /**
  * Snapshot of artifacts dirs for every registered session, deduped.
@@ -13,8 +14,10 @@ import { AgentRegistry } from "../registry/agent-registry";
  * back to the raw session file (with the `.jsonl` suffix stripped) when no
  * live session reference is attached.
  */
-export function artifactsDirsFromRegistry(): string[] {
+export function artifactsDirsFromRegistry(context?: ResolveContext): string[] {
 	const dirs: string[] = [];
+	const contextDir = context?.getArtifactsDir?.();
+	if (contextDir) dirs.push(contextDir);
 	for (const ref of AgentRegistry.global().list()) {
 		const dir =
 			ref.session?.sessionManager.getArtifactsDir() ?? (ref.sessionFile ? ref.sessionFile.slice(0, -6) : null);

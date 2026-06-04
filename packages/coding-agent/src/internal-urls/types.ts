@@ -59,6 +59,8 @@ export interface ResolveContext {
 	cwd?: string;
 	/** Settings of the calling session (used by `issue://`/`pr://` for cache TTLs). */
 	settings?: unknown;
+	/** Artifacts directory of the calling session. */
+	getArtifactsDir?: () => string | null;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
 }

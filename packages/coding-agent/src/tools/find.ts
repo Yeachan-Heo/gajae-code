@@ -155,7 +155,10 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				if (hasGlobPathChars(rawPattern)) {
 					throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPattern}`);
 				}
-				const resource = await internalRouter.resolve(rawPattern);
+				const resource = await internalRouter.resolve(rawPattern, {
+					cwd: this.session.cwd,
+					getArtifactsDir: this.session.getArtifactsDir,
+				});
 				if (!resource.sourcePath) {
 					throw new ToolError(`Cannot find internal URL without a backing file: ${rawPattern}`);
 				}
