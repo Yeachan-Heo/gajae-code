@@ -1,7 +1,9 @@
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, type SubagentRecord } from "../async";
+import { artifactsDirsFromRegistry } from "../internal-urls/registry-helpers";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
@@ -13,7 +15,9 @@ const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 const MAX_AWAIT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_LIST_LIMIT = 10;
 const MAX_LIST_LIMIT = 50;
-const TEXT_PREVIEW_WIDTH = 12_000;
+const RECEIPT_PREVIEW_WIDTH = 280;
+const PREVIEW_WIDTH = 2_000;
+const FULL_PREVIEW_WIDTH = 12_000;
 
 const subagentSchema = z.object({
 	action: z
@@ -24,6 +28,12 @@ const subagentSchema = z.object({
 	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
+	verbosity: z
+		.enum(["receipt", "preview", "full"])
+		.optional()
+		.describe(
+			"output verbosity: receipt (default, <=280-char receipt preview), preview (<=2000 chars), or full (<=12000 chars; requires explicit ids)",
+		),
 });
 
 type SubagentParams = z.infer<typeof subagentSchema>;
@@ -49,6 +59,9 @@ export interface SubagentSnapshot {
 	durationMs: number;
 	resultText?: string;
 	errorText?: string;
+	resultPreview?: string;
+	outputRef?: string;
+	truncated?: boolean;
 	guidance?: string;
 }
 
@@ -87,19 +100,26 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const ownerId = this.session.getAgentId?.() ?? undefined;
 		const ownerFilter = ownerId ? { ownerId } : undefined;
 		const limit = Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(params.limit ?? DEFAULT_LIST_LIMIT)));
+		const verbosity = params.verbosity ?? "receipt";
+		if (verbosity === "full" && (params.action === "list" || !params.ids?.length)) {
+			throw new ToolError(
+				"`verbosity=full` cannot be used with `list` and requires explicit `ids` so broad inspection cannot inline retained subagent output.",
+			);
+		}
 
 		if (params.action === "list") {
 			const records = this.#listSubagentRecords(manager, ownerFilter, limit);
-			return this.#buildRecordResult(manager, records, { title: "Subagents" });
+			return await this.#buildRecordResult(manager, records, { title: "Subagents", verbosity });
 		}
 
 		if (params.action === "inspect") {
 			const records = params.ids?.length
 				? this.#visibleRecordsByIds(manager, params.ids, ownerFilter)
 				: this.#runningRecords(manager, ownerFilter);
-			return this.#buildRecordResult(manager, records, {
+			return await this.#buildRecordResult(manager, records, {
 				title: "Subagent inspection",
 				notFoundIds: this.#notFoundRecordIds(manager, params.ids ?? [], ownerFilter),
+				verbosity,
 			});
 		}
 
@@ -108,19 +128,26 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (ids.length === 0) {
 				throw new ToolError("`cancel` requires at least one subagent id.");
 			}
-			const snapshots: SubagentSnapshot[] = [];
+			const records: SubagentRecord[] = [];
+			const missing: SubagentSnapshot[] = [];
 			for (const id of ids) {
 				const record = this.#findVisibleRecord(manager, id, ownerFilter);
 				if (!record) {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
 				const cancelled = manager.cancelSubagent(record.subagentId, ownerFilter);
 				if (!cancelled && record.currentJobId) manager.cancel(record.currentJobId, ownerFilter);
-				const updated = this.#findVisibleRecord(manager, id, ownerFilter) ?? record;
-				snapshots.push(this.#recordSnapshot(manager, updated));
+				records.push(this.#findVisibleRecord(manager, id, ownerFilter) ?? record);
 			}
-			return this.#buildSnapshotResult(snapshots, "Subagent cancellation");
+			const verifiedOutputIds = await this.#verifiedOutputIds(records);
+			return this.#buildSnapshotResult(
+				[
+					...records.map(record => this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds)),
+					...missing,
+				],
+				"Subagent cancellation",
+			);
 		}
 
 		if (params.action === "pause") {
@@ -128,23 +155,29 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (ids.length === 0) {
 				throw new ToolError("`pause` requires at least one subagent id.");
 			}
-			const snapshots: SubagentSnapshot[] = [];
+			const records: SubagentRecord[] = [];
+			const missing: SubagentSnapshot[] = [];
 			for (const id of ids) {
 				const record = this.#findVisibleRecord(manager, id, ownerFilter);
 				if (!record) {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
 				const result = manager.pauseSubagent(record.subagentId, ownerFilter);
 				if (!result.ok && result.reason === "not_found") {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
-				snapshots.push(
-					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
-				);
+				records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
-			return this.#buildSnapshotResult(snapshots, "Subagent pause");
+			const verifiedOutputIds = await this.#verifiedOutputIds(records);
+			return this.#buildSnapshotResult(
+				[
+					...records.map(record => this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds)),
+					...missing,
+				],
+				"Subagent pause",
+			);
 		}
 
 		if (params.action === "resume") {
@@ -152,36 +185,50 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (ids.length === 0) {
 				throw new ToolError("`resume` requires at least one subagent id.");
 			}
-			const snapshots: SubagentSnapshot[] = [];
+			const records: SubagentRecord[] = [];
+			const missing: SubagentSnapshot[] = [];
+			const terminalGuidanceIds = new Set<string>();
+			const verifiedOutputIds = await this.#verifiedOutputIds(this.#visibleRecordsByIds(manager, ids, ownerFilter));
 			for (const id of ids) {
 				const record = this.#findVisibleRecord(manager, id, ownerFilter);
 				if (!record) {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
 				if (record.status === "running") {
-					snapshots.push(this.#recordSnapshot(manager, record));
+					records.push(record);
 					continue;
 				}
 				if (params.message === undefined && isTerminalStatus(record.status)) {
-					snapshots.push({
-						...this.#recordSnapshot(manager, record),
-						guidance:
-							"This subagent is terminal. Provide `message` to start a follow-up resume run from its saved context.",
-					});
+					records.push(record);
+					terminalGuidanceIds.add(record.subagentId);
 					continue;
 				}
 				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
-				snapshots.push(
-					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
-				);
+				records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
-			return this.#buildSnapshotResult(snapshots, "Subagent resume");
+
+			return this.#buildSnapshotResult(
+				[
+					...records.map(record => {
+						const snapshot = this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds);
+						return terminalGuidanceIds.has(record.subagentId)
+							? {
+									...snapshot,
+									guidance:
+										"This subagent is terminal. Provide `message` to start a follow-up resume run from its saved context.",
+								}
+							: snapshot;
+					}),
+					...missing,
+				],
+				"Subagent resume",
+			);
 		}
 
 		if (params.action === "steer") {
@@ -193,11 +240,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (message === undefined || message.trim() === "") {
 				throw new ToolError("`steer` requires a non-empty message.");
 			}
-			const snapshots: SubagentSnapshot[] = [];
+			const records: SubagentRecord[] = [];
+			const missing: SubagentSnapshot[] = [];
+			const verifiedOutputIds = await this.#verifiedOutputIds(this.#visibleRecordsByIds(manager, ids, ownerFilter));
 			for (const id of ids) {
 				const record = this.#findVisibleRecord(manager, id, ownerFilter);
 				if (!record) {
-					snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					continue;
 				}
 				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
@@ -210,17 +259,19 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
 					if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 					if (!result.ok && result.reason === "not_found") {
-						snapshots.push(
-							this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
-						);
+						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 						continue;
 					}
 				}
-				snapshots.push(
-					this.#recordSnapshot(manager, manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record),
-				);
+				records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
-			return this.#buildSnapshotResult(snapshots, "Subagent steer");
+			return this.#buildSnapshotResult(
+				[
+					...records.map(record => this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds)),
+					...missing,
+				],
+				"Subagent steer",
+			);
 		}
 
 		return this.#awaitSubagents(manager, params, ownerFilter, signal, onUpdate);
@@ -249,7 +300,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			.map(record => manager.getJob(record.currentJobId!))
 			.filter((job): job is AsyncJob => job !== undefined);
 		if (runningJobs.length === 0) {
-			return this.#buildRecordResult(manager, records, { title: "Subagent await", notFoundIds });
+			return await this.#buildRecordResult(manager, records, {
+				title: "Subagent await",
+				notFoundIds,
+				verbosity: params.verbosity ?? "receipt",
+			});
 		}
 
 		const timeoutMs = Math.min(
@@ -288,7 +343,12 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (progressTimer) clearInterval(progressTimer);
 		}
 
-		return this.#buildRecordResult(manager, records, { title: "Subagent await", notFoundIds, timedOut });
+		return await this.#buildRecordResult(manager, records, {
+			title: "Subagent await",
+			notFoundIds,
+			timedOut,
+			verbosity: params.verbosity ?? "receipt",
+		});
 	}
 
 	#mergedRecords(
@@ -386,16 +446,23 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 	#progressResult(manager: AsyncJobManager, records: SubagentRecord[]): AgentToolResult<SubagentToolDetails> {
 		return {
 			content: [{ type: "text", text: "" }],
-			details: { subagents: this.#recordSnapshots(manager, records) },
+			details: { subagents: this.#recordSnapshots(manager, records, false, "receipt", new Set()) },
 		};
 	}
 
-	#buildRecordResult(
+	async #buildRecordResult(
 		manager: AsyncJobManager,
 		records: SubagentRecord[],
-		options: { title: string; notFoundIds?: string[]; timedOut?: boolean },
-	): AgentToolResult<SubagentToolDetails> {
-		const snapshots = this.#recordSnapshots(manager, records, options.timedOut);
+		options: { title: string; notFoundIds?: string[]; timedOut?: boolean; verbosity?: SubagentParams["verbosity"] },
+	): Promise<AgentToolResult<SubagentToolDetails>> {
+		const verifiedOutputIds = await this.#verifiedOutputIds(records);
+		const snapshots = this.#recordSnapshots(
+			manager,
+			records,
+			options.timedOut,
+			options.verbosity ?? "receipt",
+			verifiedOutputIds,
+		);
 		for (const id of options.notFoundIds ?? []) {
 			snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 		}
@@ -417,9 +484,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (snapshot.jobId !== snapshot.id) lines.push(`Job: ${snapshot.jobId}`);
 			if (snapshot.agent) lines.push(`Agent: ${snapshot.agent} (${snapshot.agentSource})`);
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
+			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
-			if (snapshot.resultText) lines.push("Result:", "```", snapshot.resultText, "```");
-			if (snapshot.errorText) lines.push("Error:", "```", snapshot.errorText, "```");
+			if (snapshot.resultPreview) {
+				lines.push(snapshot.errorText ? "Error preview:" : "Result preview:", "```", snapshot.resultPreview, "```");
+				if (snapshot.truncated)
+					lines.push("Preview truncated; use the output ref or explicit ids with `verbosity=full` for more.");
+			}
 			if (snapshot.guidance) lines.push(`Guidance: ${snapshot.guidance}`);
 			lines.push("");
 		}
@@ -429,15 +500,27 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		};
 	}
 
-	#recordSnapshots(manager: AsyncJobManager, records: SubagentRecord[], timedOut = false): SubagentSnapshot[] {
-		return records.map(record => this.#recordSnapshot(manager, record, timedOut));
+	#recordSnapshots(
+		manager: AsyncJobManager,
+		records: SubagentRecord[],
+		timedOut = false,
+		verbosity: SubagentParams["verbosity"] = "receipt",
+		verifiedOutputIds: ReadonlySet<string>,
+	): SubagentSnapshot[] {
+		return records.map(record => this.#recordSnapshot(manager, record, timedOut, verbosity, verifiedOutputIds));
 	}
 
-	#recordSnapshot(manager: AsyncJobManager, record: SubagentRecord, timedOut = false): SubagentSnapshot {
+	#recordSnapshot(
+		manager: AsyncJobManager,
+		record: SubagentRecord,
+		timedOut = false,
+		verbosity: SubagentParams["verbosity"] = "receipt",
+		verifiedOutputIds: ReadonlySet<string>,
+	): SubagentSnapshot {
 		const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
 		if (job) {
 			return {
-				...this.#snapshot(job, timedOut),
+				...this.#snapshot(job, timedOut, verbosity, verifiedOutputIds, record),
 				id: record.subagentId,
 				jobId: record.currentJobId ?? job.id,
 				status: record.status,
@@ -451,29 +534,76 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			agent: "unknown",
 			agentSource: "bundled",
 			durationMs: 0,
+			...(verifiedOutputIds.has(record.subagentId) ? { outputRef: `agent://${record.subagentId}` } : {}),
 		};
 	}
 
-	#snapshot(job: AsyncJob, timedOut = false): SubagentSnapshot {
+	#snapshot(
+		job: AsyncJob,
+		timedOut = false,
+		verbosity: SubagentParams["verbosity"] = "receipt",
+		verifiedOutputIds: ReadonlySet<string>,
+		record?: SubagentRecord,
+	): SubagentSnapshot {
 		const subagent = job.metadata?.subagent;
 		const runningTimeoutGuidance =
 			timedOut && job.status === "running"
 				? "Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong."
 				: undefined;
+		const output = previewJobOutput(job, verbosity);
+		const outputRef = record && verifiedOutputIds.has(record.subagentId) ? `agent://${record.subagentId}` : undefined;
 		return {
 			id: subagent?.id ?? job.id,
 			jobId: job.id,
 			status: job.status,
-			label: sanitizeText(job.label),
+			label: sanitizeText(job.label, RECEIPT_PREVIEW_WIDTH),
 			agent: subagent?.agent ?? "unknown",
 			agentSource: subagent?.agentSource ?? "bundled",
 			durationMs: Math.max(0, Date.now() - job.startTime),
-			...(subagent?.description ? { description: sanitizeText(subagent.description) } : {}),
-			...(subagent?.assignment ? { assignment: sanitizeText(subagent.assignment) } : {}),
-			...(job.resultText ? { resultText: sanitizeText(job.resultText) } : {}),
-			...(job.errorText ? { errorText: sanitizeText(job.errorText) } : {}),
+			...(subagent?.description ? { description: sanitizeText(subagent.description, RECEIPT_PREVIEW_WIDTH) } : {}),
+			...(verbosity === "full" && subagent?.assignment
+				? { assignment: sanitizeText(subagent.assignment, FULL_PREVIEW_WIDTH) }
+				: {}),
+			...(output
+				? {
+						...(output.type === "error" ? { errorText: output.preview } : { resultText: output.preview }),
+						resultPreview: output.preview,
+						truncated: output.truncated,
+					}
+				: {}),
+			...(outputRef ? { outputRef } : {}),
 			...(runningTimeoutGuidance ? { guidance: runningTimeoutGuidance } : {}),
 		};
+	}
+
+	async #verifiedOutputIds(records: SubagentRecord[]): Promise<Set<string>> {
+		const ids = new Set(records.map(record => record.subagentId));
+		const dirs = this.#artifactDirsForRecords(records);
+		const verified = new Set<string>();
+		await Promise.all(
+			[...ids].map(async id => {
+				for (const dir of dirs) {
+					if (await Bun.file(path.join(dir, `${id}.md.meta.json`)).exists()) {
+						verified.add(id);
+						return;
+					}
+				}
+			}),
+		);
+		return verified;
+	}
+
+	#artifactDirsForRecords(records: SubagentRecord[]): string[] {
+		const dirs: string[] = [];
+		for (const record of records) {
+			if (!record.sessionFile) continue;
+			const dir = path.dirname(record.sessionFile);
+			if (!dirs.includes(dir)) dirs.push(dir);
+		}
+		for (const dir of artifactsDirsFromRegistry()) {
+			if (!dirs.includes(dir)) dirs.push(dir);
+		}
+		return dirs;
 	}
 
 	#missingSnapshot(id: string, status: "not_found", guidance: string): SubagentSnapshot {
@@ -498,6 +628,23 @@ function isSubagentJob(job: AsyncJob): boolean {
 	return job.type === "task" && job.metadata?.subagent !== undefined;
 }
 
-function sanitizeText(text: string): string {
-	return truncateToWidth(replaceTabs(text), TEXT_PREVIEW_WIDTH, Ellipsis.Unicode);
+function sanitizeText(text: string, width: number): string {
+	return truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode);
+}
+
+function previewJobOutput(
+	job: AsyncJob,
+	verbosity: SubagentParams["verbosity"] = "receipt",
+): { type: "result" | "error"; preview: string; truncated: boolean } | undefined {
+	const source = job.errorText
+		? { type: "error" as const, text: job.errorText }
+		: job.resultText
+			? { type: "result" as const, text: job.resultText }
+			: undefined;
+	if (!source) return undefined;
+	const width =
+		verbosity === "full" ? FULL_PREVIEW_WIDTH : verbosity === "preview" ? PREVIEW_WIDTH : RECEIPT_PREVIEW_WIDTH;
+	const normalized = replaceTabs(source.text);
+	const preview = truncateToWidth(normalized, width, Ellipsis.Unicode);
+	return { type: source.type, preview, truncated: preview !== normalized };
 }

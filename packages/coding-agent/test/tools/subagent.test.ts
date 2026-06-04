@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { SubagentTool, type ToolSession } from "../../src/tools";
@@ -311,5 +314,152 @@ describe("SubagentTool", () => {
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-auto-resumed");
 		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("list and inspect default terminal subagents return receipt previews without bulk output and no unverified ref", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const leak = "LEAK_SENTINEL_DO_NOT_DIGEST";
+		const bulk = `${"a".repeat(300)}${leak}${"b".repeat(64 * 1024)}`;
+		const jobId = manager.register("task", "leaky subagent", async () => bulk, {
+			id: "0-Leaky",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-Leaky", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: "0-Leaky",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Leaky.jsonl",
+			resumable: true,
+		});
+		await manager.getJob(jobId)?.promise;
+
+		const listed = await tool.execute("subagent-list-leak", { action: "list" });
+		const inspected = await tool.execute("subagent-inspect-leak", { action: "inspect", ids: ["0-Leaky"] });
+
+		for (const result of [listed, inspected]) {
+			const snapshot = result.details?.subagents[0];
+			expect(snapshot?.resultPreview?.length ?? 0).toBeLessThanOrEqual(281);
+			expect(snapshot?.resultText).toBe(snapshot?.resultPreview);
+			expect(snapshot?.outputRef).toBeUndefined();
+			expect(snapshot?.truncated).toBe(true);
+			expect(getText(result)).not.toContain(leak);
+			expect(getText(result).length).toBeLessThan(2_000);
+		}
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("supports preview and explicit full verbosity bounds without unverified refs", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const bulk = "x".repeat(5_000);
+		const jobId = manager.register("task", "verbose subagent", async () => bulk, {
+			id: "0-Verbose",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-Verbose", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: "0-Verbose",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Verbose.jsonl",
+			resumable: true,
+		});
+		await manager.getJob(jobId)?.promise;
+
+		const preview = await tool.execute("subagent-preview", {
+			action: "inspect",
+			ids: ["0-Verbose"],
+			verbosity: "preview",
+		});
+		expect(preview.details?.subagents[0]?.resultPreview?.length ?? 0).toBeLessThanOrEqual(2_001);
+		expect(preview.details?.subagents[0]?.truncated).toBe(true);
+
+		await expect(tool.execute("subagent-full-bare", { action: "inspect", verbosity: "full" })).rejects.toThrow(
+			"requires explicit `ids`",
+		);
+		await expect(
+			tool.execute("subagent-full-list", { action: "list", ids: ["0-Verbose"], verbosity: "full" }),
+		).rejects.toThrow("cannot be used with `list`");
+
+		const full = await tool.execute("subagent-full", {
+			action: "inspect",
+			ids: ["0-Verbose"],
+			verbosity: "full",
+		});
+		expect(full.details?.subagents[0]?.resultPreview?.length).toBe(5_000);
+		expect(full.details?.subagents[0]?.outputRef).toBeUndefined();
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("await default returns bounded preview with output ref instead of full retained text", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const leak = "LEAK_SENTINEL_DO_NOT_DIGEST";
+		const bulk = `${"a".repeat(300)}${leak}${"b".repeat(64 * 1024)}`;
+		const jobId = manager.register("task", "await leaky subagent", async () => bulk, {
+			id: "0-AwaitLeaky",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-AwaitLeaky", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: "0-AwaitLeaky",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-AwaitLeaky.jsonl",
+			resumable: true,
+		});
+
+		const result = await tool.execute("subagent-await-leak", {
+			action: "await",
+			ids: ["0-AwaitLeaky"],
+			timeout_ms: 100,
+		});
+
+		const snapshot = result.details?.subagents[0];
+		expect(snapshot?.resultPreview?.length ?? 0).toBeLessThanOrEqual(281);
+		expect(snapshot?.outputRef).toBeUndefined();
+		expect(snapshot?.truncated).toBe(true);
+		expect(getText(result)).not.toContain(leak);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("includes output ref only when an agent output sidecar exists in the subagent artifact dir", async () => {
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "subagent-output-ref-"));
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register("task", "artifact-backed subagent", async () => "artifact backed result", {
+			id: "0-ArtifactBacked",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-ArtifactBacked", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: "0-ArtifactBacked",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: path.join(artifactsDir, "0-ArtifactBacked.jsonl"),
+			resumable: true,
+		});
+		await manager.getJob(jobId)?.promise;
+		await Bun.write(path.join(artifactsDir, "0-ArtifactBacked.md"), "artifact backed result");
+		await Bun.write(path.join(artifactsDir, "0-ArtifactBacked.md.meta.json"), "{}");
+
+		const result = await tool.execute("subagent-artifact-backed", {
+			action: "inspect",
+			ids: ["0-ArtifactBacked"],
+		});
+
+		expect(result.details?.subagents[0]?.outputRef).toBe("agent://0-ArtifactBacked");
+		expect(getText(result)).toContain("Output: agent://0-ArtifactBacked");
+		await manager.dispose({ timeoutMs: 100 });
+		await fs.rm(artifactsDir, { recursive: true, force: true });
 	});
 });

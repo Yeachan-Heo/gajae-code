@@ -2,19 +2,22 @@ Lists, inspects, awaits, pauses, resumes, steers, or cancels detached task subag
 
 Task launches return immediately. Use this tool when you need direct control over those running subagents. Prefer `subagent` for task subagents; generic `job` remains available for non-subagent jobs and compatibility fallback access.
 
+`verbosity` controls output size: `receipt` (default) returns status metadata plus a single <=280-character result/error preview and an `agent://<id>` output ref when available; `preview` returns <=2000 characters; `full` returns <=12000 characters and requires explicit `ids`.
+
 # Operations
 
 ## `action: "list"`
-Snapshot your visible detached subagents, including `running`, `paused`, `queued`, and terminal subagents when retained.
+Snapshot your visible detached subagents, including `running`, `paused`, `queued`, and terminal subagents when retained. Output is receipt-only by default; use `verbosity: "preview"` for a bounded preview or inspect explicit `ids` with `verbosity: "full"` when fuller retained text is necessary.
 
 ## `action: "inspect"`
-Inspect selected subagents by `ids`; omit `ids` to inspect current running subagents. Terminal subagents include final output when retained.
+Inspect selected subagents by `ids`; omit `ids` to inspect current running subagents. Terminal subagents return receipt-only output by default, with an `agent://<id>` ref when a verified output artifact is available. `verbosity: "full"` requires explicit `ids`.
 
 ## `action: "await"`
 Wait for selected subagents by `ids`; omit `ids` to wait for current running subagents.
 - Always set `timeout_ms` when the result is not immediately required forever.
 - Await timeout only bounds this tool call's wait; it does not stop the subagent and is not a failure reason.
 - On timeout, inspect progress and keep doing independent work. Never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.
+- Completed results are receipt-first by default: bounded preview plus `agent://<id>` output ref when available, not full retained output.
 
 ## `action: "pause"`
 Request a graceful safe-boundary pause for selected subagents by `ids`.
