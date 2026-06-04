@@ -1294,7 +1294,7 @@ async function handleHandoff(
 			`existing state for ${caller} is corrupt or tampered (${callerRead.error}); use --force to overwrite`,
 		);
 	}
-	if (callerRead.kind !== "valid") {
+	if (callerRead.kind === "absent") {
 		throw new StateCommandError(
 			2,
 			`gjc state ${caller} handoff: caller is not active (no mode-state file at ${callerPath})`,
@@ -1307,7 +1307,7 @@ async function handleHandoff(
 			`existing state for ${callee} is corrupt or tampered (${calleeRead.error}); use --force to overwrite`,
 		);
 	}
-	const existingCaller = callerRead.value;
+	const existingCaller = callerRead.kind === "valid" ? callerRead.value : {};
 	const existingCallee = calleeRead.kind === "valid" ? calleeRead.value : {};
 
 	const handoffAt = nowIso();

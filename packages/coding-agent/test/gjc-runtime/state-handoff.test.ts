@@ -175,6 +175,32 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects corrupt caller mode-state without --force and proceeds with --force", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			await fs.mkdir(path.dirname(callerPath), { recursive: true });
+			await fs.writeFile(callerPath, "{broken json", "utf-8");
+
+			const rejected = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(rejected.status).toBe(2);
+			expect(rejected.stderr).toContain("existing state for deep-interview is corrupt or tampered");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe("{broken json");
+
+			const forced = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json", "--force"],
+				cwd,
+			);
+			expect(forced.status).toBe(0);
+			const caller = await readJson(callerPath);
+			expect(caller?.active).toBe(false);
+			const callee = await readJson(path.join(cwd, ".gjc/state/ralplan-state.json"));
+			expect(callee?.handoff_from).toBe("deep-interview");
+		});
+	});
+
 	it("writes callee mode-state before caller mode-state (HUD-coherent ordering)", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
