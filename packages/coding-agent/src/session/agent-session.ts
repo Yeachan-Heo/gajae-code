@@ -972,6 +972,12 @@ export class AgentSession {
 	 *  without producing an aborted message_end). */
 	#planCompactAbortPending = false;
 
+	/** One-shot flag armed by `abort({ silent: true })` (e.g. Esc consuming a
+	 *  queued steer). Consumed in #handleAgentEvent to stamp `SILENT_ABORT_MARKER`
+	 *  on the resulting aborted assistant `message_end` so the interrupt does not
+	 *  surface a red "Operation aborted" line; cleared by a later non-silent abort
+	 *  or by `abort`'s safety net when no aborted message_end is produced. */
+	#silentAbortPending = false;
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -1644,10 +1650,11 @@ export class AgentSession {
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
 			event.message.stopReason === "aborted" &&
-			this.#planCompactAbortPending
+			(this.#planCompactAbortPending || this.#silentAbortPending)
 		) {
 			(event.message as AssistantMessage).errorMessage = SILENT_ABORT_MARKER;
 			this.#planCompactAbortPending = false;
+			this.#silentAbortPending = false;
 		}
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
@@ -2138,13 +2145,23 @@ export class AgentSession {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
-		onSkip?: () => void;
-		onError?: () => void;
+		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		onError?: (error: unknown) => void;
 	}): void {
+		const scheduledGeneration = options?.generation;
+		const signal = this.#postPromptTasksAbortController.signal;
 		this.#schedulePostPromptTask(
 			async () => {
+				if (signal.aborted) {
+					options?.onSkip?.("aborted_signal");
+					return;
+				}
+				if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+					options?.onSkip?.("generation_changed");
+					return;
+				}
 				if (options?.shouldContinue && !options.shouldContinue()) {
-					options.onSkip?.();
+					options.onSkip?.("queue_drained");
 					return;
 				}
 				try {
@@ -2154,15 +2171,43 @@ export class AgentSession {
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
 					});
-					options?.onError?.();
+					options?.onError?.(error);
 				}
 			},
-			{
-				delayMs: options?.delayMs,
-				generation: options?.generation,
-				onSkip: options?.onSkip,
-			},
+			{ delayMs: options?.delayMs },
 		);
+	}
+
+	#logCompactionContinuationSkipped(
+		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
+		reason: string,
+	): void {
+		logger.warn("Auto-compaction continuation skipped", { source, reason });
+	}
+
+	#logCompactionContinuationError(
+		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
+		error: unknown,
+	): void {
+		logger.warn("Auto-compaction continuation failed", {
+			source,
+			reason: error instanceof Error && error.name === "AgentBusyError" ? "queue_drained" : "not_resumable_tail",
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
+	#isResumableAgentTail(): boolean {
+		const lastMsg = this.agent.state.messages.at(-1);
+		return lastMsg !== undefined && lastMsg.role !== "assistant";
+	}
+
+	#stripOverflowFailedTurnForRetry(): void {
+		const messages = this.agent.state.messages;
+		const lastMsg = messages.at(-1);
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (lastMsg?.role === "assistant" && isContextOverflow(lastMsg as AssistantMessage, contextWindow)) {
+			this.agent.replaceMessages(messages.slice(0, -1));
+		}
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
@@ -2175,16 +2220,28 @@ export class AgentSession {
 					timestamp: Date.now(),
 				},
 				autoContinuePrompt,
-				{ skipPostPromptRecoveryWait: true },
+				{ skipPostPromptRecoveryWait: true, skipCompactionCheck: true },
 			);
 		};
-		this.#schedulePostPromptTask(
-			async signal => {
+		const scheduledGeneration = generation;
+		const signal = this.#postPromptTasksAbortController.signal;
+		this.#trackPostPromptTask(
+			(async () => {
 				await Promise.resolve();
-				if (signal.aborted) return;
-				await continuePrompt();
-			},
-			{ generation },
+				if (signal.aborted) {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+					return;
+				}
+				if (this.#promptGeneration !== scheduledGeneration) {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+					return;
+				}
+				try {
+					await continuePrompt();
+				} catch (error) {
+					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				}
+			})(),
 		);
 	}
 
@@ -4978,6 +5035,13 @@ export class AgentSession {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
 	}
 
+	/** Whether the agent has queued steering messages that a `user_interrupt`
+	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	get hasQueuedSteering(): boolean {
+		return this.agent.hasQueuedSteering();
+	}
+
 	/** Get pending messages (read-only). Returns the public text-only view;
 	 *  internal `{text, tag?}` records are mapped to `.text` so callers
 	 *  (`updatePendingMessagesDisplay`, `restoreQueuedMessagesToEditor`) see
@@ -5074,7 +5138,17 @@ export class AgentSession {
 			| "handoff"
 			| "tool_abort"
 			| "internal";
+		/** Suppress the "Operation aborted" line on the resulting aborted message
+		 *  by stamping `SILENT_ABORT_MARKER`. Used when Esc consumes a queued steer
+		 *  and resumes via steer-on-interrupt, so the interrupt reads as a quiet
+		 *  hand-off rather than a failure. */
+		silent?: boolean;
 	}): Promise<void> {
+		if (options?.silent) {
+			this.#silentAbortPending = true;
+		} else {
+			this.#silentAbortPending = false;
+		}
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -5114,6 +5188,10 @@ export class AgentSession {
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
 		this.#resetInFlight();
+		// Safety net: clear the silent-abort flag if it was never consumed (the
+		// abort produced no aborted assistant message_end to stamp). Prevents the
+		// marker from leaking onto a later, unrelated abort.
+		this.#silentAbortPending = false;
 		// Safety net: if the agent loop aborted without producing an assistant
 		// message (e.g. failed before the first stream), the in-flight yield was
 		// never resolved or rejected by the normal message_end path. Reject it now
@@ -6917,12 +6995,34 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
-				if (!willRetry && this.agent.hasQueuedMessages()) {
+				if (willRetry) {
+					this.#stripOverflowFailedTurnForRetry();
+					if (this.#isResumableAgentTail()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							onSkip: skipReason => this.#logCompactionContinuationSkipped("overflow_retry", skipReason),
+							onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+						});
+					} else {
+						const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
+						logger.warn("Auto-compaction continuation skipped", {
+							source: "overflow_retry",
+							reason: "not_resumable_tail",
+							role: tail?.role,
+							stopReason: tail?.stopReason,
+						});
+					}
+				} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
+						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
+				} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+					this.#scheduleAutoContinuePrompt(generation);
 				}
 				return;
 			}
@@ -7124,26 +7224,36 @@ export class AgentSession {
 			};
 			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
 
-			if (!willRetry && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				this.#scheduleAutoContinuePrompt(generation);
-			}
-
 			if (willRetry) {
-				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.replaceMessages(messages.slice(0, -1));
+				this.#stripOverflowFailedTurnForRetry();
+				if (!this.#isResumableAgentTail()) {
+					const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
+					logger.warn("Auto-compaction continuation skipped", {
+						source: "overflow_retry",
+						reason: "not_resumable_tail",
+						role: tail?.role,
+						stopReason: tail?.stopReason,
+					});
+				} else {
+					this.#scheduleAgentContinue({
+						delayMs: 100,
+						generation,
+						onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
+						onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+					});
 				}
-
-				this.#scheduleAgentContinue({ delayMs: 100, generation });
-			} else if (this.agent.hasQueuedMessages()) {
+			} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this.#scheduleAgentContinue({
 					delayMs: 100,
 					generation,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
+					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
+					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
+			} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+				this.#scheduleAutoContinuePrompt(generation);
 			}
 		} catch (error) {
 			if (autoCompactionSignal.aborted) {

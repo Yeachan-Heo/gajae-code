@@ -9,6 +9,7 @@ import {
 	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
+import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
 /**
  * Sole sanctioned project `.gjc/**` writer module (gate G1).
@@ -357,7 +358,16 @@ export async function writeWorkflowEnvelopeAtomic(
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
 	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
-	await atomicWrite(filePath, jsonText(stampWorkflowEnvelopeChecksum(withReceipt, filePath)));
+	const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
+	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
+	if (!parsed.success) {
+		throw new Error(
+			`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+				.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+				.join("; ")}`,
+		);
+	}
+	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;
 }

@@ -25,11 +25,17 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
 
 const MAX_WIDGET_LINES = 10;
+const HOOK_SELECTOR_MOUSE_REPORTING_ENABLE = "\x1b[?1006h\x1b[?1000h";
+const HOOK_SELECTOR_MOUSE_REPORTING_DISABLE = "\x1b[?1000l\x1b[?1006l";
+const HOOK_SELECTOR_CHROME_ROWS = 7;
+const HOOK_SELECTOR_OUTLINE_ROWS = 2;
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
+	#hookSelectorMouseReportingEnabled = false;
+
 	constructor(private ctx: InteractiveModeContext) {}
 
 	/**
@@ -589,12 +595,20 @@ export class ExtensionUiController {
 			() => this.hideHookSelector(),
 			dialogOptions?.signal,
 		);
-		const maxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
 		const requestedTitleRows = dialogOptions?.scrollTitleRows;
-		const selectorChromeRows = 7;
-		const availableTitleRows = this.ctx.ui.terminal.rows - maxVisible - selectorChromeRows;
+		const baseMaxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
+		const scrollOptionRows = Math.max(1, Math.min(baseMaxVisible, options.length));
+		const maxVisible =
+			requestedTitleRows === undefined ? baseMaxVisible : Math.min(15, Math.max(3, scrollOptionRows + 1));
+		const listChromeRows = dialogOptions?.outline === true ? HOOK_SELECTOR_OUTLINE_ROWS : 0;
+		const availableTitleRows =
+			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - HOOK_SELECTOR_CHROME_ROWS;
 		const scrollTitleRows =
 			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
+		if (scrollTitleRows !== undefined) {
+			this.#enableHookSelectorMouseReporting();
+		}
+
 		this.ctx.hookSelector = new HookSelectorComponent(
 			title,
 			options,
@@ -640,10 +654,32 @@ export class ExtensionUiController {
 		attachAbort();
 		return promise;
 	}
+
+	#enableHookSelectorMouseReporting(): void {
+		if (this.#hookSelectorMouseReportingEnabled) return;
+		this.#hookSelectorMouseReportingEnabled = true;
+		this.#writeTerminalControl(HOOK_SELECTOR_MOUSE_REPORTING_ENABLE);
+	}
+
+	#disableHookSelectorMouseReporting(): void {
+		if (!this.#hookSelectorMouseReportingEnabled) return;
+		this.#hookSelectorMouseReportingEnabled = false;
+		this.#writeTerminalControl(HOOK_SELECTOR_MOUSE_REPORTING_DISABLE);
+	}
+
+	#writeTerminalControl(sequence: string): void {
+		try {
+			this.ctx.ui.terminal.write(sequence);
+		} catch {
+			// Terminal teardown can race selector cleanup; normal shutdown restores modes.
+		}
+	}
+
 	/**
 	 * Hide the hook selector.
 	 */
 	hideHookSelector(): void {
+		this.#disableHookSelectorMouseReporting();
 		this.ctx.hookSelector?.dispose();
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);

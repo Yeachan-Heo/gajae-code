@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "skill": "ultragoal",
+  "current_phase": "active",
+  "active": true,
+  "updated_at": "2026-06-04T12:00:00.000Z",
+  "session_id": "sess-corpus-ultragoal",
+  "ledger_path": ".gjc/ultragoal/corpus/ledger.json",
+  "goals": [
+    {
+      "id": "goal-1",
+      "status": "active",
+      "evidence": [
+        "artifact://corpus"
+      ]
+    }
+  ],
+  "receipt": {
+    "version": 1,
+    "skill": "ultragoal",
+    "owner": "gjc-state-cli",
+    "command": "gjc state ultragoal write --input '<json>'",
+    "state_path": "/repo/.gjc/state/sessions/sess-corpus-ultragoal/active-state.json",
+    "storage_path": "/repo/.gjc/state/sessions/sess-corpus-ultragoal/ultragoal-state.json",
+    "mutated_at": "2026-06-04T12:00:00.000Z",
+    "fresh_until": "2026-06-04T12:30:00.000Z",
+    "status": "fresh",
+    "mutation_id": "ultragoal:2026-06-04T12:00:00.000Z",
+    "verb": "activate",
+    "from_phase": "pending",
+    "to_phase": "active",
+    "forced": false,
+    "paths": [
+      ".gjc/ultragoal/corpus/ledger.json"
+    ],
+    "content_sha256": {
+      "algorithm": "sha256",
+      "value": "2c6b3d9edb7f9b8a3da6f53e8f4f7d621c7e8227f942fb1b9f97cdbf58b5e4a3",
+      "covered_path": "/repo/.gjc/state/sessions/sess-corpus-ultragoal/ultragoal-state.json",
+      "computed_at": "2026-06-04T12:00:00.000Z"
+    },
+    "audit_trace_id": "trace-ultragoal-corpus"
+  },
+  "passthrough": {
+    "retained": true,
+    "checkpoint": 3
+  }
+}

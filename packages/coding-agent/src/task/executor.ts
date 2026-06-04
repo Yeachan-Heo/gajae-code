@@ -4,6 +4,8 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
+import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
@@ -1536,18 +1538,39 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	// Write output artifact (input and jsonl already written in real-time)
 	// Compute output metadata for agent:// URL integration
-	let outputMeta: { lineCount: number; charCount: number } | undefined;
+	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
 	let outputPath: string | undefined;
 	if (options.artifactsDir) {
-		outputPath = path.join(options.artifactsDir, `${id}.md`);
+		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
 		try {
-			await Bun.write(outputPath, rawOutput);
+			await Bun.write(candidateOutputPath, rawOutput);
+			const byteSize = Buffer.byteLength(rawOutput, "utf8");
+			const lineCount = rawOutput.split("\n").length;
+			const sha256 = createHash("sha256").update(rawOutput).digest("hex");
+			const createdAt = new Date().toISOString();
+			await Bun.write(
+				`${candidateOutputPath}.meta.json`,
+				JSON.stringify({ id, kind: "agent-output", sizeBytes: byteSize, lineCount, sha256, createdAt }, null, 2),
+			);
+			outputPath = candidateOutputPath;
 			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
+				lineCount,
 				charCount: rawOutput.length,
+				byteSize,
+				sha256,
 			};
 		} catch {
-			// Non-fatal
+			// Output or metadata write failed: never advertise an unverifiable
+			// artifact. Best-effort remove any orphaned `.md`/sidecar so a later
+			// agent:// read cannot serve unverified content. Non-fatal.
+			outputPath = undefined;
+			outputMeta = undefined;
+			try {
+				await fs.rm(candidateOutputPath, { force: true });
+				await fs.rm(`${candidateOutputPath}.meta.json`, { force: true });
+			} catch {
+				// best-effort cleanup; ignore
+			}
 		}
 	}
 

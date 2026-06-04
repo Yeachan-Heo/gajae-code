@@ -54,7 +54,7 @@ RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persi
 This skill runs GJC planning in consensus mode for the provided arguments.
 
 The consensus workflow:
-1. **Planner** creates initial plan and a compact **RALPLAN-DR summary** before review, then persists the stage with `gjc ralplan --write --stage planner --stage_n 1 --artifact "..."`:
+1. **Planner** creates the initial plan and a compact **RALPLAN-DR summary** before review. Launch the Planner ONCE per run as a detached, resumable subagent (await it before the Architect) and record its returned subagent id as the run's persisted Planner id; persist the stage with `gjc ralplan --write --stage planner --stage_n 1 --artifact "..." --planner-id <id> --planner-resumable <true|false>` (see **Persisted Planner** below):
    - After persistence, return only the receipt/path plus compact planning status; do not paste the full plan markdown back to the caller unless explicitly requested.
    - Principles (3-5)
    - Decision Drivers (top 3)
@@ -68,7 +68,7 @@ The consensus workflow:
    - The Critic agent/subagent must persist its evaluation with `gjc ralplan --write --stage critic --stage_n <N> --artifact "..." --json`, then return the receipt/path plus compact verdict/status (`OKAY`/`ITERATE`/`REJECT`) instead of pasting the full evaluation body.
 5. **Re-review loop** (max 5 iterations): Any non-`APPROVE` Critic verdict (`ITERATE` or `REJECT`) MUST run the same full closed loop:
    a. Collect Architect + Critic feedback
-   b. Revise the plan with Planner
+   b. Revise the plan by resuming the SAME persisted Planner subagent with consolidated Architect + Critic feedback (see **Persisted Planner** below); fall back to a fresh Planner spawn only per the fallback routing table
    c. Return to Architect review
       - Persist each Planner revision with `gjc ralplan --write --stage revision --stage_n <N> --artifact "..." --json` before re-review, then pass the receipt/path forward instead of duplicating the full revision markdown in the parent conversation.
    d. Return to Critic evaluation
@@ -89,6 +89,33 @@ The consensus workflow:
 > **Important:** Steps 3 and 4 MUST run sequentially. Do NOT issue both agent Task calls in the same parallel batch. Always await the Architect result before issuing the Critic Task.
 
 Follow the Plan skill's full documentation for consensus mode details.
+
+### Persisted Planner (consensus loop)
+
+The Planner is a **same-session persisted subagent**: launched detached once, awaited before the Architect, then **resumed** with consolidated Architect + Critic feedback on every re-review pass instead of being re-spawned. The Architect and Critic stay **fresh, independent spawns each pass** so their verdicts remain reproducible from their pass artifacts alone. Do NOT modify the subagent control surface; this orchestration uses the existing `subagent` resume/steer controls only.
+
+**Persistence boundary:** this is same-parent, active-session continuity only. Resumability depends on the in-memory subagent record (and a persistent parent session — an in-memory parent yields `resumable:false`), not just a session file. The `.gjc` run-state record is an audit/routing hint, NOT a durable cross-process subagent registry. After a process restart, a missing record, or any unavailable/failed resume, use the fresh Planner fallback.
+
+**Resume routing table** (per re-review pass, when resuming the persisted Planner id):
+
+| Resume outcome | Action |
+|---|---|
+| `running` | `steer`/inject the consolidated feedback to the same id, then await — do NOT fresh-spawn |
+| `queued` | retain/update the queued message or await the same id — do NOT fresh-spawn just because it is queued |
+| `context_unavailable`, `not_found`, `no_runner`, `resume_failed` | fresh Planner spawn for that pass; record the fallback metadata |
+| terminal (`completed`/`failed`/`cancelled`) + revision message | resume the same id when context is available; otherwise use the fresh fallback above |
+
+**Recording persisted-Planner metadata** (audit/routing only — never claim `subagent list` proves resumability, since the snapshot does not expose `resumable`). Ride these optional flags on the normal `--write` for the planner/revision stage of the pass:
+
+```
+gjc ralplan --write --stage revision --stage_n <N> --artifact "..." \
+  --planner-id <id> --planner-resumable <true|false> \
+  --fallback-reason <context_unavailable|not_found|no_runner|resume_failed|process_restart|missing_record> \
+  --fallback-attempted-id <id> --fallback-stage-n <N> \
+  --fallback-receipt-path <fresh-planner-stage-artifact-path> --json
+```
+
+Set `--planner-resumable true` only when the parent session is provably persistent; set/record `false` after an observed `context_unavailable`; otherwise omit it (unknown). Fallback flags are recorded only when a fresh-spawn fallback actually occurs: a fallback record requires `--fallback-reason` **together with** `--fallback-attempted-id` and `--fallback-stage-n` (the failed id and the pass it failed on), while `--fallback-receipt-path` (the fresh Planner's stage artifact) is optional.
 
 ## Pre-Execution Gate
 

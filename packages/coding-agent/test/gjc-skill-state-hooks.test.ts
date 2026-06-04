@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
+import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import { createUltragoalPlan } from "../src/gjc-runtime/ultragoal-runtime";
 import {
 	mergeGjcManagedCodexHooksConfig,
@@ -11,6 +12,7 @@ import {
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 import { detectSkillKeywords, readVisibleSkillActiveState } from "../src/hooks/skill-state";
 import { getDeepInterviewMutationDecision } from "../src/skill-state/deep-interview-mutation-guard";
+import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contract";
 
 describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
@@ -89,6 +91,162 @@ describe("GJC native skill-state hooks", () => {
 			threshold: 0.05,
 			threshold_source: "default",
 		});
+		const envelope = RequiredOnWriteEnvelopeSchema.safeParse(modeState);
+		expect(envelope.success).toBe(true);
+		expect(modeState.version).toBe(WORKFLOW_STATE_VERSION);
+	});
+
+	it("reads valid custom skill-active state unchanged", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(stateDir, { recursive: true });
+		const state = {
+			version: 1,
+			active: true,
+			skill: "team",
+			active_skills: [{ skill: "team", active: true, phase: "running", custom_field: "preserved" }],
+		};
+		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
+
+		await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toEqual(state);
+	});
+
+	it("fails open and logs when custom skill-active state is corrupt", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), "{");
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toBeNull();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid skill-active-state at");
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("invalid JSON");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("Stop reads valid custom mode state unchanged", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(path.join(stateDir, "sessions", "session-valid"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "sessions", "session-valid", "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				active_skills: [{ skill: "ralplan", active: true, phase: "planner", session_id: "session-valid" }],
+			}),
+		);
+		await fs.writeFile(
+			path.join(stateDir, "sessions", "session-valid", "ralplan-state.json"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-valid", extra: "preserved" }),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "Stop",
+				cwd: root,
+				sessionId: "session-valid",
+			} as never,
+			{ stateDir },
+		);
+		expect(allowed.outputJson).toBeNull();
+	});
+
+	it("Stop fails open and logs when custom mode state is corrupt", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(path.join(stateDir, "sessions", "session-corrupt"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "sessions", "session-corrupt", "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				active_skills: [{ skill: "ralplan", active: true, phase: "planner", session_id: "session-corrupt" }],
+			}),
+		);
+		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "ralplan-state.json"), "{");
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const allowed = await dispatchGjcNativeSkillHook(
+				{
+					hookEventName: "Stop",
+					cwd: root,
+					sessionId: "session-corrupt",
+				} as never,
+				{ stateDir },
+			);
+			expect(allowed.outputJson).toBeNull();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid mode-state at");
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("invalid JSON");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("Stop treats schema-invalid custom mode state as inactive and logs", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(path.join(stateDir, "sessions", "session-invalid"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "sessions", "session-invalid", "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				active_skills: [{ skill: "ralplan", active: true, phase: "planner", session_id: "session-invalid" }],
+			}),
+		);
+		await fs.writeFile(
+			path.join(stateDir, "sessions", "session-invalid", "ralplan-state.json"),
+			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
+		);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const allowed = await dispatchGjcNativeSkillHook(
+				{
+					hookEventName: "Stop",
+					cwd: root,
+					sessionId: "session-invalid",
+				} as never,
+				{ stateDir },
+			);
+			expect(allowed.outputJson).toBeNull();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid mode-state at");
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("current_phase");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("UserPromptSubmit treats schema-invalid active ultragoal mode state as inactive and logs", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, "custom-state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "ultragoal-state.json"),
+			JSON.stringify({ active: true, current_phase: 7, objective: "ship" }),
+		);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const allowed = await dispatchGjcNativeSkillHook(
+				{
+					hook_event_name: "UserPromptSubmit",
+					prompt: "continue the implementation",
+					cwd: root,
+				} as never,
+				{ stateDir },
+			);
+			expect(allowed.outputJson).toBeNull();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid mode-state at");
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("current_phase");
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("rich deep-interview prompt activation blocks product mutation and direct spec artifacts", async () => {

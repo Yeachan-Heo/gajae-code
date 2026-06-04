@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
@@ -13,7 +14,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../sessio
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { ensureSupportedImageInput } from "../../utils/image-loading";
+import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 
@@ -22,6 +23,8 @@ interface Expandable {
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+const CLIPBOARD_TEMP_IMAGE_FILE_PATTERN = /^clipboard-\d{4}-\d{2}-\d{2}-\d{6}-[A-Za-z0-9]+\.(?:png|jpe?g|gif|webp)$/i;
+const MACOS_CLIPBOARD_TEMP_DIR_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T$/;
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
@@ -30,8 +33,17 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
-	#abortInteractive(): Promise<void> {
-		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS, cause: "user_interrupt" });
+	/** Set while a first Esc is silently consuming a queued steer (abort +
+	 *  steer-on-interrupt continue). A second Esc within that window does a real
+	 *  abort instead of consuming the steer again. */
+	#steerConsumePending = false;
+
+	#abortInteractive(options?: { silent?: boolean }): Promise<void> {
+		return this.ctx.session.abort({
+			timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS,
+			cause: "user_interrupt",
+			silent: options?.silent,
+		});
 	}
 
 	setupKeyHandlers(): void {
@@ -73,7 +85,22 @@ export class InputController {
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isStreaming) {
-				void this.#abortInteractive();
+				if (this.ctx.session.hasQueuedSteering && !this.#steerConsumePending) {
+					// First Esc with a queued steer: silently consume it and
+					// auto-continue via steer-on-interrupt instead of stalling on
+					// "Operation aborted".
+					this.#steerConsumePending = true;
+					void this.#abortInteractive({ silent: true }).finally(() => {
+						this.#steerConsumePending = false;
+					});
+				} else if (this.#steerConsumePending) {
+					// Second Esc before the steer-continue lands: drop the still-queued
+					// steer (restoring its text to the editor) and do a real abort.
+					this.#steerConsumePending = false;
+					this.restoreQueuedMessagesToEditor({ abort: true });
+				} else {
+					void this.#abortInteractive();
+				}
 			} else if (!this.ctx.editor.getText().trim()) {
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
 				const action = settings.get("doubleEscapeAction");
@@ -132,6 +159,7 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
 		);
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
+		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
@@ -602,6 +630,55 @@ export class InputController {
 		process.kill(0, "SIGTSTP");
 	}
 
+	handleTextPaste(text: string): boolean | Promise<boolean> {
+		const imagePath = this.#getPastedImagePathCandidate(text);
+		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
+	}
+
+	async #attachPastedImagePath(imagePath: string): Promise<boolean> {
+		try {
+			const image = await loadImageInput({
+				path: imagePath,
+				cwd: this.ctx.sessionManager.getCwd(),
+				autoResize: this.ctx.settings.get("images.autoResize"),
+			});
+			if (!image) {
+				this.ctx.showStatus("Unsupported pasted clipboard image file");
+				return true;
+			}
+
+			this.ctx.pendingImages.push({
+				type: "image",
+				data: image.data,
+				mimeType: image.mimeType,
+			});
+			this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
+			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
+			this.ctx.ui.requestRender();
+			return true;
+		} catch (error) {
+			if (error instanceof ImageInputTooLargeError) {
+				this.ctx.showStatus(error.message);
+				return true;
+			}
+			this.ctx.showStatus("Failed to attach pasted clipboard image");
+			return true;
+		}
+	}
+
+	#getPastedImagePathCandidate(text: string): string | undefined {
+		const resolvedPath = path.resolve(text.trim());
+		const parentDir = path.dirname(resolvedPath);
+		const isClipboardTempPath =
+			(parentDir === "/tmp" || MACOS_CLIPBOARD_TEMP_DIR_PATTERN.test(parentDir)) &&
+			CLIPBOARD_TEMP_IMAGE_FILE_PATTERN.test(path.basename(resolvedPath));
+		return isClipboardTempPath ? resolvedPath : undefined;
+	}
+
+	#nextImagePlaceholder(): string {
+		return `[image ${this.ctx.pendingImages.length}]`;
+	}
+
 	async handleImagePaste(): Promise<boolean> {
 		try {
 			const image = await readImageFromClipboard();
@@ -616,7 +693,7 @@ export class InputController {
 					this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
 					return false;
 				}
-				if (settings.get("images.autoResize")) {
+				if (this.ctx.settings.get("images.autoResize")) {
 					try {
 						const resized = await resizeImage({
 							type: "image",
@@ -634,10 +711,7 @@ export class InputController {
 					data: imageData.data,
 					mimeType: imageData.mimeType,
 				});
-				// Insert placeholder at cursor like Anthropic model does
-				const imageNum = this.ctx.pendingImages.length;
-				const placeholder = `[Image #${imageNum}]`;
-				this.ctx.editor.insertText(`${placeholder} `);
+				this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
 				this.ctx.ui.requestRender();
 				return true;
 			}

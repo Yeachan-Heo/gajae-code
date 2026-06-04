@@ -5,15 +5,9 @@
 <agent id="{{id}}" agent="{{agent}}">
 <status>{{status}}</status>
 {{#if meta}}<meta lines="{{meta.lineCount}}" size="{{meta.charSize}}" />{{/if}}
-{{#if truncated}}
-<preview full-path="agent://{{id}}">
-{{preview}}
-</preview>
-{{else}}
-<result>
-{{preview}}
-</result>
-{{/if}}
+<synopsis ref="agent://{{id}}">
+{{synopsis}}
+</synopsis>
 </agent>
 {{#unless @last}}
 ---

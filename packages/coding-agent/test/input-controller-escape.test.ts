@@ -64,7 +64,7 @@ function createContext(): {
 	};
 } {
 	let editorText = "";
-	const abort = vi.fn();
+	const abort = vi.fn(() => Promise.resolve());
 	const abortBash = vi.fn();
 	const abortEval = vi.fn();
 	const addMessageToChat = vi.fn();
@@ -113,6 +113,7 @@ function createContext(): {
 			isBashRunning: false,
 			isEvalRunning: false,
 			queuedMessageCount: 0,
+			hasQueuedSteering: false,
 			messages: [],
 			extensionRunner: undefined,
 			abort,
@@ -309,5 +310,35 @@ describe("InputController escape behavior", () => {
 		expect(spies.cancelPendingSubmission).not.toHaveBeenCalled();
 		expect(spies.clearQueue).not.toHaveBeenCalled();
 		expect(spies.abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("silently consumes a queued steer on the first Esc instead of a loud abort", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt", silent: true }));
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+	});
+
+	it("does a real abort on the second Esc while a steer consume is still pending", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.(); // first: silent steer consume
+		editor.onEscape?.(); // second: real abort, dropping the steer to the editor
+
+		expect(spies.abort).toHaveBeenCalledTimes(2);
+		expect(spies.abort.mock.calls[0]?.[0]).toMatchObject({ silent: true });
+		expect(spies.abort.mock.calls[1]?.[0]?.silent).toBeUndefined();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
 	});
 });

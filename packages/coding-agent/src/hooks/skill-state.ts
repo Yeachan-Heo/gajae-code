@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
-import { writeJsonAtomic } from "../gjc-runtime/state-writer";
+import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
+import { writeJsonAtomic, writeWorkflowEnvelopeAtomic } from "../gjc-runtime/state-writer";
 import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
@@ -8,6 +9,7 @@ import {
 	type SkillActiveEntry,
 	type SkillActiveState,
 } from "../skill-state/active-state";
+import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
@@ -218,14 +220,36 @@ function skillStatePath(stateDir: string, sessionId?: string): string {
 	return path.join(stateDir, SKILL_ACTIVE_STATE_FILE);
 }
 
-async function readJsonFile<T>(filePath: string): Promise<T | null> {
+function warnInvalidState(kind: string, filePath: string, error: string): void {
+	console.warn(`gjc skill-state: invalid ${kind} at ${filePath}: ${error}`);
+}
+
+async function readValidatedJsonFile<T>(
+	filePath: string,
+	kind: string,
+	schema: { safeParse: (value: unknown) => { success: true } | { success: false; error: { message: string } } },
+): Promise<T | null> {
+	let raw: string;
 	try {
-		const raw = await Bun.file(filePath).text();
-		return JSON.parse(raw) as T;
+		raw = await Bun.file(filePath).text();
 	} catch (error) {
 		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+		warnInvalidState(kind, filePath, `read error: ${(error as Error).message}`);
 		return null;
 	}
+	let value: T;
+	try {
+		value = JSON.parse(raw) as T;
+	} catch (error) {
+		warnInvalidState(kind, filePath, `invalid JSON: ${(error as Error).message}`);
+		return null;
+	}
+	const parsed = schema.safeParse(value);
+	if (!parsed.success) {
+		warnInvalidState(kind, filePath, parsed.error.message);
+		return null;
+	}
+	return value;
 }
 
 async function writeJsonFile(filePath: string, value: unknown, cwd: string): Promise<void> {
@@ -265,10 +289,18 @@ export async function readVisibleSkillActiveState(
 	if (!stateDir) return await readCanonicalVisibleSkillActiveState(cwd, sessionId);
 	const resolvedStateDir = resolveGjcStateDir(cwd, stateDir);
 	if (sessionId) {
-		const sessionState = await readJsonFile<SkillActiveState>(skillStatePath(resolvedStateDir, sessionId));
+		const sessionState = await readValidatedJsonFile<SkillActiveState>(
+			skillStatePath(resolvedStateDir, sessionId),
+			"skill-active-state",
+			SkillActiveStateSchema,
+		);
 		if (sessionState) return sessionState;
 	}
-	return await readJsonFile<SkillActiveState>(skillStatePath(resolvedStateDir));
+	return await readValidatedJsonFile<SkillActiveState>(
+		skillStatePath(resolvedStateDir),
+		"skill-active-state",
+		SkillActiveStateSchema,
+	);
 }
 
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
@@ -307,6 +339,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 	};
 	const modeState: ModeState = {
 		active: true,
+		version: WORKFLOW_STATE_VERSION,
 		current_phase: phase,
 		skill: match.skill,
 		cwd: input.cwd,
@@ -320,7 +353,17 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 		modeState.threshold_source = "default";
 	}
 
-	await writeJsonFile(initializedStatePath, modeState, input.cwd);
+	await writeWorkflowEnvelopeAtomic(initializedStatePath, modeState, {
+		cwd: input.cwd,
+		receipt: {
+			cwd: input.cwd,
+			skill: match.skill,
+			owner: "gjc-hook",
+			command: "gjc hook recordSkillActivation",
+			sessionId: input.sessionId,
+		},
+		audit: { category: "state", verb: "write", owner: "gjc-hook", skill: match.skill },
+	});
 	await writeJsonFile(skillStatePath(resolvedStateDir, input.sessionId), state, input.cwd);
 	if (!input.sessionId) return state;
 	await writeJsonFile(skillStatePath(resolvedStateDir), state, input.cwd);
@@ -344,11 +387,11 @@ async function readVisibleModeState(
 	const resolvedStateDir = resolveGjcStateDir(cwd, stateDir);
 	if (sessionId) {
 		const sessionStatePath = modeStatePath(resolvedStateDir, skill, sessionId);
-		const sessionState = await readJsonFile<ModeState>(sessionStatePath);
+		const sessionState = await readValidatedJsonFile<ModeState>(sessionStatePath, "mode-state", ModeStateSchema);
 		if (sessionState) return { state: sessionState, statePath: sessionStatePath };
 	}
 	const rootStatePath = modeStatePath(resolvedStateDir, skill);
-	const rootState = await readJsonFile<ModeState>(rootStatePath);
+	const rootState = await readValidatedJsonFile<ModeState>(rootStatePath, "mode-state", ModeStateSchema);
 	if (!rootState) return null;
 	return { state: rootState, statePath: rootStatePath };
 }
@@ -421,7 +464,11 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 	if (!skillState || activeEntries.length === 0) return null;
 
 	for (const entry of activeEntries) {
-		const modeState = await readJsonFile<ModeState>(modeStatePath(resolvedStateDir, entry.skill, input.sessionId));
+		const modeState = await readValidatedJsonFile<ModeState>(
+			modeStatePath(resolvedStateDir, entry.skill, input.sessionId),
+			"mode-state",
+			ModeStateSchema,
+		);
 		if (isTerminalModeState(modeState)) continue;
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);

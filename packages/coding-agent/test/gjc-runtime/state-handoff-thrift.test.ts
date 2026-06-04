@@ -116,7 +116,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		const ralplanSeed = await runNativeRalplanCommand(["--json", "scope the work"], root);
 		expect(ralplanSeed.status).toBe(0);
 		expect(scrub(ralplanSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"skill":"ralplan","mode":"short","interactive":false,"architect":"default","critic":"default","task":"scope the work","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan"}
+			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan"}
 			"
 			`);
 
@@ -163,9 +163,10 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		);
 		expect(stateHandoff.status).toBe(0);
 		const statePayload = JSON.parse(stateHandoff.stdout ?? "{}") as Record<string, unknown>;
-		assertKeys(statePayload, ["from", "to", "handoff_at", "phases", "receipts", "paths"]);
+		assertKeys(statePayload, ["ok", "from", "to", "handoff_at", "phases", "receipts", "paths"]);
+		expect(statePayload.state).toBeUndefined();
 		expect(scrub(stateHandoff.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"from":"deep-interview","to":"ralplan","handoff_at":"<iso>","phases":{"from":"handoff","to":"planner"},"receipts":{"from":{"version":1,"skill":"deep-interview","owner":"gjc-state-cli","command":"gjc state deep-interview handoff --to ralplan","state_path":"/tmp/SCRUBBED","storage_path":"/tmp/SCRUBBED","mutated_at":"<iso>","fresh_until":"<iso>","status":"fresh","mutation_id":"deep-interview:handoff:ralplan:<iso>"},"to":{"version":1,"skill":"ralplan","owner":"gjc-state-cli","command":"gjc state deep-interview handoff --to ralplan","state_path":"/tmp/SCRUBBED","storage_path":"/tmp/SCRUBBED","mutated_at":"<iso>","fresh_until":"<iso>","status":"fresh","mutation_id":"deep-interview:handoff:ralplan:<iso>"}},"paths":{"from":"/tmp/SCRUBBED","to":"/tmp/SCRUBBED","active_state":"/tmp/SCRUBBED"}}
+			"{"ok":true,"from":"deep-interview","to":"ralplan","handoff_at":"<iso>","phases":{"from":"handoff","to":"planner"},"receipts":{"from":{"mutation_id":"deep-interview:handoff:ralplan:<iso>","status":"fresh","content_sha256":{"algorithm":"sha256","value":"<sha256>","covered_path":"/tmp/SCRUBBED","computed_at":"<iso>"}},"to":{"mutation_id":"deep-interview:handoff:ralplan:<iso>","status":"fresh","content_sha256":{"algorithm":"sha256","value":"<sha256>","covered_path":"/tmp/SCRUBBED","computed_at":"<iso>"}}},"paths":{"from":"/tmp/SCRUBBED","to":"/tmp/SCRUBBED","active_state":"/tmp/SCRUBBED"}}
 			"
 			`);
 

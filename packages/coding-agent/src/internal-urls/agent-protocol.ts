@@ -11,6 +11,7 @@
  * - agent://<id>/<path> - JSON extraction via path form
  * - agent://<id>?q=<query> - JSON extraction via query form
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
@@ -18,6 +19,55 @@ import { applyQuery, pathToQuery } from "./json-query";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
+interface AgentOutputMetadata {
+	id: string;
+	kind: "agent-output";
+	sizeBytes: number;
+	lineCount: number;
+	sha256: string;
+	createdAt: string;
+}
+
+function isAgentOutputMetadata(value: unknown, outputId: string): value is AgentOutputMetadata {
+	if (!value || typeof value !== "object") return false;
+	const meta = value as Record<string, unknown>;
+	return (
+		meta.id === outputId &&
+		meta.kind === "agent-output" &&
+		typeof meta.sizeBytes === "number" &&
+		typeof meta.lineCount === "number" &&
+		typeof meta.sha256 === "string" &&
+		typeof meta.createdAt === "string"
+	);
+}
+
+async function verifyAgentOutputMetadata(outputId: string, foundPath: string, bytes: Buffer): Promise<void> {
+	const metaPath = `${foundPath}.meta.json`;
+	let metaRaw: string;
+	try {
+		metaRaw = await Bun.file(metaPath).text();
+	} catch (err) {
+		if (isEnoent(err)) return;
+		throw err;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(metaRaw);
+	} catch {
+		throw new Error(`agent://${outputId} malformed metadata`);
+	}
+	if (!isAgentOutputMetadata(parsed, outputId)) {
+		throw new Error(`agent://${outputId} malformed metadata`);
+	}
+	const stat = await fs.stat(foundPath);
+	if (stat.size !== parsed.sizeBytes || bytes.byteLength !== parsed.sizeBytes) {
+		throw new Error(`agent://${outputId} size mismatch`);
+	}
+	const sha256 = createHash("sha256").update(bytes).digest("hex");
+	if (sha256 !== parsed.sha256) {
+		throw new Error(`agent://${outputId} hash mismatch`);
+	}
+}
 /**
  * Handler for agent:// URLs.
  *
@@ -88,7 +138,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error(`Not found: ${outputId}\nAvailable: ${availableStr}`);
 		}
 
-		const rawContent = await Bun.file(foundPath).text();
+		const rawBytes = Buffer.from(await Bun.file(foundPath).arrayBuffer());
+		await verifyAgentOutputMetadata(outputId, foundPath, rawBytes);
+		const rawContent = rawBytes.toString("utf8");
 		const notes: string[] = [];
 		let content = rawContent;
 		let contentType: InternalResource["contentType"] = "text/markdown";

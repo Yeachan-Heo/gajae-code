@@ -1,4 +1,5 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { renderCliWriteReceipt } from "../gjc-runtime/cli-write-receipt";
 import { renderTeamStatusMarkdown } from "../gjc-runtime/state-renderer";
 import {
 	buildTeamHudSummary,
@@ -43,6 +44,23 @@ function formatTaskCounts(counts: Record<string, number>): string {
 	return Object.entries(counts)
 		.map(([status, count]) => `${status}=${count}`)
 		.join(" ");
+}
+
+function snapshotWriteReceipt(snapshot: GjcTeamSnapshot): Record<string, unknown> {
+	return {
+		ok: true,
+		team_name: snapshot.team_name,
+		phase: snapshot.phase,
+		state_dir: snapshot.state_dir,
+		tmux_session: snapshot.tmux_session,
+		tmux_target: snapshot.tmux_target,
+		worker_count: snapshot.workers.length,
+		task_counts: snapshot.task_counts,
+	};
+}
+
+function writeReceipt(value: Record<string, unknown>): void {
+	process.stdout.write(renderCliWriteReceipt(value));
 }
 
 function parseInputFlag(argv: string[]): Record<string, unknown> {
@@ -124,7 +142,7 @@ export default class Team extends Command {
 			const snapshot = await monitorGjcTeamSnapshot(teamName);
 			await syncTeamHud(snapshot);
 			if (json) {
-				writeJson(snapshot);
+				writeReceipt(snapshotWriteReceipt(snapshot));
 				return;
 			}
 			writeText([
@@ -141,7 +159,7 @@ export default class Team extends Command {
 			const snapshot = await shutdownGjcTeam(teamName);
 			await syncTeamHud(snapshot);
 			if (json) {
-				writeJson(snapshot);
+				writeReceipt(snapshotWriteReceipt(snapshot));
 				return;
 			}
 			writeText([`team: ${snapshot.team_name}`, `phase: ${snapshot.phase}`, `state: ${snapshot.state_dir}`]);
@@ -174,7 +192,7 @@ export default class Team extends Command {
 					// API operations without a resolvable snapshot leave HUD state unchanged.
 				}
 			}
-			writeJson(result);
+			writeReceipt(result as Record<string, unknown>);
 			return;
 		}
 
@@ -183,7 +201,7 @@ export default class Team extends Command {
 		const snapshot = await startGjcTeam({ ...options, dryRun });
 		await syncTeamHud(snapshot);
 		if (json) {
-			writeJson(snapshot);
+			writeReceipt(snapshotWriteReceipt(snapshot));
 			return;
 		}
 		writeText([

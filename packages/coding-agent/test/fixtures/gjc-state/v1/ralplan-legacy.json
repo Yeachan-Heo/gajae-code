@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skill": "legacy-ralplan-alias",
+  "current_phase": "planning",
+  "phase": "planning",
+  "active": true,
+  "updated_at": "2026-05-01T09:00:00.000Z",
+  "legacy_plan_id": "rp-legacy-001",
+  "rounds": [
+    {
+      "role": "planner",
+      "notes": "old shape retained"
+    }
+  ],
+  "legacy_receipt": {
+    "custom_receipt_key": "keep-me",
+    "owner": "legacy-tool"
+  },
+  "passthrough": {
+    "legacy": true,
+    "nested": {
+      "kept": "yes"
+    }
+  }
+}

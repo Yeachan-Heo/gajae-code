@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -273,6 +273,49 @@ describe("deep-interview mutation guard", () => {
 			args: { path: "src/product.ts", content: "x" },
 		});
 		expect(decision.blocked).toBe(false);
+	});
+
+	it("allows writes and logs when deep-interview mode state is invalid", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		await Bun.write(
+			path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"),
+			JSON.stringify({ active: "yes", current_phase: "interviewing", session_id: "session-a" }),
+		);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: "src/product.ts", content: "x" },
+			});
+			expect(decision.blocked).toBe(false);
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid mode-state at");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("allows writes and logs when deep-interview mode state is corrupt JSON", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		await Bun.write(path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"), "{");
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: "src/product.ts", content: "x" },
+			});
+			expect(decision.blocked).toBe(false);
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("invalid JSON");
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("guards deferred ast_edit apply targets unless force override is explicit", async () => {

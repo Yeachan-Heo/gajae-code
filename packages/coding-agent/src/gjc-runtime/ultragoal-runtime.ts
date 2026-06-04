@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
+import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
@@ -474,13 +475,58 @@ export function buildUltragoalHudSummary(
 	});
 }
 
-function titleFromBrief(brief: string): string {
-	const firstLine = brief
+function clampTitle(title: string): string {
+	return title.length > 80 ? `${title.slice(0, 77)}...` : title;
+}
+
+function firstNonEmptyLine(text: string): string | undefined {
+	return text
 		.split(/\r?\n/)
 		.map(line => line.trim())
 		.find(line => line.length > 0);
+}
+
+function titleFromBrief(brief: string): string {
+	const firstLine = firstNonEmptyLine(brief);
 	if (!firstLine) return "Complete ultragoal brief";
-	return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+	return clampTitle(firstLine);
+}
+
+// A reserved, column-0 (unindented) `@goal` line opens a story. The character
+// right after `@goal` must be `:`, an ASCII space or tab, or end-of-line, so
+// `@goalish`, `@goals:`, `@goal-foo`, `@goal.foo`, `@goal/foo`, a non-breaking
+// space, and indented or mid-line `@goal:` are all ordinary objective text and
+// never delimiters.
+const GOAL_DELIMITER = /^@goal(?::|[ \t]+|$)[ \t]*(.*)$/;
+
+interface ParsedGoal {
+	title: string;
+	objective: string;
+}
+
+function parseGoalsFromBrief(brief: string): ParsedGoal[] {
+	const sections: { title: string; body: string[] }[] = [];
+	let current: { title: string; body: string[] } | undefined;
+	for (const line of brief.split(/\r?\n/)) {
+		const match = GOAL_DELIMITER.exec(line);
+		if (match) {
+			current = { title: match[1].trim(), body: [] };
+			sections.push(current);
+			continue;
+		}
+		current?.body.push(line);
+	}
+	if (sections.length === 0) {
+		return [{ title: titleFromBrief(brief), objective: brief.trim() }];
+	}
+	return sections.map((section, index) => {
+		const body = section.body.join("\n").trim();
+		const title = section.title || firstNonEmptyLine(body) || "";
+		if (!title && !body) {
+			throw new Error(`ultragoal @goal block ${index + 1} has no title or objective`);
+		}
+		return { title: clampTitle(title), objective: body || title };
+	});
 }
 
 export async function createUltragoalPlan(input: {
@@ -491,21 +537,23 @@ export async function createUltragoalPlan(input: {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
 	const now = new Date().toISOString();
+	// Parse the untrimmed brief so the raw-line delimiter contract holds: a
+	// leading-indented `@goal` on the first line must stay objective text rather
+	// than being promoted to column 0 by trimming.
+	const goals: UltragoalGoal[] = parseGoalsFromBrief(input.brief).map((goal, index) => ({
+		id: `G${String(index + 1).padStart(3, "0")}`,
+		title: goal.title,
+		objective: goal.objective,
+		status: "pending",
+		createdAt: now,
+		updatedAt: now,
+	}));
 	const plan: UltragoalPlan = {
 		version: 1,
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
-		goals: [
-			{
-				id: "G001",
-				title: titleFromBrief(brief),
-				objective: brief,
-				status: "pending",
-				createdAt: now,
-				updatedAt: now,
-			},
-		],
+		goals,
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -1235,8 +1283,19 @@ function renderStatus(summary: UltragoalStatusSummary, json: boolean): string {
 function renderCompleteHandoff(
 	result: { plan: UltragoalPlan; goal?: UltragoalGoal; allComplete: boolean },
 	json: boolean,
+	cwd: string,
 ): string {
-	if (json) return `${JSON.stringify(result)}\n`;
+	if (json) {
+		return renderCliWriteReceipt({
+			ok: true,
+			all_complete: result.allComplete,
+			next_action: result.allComplete ? "none" : "execute-goal",
+			goal_id: result.goal?.id,
+			goal_status: result.goal?.status,
+			gjc_objective: result.plan.gjcObjective,
+			goals_path: getUltragoalPaths(cwd).goalsPath,
+		});
+	}
 	if (result.allComplete) return "ultragoal complete all=true\n";
 	if (!result.goal) return "ultragoal next-action=none\n";
 	return [
@@ -1263,8 +1322,13 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					status: 0,
 					createdPlan: true,
 					stdout: json
-						? `${JSON.stringify(plan, null, 2)}\n`
-						: `Created ultragoal plan with ${plan.goals.length} goal at ${getUltragoalPaths(cwd).goalsPath}.\n`,
+						? renderCliWriteReceipt({
+								ok: true,
+								goals_count: plan.goals.length,
+								goal_ids: plan.goals.map(goal => goal.id),
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+							})
+						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd).goalsPath}.\n`,
 				};
 			}
 			case "complete-goals":
@@ -1273,6 +1337,7 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					stdout: renderCompleteHandoff(
 						await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") }),
 						json,
+						cwd,
 					),
 				};
 			case "checkpoint": {
@@ -1287,9 +1352,19 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 					qualityGateJson: flagValue(args, "--quality-gate-json"),
 				});
+				const goal = plan.goals.find(item => item.id === goalId);
 				return {
 					status: 0,
-					stdout: json ? `${JSON.stringify(plan)}\n` : `ultragoal checkpoint goal-id=${goalId} status=${status}\n`,
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								goal_id: goalId,
+								status,
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+								completion_receipt_kind: goal?.completionVerification?.receiptKind,
+								quality_gate_hash: goal?.completionVerification?.qualityGateHash,
+							})
+						: `ultragoal checkpoint goal-id=${goalId} status=${status}\n`,
 				};
 			}
 			case "steer": {
@@ -1302,9 +1377,17 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					rationale: flagValue(args, "--rationale") ?? "",
 				});
+				const goal = plan.goals.at(-1);
 				return {
 					status: 0,
-					stdout: json ? `${JSON.stringify(plan, null, 2)}\n` : "Accepted add_subgoal steering.\n",
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								kind,
+								goal_id: goal?.id,
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+							})
+						: "Accepted add_subgoal steering.\n",
 				};
 			}
 			case "record-review-blockers": {
@@ -1316,7 +1399,13 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 				});
-				return { status: 0, stdout: json ? `${JSON.stringify(plan, null, 2)}\n` : "Recorded review blockers.\n" };
+				const goal = plan.goals.at(-1);
+				return {
+					status: 0,
+					stdout: json
+						? renderCliWriteReceipt({ ok: true, goal_id: goal?.id, goals_path: getUltragoalPaths(cwd).goalsPath })
+						: "Recorded review blockers.\n",
+				};
 			}
 			default:
 				return { status: 1, stderr: `Unknown gjc ultragoal command: ${command}\n` };

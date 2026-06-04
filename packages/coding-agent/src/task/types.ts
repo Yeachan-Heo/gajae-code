@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { TaskResultReceipt } from "./receipt";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import type { NestedRepoPatch } from "./worktree";
 
@@ -304,17 +305,16 @@ export interface SingleResult {
 		errorMessage: string;
 	};
 	/** Output metadata for agent:// URL integration */
-	outputMeta?: { lineCount: number; charCount: number };
+	outputMeta?: { lineCount: number; charCount: number; byteSize?: number; sha256?: string };
 }
 
 /** Tool details for TUI rendering */
 export interface TaskToolDetails {
 	projectAgentsDir: string | null;
-	results: SingleResult[];
+	results: TaskResultReceipt[];
 	totalDurationMs: number;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
-	outputPaths?: string[];
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

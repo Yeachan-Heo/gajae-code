@@ -58,7 +58,14 @@ describe("gjc state read markdown", () => {
 	it("exposes readWorkflowStateJson for programmatic callers", async () => {
 		const root = await tempDir();
 		await runNativeStateCommand(
-			["write", "--mode", "ralplan", "--input", JSON.stringify({ active: true, current_phase: "approval" })],
+			[
+				"write",
+				"--mode",
+				"ralplan",
+				"--force",
+				"--input",
+				JSON.stringify({ active: true, current_phase: "approval" }),
+			],
 			root,
 		);
 

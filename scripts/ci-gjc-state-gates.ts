@@ -3,6 +3,11 @@ import { $ } from "bun";
 import * as path from "node:path";
 
 const repoRoot = path.join(import.meta.dir, "..");
+// Local agent sessions may export a workflow session id, which would redirect
+// state-runtime tests into session-scoped state paths. CI gates exercise the
+// default native-free state files, so keep this script hermetic.
+delete process.env.GJC_SESSION_ID;
+delete process.env.GJC_STATE_SESSION_ID;
 
 const relevantPathPrefixes = [
 	"packages/coding-agent/",
@@ -24,6 +29,13 @@ const boundedGateCommands = [
 	["bun", "scripts/verify-gjc-state-writers.ts", "--fail"],
 	["bun", "scripts/generate-gjc-workflow-manifest.ts", "--check"],
 	["bun", "scripts/verify-gjc-skill-docs.ts", "--fail"],
+	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-schema.test.ts"],
+	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-migrations.test.ts"],
+	// NOTE: state-writer-drift.test.ts imports recordSkillActivation (hooks) and
+	// persistGjcTeamModeStateSummary (team-runtime), which load the @gajae-code/natives
+	// addon transitively, so it runs in the heavier "Affected path validation" job, not
+	// this native-free gate.
+	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-schema-corpus.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-runtime.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-handoff.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-receipts.test.ts"],

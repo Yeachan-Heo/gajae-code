@@ -6,6 +6,7 @@ import {
 	validateCompletionReceipt,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
+	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
 	getUltragoalStatus,
@@ -201,6 +202,146 @@ describe("native GJC ultragoal runtime", () => {
 		expect(plan.goals[0]).toMatchObject({ id: "G001", status: "pending" });
 		expect(goalsRaw).toContain("Fix native ultragoal status");
 		expect(ledgerRaw).toContain("plan_created");
+	});
+
+	it("prints receipt-only json for create-goals", async () => {
+		const root = await tempDir();
+
+		const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix", "--json"], root);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+
+		expect(result.status).toBe(0);
+		expect(receipt).toEqual({
+			ok: true,
+			goals_count: 1,
+			goal_ids: ["G001"],
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+		});
+		expect(receipt).not.toHaveProperty("brief");
+		expect(receipt).not.toHaveProperty("goals");
+	});
+
+	it("prints receipt-only json for complete-goals", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+
+		const result = await runNativeUltragoalCommand(["complete-goals", "--json"], root);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+
+		expect(result.status).toBe(0);
+		expect(receipt).toMatchObject({
+			ok: true,
+			all_complete: false,
+			next_action: "execute-goal",
+			goal_id: "G001",
+			goal_status: "active",
+			gjc_objective: created.gjcObjective,
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+		});
+		expect(receipt).not.toHaveProperty("plan");
+		expect(receipt).not.toHaveProperty("goal");
+	});
+
+	it("prints receipt-only json for checkpoint", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+
+		expect(result.status).toBe(0);
+		expect(receipt).toMatchObject({
+			ok: true,
+			goal_id: "G001",
+			status: "complete",
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+			completion_receipt_kind: "final-aggregate",
+		});
+		expect(receipt.quality_gate_hash).toEqual(expect.any(String));
+		expect(receipt).not.toHaveProperty("goals");
+	});
+
+	it("prints receipt-only json for steering", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"add_subgoal",
+				"--title",
+				"Verify the fix",
+				"--objective",
+				"Run focused verification.",
+				"--evidence",
+				"review found missing coverage",
+				"--rationale",
+				"coverage closes the risk",
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+
+		expect(result.status).toBe(0);
+		expect(receipt).toEqual({
+			ok: true,
+			kind: "add_subgoal",
+			goal_id: "G002",
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+		});
+		expect(receipt).not.toHaveProperty("goals");
+	});
+
+	it("prints receipt-only json for review blockers", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"record-review-blockers",
+				"--goal-id",
+				"G001",
+				"--title",
+				"Resolve verification blockers",
+				"--objective",
+				"Fix architect and executor QA findings.",
+				"--evidence",
+				"architect found product regression",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+
+		expect(result.status).toBe(0);
+		expect(receipt).toEqual({
+			ok: true,
+			goal_id: "G002",
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+		});
+		expect(receipt).not.toHaveProperty("goals");
 	});
 
 	it("starts and checkpoints the current goal", async () => {
@@ -1018,5 +1159,279 @@ describe("native GJC ultragoal runtime", () => {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("checkpoint --status must be");
 		expect(status.goals[0]?.status).toBe("pending");
+	});
+});
+
+describe("ultragoal @goal decomposition", () => {
+	async function goalsFileExists(root: string): Promise<boolean> {
+		return await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).exists();
+	}
+
+	it("keeps a no-sigil brief as a single goal (backward compatible)", async () => {
+		const root = await tempDir();
+		const brief = "Ship the native fix\nwith a second line";
+		const plan = await createUltragoalPlan({ cwd: root, brief });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]).toMatchObject({ id: "G001", status: "pending" });
+		expect(plan.goals[0]?.objective).toBe(brief.trim());
+	});
+
+	it("trims a whitespace-padded no-sigil brief", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "\n\n  Only one goal here  \n\n" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.objective).toBe("Only one goal here");
+	});
+
+	it("splits multiple @goal blocks into ordered goals", async () => {
+		const root = await tempDir();
+		const brief = [
+			"@goal: Parse CSVs",
+			"Ingest and validate rows.",
+			"Reject malformed rows.",
+			"",
+			"@goal: Normalize records",
+			"Map onto the canonical schema.",
+			"",
+			"@goal: Export report",
+			"Emit the audit report.",
+		].join("\n");
+		const plan = await createUltragoalPlan({ cwd: root, brief });
+		expect(plan.goals.map(goal => goal.id)).toEqual(["G001", "G002", "G003"]);
+		expect(plan.goals.map(goal => goal.title)).toEqual(["Parse CSVs", "Normalize records", "Export report"]);
+		expect(plan.goals[0]?.objective).toBe("Ingest and validate rows.\nReject malformed rows.");
+		expect(plan.goals[2]?.objective).toBe("Emit the audit report.");
+	});
+
+	it("accepts @goal without a colon", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal First story\nDo the thing.\n\n@goal Second story\nDo the next thing.",
+		});
+		expect(plan.goals.map(goal => goal.title)).toEqual(["First story", "Second story"]);
+	});
+
+	it("treats @goal-adjacent tokens as objective text, not delimiters", async () => {
+		const root = await tempDir();
+		const brief = [
+			"@goal: Real story",
+			"@goalish is not a delimiter",
+			"@goals: also not one",
+			"@goal-foo @goal.foo @goal/foo stay in the body",
+		].join("\n");
+		const plan = await createUltragoalPlan({ cwd: root, brief });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.title).toBe("Real story");
+		expect(plan.goals[0]?.objective).toContain("@goalish is not a delimiter");
+		expect(plan.goals[0]?.objective).toContain("@goals: also not one");
+		expect(plan.goals[0]?.objective).toContain("@goal-foo @goal.foo @goal/foo stay in the body");
+	});
+
+	it("keeps a leading-indented first @goal line as objective text, not a delimiter", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "    @goal: Indented first line\nfollow-up detail" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.id).toBe("G001");
+		expect(plan.goals[0]?.objective).toBe("@goal: Indented first line\nfollow-up detail");
+	});
+
+	it("parses @goal:Title with no space after the colon", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal:First\nbody one\n\n@goal:Second\nbody two" });
+		expect(plan.goals.map(goal => goal.title)).toEqual(["First", "Second"]);
+	});
+
+	it("derives the title from the body for a bare @goal line", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal\nBare delimiter story\nmore detail" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.title).toBe("Bare delimiter story");
+		expect(plan.goals[0]?.objective).toBe("Bare delimiter story\nmore detail");
+	});
+
+	it("treats a tab after @goal as a boundary", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal\tTabbed title\nbody" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.title).toBe("Tabbed title");
+	});
+
+	it("does not treat a non-breaking space after @goal as a boundary", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: Real\n@goal\u00a0NotADelimiter still body" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.title).toBe("Real");
+		expect(plan.goals[0]?.objective).toContain("@goal\u00a0NotADelimiter still body");
+	});
+
+	it("keeps an indented @goal line inside the objective", async () => {
+		const root = await tempDir();
+		const brief = "@goal: Story\nUse a literal like:\n    @goal: not a real delimiter\ndone.";
+		const plan = await createUltragoalPlan({ cwd: root, brief });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.objective).toContain("    @goal: not a real delimiter");
+	});
+
+	it("keeps a mid-line @goal reference inside the objective", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Story\nThe sigil is @goal: when at column zero.",
+		});
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]?.objective).toBe("The sigil is @goal: when at column zero.");
+	});
+
+	it("uses the title as the objective for a title-only block", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: Just a title" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]).toMatchObject({ title: "Just a title", objective: "Just a title" });
+	});
+
+	it("derives the title from the first body line when the title is empty", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal:\nDerived title line\nmore detail" });
+		expect(plan.goals[0]?.title).toBe("Derived title line");
+		expect(plan.goals[0]?.objective).toBe("Derived title line\nmore detail");
+	});
+
+	it("clamps long titles to 80 characters", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: `@goal: ${"T".repeat(120)}\nbody` });
+		const title = plan.goals[0]?.title ?? "";
+		expect(title).toHaveLength(80);
+		expect(title.endsWith("...")).toBe(true);
+	});
+
+	it("rejects an empty @goal block without writing goals.json", async () => {
+		const adjacent = await tempDir();
+		await expect(createUltragoalPlan({ cwd: adjacent, brief: "@goal:\n@goal: Second\nbody" })).rejects.toThrow(
+			"has no title or objective",
+		);
+		expect(await goalsFileExists(adjacent)).toBe(false);
+
+		const trailing = await tempDir();
+		await expect(createUltragoalPlan({ cwd: trailing, brief: "@goal: First\nbody\n@goal:" })).rejects.toThrow(
+			"has no title or objective",
+		);
+		expect(await goalsFileExists(trailing)).toBe(false);
+	});
+
+	it("excludes preamble from goals but retains it in the brief", async () => {
+		const root = await tempDir();
+		const brief = "Global constraints: be fast.\n\n@goal: Only story\nDo the work.";
+		const plan = await createUltragoalPlan({ cwd: root, brief });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]).toMatchObject({ title: "Only story", objective: "Do the work." });
+		expect(plan.brief).toContain("Global constraints: be fast.");
+	});
+
+	it("pluralizes the create-goals summary by goal count", async () => {
+		const single = await tempDir();
+		const one = await runNativeUltragoalCommand(["create-goals", "--brief", "One story only"], single);
+		expect(one.stdout).toContain("with 1 goal at");
+		expect(one.stdout).not.toContain("with 1 goals");
+
+		const multi = await tempDir();
+		const three = await runNativeUltragoalCommand(
+			["create-goals", "--brief", "@goal: A\nfirst\n@goal: B\nsecond\n@goal: C\nthird"],
+			multi,
+		);
+		expect(three.stdout).toContain("with 3 goals at");
+	});
+
+	it("reflects a multi-goal plan in the HUD summary", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Parse\nstep one\n@goal: Normalize\nstep two\n@goal: Export\nstep three",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const summary = await getUltragoalStatus(root);
+		const hud = buildUltragoalHudSummary(summary);
+		const serialized = JSON.stringify(hud);
+		expect(serialized).toContain("0/3");
+		expect(serialized).toContain("G001:Parse");
+		expect(summary.status).toBe("active");
+	});
+
+	it("schedules each @goal story in order through the existing API", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Parse\nstep one\n@goal: Normalize\nstep two\n@goal: Export\nstep three",
+		});
+
+		const first = await startNextUltragoalGoal({ cwd: root });
+		expect(first.goal?.id).toBe("G001");
+		expect(first.goal?.objective).toBe("step one");
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first story verified",
+			gjcGoalJson: goalSnapshot(created.gjcObjective),
+			qualityGateJson: passingQualityGate(),
+		});
+
+		const second = await startNextUltragoalGoal({ cwd: root });
+		expect(second.goal?.id).toBe("G002");
+		expect(second.goal?.status).toBe("active");
+		expect(second.allComplete).toBe(false);
+
+		const status = await getUltragoalStatus(root);
+		expect(status.counts.complete).toBe(1);
+		expect(status.currentGoal?.id).toBe("G002");
+	});
+
+	it("splits CRLF briefs without retaining carriage returns", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: Parse\r\nstep one\r\n\r\n@goal: Normalize\r\nstep two",
+		});
+		expect(plan.goals.map(goal => goal.title)).toEqual(["Parse", "Normalize"]);
+		expect(plan.goals.map(goal => goal.objective)).toEqual(["step one", "step two"]);
+		for (const goal of plan.goals) {
+			expect(goal.title).not.toContain("\r");
+			expect(goal.objective).not.toContain("\r");
+		}
+	});
+
+	it("trims trailing whitespace on delimiter lines", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: First   \nbody\n@goal   \nSecond body" });
+		expect(plan.goals.map(goal => goal.title)).toEqual(["First", "Second body"]);
+		expect(plan.goals.map(goal => goal.objective)).toEqual(["body", "Second body"]);
+	});
+
+	it("collapses multiple blank lines between stories", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First\nfirst body\n\n\n\n@goal: Second\nsecond body",
+		});
+		expect(plan.goals.map(goal => goal.id)).toEqual(["G001", "G002"]);
+		expect(plan.goals[0]?.objective).toBe("first body");
+		expect(plan.goals[1]?.objective).toBe("second body");
+	});
+
+	it("ignores a single trailing blank line", async () => {
+		const root = await tempDir();
+		const plan = await createUltragoalPlan({ cwd: root, brief: "@goal: First\nfirst body\n" });
+		expect(plan.goals).toHaveLength(1);
+		expect(plan.goals[0]).toMatchObject({ title: "First", objective: "first body" });
+	});
+
+	it("preserves a very long objective without clamping it", async () => {
+		const root = await tempDir();
+		const longBody = "x".repeat(5000);
+		const plan = await createUltragoalPlan({ cwd: root, brief: `@goal: Long\n${longBody}` });
+		expect(plan.goals[0]?.title).toBe("Long");
+		expect(plan.goals[0]?.objective).toBe(longBody);
+		expect(plan.goals[0]?.objective).toHaveLength(5000);
 	});
 });

@@ -1,0 +1,18 @@
+{
+  "skill": "old-deep-interview",
+  "current_phase": "triage",
+  "phase": "triage",
+  "active": false,
+  "updated_at": "2026-05-02T09:00:00.000Z",
+  "legacy_spec_path": ".gjc/specs/legacy/deep.md",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Need requirements captured"
+    }
+  ],
+  "passthrough": {
+    "legacy": true,
+    "missing_version": true
+  }
+}

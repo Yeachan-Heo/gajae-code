@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-state-handoff-"));
@@ -56,6 +57,8 @@ describe("gjc state handoff", () => {
 			expect(payload.from).toBe("deep-interview");
 			expect(payload.to).toBe("ralplan");
 			expect(typeof payload.handoff_at).toBe("string");
+			expect(payload.ok).toBe(true);
+			expect(payload.state).toBeUndefined();
 			const handoffAt = payload.handoff_at as string;
 
 			const caller = await readJson(callerPath);
@@ -63,11 +66,13 @@ describe("gjc state handoff", () => {
 			expect(caller?.current_phase).toBe("handoff");
 			expect(caller?.handoff_to).toBe("ralplan");
 			expect(caller?.handoff_at).toBe(handoffAt);
+			expect(caller?.version).toBe(WORKFLOW_STATE_VERSION);
 
 			const callee = await readJson(path.join(cwd, ".gjc/state/ralplan-state.json"));
 			expect(callee?.active).toBe(true);
 			expect(callee?.handoff_from).toBe("deep-interview");
 			expect(callee?.handoff_at).toBe(handoffAt);
+			expect(callee?.version).toBe(WORKFLOW_STATE_VERSION);
 
 			const activeState = await readJson(path.join(cwd, ".gjc/state/skill-active-state.json"));
 			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
@@ -82,6 +87,35 @@ describe("gjc state handoff", () => {
 			expect(di?.active).toBe(false);
 			expect(di?.handoff_to).toBe("ralplan");
 			expect(di?.handoff_at).toBe(handoffAt);
+		});
+	});
+
+	it("normalizes legacy caller and callee envelopes to v2 during handoff", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			const calleePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			await writeJson(calleePath, {
+				skill: "ralplan",
+				active: false,
+				current_phase: "planner",
+			});
+
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+
+			expect(result.status).toBe(0);
+			const caller = await readJson(callerPath);
+			const callee = await readJson(calleePath);
+			expect(caller?.version).toBe(2);
+			expect(callee?.version).toBe(2);
 		});
 	});
 
