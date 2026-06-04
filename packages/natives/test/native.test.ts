@@ -11,6 +11,7 @@ import {
 	glob,
 	grep,
 	htmlToMarkdown,
+	initNativeCrashDiagnostics,
 	invalidateFsScanCache,
 	listWorkspace,
 	MacOSPowerAssertion,
@@ -82,6 +83,11 @@ describe("pi-natives", () => {
 		return async () => {
 			await cleanupFixtures();
 		};
+	});
+
+	it("keeps native crash diagnostics opt-in", () => {
+		delete process.env.GJC_NATIVE_CRASH_DIAGNOSTICS;
+		expect(initNativeCrashDiagnostics()).toBe(false);
 	});
 
 	describe("summarize", () => {

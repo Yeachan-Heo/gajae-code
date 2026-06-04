@@ -24,6 +24,7 @@
 pub mod appearance;
 pub mod ast;
 pub mod clipboard;
+pub mod crash;
 pub mod fd;
 pub mod fs_cache;
 pub mod glob;

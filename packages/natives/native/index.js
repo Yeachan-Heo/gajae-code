@@ -14,6 +14,7 @@ import { loadNative } from "./loader-state.js";
  */
 
 const nativeBindings = loadNative();
+nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
@@ -41,6 +42,7 @@ export const grep = nativeBindings.grep;
 export const hasMatch = nativeBindings.hasMatch;
 export const highlightCode = nativeBindings.highlightCode;
 export const htmlToMarkdown = nativeBindings.htmlToMarkdown;
+export const initNativeCrashDiagnostics = nativeBindings.initNativeCrashDiagnostics;
 export const invalidateFsScanCache = nativeBindings.invalidateFsScanCache;
 export const isoBackend = nativeBindings.isoBackend;
 export const isoDiff = nativeBindings.isoDiff;

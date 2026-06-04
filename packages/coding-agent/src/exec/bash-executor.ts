@@ -7,6 +7,7 @@ import * as fs from "node:fs/promises";
 import { executeShell, type MinimizerOptions, Shell } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
+import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
@@ -303,6 +304,21 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
 				}
 			}
+		}
+
+		const crashReport = await writeCrashReport(
+			{
+				kind: "bash",
+				command: [shell, "-lc", finalCommand],
+				exitCode: winner.result.exitCode,
+				stderr: undefined,
+			},
+			{ cwd: commandCwd },
+		);
+		const crashNotice = formatCrashDiagnosticNotice(crashReport);
+		if (crashNotice) {
+			const separator = "\n";
+			sink.push(`${separator}${crashNotice}\n`);
 		}
 
 		// Normal completion

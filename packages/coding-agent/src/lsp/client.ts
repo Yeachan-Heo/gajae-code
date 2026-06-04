@@ -1,4 +1,5 @@
 import { isEnoent, logger, ptree, untilAborted } from "@gajae-code/utils";
+import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
@@ -486,7 +487,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 		clients.set(key, client);
 
 		// Register crash recovery - remove client on process exit
-		proc.exited.then(() => {
+		proc.exited.then(async () => {
 			clients.delete(key);
 			clientLocks.delete(key);
 			client.resolveProjectLoaded();
@@ -501,9 +502,24 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 					.filter(line => !/^\[\d{2}:\d{2}:\d{2} (?:INF|DBG|VRB)\]/.test(line))
 					.join("\n")
 					.trim();
+				const crashNotice = formatCrashDiagnosticNotice(
+					await writeCrashReport(
+						{
+							kind: "lsp",
+							command: [command, ...args],
+							exitCode: proc.exitCode,
+							stderr,
+							protocol: "lsp",
+						},
+						{ cwd },
+					),
+				);
+				const diagnosticSuffix = crashNotice ? `\n${crashNotice}` : "";
 				const code = proc.exitCode;
 				const err = new Error(
-					stderr ? `LSP server exited (code ${code}): ${stderr}` : `LSP server exited unexpectedly (code ${code})`,
+					stderr
+						? `LSP server exited (code ${code}): ${stderr}${diagnosticSuffix}`
+						: `LSP server exited unexpectedly (code ${code})${diagnosticSuffix}`,
 				);
 				for (const pending of client.pendingRequests.values()) {
 					pending.reject(err);

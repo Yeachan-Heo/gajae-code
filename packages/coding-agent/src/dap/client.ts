@@ -1,4 +1,5 @@
 import { logger, ptree } from "@gajae-code/utils";
+import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { ToolAbortError } from "../tools/tool-errors";
 import type {
@@ -532,15 +533,28 @@ export class DapClient {
 		}
 	}
 
-	#handleProcessExit(): void {
+	async #handleProcessExit(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		const stderr = this.proc.peekStderr().trim();
 		const exitCode = this.proc.exitCode;
+		const crashNotice = formatCrashDiagnosticNotice(
+			await writeCrashReport(
+				{
+					kind: "dap",
+					command: [this.adapter.resolvedCommand, ...this.adapter.args],
+					exitCode,
+					stderr,
+					protocol: this.adapter.connectMode ?? "stdio",
+				},
+				{ cwd: this.cwd },
+			),
+		);
+		const diagnosticSuffix = crashNotice ? `\n${crashNotice}` : "";
 		const error = new Error(
 			stderr
-				? `DAP adapter exited (code ${exitCode}): ${stderr}`
-				: `DAP adapter exited unexpectedly (code ${exitCode})`,
+				? `DAP adapter exited (code ${exitCode}): ${stderr}${diagnosticSuffix}`
+				: `DAP adapter exited unexpectedly (code ${exitCode})${diagnosticSuffix}`,
 		);
 		this.#rejectPendingRequests(error);
 	}
