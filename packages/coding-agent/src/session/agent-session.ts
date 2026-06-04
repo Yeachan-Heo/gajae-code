@@ -8495,13 +8495,17 @@ export class AgentSession {
 				return;
 			}
 			if (this.isStreaming) {
-				setTimeout(attempt, 50);
+				// Re-poll while streaming, but do not let this housekeeping timer
+				// keep the event loop alive on its own (CPU-7).
+				const pollTimer = setTimeout(attempt, 50);
+				pollTimer.unref?.();
 				return;
 			}
 			this.#scheduledBackgroundExchangeFlush = false;
 			this.#flushPendingBackgroundExchanges();
 		};
-		setTimeout(attempt, 0);
+		const kickoff = setTimeout(attempt, 0);
+		kickoff.unref?.();
 	}
 
 	#flushPendingBackgroundExchanges(): void {
