@@ -146,9 +146,9 @@ function hasNonEmptyPreview(raw: SingleResult): boolean {
 export function buildTaskRoi(raw: SingleResult): TaskRoi {
 	const outputBytes = raw.outputMeta?.byteSize ?? (raw.outputMeta ? Buffer.byteLength(raw.output, "utf8") : undefined);
 	const outputLines = raw.outputMeta?.lineCount;
-	const producedChanges = Boolean(
-		raw.patchPath || raw.branchName || (Array.isArray(raw.nestedPatches) && raw.nestedPatches.length > 0),
-	);
+	const producedChanges =
+		raw.producedChanges ??
+		Boolean(raw.branchName || (Array.isArray(raw.nestedPatches) && raw.nestedPatches.length > 0));
 	const status = getStatus(raw);
 	const terminal = status !== "paused" && !raw.aborted;
 	const materialContribution = Boolean(

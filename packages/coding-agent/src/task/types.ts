@@ -307,6 +307,8 @@ export interface SingleResult {
 	branchName?: string;
 	/** Nested repo patches to apply after parent merge */
 	nestedPatches?: NestedRepoPatch[];
+	/** Whether isolated execution produced a non-empty root or nested patch. */
+	producedChanges?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -339,6 +341,7 @@ export interface TaskToolDetails {
 		totalTokens: number;
 		totalCostTotal?: number;
 		totalClonedTokens?: number;
+		/** Advisory ids for terminal children that spent tokens without detectable output/review/changes. */
 		lowRoiChildIds: string[];
 	};
 	progress?: AgentProgress[];

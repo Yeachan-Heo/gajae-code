@@ -35,6 +35,7 @@ describe("task ROI", () => {
 		const roi = buildTaskRoi(
 			makeRaw({
 				patchPath: "/tmp/0-Test.patch",
+				producedChanges: true,
 				outputMeta: { lineCount: 1, charCount: 13, byteSize: 13 },
 				usage: CANONICAL_USAGE,
 			}),
@@ -49,6 +50,23 @@ describe("task ROI", () => {
 			materialContribution: true,
 			lowRoi: false,
 		});
+	});
+
+	it("does not count an empty patch artifact path as produced changes", () => {
+		const roi = buildTaskRoi(
+			makeRaw({
+				output: "",
+				stderr: "",
+				patchPath: "/tmp/0-Test.patch",
+				producedChanges: false,
+				outputMeta: { lineCount: 0, charCount: 0, byteSize: 0 },
+				tokens: 5,
+			}),
+		);
+
+		expect(roi.producedChanges).toBe(false);
+		expect(roi.materialContribution).toBe(false);
+		expect(roi.lowRoi).toBe(true);
 	});
 
 	it("marks a completed token-spending child with zero output and no changes as low ROI", () => {

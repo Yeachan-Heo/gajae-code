@@ -1369,10 +1369,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								task.description,
 								commitMsg,
 							);
+							const producedChanges = Boolean(commitResult?.branchName || commitResult?.nestedPatches.length);
 							return {
 								...resultWithForkContext,
 								branchName: commitResult?.branchName,
 								nestedPatches: commitResult?.nestedPatches,
+								producedChanges,
 							};
 						} catch (mergeErr) {
 							// Agent succeeded but branch commit failed — clean up stale branch
@@ -1387,10 +1389,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
 							const patchPath = path.join(effectiveArtifactsDir, `${task.id}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
+							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
 							return {
 								...resultWithForkContext,
 								patchPath,
 								nestedPatches: delta.nestedPatches,
+								producedChanges,
 							};
 						} catch (patchErr) {
 							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
