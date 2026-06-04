@@ -3,6 +3,7 @@ import {
 	type AgentEvent,
 	type AgentMessage,
 	type AgentTelemetryConfig,
+	type AgentTelemetryWarning,
 	type AgentTool,
 	AppendOnlyContextManager,
 	INTENT_FIELD,
@@ -49,7 +50,7 @@ export function warnIfEnvFullContentCaptureActive(telemetry: AgentTelemetryConfi
 		message:
 			`${CONTENT_CAPTURE_ENV}=full enables full GenAI message content capture. ` +
 			`Use ${CONTENT_CAPTURE_ENV}=summary for bounded telemetry summaries.`,
-	};
+	} satisfies AgentTelemetryWarning;
 	try {
 		telemetry.onTelemetryWarning?.(warning);
 	} catch (error) {

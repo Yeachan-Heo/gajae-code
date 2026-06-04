@@ -271,20 +271,22 @@ export interface AgentIdentity {
 	readonly description?: string;
 }
 
+export type AgentTelemetryWarningCode =
+	| "resolve_attributes_failed"
+	| "content_serializer_failed"
+	| "on_cost_delta_failed"
+	| "on_chat_usage_failed"
+	| "cost_estimator_failed"
+	| "on_run_end_failed"
+	| "on_span_start_failed"
+	| "on_span_end_failed"
+	| "normalize_agent_name_failed"
+	| "normalize_provider_failed"
+	| "full_content_capture_env_active"
+	| "on_telemetry_warning_failed";
+
 export interface AgentTelemetryWarning {
-	readonly code:
-		| "resolve_attributes_failed"
-		| "content_serializer_failed"
-		| "on_cost_delta_failed"
-		| "on_chat_usage_failed"
-		| "cost_estimator_failed"
-		| "on_run_end_failed"
-		| "on_span_start_failed"
-		| "on_span_end_failed"
-		| "normalize_agent_name_failed"
-		| "normalize_provider_failed"
-		| "full_content_capture_env_active"
-		| "on_telemetry_warning_failed";
+	readonly code: AgentTelemetryWarningCode;
 	readonly message: string;
 	readonly error?: unknown;
 }
