@@ -59,7 +59,8 @@ function isOwnerLivenessBlocker(blocker: string): boolean {
 function reconcileLiveOwnerState(state: SessionState): { state: SessionState; reconciled: boolean } {
 	const blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
 	const hadLivenessBlocker = blockers.length !== state.blockers.length;
-	const lifecycle = hadLivenessBlocker && state.lifecycle === "blocked" && blockers.length === 0 ? "observing" : state.lifecycle;
+	const lifecycle =
+		hadLivenessBlocker && state.lifecycle === "blocked" && blockers.length === 0 ? "observing" : state.lifecycle;
 	if (!hadLivenessBlocker && lifecycle === state.lifecycle) return { state, reconciled: false };
 	return {
 		state: {
@@ -71,7 +72,6 @@ function reconcileLiveOwnerState(state: SessionState): { state: SessionState; re
 		reconciled: true,
 	};
 }
-
 
 export interface OwnerOptions {
 	root: string;

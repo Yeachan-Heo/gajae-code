@@ -872,6 +872,7 @@ export class AgentSession {
 	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#lastGoalReminderAssistantTimestamp: number | undefined = undefined;
 	#todoPhases: TodoPhase[] = [];
 	#toolChoiceQueue = new ToolChoiceQueue();
 
@@ -2055,6 +2056,9 @@ export class AgentSession {
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
 				if (this.#enforceRewindBeforeYield()) {
+					return;
+				}
+				if (await this.#checkGoalCompletion(msg)) {
 					return;
 				}
 				await this.#checkTodoCompletion();
@@ -6351,6 +6355,39 @@ export class AgentSession {
 			},
 			toolChoice: todoWriteToolChoice,
 		};
+	}
+
+	async #checkGoalCompletion(assistantMessage: AssistantMessage): Promise<boolean> {
+		const state = this.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") {
+			this.#lastGoalReminderAssistantTimestamp = undefined;
+			return false;
+		}
+		if (this.#lastGoalReminderAssistantTimestamp === assistantMessage.timestamp) {
+			return false;
+		}
+		this.#lastGoalReminderAssistantTimestamp = assistantMessage.timestamp;
+
+		const continuationPrompt = this.#goalRuntime.buildContinuationPrompt();
+		if (!continuationPrompt) return false;
+		const reminder = [
+			"<system-reminder>",
+			"You stopped while a goal is still active and uncleared.",
+			"Continue working on the active goal until it is verified complete, paused, or dropped.",
+			"",
+			continuationPrompt,
+			"</system-reminder>",
+		].join("\n");
+
+		logger.debug("Goal completion: sending active-goal reminder", { goalId: state.goal.id });
+		this.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: reminder }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		return true;
 	}
 	/**
 	 * Check if agent stopped with incomplete todos and prompt to continue.
