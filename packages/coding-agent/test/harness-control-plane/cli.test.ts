@@ -59,13 +59,21 @@ function git(args: string[]): void {
 	if (proc.exitCode !== 0) throw new Error(proc.stderr.toString() || `git ${args.join(" ")} failed`);
 }
 
+function gitOutput(args: string[]): string {
+	const proc = Bun.spawnSync(["git", ...args], { cwd: workspace, stdout: "pipe", stderr: "pipe" });
+	if (proc.exitCode !== 0) throw new Error(proc.stderr.toString() || `git ${args.join(" ")} failed`);
+	return proc.stdout.toString().trim();
+}
+
 async function initCleanGitWorkspace(): Promise<void> {
+	if (await Bun.file(path.join(workspace, ".git")).exists()) return;
 	git(["init"]);
 	git(["config", "user.email", "test@example.com"]);
 	git(["config", "user.name", "Test User"]);
 	await writeFile(path.join(workspace, "README.md"), "fixture\n", "utf8");
 	git(["add", "README.md"]);
 	git(["commit", "-m", "init"]);
+	git(["checkout", "-b", "feature/harness"]);
 }
 
 async function appendSignal(sessionId: string, cursor: number, signal: string): Promise<void> {
@@ -83,6 +91,63 @@ async function appendSignal(sessionId: string, cursor: number, signal: string): 
 }
 
 describe("gjc harness CLI (foundation)", () => {
+	it("preflight rejects a declared branch that differs from the actual checkout", async () => {
+		await initCleanGitWorkspace();
+		const res = runHarness([
+			"preflight",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, branch: "gajae-code-pr-265-review", issueOrPr: "PR-265" }),
+		]);
+		expect(res.code).toBe(1);
+		expect(res.json.ok).toBe(false);
+		expect(res.json.evidence.preflight.blockers).toContain("branch-mismatch");
+		expect(res.json.evidence.preflight.actualBranch).toBe("feature/harness");
+		expect(res.json.evidence.preflight.declaredBranch).toBe("gajae-code-pr-265-review");
+		expect(res.json.evidence.preflight.normalizedIssueOrPr).toBe("265");
+	});
+
+	it("normalizes recognized issueOrPr forms and rejects ambiguous mixed ids", async () => {
+		await initCleanGitWorkspace();
+		for (const issueOrPr of [
+			265,
+			"265",
+			"#265",
+			"PR-265",
+			"pr_265",
+			"Yeachan-Heo/gajae-code#265",
+			"https://github.com/Yeachan-Heo/gajae-code/pull/265",
+		]) {
+			const res = runHarness([
+				"preflight",
+				"--input",
+				JSON.stringify({ harness: "gajae-code", workspace, issueOrPr }),
+			]);
+			expect(res.code).toBe(0);
+			expect(res.json.evidence.preflight.normalizedIssueOrPr).toBe("265");
+		}
+
+		const bad = runHarness([
+			"preflight",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, issueOrPr: "pr-2725-recovery" }),
+		]);
+		expect(bad.code).toBe(1);
+		expect(bad.json.evidence.preflight.blockers).toContain("invalid_issue_or_pr:pr-2725-recovery");
+	});
+
+	it("start persists normalized branch and issueOrPr metadata", async () => {
+		await initCleanGitWorkspace();
+		const branch = gitOutput(["rev-parse", "--abbrev-ref", "HEAD"]);
+		const res = runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, branch, issueOrPr: "owner/repo#266" }),
+		]);
+		expect(res.code).toBe(0);
+		expect(res.json.evidence.handle.branch).toBe(branch);
+		expect(res.json.evidence.handle.issueOrPr).toBe("266");
+		expect(res.json.evidence.preflight.ok).toBe(true);
+	});
 	it("start creates a session and reports submit owner-not-live", () => {
 		const res = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
 		expect(res.code).toBe(0);
