@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Render terminal-pasted clipboard image temp paths as compact `[image N]` prompt placeholders while attaching the image payload, instead of inserting the raw `/var/folders/.../clipboard-*.png` path text.
+
 ## [0.3.0] - 2026-06-03
 
 ### Added
