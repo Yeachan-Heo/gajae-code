@@ -27,10 +27,13 @@ Subagents have no conversation history. Every fact, file path, and direction the
 - `.inheritContext` (optional): `true` requests a sanitized, bounded forked snapshot of the parent conversation for this task. Works only when the global `task.forkContext.enabled` setting is true and the target agent declares `forkContext: allowed`; otherwise the call is rejected. Bundled agents that support it: `executor`, `architect`. Use it when the subagent's value depends on what the parent has already established (architect reviewing code the parent has been discussing; executor continuing a mid-investigation handoff). Skip it for independent work — passing context the child will not use wastes tokens. The child runs under its own agent-specific system prompt and tool surface, so treat seeded tokens as full re-billing rather than a prefix-cache hit.
 {{/if}}
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
+- `spawnPlan` (optional): required before any batch with more than 4 tasks, and before a reviewer agent spawns `explore`; include whyParallel, whyNotLocal, independence, expectedReceiptShape, and maxInlineTokens.
 {{#if isolationEnabled}}- `isolated`: run in isolated env; use when tasks edit overlapping files{{/if}}
 </parameters>
 
 <rules>
+- HARD runtime gate: calls with more than 4 tasks are rejected before any child launches unless `spawnPlan` is complete.
+- Reviewer->explore gate: a `reviewer` spawning `explore` is rejected before launch unless `spawnPlan` is complete, even for a single task.
 - NEVER assign tasks to run project-wide build/test/lint. Caller verifies after the batch.
 - **Subagents do not verify, lint, or format.** Every assignment MUST instruct the subagent to skip all gates and formatters. You run them once at the end across the union of changed files — avoids redundant runs and racing formatter passes.
 {{#if ircEnabled}}

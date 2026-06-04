@@ -51,6 +51,7 @@ import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import { DEFAULT_SPAWN_THRESHOLD, evaluateReviewerExploreGate, evaluateSpawnGate } from "./spawn-gate";
 import {
 	applyNestedPatches,
 	captureBaseline,
@@ -272,6 +273,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
+	readonly #spawningAgentType: string | undefined;
 
 	get parameters(): TaskToolSchemaInstance {
 		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
@@ -303,6 +305,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		discoveredAgents: AgentDefinition[],
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
+		this.#spawningAgentType = $env.PI_BLOCKED_AGENT;
 		this.#discoveredAgents = discoveredAgents;
 	}
 
@@ -371,6 +374,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		);
 		if (forkContextValidationError) {
 			return createTaskModeError(forkContextValidationError);
+		}
+
+		const batchGateDecision = evaluateSpawnGate({ childCount: taskItems.length, plan: params.spawnPlan });
+		if (batchGateDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected this batch: ${batchGateDecision.reason}. Batches with more than ${DEFAULT_SPAWN_THRESHOLD} tasks require spawnPlan fields: ${batchGateDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+			};
+		}
+
+		const reviewerExploreDecision = evaluateReviewerExploreGate({
+			spawningAgentType: this.#spawningAgentType,
+			targetAgent: params.agent,
+			plan: params.spawnPlan,
+		});
+		if (reviewerExploreDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected reviewer->explore: ${reviewerExploreDecision.reason}. Provide spawnPlan fields: ${reviewerExploreDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+			};
 		}
 
 		const manager = AsyncJobManager.instance();
@@ -924,6 +957,44 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					projectAgentsDir,
 					results: [],
 					totalDurationMs: 0,
+				},
+			};
+		}
+
+		const batchGateDecision = evaluateSpawnGate({ childCount: tasks.length, plan: params.spawnPlan });
+		if (batchGateDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected this batch: ${batchGateDecision.reason}. Batches with more than ${DEFAULT_SPAWN_THRESHOLD} tasks require spawnPlan fields: ${batchGateDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: {
+					projectAgentsDir,
+					results: [],
+					totalDurationMs: Date.now() - startTime,
+				},
+			};
+		}
+
+		const reviewerExploreDecision = evaluateReviewerExploreGate({
+			spawningAgentType: this.#spawningAgentType,
+			targetAgent: agentName,
+			plan: params.spawnPlan,
+		});
+		if (reviewerExploreDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected reviewer->explore: ${reviewerExploreDecision.reason}. Provide spawnPlan fields: ${reviewerExploreDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: {
+					projectAgentsDir,
+					results: [],
+					totalDurationMs: Date.now() - startTime,
 				},
 			};
 		}

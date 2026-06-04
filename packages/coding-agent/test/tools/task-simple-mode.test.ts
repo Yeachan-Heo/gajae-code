@@ -23,7 +23,13 @@ const TEST_AGENTS = [
 		blocking: true,
 	},
 ];
-
+const COMPLETE_SPAWN_PLAN = {
+	whyParallel: "Independent test tasks can run together.",
+	whyNotLocal: "Serial local execution would waste coordination time.",
+	independence: "Each task has disjoint acceptance criteria.",
+	expectedReceiptShape: "Each task returns a concise receipt.",
+	maxInlineTokens: 1000,
+};
 type CapturedRegister = {
 	type: "bash" | "task";
 	label: string;
@@ -88,6 +94,93 @@ describe("task.simple", () => {
 		expect(tool.description).not.toContain("- `schema`:");
 	});
 
+	it("keeps spawnPlan available in every simple mode", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		for (const mode of ["default", "schema-free", "independent"] as const) {
+			const tool = await TaskTool.create(createSession({ "task.simple": mode }));
+			const properties = getSchemaProperties(tool);
+			expect(properties.spawnPlan).toBeDefined();
+		}
+	});
+
+	it("rejects a five-task batch before scheduling without spawnPlan", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const captured: CapturedRegister[] = [];
+		const manager = {
+			register: (
+				type: "bash" | "task",
+				label: string,
+				_run: (ctx: {
+					jobId: string;
+					signal: AbortSignal;
+					reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+				}) => Promise<string>,
+				options?: AsyncJobRegisterOptions,
+			): string => {
+				captured.push({ type, label, options });
+				return options?.id ?? label;
+			},
+		};
+		AsyncJobManager.setInstance(manager as unknown as AsyncJobManager);
+
+		const tool = await TaskTool.create(createSession());
+		const tasks = Array.from({ length: 5 }, (_, index) => ({
+			id: `Task${index}`,
+			description: `label ${index}`,
+			assignment: `Do work ${index}.`,
+		}));
+		const result = await tool.execute("tool-gated", { agent: "task", tasks } as TaskParams);
+
+		expect(captured).toHaveLength(0);
+		expect(result.details?.results).toEqual([]);
+		expect(getFirstText(result)).toContain("Task spawn gate rejected this batch");
+	});
+
+	it("allows a five-task batch with complete spawnPlan to schedule", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const captured: CapturedRegister[] = [];
+		const manager = {
+			register: (
+				type: "bash" | "task",
+				label: string,
+				_run: (ctx: {
+					jobId: string;
+					signal: AbortSignal;
+					reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+				}) => Promise<string>,
+				options?: AsyncJobRegisterOptions,
+			): string => {
+				captured.push({ type, label, options });
+				return options?.id ?? label;
+			},
+		};
+		AsyncJobManager.setInstance(manager as unknown as AsyncJobManager);
+
+		const tool = await TaskTool.create(createSession());
+		const tasks = Array.from({ length: 5 }, (_, index) => ({
+			id: `Task${index}`,
+			description: `label ${index}`,
+			assignment: `Do work ${index}.`,
+		}));
+		const result = await tool.execute("tool-allowed", {
+			agent: "task",
+			tasks,
+			spawnPlan: COMPLETE_SPAWN_PLAN,
+		} as TaskParams);
+
+		expect(captured).toHaveLength(5);
+		expect(getFirstText(result)).toContain("Started 5 background task jobs");
+	});
 	it("rejects direct schema and context fields when the mode disables them", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: TEST_AGENTS,

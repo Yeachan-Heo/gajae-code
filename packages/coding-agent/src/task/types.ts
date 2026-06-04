@@ -4,6 +4,7 @@ import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { TaskResultReceipt } from "./receipt";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import type { SpawnPlanReceipt } from "./spawn-gate";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
@@ -60,6 +61,15 @@ export interface SubagentLifecyclePayload {
 }
 
 const assignmentDescription = "per-task instructions; self-contained";
+const spawnPlanSchema = z
+	.object({
+		whyParallel: z.string(),
+		whyNotLocal: z.string(),
+		independence: z.string(),
+		expectedReceiptShape: z.string(),
+		maxInlineTokens: z.number(),
+	})
+	.describe("justification required before spawning more than four tasks or reviewer-spawned explore tasks");
 
 const createTaskItemSchema = (_contextEnabled: boolean) =>
 	z.object({
@@ -83,6 +93,7 @@ const createTaskSchema = (options: { isolationEnabled: boolean; simpleMode: Task
 	let schema = z.object({
 		agent: z.string().describe("agent type"),
 		tasks: z.array(itemSchema).describe("tasks to execute in parallel"),
+		spawnPlan: spawnPlanSchema.optional(),
 	});
 	if (contextEnabled) {
 		schema = schema.extend({
@@ -140,6 +151,7 @@ export interface TaskParams {
 	agent: string;
 	context?: string;
 	schema?: string;
+	spawnPlan?: SpawnPlanReceipt;
 	tasks: TaskItem[];
 	isolated?: boolean;
 }
