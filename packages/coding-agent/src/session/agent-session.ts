@@ -975,10 +975,9 @@ export class AgentSession {
 	/** One-shot flag armed by `abort({ silent: true })` (e.g. Esc consuming a
 	 *  queued steer). Consumed in #handleAgentEvent to stamp `SILENT_ABORT_MARKER`
 	 *  on the resulting aborted assistant `message_end` so the interrupt does not
-	 *  surface a red "Operation aborted" line; cleared in `abort` as a safety net
-	 *  when the abort produces no aborted message_end. */
+	 *  surface a red "Operation aborted" line; cleared by a later non-silent abort
+	 *  or by `abort`'s safety net when no aborted message_end is produced. */
 	#silentAbortPending = false;
-
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -5097,6 +5096,8 @@ export class AgentSession {
 	}): Promise<void> {
 		if (options?.silent) {
 			this.#silentAbortPending = true;
+		} else {
+			this.#silentAbortPending = false;
 		}
 		this.abortRetry();
 		this.#promptGeneration++;

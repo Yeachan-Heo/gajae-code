@@ -132,6 +132,29 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(session.isPlanCompactAbortPending).toBe(false);
 	});
 
+	it("does not let a pending silent abort silence a later real abort", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const waitForIdleGate = Promise.withResolvers<void>();
+		vi.spyOn(session.agent, "waitForIdle").mockImplementation(() => waitForIdleGate.promise);
+
+		const silentAbort = session.abort({ silent: true });
+		await Promise.resolve();
+
+		const realAbort = session.abort();
+		await Promise.resolve();
+
+		const message = makeAbortedAssistantMessage();
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(message.errorMessage).toBeUndefined();
+
+		waitForIdleGate.resolve();
+		await Promise.all([silentAbort, realAbort]);
+	});
+
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
