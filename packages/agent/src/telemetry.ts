@@ -283,6 +283,7 @@ export interface AgentTelemetryWarning {
 		| "on_span_end_failed"
 		| "normalize_agent_name_failed"
 		| "normalize_provider_failed"
+		| "full_content_capture_env_active"
 		| "on_telemetry_warning_failed";
 	readonly message: string;
 	readonly error?: unknown;
@@ -322,12 +323,14 @@ export interface AgentTelemetryConfig {
 	/** Override the tracer name passed to `trace.getTracer`. */
 	readonly tracerName?: string;
 	/**
-	 * Capture request/response content. `true` preserves the historical full
-	 * payload capture; `"summary"` emits bounded dashboard-friendly summaries;
-	 * `"full"` emits both summaries and full OTEL message payloads.
+	 * Capture request/response content. Programmatic `true` preserves the
+	 * historical full payload capture because code config is an explicit opt-in;
+	 * `"summary"` emits bounded dashboard-friendly summaries; `"full"` emits
+	 * both summaries and full OTEL message payloads.
 	 *
 	 * Defaults to the value of the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
-	 * env var (`true`/`1`/`yes` => `"full"`, `"summary"` => `"summary"`).
+	 * env var (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
+	 * `"full"` => `"full"`).
 	 */
 	readonly captureMessageContent?: TelemetryContentCapture;
 	/** Extra attributes merged onto every emitted span. */
@@ -436,13 +439,18 @@ function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 		return "none";
 	}
 	const normalized = raw.trim().toLowerCase();
-	if (normalized === "summary") {
+	if (normalized === "full") {
+		contentCaptureEnvCache = "full";
+	} else if (normalized === "summary" || normalized === "true" || normalized === "1" || normalized === "yes") {
 		contentCaptureEnvCache = "summary";
 	} else {
-		contentCaptureEnvCache =
-			normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "full" ? "full" : "none";
+		contentCaptureEnvCache = "none";
 	}
 	return contentCaptureEnvCache;
+}
+
+export function resetContentCaptureEnvCacheForTest(): void {
+	contentCaptureEnvCache = undefined;
 }
 
 function resolveContentCapture(value: TelemetryContentCapture | undefined): ResolvedTelemetryContentCapture {

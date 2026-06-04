@@ -17,6 +17,7 @@ import {
 	PiGenAIAttr,
 	recordHandoff,
 	recordManualChatTelemetry,
+	resetContentCaptureEnvCacheForTest,
 	resolveTelemetry,
 	type TelemetryHookContext,
 } from "@gajae-code/agent-core/telemetry";
@@ -52,6 +53,7 @@ beforeAll(() => {
 
 afterEach(() => {
 	exporter.reset();
+	resetContentCaptureEnvCacheForTest();
 });
 
 afterAll(async () => {
@@ -387,6 +389,130 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(responseText).toEqual(["hi back"]);
 		expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
 		expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
+	});
+
+	it.each([
+		"true",
+		"1",
+		"yes",
+		"summary",
+	])("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to summary capture", async value => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				telemetry: {},
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(JSON.parse(chat?.attributes[PiGenAIAttr.ResponseText] as string)).toEqual(["hi back"]);
+			expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.SystemInstructions]).toBeUndefined();
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
+	});
+
+	it("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=full to full capture", async () => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "full";
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				telemetry: {},
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(JSON.parse(chat?.attributes[GenAIAttr.InputMessages] as string)).toEqual([
+				{ role: "user", parts: [{ type: "text", content: "hi" }] },
+			]);
+			expect(JSON.parse(chat?.attributes[GenAIAttr.OutputMessages] as string)).toEqual([
+				{ role: "assistant", parts: [{ type: "text", content: "hi back" }], finish_reason: "stop" },
+			]);
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
+	});
+
+	it.each([
+		undefined,
+		"",
+		"none",
+		"false",
+		"garbage",
+	])("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to none", async value => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			if (value === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				telemetry: {},
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(chat?.attributes[PiGenAIAttr.RequestMessages]).toBeUndefined();
+			expect(chat?.attributes[PiGenAIAttr.ResponseText]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
+	});
+
+	it("keeps explicit captureMessageContent true as full capture even though env truthy maps to summary", async () => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "true";
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				telemetry: { captureMessageContent: true },
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(chat?.attributes[GenAIAttr.InputMessages]).toBeDefined();
+			expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeDefined();
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
 	});
 
 	it("invokes costEstimator and stamps pi.gen_ai.cost.estimated_usd", async () => {
