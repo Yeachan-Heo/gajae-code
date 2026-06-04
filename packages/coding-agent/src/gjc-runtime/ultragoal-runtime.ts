@@ -474,13 +474,57 @@ export function buildUltragoalHudSummary(
 	});
 }
 
-function titleFromBrief(brief: string): string {
-	const firstLine = brief
+function clampTitle(title: string): string {
+	return title.length > 80 ? `${title.slice(0, 77)}...` : title;
+}
+
+function firstNonEmptyLine(text: string): string | undefined {
+	return text
 		.split(/\r?\n/)
 		.map(line => line.trim())
 		.find(line => line.length > 0);
+}
+
+function titleFromBrief(brief: string): string {
+	const firstLine = firstNonEmptyLine(brief);
 	if (!firstLine) return "Complete ultragoal brief";
-	return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+	return clampTitle(firstLine);
+}
+
+// A reserved, column-0 (unindented) `@goal` line opens a story. The character
+// right after `@goal` must be `:`, whitespace, or end-of-line, so `@goalish`,
+// `@goals:`, `@goal-foo`, `@goal.foo`, and `@goal/foo` are ordinary objective
+// text, and indented or mid-line `@goal:` is never a delimiter.
+const GOAL_DELIMITER = /^@goal(?::|\s+|$)\s*(.*)$/;
+
+interface ParsedGoal {
+	title: string;
+	objective: string;
+}
+
+function parseGoalsFromBrief(brief: string): ParsedGoal[] {
+	const sections: { title: string; body: string[] }[] = [];
+	let current: { title: string; body: string[] } | undefined;
+	for (const line of brief.split(/\r?\n/)) {
+		const match = GOAL_DELIMITER.exec(line);
+		if (match) {
+			current = { title: match[1].trim(), body: [] };
+			sections.push(current);
+			continue;
+		}
+		current?.body.push(line);
+	}
+	if (sections.length === 0) {
+		return [{ title: titleFromBrief(brief), objective: brief.trim() }];
+	}
+	return sections.map((section, index) => {
+		const body = section.body.join("\n").trim();
+		const title = section.title || firstNonEmptyLine(body) || "";
+		if (!title && !body) {
+			throw new Error(`ultragoal @goal block ${index + 1} has no title or objective`);
+		}
+		return { title: clampTitle(title), objective: body || title };
+	});
 }
 
 export async function createUltragoalPlan(input: {
@@ -491,21 +535,23 @@ export async function createUltragoalPlan(input: {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
 	const now = new Date().toISOString();
+	// Parse the untrimmed brief so the raw-line delimiter contract holds: a
+	// leading-indented `@goal` on the first line must stay objective text rather
+	// than being promoted to column 0 by trimming.
+	const goals: UltragoalGoal[] = parseGoalsFromBrief(input.brief).map((goal, index) => ({
+		id: `G${String(index + 1).padStart(3, "0")}`,
+		title: goal.title,
+		objective: goal.objective,
+		status: "pending",
+		createdAt: now,
+		updatedAt: now,
+	}));
 	const plan: UltragoalPlan = {
 		version: 1,
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
-		goals: [
-			{
-				id: "G001",
-				title: titleFromBrief(brief),
-				objective: brief,
-				status: "pending",
-				createdAt: now,
-				updatedAt: now,
-			},
-		],
+		goals,
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -1264,7 +1310,7 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					createdPlan: true,
 					stdout: json
 						? `${JSON.stringify(plan, null, 2)}\n`
-						: `Created ultragoal plan with ${plan.goals.length} goal at ${getUltragoalPaths(cwd).goalsPath}.\n`,
+						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd).goalsPath}.\n`,
 				};
 			}
 			case "complete-goals":
