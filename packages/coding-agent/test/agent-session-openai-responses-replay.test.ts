@@ -509,7 +509,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 	});
 
-	it("spawns bundled executor and architect via TaskTool with inheritContext: true through the production path", async () => {
+	it("spawns bundled executor and architect via TaskTool with inheritContext: bounded through the production path", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentManager = SessionManager.create(tempDir, tempDir);
@@ -642,11 +642,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		await tool.execute("call-exec", {
 			agent: "executor",
-			tasks: [{ id: "ExecFork", description: "d", assignment: "a", inheritContext: true }],
+			tasks: [{ id: "ExecFork", description: "d", assignment: "a", inheritContext: "bounded" }],
 		});
 		await tool.execute("call-arch", {
 			agent: "architect",
-			tasks: [{ id: "ArchFork", description: "d", assignment: "a", inheritContext: true }],
+			tasks: [{ id: "ArchFork", description: "d", assignment: "a", inheritContext: "bounded" }],
 		});
 		try {
 			await manager.waitForAll();

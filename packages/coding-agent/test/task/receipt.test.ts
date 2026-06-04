@@ -150,6 +150,23 @@ describe("task result receipts", () => {
 		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
 	});
 
+	it("preserves numeric fork-context accounting on receipts and sanitized details", () => {
+		const raw = makeRaw({ forkContext: { mode: "bounded", clonedTokens: 42 } });
+		const receipt = buildTaskReceipt(raw);
+		expect(receipt.forkContext).toEqual({ mode: "bounded", clonedTokens: 42 });
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+
+		const sanitized = sanitizeTaskToolDetails({
+			projectAgentsDir: null,
+			results: [raw],
+			totalDurationMs: 10,
+			forkContextClonedTokens: 42,
+		});
+		expect(sanitized.results[0]?.forkContext).toEqual({ mode: "bounded", clonedTokens: 42 });
+		expect(sanitized.forkContextClonedTokens).toBe(42);
+		expect(findRawTaskLeakKeys(sanitized)).toEqual([]);
+	});
+
 	it("keeps raw output, stderr, error text, and filesystem paths out of public receipts", () => {
 		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
 		const secretPath = `/tmp/${sentinel}/0-Test.md`;

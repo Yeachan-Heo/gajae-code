@@ -34,6 +34,7 @@ export interface TaskResultReceipt {
 		findings?: Array<{ severity?: string; summary: string }>;
 	};
 	extractedToolCounts?: Record<string, number>;
+	forkContext?: SingleResult["forkContext"];
 }
 
 const BANNED_RAW_TASK_KEYS = new Set([
@@ -167,6 +168,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		outputUnavailable: outputRef ? undefined : true,
 		review: buildReview(raw),
 		extractedToolCounts,
+		forkContext: raw.forkContext,
 	};
 }
 
@@ -181,6 +183,7 @@ export interface RawTaskToolDetails {
 	totalDurationMs: number;
 	usage?: TaskToolDetails["usage"];
 	async?: TaskToolDetails["async"];
+	forkContextClonedTokens?: number;
 }
 
 /** Central converter from raw task details to receipt-only public details. */
@@ -190,6 +193,7 @@ export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetail
 		results: raw.results.map(buildTaskReceipt),
 		totalDurationMs: raw.totalDurationMs,
 		usage: raw.usage,
+		forkContextClonedTokens: raw.forkContextClonedTokens,
 		async: raw.async,
 	};
 }

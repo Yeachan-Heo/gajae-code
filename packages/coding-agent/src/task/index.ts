@@ -31,6 +31,7 @@ import { formatBytes, formatDuration } from "../tools/render-utils";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type ForkContextMode,
 	type ForkContextPolicy,
 	getTaskSchema,
 	type SingleResult,
@@ -229,13 +230,63 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 function getForkContextPolicy(agent: AgentDefinition): ForkContextPolicy {
 	return agent.forkContext ?? "forbidden";
 }
+const FORK_CONTEXT_MODES = [
+	"none",
+	"receipt",
+	"last-turn",
+	"bounded",
+	"full",
+] as const satisfies readonly ForkContextMode[];
+const FORK_CONTEXT_MODE_SET = new Set<unknown>(FORK_CONTEXT_MODES);
+const FORK_CONTEXT_REQUEST_MODES = ["receipt", "last-turn", "bounded", "full"] as const satisfies readonly Exclude<
+	ForkContextMode,
+	"none"
+>[];
+const FORK_CONTEXT_REQUEST_MODE_SET = new Set<unknown>(FORK_CONTEXT_REQUEST_MODES);
+
+function isValidForkContextMode(value: unknown): value is ForkContextMode {
+	return FORK_CONTEXT_MODE_SET.has(value);
+}
+
+function requestsForkContext(
+	task: Pick<TaskItem, "inheritContext">,
+): task is TaskItem & { inheritContext: Exclude<ForkContextMode, "none"> } {
+	return FORK_CONTEXT_REQUEST_MODE_SET.has(task.inheritContext);
+}
+
+function resolveForkSeedParamsForMode(
+	mode: ForkContextMode,
+	configuredMaxTokens: number,
+	model: Model | undefined,
+): { maxMessages: number; maxTokens: number } | undefined {
+	switch (mode) {
+		case "none":
+			return undefined;
+		case "receipt":
+			return { maxMessages: 1, maxTokens: 64 };
+		case "last-turn":
+			return { maxMessages: 2, maxTokens: 250 };
+		case "bounded":
+			return { maxMessages: 50, maxTokens: 250 };
+		case "full":
+			return { maxMessages: 500, maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
+		default:
+			return undefined;
+	}
+}
 
 function validateForkContextRequests(
 	tasks: readonly TaskItem[],
 	agent: AgentDefinition,
 	forkContextEnabled: boolean,
 ): string | undefined {
-	const requested = tasks.filter(task => task.inheritContext === true);
+	const invalidTaskIds = tasks
+		.filter(task => task.inheritContext !== undefined && !isValidForkContextMode(task.inheritContext as unknown))
+		.map(task => task.id);
+	if (invalidTaskIds.length > 0) {
+		return `Invalid inheritContext for task(s) ${invalidTaskIds.join(", ")}. Allowed modes: ${FORK_CONTEXT_MODES.join(", ")}.`;
+	}
+	const requested = tasks.filter(requestsForkContext);
 	if (requested.length === 0) return undefined;
 	const taskIds = requested.map(task => task.id).join(", ");
 	if (!forkContextEnabled) {
@@ -482,15 +533,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
-			if (task.inheritContext !== true) return undefined;
+			if (!requestsForkContext(task)) return undefined;
 			if (!this.session.buildForkContextSeed) {
 				throw new Error("Current session cannot build fork-context seeds.");
 			}
-			const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
 			const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+			const params = resolveForkSeedParamsForMode(task.inheritContext, configuredMaxTokens, this.session.model);
+			if (!params) return undefined;
 			return await this.session.buildForkContextSeed({
-				maxMessages,
-				maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+				...params,
 				signal,
 			});
 		};
@@ -1093,15 +1144,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			emitProgress();
 
 			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number]) => {
-				if (task.inheritContext !== true) return undefined;
+				if (!requestsForkContext(task)) return undefined;
 				if (!this.session.buildForkContextSeed) {
 					throw new Error("Current session cannot build fork-context seeds.");
 				}
-				const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
 				const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+				const params = resolveForkSeedParamsForMode(task.inheritContext, configuredMaxTokens, this.session.model);
+				if (!params) return undefined;
 				return await this.session.buildForkContextSeed({
-					maxMessages,
-					maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+					...params,
 					signal,
 				});
 			};
@@ -1116,9 +1167,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 			) => {
 				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
+				const forkContext = requestsForkContext(task)
+					? { mode: task.inheritContext, clonedTokens: forkContextSeed?.metadata.approximateTokens ?? 0 }
+					: undefined;
 				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
 				if (!isIsolated) {
-					return runSubprocess({
+					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
@@ -1162,6 +1216,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
+					return forkContext ? { ...result, forkContext } : result;
 				}
 
 				const taskStart = Date.now();
@@ -1220,7 +1275,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					if (mergeMode === "branch" && result.exitCode === 0) {
+					const resultWithForkContext = forkContext ? { ...result, forkContext } : result;
+					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
 						try {
 							const commitMsg =
 								commitStyle === "ai" && this.session.modelRegistry
@@ -1241,7 +1297,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								commitMsg,
 							);
 							return {
-								...result,
+								...resultWithForkContext,
 								branchName: commitResult?.branchName,
 								nestedPatches: commitResult?.nestedPatches,
 							};
@@ -1250,25 +1306,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							const branchName = `gjc/task/${task.id}`;
 							await git.branch.tryDelete(repoRoot, branchName);
 							const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-							return { ...result, error: `Merge failed: ${msg}` };
+							return { ...resultWithForkContext, error: `Merge failed: ${msg}` };
 						}
 					}
-					if (result.exitCode === 0) {
+					if (resultWithForkContext.exitCode === 0) {
 						try {
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
 							const patchPath = path.join(effectiveArtifactsDir, `${task.id}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
 							return {
-								...result,
+								...resultWithForkContext,
 								patchPath,
 								nestedPatches: delta.nestedPatches,
 							};
 						} catch (patchErr) {
 							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-							return { ...result, error: `Patch capture failed: ${msg}` };
+							return { ...resultWithForkContext, error: `Patch capture failed: ${msg}` };
 						}
 					}
-					return result;
+					return resultWithForkContext;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const assignment = task.assignment.trim();
@@ -1287,6 +1343,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						durationMs: Date.now() - taskStart,
 						tokens: 0,
 						modelOverride,
+						forkContext,
 						error: message,
 					};
 				} finally {
@@ -1331,6 +1388,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					abortReason: "Cancelled before start",
 				};
 			});
+			const forkContextClonedTokens = results.reduce(
+				(total, result) => total + (result.forkContext?.clonedTokens ?? 0),
+				0,
+			);
 
 			// Aggregate usage from executor results (already accumulated incrementally)
 			const aggregatedUsage = createUsageTotals();
@@ -1535,6 +1596,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				results: receipts,
 				totalDurationMs: totalDuration,
 				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
+				forkContextClonedTokens: forkContextClonedTokens > 0 ? forkContextClonedTokens : undefined,
 			};
 			assertNoRawTaskFields(details, "task.return.details");
 			return {
