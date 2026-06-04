@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner } from "../../src/harness-control-plane/owner";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
-import { readEvents, writeSessionState } from "../../src/harness-control-plane/storage";
+import { readEvents, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
 class FakeRpc implements HarnessRpc {
@@ -157,6 +157,27 @@ describe("RuntimeOwner (in-process integration)", () => {
 		expect(events.map(e => e.kind)).toContain("prompt_not_accepted");
 		const warn = events.find(e => e.kind === "prompt_not_accepted");
 		expect(warn?.severity).toBe("warn");
+	});
+
+	it("live owner reconcile clears stale vanished blockers and re-enables submit", async () => {
+		const rpc = new FakeRpc();
+		await writeSessionState(root, {
+			...seedState(root),
+			lifecycle: "blocked",
+			blockers: ["owner-vanished:dirty"],
+		});
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc, acceptanceTimeoutMs: 200 });
+		const info = await owner.start();
+
+		const obs = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>;
+
+		expect((obs.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((obs.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((obs.state as Record<string, unknown>).blockers).not.toContain("owner-vanished:dirty");
+		expect(obs.nextAllowedActions).toContainEqual({ verb: "submit", available: true });
+		const persisted = await readSessionState(root, SID);
+		expect(persisted?.lifecycle).toBe("observing");
+		expect(persisted?.blockers).not.toContain("owner-vanished:dirty");
 	});
 
 	it("observe is owner-routed and reports ownerLive; retire releases the lease", async () => {

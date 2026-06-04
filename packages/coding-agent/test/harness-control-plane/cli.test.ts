@@ -183,7 +183,7 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.code).toBe(0);
 		assertContract(res.json);
 		expect(res.json.state.ownerLive).toBe(false);
-		expect(res.json.state.lifecycle).toBe("observing");
+		expect(res.json.state.lifecycle).toBe("completed");
 		expect(res.json.state.blockers).not.toContain("owner-vanished:clean");
 		expect(res.json.evidence.ownerVanished).toBeUndefined();
 		expect(res.json.evidence.blockerReason).toBeUndefined();
@@ -199,8 +199,45 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.json.evidence.observation.observedSignals).not.toContain("completed");
 
 		const persisted = await readSessionState(root, sessionId);
-		expect(persisted?.lifecycle).toBe("observing");
+		expect(persisted?.lifecycle).toBe("completed");
 		expect(persisted?.blockers).not.toContain("owner-vanished:clean");
+	});
+
+	it("observe reconciles completed clean owner exit away from stale dirty vanish blocker", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "blocked";
+		state.blockers = ["owner-vanished:dirty"];
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendEvent(root, sessionId, {
+			eventId: "evt-completed-clean",
+			cursor: 1,
+			createdAt: "2026-06-03T00:00:01.000Z",
+			severity: "info",
+			kind: "rpc_agent_completed",
+			state: { sessionId, lifecycle: "finalizing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { outcome: "completed" },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-exited", leaseEpoch: 1 },
+		});
+
+		const res = runHarness(["observe", "--session", sessionId]);
+
+		expect(res.code).toBe(0);
+		assertContract(res.json);
+		expect(res.json.state.lifecycle).toBe("completed");
+		expect(res.json.state.blockers).not.toContain("owner-vanished:dirty");
+		expect(res.json.evidence.completedOwnerExited).toBe(true);
+		expect(action(res.json, "recover").available).toBe(false);
+		expect(action(res.json, "recover").reason).toBe("lifecycle-terminal:completed");
+		const persisted = await readSessionState(root, sessionId);
+		expect(persisted?.lifecycle).toBe("completed");
+		expect(persisted?.blockers).toEqual([]);
 	});
 
 	it("observe marks vanished owner after prompt/tool activity instead of silently observing clean worktree", async () => {

@@ -9,6 +9,7 @@
 ### Fixed
 
 - Render terminal-pasted clipboard image temp paths as compact `[image N]` prompt placeholders while attaching the image payload, instead of inserting raw `/var/folders/.../clipboard-*.png` path text.
+- Reconciled `gjc harness` owner liveness after tmux readiness races so fresh live-owner evidence clears stale owner-vanished blockers, re-enables submit, and clean completed owner exits become terminal instead of dirty vanish recovery.
 - Fixed the interactive agent unexpectedly stopping after automatic context maintenance instead of resuming the in-flight task. Post-compaction continuation now schedules exactly one source per completion (overflow retry → queued messages → synthetic auto-continue prompt), the threshold/handoff auto-continue prompt skips a redundant pre-send compaction check, overflow retry strips only the context-overflow failed turn (never normal/aborted/silent-abort tails), and non-resumable or superseded continuations log a structured reason instead of stranding the session.
 
 ## [0.3.0] - 2026-06-03

@@ -135,6 +135,26 @@ async function buildObservation(
 	};
 }
 
+function isOwnerLivenessBlocker(blocker: string): boolean {
+	return blocker === "detached-owner-not-live" || blocker.startsWith("owner-vanished:");
+}
+
+async function reconcileCompletedOwnerExited(
+	root: string,
+	state: SessionState,
+	observation: Observation,
+	completedTerminal: CompletedTerminalEvent | null,
+): Promise<SessionState> {
+	if (!completedTerminal || observation.ownerLive || observation.gitDelta !== "clean") return state;
+	if (state.lifecycle === "completed" || state.lifecycle === "retired") return state;
+	state.lifecycle = "completed";
+	state.blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
+	state.updatedAt = nowIso();
+	await writeSessionState(root, state);
+	return state;
+}
+
+
 function needsVanishedOwnerBlock(
 	state: SessionState,
 	observation: Observation,
@@ -474,6 +494,25 @@ export default class Harness extends Command {
 			}
 		}
 		if (ownerBlockerReason) {
+			const resolved = await resolveOwner(root, sessionId);
+			if (resolved.live && resolved.socketPath) {
+				ownerLive = true;
+				ownerBlockerReason = null;
+				handle.processHandle = {
+					kind: "runtime-owner",
+					ownerId: resolved.lease?.ownerId ?? null,
+					pid: resolved.lease?.pid ?? null,
+				};
+				handle.ownerHandle = {
+					leasePath,
+					endpoint: resolved.socketPath,
+					heartbeatAt: resolved.lease?.heartbeatAt ?? null,
+				};
+				state.handle = handle;
+				await writeSessionState(root, state);
+			}
+		}
+		if (ownerBlockerReason) {
 			state.lifecycle = "blocked";
 			state.blockers = [...state.blockers, ownerBlockerReason];
 			state.handle = handle;
@@ -522,6 +561,7 @@ export default class Harness extends Command {
 		let state = await loadState(root, sessionId);
 		const ownerLive = ownerLiveFor(state);
 		const { observation, completedTerminalEvent } = await buildObservation(root, state, ownerLive);
+		state = await reconcileCompletedOwnerExited(root, state, observation, completedTerminalEvent);
 		const vanishedOwnerBlock = needsVanishedOwnerBlock(state, observation, completedTerminalEvent);
 		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
 		writeJson(

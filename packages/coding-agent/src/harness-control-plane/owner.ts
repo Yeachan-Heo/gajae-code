@@ -52,6 +52,27 @@ import {
 import type { EventEnvelope, GitDelta, Observation, PrimitiveResponse, SessionState, Severity } from "./types";
 import { DEFAULT_RETRY_BUDGET, OBSERVED_SIGNALS } from "./types";
 
+function isOwnerLivenessBlocker(blocker: string): boolean {
+	return blocker === "detached-owner-not-live" || blocker.startsWith("owner-vanished:");
+}
+
+function reconcileLiveOwnerState(state: SessionState): { state: SessionState; reconciled: boolean } {
+	const blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
+	const hadLivenessBlocker = blockers.length !== state.blockers.length;
+	const lifecycle = hadLivenessBlocker && state.lifecycle === "blocked" && blockers.length === 0 ? "observing" : state.lifecycle;
+	if (!hadLivenessBlocker && lifecycle === state.lifecycle) return { state, reconciled: false };
+	return {
+		state: {
+			...state,
+			lifecycle,
+			blockers,
+			updatedAt: new Date().toISOString(),
+		},
+		reconciled: true,
+	};
+}
+
+
 export interface OwnerOptions {
 	root: string;
 	sessionId: string;
@@ -139,6 +160,11 @@ export class RuntimeOwner {
 	async #loadState(): Promise<SessionState> {
 		const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 		if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+		const reconciled = reconcileLiveOwnerState(state);
+		if (reconciled.reconciled) {
+			await writeSessionState(this.#opts.root, reconciled.state);
+			return reconciled.state;
+		}
 		return state;
 	}
 

@@ -173,7 +173,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
 	}, 60_000);
 
-	it("blocks start when tmux ghosts and detached owner endpoint is not routable", async () => {
+	it("reports blocked only after detached owner endpoint remains unavailable", async () => {
 		tmuxCommand = await createFakeTmuxBin(root, { skipOwnerLaunch: true });
 		const originalRpcCommandEnv = rpcCommandEnv;
 		rpcCommandEnv = "{";
