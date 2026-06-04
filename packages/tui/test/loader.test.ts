@@ -28,4 +28,35 @@ describe("Loader component", () => {
 		loader.stop();
 		tui.stop();
 	});
+
+	it("unrefs its animation interval so it does not keep the event loop alive", () => {
+		const term = new VirtualTerminal(20, 4);
+		const tui = new TUI(term);
+		let unrefCalled = false;
+		const realSetInterval = globalThis.setInterval;
+		// Shim setInterval to observe that the loader unrefs the timer it creates.
+		globalThis.setInterval = ((handler: (...handlerArgs: unknown[]) => void, timeout?: number, ...args: unknown[]) => {
+			const timer = realSetInterval(handler, timeout, ...args);
+			const realUnref = timer.unref?.bind(timer);
+			timer.unref = () => {
+				unrefCalled = true;
+				return realUnref ? realUnref() : timer;
+			};
+			return timer;
+		}) as typeof globalThis.setInterval;
+		try {
+			const loader = new Loader(
+				tui,
+				text => text,
+				text => text,
+				"Working",
+				["|"],
+			);
+			loader.stop();
+		} finally {
+			globalThis.setInterval = realSetInterval;
+		}
+		tui.stop();
+		expect(unrefCalled).toBe(true);
+	});
 });

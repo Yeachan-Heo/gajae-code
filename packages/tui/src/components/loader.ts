@@ -62,6 +62,8 @@ export class Loader extends Text {
 			}
 			this.#updateDisplay();
 		}, RENDER_INTERVAL_MS);
+		// Don't let the animation timer keep the event loop alive on its own.
+		this.#intervalId?.unref?.();
 	}
 
 	stop() {

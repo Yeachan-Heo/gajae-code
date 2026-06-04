@@ -5,6 +5,7 @@
  */
 import * as fs from "node:fs/promises";
 import { executeShell, type MinimizerOptions, Shell } from "@gajae-code/natives";
+import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -57,6 +58,30 @@ export interface BashResult {
 
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
+
+/** Number of persistent shell sessions currently retained (owner gauge). */
+export function getShellSessionCount(): number {
+	return shellSessions.size;
+}
+
+/**
+ * Dispose all persistent shell sessions: abort in-flight work and drop the
+ * strong references so the native shells can be finalized. Healthy persistent
+ * sessions are otherwise retained for the whole process lifetime (MEM-7). This
+ * is registered as a postmortem cleanup so shutdown/signals release native
+ * shell resources, and is also callable directly (e.g. on owner teardown).
+ */
+export async function disposeAllShellSessions(): Promise<void> {
+	// Snapshot and drop strong references up front so concurrent callers cannot
+	// reuse a session that is being torn down, then await every native abort so
+	// shutdown/signal cleanup does not return before resources are released.
+	const sessions = [...shellSessions.values()];
+	shellSessions.clear();
+	brokenShellSessions.clear();
+	await Promise.allSettled(sessions.map(session => session.abort()));
+}
+
+postmortem.register("bash-executor:shell-sessions", () => disposeAllShellSessions());
 
 async function resolveShellCwd(cwd: string | undefined): Promise<string | undefined> {
 	if (!cwd) return undefined;
