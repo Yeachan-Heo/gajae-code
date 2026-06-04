@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { $flag, getDebugLogPath } from "@gajae-code/utils";
 import { isKeyRelease, matchesKey } from "./keys";
+import { renderMetrics } from "./metrics";
 import type { Terminal } from "./terminal";
 import { ImageProtocol, setCellDimensions, setTerminalImageProtocol, TERMINAL } from "./terminal-capabilities";
 import {
@@ -433,6 +434,7 @@ export class TUI extends Container {
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
+			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
 		this.#clearSixelProbeState();
 	}
@@ -619,6 +621,7 @@ export class TUI extends Container {
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
+			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.#previousLines.length > 0) {
@@ -640,11 +643,12 @@ export class TUI extends Container {
 		}
 	}
 
-	requestRender(force = false): void {
+	requestRender(force = false, source = "unknown"): void {
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
 			return;
 		}
+		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
 			this.#previousLines = [];
 			this.#previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
@@ -656,6 +660,7 @@ export class TUI extends Container {
 			if (this.#renderTimer) {
 				clearTimeout(this.#renderTimer);
 				this.#renderTimer = undefined;
+				if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 			}
 			this.#renderRequested = true;
 			process.nextTick(() => {
@@ -664,7 +669,9 @@ export class TUI extends Container {
 				}
 				this.#renderRequested = false;
 				this.#lastRenderAt = performance.now();
+				const t0 = renderMetrics.now();
 				this.#doRender();
+				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			});
 			return;
 		}
@@ -681,16 +688,20 @@ export class TUI extends Container {
 		const delay = Math.max(0, TUI.#MIN_RENDER_INTERVAL_MS - elapsed);
 		this.#renderTimer = setTimeout(() => {
 			this.#renderTimer = undefined;
+			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 			if (this.#stopped || !this.#renderRequested) {
 				return;
 			}
 			this.#renderRequested = false;
 			this.#lastRenderAt = performance.now();
+			const t0 = renderMetrics.now();
 			this.#doRender();
+			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			if (this.#renderRequested) {
 				this.#scheduleRender();
 			}
 		}, delay);
+		if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 1);
 	}
 
 	#handleInput(data: string): void {
@@ -1108,7 +1119,9 @@ export class TUI extends Container {
 		};
 
 		// Render all components to get new lines
+		const renderTreeStart = renderMetrics.now();
 		let newLines = this.render(width);
+		if (renderMetrics.enabled) renderMetrics.recordHelper("renderTree", renderMetrics.now() - renderTreeStart);
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
@@ -1130,8 +1143,9 @@ export class TUI extends Container {
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
 
 		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		const fullRender = (clear: boolean, reason = "full render"): void => {
 			this.#fullRedrawCount += 1;
+			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			// Skip clearing scrollback (3J) in multiplexers — users actively navigate scrollback history
 			if (clear) buffer += isMultiplexerSession() ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
@@ -1161,6 +1175,7 @@ export class TUI extends Container {
 
 		const multiplexerViewportRepaint = (reason: string): void => {
 			this.#fullRedrawCount += 1;
+			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			const nextViewportTop = Math.max(0, newLines.length - height);
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			let buffer = "\x1b[?2026h";
@@ -1225,14 +1240,14 @@ export class TUI extends Container {
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.#previousLines.length === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
-			fullRender(false);
+			fullRender(false, "first render");
 			return;
 		}
 
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
-			fullRender(true);
+			fullRender(true, "terminal width changed");
 			return;
 		}
 
@@ -1246,7 +1261,7 @@ export class TUI extends Container {
 			}
 			if (!isTermuxSession() && !isMultiplexerSession()) {
 				logRedraw(`terminal height changed (${this.#previousHeight} -> ${height})`);
-				fullRender(true);
+				fullRender(true, "terminal height changed");
 				return;
 			}
 		}
@@ -1256,7 +1271,7 @@ export class TUI extends Container {
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			fullRender(true);
+			fullRender(true, "clearOnShrink");
 			return;
 		}
 
@@ -1308,7 +1323,7 @@ export class TUI extends Container {
 					if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
 						multiplexerViewportRepaint(`extraLines > height (${extraLines} > ${height})`);
 					} else {
-						fullRender(true);
+						fullRender(true, "extraLines > height");
 					}
 					return;
 				}
@@ -1347,7 +1362,7 @@ export class TUI extends Container {
 			if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
 				multiplexerViewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 			} else {
-				fullRender(true);
+				fullRender(true, "firstChanged < viewportTop");
 			}
 			return;
 		}

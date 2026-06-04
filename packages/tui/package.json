@@ -33,6 +33,7 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test test/*.test.ts",
+		"test:perf": "PI_TUI_PERF_GATES=1 bun test test/perf-gates.test.ts",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},

@@ -24,6 +24,8 @@ export * from "./fuzzy";
 export * from "./keybindings";
 // Kitty keyboard protocol helpers
 export * from "./keys";
+// Renderer/runtime observability metrics (opt-in)
+export * from "./metrics";
 // Mermaid diagram support
 // Input buffering for batch splitting
 export * from "./stdin-buffer";
