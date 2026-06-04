@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
+import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -87,6 +88,44 @@ describe("AgentSession active goal reminders", () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		await emitAssistantStop(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+		const reminder = session.agent.state.messages.find(message => message.role === "developer");
+		expect(JSON.stringify(reminder?.content)).toContain("Ship the idle reminder fix");
+		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
+	});
+
+	it("continues after a successful yield when an active goal remains uncleared", async () => {
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const yieldCall: ToolCall = {
+			type: "toolCall",
+			id: "call_yield_done",
+			name: "yield",
+			arguments: { result: { data: { done: true } } },
+		};
+		const assistantMessage: AssistantMessage = {
+			...createAssistantMessage(""),
+			content: [yieldCall],
+			stopReason: "toolUse",
+			timestamp: 150,
+		};
+
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: "yield",
+			result: {
+				content: [{ type: "text", text: "Result submitted." }],
+				details: { status: "success", data: { done: true } },
+			},
+			isError: false,
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
 
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(developerReminderCount()).toBe(1);

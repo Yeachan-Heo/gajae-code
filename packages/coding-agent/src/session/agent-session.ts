@@ -2023,6 +2023,9 @@ export class AgentSession {
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
+					return;
+				}
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
