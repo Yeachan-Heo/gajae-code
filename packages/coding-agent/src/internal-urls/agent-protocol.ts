@@ -83,6 +83,12 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!outputId) {
 			throw new Error("agent:// URL requires an output ID: agent://<id>");
 		}
+		// Output IDs address a single file inside a session artifacts dir. Reject
+		// path separators / traversal so a crafted id cannot escape the dir via
+		// path.join(dir, `${outputId}.md`).
+		if (outputId.includes("/") || outputId.includes("\\") || outputId.includes("..")) {
+			throw new Error(`agent://${outputId} invalid id: path separators are not allowed`);
+		}
 
 		const urlPath = url.pathname;
 		const queryParam = url.searchParams.get("q");
@@ -99,7 +105,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("No session - agent outputs unavailable");
 		}
 
-		let foundPath: string | undefined;
+		const candidatePaths: string[] = [];
 		let anyDirExists = false;
 		const availableIds = new Set<string>();
 
@@ -114,18 +120,17 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			const candidate = path.join(dir, `${outputId}.md`);
 			try {
 				await fs.stat(candidate);
-				foundPath = candidate;
-				break;
+				candidatePaths.push(candidate);
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
-				try {
-					const files = await fs.readdir(dir);
-					for (const f of files) {
-						if (f.endsWith(".md")) availableIds.add(f.replace(/\.md$/, ""));
-					}
-				} catch {
-					// Listing failures are non-fatal; continue searching.
+			}
+			try {
+				const files = await fs.readdir(dir);
+				for (const f of files) {
+					if (f.endsWith(".md")) availableIds.add(f.replace(/\.md$/, ""));
 				}
+			} catch {
+				// Listing failures are non-fatal; continue searching.
 			}
 		}
 
@@ -133,11 +138,15 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (!foundPath) {
+		if (candidatePaths.length === 0) {
 			const availableStr = availableIds.size > 0 ? [...availableIds].join(", ") : "none";
 			throw new Error(`Not found: ${outputId}\nAvailable: ${availableStr}`);
 		}
+		if (candidatePaths.length > 1) {
+			throw new Error(`agent://${outputId} ambiguous id: ${candidatePaths.length} matching outputs`);
+		}
 
+		const foundPath = candidatePaths[0]!;
 		const rawBytes = Buffer.from(await Bun.file(foundPath).arrayBuffer());
 		await verifyAgentOutputMetadata(outputId, foundPath, rawBytes);
 		const rawContent = rawBytes.toString("utf8");

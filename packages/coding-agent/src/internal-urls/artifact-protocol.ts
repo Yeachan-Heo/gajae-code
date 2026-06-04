@@ -34,7 +34,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error("No session - artifacts unavailable");
 		}
 
-		let foundPath: string | undefined;
+		const candidatePaths: string[] = [];
 		let anyDirExists = false;
 		const availableIds = new Set<string>();
 
@@ -47,14 +47,11 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 				if (isEnoent(err)) continue;
 				throw err;
 			}
-			const match = files.find(f => f.startsWith(`${id}.`));
-			if (match) {
-				foundPath = path.join(dir, match);
-				break;
-			}
 			for (const f of files) {
+				if (f.endsWith(".meta.json")) continue;
 				const m = f.match(/^(\d+)\./);
 				if (m) availableIds.add(m[1]);
+				if (f.startsWith(`${id}.`)) candidatePaths.push(path.join(dir, f));
 			}
 		}
 
@@ -62,12 +59,16 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (!foundPath) {
+		if (candidatePaths.length === 0) {
 			const sorted = [...availableIds].sort((a, b) => Number(a) - Number(b));
 			const availableStr = sorted.length > 0 ? sorted.join(", ") : "none";
 			throw new Error(`Artifact ${id} not found. Available: ${availableStr}`);
 		}
+		if (candidatePaths.length > 1) {
+			throw new Error(`artifact://${id} ambiguous id: ${candidatePaths.length} matching artifacts`);
+		}
 
+		const foundPath = candidatePaths[0]!;
 		const content = await Bun.file(foundPath).text();
 		return {
 			url: url.href,
