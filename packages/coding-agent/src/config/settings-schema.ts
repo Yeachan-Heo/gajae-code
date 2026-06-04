@@ -2352,11 +2352,12 @@ export const SETTINGS_SCHEMA = {
 
 	"task.maxConcurrency": {
 		type: "number",
-		default: 32,
+		default: 8,
 		ui: {
 			tab: "tasks",
 			label: "Max Concurrent Tasks",
-			description: "Concurrent limit for subagents",
+			description:
+				"Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
 			options: [
 				{ value: "0", label: "Unlimited" },
 				{ value: "1", label: "1 task" },
@@ -2408,7 +2409,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tasks",
 			label: "Fork Context Max Tokens",
-			description: "Approximate token cap for fork-context seeds. 0 uses 25% of the target model context window.",
+			description:
+				"Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
 		},
 	},
 

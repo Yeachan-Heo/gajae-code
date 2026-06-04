@@ -372,6 +372,20 @@ describe("fork context policy surface", () => {
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
 	});
 
+	test("uses reduced model-window fallback for full fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "FullForkSeed", description: "seed", assignment: "Use full context.", inheritContext: "full" }],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 500, maxTokens: 150, signal: undefined });
+	});
+
 	test("freezes inherited context seeds before detached job execution", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seedAtDispatch = createSeed("dispatch seed");
