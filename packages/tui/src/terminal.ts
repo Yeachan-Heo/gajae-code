@@ -34,6 +34,8 @@ export function emergencyTerminalRestore(): void {
 			// This avoids writing escape sequences for non-TUI commands (grep, commit, etc.)
 			process.stdout.write(
 				"\x1b[?2004l" + // Disable bracketed paste
+					"\x1b[?1000l" + // Disable normal mouse reporting
+					"\x1b[?1006l" + // Disable SGR extended mouse reporting
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
 					"\x1b[>4;0m" + // Disable modifyOtherKeys fallback
@@ -572,6 +574,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Disable bracketed paste mode
 		this.#safeWrite("\x1b[?2004l");
+		this.#safeWrite("\x1b[?1000l");
+		this.#safeWrite("\x1b[?1006l");
 
 		// Disable Mode 2031 appearance change notifications
 		this.#safeWrite("\x1b[?2031l");

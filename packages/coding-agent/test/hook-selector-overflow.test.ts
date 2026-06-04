@@ -297,7 +297,7 @@ describe("HookSelectorComponent", () => {
 				wrapFocused: true,
 				scrollTitleRows: 3,
 				maxVisible: 2,
-				helpText: "up/down navigate  enter select  esc cancel  PgUp/PgDn scroll question",
+				helpText: "up/down navigate  enter select  esc cancel  wheel/PgUp/PgDn scroll question",
 			},
 		);
 
@@ -307,7 +307,7 @@ describe("HookSelectorComponent", () => {
 		expect(titleRows.length).toBeLessThanOrEqual(3);
 		expect(rendered).toContain("answer-a");
 		expect(rendered).toContain("answer-b");
-		expect(rendered).toContain("PgUp/PgDn scroll question");
+		expect(rendered).toContain("wheel/PgUp/PgDn scroll question");
 		expect(rendered).toContain("PgDn");
 	});
 
@@ -341,5 +341,37 @@ describe("HookSelectorComponent", () => {
 		for (let i = 0; i < 8; i++) component.handleInput("\x1b[5~");
 		const afterPageUp = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterPageUp).toContain("Question segment 1");
+	});
+
+	it("uses mouse wheel events for title scrolling without moving option focus", () => {
+		const title = Array.from({ length: 8 }, (_, index) => `Wheel segment ${index + 1}`).join("\n\n");
+		let selected: string | undefined;
+		const component = new HookSelectorComponent(
+			title,
+			["first-choice", "second-choice"],
+			option => {
+				selected = option;
+			},
+			() => {},
+			{ outline: true, wrapFocused: true, scrollTitleRows: 2, maxVisible: 2 },
+		);
+
+		const initial = Bun.stripANSI(component.render(56).join("\n"));
+		expect(initial).toContain("Wheel segment 1");
+		expect(initial).not.toContain("Wheel segment 8");
+		expect(initial).toContain("first-choice");
+
+		for (let i = 0; i < 8; i++) component.handleInput("\x1b[<65;10;5M");
+		const afterWheelDown = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterWheelDown).not.toContain("Wheel segment 1");
+		expect(afterWheelDown).toContain("Wheel segment 8");
+		expect(afterWheelDown).toContain("first-choice");
+
+		component.handleInput("\n");
+		expect(selected).toBe("first-choice");
+
+		for (let i = 0; i < 8; i++) component.handleInput("\x1b[<64;10;5M");
+		const afterWheelUp = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterWheelUp).toContain("Wheel segment 1");
 	});
 });

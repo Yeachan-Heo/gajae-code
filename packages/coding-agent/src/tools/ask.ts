@@ -85,7 +85,7 @@ export interface AskToolDetails {
 
 const OTHER_OPTION = "Other (type your own)";
 const RECOMMENDED_SUFFIX = " (Recommended)";
-const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = 12;
+const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 
 function getDoneOptionLabel(): string {
 	return `${theme.status.success} Done selecting`;
@@ -194,7 +194,8 @@ async function askSingleQuestion(
 		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
 			: "up/down navigate  enter select  esc cancel";
-		const helpText = scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  PgUp/PgDn scroll question`;
+		const helpText =
+			scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  wheel/PgUp/PgDn scroll question`;
 		const dialogOptions = {
 			initialIndex,
 			timeout,

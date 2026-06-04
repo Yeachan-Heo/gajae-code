@@ -1100,8 +1100,8 @@ describe("AskTool deep-interview rendering middleware", () => {
 		);
 
 		const dialogOptions = select.mock.calls[0]?.[2];
-		expect(dialogOptions?.scrollTitleRows).toBe(12);
-		expect(dialogOptions?.helpText).toContain("PgUp/PgDn scroll question");
+		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
+		expect(dialogOptions?.helpText).toContain("wheel/PgUp/PgDn scroll question");
 	});
 
 	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {
@@ -1130,7 +1130,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 
 		const dialogOptions = select.mock.calls[0]?.[2];
 		expect(dialogOptions?.scrollTitleRows).toBeUndefined();
-		expect(dialogOptions?.helpText).not.toContain("PgUp/PgDn scroll question");
+		expect(dialogOptions?.helpText).not.toContain("scroll question");
 	});
 
 	it("recognizes topology questions even when the agent prepends an intro", async () => {
