@@ -77,6 +77,8 @@ export class CustomEditor extends Editor {
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
 	#pasteHandler = new BracketedPasteHandler();
+	#pasteDecisionPending = false;
+	#pendingPasteInput: string[] = [];
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
 		this.#actionKeys.set(action, [...keys]);
@@ -112,18 +114,29 @@ export class CustomEditor extends Editor {
 		this.#customKeyHandlers.clear();
 	}
 
+	#drainPendingPasteInput(initialInput?: string): void {
+		if (initialInput && initialInput.length > 0) {
+			this.handleInput(initialInput);
+		}
+		while (!this.#pasteDecisionPending) {
+			const nextInput = this.#pendingPasteInput.shift();
+			if (nextInput === undefined) break;
+			this.handleInput(nextInput);
+		}
+	}
+
 	#handleBracketedPaste(pasteContent: string, remaining: string): void {
-		const pasteResult = this.onPasteText?.(pasteContent);
 		const applyPasteResult = (handled: boolean | undefined) => {
 			if (!handled) {
 				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
 			}
-			if (remaining.length > 0) {
-				this.handleInput(remaining);
-			}
+			this.#pasteDecisionPending = false;
+			this.#drainPendingPasteInput(remaining);
 		};
+		const pasteResult = this.onPasteText?.(pasteContent);
 
 		if (pasteResult instanceof Promise) {
+			this.#pasteDecisionPending = true;
 			void pasteResult.then(applyPasteResult, () => applyPasteResult(false));
 		} else {
 			applyPasteResult(pasteResult);
@@ -131,6 +144,11 @@ export class CustomEditor extends Editor {
 	}
 
 	handleInput(data: string): void {
+		if (this.#pasteDecisionPending) {
+			this.#pendingPasteInput.push(data);
+			return;
+		}
+
 		const parsed = parseKittySequence(data);
 		if (parsed && (parsed.modifier & 64) !== 0 && this.onCapsLock) {
 			// Caps Lock is modifier bit 64

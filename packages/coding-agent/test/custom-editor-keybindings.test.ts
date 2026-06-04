@@ -62,4 +62,38 @@ describe("CustomEditor bracketed paste interception", () => {
 		expect(onPasteText).toHaveBeenCalledWith("hello");
 		expect(editor.getText()).toBe("hello");
 	});
+
+	it("keeps later input behind a pending async consumed paste", async () => {
+		const editor = createEditor();
+		const pasteDecision = Promise.withResolvers<boolean>();
+		editor.onPasteText = vi.fn(() => pasteDecision.promise);
+
+		editor.handleInput("before ");
+		editor.handleInput("\x1b[200~/tmp/clipboard-2026-06-04-120441-CAC144E7.png\x1b[201~");
+		editor.handleInput("after");
+
+		expect(editor.getText()).toBe("before ");
+
+		pasteDecision.resolve(true);
+		await Bun.sleep(0);
+
+		expect(editor.getText()).toBe("before after");
+	});
+
+	it("replays async unconsumed paste before later input", async () => {
+		const editor = createEditor();
+		const pasteDecision = Promise.withResolvers<boolean>();
+		editor.onPasteText = vi.fn(() => pasteDecision.promise);
+
+		editor.handleInput("before ");
+		editor.handleInput("\x1b[200~middle \x1b[201~");
+		editor.handleInput("after");
+
+		expect(editor.getText()).toBe("before ");
+
+		pasteDecision.resolve(false);
+		await Bun.sleep(0);
+
+		expect(editor.getText()).toBe("before middle after");
+	});
 });
