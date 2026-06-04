@@ -44,16 +44,25 @@ Use a worktree-backed run when the task may touch many files, needs a clean bran
 
 ### Using GJC with other coding agents
 
-GJC is a harness, not an editor plugin. In practice, start `gjc` from the same repository or Git worktree where your other coding agent is working, then let GJC drive the interview, planning, execution, verification, and evidence loop. Keep the underlying coding tool as the executor surface where that is supported today.
+GJC is an external runner, not runtime injection. Start `gjc` from the same repository or dedicated Git worktree where Hermes, Claw Code, or another coding tool is operating, then use GJC to drive the public workflow surface: `deep-interview`, `ralplan`, `ultragoal`, and optional `team` workers. Installing GJC does **not** patch another agent runtime, install hidden routing, or make GJC run inside that tool.
 
-| Tool                         | Recommended GJC command                                                         | Boundary / limitation                                                                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Codex CLI                    | `gjc --tmux --worktree <path>` for branch-local work, or `gjc` for a quick pass | First-class as an external executor surface: run both from the same repo/worktree. GJC is not installed inside Codex CLI.                |
-| Claude Code                  | `gjc --tmux` from the target repo, optionally with `--worktree <path>`          | First-class as an external executor surface: keep Claude Code pointed at the same checkout. GJC does not become a Claude Code extension. |
-| OpenCode                     | `gjc` or `gjc --tmux` from the same checkout OpenCode uses                      | External-runner workflow only today. Treat deeper OpenCode adapter behavior as future work unless documented in a release note.          |
-| Rust `claw-code` / Claw Code | `gjc --tmux --worktree <path>` when you want isolated evidence and review state | External-runner workflow only today. GJC does not install into Claw Code or replace its runtime.                                         |
+Canonical orchestration flow:
 
-The safe default is: create or choose the repo/worktree first, start the other tool there if you use one, then launch `gjc` in that same directory and let it manage the public workflow surface (`deep-interview`, `ralplan`, `ultragoal`, and optional `team`).
+1. Create or choose the target checkout, usually a branch-specific Git worktree for reviewable work.
+2. Launch or attach the GJC leader from that directory with `gjc --tmux`, or use `gjc --tmux --worktree <path>` when GJC should create/use the worktree path.
+3. Submit the appropriate workflow command inside the session: `/skill:deep-interview` for ambiguous requirements, `/skill:ralplan` for a reviewed plan, then `gjc ultragoal ...` for durable execution/evidence tracking.
+4. Add `gjc team ...` only when parallel tmux workers materially help; it is an optional execution lane, not a required handoff.
+5. Collect the stop state before handing work back: changed files, checks run, failures, remaining risks, and evidence links or summaries.
+
+| Tool                         | Recommended GJC command                                                         | Boundary / limitation                                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Codex CLI                    | `gjc --tmux --worktree <path>` for branch-local work, or `gjc` for a quick pass | External-runner workflow: run both from the same repo/worktree. GJC is not installed inside Codex CLI.                          |
+| Claude Code                  | `gjc --tmux` from the target repo, optionally with `--worktree <path>`          | External-runner workflow: keep Claude Code pointed at the same checkout. GJC does not become a Claude Code extension.           |
+| OpenCode                     | `gjc` or `gjc --tmux` from the same checkout OpenCode uses                      | External-runner workflow only today. Treat deeper adapter behavior as future work unless documented in a release note.          |
+| Rust `claw-code` / Claw Code | `gjc --tmux --worktree <path>` when you want isolated evidence and review state | External-runner workflow only today. GJC does not install into Claw Code, replace its runtime, or expose private routing logic. |
+
+For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). The bridge is a public control surface for an already-running GJC session; it is not a deployment recipe for private Hermes/Claw routing.
+
 
 ## Provider retry budgets
 
@@ -90,7 +99,7 @@ deep-interview -> ralplan -> ultragoal
                          └─ optional team execution when parallel tmux workers help
 ```
 
-Use `deep-interview` to clarify intent, `ralplan` to critique the approach, and `$ultragoal` to carry the work through implementation, revision, verification, and an evidence summary. Add `$team` only when the task benefits from coordinated parallel workers; `$team` is an optional execution mode, not a required handoff step. The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, model routing, tool execution, and persistent evidence when the work needs it.
+Use `deep-interview` to clarify intent, `ralplan` to critique the approach, and `ultragoal` to carry the work through implementation, revision, verification, and an evidence summary. Add `team` only when the task benefits from coordinated parallel workers; `team` is an optional execution mode, not a required handoff step. The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, tool execution, and persistent evidence when the work needs it.
 
 ## Workflow surface
 

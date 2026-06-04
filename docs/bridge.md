@@ -308,14 +308,18 @@ controller/UI/host-callback helpers, and an idempotency-key helper.
 - Coarse per-token scopes only (no fine-grained per-command policy yet).
 - UI parity is semantic, not pixel-perfect (see UI Capability Parity).
 
-## Harness control-plane layering
+## Hermes/Claw orchestration layering
 
-A coding-harness operations control plane (e.g. the OpenClaw/Hermes `gjc harness`
-work) should **layer on top of this bridge** rather than introducing a second
-authenticated remote-control protocol. Concretely, an owner-runtime should use
-`@gajae-code/bridge-client` as the live-agent transport (commands + event
-stream + permission/UI callbacks), and keep harness lifecycle/evidence semantics
-above the bridge frames. Introducing a separate authenticated remote-control
-transport for the same purpose should require ADR-level rationale. This describes
-the intended layering; it is not a compliance claim about any specific
-in-progress harness PR.
+For Hermes/Claw-style orchestration, treat `gjc` as an external runner. The orchestration agent should choose or create the repository checkout first, preferably a dedicated Git worktree for branch-local work, then launch or attach a leader session with `gjc --tmux` from that directory. GJC is not embedded runtime injection into Hermes, Claw Code, or another coding tool.
+
+Public orchestration boundaries:
+
+1. Choose the repo/worktree and branch that will own changes, logs, and review evidence.
+2. Start or attach the GJC leader with `gjc --tmux` (or `gjc --tmux --worktree <path>` when the worktree path is part of the launch).
+3. Submit the workflow appropriate to the task: `/skill:deep-interview` for requirements discovery, `/skill:ralplan` for plan consensus, and `gjc ultragoal ...` for durable goal tracking through execution and verification.
+4. Use `gjc team ...` only when coordinated parallel tmux workers help with implementation or verification; single-lane work should stay in the leader session.
+5. Collect the handoff state: whether the session stopped cleanly, changed files, commands/checks run, failures, unresolved risks, and evidence summaries.
+
+Bridge mode remains the public remote-control protocol for an already-running GJC session. Keep lifecycle, worktree selection, and evidence policy above the bridge frames, and avoid documenting private deployment, routing, or credential internals. Introducing another authenticated remote-control protocol for the same purpose should require ADR-level rationale.
+
+The same external-runner workflow is summarized in the README section [Using GJC with other coding agents](../README.md#using-gjc-with-other-coding-agents).
