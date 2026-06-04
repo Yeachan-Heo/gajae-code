@@ -41,6 +41,14 @@ import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
+import { JobsSelectorComponent } from "../components/jobs-overlay";
+import {
+	buildConfirmItems,
+	buildJobDetailItems,
+	buildJobsListItems,
+	type JobRef,
+	parseJobRef,
+} from "../components/jobs-overlay-model";
 import { ModelSelectorComponent, type ModelSelectorSelection } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
@@ -55,6 +63,7 @@ import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
+import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
@@ -1149,5 +1158,77 @@ export class SelectorController {
 		});
 		this.ctx.ui.setFocus(selector);
 		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Jobs overlay: navigate ongoing monitor + cron jobs (Monitors then Crons,
+	 * newest-first), drill into per-type detail, and cancel/delete with a y/N
+	 * confirm. Built from nested SelectLists (list -> detail -> confirm) so focus
+	 * stays on the active SelectList.
+	 */
+	showJobsOverlay(observer: JobsObserver): void {
+		observer.acknowledgeFailures();
+
+		const openConfirm = (ref: JobRef, action: "cancel" | "delete"): void => {
+			this.showSelector(() => {
+				const label = action === "cancel" ? "cancel this monitor" : "delete this cron";
+				const component = new JobsSelectorComponent(
+					buildConfirmItems(label),
+					item => {
+						if (item.value === "yes") {
+							if (action === "cancel") observer.cancelMonitor(ref.id);
+							else observer.deleteCron(ref.id);
+							openList();
+						} else {
+							openDetail(ref);
+						}
+					},
+					() => openDetail(ref),
+					4,
+				);
+				return { component, focus: component.getSelectList() };
+			});
+		};
+
+		const openDetail = (ref: JobRef): void => {
+			this.showSelector(done => {
+				const output = ref.kind === "monitor" ? observer.getMonitorOutput(ref.id) : "";
+				const items = buildJobDetailItems(observer.getSnapshot(), ref, output);
+				const component = new JobsSelectorComponent(
+					items,
+					item => {
+						if (item.value === "action:cancel") openConfirm(ref, "cancel");
+						else if (item.value === "action:delete") openConfirm(ref, "delete");
+						else if (item.value === "back") openList();
+						// "noop" info rows: stay on the detail view.
+					},
+					() => {
+						done();
+						openList();
+					},
+				);
+				return { component, focus: component.getSelectList() };
+			});
+		};
+
+		const openList = (): void => {
+			this.showSelector(done => {
+				const snapshot = observer.getSnapshot();
+				const built = buildJobsListItems(snapshot);
+				const items = built.length > 0 ? built : [{ value: "back", label: "No active monitor or cron jobs" }];
+				const component = new JobsSelectorComponent(
+					items,
+					item => {
+						const ref = parseJobRef(item.value);
+						if (ref) openDetail(ref);
+						else done();
+					},
+					done,
+				);
+				return { component, focus: component.getSelectList() };
+			});
+		};
+
+		openList();
 	}
 }

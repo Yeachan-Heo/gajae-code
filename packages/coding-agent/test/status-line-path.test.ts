@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getProjectDir, setProjectDir } from "@gajae-code/utils";
 import type { SegmentContext } from "../src/modes/components/status-line/segments";
 import { renderSegment } from "../src/modes/components/status-line/segments";
+import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
 
 import { initTheme, theme } from "../src/modes/theme/theme";
 
@@ -44,6 +45,7 @@ function createPathContext(): SegmentContext {
 		contextWindow: 0,
 		autoCompactEnabled: false,
 		subagentCount: 0,
+		jobs: EMPTY_JOBS_SNAPSHOT,
 		sessionStartTime: Date.now(),
 		git: {
 			branch: null,

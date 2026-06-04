@@ -249,6 +249,7 @@ export interface InteractiveModeContext {
 	showHookConfirm(title: string, message: string): Promise<boolean>;
 	showDebugSelector(): void;
 	showSessionObserver(): void;
+	showJobsOverlay(): void;
 	resetObserverRegistry(): void;
 
 	// Input handling

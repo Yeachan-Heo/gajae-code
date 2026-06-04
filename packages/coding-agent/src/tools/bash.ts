@@ -693,7 +693,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					throw error instanceof Error ? error : new Error(String(error));
 				}
 			},
-			{ ownerId },
+			{ ownerId, metadata: { monitor: true } },
 		);
 		currentJobId = jobId;
 		return { jobId, label, commandCwd: prepared.commandCwd };

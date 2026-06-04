@@ -270,6 +270,30 @@ const subagentsSegment: StatusLineSegment = {
 	},
 };
 
+const jobsSegment: StatusLineSegment = {
+	id: "jobs",
+	render(ctx) {
+		const { jobs } = ctx;
+		const visible = jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || jobs.worstState === "failed";
+		if (!visible) {
+			return { content: "", visible: false };
+		}
+		const parts: string[] = [];
+		if (jobs.activeMonitorCount > 0) {
+			parts.push(withIcon(theme.icon.agents, `${jobs.activeMonitorCount}`));
+		}
+		if (jobs.activeCronCount > 0) {
+			parts.push(withIcon(theme.icon.time, `${jobs.activeCronCount}`));
+		}
+		if (parts.length === 0) {
+			// Nothing active but a failure is unacknowledged — keep a drill-in marker.
+			parts.push(withIcon(theme.icon.warning, "jobs"));
+		}
+		const color: ThemeColor = jobs.worstState === "failed" ? "error" : "statusLineSubagents";
+		return { content: theme.fg(color, parts.join(" ")), visible: true };
+	},
+};
+
 const tokenInSegment: StatusLineSegment = {
 	id: "token_in",
 	render(ctx) {
@@ -521,6 +545,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	git: gitSegment,
 	pr: prSegment,
 	subagents: subagentsSegment,
+	jobs: jobsSegment,
 	token_in: tokenInSegment,
 	token_out: tokenOutSegment,
 	token_total: tokenTotalSegment,

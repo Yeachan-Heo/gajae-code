@@ -35,6 +35,8 @@ export interface AsyncJobMetadata {
 		description?: string;
 		assignment?: string;
 	};
+	/** True when this bash job was started by the `monitor` tool (vs plain async bash). */
+	monitor?: boolean;
 }
 
 /**
@@ -224,6 +226,12 @@ export class AsyncJobManager {
 	#resumeSeq = 0;
 	#resumeRunner?: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
 	readonly #resumeDescriptors = new Map<string, ResumeDescriptor>();
+	/**
+	 * Change listeners notified on any mutation that can alter the live job set
+	 * (register, terminal/eviction transitions, dispose). Used by the status-line
+	 * jobs widget / overlay to refresh event-driven without polling.
+	 */
+	readonly #changeListeners = new Set<() => void>();
 
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
 		const ownerId = filter?.ownerId;
@@ -239,6 +247,29 @@ export class AsyncJobManager {
 		this.#onJobComplete = options.onJobComplete;
 		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
+	}
+
+	/**
+	 * Subscribe to live-job-set change events. Returns an unsubscribe function.
+	 * Listener errors are isolated so one bad subscriber cannot break others.
+	 */
+	onChange(cb: () => void): () => void {
+		this.#changeListeners.add(cb);
+		return () => {
+			this.#changeListeners.delete(cb);
+		};
+	}
+
+	#notifyChange(): void {
+		for (const cb of this.#changeListeners) {
+			try {
+				cb();
+			} catch (error) {
+				logger.warn("Async job change listener failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 
 	register(
@@ -336,6 +367,7 @@ export class AsyncJobManager {
 		})();
 
 		this.#jobs.set(id, job);
+		this.#notifyChange();
 		return id;
 	}
 
@@ -880,6 +912,8 @@ export class AsyncJobManager {
 		this.#liveHandles.clear();
 		this.#resumeDescriptors.clear();
 		this.#resumeQueue.length = 0;
+		this.#notifyChange();
+		this.#changeListeners.clear();
 		return drained;
 	}
 
@@ -909,6 +943,7 @@ export class AsyncJobManager {
 	}
 
 	#scheduleEviction(jobId: string): void {
+		this.#notifyChange();
 		if (this.#retentionMs <= 0) {
 			this.#jobs.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
@@ -926,6 +961,7 @@ export class AsyncJobManager {
 			this.#suppressedDeliveries.delete(jobId);
 			this.#watchedJobs.delete(jobId);
 			this.#outputState.delete(jobId);
+			this.#notifyChange();
 		}, this.#retentionMs);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
