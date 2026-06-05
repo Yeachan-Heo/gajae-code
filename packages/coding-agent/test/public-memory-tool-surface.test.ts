@@ -7,6 +7,7 @@ import { BUILTIN_TOOLS, createTools, type ToolSession } from "../src/tools/index
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 
 const publicGuidanceFiles = [
+	"packages/coding-agent/README.md",
 	"docs/codebase-overview.md",
 	"docs/onboarding-packet.md",
 	"docs/tools/read.md",
@@ -60,11 +61,16 @@ describe("public memory tool surface", () => {
 		expect(docsToolFiles).not.toEqual(expect.arrayContaining(["recall.md", "retain.md", "reflect.md"]));
 	});
 
-	it("does not document memory URI usage in public tool guidance", async () => {
+	it("does not document public memory tool usage in public guidance", async () => {
 		const offenders: string[] = [];
+		const publicToolUsagePatterns = [
+			/memory:\/\//i,
+			/\buse\s+`?(?:recall|retain|reflect)`?/i,
+			/\bexposes?\s+`?retain`?,\s+`?recall`?,\s+(?:and\s+)?`?reflect`?/i,
+		];
 		for (const relativePath of publicGuidanceFiles) {
 			const content = await fs.readFile(path.join(repoRoot, relativePath), "utf8");
-			if (/memory:\/\//i.test(content) || /memory\s+tools?/i.test(content)) {
+			if (publicToolUsagePatterns.some(pattern => pattern.test(content))) {
 				offenders.push(relativePath);
 			}
 		}
