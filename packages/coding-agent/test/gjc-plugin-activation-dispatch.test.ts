@@ -8,7 +8,7 @@ import {
 	resolveSubskillActivationForSkillInvocation,
 	toActiveSubskillEntry,
 } from "../src/extensibility/gjc-plugins";
-import { syncSkillActiveState } from "../src/skill-state/active-state";
+import { applyHandoffToActiveState, syncSkillActiveState } from "../src/skill-state/active-state";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const tempRoots: string[] = [];
@@ -102,6 +102,57 @@ describe("GJC sub-skill activation dispatch", () => {
 		});
 
 		const executorSubskills = await readActiveSubskillsForParent({ cwd, parent: "executor", phase: "prompt" });
+		expect(executorSubskills).toHaveLength(1);
+		expect(executorSubskills[0]).toMatchObject({
+			plugin: "combined-pack",
+			subskillName: "executor-design",
+			parent: "executor",
+			bindsTo: "executor",
+			phase: "prompt",
+			activationArg: "design",
+		});
+	});
+
+	test("keeps agent-bound active sub-skills visible after workflow handoff", async () => {
+		const cwd = await tempProjectWithFixture("combined-pack");
+		const sessionId = "handoff-session";
+		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
+		expect(result.activation).toBeDefined();
+		const activeSubskills = result.activeSubskillsToPersist.map(toActiveSubskillEntry);
+
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "ralplan",
+			active: true,
+			phase: result.activation!.phase,
+			active_subskills: activeSubskills,
+		});
+
+		await applyHandoffToActiveState({
+			cwd,
+			caller: {
+				cwd,
+				sessionId,
+				skill: "ralplan",
+				active: false,
+				handoff_to: "team",
+			},
+			callee: {
+				cwd,
+				sessionId,
+				skill: "team",
+				active: true,
+				handoff_from: "ralplan",
+			},
+		});
+
+		const executorSubskills = await readActiveSubskillsForParent({
+			cwd,
+			sessionId,
+			parent: "executor",
+			phase: "prompt",
+		});
 		expect(executorSubskills).toHaveLength(1);
 		expect(executorSubskills[0]).toMatchObject({
 			plugin: "combined-pack",

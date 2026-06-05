@@ -227,6 +227,24 @@ function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | u
 	return entries.length > 0 ? entries : undefined;
 }
 
+function activeSubskillEntryKey(entry: ActiveSubskillEntry): string {
+	return [entry.plugin, entry.parent, entry.phase, entry.activationArg].join("\0");
+}
+
+function unionActiveSubskillEntries(...entrySets: Array<ActiveSubskillEntry[] | undefined>): ActiveSubskillEntry[] {
+	const merged: ActiveSubskillEntry[] = [];
+	const seen = new Set<string>();
+	for (const entries of entrySets) {
+		for (const entry of entries ?? []) {
+			const key = activeSubskillEntryKey(entry);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(entry);
+		}
+	}
+	return merged;
+}
+
 function encodePathSegment(value: string): string {
 	return encodeURIComponent(value).replaceAll(".", "%2E");
 }
@@ -704,7 +722,10 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 					...(priorCaller.active_subskills ? { active_subskills: priorCaller.active_subskills } : {}),
 				}
 			: callerEntry;
-		return [...kept, mergedCaller, calleeEntry];
+		const activeSubskills = unionActiveSubskillEntries(priorCaller?.active_subskills, calleeEntry.active_subskills);
+		const mergedCallee: SkillActiveEntry =
+			activeSubskills.length > 0 ? { ...calleeEntry, active_subskills: activeSubskills } : calleeEntry;
+		return [...kept, mergedCaller, mergedCallee];
 	};
 	const writeEntries = async (
 		sessionScope: ActiveSessionScope | undefined,
