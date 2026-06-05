@@ -1,11 +1,18 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import type { WorkflowHudSummary } from "../skill-state/active-state";
+import { syncSkillActiveState, type WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
+import { WORKFLOW_STATE_VERSION, workflowStateStoragePath } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
-import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
+import {
+	appendJsonl,
+	readExistingStateForMutation,
+	writeArtifact,
+	writeJsonAtomic,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
@@ -473,6 +480,82 @@ export function buildUltragoalHudSummary(
 		latestLedgerEvent: latestLedger,
 		updatedAt: new Date().toISOString(),
 	});
+}
+function currentSessionId(): string | undefined {
+	const sessionId = process.env.GJC_SESSION_ID?.trim();
+	return sessionId || undefined;
+}
+
+function ultragoalModeStateFromSummary(
+	summary: UltragoalStatusSummary,
+	latestLedger?: UltragoalLedgerEvent,
+	existing?: Record<string, unknown>,
+): Record<string, unknown> {
+	const updatedAt = new Date().toISOString();
+	const sessionId = currentSessionId();
+	return {
+		...(existing ?? {}),
+		skill: "ultragoal",
+		version: WORKFLOW_STATE_VERSION,
+		active: summary.exists && summary.status !== "complete",
+		current_phase: summary.status,
+		status: summary.status,
+		active_goal_id: summary.currentGoal?.id,
+		counts: summary.counts,
+		brief_path: summary.paths.briefPath,
+		ledger_path: summary.paths.ledgerPath,
+		goals_path: summary.paths.goalsPath,
+		latest_ledger_event: latestLedger?.event,
+		latest_ledger_event_id: latestLedger?.eventId,
+		updated_at: updatedAt,
+		...(sessionId ? { session_id: sessionId } : {}),
+	};
+}
+
+export async function syncUltragoalWorkflowState(cwd: string): Promise<void> {
+	const summary = await getUltragoalStatus(cwd);
+	const ledger = await readUltragoalLedger(cwd);
+	const latestLedger = ledger.at(-1);
+	if (summary.exists) {
+		const sessionId = currentSessionId();
+		const statePath = workflowStateStoragePath(cwd, "ultragoal", sessionId);
+		const existing = await readExistingStateForMutation(statePath);
+		if (existing.kind === "corrupt") throw new Error(`Cannot sync corrupt ultragoal mode-state: ${existing.error}`);
+		const existingValue = existing.kind === "valid" ? existing.value : undefined;
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			ultragoalModeStateFromSummary(summary, latestLedger, existingValue),
+			{
+				cwd,
+				receipt: { cwd, skill: "ultragoal", owner: "gjc-runtime", command: "gjc ultragoal sync", sessionId },
+				audit: {
+					category: "state",
+					verb: "sync",
+					owner: "gjc-runtime",
+					skill: "ultragoal",
+					fromPhase: typeof existingValue?.current_phase === "string" ? existingValue.current_phase : undefined,
+					toPhase: summary.status,
+				},
+			},
+		);
+	}
+	await syncSkillActiveState({
+		cwd,
+		skill: "ultragoal",
+		active: summary.exists && summary.status !== "complete",
+		phase: summary.status,
+		sessionId: currentSessionId(),
+		hud: buildUltragoalHudSummary(summary, latestLedger),
+		source: "gjc-ultragoal",
+	});
+}
+
+async function syncUltragoalWorkflowStateBestEffort(cwd: string): Promise<void> {
+	try {
+		await syncUltragoalWorkflowState(cwd);
+	} catch {
+		// HUD and mode-state sync are best-effort and must not change command semantics.
+	}
 }
 
 function clampTitle(title: string): string {
@@ -1311,14 +1394,18 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 	try {
 		const command = commandName(args);
 		const json = hasFlag(args, "--json");
+		let result: UltragoalCommandResult;
 		switch (command) {
 			case "status":
-				return { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd), json) };
+				await syncUltragoalWorkflowStateBestEffort(cwd);
+				result = { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd), json) };
+				break;
 			case "create":
 			case "create-goals": {
 				const mode = flagValue(args, "--gjc-goal-mode") === "per-story" ? "per-story" : "aggregate";
 				const plan = await createUltragoalPlan({ cwd, brief: await readBrief(cwd, args), gjcGoalMode: mode });
-				return {
+				await syncUltragoalWorkflowStateBestEffort(cwd);
+				result = {
 					status: 0,
 					createdPlan: true,
 					stdout: json
@@ -1330,16 +1417,17 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 							})
 						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd).goalsPath}.\n`,
 				};
+				break;
 			}
-			case "complete-goals":
-				return {
+			case "complete-goals": {
+				const handoff = await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") });
+				await syncUltragoalWorkflowStateBestEffort(cwd);
+				result = {
 					status: 0,
-					stdout: renderCompleteHandoff(
-						await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") }),
-						json,
-						cwd,
-					),
+					stdout: renderCompleteHandoff(handoff, json, cwd),
 				};
+				break;
+			}
 			case "checkpoint": {
 				const goalId = flagValue(args, "--goal-id") ?? "";
 				const status = parseGoalStatus(flagValue(args, "--status"));
@@ -1352,8 +1440,9 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 					qualityGateJson: flagValue(args, "--quality-gate-json"),
 				});
+				await syncUltragoalWorkflowStateBestEffort(cwd);
 				const goal = plan.goals.find(item => item.id === goalId);
-				return {
+				result = {
 					status: 0,
 					stdout: json
 						? renderCliWriteReceipt({
@@ -1366,6 +1455,7 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 							})
 						: `ultragoal checkpoint goal-id=${goalId} status=${status}\n`,
 				};
+				break;
 			}
 			case "steer": {
 				const kind = flagValue(args, "--kind");
@@ -1377,8 +1467,9 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					rationale: flagValue(args, "--rationale") ?? "",
 				});
+				await syncUltragoalWorkflowStateBestEffort(cwd);
 				const goal = plan.goals.at(-1);
-				return {
+				result = {
 					status: 0,
 					stdout: json
 						? renderCliWriteReceipt({
@@ -1389,6 +1480,7 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 							})
 						: "Accepted add_subgoal steering.\n",
 				};
+				break;
 			}
 			case "record-review-blockers": {
 				const plan = await recordUltragoalReviewBlockers({
@@ -1399,17 +1491,20 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 				});
+				await syncUltragoalWorkflowStateBestEffort(cwd);
 				const goal = plan.goals.at(-1);
-				return {
+				result = {
 					status: 0,
 					stdout: json
 						? renderCliWriteReceipt({ ok: true, goal_id: goal?.id, goals_path: getUltragoalPaths(cwd).goalsPath })
 						: "Recorded review blockers.\n",
 				};
+				break;
 			}
 			default:
 				return { status: 1, stderr: `Unknown gjc ultragoal command: ${command}\n` };
 		}
+		return result;
 	} catch (error) {
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}

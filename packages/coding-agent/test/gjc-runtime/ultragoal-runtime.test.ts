@@ -124,6 +124,57 @@ function goalSnapshot(objective: string, status = "active", updatedAt = Date.now
 		},
 	});
 }
+
+async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
+	return (await Bun.file(filePath).json()) as Record<string, unknown>;
+}
+
+async function seedStaleUltragoalWorkflowState(root: string): Promise<void> {
+	const stateDir = path.join(root, ".gjc", "state");
+	await fs.mkdir(stateDir, { recursive: true });
+	const staleAt = "2026-01-01T00:00:00.000Z";
+	await Bun.write(
+		path.join(stateDir, "ultragoal-state.json"),
+		JSON.stringify(
+			{
+				skill: "ultragoal",
+				version: 1,
+				active: true,
+				current_phase: "goal-planning",
+				updated_at: staleAt,
+			},
+			null,
+			2,
+		),
+	);
+	await Bun.write(
+		path.join(stateDir, "skill-active-state.json"),
+		JSON.stringify(
+			{
+				version: 1,
+				active: true,
+				skill: "ultragoal",
+				phase: "goal-planning",
+				updated_at: staleAt,
+				active_skills: [
+					{
+						skill: "ultragoal",
+						phase: "goal-planning",
+						active: true,
+						updated_at: staleAt,
+						hud: {
+							version: 1,
+							chips: [{ label: "status", value: "goal-planning" }],
+						},
+					},
+				],
+			},
+			null,
+			2,
+		),
+	);
+}
+
 function mutateQualityGate(mutator: (gate: Record<string, Record<string, unknown>>) => void): string {
 	const gate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
 	mutator(gate);
@@ -1355,6 +1406,41 @@ describe("ultragoal @goal decomposition", () => {
 		expect(serialized).toContain("0/3");
 		expect(serialized).toContain("G001:Parse");
 		expect(summary.status).toBe("active");
+	});
+
+	it("reconciles completed runs with mode-state and HUD active-state", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship state reconciliation" });
+		await startNextUltragoalGoal({ cwd: root });
+		await seedStaleUltragoalWorkflowState(root);
+
+		const checkpoint = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"final story verified with targeted regression coverage",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+			],
+			root,
+		);
+
+		expect(checkpoint.status).toBe(0);
+		const modeState = await readJsonFile(path.join(root, ".gjc", "state", "ultragoal-state.json"));
+		expect(modeState.active).toBe(false);
+		expect(modeState.current_phase).toBe("complete");
+		expect(modeState.status).toBe("complete");
+		expect(modeState.receipt).toMatchObject({ skill: "ultragoal", owner: "gjc-runtime" });
+
+		const activeState = await readJsonFile(path.join(root, ".gjc", "state", "skill-active-state.json"));
+		expect(activeState.active).toBe(false);
+		expect(activeState.active_skills).toEqual([]);
 	});
 
 	it("schedules each @goal story in order through the existing API", async () => {
