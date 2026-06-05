@@ -5,7 +5,7 @@
 <agent id="{{id}}" agent="{{agent}}">
 <status>{{status}}</status>
 {{#if meta}}<meta lines="{{meta.lineCount}}" size="{{meta.charSize}}" />{{/if}}
-<synopsis ref="agent://{{id}}">
+<synopsis{{#if outputUri}} ref="{{outputUri}}"{{/if}}>
 {{synopsis}}
 </synopsis>
 </agent>

@@ -1473,6 +1473,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					abortReason: "Cancelled before start",
 				};
 			});
+			if (!artifactsDir) {
+				for (const result of results) {
+					delete result.outputMeta;
+					delete result.outputPath;
+				}
+			}
+
 			const forkContextClonedTokens = results.reduce(
 				(total, result) => total + (result.forkContext?.clonedTokens ?? 0),
 				0,
@@ -1650,6 +1657,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					status,
 					id: r.id,
 					synopsis: r.preview,
+					outputUri: r.outputRef?.uri,
 					meta: r.outputRef
 						? {
 								lineCount: r.outputRef.lineCount,
