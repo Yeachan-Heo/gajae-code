@@ -3,19 +3,23 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appendEvent, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
+import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 
 let root: string;
 let workspace: string;
+let cliEnv: HarnessCliEnv;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-cli-root-"));
 	workspace = await mkdtemp(path.join(tmpdir(), "harness-cli-ws-"));
+	cliEnv = createHarnessCliEnv(repoRoot);
 });
 
 afterEach(async () => {
+	cliEnv.cleanup();
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });
@@ -29,7 +33,7 @@ interface HarnessResult {
 function runHarness(args: string[]): HarnessResult {
 	const proc = Bun.spawnSync(["bun", cliEntry, "harness", ...args], {
 		cwd: workspace,
-		env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
+		env: { ...cliEnv.env, GJC_HARNESS_STATE_ROOT: root },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -59,7 +63,7 @@ function runHarnessInCwd(args: string[], cwd: string, env: NodeJS.ProcessEnv = p
 	return { code: proc.exitCode ?? 0, json, raw };
 }
 function harnessEnvWithoutStateRoot(): NodeJS.ProcessEnv {
-	const env = { ...process.env };
+	const env = { ...cliEnv.env };
 	delete env.GJC_HARNESS_STATE_ROOT;
 	return env;
 }

@@ -9,6 +9,7 @@ import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-pla
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
+import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -36,6 +37,7 @@ class FakeRpc implements HarnessRpc {
 let root: string;
 let owner: RuntimeOwner | null = null;
 let hungServer: net.Server | null = null;
+let cliEnv: HarnessCliEnv;
 
 function seed(workspace: string): SessionState {
 	const now = new Date().toISOString();
@@ -57,7 +59,7 @@ function seed(workspace: string): SessionState {
 async function runHarness(args: string[]): Promise<{ code: number; json: Record<string, unknown> | null }> {
 	const proc = Bun.spawn(["bun", cliEntry, "harness", ...args], {
 		cwd: root,
-		env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
+		env: { ...cliEnv.env, GJC_HARNESS_STATE_ROOT: root },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -89,6 +91,7 @@ const passingFinalizeChecks: FinalizeChecks = {
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
+	cliEnv = createHarnessCliEnv(repoRoot);
 	await writeSessionState(root, seed(root));
 	owner = new RuntimeOwner({
 		root,
@@ -102,6 +105,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	cliEnv.cleanup();
 	await owner?.stop();
 	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
 	hungServer = null;

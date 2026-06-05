@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
 import { readLease } from "../../src/harness-control-plane/session-lease";
+import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -14,6 +15,7 @@ let root: string;
 let workspace: string;
 let tmuxCommand: string;
 let rpcCommandEnv: string;
+let cliEnv: HarnessCliEnv;
 
 async function createFakeTmuxBin(
 	rootDir: string,
@@ -55,7 +57,7 @@ async function runHarness(args: string[]): Promise<{ code: number; json: Record<
 	const proc = Bun.spawn(["bun", cliEntry, "harness", ...args], {
 		cwd: workspace,
 		env: {
-			...process.env,
+			...cliEnv.env,
 			GJC_HARNESS_STATE_ROOT: root,
 			// Drive the REAL GajaeCodeRpc against a protocol fixture (no shipped fake seam).
 			GJC_HARNESS_RPC_COMMAND: rpcCommandEnv,
@@ -81,11 +83,13 @@ beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
+	cliEnv = createHarnessCliEnv(repoRoot);
 	tmuxCommand = await createFakeTmuxBin(root);
 	rpcCommandEnv = JSON.stringify(["bun", FAKE_RPC]);
 });
 
 afterEach(async () => {
+	cliEnv.cleanup();
 	// Safety net: kill any lingering detached owner.
 	try {
 		const lease = await readLease(root, SID);
