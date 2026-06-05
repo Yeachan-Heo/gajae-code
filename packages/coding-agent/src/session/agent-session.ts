@@ -164,7 +164,9 @@ import type {
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { LoadedSubskillActivation } from "../extensibility/gjc-plugins";
-import { toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
+import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injection";
+import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
+import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
@@ -201,7 +203,11 @@ import {
 } from "../runtime-mcp/discoverable-tool-metadata";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
-import { isCanonicalGjcWorkflowSkill, syncSkillActiveState } from "../skill-state/active-state";
+import {
+	isCanonicalGjcWorkflowSkill,
+	readVisibleSkillActiveState,
+	syncSkillActiveState,
+} from "../skill-state/active-state";
 
 import { assertDeepInterviewMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
@@ -953,6 +959,8 @@ export class AgentSession {
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
 	#rpcHostToolNames = new Set<string>();
+	#gjcSubskillToolNames = new Set<string>();
+	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
 	#sessionDefaultSelectedMCPToolNames = new Map<string, string[]>();
@@ -3945,6 +3953,123 @@ export class AgentSession {
 		);
 	}
 
+	async #hasActiveGjcSubskillTools(parent: string, sessionId: string | undefined): Promise<boolean> {
+		if (!parent.trim()) return false;
+		const cwd = this.sessionManager.getCwd();
+		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
+		const entries = await readActiveSubskillsForParent({ cwd, sessionId, parent, phase });
+		return entries.some(entry => (entry.toolPaths ?? []).some(toolPath => toolPath.trim().length > 0));
+	}
+
+	#getCustomToolContext(): CustomToolContext {
+		return {
+			sessionManager: this.sessionManager,
+			modelRegistry: this.#modelRegistry,
+			model: this.model,
+			isIdle: () => !this.isStreaming,
+			hasQueuedMessages: () => this.queuedMessageCount > 0,
+			abort: () => {
+				this.agent.abort();
+			},
+		};
+	}
+
+	#computeGjcSubskillToolSignature(tools: CustomTool[]): string {
+		return tools
+			.map(tool => `${tool.name}\u0000${tool.description}\u0000${JSON.stringify(tool.parameters)}`)
+			.sort()
+			.join("\u0001");
+	}
+
+	/**
+	 * Refresh plugin sub-skill tools after workflow/sub-skill activation or phase changes.
+	 */
+	async refreshGjcSubskillTools(): Promise<void> {
+		const activeState = await readVisibleSkillActiveState(
+			this.sessionManager.getCwd(),
+			this.sessionManager.getSessionId(),
+		);
+		const activeSkill =
+			this.#activeSkillState?.skill ??
+			activeState?.skill ??
+			activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+		const parent = activeSkill?.trim();
+		if (!parent) {
+			if (this.#gjcSubskillToolNames.size === 0) return;
+			const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
+			const previousActiveToolNames = this.getActiveToolNames();
+			for (const name of previousGjcSubskillToolNames) {
+				this.#toolRegistry.delete(name);
+			}
+			this.#gjcSubskillToolNames.clear();
+			this.#invalidateDiscoveryCaches();
+			await this.#applyActiveToolsByName(
+				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
+			);
+			return;
+		}
+
+		const cwd = this.sessionManager.getCwd();
+		const sessionId =
+			this.#activeSkillState?.sessionId ?? activeState?.session_id ?? this.sessionManager.getSessionId();
+		if (this.#gjcSubskillToolNames.size === 0 && !(await this.#hasActiveGjcSubskillTools(parent, sessionId))) return;
+
+		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
+		const reservedToolNames = Array.from(this.#toolRegistry.keys()).filter(
+			name => !this.#gjcSubskillToolNames.has(name),
+		);
+		const customTools = await loadActiveSubskillTools({ cwd, sessionId, parent, phase, reservedToolNames });
+		const nextToolNames = customTools.map(tool => tool.name);
+		const uniqueToolNames = new Set(nextToolNames);
+		if (uniqueToolNames.size !== nextToolNames.length) {
+			throw new Error("GJC sub-skill tool names must be unique");
+		}
+
+		const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
+		const nextSignature = this.#computeGjcSubskillToolSignature(customTools);
+		if (this.#gjcSubskillToolSignature === nextSignature) {
+			return;
+		}
+
+		const previousActiveToolNames = this.getActiveToolNames();
+		for (const name of previousGjcSubskillToolNames) {
+			this.#toolRegistry.delete(name);
+		}
+		this.#gjcSubskillToolNames.clear();
+		this.#gjcSubskillToolSignature = undefined;
+
+		const getCustomToolContext = () => this.#getCustomToolContext();
+		for (const customTool of customTools) {
+			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
+			const finalTool = (
+				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
+			) as AgentTool;
+			this.#toolRegistry.set(finalTool.name, finalTool);
+			this.#gjcSubskillToolNames.add(finalTool.name);
+		}
+		this.#gjcSubskillToolSignature = nextSignature;
+
+		this.#invalidateDiscoveryCaches();
+		const activeNonGjcSubskillToolNames = previousActiveToolNames.filter(
+			name => !previousGjcSubskillToolNames.has(name),
+		);
+		const preservedGjcSubskillToolNames = previousActiveToolNames.filter(
+			name => previousGjcSubskillToolNames.has(name) && this.#gjcSubskillToolNames.has(name),
+		);
+		const autoActivatedGjcSubskillToolNames = customTools
+			.filter(tool => !tool.hidden && !previousGjcSubskillToolNames.has(tool.name))
+			.map(tool => tool.name);
+		await this.#applyActiveToolsByName(
+			Array.from(
+				new Set([
+					...activeNonGjcSubskillToolNames,
+					...preservedGjcSubskillToolNames,
+					...autoActivatedGjcSubskillToolNames,
+				]),
+			),
+		);
+	}
+
 	/** Whether auto-compaction is currently running */
 	get isCompacting(): boolean {
 		return this.#autoCompactionAbortController !== undefined || this.#compactionAbortController !== undefined;
@@ -4367,6 +4492,7 @@ export class AgentSession {
 		const message = options?.synthetic
 			? { role: "developer" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() }
 			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+		await this.refreshGjcSubskillTools();
 
 		if (eagerTodoPrelude) {
 			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
@@ -4436,6 +4562,9 @@ export class AgentSession {
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
+		if (active) {
+			await this.refreshGjcSubskillTools();
+		}
 	}
 
 	async #syncSkillPromptActiveStateSafely(
