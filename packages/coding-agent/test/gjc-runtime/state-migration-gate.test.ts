@@ -76,4 +76,88 @@ describe("G7 gjc state migration gate", () => {
 			});
 		});
 	});
+
+	it("rejects tampered migrated state without --force and leaves the file untouched", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const legacy = {
+				current_phase: "planning",
+				extension_field: { nested: true },
+			};
+			const initial = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify(legacy), "--force"],
+				cwd,
+			);
+			expect(initial.status).toBe(0);
+
+			const stamped = await readJson(statePath);
+			stamped.version = 1;
+			stamped.current_phase = "planning";
+			stamped.tampered = true;
+			await writeJson(statePath, stamped);
+			const before = await fs.readFile(statePath, "utf-8");
+
+			const rejected = await runNativeStateCommand(["ralplan", "migrate", "--json"], cwd);
+
+			expect(rejected.status).toBe(2);
+			expect(rejected.stderr).toContain("out-of-band edit detected");
+			expect(rejected.stderr).toContain("use --force to migrate tampered mode-state");
+			expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+			expect(await readJson(statePath)).toMatchObject({ current_phase: "planning", tampered: true });
+		});
+	});
+
+	it("migrates tampered state with --force and audits the forced mismatch", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const legacy = {
+				current_phase: "planning",
+				extension_field: { nested: true },
+			};
+			await writeJson(statePath, {
+				version: 1,
+				skill: "ralplan",
+				active: true,
+				current_phase: "planning",
+				extension_field: legacy.extension_field,
+				receipt: {
+					version: 1,
+					skill: "ralplan",
+					owner: "gjc-state-cli",
+					status: "fresh",
+					command: "gjc state ralplan write",
+					state_path: statePath,
+					storage_path: statePath,
+					mutated_at: "2026-06-05T00:00:00.000Z",
+					fresh_until: "2026-06-05T00:00:00.000Z",
+					mutation_id: "seed",
+				},
+			});
+			const seeded = await runNativeStateCommand(["ralplan", "migrate", "--json", "--force"], cwd);
+			expect(seeded.status).toBe(0);
+
+			const stamped = await readJson(statePath);
+			stamped.version = 1;
+			stamped.current_phase = "planning";
+			stamped.tampered = true;
+			await writeJson(statePath, stamped);
+
+			const forced = await runNativeStateCommand(["ralplan", "migrate", "--json", "--force"], cwd);
+
+			expect(forced.status).toBe(0);
+			expect(forced.stderr).toContain("out-of-band edit detected");
+			const receipt = JSON.parse(forced.stdout ?? "{}") as Record<string, unknown>;
+			expect(receipt).toMatchObject({ skill: "ralplan", migrated: true, integrity_mismatch: true });
+			const persisted = await readJson(statePath);
+			expect(persisted).toMatchObject({ current_phase: "planner", tampered: true });
+			expect(persisted.receipt).toMatchObject({ owner: "gjc-state-cli", status: "fresh" });
+
+			const entries = await readAuditEntries(cwd);
+			const mismatch = entries.find(entry => entry.verb === "out_of_band_detected" && entry.forced === true);
+			expect(mismatch).toMatchObject({ skill: "ralplan", category: "state", owner: "gjc-state-cli" });
+			expect(typeof mismatch?.expected_sha256).toBe("string");
+			expect(typeof mismatch?.actual_sha256).toBe("string");
+			expect(entries.at(-1)).toMatchObject({ skill: "ralplan", category: "state", verb: "migrate" });
+		});
+	});
 });

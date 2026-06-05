@@ -1783,9 +1783,13 @@ async function handleMigrate(
 		);
 	}
 	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const forced = hasFlag(args, "--force");
 	const mismatchWarning = await warnAndAuditOutOfBandIfNeeded(cwd, filePath, mode, {
-		forced: hasFlag(args, "--force"),
+		forced,
 	});
+	if (mismatchWarning && !forced) {
+		throw new StateCommandError(2, `${mismatchWarning}; use --force to migrate tampered mode-state`);
+	}
 	const result = await migrateAndPersistLegacyState({
 		cwd,
 		skill: mode,
