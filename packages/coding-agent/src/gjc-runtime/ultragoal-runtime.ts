@@ -516,40 +516,39 @@ export async function syncUltragoalWorkflowState(cwd: string): Promise<void> {
 	const summary = await getUltragoalStatus(cwd);
 	const ledger = await readUltragoalLedger(cwd);
 	const latestLedger = ledger.at(-1);
-	if (summary.exists) {
-		const sessionId = currentSessionId();
-		const syncModeState = async (targetSessionId: string | undefined): Promise<void> => {
-			const statePath = workflowStateStoragePath(cwd, "ultragoal", targetSessionId);
-			const existing = await readExistingStateForMutation(statePath);
-			if (existing.kind === "corrupt")
-				throw new Error(`Cannot sync corrupt ultragoal mode-state: ${existing.error}`);
-			const existingValue = existing.kind === "valid" ? existing.value : undefined;
-			await writeWorkflowEnvelopeAtomic(
-				statePath,
-				ultragoalModeStateFromSummary(summary, latestLedger, existingValue, targetSessionId),
-				{
+	const sessionId = currentSessionId();
+	const modeStateActive = summary.exists && summary.status !== "complete";
+	const syncModeState = async (targetSessionId: string | undefined): Promise<void> => {
+		const statePath = workflowStateStoragePath(cwd, "ultragoal", targetSessionId);
+		const existing = await readExistingStateForMutation(statePath);
+		if (existing.kind === "corrupt" && modeStateActive)
+			throw new Error(`Cannot sync corrupt ultragoal mode-state: ${existing.error}`);
+		const existingValue = existing.kind === "valid" ? existing.value : undefined;
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			ultragoalModeStateFromSummary(summary, latestLedger, existingValue, targetSessionId),
+			{
+				cwd,
+				receipt: {
 					cwd,
-					receipt: {
-						cwd,
-						skill: "ultragoal",
-						owner: "gjc-runtime",
-						command: "gjc ultragoal sync",
-						sessionId: targetSessionId,
-					},
-					audit: {
-						category: "state",
-						verb: "sync",
-						owner: "gjc-runtime",
-						skill: "ultragoal",
-						fromPhase: typeof existingValue?.current_phase === "string" ? existingValue.current_phase : undefined,
-						toPhase: summary.status,
-					},
+					skill: "ultragoal",
+					owner: "gjc-runtime",
+					command: "gjc ultragoal sync",
+					sessionId: targetSessionId,
 				},
-			);
-		};
-		await syncModeState(undefined);
-		if (sessionId) await syncModeState(sessionId);
-	}
+				audit: {
+					category: "state",
+					verb: "sync",
+					owner: "gjc-runtime",
+					skill: "ultragoal",
+					fromPhase: typeof existingValue?.current_phase === "string" ? existingValue.current_phase : undefined,
+					toPhase: summary.status,
+				},
+			},
+		);
+	};
+	await syncModeState(undefined);
+	if (sessionId) await syncModeState(sessionId);
 	await syncSkillActiveState({
 		cwd,
 		skill: "ultragoal",
