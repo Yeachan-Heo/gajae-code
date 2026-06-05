@@ -382,6 +382,8 @@ async function seedSkillActivationState(
 	return state;
 }
 
+// Fallback for native-hook prompts when SkillPromptDetails.subskillActivation is absent;
+// real /skill dispatch paths resolve sub-skill activation before prompt construction.
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
 	const match = detectPrimarySkillKeyword(input.text);
 	if (!match) return null;

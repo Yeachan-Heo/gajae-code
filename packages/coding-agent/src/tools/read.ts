@@ -1031,7 +1031,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const collectedLines = streamResult.lines;
-			if (!rawSelector && maxColumns > 0) {
+			if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
 				for (let i = 0; i < collectedLines.length; i++) {
 					const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
 					if (wasTruncated) {
@@ -1789,8 +1789,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// counts in `truncation` keep reflecting the source, not the trimmed
 					// view — column truncation surfaces separately via `.limits()`.
 					const rawSelector = isRawSelector(parsed);
+					const shouldAddHashLines = !rawSelector && displayMode.hashLines;
 					const maxColumns = resolveOutputMaxColumns(this.session.settings);
-					if (!rawSelector && maxColumns > 0) {
+					if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
 						for (let i = 0; i < collectedLines.length; i++) {
 							const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
 							if (wasTruncated) {
@@ -1824,7 +1825,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
 					}
 
-					const shouldAddHashLines = !rawSelector && displayMode.hashLines;
 					const shouldAddLineNumbers = rawSelector ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
 					let capturedDisplayContent: { text: string; startLine: number } | undefined;
 					const formatText = (text: string, startNum: number): string => {

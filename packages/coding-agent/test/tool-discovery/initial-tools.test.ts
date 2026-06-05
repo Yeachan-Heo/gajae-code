@@ -106,6 +106,21 @@ describe("BUILTIN_TOOLS public factory map", () => {
 		expect(missing).toEqual([]);
 	});
 
+	it("does not expose memory helpers as public built-in tools", async () => {
+		expect(Object.keys(BUILTIN_TOOLS)).not.toEqual(expect.arrayContaining(["memory", "recall", "retain", "reflect"]));
+
+		const tools = await createTools(
+			{
+				...toolSession,
+				settings: Settings.isolated({ "memory.backend": "hindsight", "tools.discoveryMode": "all" }),
+			},
+			Object.keys(BUILTIN_TOOLS),
+		);
+		expect(tools.map(tool => tool.name)).not.toEqual(
+			expect.arrayContaining(["memory", "recall", "retain", "reflect"]),
+		);
+	});
+
 	it("exposes the skill tool by default when skills and custom-message bridge are available", async () => {
 		const tools = await createTools(
 			{

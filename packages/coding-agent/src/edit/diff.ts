@@ -4,6 +4,8 @@
  * Provides diff string generation and the replace-mode edit logic
  * used when not in patch mode.
  */
+
+import { createRequire } from "node:module";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
@@ -54,12 +56,73 @@ function formatNumberedDiffLine(prefix: "+" | "-" | " ", lineNum: number, conten
 	return `${prefix}${lineNum}|${content}`;
 }
 
+type DiffLinePart = {
+	added?: boolean;
+	removed?: boolean;
+	value: string;
+};
+
+type DiffLinesFn = (oldStr: string, newStr: string) => DiffLinePart[];
+
+const require = createRequire(import.meta.url);
+const DIFF_LINES_TEST_OVERRIDE_UNSET = Symbol("DIFF_LINES_TEST_OVERRIDE_UNSET");
+
+let cachedNativeDiffLines: DiffLinesFn | null | undefined;
+let diffLinesTestOverride: DiffLinesFn | null | typeof DIFF_LINES_TEST_OVERRIDE_UNSET = DIFF_LINES_TEST_OVERRIDE_UNSET;
+
+function resolveNativeDiffLines(): DiffLinesFn | undefined {
+	if (diffLinesTestOverride !== DIFF_LINES_TEST_OVERRIDE_UNSET) {
+		return diffLinesTestOverride ?? undefined;
+	}
+
+	if (cachedNativeDiffLines !== undefined) {
+		return cachedNativeDiffLines ?? undefined;
+	}
+
+	try {
+		const natives = require("@gajae-code/natives") as { diffLines?: unknown };
+		cachedNativeDiffLines = typeof natives.diffLines === "function" ? (natives.diffLines as DiffLinesFn) : null;
+	} catch {
+		cachedNativeDiffLines = null;
+	}
+
+	return cachedNativeDiffLines ?? undefined;
+}
+
+function diffLinesWithFallback(oldContent: string, newContent: string): DiffLinePart[] {
+	const nativeDiffLines = resolveNativeDiffLines();
+	if (nativeDiffLines) {
+		try {
+			return nativeDiffLines(oldContent, newContent);
+		} catch {
+			// Fall through to the JS implementation if the native export fails at runtime.
+		}
+	}
+
+	return Diff.diffLines(oldContent, newContent);
+}
+
+export function __setDiffLinesForTest(diffLines: DiffLinesFn | null): void {
+	diffLinesTestOverride = diffLines;
+}
+
+export function __clearDiffLinesForTest(): void {
+	diffLinesTestOverride = DIFF_LINES_TEST_OVERRIDE_UNSET;
+	cachedNativeDiffLines = undefined;
+}
+
+export function __getNativeDiffLinesForTest(): DiffLinesFn | undefined {
+	return resolveNativeDiffLines();
+}
+
 /**
  * Generate a unified diff string with line numbers and context.
  * Returns both the diff string and the first changed line number (in the new file).
  */
 export function generateDiffString(oldContent: string, newContent: string, contextLines = 4): DiffResult {
-	const parts = Diff.diffLines(oldContent, newContent);
+	// Native line diff (Rust port of jsdiff `Diff.diffLines`, byte-identical
+	// output) — avoids the pure-JS Myers blowup (>1s on ~1MB files).
+	const parts = diffLinesWithFallback(oldContent, newContent);
 	const output: string[] = [];
 
 	let oldLineNum = 1;

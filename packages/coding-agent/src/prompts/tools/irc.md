@@ -24,7 +24,7 @@ These rules apply to both sending and replying.
 - **Do not quote the message you are replying to.** The sender already saw it; the TUI already renders it. Lead with the answer.
 - **Use IRC, not terminal tools, to learn about peers.** Do not `grep` artifacts, read other sessions' JSONL files, or shell-poke around to figure out what another agent is doing. DM them — they have the live answer and you do not.
 - **One round-trip is enough.** Replies arrive synchronously when the recipient is reachable. Do not follow up with "did you get my message?" — they did. If `delivered` is empty or the result was `failed`, the peer is unavailable; move on or report the blocker, do not retry in a loop.
-- **Stay terse.** A DM is a chat message, not a memo. One question per send when you can. Share file paths and artifacts via `local://` / `memory://` / `artifact://` URLs instead of pasting blobs.
+- **Stay terse.** A DM is a chat message, not a memo. One question per send when you can. Share file paths and artifacts via `local://` / `artifact://` URLs instead of pasting blobs.
 - **Address peers by id.** Use the exact id from `op: "list"` (e.g. `0-AuthLoader`, `0-Main`). Do not invent friendly names.
 - **Do not IRC for things a tool would answer.** If a `read`, `grep`, or build command would resolve the question, do that first.
 - **When you receive an IRC message, answer it before continuing.** The recipient injects the question + your auto-reply into your history; address it directly, do not repeat it back to the user.

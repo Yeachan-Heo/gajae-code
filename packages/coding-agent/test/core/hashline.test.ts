@@ -23,6 +23,7 @@ import {
 	tryRecoverHashlineWithCache,
 } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -52,6 +53,12 @@ function applyDiff(content: string, diff: string): string {
 
 function applyDiffWithPureInsertAutoDrop(content: string, diff: string): string {
 	return applyHashlineEdits(content, parseHashline(diff), { autoDropPureInsertDuplicates: true }).lines;
+}
+function toolText(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+		.map(part => part.text)
+		.join("\n");
 }
 
 async function withTempDir(fn: (tempDir: string) => Promise<void>): Promise<void> {
@@ -826,6 +833,30 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 		expect(cache.get("/tmp/file-1.ts")).toBeNull();
 		expect(cache.get("/tmp/file-2.ts")).not.toBeNull();
 		expect(cache.get("/tmp/file-31.ts")).not.toBeNull();
+	});
+
+	it("does not generate anchors from column-truncated read lines", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "long-line.txt");
+			const longLine = "abcdefghij";
+			await Bun.write(filePath, `${longLine}\nsecond\n`);
+
+			const settings = Settings.isolated({ "tools.outputMaxColumns": 5 });
+			const session = makeHashlineSession(tempDir, settings);
+			const readTool = new ReadTool(session);
+			const readResult = await readTool.execute("read-long-line", { path: `${filePath}:1+1` });
+			const readText = toolText(readResult);
+
+			expect(readText).toContain(`1${computeLineHash(1, longLine)}${outputSep}${longLine}`);
+			expect(readText).not.toContain("abcde…");
+
+			const anchor = `${1}${computeLineHash(1, longLine)}`;
+			await executeHashlineSingle(
+				hashlineExecuteOptions(tempDir, `§long-line.txt\n≔${sameLineRange(anchor)}\nshort\n`, settings, session),
+			);
+
+			expect(await Bun.file(filePath).text()).toBe("short\nsecond\n");
+		});
 	});
 });
 

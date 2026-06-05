@@ -1,0 +1,707 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`diff oracle snapshots single-line word change 1`] = `
+{
+  "diffLines": [
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": 
+"alpha beta gamma
+"
+,
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": 
+"alpha delta gamma
+"
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": 
+"unchanged
+"
+,
+    },
+  ],
+  "diffWords": [
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": "alpha ",
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": "beta",
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "delta",
+    },
+    {
+      "added": false,
+      "count": 2,
+      "removed": false,
+      "value": 
+" gamma
+unchanged
+"
+,
+    },
+  ],
+  "generateDiffString": {
+    "diff": 
+"-1|alpha beta gamma
++1|alpha delta gamma
+ 2|unchanged"
+,
+    "firstChangedLine": 1,
+  },
+  "generateUnifiedDiffString": {
+    "diff": 
+"@@ -1,2 +1,2 @@
+-1|alpha beta gamma
++1|alpha delta gamma
+ 2|unchanged"
+,
+    "firstChangedLine": 1,
+  },
+  "renderedGenerateDiffString": 
+"\x1B[38;2;216;74;74m-1│alpha beta gamma\x1B[39m
+\x1B[38;2;110;231;183m +│alpha delta gamma\x1B[39m
+\x1B[38;2;185;143;134m 2│\x1B[38;2;255;231;220munchanged\x1B[39m\x1B[39m"
+,
+  "renderedUnifiedDiffString": 
+"\x1B[38;2;185;143;134m@@ -1,2 +1,2 @@\x1B[39m
+\x1B[38;2;216;74;74m-1│alpha beta gamma\x1B[39m
+\x1B[38;2;110;231;183m +│alpha delta gamma\x1B[39m
+\x1B[38;2;185;143;134m 2│\x1B[38;2;255;231;220munchanged\x1B[39m\x1B[39m"
+,
+  "structuredPatch": {
+    "hunks": [
+      {
+        "lines": [
+          "-alpha beta gamma",
+          "+alpha delta gamma",
+          " unchanged",
+        ],
+        "newLines": 2,
+        "newStart": 1,
+        "oldLines": 2,
+        "oldStart": 1,
+      },
+    ],
+    "newFileName": "new.txt",
+    "newHeader": "new",
+    "oldFileName": "old.txt",
+    "oldHeader": "old",
+  },
+}
+`;
+
+exports[`diff oracle snapshots insert delete with context collapse 1`] = `
+{
+  "diffLines": [
+    {
+      "added": false,
+      "count": 2,
+      "removed": false,
+      "value": 
+"line 1
+line 2
+"
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": 
+"line 3
+"
+,
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": 
+"line THREE
+"
+,
+    },
+    {
+      "added": false,
+      "count": 11,
+      "removed": false,
+      "value": 
+"line 4
+line 5
+line 6
+line 7
+line 8
+line 9
+line 10
+line 11
+line 12
+line 13
+line 14
+"
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": 
+"line 15
+"
+,
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": 
+"line FIFTEEN
+"
+,
+    },
+    {
+      "added": false,
+      "count": 3,
+      "removed": false,
+      "value": 
+"line 16
+line 17
+line 18"
+,
+    },
+  ],
+  "diffWords": [
+    {
+      "added": false,
+      "count": 5,
+      "removed": false,
+      "value": 
+"line 1
+line 2
+line "
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": "3",
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "THREE",
+    },
+    {
+      "added": false,
+      "count": 23,
+      "removed": false,
+      "value": 
+"
+line 4
+line 5
+line 6
+line 7
+line 8
+line 9
+line 10
+line 11
+line 12
+line 13
+line 14
+line "
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": "15",
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "FIFTEEN",
+    },
+    {
+      "added": false,
+      "count": 6,
+      "removed": false,
+      "value": 
+"
+line 16
+line 17
+line 18"
+,
+    },
+  ],
+  "generateDiffString": {
+    "diff": 
+" 1|line 1
+ 2|line 2
+-3|line 3
++3|line THREE
+ 4|line 4
+ 5|line 5
+ 6|...
+ 13|line 13
+ 14|line 14
+-15|line 15
++15|line FIFTEEN
+ 16|line 16
+ 17|line 17
+ 18|..."
+,
+    "firstChangedLine": 3,
+  },
+  "generateUnifiedDiffString": {
+    "diff": 
+"@@ -1,5 +1,5 @@
+ 1|line 1
+ 2|line 2
+-3|line 3
++3|line THREE
+ 4|line 4
+ 5|line 5
+@@ -13,5 +13,5 @@
+ 13|line 13
+ 14|line 14
+-15|line 15
++15|line FIFTEEN
+ 16|line 16
+ 17|line 17"
+,
+    "firstChangedLine": 3,
+  },
+  "renderedGenerateDiffString": 
+"\x1B[38;2;185;143;134m  1│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m1\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m  2│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m2\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m -3│line 3\x1B[39m
+\x1B[38;2;110;231;183m  +│line THREE\x1B[39m
+\x1B[38;2;185;143;134m  4│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m4\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m  5│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m5\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m  6│...\x1B[39m
+\x1B[38;2;185;143;134m 13│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m13\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m 14│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m14\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m-15│line 15\x1B[39m
+\x1B[38;2;110;231;183m  +│line FIFTEEN\x1B[39m
+\x1B[38;2;185;143;134m 16│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m16\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m 17│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m17\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m 18│...\x1B[39m"
+,
+  "renderedUnifiedDiffString": 
+"\x1B[38;2;185;143;134m@@ -1,5 +1,5 @@\x1B[39m
+\x1B[38;2;185;143;134m  1│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m1\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m  2│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m2\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m -3│line 3\x1B[39m
+\x1B[38;2;110;231;183m  +│line THREE\x1B[39m
+\x1B[38;2;185;143;134m  4│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m4\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m  5│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m5\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m@@ -13,5 +13,5 @@\x1B[39m
+\x1B[38;2;185;143;134m 13│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m13\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m 14│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m14\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m-15│line 15\x1B[39m
+\x1B[38;2;110;231;183m  +│line FIFTEEN\x1B[39m
+\x1B[38;2;185;143;134m 16│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m16\x1B[39m\x1B[39m
+\x1B[38;2;185;143;134m 17│\x1B[38;2;255;231;220mline\x1B[39m \x1B[38;2;125;211;199m17\x1B[39m\x1B[39m"
+,
+  "structuredPatch": {
+    "hunks": [
+      {
+        "lines": [
+          " line 1",
+          " line 2",
+          "-line 3",
+          "+line THREE",
+          " line 4",
+          " line 5",
+        ],
+        "newLines": 5,
+        "newStart": 1,
+        "oldLines": 5,
+        "oldStart": 1,
+      },
+      {
+        "lines": [
+          " line 13",
+          " line 14",
+          "-line 15",
+          "+line FIFTEEN",
+          " line 16",
+          " line 17",
+        ],
+        "newLines": 5,
+        "newStart": 13,
+        "oldLines": 5,
+        "oldStart": 13,
+      },
+    ],
+    "newFileName": "new.txt",
+    "newHeader": "new",
+    "oldFileName": "old.txt",
+    "oldHeader": "old",
+  },
+}
+`;
+
+exports[`diff oracle snapshots CRLF unicode and tabs 1`] = `
+{
+  "diffLines": [
+    {
+      "added": false,
+      "count": 3,
+      "removed": true,
+      "value": 
+"	alpha — beta
+emoji 😀 old
+combining café
+"
+,
+    },
+    {
+      "added": true,
+      "count": 4,
+      "removed": false,
+      "value": 
+"	alpha – beta
+emoji 😀 new
+combining café
+added
+"
+,
+    },
+  ],
+  "diffWords": [
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": "	alpha ",
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": "—",
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "–",
+    },
+    {
+      "added": false,
+      "count": 3,
+      "removed": false,
+      "value": 
+" beta
+emoji 😀 "
+,
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": true,
+      "value": "old",
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "new",
+    },
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": 
+"
+combining "
+,
+    },
+    {
+      "added": false,
+      "count": 2,
+      "removed": true,
+      "value": 
+"café
+"
+,
+    },
+    {
+      "added": true,
+      "count": 2,
+      "removed": false,
+      "value": 
+"café
+added
+"
+,
+    },
+  ],
+  "generateDiffString": {
+    "diff": 
+"-1|	alpha — beta
+-2|emoji 😀 old
+-3|combining café
++1|	alpha – beta
++2|emoji 😀 new
++3|combining café
++4|added
+"
+,
+    "firstChangedLine": 1,
+  },
+  "generateUnifiedDiffString": {
+    "diff": 
+"@@ -1,3 +1,4 @@
+-1|	alpha — beta
+-2|emoji 😀 old
+-3|combining café
++1|	alpha – beta
++2|emoji 😀 new
++3|combining café
++4|added
+"
+,
+    "firstChangedLine": 1,
+  },
+  "renderedGenerateDiffString": 
+"\x1B[38;2;216;74;74m-1│\x1B[2m → \x1B[22malpha — beta\x1B[39m
+\x1B[38;2;216;74;74m-2│emoji 😀 old\x1B[39m
+\x1B[38;2;216;74;74m-3│combining café\x1B[39m
+\x1B[38;2;110;231;183m+1│\x1B[2m → \x1B[22malpha – beta\x1B[39m
+\x1B[38;2;110;231;183m+2│emoji 😀 new\x1B[39m
+\x1B[38;2;110;231;183m+3│combining café\x1B[39m
+\x1B[38;2;110;231;183m+4│added\x1B[39m"
+,
+  "renderedUnifiedDiffString": 
+"\x1B[38;2;185;143;134m@@ -1,3 +1,4 @@\x1B[39m
+\x1B[38;2;216;74;74m-1│\x1B[2m → \x1B[22malpha — beta\x1B[39m
+\x1B[38;2;216;74;74m-2│emoji 😀 old\x1B[39m
+\x1B[38;2;216;74;74m-3│combining café\x1B[39m
+\x1B[38;2;110;231;183m+1│\x1B[2m → \x1B[22malpha – beta\x1B[39m
+\x1B[38;2;110;231;183m+2│emoji 😀 new\x1B[39m
+\x1B[38;2;110;231;183m+3│combining café\x1B[39m
+\x1B[38;2;110;231;183m+4│added\x1B[39m"
+,
+  "structuredPatch": {
+    "hunks": [
+      {
+        "lines": [
+          
+"-	alpha — beta
+"
+,
+          
+"-emoji 😀 old
+"
+,
+          
+"-combining café
+"
+,
+          
+"+	alpha – beta
+"
+,
+          
+"+emoji 😀 new
+"
+,
+          
+"+combining café
+"
+,
+          
+"+added
+"
+,
+        ],
+        "newLines": 4,
+        "newStart": 1,
+        "oldLines": 3,
+        "oldStart": 1,
+      },
+    ],
+    "newFileName": "new.txt",
+    "newHeader": "new",
+    "oldFileName": "old.txt",
+    "oldHeader": "old",
+  },
+}
+`;
+
+exports[`diff oracle snapshots blank and no final newline 1`] = `
+{
+  "diffLines": [
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": 
+"alpha
+"
+,
+    },
+    {
+      "added": false,
+      "count": 3,
+      "removed": true,
+      "value": 
+"
+ beta  
+last"
+,
+    },
+    {
+      "added": true,
+      "count": 4,
+      "removed": false,
+      "value": 
+"blank
+ beta	
+last
+EOF"
+,
+    },
+  ],
+  "diffWords": [
+    {
+      "added": false,
+      "count": 1,
+      "removed": false,
+      "value": 
+"alpha
+"
+,
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": 
+"blank
+ "
+,
+    },
+    {
+      "added": false,
+      "count": 2,
+      "removed": false,
+      "value": 
+"beta	
+last
+"
+,
+    },
+    {
+      "added": true,
+      "count": 1,
+      "removed": false,
+      "value": "EOF",
+    },
+  ],
+  "generateDiffString": {
+    "diff": 
+" 1|alpha
+-2|
+-3| beta  
+-4|last
++2|blank
++3| beta	
++4|last
++5|EOF"
+,
+    "firstChangedLine": 2,
+  },
+  "generateUnifiedDiffString": {
+    "diff": 
+"@@ -1,4 +1,5 @@
+ 1|alpha
+-2|
+-3| beta  
+-4|last
+\\ No newline at end of file
++2|blank
++3| beta	
++4|last
++5|EOF
+\\ No newline at end of file"
+,
+    "firstChangedLine": 2,
+  },
+  "renderedGenerateDiffString": 
+"\x1B[38;2;185;143;134m 1│\x1B[38;2;255;231;220malpha\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m-2│\x1B[39m
+\x1B[38;2;216;74;74m-3│\x1B[2m·\x1B[22mbeta  \x1B[39m
+\x1B[38;2;216;74;74m-4│last\x1B[39m
+\x1B[38;2;110;231;183m+2│blank\x1B[39m
+\x1B[38;2;110;231;183m+3│\x1B[2m·\x1B[22mbeta   \x1B[39m
+\x1B[38;2;110;231;183m+4│last\x1B[39m
+\x1B[38;2;110;231;183m+5│EOF\x1B[39m"
+,
+  "renderedUnifiedDiffString": 
+"\x1B[38;2;185;143;134m@@ -1,4 +1,5 @@\x1B[39m
+\x1B[38;2;185;143;134m 1│\x1B[38;2;255;231;220malpha\x1B[39m\x1B[39m
+\x1B[38;2;216;74;74m-2│\x1B[39m
+\x1B[38;2;216;74;74m-3│\x1B[2m·\x1B[22mbeta  \x1B[39m
+\x1B[38;2;216;74;74m-4│last\x1B[39m
+\x1B[38;2;185;143;134m\\ No newline at end of file\x1B[39m
+\x1B[38;2;110;231;183m+2│blank\x1B[39m
+\x1B[38;2;110;231;183m+3│\x1B[2m·\x1B[22mbeta   \x1B[39m
+\x1B[38;2;110;231;183m+4│last\x1B[39m
+\x1B[38;2;110;231;183m+5│EOF\x1B[39m
+\x1B[38;2;185;143;134m\\ No newline at end of file\x1B[39m"
+,
+  "structuredPatch": {
+    "hunks": [
+      {
+        "lines": [
+          " alpha",
+          "-",
+          "- beta  ",
+          "-last",
+          "\\ No newline at end of file",
+          "+blank",
+          "+ beta	",
+          "+last",
+          "+EOF",
+          "\\ No newline at end of file",
+        ],
+        "newLines": 5,
+        "newStart": 1,
+        "oldLines": 4,
+        "oldStart": 1,
+      },
+    ],
+    "newFileName": "new.txt",
+    "newHeader": "new",
+    "oldFileName": "old.txt",
+    "oldHeader": "old",
+  },
+}
+`;

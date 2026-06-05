@@ -5,6 +5,7 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
+import { reconcileWorkflowSkillState } from "./state-runtime";
 import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
@@ -474,7 +475,6 @@ export function buildUltragoalHudSummary(
 		updatedAt: new Date().toISOString(),
 	});
 }
-
 function clampTitle(title: string): string {
 	return title.length > 80 ? `${title.slice(0, 77)}...` : title;
 }
@@ -1307,7 +1307,7 @@ function renderCompleteHandoff(
 	].join("\n");
 }
 
-export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
 	try {
 		const command = commandName(args);
 		const json = hasFlag(args, "--json");
@@ -1413,4 +1413,64 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 	} catch (error) {
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
+}
+
+const RECONCILE_COMMANDS = new Set([
+	"status",
+	"create",
+	"create-goals",
+	"complete-goals",
+	"checkpoint",
+	"steer",
+	"record-review-blockers",
+]);
+
+/**
+ * Derive a workflow-state payload from the ultragoal plan/ledger and reconcile the
+ * ultragoal mode-state + active-state/HUD so `gjc state ultragoal read`, the
+ * skill-tool chain guard, and the HUD chip mirror the plan/ledger. Session scope
+ * follows `gjc state` (`GJC_SESSION_ID`). This is a derived repair: it never changes
+ * the triggering command's status/stdout, but a failure is surfaced (stderr + a
+ * `reconcile_failed` ledger audit event) rather than silently swallowed. `status` is
+ * therefore a read PLUS a derived repair; it never mutates goals.json/ledger.jsonl
+ * beyond that reconcile-failure audit event.
+ */
+async function reconcileUltragoalState(cwd: string): Promise<void> {
+	const sessionId = process.env.GJC_SESSION_ID?.trim() || undefined;
+	try {
+		const summary = await getUltragoalStatus(cwd);
+		const status = summary.status;
+		const active = summary.exists && status !== "complete";
+		const payload: Record<string, unknown> = {
+			skill: "ultragoal",
+			status,
+			current_phase: status,
+			active,
+			goals: summary.goals.map(goal => ({ id: goal.id, title: goal.title, status: goal.status })),
+			counts: summary.counts,
+			active_goal_id: summary.currentGoal?.id ?? null,
+			ledger_path: summary.paths.ledgerPath,
+			brief_path: summary.paths.briefPath,
+			goals_path: summary.paths.goalsPath,
+		};
+		if (summary.gjcObjective) payload.gjc_objective = summary.gjcObjective;
+		await reconcileWorkflowSkillState({ cwd, mode: "ultragoal", sessionId, active, phase: status, payload });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`ultragoal state reconciliation failed: ${message}\n`);
+		try {
+			await appendLedger(cwd, { type: "reconcile_failed", error: message });
+		} catch {
+			// Best-effort audit; never let a secondary failure change command semantics.
+		}
+	}
+}
+
+export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+	const command = commandName(args);
+	const result = await dispatchUltragoalCommand(args, cwd);
+	if (result.status === 0 && RECONCILE_COMMANDS.has(command)) {
+		await reconcileUltragoalState(cwd);
+	}
+	return result;
 }

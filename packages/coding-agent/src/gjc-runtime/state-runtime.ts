@@ -22,6 +22,7 @@ import {
 	canonicalWorkflowSkill,
 	describeWorkflowStateContract,
 	WORKFLOW_STATE_VERSION,
+	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -686,13 +687,14 @@ async function writeJsonAtomic(
 	cwd: string,
 	filePath: string,
 	value: unknown,
-	verb: "write" | "clear" | "handoff" = "write",
+	verb: "write" | "clear" | "handoff" | "reconcile" = "write",
 	options?: {
 		skill?: CanonicalGjcWorkflowSkill;
 		mutationId?: string;
 		force?: boolean;
 		fromPhase?: string;
 		toPhase?: string;
+		owner?: WorkflowStateMutationOwner;
 	},
 ): Promise<{ warning?: string; stamped: Record<string, unknown> }> {
 	const warning = options?.skill
@@ -709,7 +711,7 @@ async function writeJsonAtomic(
 		audit: {
 			category: "state",
 			verb,
-			owner: "gjc-state-cli",
+			owner: options?.owner ?? "gjc-state-cli",
 			skill: options?.skill,
 			mutationId: options?.mutationId,
 			fromPhase: options?.fromPhase,
@@ -956,6 +958,95 @@ async function syncWorkflowSkillState(options: {
 	} catch {
 		// HUD sync is best-effort and must not change command semantics.
 	}
+}
+
+/**
+ * Reconcile a workflow skill's mode-state + active-state/HUD from a caller-derived
+ * payload. Unlike `gjc state write`, this is a derived repair: callers reconcile from
+ * an authoritative source (e.g. the ultragoal plan/ledger), where intermediate
+ * aggregate phases like ultragoal `active -> pending` are legitimate, so it bypasses
+ * ONLY verb transition-edge validation while preserving schema validation,
+ * unknown-phase rejection, version/checksum stamping, and audit/out-of-band tamper
+ * detection. Receipts carry `owner: "gjc-runtime"` and `verb: "reconcile"` so the
+ * provenance is distinguishable from a user-initiated write.
+ */
+export async function reconcileWorkflowSkillState(options: {
+	cwd: string;
+	mode: CanonicalGjcWorkflowSkill;
+	sessionId: string | undefined;
+	threadId?: string;
+	turnId?: string;
+	active: boolean;
+	phase: string;
+	payload: Record<string, unknown>;
+}): Promise<{ stateFile: string }> {
+	const { cwd, mode, sessionId, threadId, turnId, active, payload } = options;
+	const filePath = modeStateFile(cwd, mode, sessionId);
+	const existingRead = await readExistingStateForMutation(filePath);
+	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
+	const nowIsoStr = nowIso();
+	const mutationId = `${mode}:reconcile:${nowIsoStr}`;
+
+	const trimmedPhase = options.phase.trim();
+	const manifestStates = new Set(getSkillManifest(mode).states.map(state => state.id));
+	if (!manifestStates.has(trimmedPhase)) {
+		throw new StateCommandError(2, `unknown ${mode} phase "${trimmedPhase}" for reconciliation`);
+	}
+
+	const fromPhase =
+		typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : undefined;
+	const receipt = buildWorkflowStateReceipt({
+		cwd,
+		skill: mode,
+		owner: "gjc-runtime",
+		command: `gjc ${mode} (reconcile)`,
+		sessionId,
+		nowIso: nowIsoStr,
+		mutationId,
+	});
+	receipt.verb = "reconcile";
+	receipt.forced = true;
+	receipt.from_phase = fromPhase;
+	receipt.to_phase = trimmedPhase;
+
+	const merged = mergeWithNullDelete(existingPayload, payload);
+	merged.skill = mode;
+	merged.current_phase = trimmedPhase;
+	merged.active = active;
+	merged.version = WORKFLOW_STATE_VERSION;
+	merged.updated_at = nowIsoStr;
+	merged.receipt = receipt;
+	if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
+
+	const validation = validateWorkflowStateEnvelope(mode, merged);
+	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
+
+	await writeJsonAtomic(cwd, filePath, merged, "reconcile", {
+		skill: mode,
+		mutationId,
+		force: true,
+		fromPhase,
+		toPhase: trimmedPhase,
+		owner: "gjc-runtime",
+	});
+
+	// Reconciliation drives the active-state/HUD update directly (not via the
+	// best-effort syncWorkflowSkillState wrapper) so a failed HUD/active-state write
+	// is surfaced to the caller and recorded as a reconcile failure, rather than
+	// silently leaving a stale chip behind a freshly reconciled mode-state.
+	await syncSkillActiveState({
+		cwd,
+		skill: mode,
+		active,
+		phase: trimmedPhase,
+		sessionId,
+		threadId,
+		turnId,
+		source: "gjc-runtime-reconcile",
+		hud: buildHudForMode(mode, merged),
+		receipt,
+	});
+	return { stateFile: filePath };
 }
 export async function readWorkflowStateJson(
 	cwd: string,

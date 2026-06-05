@@ -19,6 +19,7 @@ import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import { buildAgentSubskillInjection } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -1159,6 +1160,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live; use IRC for live coordination when enabled.`
 				: "";
 
+			const agentSubskillBlock = await buildAgentSubskillInjection({
+				cwd,
+				sessionId: options.parentSessionId,
+				agentName: agent.name,
+			});
+
 			const { session } = await awaitAbortable(
 				createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1185,15 +1192,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							ircSelfId: ircEnabled ? id : "",
 							forkContext: forkContextNotice,
 						});
+						const promptWithSubskills = `${subagentPrompt}${agentSubskillBlock}`;
 						return defaultPrompt.length === 0
-							? [subagentPrompt]
-							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+							? [promptWithSubskills]
+							: [...defaultPrompt.slice(0, -1), promptWithSubskills, defaultPrompt[defaultPrompt.length - 1]];
 					},
 					sessionManager,
 					hasUI: false,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
 					currentAgentType: agent.name,
+					gjcSubskillToolContext: {
+						cwd,
+						sessionId: options.parentSessionId,
+						parent: agent.name,
+						phase: "prompt",
+					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
 					agentId: id,

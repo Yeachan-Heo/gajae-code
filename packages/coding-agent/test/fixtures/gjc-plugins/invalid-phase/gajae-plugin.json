@@ -1,0 +1,7 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "invalid-phase",
+  "version": "1.0.0",
+  "subskills": ["subskills/badphase/SKILL.md"],
+  "tools": []
+}

@@ -43,6 +43,7 @@ import {
 	formatCanonicalVariantSelector,
 	type ModelEquivalenceConfig,
 } from "./model-equivalence";
+import { type ModelProfileDefinition, mergeModelProfiles } from "./model-profiles";
 import {
 	type ModelOverride,
 	type ModelsConfig,
@@ -511,6 +512,7 @@ interface CustomModelsResult {
 	configuredProviders?: Set<string>;
 	equivalence?: ModelEquivalenceConfig;
 	modelBindings?: NonNullable<ModelsConfig["modelBindings"]>;
+	profiles?: ModelsConfig["profiles"];
 	error?: ConfigError;
 	found: boolean;
 }
@@ -954,6 +956,7 @@ export class ModelRegistry {
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#configuredModelBindings: NonNullable<ModelsConfig["modelBindings"]> | undefined;
+	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
 	#modelBindingsTargetSettings: Settings | undefined;
 	#appliedModelBindingRoles = new Set<string>();
 	#appliedAgentModelBindingOverrides = new Set<string>();
@@ -1093,6 +1096,7 @@ export class ModelRegistry {
 			configuredProviders = new Set(),
 			equivalence,
 			modelBindings,
+			profiles,
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#configError = configError;
@@ -1103,6 +1107,7 @@ export class ModelRegistry {
 		this.#modelOverrides = modelOverrides;
 		this.#equivalenceConfig = equivalence;
 		this.#configuredModelBindings = modelBindings;
+		this.#modelProfiles = mergeModelProfiles(profiles);
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
@@ -1343,6 +1348,7 @@ export class ModelRegistry {
 				discoverableProviders: [],
 				configuredProviders: new Set(),
 				error,
+				profiles: undefined,
 				found: true,
 			};
 		} else if (status === "not-found") {
@@ -1353,6 +1359,7 @@ export class ModelRegistry {
 				keylessProviders: new Set(),
 				discoverableProviders: [],
 				configuredProviders: new Set(),
+				profiles: undefined,
 				found: false,
 			};
 		}
@@ -1441,10 +1448,22 @@ export class ModelRegistry {
 			configuredProviders,
 			equivalence: value.equivalence,
 			modelBindings: value.modelBindings,
+			profiles: value.profiles,
 			found: true,
 		};
 	}
 
+	getModelProfiles(): Map<string, ModelProfileDefinition> {
+		return new Map(this.#modelProfiles);
+	}
+
+	getModelProfile(name: string): ModelProfileDefinition | undefined {
+		return this.#modelProfiles.get(name);
+	}
+
+	getAvailableModelProfileNames(): string[] {
+		return [...this.#modelProfiles.keys()].sort((a, b) => a.localeCompare(b));
+	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
 		this.#modelBindingsTargetSettings = targetSettings;
 		this.#applyConfiguredModelBindingsToTarget();

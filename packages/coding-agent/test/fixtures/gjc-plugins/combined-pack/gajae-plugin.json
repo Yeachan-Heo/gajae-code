@@ -1,0 +1,7 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "combined-pack",
+  "version": "1.0.0",
+  "subskills": ["subskills/ralplan-design/SKILL.md", "subskills/executor-design/SKILL.md"],
+  "tools": []
+}

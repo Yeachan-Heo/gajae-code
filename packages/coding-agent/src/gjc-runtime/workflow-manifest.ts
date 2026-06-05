@@ -212,8 +212,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",
-		states: ["goal-planning", "pending", "active", "blocked", "failed", "complete", "handoff"],
-		terminalStates: ["failed", "complete", "handoff"],
+		states: ["missing", "goal-planning", "pending", "active", "blocked", "failed", "complete", "handoff"],
+		terminalStates: ["missing", "failed", "complete", "handoff"],
 		transitions: [
 			{ from: "goal-planning", to: "pending", verb: "create-goals" },
 			{ from: "pending", to: "active", verb: "complete-goals" },

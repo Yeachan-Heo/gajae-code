@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/swarm-extension",
-	"version": "0.3.1",
+	"version": "0.3.2",
 	"description": "Swarm orchestration extension for gjc",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",

@@ -84,6 +84,20 @@ function isSubcommand(first: string | undefined): boolean {
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
 	await smokeTestSyncWorker();
+	// Prove the embedded native addon extracts and the new perf exports resolve in
+	// the COMPILED single binary (dev runs only load the on-disk .node). Loading the
+	// natives module triggers loadNative()/embedded extraction; calling each new
+	// export confirms the symbols are present in the shipped binary.
+	const { h06FormatHashLines, h02ScoreSequenceFuzzy, h01FindBestFuzzyMatch } = await import(
+		"../../natives/native/index.js"
+	);
+	const hashed = h06FormatHashLines("a\nb", 1);
+	if (hashed.split("\n").length !== 2) {
+		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
+	}
+	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
+		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
+	}
 	process.stdout.write("smoke-test: ok\n");
 }
 

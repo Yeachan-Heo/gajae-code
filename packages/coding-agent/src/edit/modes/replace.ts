@@ -21,6 +21,28 @@ import {
 	restoreLineEndings,
 	stripBom,
 } from "../normalize";
+
+type NativeSequenceFuzzyResult = {
+	index?: number;
+	confidence: number;
+	matchCount: number;
+	matchIndices: number[];
+	secondBestScore: number;
+};
+
+let scoreSequenceFuzzyNative:
+	| ((lines: string[], pattern: string[], start: number, eof: boolean) => NativeSequenceFuzzyResult)
+	| undefined;
+void import("../../../../natives/native/index.js")
+	.then(mod => {
+		if (typeof mod.h02ScoreSequenceFuzzy === "function") {
+			scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
+		}
+	})
+	.catch(() => {
+		// Native unavailable; fuzzy matching uses the TS fallback.
+	});
+
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 
@@ -444,7 +466,7 @@ function findBestFuzzyMatchCore(
 	return { best, aboveThresholdCount, secondBestScore };
 }
 
-function findBestFuzzyMatch(content: string, target: string, threshold: number): BestFuzzyMatchResult {
+export function findBestFuzzyMatch(content: string, target: string, threshold: number): BestFuzzyMatchResult {
 	const contentLines = content.split("\n");
 	const targetLines = target.split("\n");
 
@@ -682,6 +704,29 @@ export function seekSequence(
 		return { index: undefined, confidence: 0 };
 	}
 
+	const nativeFuzzyResult = scoreSequenceFuzzyNative?.(lines, pattern, start, eof);
+	if (nativeFuzzyResult?.index !== undefined && nativeFuzzyResult.confidence >= SEQUENCE_FUZZY_THRESHOLD) {
+		if (
+			nativeFuzzyResult.matchCount > 1 &&
+			nativeFuzzyResult.confidence >= DOMINANT_FUZZY_MIN_CONFIDENCE &&
+			nativeFuzzyResult.confidence - nativeFuzzyResult.secondBestScore >= DOMINANT_FUZZY_DELTA
+		) {
+			return {
+				index: nativeFuzzyResult.index,
+				confidence: nativeFuzzyResult.confidence,
+				matchCount: 1,
+				matchIndices: nativeFuzzyResult.matchIndices,
+				strategy: "fuzzy-dominant",
+			};
+		}
+		return {
+			index: nativeFuzzyResult.index,
+			confidence: nativeFuzzyResult.confidence,
+			matchCount: nativeFuzzyResult.matchCount,
+			matchIndices: nativeFuzzyResult.matchIndices,
+			strategy: "fuzzy",
+		};
+	}
 	// Pass 7: Fuzzy matching - find best match above threshold
 	let bestScore = 0;
 	let secondBestScore = 0;

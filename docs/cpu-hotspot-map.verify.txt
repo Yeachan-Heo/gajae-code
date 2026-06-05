@@ -1,0 +1,26 @@
+CPU/MEMORY HOTSPOT MAP — VERIFICATION REPORT
+generated: 2026-06-05T08:36:19.819360Z
+
+PASS H01 packages/coding-agent/src/edit/modes/replace.ts  token='fuzzyScoreAt'
+PASS H02 packages/coding-agent/src/edit/modes/replace.ts  token='function levenshteinDistance'
+PASS H03 packages/coding-agent/src/edit/diff.ts  token='Diff.diffLines'
+PASS H04 packages/coding-agent/src/modes/components/diff.ts  token='Diff.diffWords'
+PASS H05 packages/coding-agent/src/hindsight/mental-models.ts  token='function longestCommonSubsequence'
+PASS H06 packages/coding-agent/src/hashline/hash.ts  token='function computeLineHash'
+PASS H07 packages/agent/src/compaction/compaction.ts  token='function estimateTokens'
+PASS H08 packages/agent/src/compaction/openai.ts  token='JSON.stringify(item).length'
+PASS H09 packages/agent/src/append-only-context.ts  token='JSON.parse(JSON.stringify'
+PASS H10 packages/coding-agent/src/session/agent-session.ts  token='normalizeSessionMessageForProviderReplay'
+PASS H11 packages/coding-agent/src/secrets/obfuscator.ts  token='replaceAll(result'
+PASS M01 packages/coding-agent/src/session/session-manager.ts  token='#fileEntries: FileEntry[]'
+PASS M02 packages/coding-agent/src/session/session-manager.ts  token='.filter((e): e is SessionEntry'
+PASS M03 packages/coding-agent/src/session/agent-session.ts  token='replaceMessages(sessionContext.messages'
+PASS M04 packages/agent/src/append-only-context.ts  token='#entries: Message[]'
+PASS M05 packages/coding-agent/src/session/session-manager.ts  token='fileEntries: [...this.#fileEntries]'
+
+coverage: 11 CPU + 5 memory (>=10 required: YES)
+citations resolved: 16/16
+already-native false positives among flagged: NONE
+JSON: valid
+adversarial: H02 wording corrected to two-row DP and re-verified; H01 ranges widened to loop starts
+independent review: agent://0-VerifyHotspotMap = APPROVE, blockers=[]

@@ -51,7 +51,7 @@ afterEach(async () => {
 });
 
 describe("default GJC definitions", () => {
-	it("bundles exactly the four default workflow skills plus deep-interview fragments as installable assets", () => {
+	it("bundles exactly the four default workflow skills plus deep-interview and ultragoal fragments as installable assets", () => {
 		const definitions = getDefaultGjcDefinitions();
 		const workflowDefinitions = definitions.filter(definition => definition.kind === "skill");
 		const fragmentDefinitions = definitions.filter(definition => definition.kind === "skill-fragment");
@@ -60,17 +60,19 @@ describe("default GJC definitions", () => {
 
 		expect(skills).toEqual(expected);
 		expect(workflowDefinitions).toHaveLength(4);
-		expect(definitions).toHaveLength(6);
+		expect(definitions).toHaveLength(7);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
 		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
-		expect(fragmentDefinitions).toHaveLength(2);
-		expect(fragmentDefinitions.map(definition => definition.parentSkillName)).toEqual([
+		expect(fragmentDefinitions).toHaveLength(3);
+		expect(fragmentDefinitions.map(definition => definition.parentSkillName).sort()).toEqual([
 			"deep-interview",
 			"deep-interview",
+			"ultragoal",
 		]);
 		expect(fragmentDefinitions.map(definition => definition.relativePath).sort()).toEqual([
 			"skill-fragments/deep-interview/auto-answer-uncertain.md",
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
+			"skill-fragments/ultragoal/ai-slop-cleaner.md",
 		]);
 	});
 
@@ -89,6 +91,83 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
 		]);
 		expect(fragments.every(fragment => fragment.content.includes("read-only architect"))).toBe(true);
+	});
+
+	it("exposes the ultragoal ai-slop-cleaner fragment only through the parent-scoped fragment accessor", () => {
+		const fragments = getEmbeddedDefaultGjcSkillFragments("ultragoal");
+
+		expect(
+			getEmbeddedDefaultGjcSkills()
+				.map(skill => skill.name)
+				.sort(),
+		).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
+		expect(fragments).toHaveLength(1);
+		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment"]);
+		expect(fragments.map(fragment => fragment.relativePath)).toEqual([
+			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+		]);
+		expect(fragments[0]!.content).toContain("AI SLOP CLEANUP REPORT");
+		expect(fragments[0]!.content).toContain("read-only detector");
+	});
+
+	it("authors the ai-slop-cleaner fragment with the mandated report labels and full taxonomy", () => {
+		const fragment = getEmbeddedDefaultGjcSkillFragments("ultragoal")[0]!;
+		const content = fragment.content;
+
+		for (const label of [
+			"AI SLOP CLEANUP REPORT",
+			"Scope:",
+			"Mode: read-only detector/report; no edits performed",
+			"Blocking Findings",
+			"Advisory Findings",
+			"Fallback Findings",
+			"UI/Design Findings",
+			"Missing Test Findings",
+			"Recursion Guard",
+			"Changed Files Reviewed",
+			"Gate Result: PASS | BLOCKED",
+		]) {
+			expect(content).toContain(label);
+		}
+		for (const taxonomy of [
+			"masking fallback slop",
+			"grounded compatibility/fail-safe fallback",
+			"Fallback-like code",
+			"Duplication",
+			"Dead code",
+			"Needless abstraction",
+			"Boundary violations",
+			"UI/design slop",
+			"Missing tests",
+		]) {
+			expect(content).toContain(taxonomy);
+		}
+	});
+
+	it("wires the ai-slop-cleaner into the ultragoal completion gate before verification and red-team", () => {
+		const ultragoal = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "ultragoal",
+		);
+		if (!ultragoal) throw new Error("missing bundled ultragoal skill");
+		const content = ultragoal.content;
+
+		const sectionStart = content.indexOf("## Mandatory completion cleanup and review gate");
+		expect(sectionStart).toBeGreaterThanOrEqual(0);
+		const afterStart = content.indexOf("\n## ", sectionStart + 1);
+		const section = content.slice(sectionStart, afterStart === -1 ? undefined : afterStart);
+
+		const cleanerStep = section.indexOf("2. Run the internal ai-slop-cleaner skill fragment");
+		const verifyStep = section.indexOf("3. Rerun verification after the cleaner pass");
+		const architectStep = section.indexOf("4. Delegate an `architect` review");
+		const redTeamStep = section.indexOf("5. Delegate an `executor` QA/red-team lane");
+
+		expect(cleanerStep).toBeGreaterThanOrEqual(0);
+		expect(verifyStep).toBeGreaterThan(cleanerStep);
+		expect(architectStep).toBeGreaterThan(verifyStep);
+		expect(redTeamStep).toBeGreaterThan(architectStep);
+
+		expect(section).toContain("reruns the cleaner until blocking findings are zero");
+		expect(section).toContain("Advisory findings are included in the gate report only");
 	});
 
 	it("keeps the four role agents bundled when project .gjc is absent", async () => {
@@ -298,10 +377,10 @@ Project executor override body.
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
 		const installedDeepInterview = await Bun.file(deepInterviewSkillPath).text();
 
-		expect(initial.written).toBe(6);
-		expect(initial.total).toBe(6);
+		expect(initial.written).toBe(7);
+		expect(initial.total).toBe(7);
 		expect(initial.skipped).toBe(0);
-		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(2);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(3);
 
 		const installedResearchFragment = await Bun.file(
 			path.join(targetRoot, "skill-fragments", "deep-interview", "auto-research-greenfield.md"),
@@ -310,15 +389,15 @@ Project executor override body.
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(6);
+		expect(skipped.skipped).toBe(7);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(5);
+		expect(check.matching).toBe(6);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(6);
+		expect(forced.written).toBe(7);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
 		expect(
 			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
@@ -345,6 +424,30 @@ Project executor override body.
 			await expect(
 				new SkillProtocolHandler().resolve(parseInternalUrl("skill://deep-interview/auto-research-greenfield.md")),
 			).rejects.toThrow("File not found");
+		});
+	});
+
+	it("does not make the ultragoal ai-slop-cleaner fragment reachable as a skill-relative internal URL asset", async () => {
+		await withTempHome(async () => {
+			const repoRoot = await makeTempRoot();
+			await installDefaultGjcDefinitions({ targetRoot: path.join(repoRoot, ".gjc") });
+
+			const skills = await loadSkills({
+				cwd: repoRoot,
+				enabled: true,
+				enablePiProject: true,
+				enablePiUser: false,
+			});
+			const ultragoal = skills.skills.find(skill => skill.name === "ultragoal" && skill.source === "native:project");
+			if (!ultragoal) throw new Error("missing installed ultragoal skill");
+
+			setActiveSkills([ultragoal]);
+			await expect(
+				new SkillProtocolHandler().resolve(parseInternalUrl("skill://ultragoal/ai-slop-cleaner.md")),
+			).rejects.toThrow("File not found");
+			await expect(new SkillProtocolHandler().resolve(parseInternalUrl("skill://ai-slop-cleaner"))).rejects.toThrow(
+				"Unknown skill: ai-slop-cleaner",
+			);
 		});
 	});
 });
@@ -419,37 +522,40 @@ describe("bundled skills CLI", () => {
 		expect(parsed.skills.every(skill => skill.path.startsWith("embedded:gjc/skills/"))).toBe(true);
 		expect(parsed.skills.some(skill => skill.name === "auto-research-greenfield")).toBe(false);
 		expect(parsed.skills.some(skill => skill.name === "auto-answer-uncertain")).toBe(false);
+		expect(parsed.skills.some(skill => skill.name === "ai-slop-cleaner")).toBe(false);
 	});
 
 	it("does not expose embedded fragments through skills read", async () => {
-		const externalRoot = await makeTempRoot();
-		const proc = Bun.spawn(
-			[
-				process.execPath,
-				path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
-				"skills",
-				"read",
-				"auto-research-greenfield",
-				"--json",
-			],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...process.env,
-					HOME: await makeTempRoot(),
-					PI_NO_TITLE: "1",
-					NO_COLOR: "1",
+		for (const fragmentName of ["auto-research-greenfield", "auto-answer-uncertain", "ai-slop-cleaner"]) {
+			const externalRoot = await makeTempRoot();
+			const proc = Bun.spawn(
+				[
+					process.execPath,
+					path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
+					"skills",
+					"read",
+					fragmentName,
+					"--json",
+				],
+				{
+					cwd: externalRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						HOME: await makeTempRoot(),
+						PI_NO_TITLE: "1",
+						NO_COLOR: "1",
+					},
 				},
-			},
-		);
-		const stdout = await new Response(proc.stdout).text();
-		const stderr = await new Response(proc.stderr).text();
-		const exitCode = await proc.exited;
+			);
+			const stdout = await new Response(proc.stdout).text();
+			const stderr = await new Response(proc.stderr).text();
+			const exitCode = await proc.exited;
 
-		expect(exitCode).not.toBe(0);
-		expect(stdout).toBe("");
-		expect(stderr).toContain("unknown embedded skill");
+			expect(exitCode).not.toBe(0);
+			expect(stdout).toBe("");
+			expect(stderr).toContain("unknown embedded skill");
+		}
 	});
 });

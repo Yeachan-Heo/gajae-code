@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	assertCanCompleteCurrentGoal,
 	validateCompletionReceipt,
@@ -14,6 +15,7 @@ import {
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
 const tempRoots: string[] = [];
 
@@ -124,6 +126,89 @@ function goalSnapshot(objective: string, status = "active", updatedAt = Date.now
 		},
 	});
 }
+
+async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
+	return (await Bun.file(filePath).json()) as Record<string, unknown>;
+}
+
+async function seedStaleUltragoalWorkflowState(root: string): Promise<void> {
+	const stateDir = path.join(root, ".gjc", "state");
+	await fs.mkdir(stateDir, { recursive: true });
+	const staleAt = "2026-01-01T00:00:00.000Z";
+	await Bun.write(
+		path.join(stateDir, "ultragoal-state.json"),
+		JSON.stringify(
+			{
+				skill: "ultragoal",
+				version: 1,
+				active: true,
+				current_phase: "goal-planning",
+				updated_at: staleAt,
+			},
+			null,
+			2,
+		),
+	);
+	await Bun.write(
+		path.join(stateDir, "skill-active-state.json"),
+		JSON.stringify(
+			{
+				version: 1,
+				active: true,
+				skill: "ultragoal",
+				phase: "goal-planning",
+				updated_at: staleAt,
+				active_skills: [
+					{
+						skill: "ultragoal",
+						phase: "goal-planning",
+						active: true,
+						updated_at: staleAt,
+						hud: {
+							version: 1,
+							chips: [{ label: "status", value: "goal-planning" }],
+						},
+					},
+				],
+			},
+			null,
+			2,
+		),
+	);
+}
+
+async function seedStaleUltragoalActiveEntry(root: string): Promise<void> {
+	const stateDir = path.join(root, ".gjc", "state");
+	await fs.mkdir(path.join(stateDir, "active"), { recursive: true });
+	const staleAt = "2026-01-01T00:00:00.000Z";
+	const entry = {
+		skill: "ultragoal",
+		phase: "goal-planning",
+		active: true,
+		updated_at: staleAt,
+		hud: {
+			version: 1,
+			chips: [{ label: "status", value: "goal-planning" }],
+		},
+	};
+	await Bun.write(path.join(stateDir, "active", "ultragoal.json"), JSON.stringify(entry, null, 2));
+	await Bun.write(
+		path.join(stateDir, "skill-active-state.json"),
+		JSON.stringify(
+			{
+				version: 1,
+				active: true,
+				skill: "ultragoal",
+				phase: "goal-planning",
+				updated_at: staleAt,
+				active_skills: [entry],
+			},
+			null,
+			2,
+		),
+	);
+}
+
 function mutateQualityGate(mutator: (gate: Record<string, Record<string, unknown>>) => void): string {
 	const gate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
 	mutator(gate);
@@ -1357,6 +1442,100 @@ describe("ultragoal @goal decomposition", () => {
 		expect(summary.status).toBe("active");
 	});
 
+	it("reconciles completed runs with mode-state and HUD active-state", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship state reconciliation" });
+		await startNextUltragoalGoal({ cwd: root });
+		await seedStaleUltragoalWorkflowState(root);
+
+		const checkpoint = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"final story verified with targeted regression coverage",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+			],
+			root,
+		);
+
+		expect(checkpoint.status).toBe(0);
+		const modeState = await readJsonFile(path.join(root, ".gjc", "state", "ultragoal-state.json"));
+		expect(modeState.active).toBe(false);
+		expect(modeState.current_phase).toBe("complete");
+		expect(modeState.status).toBe("complete");
+		expect(modeState.counts).toMatchObject({ complete: 1, pending: 0, active: 0 });
+		expect(modeState.active_goal_id).toBeUndefined();
+		expect(modeState.receipt).toMatchObject({ skill: "ultragoal", owner: "gjc-runtime" });
+
+		const activeState = await readJsonFile(path.join(root, ".gjc", "state", "skill-active-state.json"));
+		expect(activeState.active).toBe(false);
+		expect(activeState.active_skills).toEqual([]);
+	});
+
+	it("reconciles missing durable plans with stale active mode-state", async () => {
+		const root = await tempDir();
+		await seedStaleUltragoalWorkflowState(root);
+		await seedStaleUltragoalActiveEntry(root);
+
+		const status = await runNativeUltragoalCommand(["status"], root);
+
+		expect(status.status).toBe(0);
+		expect(status.stdout).toContain("No ultragoal plan found");
+		const modeState = await readJsonFile(path.join(root, ".gjc", "state", "ultragoal-state.json"));
+		expect(modeState.active).toBe(false);
+		expect(modeState.current_phase).toBe("missing");
+		expect(modeState.status).toBe("missing");
+		expect(modeState.active_goal_id).toBeUndefined();
+
+		const activeState = await readJsonFile(path.join(root, ".gjc", "state", "skill-active-state.json"));
+		expect(activeState.active).toBe(false);
+		expect(activeState.active_skills).toEqual([]);
+	});
+
+	it("reconciles terminal checkpoints despite corrupt stale mode-state", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship corrupt state reconciliation" });
+		await startNextUltragoalGoal({ cwd: root });
+		await seedStaleUltragoalActiveEntry(root);
+		await fs.mkdir(path.join(root, ".gjc", "state"), { recursive: true });
+		await Bun.write(path.join(root, ".gjc", "state", "ultragoal-state.json"), "{not-json");
+
+		const checkpoint = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"final story verified with targeted regression coverage",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+			],
+			root,
+		);
+
+		expect(checkpoint.status).toBe(0);
+		const modeState = await readJsonFile(path.join(root, ".gjc", "state", "ultragoal-state.json"));
+		expect(modeState.active).toBe(false);
+		expect(modeState.current_phase).toBe("complete");
+		expect(modeState.status).toBe("complete");
+		expect(modeState.counts).toMatchObject({ complete: 1, pending: 0, active: 0 });
+
+		const activeState = await readJsonFile(path.join(root, ".gjc", "state", "skill-active-state.json"));
+		expect(activeState.active).toBe(false);
+		expect(activeState.active_skills).toEqual([]);
+	});
+
 	it("schedules each @goal story in order through the existing API", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({
@@ -1433,5 +1612,237 @@ describe("ultragoal @goal decomposition", () => {
 		expect(plan.goals[0]?.title).toBe("Long");
 		expect(plan.goals[0]?.objective).toBe(longBody);
 		expect(plan.goals[0]?.objective).toHaveLength(5000);
+	});
+});
+
+describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
+	function modeStatePath(root: string, sessionId?: string): string {
+		if (sessionId) {
+			const encoded = encodeURIComponent(sessionId).replaceAll(".", "%2E");
+			return path.join(root, ".gjc", "state", "sessions", encoded, "ultragoal-state.json");
+		}
+		return path.join(root, ".gjc", "state", "ultragoal-state.json");
+	}
+
+	async function readModeState(root: string, sessionId?: string): Promise<Record<string, unknown>> {
+		return JSON.parse(await Bun.file(modeStatePath(root, sessionId)).text());
+	}
+
+	async function withSessionId<T>(id: string | undefined, fn: () => Promise<T>): Promise<T> {
+		const prev = process.env.GJC_SESSION_ID;
+		if (id === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = id;
+		try {
+			return await fn();
+		} finally {
+			if (prev === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prev;
+		}
+	}
+
+	it("reconciles mode-state + HUD on create-goals (AC1)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			expect(result.status).toBe(0);
+
+			const mode = await readModeState(root);
+			expect(mode.skill).toBe("ultragoal");
+			expect(mode.current_phase).toBe("pending");
+			expect(mode.active).toBe(true);
+
+			const active = await readVisibleSkillActiveState(root);
+			const entry = active?.active_skills?.find(e => e.skill === "ultragoal");
+			expect(entry?.active).toBe(true);
+			expect(entry?.hud?.chips?.some(chip => chip.label === "status" && chip.value === "pending")).toBe(true);
+			expect(entry?.hud?.chips?.some(chip => chip.label === "goals")).toBe(true);
+		});
+	});
+
+	it("writes session-scoped state when GJC_SESSION_ID is set (AC1)", async () => {
+		const root = await tempDir();
+		const sessionId = "sess.test.342";
+		await withSessionId(sessionId, async () => {
+			const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			expect(result.status).toBe(0);
+
+			const sessionMode = await readModeState(root, sessionId);
+			expect(sessionMode.current_phase).toBe("pending");
+			expect(sessionMode.active).toBe(true);
+
+			const sessionActive = await readVisibleSkillActiveState(root, sessionId);
+			expect(sessionActive?.active_skills?.some(e => e.skill === "ultragoal")).toBe(true);
+		});
+	});
+
+	it("stamps reconcile provenance distinguishable from a user write (AC5)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			const mode = await readModeState(root);
+			const receipt = mode.receipt as Record<string, unknown>;
+			expect(receipt.owner).toBe("gjc-runtime");
+			expect(receipt.verb).toBe("reconcile");
+			expect(receipt.forced).toBe(true);
+			expect(receipt.to_phase).toBe("pending");
+			expect(receipt.content_sha256).toBeDefined();
+			expect(typeof mode.version).toBe("number");
+		});
+	});
+
+	it("reconciles to terminal complete/active:false on aggregate completion (AC2)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+			await startNextUltragoalGoal({ cwd: root });
+			const result = await runNativeUltragoalCommand(
+				[
+					"checkpoint",
+					"--goal-id",
+					"G001",
+					"--status",
+					"complete",
+					"--evidence",
+					"tests passed",
+					"--gjc-goal-json",
+					goalSnapshot(created.gjcObjective),
+					"--quality-gate-json",
+					passingQualityGate(),
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+
+			const summary = await getUltragoalStatus(root);
+			expect(summary.status).toBe("complete");
+
+			const mode = await readModeState(root);
+			expect(mode.current_phase).toBe("complete");
+			expect(mode.active).toBe(false);
+
+			const active = await readVisibleSkillActiveState(root);
+			const stillActive = active?.active_skills?.find(e => e.skill === "ultragoal" && e.active === true);
+			expect(stillActive).toBeUndefined();
+		});
+	});
+
+	it("reconcileWorkflowSkillState bypasses transition-edge validation but keeps phase validation (AC3)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			// Drive the mode-state to "active" via the sanctioned reconciliation path.
+			await reconcileWorkflowSkillState({
+				cwd: root,
+				mode: "ultragoal",
+				sessionId: undefined,
+				active: true,
+				phase: "active",
+				payload: { skill: "ultragoal", status: "active" },
+			});
+			// active -> pending has no manifest transition edge; reconciliation must still succeed.
+			const res = await reconcileWorkflowSkillState({
+				cwd: root,
+				mode: "ultragoal",
+				sessionId: undefined,
+				active: true,
+				phase: "pending",
+				payload: { skill: "ultragoal", status: "pending" },
+			});
+			const mode = JSON.parse(await Bun.file(res.stateFile).text());
+			expect(mode.current_phase).toBe("pending");
+
+			// Schema/unknown-phase validation is still enforced.
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd: root,
+					mode: "ultragoal",
+					sessionId: undefined,
+					active: true,
+					phase: "goal-execution",
+					payload: { skill: "ultragoal" },
+				}),
+			).rejects.toThrow(/unknown ultragoal phase/);
+		});
+	});
+
+	it("status repairs stale/missing mode-state without mutating plan/ledger (AC5)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			await fs.rm(modeStatePath(root), { force: true });
+
+			const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+			const beforeLedger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+
+			const result = await runNativeUltragoalCommand(["status"], root);
+			expect(result.status).toBe(0);
+
+			const mode = await readModeState(root);
+			expect(mode.current_phase).toBe("pending");
+			expect(mode.active).toBe(true);
+
+			expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+			expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text()).toBe(beforeLedger);
+		});
+	});
+
+	it("keeps the command receipt intact and is diagnosable when reconciliation fails (AC5)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			// Force the reconcile write to fail by replacing the mode-state file with a directory.
+			const p = modeStatePath(root);
+			await fs.rm(p, { force: true });
+			await fs.mkdir(p, { recursive: true });
+
+			const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+			const result = await runNativeUltragoalCommand(["status", "--json"], root);
+
+			// The triggering command still succeeds with an intact receipt.
+			expect(result.status).toBe(0);
+			expect(() => JSON.parse(result.stdout ?? "")).not.toThrow();
+
+			// The plan is untouched and the failure is recorded in the audit trail.
+			expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+			const ledger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+			expect(ledger).toContain("reconcile_failed");
+		});
+	});
+
+	it("reconciliation does not alter the command JSON receipt (AC4)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix", "--json"], root);
+			// stdout receipt is exactly the create-goals receipt — reconciliation adds nothing.
+			expect(JSON.parse(result.stdout ?? "{}")).toEqual({
+				ok: true,
+				goals_count: 1,
+				goal_ids: ["G001"],
+				goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+			});
+			// ...yet the derived mode-state was still reconciled out-of-band.
+			const mode = await readModeState(root);
+			expect(mode.current_phase).toBe("pending");
+		});
+	});
+
+	it("surfaces active-state/HUD sync failures during reconciliation (AC5)", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+			// Force the active-state/HUD write to fail by replacing skill-active-state.json with a directory.
+			const activePath = path.join(root, ".gjc", "state", "skill-active-state.json");
+			await fs.rm(activePath, { force: true });
+			await fs.mkdir(activePath, { recursive: true });
+
+			const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+			const result = await runNativeUltragoalCommand(["status", "--json"], root);
+
+			// Command still succeeds; the HUD-sync failure is diagnosable via the audit trail.
+			expect(result.status).toBe(0);
+			expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+			const ledger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
+			expect(ledger).toContain("reconcile_failed");
+		});
 	});
 });

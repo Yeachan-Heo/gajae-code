@@ -102,19 +102,24 @@ async function loadWorkspaceVersions(): Promise<Readonly<Record<string, string>>
 	return workspaceVersions;
 }
 
+export function normalizeFileDependencySpec(spec: string): string {
+	if (!spec.startsWith("file:")) return spec;
+	return `file:${spec.replace(/^(?:file:)+/u, "")}`;
+}
+
 function rewriteSrcPath(value: string): string {
 	if (!value.startsWith("./src/")) return value;
 	const rel = value.slice("./src/".length).replace(/\.tsx?$/, "");
 	return `./dist/types/${rel}.d.ts`;
 }
 
-async function resolvePublishDependency(name: string, spec: string): Promise<string> {
-	let resolved = spec;
+export async function resolvePublishDependency(name: string, spec: string): Promise<string> {
+	let resolved = normalizeFileDependencySpec(spec);
 	if (spec === "catalog:" || spec.startsWith("catalog:")) {
 		const catalog = await loadRootCatalog();
 		const catalogEntry = catalog[name];
 		if (catalogEntry === undefined) throw new Error(`Missing catalog version for ${name}`);
-		resolved = catalogEntry;
+		resolved = normalizeFileDependencySpec(catalogEntry);
 	}
 	if (resolved === "workspace:*" || resolved.startsWith("workspace:")) {
 		const versions = await loadWorkspaceVersions();
@@ -122,7 +127,7 @@ async function resolvePublishDependency(name: string, spec: string): Promise<str
 		if (workspaceVersion === undefined) throw new Error(`Missing workspace package version for ${name}`);
 		return workspaceVersion;
 	}
-	return resolved;
+	return normalizeFileDependencySpec(resolved);
 }
 
 async function rewriteDependencyFields(manifest: PackageManifest): Promise<void> {
@@ -231,6 +236,12 @@ async function publishPackage(pkg: PublishPackage): Promise<void> {
 	if (result.exitCode !== 0) process.exit(result.exitCode ?? 1);
 }
 
-for (const pkg of packages) {
-	await publishPackage(pkg);
+async function main(): Promise<void> {
+	for (const pkg of packages) {
+		await publishPackage(pkg);
+	}
+}
+
+if (import.meta.main) {
+	await main();
 }

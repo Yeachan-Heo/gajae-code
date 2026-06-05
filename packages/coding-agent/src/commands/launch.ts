@@ -36,6 +36,12 @@ export default class Index extends Command {
 		plan: Flags.string({
 			description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)",
 		}),
+		mpreset: Flags.string({
+			description: "Model profile preset to activate for this session",
+		}),
+		default: Flags.boolean({
+			description: "Persist --mpreset as the default model profile",
+		}),
 		provider: Flags.string({
 			description: "Provider to use (legacy; prefer --model)",
 		}),
@@ -136,6 +142,8 @@ export default class Index extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-standard`,
+		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencode-go-pro --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
 	];
 

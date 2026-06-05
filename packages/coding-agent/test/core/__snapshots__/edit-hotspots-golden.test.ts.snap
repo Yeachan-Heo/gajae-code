@@ -1,0 +1,728 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`edit hotspot golden oracle LF 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+  },
+  "formatHashLines": 
+"1im|alpha
+2id|beta
+3uw|gamma
+4yy|"
+,
+  "name": "LF",
+  "replaceText": {
+    "content": 
+"alpha
+BETA
+gamma
+"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 1,
+    "index": 1,
+    "strategy": "exact",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle CRLF 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+  },
+  "formatHashLines": 
+"3im|alpha
+4id|beta
+5uw|gamma
+6yy|"
+,
+  "name": "CRLF",
+  "replaceText": {
+    "content": 
+"alpha
+BETA
+gamma
+"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 1,
+    "index": 1,
+    "strategy": "exact",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle embedded CR 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": 
+"bet
+a"
+,
+      "confidence": 0.8571428571428572,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": 
+"bet
+a"
+,
+      "confidence": 0.8571428571428572,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"5im|alpha
+6id|bet
+a
+7uw|gamma"
+,
+  "name": "embedded CR",
+  "replaceText": {
+    "content": 
+"alpha
+bet
+a
+gamma"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.75,
+    "matchCount": 0,
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle no-final-newline 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "gamma",
+      "confidence": 1,
+      "startIndex": 11,
+      "startLine": 3,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "gamma",
+      "confidence": 1,
+      "startIndex": 11,
+      "startLine": 3,
+    },
+  },
+  "formatHashLines": 
+"7im|alpha
+8id|beta
+9uw|gamma"
+,
+  "name": "no-final-newline",
+  "replaceText": {
+    "content": 
+"alpha
+beta
+GAMMA"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 1,
+    "index": 2,
+    "strategy": "exact",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle blank lines 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "	beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 3,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "	beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 3,
+    },
+  },
+  "formatHashLines": 
+"11im|alpha
+12yy|
+13gf|	beta
+14yy|
+15yy|"
+,
+  "name": "blank lines",
+  "replaceText": {
+    "content": 
+"alpha
+
+	BETA
+
+"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 1,
+    "index": 2,
+    "strategy": "exact",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle trailing whitespace 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 9,
+      "startLine": 2,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "beta",
+      "confidence": 1,
+      "startIndex": 9,
+      "startLine": 2,
+    },
+  },
+  "formatHashLines": 
+"13im|alpha   
+14id|beta	
+15uw|gamma  "
+,
+  "name": "trailing whitespace",
+  "replaceText": {
+    "content": 
+"alpha   
+BETA	
+gamma  "
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 0.99,
+    "index": 1,
+    "strategy": "trim-trailing",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle tabs 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "		beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+    "match": {
+      "actualText": "		beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "		beta",
+      "confidence": 1,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 1,
+  },
+  "formatHashLines": 
+"17ri|	alpha
+18fi|		beta
+19hv|	gamma"
+,
+  "name": "tabs",
+  "replaceText": {
+    "content": 
+"	alpha
+    BETA
+	gamma"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 0.98,
+    "index": 1,
+    "strategy": "trim",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle Unicode punctuation 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "quote “smart”",
+      "confidence": 0.8666666666666667,
+      "startIndex": 13,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "quote “smart”",
+      "confidence": 0.8666666666666667,
+      "startIndex": 13,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"19yh|alpha — beta
+20vd|quote “smart”
+21gu|ellipsis …"
+,
+  "name": "Unicode punctuation",
+  "replaceText": {
+    "content": 
+"alpha — beta
+quote “smart”
+ellipsis …"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.97,
+    "index": 1,
+    "strategy": "unicode",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle surrogate pairs 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "beta 😀",
+      "confidence": 0.8888888888888888,
+      "startIndex": 12,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "beta 😀",
+      "confidence": 0.8888888888888888,
+      "startIndex": 12,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"23zr|alpha 👩‍💻
+24ap|beta 😀
+25uw|gamma"
+,
+  "name": "surrogate pairs",
+  "replaceText": {
+    "content": 
+"alpha 👩‍💻
+beta 😀
+gamma"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.8571428571428572,
+    "matchCount": 0,
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle combining marks 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "café",
+      "confidence": 0.7142857142857143,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "café",
+      "confidence": 0.7142857142857143,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"29ke|café
+30cf|mañana
+31qn|resumé"
+,
+  "name": "combining marks",
+  "replaceText": {
+    "content": 
+"café
+mañana
+resumé"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.97,
+    "index": 0,
+    "strategy": "unicode",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle long lines 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa TARGET bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "confidence": 0.9990328820116054,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+    "match": {
+      "actualText": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa TARGET bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "confidence": 0.9990328820116054,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa TARGET bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "confidence": 0.9990328820116054,
+      "startIndex": 7,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 1,
+  },
+  "formatHashLines": 
+"31lk|before
+32tx|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa TARGET bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+33do|after"
+,
+  "name": "long lines",
+  "replaceText": {
+    "content": 
+"before
+LONG
+after"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 0.999031007751938,
+    "index": 1,
+    "matchCount": 1,
+    "matchIndices": [
+      1,
+    ],
+    "strategy": "fuzzy",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle ambiguous fuzzy 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "item1",
+      "confidence": 0.8571428571428572,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 3,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "item1",
+      "confidence": 0.8571428571428572,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 3,
+  },
+  "formatHashLines": 
+"37da|item1
+38qd|item2
+39sr|item3"
+,
+  "name": "ambiguous fuzzy",
+  "replaceText": {
+    "content": 
+"item1
+item2
+item3"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.8,
+    "matchCount": 0,
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle dominant fuzzy 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "function alphaBetaGamma(value) {}",
+      "confidence": 0.9714285714285714,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 2,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "function alphaBetaGamma(value) {}",
+      "confidence": 0.9714285714285714,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+    "fuzzyMatches": 2,
+  },
+  "formatHashLines": 
+"41mq|function alphaBetaGamma(value) {}
+42zx|function alphaBetaGimme(value) {}
+43ba|function completelyDifferent(value) {}"
+,
+  "name": "dominant fuzzy",
+  "replaceText": {
+    "content": 
+"function alphaBetaGamma(value) {}
+function alphaBetaGimme(value) {}
+function completelyDifferent(value) {}"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.9696969696969697,
+    "index": 0,
+    "matchCount": 2,
+    "matchIndices": [
+      0,
+      1,
+    ],
+    "strategy": "fuzzy",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle below-threshold-closest 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "function beta() {}",
+      "confidence": 0.4,
+      "startIndex": 20,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "function beta() {}",
+      "confidence": 0.4,
+      "startIndex": 20,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"43wa|function alpha() {}
+44te|function beta() {}"
+,
+  "name": "below-threshold-closest",
+  "replaceText": {
+    "content": 
+"function alpha() {}
+function beta() {}"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0.33333333333333337,
+    "matchCount": 0,
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle no-match 1`] = `
+{
+  "findMatchFuzzy": {
+    "closest": {
+      "actualText": "beta",
+      "confidence": 0.33333333333333337,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "findMatchStrict": {
+    "closest": {
+      "actualText": "beta",
+      "confidence": 0.33333333333333337,
+      "startIndex": 6,
+      "startLine": 2,
+    },
+    "fuzzyMatches": 0,
+  },
+  "formatHashLines": 
+"47im|alpha
+48id|beta
+49uw|gamma"
+,
+  "name": "no-match",
+  "replaceText": {
+    "content": 
+"alpha
+beta
+gamma"
+,
+    "count": 0,
+  },
+  "seekSequence": {
+    "confidence": 0,
+    "matchCount": 0,
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle EOF 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "gamma",
+      "confidence": 1,
+      "startIndex": 11,
+      "startLine": 3,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "gamma",
+      "confidence": 1,
+      "startIndex": 11,
+      "startLine": 3,
+    },
+  },
+  "formatHashLines": 
+"53im|alpha
+54id|beta
+55uw|gamma"
+,
+  "name": "EOF",
+  "replaceText": {
+    "content": 
+"alpha
+beta
+GAMMA"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 1,
+    "index": 2,
+    "strategy": "exact",
+  },
+}
+`;
+
+exports[`edit hotspot golden oracle non-1 startLine 1`] = `
+{
+  "findMatchFuzzy": {
+    "match": {
+      "actualText": "alpha",
+      "confidence": 1,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+  },
+  "findMatchStrict": {
+    "match": {
+      "actualText": "alpha",
+      "confidence": 1,
+      "startIndex": 0,
+      "startLine": 1,
+    },
+  },
+  "formatHashLines": 
+"101im|alpha
+102id|beta
+103uw|gamma"
+,
+  "name": "non-1 startLine",
+  "replaceText": {
+    "content": 
+"ALPHA
+beta
+gamma"
+,
+    "count": 1,
+  },
+  "seekSequence": {
+    "confidence": 0.19999999999999996,
+    "matchCount": 0,
+  },
+}
+`;

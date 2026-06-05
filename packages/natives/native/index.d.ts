@@ -136,7 +136,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_3_1(): void
+export declare function __piNativesV0_3_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -390,6 +390,12 @@ export declare function countTokens(input: string | Array<string>, encoding?: En
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
+
+/**
+ * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old,
+ * new)` with default options. Returns ordered `{added, removed, value}` parts.
+ */
+export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
 
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
@@ -681,6 +687,33 @@ export interface GrepResult {
   limitReached?: boolean
 }
 
+export interface H01BestFuzzyMatch {
+  actualText: string
+  startIndex: number
+  startLine: number
+  confidence: number
+}
+
+export interface H01BestFuzzyMatchResult {
+  best?: H01BestFuzzyMatch
+  aboveThresholdCount: number
+  secondBestScore: number
+}
+
+export declare function h01FindBestFuzzyMatch(content: string, target: string, threshold: number): H01BestFuzzyMatchResult
+
+export declare function h02ScoreSequenceFuzzy(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean): H02SequenceFuzzyResult
+
+export interface H02SequenceFuzzyResult {
+  index?: number
+  confidence: number
+  matchCount: number
+  matchIndices: Array<number>
+  secondBestScore: number
+}
+
+export declare function h06FormatHashLines(text: string, startLine?: number | undefined | null): string
+
 /**
  * Quick check if content matches a pattern.
  *
@@ -886,6 +919,16 @@ export declare enum KeyEventType {
   Repeat = 2,
   /** Key release event. */
   Release = 3
+}
+
+/**
+ * One diff component, mirroring jsdiff's change object (sans `count`, which
+ * the TS `generateDiffString` formatter does not consume).
+ */
+export interface LineDiffPart {
+  added: boolean
+  removed: boolean
+  value: string
 }
 
 /**

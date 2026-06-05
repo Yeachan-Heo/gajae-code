@@ -32,6 +32,17 @@ export interface WorkflowHudSummary {
 
 export type { WorkflowStateReceipt } from "./workflow-state-contract";
 
+export interface ActiveSubskillEntry {
+	plugin: string;
+	subskillName: string;
+	parent: string;
+	bindsTo: string;
+	phase: string;
+	activationArg: string;
+	filePath: string;
+	toolPaths: string[];
+}
+
 export interface SkillActiveEntry {
 	skill: string;
 	phase?: string;
@@ -47,6 +58,7 @@ export interface SkillActiveEntry {
 	handoff_from?: string;
 	handoff_to?: string;
 	handoff_at?: string;
+	active_subskills?: ActiveSubskillEntry[];
 }
 
 export interface SkillActiveState {
@@ -64,6 +76,7 @@ export interface SkillActiveState {
 	initialized_mode?: CanonicalGjcWorkflowSkill;
 	initialized_state_path?: string;
 	active_skills?: SkillActiveEntry[];
+	active_subskills?: ActiveSubskillEntry[];
 	[key: string]: unknown;
 }
 
@@ -87,6 +100,7 @@ export interface SyncSkillActiveStateOptions {
 	handoff_from?: string;
 	handoff_to?: string;
 	handoff_at?: string;
+	active_subskills?: ActiveSubskillEntry[];
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -188,6 +202,48 @@ function normalizeWorkflowStateReceipt(raw: unknown): WorkflowStateReceipt | und
 		mutation_id: mutationId,
 	};
 }
+function normalizeActiveSubskillEntry(raw: unknown): ActiveSubskillEntry | null {
+	if (!raw || typeof raw !== "object") return null;
+	const record = raw as Record<string, unknown>;
+	const plugin = safeString(record.plugin).trim();
+	const subskillName = safeString(record.subskillName).trim();
+	const parent = safeString(record.parent).trim();
+	const bindsTo = safeString(record.bindsTo).trim();
+	const phase = safeString(record.phase).trim();
+	const activationArg = safeString(record.activationArg).trim();
+	const filePath = safeString(record.filePath).trim();
+	const toolPaths = Array.isArray(record.toolPaths)
+		? record.toolPaths.map(item => safeString(item).trim()).filter(Boolean)
+		: [];
+	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !filePath) return null;
+	return { plugin, subskillName, parent, bindsTo, phase, activationArg, filePath, toolPaths };
+}
+
+function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	const entries = raw
+		.map(normalizeActiveSubskillEntry)
+		.filter((entry): entry is ActiveSubskillEntry => entry !== null);
+	return entries.length > 0 ? entries : undefined;
+}
+
+function activeSubskillEntryKey(entry: ActiveSubskillEntry): string {
+	return [entry.plugin, entry.parent, entry.phase, entry.activationArg].join("\0");
+}
+
+function unionActiveSubskillEntries(...entrySets: Array<ActiveSubskillEntry[] | undefined>): ActiveSubskillEntry[] {
+	const merged: ActiveSubskillEntry[] = [];
+	const seen = new Set<string>();
+	for (const entries of entrySets) {
+		for (const entry of entries ?? []) {
+			const key = activeSubskillEntryKey(entry);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(entry);
+		}
+	}
+	return merged;
+}
 
 function encodePathSegment(value: string): string {
 	return encodeURIComponent(value).replaceAll(".", "%2E");
@@ -204,6 +260,7 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 	if (!skill) return null;
 	const hud = normalizeWorkflowHudSummary(record.hud);
 	const receipt = normalizeWorkflowStateReceipt(record.receipt);
+	const activeSubskills = normalizeActiveSubskillEntries(record.active_subskills);
 	return {
 		...record,
 		skill,
@@ -219,6 +276,7 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 		handoff_at: safeString(record.handoff_at).trim() || undefined,
 		...(hud ? { hud } : {}),
 		...(receipt ? { receipt } : {}),
+		...(activeSubskills ? { active_subskills: activeSubskills } : {}),
 		stale: undefined,
 	};
 }
@@ -278,6 +336,7 @@ export function normalizeSkillActiveState(raw: unknown): SkillActiveState | null
 		session_id: safeString(state.session_id).trim() || primary?.session_id || undefined,
 		thread_id: safeString(state.thread_id).trim() || primary?.thread_id || undefined,
 		turn_id: safeString(state.turn_id).trim() || primary?.turn_id || undefined,
+		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
 		active_skills: activeSkills.length > 0 ? activeSkills : [],
 	};
 }
@@ -512,6 +571,7 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 		phase: primary?.phase ?? "",
 		session_id: safeString(sessionId).trim() || primary?.session_id,
 		active_skills: activeSkills,
+		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
 	};
 }
 
@@ -552,7 +612,25 @@ async function rebuildActiveState(cwd: string, sessionScope?: ActiveSessionScope
 	await rebuildActiveSnapshot(cwd, sessionScope, { cwd, audit: activeStateWriterAudit("rebuild-active-snapshot") });
 }
 
+async function activeSubskillsForExistingEntry(
+	cwd: string,
+	sessionId: string | undefined,
+	skill: string,
+): Promise<ActiveSubskillEntry[] | undefined> {
+	const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+	const [rootState, sessionState] = await Promise.all([
+		readRawActiveStateForHandoff(rootPath, false),
+		sessionPath ? readRawActiveStateForHandoff(sessionPath, false) : Promise.resolve(null),
+	]);
+	const existing = mergeVisibleEntries(sessionState, rootState, sessionId).find(entry => entry.skill === skill);
+	return existing?.active_subskills;
+}
+
 export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
+	const preservedActiveSubskills =
+		options.active_subskills === undefined
+			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
+			: undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
 	const entry: SkillActiveEntry = {
@@ -569,6 +647,11 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
+		...(options.active_subskills !== undefined
+			? { active_subskills: options.active_subskills }
+			: preservedActiveSubskills
+				? { active_subskills: preservedActiveSubskills }
+				: {}),
 	};
 	await persistActiveEntry(options.cwd, undefined, entry);
 	await rebuildActiveState(options.cwd);
@@ -636,9 +719,13 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 					...(priorCaller.handoff_from && !callerEntry.handoff_from
 						? { handoff_from: priorCaller.handoff_from }
 						: {}),
+					...(priorCaller.active_subskills ? { active_subskills: priorCaller.active_subskills } : {}),
 				}
 			: callerEntry;
-		return [...kept, mergedCaller, calleeEntry];
+		const activeSubskills = unionActiveSubskillEntries(priorCaller?.active_subskills, calleeEntry.active_subskills);
+		const mergedCallee: SkillActiveEntry =
+			activeSubskills.length > 0 ? { ...calleeEntry, active_subskills: activeSubskills } : calleeEntry;
+		return [...kept, mergedCaller, mergedCallee];
 	};
 	const writeEntries = async (
 		sessionScope: ActiveSessionScope | undefined,
@@ -675,5 +762,6 @@ function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): S
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
+		...(options.active_subskills ? { active_subskills: options.active_subskills } : {}),
 	};
 }

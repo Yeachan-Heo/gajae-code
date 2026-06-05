@@ -1,0 +1,7 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "valid-agent-plugin",
+  "version": "1.0.0",
+  "subskills": ["subskills/domain/SKILL.md"],
+  "tools": ["tools/domain-note.ts"]
+}

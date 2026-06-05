@@ -53159,7 +53159,8 @@
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "low",
-				"maxLevel": "xhigh"
+				"maxLevel": "xhigh",
+				"defaultLevel": "xhigh"
 			},
 			"applyPatchToolType": "freeform",
 			"contextPromotionTarget": "openai-codex/gpt-5.4"
