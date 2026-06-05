@@ -44,6 +44,39 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(payload.task).toBeUndefined();
 	});
 
+	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, "{broken json", "utf-8");
+
+		const result = await runNativeRalplanCommand(["--json", "make state native"], root);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("existing ralplan state is corrupt or tampered");
+		expect(await fs.readFile(statePath, "utf-8")).toBe("{broken json");
+	});
+
+	it("reuses a valid active run id during consensus handoff seeding", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({ skill: "ralplan", active: true, current_phase: "planner", run_id: "existing-run" }),
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(["--json", "continue existing"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string };
+		expect(payload.run_id).toBe("existing-run");
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string; task: string };
+		expect(state.run_id).toBe("existing-run");
+		expect(state.task).toBe("continue existing");
+	});
+
 	it("--architect openai-code seeds the kind into state", async () => {
 		const root = await tempDir();
 		const result = await runNativeRalplanCommand(

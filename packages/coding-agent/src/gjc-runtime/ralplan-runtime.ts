@@ -165,16 +165,19 @@ function ralplanStatePath(cwd: string, sessionId: string | undefined): string {
 }
 
 async function readActiveRunId(cwd: string, sessionId: string | undefined): Promise<string | undefined> {
-	try {
-		const raw = await fs.readFile(ralplanStatePath(cwd, sessionId), "utf-8");
-		const parsed = JSON.parse(raw) as { run_id?: unknown };
-		const candidate = typeof parsed.run_id === "string" ? parsed.run_id.trim() : "";
-		if (!candidate) return undefined;
-		assertSafePathComponent(candidate, "run-id");
-		return candidate;
-	} catch {
-		return undefined;
+	const statePath = ralplanStatePath(cwd, sessionId);
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "absent") return undefined;
+	if (existingRead.kind === "corrupt") {
+		throw new RalplanCommandError(
+			2,
+			`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
+		);
 	}
+	const candidate = typeof existingRead.value.run_id === "string" ? existingRead.value.run_id.trim() : "";
+	if (!candidate) return undefined;
+	assertSafePathComponent(candidate, "run-id");
+	return candidate;
 }
 
 async function persistActiveRunId(cwd: string, sessionId: string | undefined, runId: string): Promise<void> {
