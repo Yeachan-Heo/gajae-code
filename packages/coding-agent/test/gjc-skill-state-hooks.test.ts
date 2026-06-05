@@ -10,7 +10,11 @@ import {
 	readGjcManagedCodexHooksStatus,
 } from "../src/hooks/codex-native-hooks-config";
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
-import { detectSkillKeywords, readVisibleSkillActiveState } from "../src/hooks/skill-state";
+import {
+	detectSkillKeywords,
+	ensureWorkflowSkillActivationState,
+	readVisibleSkillActiveState,
+} from "../src/hooks/skill-state";
 import { getDeepInterviewMutationDecision } from "../src/skill-state/deep-interview-mutation-guard";
 import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contract";
 
@@ -155,7 +159,7 @@ describe("GJC native skill-state hooks", () => {
 		expect(allowed.outputJson).toBeNull();
 	});
 
-	it("Stop fails open and logs when custom mode state is corrupt", async () => {
+	it("Stop fails open and logs when a non-handoff skill's mode state is corrupt", async () => {
 		const root = await cwd();
 		const stateDir = path.join(root, "custom-state");
 		await fs.mkdir(path.join(stateDir, "sessions", "session-corrupt"), { recursive: true });
@@ -164,10 +168,10 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "ralplan", active: true, phase: "planner", session_id: "session-corrupt" }],
+				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-corrupt" }],
 			}),
 		);
-		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "ralplan-state.json"), "{");
+		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "team-state.json"), "{");
 		const warn = spyOn(console, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
@@ -187,7 +191,7 @@ describe("GJC native skill-state hooks", () => {
 		}
 	});
 
-	it("Stop treats schema-invalid custom mode state as inactive and logs", async () => {
+	it("Stop treats schema-invalid non-handoff mode state as inactive and logs", async () => {
 		const root = await cwd();
 		const stateDir = path.join(root, "custom-state");
 		await fs.mkdir(path.join(stateDir, "sessions", "session-invalid"), { recursive: true });
@@ -196,11 +200,11 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "ralplan", active: true, phase: "planner", session_id: "session-invalid" }],
+				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-invalid" }],
 			}),
 		);
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-invalid", "ralplan-state.json"),
+			path.join(stateDir, "sessions", "session-invalid", "team-state.json"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
 		const warn = spyOn(console, "warn").mockImplementation(() => {});
@@ -580,6 +584,77 @@ disabledExtensions:
 		expect(allowed.outputJson).toBeNull();
 	});
 
+	it("Stop keeps blocking a handoff skill when its mode-state file is missing", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ralplan plan this",
+				cwd: root,
+				sessionId: "session-missing",
+				threadId: "thread-missing",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// Remove the mode-state file while skill-active-state.json still lists the
+		// handoff skill active. The Stop hook must not treat the missing file as
+		// terminal — handoff skills must always offer a next step.
+		await fs.rm(path.join(root, ".gjc", "state", "sessions", "session-missing", "ralplan-state.json"), {
+			force: true,
+		});
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-missing",
+			threadId: "thread-missing",
+		});
+		expect(blocked.outputJson).toMatchObject({ decision: "block" });
+	});
+
+	it("Stop keeps blocking handoff skills in the handoff phase until demoted", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-handoff",
+				threadId: "thread-handoff",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// A handoff-phase deep-interview that is still active must keep blocking so
+		// the agent presents the next handoff step via the ask tool.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-handoff", "deep-interview-state.json"),
+			JSON.stringify({ active: true, current_phase: "handoff", session_id: "session-handoff" }),
+		);
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-handoff",
+			threadId: "thread-handoff",
+		});
+		expect(blocked.outputJson).toMatchObject({ decision: "block" });
+		expect(String(blocked.outputJson?.systemMessage ?? "")).toContain("ask tool");
+
+		// Once demoted to active:false (the handoff/clear outcome), stop is allowed.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-handoff", "deep-interview-state.json"),
+			JSON.stringify({ active: false, current_phase: "handoff", session_id: "session-handoff" }),
+		);
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-handoff",
+			threadId: "thread-handoff",
+		});
+		expect(allowed.outputJson).toBeNull();
+	});
+
 	it("UserPromptSubmit reminds active Ultragoal sessions to use ultragoal steer", async () => {
 		const root = await cwd();
 		await dispatchGjcNativeSkillHook(
@@ -720,5 +795,81 @@ disabledExtensions:
 			missingEvents: [],
 			managedHookCount: 2,
 		});
+	});
+
+	it("ensureWorkflowSkillActivationState seeds state and engages the mutation guard", async () => {
+		const root = await cwd();
+		const before = await getDeepInterviewMutationDecision({
+			cwd: root,
+			tool: { name: "write" } as never,
+			args: { path: "src/app.ts", content: "x" },
+		});
+		expect(before.blocked).toBe(false);
+
+		const seeded = await ensureWorkflowSkillActivationState({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId: "session-seed",
+		});
+		expect(seeded).toMatchObject({ active: true, skill: "deep-interview" });
+
+		const state = await readVisibleSkillActiveState(root, "session-seed");
+		expect(state).toMatchObject({ active: true, skill: "deep-interview" });
+
+		const after = await getDeepInterviewMutationDecision({
+			cwd: root,
+			sessionId: "session-seed",
+			tool: { name: "write" } as never,
+			args: { path: "src/app.ts", content: "x" },
+		});
+		expect(after.blocked).toBe(true);
+	});
+
+	it("ensureWorkflowSkillActivationState is idempotent and preserves handoff lineage", async () => {
+		const root = await cwd();
+		const stateDir = path.join(root, ".gjc", "state", "sessions", "session-keep");
+		await fs.mkdir(stateDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				skill: "ralplan",
+				active_skills: [
+					{
+						skill: "ralplan",
+						active: true,
+						phase: "planner",
+						session_id: "session-keep",
+						handoff_from: "deep-interview",
+					},
+				],
+			}),
+		);
+		await fs.writeFile(
+			path.join(stateDir, "ralplan-state.json"),
+			JSON.stringify({ active: true, current_phase: "planner", session_id: "session-keep" }),
+		);
+
+		const result = await ensureWorkflowSkillActivationState({
+			cwd: root,
+			skill: "ralplan",
+			sessionId: "session-keep",
+		});
+
+		// Already active → no reseed; lineage entry untouched.
+		const entry = result?.active_skills?.find(e => e.skill === "ralplan");
+		expect(entry?.handoff_from).toBe("deep-interview");
+	});
+
+	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {
+		const root = await cwd();
+		const result = await ensureWorkflowSkillActivationState({
+			cwd: root,
+			skill: "some-user-skill",
+			sessionId: "session-none",
+		});
+		expect(result).toBeNull();
+		expect(await readVisibleSkillActiveState(root, "session-none")).toBeNull();
 	});
 });

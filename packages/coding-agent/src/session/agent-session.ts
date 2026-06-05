@@ -172,6 +172,7 @@ import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime"
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
+import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
@@ -4399,12 +4400,17 @@ export class AgentSession {
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
 		// own their `.gjc/state/skill-active-state.json` row through the
 		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
-		// observer here used to overwrite the row with `phase: running` and
-		// later remove it with `active:false`, which clobbered handoff lineage
-		// (`handoff_from`/`handoff_at`) and made the HUD inconsistent with
-		// mode-state. The observational filesystem write is now skipped for
-		// canonical skills; the in-memory `#activeSkillState` tracking below
-		// keeps `getActiveSkillState` accurate for the chain guard.
+		// observer must not overwrite an existing row (that clobbered handoff
+		// lineage `handoff_from`/`handoff_at` and desynced the HUD). But a fresh
+		// `/skill:<name>` invocation has no row yet, so seed `.gjc/state`
+		// idempotently here: `ensureWorkflowSkillActivationState` writes the
+		// initial mode-state + active row only when the skill is not already
+		// active, so the mutation guard and Stop hook engage immediately instead
+		// of relying on the skill prompt to run its own state-init steps.
+		if (active) {
+			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
+		}
+		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 	}
 

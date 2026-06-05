@@ -303,16 +303,27 @@ export async function readVisibleSkillActiveState(
 	);
 }
 
-export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
-	const match = detectPrimarySkillKeyword(input.text);
-	if (!match) return null;
+interface SeedSkillActivationStateInput {
+	cwd: string;
+	sessionId?: string;
+	threadId?: string;
+	turnId?: string;
+	nowIso?: string;
+	stateDir?: string;
+}
 
+async function seedSkillActivationState(
+	skill: GjcWorkflowSkill,
+	keyword: string,
+	source: string,
+	input: SeedSkillActivationStateInput,
+): Promise<SkillActiveState> {
 	const resolvedStateDir = resolveGjcStateDir(input.cwd, input.stateDir);
 	const nowIso = input.nowIso ?? new Date().toISOString();
-	const phase = initialPhaseForSkill(match.skill);
-	const initializedStatePath = modeStatePath(resolvedStateDir, match.skill, input.sessionId);
+	const phase = initialPhaseForSkill(skill);
+	const initializedStatePath = modeStatePath(resolvedStateDir, skill, input.sessionId);
 	const entry: SkillActiveEntry = {
-		skill: match.skill,
+		skill,
 		phase,
 		active: true,
 		activated_at: nowIso,
@@ -324,16 +335,16 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 	const state: SkillActiveState = {
 		version: 1,
 		active: true,
-		skill: match.skill,
-		keyword: match.keyword,
+		skill,
+		keyword,
 		phase,
 		activated_at: nowIso,
 		updated_at: nowIso,
-		source: "gjc-skill-state-hook",
+		source,
 		...(input.sessionId ? { session_id: input.sessionId } : {}),
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
-		initialized_mode: match.skill,
+		initialized_mode: skill,
 		initialized_state_path: initializedStatePath,
 		active_skills: [entry],
 	};
@@ -341,14 +352,14 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 		active: true,
 		version: WORKFLOW_STATE_VERSION,
 		current_phase: phase,
-		skill: match.skill,
+		skill,
 		cwd: input.cwd,
 		updated_at: nowIso,
 		...(input.sessionId ? { session_id: input.sessionId } : {}),
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 	};
-	if (match.skill === "deep-interview") {
+	if (skill === "deep-interview") {
 		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
 		modeState.threshold_source = "default";
 	}
@@ -357,17 +368,67 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 		cwd: input.cwd,
 		receipt: {
 			cwd: input.cwd,
-			skill: match.skill,
+			skill,
 			owner: "gjc-hook",
-			command: "gjc hook recordSkillActivation",
+			command: source,
 			sessionId: input.sessionId,
 		},
-		audit: { category: "state", verb: "write", owner: "gjc-hook", skill: match.skill },
+		audit: { category: "state", verb: "write", owner: "gjc-hook", skill },
 	});
 	await writeJsonFile(skillStatePath(resolvedStateDir, input.sessionId), state, input.cwd);
-	if (!input.sessionId) return state;
-	await writeJsonFile(skillStatePath(resolvedStateDir), state, input.cwd);
+	if (input.sessionId) {
+		await writeJsonFile(skillStatePath(resolvedStateDir), state, input.cwd);
+	}
 	return state;
+}
+
+export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+	const match = detectPrimarySkillKeyword(input.text);
+	if (!match) return null;
+	return await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input);
+}
+
+export interface EnsureWorkflowSkillActivationInput {
+	cwd: string;
+	skill: string;
+	sessionId?: string;
+	threadId?: string;
+	turnId?: string;
+	nowIso?: string;
+	stateDir?: string;
+}
+
+/**
+ * Idempotently seed `.gjc/state` for a workflow skill that was invoked directly
+ * (e.g. via `/skill:<name>`) rather than through keyword detection. This ensures
+ * the mutation guard and Stop hook engage the moment a workflow skill becomes
+ * active, instead of relying on the skill prompt to run its own state-init steps.
+ *
+ * The seed is non-destructive: if an active entry for this skill already exists
+ * (for example after a `gjc state handoff` promotion that carries
+ * `handoff_from`/`handoff_at` lineage), nothing is written so lineage is
+ * preserved. Non-workflow skills are ignored.
+ */
+export async function ensureWorkflowSkillActivationState(
+	input: EnsureWorkflowSkillActivationInput,
+): Promise<SkillActiveState | null> {
+	const skill = input.skill.trim();
+	if (!isGjcWorkflowSkill(skill)) return null;
+	const existing = await readVisibleSkillActiveState(input.cwd, input.sessionId, input.stateDir);
+	const alreadyActive = listActiveSkills(existing).some(
+		entry =>
+			entry.skill === skill &&
+			(existing ? entryMatchesContext(entry, existing, input.sessionId, input.threadId) : true),
+	);
+	if (alreadyActive) return existing;
+	return await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
+		cwd: input.cwd,
+		sessionId: input.sessionId,
+		threadId: input.threadId,
+		turnId: input.turnId,
+		nowIso: input.nowIso,
+		stateDir: input.stateDir,
+	});
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {
@@ -376,6 +437,45 @@ function isTerminalModeState(state: ModeState | null): boolean {
 		.trim()
 		.toLowerCase();
 	return ["complete", "completed", "handoff", "failed", "cancelled", "canceled", "inactive"].includes(phase);
+}
+
+/**
+ * Phases that genuinely finish a skill and release the Stop block. Note that
+ * "handoff" is intentionally absent: a skill sitting in the handoff phase has
+ * declared it is ready to chain but has not yet been demoted/cleared, so it
+ * must keep blocking until the chain (or an explicit clear) removes it.
+ */
+const STOP_RELEASING_PHASES = ["complete", "completed", "failed", "cancelled", "canceled", "inactive"] as const;
+
+/**
+ * Handoff workflows must never stop silently — they always have to offer the
+ * user a next step (refine, hand off, or finish) via the ask tool. The Stop
+ * hook keeps blocking these even in the "handoff" phase until they are demoted
+ * (active:false) or cleared.
+ */
+function isHandoffRequiredSkill(skill: GjcWorkflowSkill): boolean {
+	return skill === "deep-interview" || skill === "ralplan";
+}
+
+/**
+ * Decide whether an active-state entry's mode-state releases the Stop block.
+ *
+ * For handoff-required skills a missing or unreadable mode-state does NOT
+ * release the block: those workflows must always end by offering the user a
+ * next step, so the `skill-active-state.json` entry stays authoritative until
+ * the skill is demoted or cleared. For other skills a missing/corrupt
+ * mode-state preserves the historical fail-open behavior so a broken state file
+ * cannot lock a session.
+ */
+function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean): boolean {
+	if (!state) return !handoffRequired;
+	if (state.active !== true) return true;
+	const phase = String(state.current_phase ?? "")
+		.trim()
+		.toLowerCase();
+	if ((STOP_RELEASING_PHASES as readonly string[]).includes(phase)) return true;
+	if (!handoffRequired && phase === "handoff") return true;
+	return false;
 }
 
 async function readVisibleModeState(
@@ -469,7 +569,8 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			"mode-state",
 			ModeStateSchema,
 		);
-		if (isTerminalModeState(modeState)) continue;
+		const handoffRequired = isHandoffRequiredSkill(entry.skill);
+		if (modeStateReleasesStop(modeState, handoffRequired)) continue;
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);
 		if (entry.skill === "ultragoal") {
@@ -497,7 +598,9 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 				}
 			}
 		}
-		const systemMessage = `GJC skill "${entry.skill}" is still active (phase: ${phase}; state: ${statePath}). Continue or explicitly finish/cancel the skill before stopping.`;
+		const systemMessage = handoffRequired
+			? `GJC handoff skill "${entry.skill}" must not stop without offering a next step (phase: ${phase}; state: ${statePath}). Use the ask tool to present the next handoff step — e.g. refine further, hand off to ralplan/team/ultragoal, or finish — then chain or explicitly clear the skill before stopping.`
+			: `GJC skill "${entry.skill}" is still active (phase: ${phase}; state: ${statePath}). Continue or explicitly finish/cancel the skill before stopping.`;
 		return {
 			decision: "block",
 			reason: systemMessage,
