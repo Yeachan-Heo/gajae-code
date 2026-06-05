@@ -18,6 +18,7 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage } from "../extensibility/skills";
 import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
@@ -125,7 +126,17 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			}
 
 			const args = (input.args ?? "").trim();
-			const built = await buildSkillPromptMessage(skill, args);
+			const activationResult = await resolveSubskillActivationForSkillInvocation({
+				cwd: this.#session.cwd,
+				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
+				skillName: skill.name,
+				args,
+			});
+			const built = await buildSkillPromptMessage(skill, activationResult.cleanedArgs, {
+				subskillActivation: activationResult.activation,
+				cwd: this.#session.cwd,
+				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
+			});
 
 			await sendCustomMessage(
 				{
@@ -141,7 +152,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			const summary = JSON.stringify({
 				callee: skill.name,
 				path: skill.filePath,
-				args: args || undefined,
+				args: activationResult.cleanedArgs || undefined,
 				lineCount: built.details.lineCount,
 			});
 			return {
@@ -149,7 +160,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				details: {
 					name: skill.name,
 					path: skill.filePath,
-					args: args || undefined,
+					args: activationResult.cleanedArgs || undefined,
 					lineCount: built.details.lineCount,
 				},
 			};

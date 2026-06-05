@@ -1,0 +1,7 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "duplicate-arg",
+  "version": "1.0.0",
+  "subskills": ["subskills/one/SKILL.md", "subskills/two/SKILL.md"],
+  "tools": []
+}

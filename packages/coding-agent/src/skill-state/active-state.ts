@@ -32,6 +32,17 @@ export interface WorkflowHudSummary {
 
 export type { WorkflowStateReceipt } from "./workflow-state-contract";
 
+export interface ActiveSubskillEntry {
+	plugin: string;
+	subskillName: string;
+	parent: string;
+	bindsTo: string;
+	phase: string;
+	activationArg: string;
+	filePath: string;
+	toolPaths: string[];
+}
+
 export interface SkillActiveEntry {
 	skill: string;
 	phase?: string;
@@ -47,6 +58,7 @@ export interface SkillActiveEntry {
 	handoff_from?: string;
 	handoff_to?: string;
 	handoff_at?: string;
+	active_subskills?: ActiveSubskillEntry[];
 }
 
 export interface SkillActiveState {
@@ -64,6 +76,7 @@ export interface SkillActiveState {
 	initialized_mode?: CanonicalGjcWorkflowSkill;
 	initialized_state_path?: string;
 	active_skills?: SkillActiveEntry[];
+	active_subskills?: ActiveSubskillEntry[];
 	[key: string]: unknown;
 }
 
@@ -87,6 +100,7 @@ export interface SyncSkillActiveStateOptions {
 	handoff_from?: string;
 	handoff_to?: string;
 	handoff_at?: string;
+	active_subskills?: ActiveSubskillEntry[];
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -188,6 +202,30 @@ function normalizeWorkflowStateReceipt(raw: unknown): WorkflowStateReceipt | und
 		mutation_id: mutationId,
 	};
 }
+function normalizeActiveSubskillEntry(raw: unknown): ActiveSubskillEntry | null {
+	if (!raw || typeof raw !== "object") return null;
+	const record = raw as Record<string, unknown>;
+	const plugin = safeString(record.plugin).trim();
+	const subskillName = safeString(record.subskillName).trim();
+	const parent = safeString(record.parent).trim();
+	const bindsTo = safeString(record.bindsTo).trim();
+	const phase = safeString(record.phase).trim();
+	const activationArg = safeString(record.activationArg).trim();
+	const filePath = safeString(record.filePath).trim();
+	const toolPaths = Array.isArray(record.toolPaths)
+		? record.toolPaths.map(item => safeString(item).trim()).filter(Boolean)
+		: [];
+	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !filePath) return null;
+	return { plugin, subskillName, parent, bindsTo, phase, activationArg, filePath, toolPaths };
+}
+
+function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	const entries = raw
+		.map(normalizeActiveSubskillEntry)
+		.filter((entry): entry is ActiveSubskillEntry => entry !== null);
+	return entries.length > 0 ? entries : undefined;
+}
 
 function encodePathSegment(value: string): string {
 	return encodeURIComponent(value).replaceAll(".", "%2E");
@@ -204,6 +242,7 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 	if (!skill) return null;
 	const hud = normalizeWorkflowHudSummary(record.hud);
 	const receipt = normalizeWorkflowStateReceipt(record.receipt);
+	const activeSubskills = normalizeActiveSubskillEntries(record.active_subskills);
 	return {
 		...record,
 		skill,
@@ -219,6 +258,7 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 		handoff_at: safeString(record.handoff_at).trim() || undefined,
 		...(hud ? { hud } : {}),
 		...(receipt ? { receipt } : {}),
+		...(activeSubskills ? { active_subskills: activeSubskills } : {}),
 		stale: undefined,
 	};
 }
@@ -278,6 +318,7 @@ export function normalizeSkillActiveState(raw: unknown): SkillActiveState | null
 		session_id: safeString(state.session_id).trim() || primary?.session_id || undefined,
 		thread_id: safeString(state.thread_id).trim() || primary?.thread_id || undefined,
 		turn_id: safeString(state.turn_id).trim() || primary?.turn_id || undefined,
+		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
 		active_skills: activeSkills.length > 0 ? activeSkills : [],
 	};
 }
@@ -512,6 +553,7 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 		phase: primary?.phase ?? "",
 		session_id: safeString(sessionId).trim() || primary?.session_id,
 		active_skills: activeSkills,
+		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
 	};
 }
 
@@ -569,6 +611,7 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
+		...(options.active_subskills ? { active_subskills: options.active_subskills } : {}),
 	};
 	await persistActiveEntry(options.cwd, undefined, entry);
 	await rebuildActiveState(options.cwd);
@@ -636,6 +679,7 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 					...(priorCaller.handoff_from && !callerEntry.handoff_from
 						? { handoff_from: priorCaller.handoff_from }
 						: {}),
+					...(priorCaller.active_subskills ? { active_subskills: priorCaller.active_subskills } : {}),
 				}
 			: callerEntry;
 		return [...kept, mergedCaller, calleeEntry];
@@ -675,5 +719,6 @@ function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): S
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
+		...(options.active_subskills ? { active_subskills: options.active_subskills } : {}),
 	};
 }

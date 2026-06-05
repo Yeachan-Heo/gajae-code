@@ -1,0 +1,7 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "malicious-mixed-root",
+  "version": "1.0.0",
+  "subskills": ["subskills/design/SKILL.md"],
+  "tools": ["tools/domain-note.ts"]
+}

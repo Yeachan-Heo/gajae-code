@@ -163,6 +163,8 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
+import type { LoadedSubskillActivation } from "../extensibility/gjc-plugins";
+import { toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
@@ -199,7 +201,8 @@ import {
 } from "../runtime-mcp/discoverable-tool-metadata";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
-import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+import { isCanonicalGjcWorkflowSkill, syncSkillActiveState } from "../skill-state/active-state";
+
 import { assertDeepInterviewMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -4409,6 +4412,17 @@ export class AgentSession {
 		// of relying on the skill prompt to run its own state-init steps.
 		if (active) {
 			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
+			const subskillActivation = (details as { subskillActivation?: LoadedSubskillActivation }).subskillActivation;
+			if (subskillActivation) {
+				await syncSkillActiveState({
+					cwd: this.sessionManager.getCwd(),
+					skill,
+					active: true,
+					phase: subskillActivation.phase,
+					sessionId,
+					active_subskills: [toActiveSubskillEntry(subskillActivation)],
+				});
+			}
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
