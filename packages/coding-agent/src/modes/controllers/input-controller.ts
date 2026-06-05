@@ -33,9 +33,9 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
-	/** Set while a first Esc is silently consuming a queued steer (abort +
-	 *  steer-on-interrupt continue). A second Esc within that window does a real
-	 *  abort instead of consuming the steer again. */
+	/** Set after a first Esc silently consumes a queued steer. Kept until the
+	 *  queued steer is either cancelled by a second Esc or drained by continuation,
+	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
 	#steerConsumePending = false;
 
 	#abortInteractive(options?: { silent?: boolean }): Promise<void> {
@@ -52,6 +52,7 @@ export class InputController {
 			Boolean(
 				this.ctx.loadingAnimation ||
 					this.ctx.hasActiveBtw() ||
+					(this.#steerConsumePending && this.ctx.session.hasQueuedSteering) ||
 					this.ctx.session.isStreaming ||
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isGeneratingHandoff ||
@@ -65,6 +66,17 @@ export class InputController {
 		this.ctx.editor.onEscape = () => {
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
+			}
+			if (this.#steerConsumePending) {
+				if (this.ctx.session.hasQueuedSteering) {
+					// Second Esc before the scheduled steer continuation drains the
+					// queue: restore/drop the queued steer and perform a real abort,
+					// even if abort cleanup already made the session look idle.
+					this.#steerConsumePending = false;
+					this.restoreQueuedMessagesToEditor({ abort: true });
+					return;
+				}
+				this.#steerConsumePending = false;
 			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
@@ -90,14 +102,7 @@ export class InputController {
 					// auto-continue via steer-on-interrupt instead of stalling on
 					// "Operation aborted".
 					this.#steerConsumePending = true;
-					void this.#abortInteractive({ silent: true }).finally(() => {
-						this.#steerConsumePending = false;
-					});
-				} else if (this.#steerConsumePending) {
-					// Second Esc before the steer-continue lands: drop the still-queued
-					// steer (restoring its text to the editor) and do a real abort.
-					this.#steerConsumePending = false;
-					this.restoreQueuedMessagesToEditor({ abort: true });
+					void this.#abortInteractive({ silent: true });
 				} else {
 					void this.#abortInteractive();
 				}

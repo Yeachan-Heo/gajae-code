@@ -341,4 +341,24 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort.mock.calls[1]?.[0]?.silent).toBeUndefined();
 		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
 	});
+
+	it("cancels a queued steer on second Esc after silent abort cleanup goes idle", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		spies.clearQueue.mockReturnValue({ steering: ["stop after this"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		(ctx.session as { isStreaming: boolean }).isStreaming = false;
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(2);
+		expect(spies.abort.mock.calls[0]?.[0]).toMatchObject({ silent: true });
+		expect(spies.abort.mock.calls[1]?.[0]?.silent).toBeUndefined();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("stop after this");
+		expect(editor.shouldBypassAutocompleteOnEscape?.()).toBe(false);
+	});
 });
