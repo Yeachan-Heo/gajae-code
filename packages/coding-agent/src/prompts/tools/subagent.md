@@ -25,18 +25,20 @@ Request a graceful safe-boundary pause for selected subagents by `ids`.
 - A paused subagent keeps its session context and can be resumed later.
 
 ## `action: "resume"`
-Resume selected non-running subagents by `ids`.
-- Optional `message` is delivered into the resumed run.
+Resume one subagent by `id` (preferred) or a single-item `ids` array.
+- Optional `message` is delivered into that one resumed run.
 - Running subagents are a no-op and return their current status snapshot.
 - Terminal subagents require `message` to start a follow-up resume run; without `message`, the tool returns the current snapshot with guidance.
 - `paused` subagents resume from saved context; `queued` subagents are already waiting for capacity.
+- Multiple targets are rejected because one global `message` must not broadcast to several subagents.
 
 ## `action: "steer"`
-Send a non-empty `message` to selected subagents by `ids`.
-- Running subagents receive the message through their live handle.
+Send a non-empty `message` to one subagent by `id` (preferred) or a single-item `ids` array.
+- A running subagent receives the message through its live handle.
 - Optional `pause: true` requests a safe-boundary pause after steering a running subagent.
 - `pause` only matters while the target is running.
-- Non-active subagents (`paused`, `queued`, or terminal) automatically resume with the message; `pause` is ignored for these targets.
+- A non-active subagent (`paused`, `queued`, or terminal) automatically resumes with the message; `pause` is ignored for that target.
+- Multiple targets are rejected because one global `message` must not broadcast to several subagents.
 
 ## `action: "cancel"`
 Stop selected subagents by `ids`, including running, paused, or queued subagents.

@@ -23,6 +23,7 @@ const subagentSchema = z.object({
 		.enum(["list", "inspect", "await", "cancel", "pause", "resume", "steer"])
 		.describe("subagent control action"),
 	ids: z.array(z.string()).optional().describe("subagent ids or backing job ids"),
+	id: z.string().optional().describe("single subagent id or backing job id for resume/steer"),
 	message: z.string().optional().describe("message to deliver when resuming or steering a subagent"),
 	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
@@ -180,36 +181,27 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		}
 
 		if (params.action === "resume") {
-			const ids = params.ids ?? [];
-			if (ids.length === 0) {
-				throw new ToolError("`resume` requires at least one subagent id.");
-			}
+			const id = this.#singleTargetId(params, "resume");
 			const records: SubagentRecord[] = [];
 			const missing: SubagentSnapshot[] = [];
 			const terminalGuidanceIds = new Set<string>();
-			const verifiedOutputIds = await this.#verifiedOutputIds(this.#visibleRecordsByIds(manager, ids, ownerFilter));
-			for (const id of ids) {
-				const record = this.#findVisibleRecord(manager, id, ownerFilter);
-				if (!record) {
-					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
-					continue;
-				}
-				if (record.status === "running") {
-					records.push(record);
-					continue;
-				}
-				if (params.message === undefined && isTerminalStatus(record.status)) {
-					records.push(record);
-					terminalGuidanceIds.add(record.subagentId);
-					continue;
-				}
+			const record = this.#findVisibleRecord(manager, id, ownerFilter);
+			const verifiedOutputIds = await this.#verifiedOutputIds(record ? [record] : []);
+			if (!record) {
+				missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+			} else if (record.status === "running") {
+				records.push(record);
+			} else if (params.message === undefined && isTerminalStatus(record.status)) {
+				records.push(record);
+				terminalGuidanceIds.add(record.subagentId);
+			} else {
 				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
 					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
-					continue;
+				} else {
+					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 				}
-				records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
 
 			return this.#buildSnapshotResult(
@@ -231,23 +223,18 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		}
 
 		if (params.action === "steer") {
-			const ids = params.ids ?? [];
+			const id = this.#singleTargetId(params, "steer");
 			const message = params.message;
-			if (ids.length === 0) {
-				throw new ToolError("`steer` requires at least one subagent id.");
-			}
 			if (message === undefined || message.trim() === "") {
 				throw new ToolError("`steer` requires a non-empty message.");
 			}
 			const records: SubagentRecord[] = [];
 			const missing: SubagentSnapshot[] = [];
-			const verifiedOutputIds = await this.#verifiedOutputIds(this.#visibleRecordsByIds(manager, ids, ownerFilter));
-			for (const id of ids) {
-				const record = this.#findVisibleRecord(manager, id, ownerFilter);
-				if (!record) {
-					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
-					continue;
-				}
+			const record = this.#findVisibleRecord(manager, id, ownerFilter);
+			const verifiedOutputIds = await this.#verifiedOutputIds(record ? [record] : []);
+			if (!record) {
+				missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+			} else {
 				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
@@ -259,10 +246,12 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 					if (!result.ok && result.reason === "not_found") {
 						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
-						continue;
+					} else {
+						records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 					}
 				}
-				records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
+				if (record.status === "running")
+					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
 			return this.#buildSnapshotResult(
 				[
@@ -274,6 +263,25 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		}
 
 		return this.#awaitSubagents(manager, params, ownerFilter, signal, onUpdate);
+	}
+
+	#singleTargetId(params: SubagentParams, action: "resume" | "steer"): string {
+		const id = params.id?.trim();
+		const ids = (params.ids ?? []).map(value => value.trim()).filter(value => value.length > 0);
+		if (id && ids.length > 0) {
+			if (ids.length === 1 && ids[0] === id) return id;
+			throw new ToolError(
+				`\`${action}\` accepts exactly one target; provide \`id\` or a single-item \`ids\`, not both.`,
+			);
+		}
+		if (id) return id;
+		if (ids.length === 1) return ids[0]!;
+		if (ids.length > 1) {
+			throw new ToolError(
+				`\`${action}\` accepts exactly one target because \`message\` is delivered to one subagent.`,
+			);
+		}
+		throw new ToolError(`\`${action}\` requires a single subagent id via \`id\`.`);
 	}
 
 	async #awaitSubagents(

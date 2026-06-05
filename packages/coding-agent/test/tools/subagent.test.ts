@@ -245,6 +245,47 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("resume accepts id and rejects multi-id message broadcast", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const resumed: string[] = [];
+		manager.setResumeRunner(subagentId => {
+			resumed.push(subagentId);
+			return manager.register("task", subagentId, async () => "resumed", {
+				id: `job-${subagentId}`,
+				ownerId: "0-Main",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		for (const subagentId of ["0-ResumeA", "0-ResumeB"]) {
+			manager.registerSubagentRecord({
+				subagentId,
+				ownerId: "0-Main",
+				currentJobId: null,
+				historicalJobIds: [],
+				status: "paused",
+				sessionFile: `/tmp/${subagentId}.jsonl`,
+				resumable: true,
+			});
+		}
+
+		await expect(
+			tool.execute("subagent-resume-broadcast", {
+				action: "resume",
+				ids: ["0-ResumeA", "0-ResumeB"],
+				message: "resume only one",
+			}),
+		).rejects.toThrow("accepts exactly one target");
+		expect(resumed).toEqual([]);
+
+		const result = await tool.execute("subagent-resume-id", { action: "resume", id: "0-ResumeA" });
+
+		expect(resumed).toEqual(["0-ResumeA"]);
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.jobId).toBe("job-0-ResumeA");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("steer running injects a message and optionally requests pause", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
@@ -277,6 +318,48 @@ describe("SubagentTool", () => {
 
 		expect(injected).toBe("tighten scope");
 		expect(pauseRequested).toBe(true);
+		expect(result.details?.subagents[0]?.status).toBe("running");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer accepts id and rejects multi-id message broadcast", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const injected: string[] = [];
+		for (const subagentId of ["0-SteerA", "0-SteerB"]) {
+			manager.registerSubagentRecord({
+				subagentId,
+				ownerId: "0-Main",
+				currentJobId: null,
+				historicalJobIds: [],
+				status: "running",
+				sessionFile: `/tmp/${subagentId}.jsonl`,
+				resumable: true,
+			});
+			manager.registerLiveHandle(subagentId, {
+				requestPause() {},
+				async injectMessage(content) {
+					injected.push(`${subagentId}:${content}`);
+				},
+			});
+		}
+
+		await expect(
+			tool.execute("subagent-steer-broadcast", {
+				action: "steer",
+				ids: ["0-SteerA", "0-SteerB"],
+				message: "steer only one",
+			}),
+		).rejects.toThrow("accepts exactly one target");
+		expect(injected).toEqual([]);
+
+		const result = await tool.execute("subagent-steer-id", {
+			action: "steer",
+			id: "0-SteerA",
+			message: "steer one",
+		});
+
+		expect(injected).toEqual(["0-SteerA:steer one"]);
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		await manager.dispose({ timeoutMs: 100 });
 	});
