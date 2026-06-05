@@ -447,6 +447,13 @@ function skillFromActiveValue(value: unknown): string | undefined {
 function activeFlag(value: unknown): boolean {
 	return isPlainObject(value) && value.active !== false;
 }
+function shellWord(value: string): string {
+	return /^[A-Za-z0-9._-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function stateClearFixCommand(skill: CanonicalGjcWorkflowSkill, sessionId: string | undefined): string {
+	return sessionId ? `gjc state ${skill} clear --session-id ${shellWord(sessionId)}` : `gjc state ${skill} clear`;
+}
 
 async function collectDoctorSummary(
 	cwd: string,
@@ -546,7 +553,7 @@ async function collectDoctorSummary(
 						"stale_active_state",
 						entryPath,
 						`active entry for ${entrySkill} does not match a live active mode-state`,
-						canonical ? `gjc state ${canonical} clear` : "gjc state prune --hard",
+						canonical ? stateClearFixCommand(canonical, scopeSessionId) : "gjc state prune --hard",
 						canonical ?? undefined,
 					),
 				);
@@ -565,7 +572,7 @@ async function collectDoctorSummary(
 							"stale_active_state",
 							snapshotPath,
 							`active snapshot lists ${entrySkill} but no raw per-skill active entry exists`,
-							canonical ? `gjc state ${canonical} clear` : "gjc state prune --hard",
+							canonical ? stateClearFixCommand(canonical, scopeSessionId) : "gjc state prune --hard",
 							canonical ?? undefined,
 						),
 					);

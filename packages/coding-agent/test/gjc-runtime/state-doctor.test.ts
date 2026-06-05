@@ -208,4 +208,31 @@ describe("gjc state doctor", () => {
 			}),
 		]);
 	});
+
+	it("prints a session-scoped clear command for stale active snapshots in old sessions", async () => {
+		const root = await tempDir();
+		const sessionId = "old-session";
+		const sessionRoot = path.join(root, ".gjc", "state", "sessions", sessionId);
+		const snapshotPath = path.join(sessionRoot, "skill-active-state.json");
+		await writeJson(snapshotPath, {
+			version: 1,
+			active: true,
+			skill: "ralplan",
+			phase: "final",
+			session_id: sessionId,
+			active_skills: [{ skill: "ralplan", active: true, phase: "final", session_id: sessionId }],
+		});
+
+		const result = await runDoctorUnchanged(root, ["doctor", "--skill", "ralplan", "--json"]);
+		expect(result.status).toBe(1);
+		const parsed = JSON.parse(result.stdout ?? "{}");
+		expect(parsed.problems).toEqual([
+			expect.objectContaining({
+				type: "stale_active_state",
+				skill: "ralplan",
+				path: snapshotPath,
+				fixCommand: "gjc state ralplan clear --session-id old-session",
+			}),
+		]);
+	});
 });
