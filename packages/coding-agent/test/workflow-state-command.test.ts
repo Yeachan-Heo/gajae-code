@@ -81,6 +81,28 @@ describe("gjc state workflow command", () => {
 		});
 	}, 30_000);
 
+	it("rejects stale workflow phases without force", async () => {
+		await withTempCwd(async cwd => {
+			for (const { skill, phase } of [
+				{ skill: "deep-interview", phase: "initializing" },
+				{ skill: "ralplan", phase: "approval" },
+			] as const) {
+				const result = runState(cwd, [
+					"write",
+					"--session-id",
+					`session-${skill}-${phase}`,
+					"--input",
+					JSON.stringify({ skill, current_phase: phase, active: true }),
+					"--json",
+				]);
+
+				expect(result.exitCode).toBe(2);
+				expect(result.stderr.toString()).toContain(`unknown ${skill} phase "${phase}"`);
+				expect(result.stderr.toString()).toContain("use --force to bypass");
+			}
+		});
+	}, 20_000);
+
 	it("infers read skill from session context and prefers incoming phase transitions", async () => {
 		await withTempCwd(async cwd => {
 			const initial = runState(cwd, [

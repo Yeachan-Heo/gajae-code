@@ -125,7 +125,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
 ```json
 {
   "active": true,
-  "current_phase": "deep-interview",
+  "current_phase": "interviewing",
   "state": {
     "interview_id": "<uuid>",
     "type": "greenfield|brownfield",
