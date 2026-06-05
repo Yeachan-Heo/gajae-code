@@ -123,6 +123,7 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
+	parentSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -1094,6 +1095,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
+					options.parentSessionId,
 				),
 			);
 			if (authFallbackUsed && model) {

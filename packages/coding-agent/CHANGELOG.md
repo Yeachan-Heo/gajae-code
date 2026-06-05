@@ -15,6 +15,10 @@
 - Fixed the interactive agent unexpectedly stopping after automatic context maintenance instead of resuming the in-flight task. Post-compaction continuation now schedules exactly one source per completion (overflow retry → queued messages → synthetic auto-continue prompt), the threshold/handoff auto-continue prompt skips a redundant pre-send compaction check, overflow retry strips only the context-overflow failed turn (never normal/aborted/silent-abort tails), and non-resumable or superseded continuations log a structured reason instead of stranding the session.
 - Fixed the native Stop skill-state hook letting active GJC workflow skills stop prematurely. The Stop hook no longer treats a missing/unreadable mode-state file as terminal for handoff workflows, and handoff skills (`deep-interview`, `ralplan`) now keep blocking Stop even in the `handoff` phase until they are demoted (`active:false`) or cleared, so they always end by offering the next handoff step via the ask tool. Non-handoff skills (`team`, `ultragoal`) retain the fail-open safety valve when their mode-state file is corrupt or invalid.
 
+### Fixed
+
+- Forwarded the parent session id when task subagents validate configured role-agent model overrides, preventing session-scoped OAuth providers from being misread as unauthenticated and falling back to the parent chat model.
+
 ## [0.3.0] - 2026-06-03
 
 ### Added
