@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -12,6 +13,7 @@ import {
 let dir: string;
 let sock: string;
 let server: ControlServer | null = null;
+let rawServer: net.Server | null = null;
 
 beforeEach(async () => {
 	// Keep the socket path short (AF_UNIX sun_path limit) by living directly in a temp dir.
@@ -22,6 +24,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await server?.close();
+	await new Promise<void>(resolve => rawServer?.close(() => resolve()) ?? resolve());
+	rawServer = null;
 	await rm(dir, { recursive: true, force: true });
 });
 
@@ -53,6 +57,40 @@ describe("control endpoint", () => {
 
 	it("rejects with EndpointUnreachableError when no owner is listening", async () => {
 		await expect(callEndpoint(path.join(dir, "absent.sock"), { verb: "submit", input: {} })).rejects.toBeInstanceOf(
+			EndpointUnreachableError,
+		);
+	});
+
+	it("rejects with EndpointUnreachableError when the owner accepts but never responds", async () => {
+		rawServer = net.createServer(socket => {
+			socket.on("data", () => {});
+		});
+		await new Promise<void>((resolve, reject) => {
+			rawServer?.once("error", reject);
+			rawServer?.listen(sock, () => {
+				rawServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+
+		await expect(callEndpoint(sock, { verb: "observe", input: {} }, 50)).rejects.toBeInstanceOf(
+			EndpointUnreachableError,
+		);
+	});
+
+	it("rejects malformed owner frames as EndpointUnreachableError", async () => {
+		rawServer = net.createServer(socket => {
+			socket.end("not-json\n");
+		});
+		await new Promise<void>((resolve, reject) => {
+			rawServer?.once("error", reject);
+			rawServer?.listen(sock, () => {
+				rawServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+
+		await expect(callEndpoint(sock, { verb: "observe", input: {} }, 500)).rejects.toBeInstanceOf(
 			EndpointUnreachableError,
 		);
 	});
