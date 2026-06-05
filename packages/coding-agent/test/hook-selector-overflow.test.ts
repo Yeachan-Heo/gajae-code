@@ -285,6 +285,52 @@ describe("HookSelectorComponent", () => {
 		// label — it is still one-line behavior.
 		expect(nonFocusedLines[0]).not.toContain("hotel golf");
 	});
+
+	it("caps extremely long focused options to maxVisible rows with an omitted marker", () => {
+		const longLabel = Array.from({ length: 400 }, (_, index) => `token-${index}`).join(" ");
+		const maxVisible = 5;
+		const rendered = renderStripped(28, { outline: true, initialIndex: 1, maxVisible, wrapFocused: true }, [
+			"above option",
+			longLabel,
+			"below option",
+		]);
+		const lines = rendered.split("\n");
+		const innerRows = lines.map(line => stripBorder(line, "│"));
+		const optionRows = innerRows.filter(
+			line =>
+				line.includes("above option") ||
+				line.includes("token-") ||
+				line.includes("wrapped rows omitted") ||
+				line.includes("below option") ||
+				line.includes("(2/3)"),
+		);
+
+		expect(optionRows.length).toBeLessThanOrEqual(maxVisible);
+		expect(rendered).toContain("wrapped rows omit");
+		expect(rendered).toContain("(2/3)");
+		expect(rendered).not.toContain("below option");
+	});
+
+	it("keeps controls reachable when focused option budget leaves one content row", () => {
+		const longLabel = Array.from({ length: 200 }, (_, index) => `word${index}`).join(" ");
+		const rendered = renderStripped(24, { outline: false, initialIndex: 0, maxVisible: 3, wrapFocused: true }, [
+			longLabel,
+			"second choice",
+		]);
+		const lines = rendered.split("\n");
+		const optionRows = lines.filter(
+			line =>
+				line.includes("word") ||
+				line.includes("wrapped rows omitted") ||
+				line.includes("second choice") ||
+				line.includes("(1/2)"),
+		);
+
+		expect(optionRows.length).toBeLessThanOrEqual(3);
+		expect(rendered).toContain("wrapped rows omi");
+		expect(rendered).toContain("(1/2)");
+		expect(rendered).toContain("up/down navigate");
+	});
 	it("caps scrollable title rows while keeping options and help visible", () => {
 		const title = Array.from({ length: 10 }, (_, index) => `Prompt row ${index + 1}`).join("\n\n");
 		const component = new HookSelectorComponent(
