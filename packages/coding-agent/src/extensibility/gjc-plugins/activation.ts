@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import { loadGjcPlugins } from "./loader";
 import { discoverGjcPluginRoots } from "./paths";
 import { GjcPluginLoadError, type LoadedGjcPlugin, type LoadedSubskillActivation } from "./types";
@@ -22,9 +23,9 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		plugins = await loadGjcPlugins(roots);
 	} catch (error) {
 		if (error instanceof GjcPluginLoadError) throw error;
-		console.warn(
-			`Skipping GJC plugin activation set after load error: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		logger.warn("Skipping GJC plugin activation set after load error", {
+			error: error instanceof Error ? error.message : String(error),
+		});
 		plugins = [];
 	}
 

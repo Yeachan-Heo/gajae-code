@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { readActiveSubskillsForParent } from "./state";
@@ -23,7 +24,7 @@ export async function loadActiveSubskillTools(input: {
 	);
 
 	for (const error of result.errors) {
-		console.warn(`[gjc-plugin] Skipping sub-skill tool ${error.path}: ${error.error}`);
+		logger.warn("Skipping GJC plugin sub-skill tool", { path: error.path, error: error.error });
 	}
 
 	const tools: CustomTool[] = [];
@@ -31,11 +32,11 @@ export async function loadActiveSubskillTools(input: {
 	for (const loadedTool of result.tools) {
 		const name = loadedTool.tool.name;
 		if (reservedToolNames.has(name)) {
-			console.warn(`[gjc-plugin] Skipping sub-skill tool name "${name}" because it conflicts with a reserved tool`);
+			logger.warn("Skipping GJC plugin sub-skill tool name because it conflicts with a reserved tool", { name });
 			continue;
 		}
 		if (seenNames.has(name)) {
-			console.warn(`[gjc-plugin] Skipping duplicate sub-skill tool name "${name}" from ${loadedTool.path}`);
+			logger.warn("Skipping duplicate GJC plugin sub-skill tool name", { name, path: loadedTool.path });
 			continue;
 		}
 		seenNames.add(name);
