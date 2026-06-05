@@ -18,8 +18,6 @@ export class HindsightReflectTool implements AgentTool<typeof hindsightReflectSc
 	readonly description = reflectDescription;
 	readonly parameters = hindsightReflectSchema;
 	readonly strict = true;
-	readonly loadMode = "discoverable";
-	readonly summary = "Reflect on recent work and write hindsight memory";
 
 	constructor(private readonly session: ToolSession) {}
 

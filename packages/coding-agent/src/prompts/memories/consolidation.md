@@ -1,5 +1,5 @@
 Memory consolidation agent.
-Memory root: memory://root
+Memory backend: local private runtime state
 Input corpus (raw memories):
 {{raw_memories}}
 Input corpus (rollout summaries):
