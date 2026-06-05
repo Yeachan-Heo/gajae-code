@@ -585,16 +585,14 @@ class RpcClient:
         self._workflow_gate_listeners.append(listener)
         return lambda: self._remove_listener(self._workflow_gate_listeners, listener)
 
-    def respond_gate(self, gate_id: str, answer: object, *, idempotency_key: str | None = None) -> None:
-        """Answer a workflow gate by sending a `workflow_gate_response` (#322)."""
-        payload: JsonObject = {
-            "type": "workflow_gate_response",
-            "gate_id": gate_id,
-            "answer": _clone_json_value(answer),
-        }
-        if idempotency_key is not None:
-            payload["idempotency_key"] = idempotency_key
-        self._send_notification(payload)
+    def respond_gate(self, gate_id: str, answer: object, *, idempotency_key: str | None = None) -> JsonObject:
+        """Answer a workflow gate and return the accepted/rejected resolution envelope (#322)."""
+        return self._request(
+            "workflow_gate_response",
+            gate_id=gate_id,
+            answer=_clone_json_value(answer),
+            idempotency_key=idempotency_key,
+        )
 
     def run_workflow_gate_policy(
         self, resolver: Callable[[WorkflowGate], object]
@@ -606,7 +604,11 @@ class RpcClient:
         """
 
         def handle(gate: WorkflowGate) -> None:
-            self.respond_gate(gate.gate_id, resolver(gate))
+            threading.Thread(
+                target=lambda: self.respond_gate(gate.gate_id, resolver(gate)),
+                name=f"gjc-rpc-workflow-gate-{gate.gate_id}",
+                daemon=True,
+            ).start()
 
         return self.on_workflow_gate(handle)
 

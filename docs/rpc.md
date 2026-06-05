@@ -136,7 +136,7 @@ Important edge behavior from runtime:
 All command results use `RpcResponse`:
 
 - Success: `{ id?, type: "response", command: <command>, success: true, data?: ... }`
-- Failure: `{ id?, type: "response", command: string, success: false, error: string }`
+- Failure: `{ id?, type: "response", command: string, success: false, error: string | object }`; typed control-plane failures use object-valued errors such as `{ "code": "scope_denied", ... }`.
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
 
@@ -622,8 +622,10 @@ Current helper characteristics:
 
 - Spawns `bun <cliPath> --mode rpc`
 - Correlates responses by generated `req_<n>` ids
-- Dispatches only recognized `AgentEvent` types to listeners
+- Dispatches recognized `AgentEvent` types to event listeners
+- Dispatches top-level `workflow_gate` frames to `onWorkflowGate()` listeners
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
+- Exposes `respondGate()` for `workflow_gate_response` and waits for the accepted/rejected resolution envelope
 - Does **not** expose helper methods for every protocol command (for example, `set_interrupt_mode` and `set_session_name` are in protocol types but not wrapped as dedicated methods)
 
 Use raw protocol frames if you need complete surface coverage.
@@ -679,6 +681,7 @@ The answer is validated against the advertised schema **before acceptance**:
 - Idempotency: replaying the same `idempotency_key` + identical body returns the
   cached resolution; the same key with a different body is an
   `idempotency_conflict`; answering an already-accepted gate is `already_resolved`.
+- Client helpers wait for this accepted/rejected resolution envelope; they must not treat the write of `workflow_gate_response` itself as completion.
 
 ### Entering unattended mode: `negotiate_unattended`
 
@@ -715,6 +718,12 @@ audit enforcement are layered on this contract by the unattended control plane
 
 Both clients expose typed `workflow_gate` receive + respond helpers so an agent
 can answer a gate from its own memory via a callback.
+
+For bridge sessions, gate responses are **not** posted through `/commands`. The
+client must first own the UI/control plane, then post the answer body to
+`POST /v1/sessions/{session_id}/ui-responses/{gate_id}` with
+`X-GJC-Bridge-Owner-Token: <ownerToken>`. `Idempotency-Key` may be supplied as a
+header and the same value is also accepted in the JSON body as `idempotency_key`.
 
 `@gajae-code/bridge-client` (TypeScript):
 

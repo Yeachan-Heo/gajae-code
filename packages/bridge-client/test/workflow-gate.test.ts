@@ -52,7 +52,7 @@ describe("bridge-client workflow_gate helpers (#322)", () => {
 		expect(isWorkflowGateFrame(other)).toBe(false);
 	});
 
-	it("respondGate posts a workflow_gate_response command", async () => {
+	it("respondGate posts through the owner-token protected UI response endpoint", async () => {
 		const captured: Array<{ url: string; body: string | null; headers: Record<string, string> }> = [];
 		const client = fakeClient(captured);
 		await client.respondGate(
@@ -62,11 +62,11 @@ describe("bridge-client workflow_gate helpers (#322)", () => {
 			{ decision: "approve" },
 			{ idempotencyKey: "k1" },
 		);
-		expect(captured[0]?.url).toBe("https://bridge.test/v1/sessions/sess-1/commands");
+		expect(captured[0]?.url).toBe(`https://bridge.test/v1/sessions/sess-1/ui-responses/${gate.gate_id}`);
+		expect(captured[0]?.headers["x-gjc-bridge-owner-token"]).toBe("owner-token");
 		expect(captured[0]?.headers["idempotency-key"]).toBe("k1");
 		const body = JSON.parse(captured[0]?.body ?? "{}");
-		expect(body).toMatchObject({
-			type: "workflow_gate_response",
+		expect(body).toEqual({
 			gate_id: gate.gate_id,
 			answer: { decision: "approve" },
 			idempotency_key: "k1",

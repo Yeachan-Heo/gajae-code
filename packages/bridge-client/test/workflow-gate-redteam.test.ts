@@ -56,10 +56,10 @@ describe("bridge-client workflow_gate red-team coverage (#322)", () => {
 
 		await client.respondGate("sess-1", gate.gate_id, "owner-token", { decision: "approve" });
 
-		expect(captured[0]?.url).toBe("https://bridge.test/v1/sessions/sess-1/commands");
-		expect(captured[0]?.headers["idempotency-key"]).toBeDefined();
-		expect(JSON.parse(captured[0]?.body ?? "{}")).toMatchObject({
-			type: "workflow_gate_response",
+		expect(captured[0]?.url).toBe(`https://bridge.test/v1/sessions/sess-1/ui-responses/${gate.gate_id}`);
+		expect(captured[0]?.headers["idempotency-key"]).toBeUndefined();
+		expect(captured[0]?.headers["x-gjc-bridge-owner-token"]).toBe("owner-token");
+		expect(JSON.parse(captured[0]?.body ?? "{}")).toEqual({
 			gate_id: gate.gate_id,
 			answer: { decision: "approve" },
 		});
@@ -73,10 +73,12 @@ describe("bridge-client workflow_gate red-team coverage (#322)", () => {
 			idempotencyKey: "idem-1",
 		});
 
-		expect(captured[0]?.url).toBe("https://bridge.test/v1/sessions/session%2Fwith%20space/commands");
+		expect(captured[0]?.url).toBe(
+			"https://bridge.test/v1/sessions/session%2Fwith%20space/ui-responses/gate%2Fwith%20space",
+		);
 		expect(captured[0]?.headers["idempotency-key"]).toBe("idem-1");
+		expect(captured[0]?.headers["x-gjc-bridge-owner-token"]).toBe("owner-token");
 		expect(JSON.parse(captured[0]?.body ?? "{}")).toEqual({
-			type: "workflow_gate_response",
 			gate_id: "gate/with space",
 			answer: "approved",
 			idempotency_key: "idem-1",
@@ -104,9 +106,9 @@ describe("bridge-client workflow_gate red-team coverage (#322)", () => {
 		}
 
 		expect(handled.map(item => item.gate.gate_id)).toEqual(["wg_1", "wg_2"]);
-		expect(captured.map(item => JSON.parse(item.body ?? "{}"))).toMatchObject([
-			{ type: "workflow_gate_response", gate_id: "wg_1", answer: { gate: "wg_1" } },
-			{ type: "workflow_gate_response", gate_id: "wg_2", answer: { gate: "wg_2" } },
+		expect(captured.map(item => JSON.parse(item.body ?? "{}"))).toEqual([
+			{ gate_id: "wg_1", answer: { gate: "wg_1" } },
+			{ gate_id: "wg_2", answer: { gate: "wg_2" } },
 		]);
 	});
 });

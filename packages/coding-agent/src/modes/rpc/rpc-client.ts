@@ -20,6 +20,8 @@ import type {
 	RpcHostToolUpdate,
 	RpcResponse,
 	RpcSessionState,
+	RpcWorkflowGate,
+	RpcWorkflowGateResolution,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -97,7 +99,7 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	if (typeof value.success !== "boolean") return false;
 	if (value.id !== undefined && typeof value.id !== "string") return false;
 	if (value.success === false) {
-		return typeof value.error === "string";
+		return typeof value.error === "string" || isRecord(value.error);
 	}
 	return true;
 }
@@ -130,6 +132,21 @@ function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest
 	return value.type === "extension_ui_request" && typeof value.id === "string" && typeof value.method === "string";
 }
 
+function isRpcWorkflowGate(value: unknown): value is RpcWorkflowGate {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "workflow_gate" &&
+		typeof value.gate_id === "string" &&
+		typeof value.stage === "string" &&
+		typeof value.kind === "string" &&
+		isRecord(value.schema) &&
+		typeof value.schema_hash === "string" &&
+		isRecord(value.context) &&
+		typeof value.created_at === "string" &&
+		value.required === true
+	);
+}
+
 function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): AgentToolResult<TDetails> {
 	if (typeof result === "string") {
 		return {
@@ -152,6 +169,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#workflowGateListeners: Set<(gate: RpcWorkflowGate) => void> = new Set();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -297,6 +315,29 @@ export class RpcClient {
 				this.#eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Subscribe to workflow lifecycle gates emitted by RPC mode.
+	 */
+	onWorkflowGate(listener: (gate: RpcWorkflowGate) => void): () => void {
+		this.#workflowGateListeners.add(listener);
+		return () => {
+			this.#workflowGateListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Answer a workflow lifecycle gate and wait for the server resolution envelope.
+	 */
+	async respondGate(gateId: string, answer: unknown, idempotencyKey?: string): Promise<RpcWorkflowGateResolution> {
+		const response = await this.#send({
+			type: "workflow_gate_response",
+			gate_id: gateId,
+			answer,
+			idempotency_key: idempotencyKey,
+		});
+		return this.#getData(response);
 	}
 
 	/**
@@ -682,6 +723,13 @@ export class RpcClient {
 
 		if (isRpcExtensionUiRequest(data)) {
 			for (const listener of this.#extensionUiListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcWorkflowGate(data)) {
+			for (const listener of this.#workflowGateListeners) {
 				listener(data);
 			}
 			return;

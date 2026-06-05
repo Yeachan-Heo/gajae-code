@@ -43,6 +43,18 @@ ECHO_SERVER = textwrap.dedent(
                 "event": "received",
                 "error": json.dumps(msg, sort_keys=True),
             })
+            emit({
+                "id": msg.get("id"),
+                "type": "response",
+                "command": "workflow_gate_response",
+                "success": True,
+                "data": {
+                    "gate_id": msg.get("gate_id", ""),
+                    "status": "accepted",
+                    "answer_hash": "sha256:test",
+                    "resolved_at": "2026-06-05T05:01:00.000Z",
+                },
+            })
     """
 )
 
@@ -94,6 +106,18 @@ MULTI_GATE_SERVER = textwrap.dedent(
                 "event": msg.get("gate_id", ""),
                 "error": json.dumps(msg, sort_keys=True),
             })
+            emit({
+                "id": msg.get("id"),
+                "type": "response",
+                "command": "workflow_gate_response",
+                "success": True,
+                "data": {
+                    "gate_id": msg.get("gate_id", ""),
+                    "status": "accepted",
+                    "answer_hash": "sha256:test",
+                    "resolved_at": "2026-06-05T05:01:00.000Z",
+                },
+            })
     """
 )
 
@@ -126,7 +150,7 @@ class WorkflowGateRedTeamTest(unittest.TestCase):
         try:
             client.respond_gate("wg_no_idem", {"decision": "approve"})
             self.assertTrue(done.wait(timeout=2.0))
-            self.assertEqual(echoes[0], {"type": "workflow_gate_response", "gate_id": "wg_no_idem", "answer": {"decision": "approve"}})
+            self.assertEqual(echoes[0], {"id": "req_1", "type": "workflow_gate_response", "gate_id": "wg_no_idem", "answer": {"decision": "approve"}})
         finally:
             client.stop()
 
@@ -146,7 +170,13 @@ class WorkflowGateRedTeamTest(unittest.TestCase):
             self.assertTrue(done.wait(timeout=2.0))
             self.assertEqual(
                 echoes[0],
-                {"type": "workflow_gate_response", "gate_id": "wg_with_idem", "answer": "approved", "idempotency_key": "idem-1"},
+                {
+                    "id": "req_1",
+                    "type": "workflow_gate_response",
+                    "gate_id": "wg_with_idem",
+                    "answer": "approved",
+                    "idempotency_key": "idem-1",
+                },
             )
         finally:
             client.stop()

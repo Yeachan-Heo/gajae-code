@@ -10,9 +10,9 @@ from gjc_rpc import RpcClient, WorkflowGate
 
 
 # Fake server: announces ready, emits one workflow_gate, then waits for a
-# workflow_gate_response on stdin and echoes the answer back as an extension_error
-# frame (an easily-observed inbound notification) so the test can assert the
-# headless respond_gate round-trip.
+# workflow_gate_response request on stdin. It echoes the answer as an
+# extension_error frame and sends the accepted resolution envelope so the client
+# can assert the headless respond_gate round-trip.
 GATE_SERVER = textwrap.dedent(
     """
     import json
@@ -49,6 +49,18 @@ GATE_SERVER = textwrap.dedent(
                 "event": msg.get("gate_id", ""),
                 "error": json.dumps(msg.get("answer")),
             })
+            emit({
+                "id": msg.get("id"),
+                "type": "response",
+                "command": "workflow_gate_response",
+                "success": True,
+                "data": {
+                    "gate_id": msg.get("gate_id", ""),
+                    "status": "accepted",
+                    "answer_hash": "sha256:test",
+                    "resolved_at": "2026-06-05T05:01:00.000Z",
+                },
+            })
     """
 )
 
@@ -67,6 +79,17 @@ class WorkflowGateClientTest(unittest.TestCase):
             self.assertTrue(done.wait(timeout=2.0))
             self.assertEqual(received[0].gate_id, "wg_test_ralplan_000001")
             self.assertEqual(received[0].kind, "approval")
+        finally:
+            client.stop()
+
+    def test_respond_gate_waits_for_resolution_envelope(self) -> None:
+        client = self.make_client()
+        client.start()
+        try:
+            resolution = client.respond_gate("wg_test_ralplan_000001", {"decision": "approve"}, idempotency_key="idem-1")
+            self.assertEqual(resolution["gate_id"], "wg_test_ralplan_000001")
+            self.assertEqual(resolution["status"], "accepted")
+            self.assertEqual(resolution["answer_hash"], "sha256:test")
         finally:
             client.stop()
 

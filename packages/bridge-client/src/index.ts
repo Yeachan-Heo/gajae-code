@@ -431,23 +431,25 @@ export class BridgeClient implements BridgeCommandHelpers {
 	}
 
 	/**
-	 * Answer a `workflow_gate` by sending `workflow_gate_response` through the
-	 * live command broker/control plane. #322.
+	 * Answer a `workflow_gate` through the owner-token protected UI response
+	 * endpoint and return the gate resolution envelope.
 	 */
 	respondGate(
 		sessionId: string,
 		gateId: string,
-		_ownerToken: string,
+		ownerToken: string,
 		answer: unknown,
 		options: { idempotencyKey?: string; id?: string } = {},
 	): Promise<unknown> {
-		return this.#command(
-			"workflow_gate_response",
-			sessionId,
-			{ gate_id: gateId, answer, idempotency_key: options.idempotencyKey },
-			{ id: options.id, idempotencyKey: options.idempotencyKey },
-			"workflow-gate-response",
-		);
+		return this.#json(`/v1/sessions/${encodeURIComponent(sessionId)}/ui-responses/${encodeURIComponent(gateId)}`, {
+			method: "POST",
+			body: JSON.stringify({ gate_id: gateId, answer, idempotency_key: options.idempotencyKey }),
+			headers: {
+				"Content-Type": "application/json",
+				"X-GJC-Bridge-Owner-Token": ownerToken,
+				...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+			},
+		});
 	}
 
 	/**
