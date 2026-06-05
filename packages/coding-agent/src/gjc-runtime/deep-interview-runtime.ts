@@ -7,7 +7,7 @@ import { buildDeepInterviewHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { runNativeStateCommand } from "./state-runtime";
-import { appendJsonl, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
 
 /**
  * Native implementation of `gjc deep-interview`.
@@ -96,16 +96,6 @@ function deepInterviewStatePath(cwd: string, sessionId: string | undefined): str
 	return path.join(stateDirFor(cwd, sessionId), "deep-interview-state.json");
 }
 
-async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
-	try {
-		const parsed = JSON.parse(await fs.readFile(filePath, "utf-8"));
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-	} catch {
-		// Missing/corrupt state should not prevent the sanctioned persistence CLI from writing a receipt.
-	}
-	return {};
-}
-
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
 	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
 	try {
@@ -145,6 +135,7 @@ export interface ResolvedDeepInterviewSpecWriteArgs {
 	json: boolean;
 	deliberate: boolean;
 	handoff?: "ralplan";
+	force: boolean;
 }
 
 export interface PersistedDeepInterviewSpec {
@@ -299,6 +290,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		"--handoff",
 		"--deliberate",
 		"--json",
+		"--force",
 	]);
 	let skipNext = false;
 	for (const arg of args) {
@@ -322,6 +314,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		sessionId,
 		json: hasFlag(args, "--json"),
 		deliberate: hasFlag(args, "--deliberate"),
+		force: hasFlag(args, "--force"),
 		handoff: rawHandoff as "ralplan" | undefined,
 	};
 }
@@ -395,6 +388,16 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "corrupt" && !resolved.force) {
+		throw new DeepInterviewCommandError(
+			2,
+			`existing deep-interview state is corrupt or tampered (${existingRead.error}); use --force to overwrite ${statePath}`,
+		);
+	}
+	const existing = existingRead.kind === "valid" ? existingRead.value : {};
+
 	const specPath = path.join(cwd, ".gjc", "specs", `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	await writeArtifact(specPath, content, {
@@ -410,8 +413,6 @@ export async function persistDeepInterviewSpec(
 		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview" } },
 	);
 
-	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
-	const existing = await readJsonObject(statePath);
 	const payload: Record<string, unknown> = {
 		...existing,
 		active: true,
@@ -436,7 +437,13 @@ export async function persistDeepInterviewSpec(
 			sessionId: resolved.sessionId,
 			nowIso: createdAt,
 		},
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			forced: resolved.force,
+		},
 	});
 	await syncDeepInterviewHud({
 		cwd,

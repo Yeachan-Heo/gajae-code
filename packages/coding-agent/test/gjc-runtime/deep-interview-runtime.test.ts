@@ -47,6 +47,69 @@ describe("native gjc deep-interview runtime", () => {
 		expect(source).toContain("handoff: Flags.string");
 	});
 
+	it("handles missing, valid, and corrupt deep-interview state during spec persistence", async () => {
+		const missingRoot = await tempDir();
+		const missing = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "missing-state", "--spec", "# Missing", "--json"],
+			missingRoot,
+		);
+		expect(missing.status).toBe(0);
+		const missingState = JSON.parse(
+			await fs.readFile(path.join(missingRoot, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
+		);
+		expect(missingState.spec_slug).toBe("missing-state");
+
+		const validRoot = await tempDir();
+		const validStatePath = path.join(validRoot, ".gjc", "state", "deep-interview-state.json");
+		await fs.mkdir(path.dirname(validStatePath), { recursive: true });
+		await fs.writeFile(
+			validStatePath,
+			`${JSON.stringify({ transcript: [{ question: "q", answer: "a" }], current_phase: "interviewing" })}\n`,
+			"utf-8",
+		);
+		const valid = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "valid-state", "--spec", "# Valid", "--json"],
+			validRoot,
+		);
+		expect(valid.status).toBe(0);
+		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
+		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
+		expect(validState.spec_slug).toBe("valid-state");
+	});
+
+	it("fails closed on corrupt deep-interview state unless --force is supplied", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "deep-interview-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, '{"current_phase":', "utf-8");
+
+		const rejected = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "corrupt-rejected", "--spec", "# Rejected", "--json"],
+			root,
+		);
+		expect(rejected.status).toBe(2);
+		expect(rejected.stderr).toContain("existing deep-interview state is corrupt or tampered");
+		expect(rejected.stderr).toContain("use --force to overwrite");
+		expect(await fs.readFile(statePath, "utf-8")).toBe('{"current_phase":');
+		await expect(fs.access(path.join(root, ".gjc", "specs", "deep-interview-corrupt-rejected.md"))).rejects.toThrow();
+
+		const forced = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "corrupt-forced", "--spec", "# Forced", "--force", "--json"],
+			root,
+		);
+		expect(forced.status).toBe(0);
+		const forcedState = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(forcedState.spec_slug).toBe("corrupt-forced");
+		expect(forcedState.receipt).toMatchObject({ skill: "deep-interview", owner: "gjc-runtime" });
+		const audit = (await fs.readFile(path.join(root, ".gjc", "state", "audit.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(
+			audit.some(entry => entry.skill === "deep-interview" && entry.verb === "write" && entry.forced === true),
+		).toBe(true);
+	});
+
 	it("persists a final spec under .gjc/specs through the native CLI/API", async () => {
 		const root = await tempDir();
 		const specPath = path.join(root, "final-spec.md");
