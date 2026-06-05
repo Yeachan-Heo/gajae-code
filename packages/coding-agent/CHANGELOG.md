@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forwarded the parent session id when task subagents validate configured role-agent model overrides, preventing session-scoped OAuth providers from being misread as unauthenticated and falling back to the parent chat model.
+
 ## [0.3.0] - 2026-06-03
 
 ### Added
