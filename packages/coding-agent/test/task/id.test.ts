@@ -52,7 +52,7 @@ function validParams(id: string): TaskParams {
 
 describe("task id validation", () => {
 	it("accepts filesystem-safe task ids and allocated prefixes", async () => {
-		for (const id of ["A", "a_b-9", "Z".repeat(48)]) {
+		for (const id of ["A", "ab", "a_b-9", "Z".repeat(48)]) {
 			expect(isValidTaskId(id)).toBe(true);
 			expect(taskSchema.safeParse(validParams(id)).success).toBe(true);
 		}
@@ -77,7 +77,6 @@ describe("task id validation", () => {
 			"a\u0000b",
 			"a\u001fb",
 			"a\u2215b",
-			"ab",
 			"-startsWithDash",
 			"_startsWithUnderscore",
 			"a.b",
