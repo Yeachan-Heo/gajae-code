@@ -3,7 +3,6 @@ import {
 	BUILTIN_MODEL_PROFILES,
 	mergeModelProfiles,
 	resolveProfileBindings,
-	type ModelProfileDefinition,
 } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelsConfigSchema, ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 
@@ -118,6 +117,17 @@ describe("model profile red-team schema and catalog cases", () => {
 		});
 	});
 
+	test("mergeModelProfiles aggregates underdeclared providers from mappings", () => {
+		const merged = mergeModelProfiles({
+			underdeclared: {
+				required_providers: ["provider-a"],
+				model_mapping: { default: "provider-a/default", executor: "provider-b/executor:high" },
+			},
+		});
+
+		expect(merged.get("underdeclared")?.requiredProviders).toEqual(["provider-a", "provider-b"]);
+	});
+
 	test("resolveProfileBindings on a default-only mapping returns only defaultSelector", () => {
 		const resolved = resolveProfileBindings({
 			name: "default-only",
@@ -148,14 +158,15 @@ describe("model profile red-team schema and catalog cases", () => {
 		const merged = mergeModelProfiles(undefined);
 
 		expect(merged.size).toBe(9);
-		expect([...merged.values()]).toEqual(BUILTIN_MODEL_PROFILES);
+		expect([...merged.values()]).toEqual([...BUILTIN_MODEL_PROFILES]);
 	});
 
 	test("every builtin selector satisfies public selector validation", () => {
 		const failures: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
 			for (const [role, selector] of Object.entries(profile.modelMapping)) {
-				if (!ProfileModelSelectorSchema.safeParse(selector).success) failures.push(`${profile.name}.${role}=${selector}`);
+				if (!ProfileModelSelectorSchema.safeParse(selector).success)
+					failures.push(`${profile.name}.${role}=${selector}`);
 			}
 		}
 

@@ -15,13 +15,40 @@ export interface ResolvedProfileBinding {
 	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, string>>;
 }
 
+function parseModelSelectorProvider(selector: string): string | undefined {
+	const slashIdx = selector.indexOf("/");
+	if (slashIdx <= 0) return undefined;
+	return selector.slice(0, slashIdx);
+}
+
+export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileDefinition, "modelMapping">): string[] {
+	const providers = new Set<string>();
+	for (const selector of Object.values(definition.modelMapping)) {
+		if (!selector) continue;
+		const provider = parseModelSelectorProvider(selector);
+		if (provider) providers.add(provider);
+	}
+	return [...providers].sort((a, b) => a.localeCompare(b));
+}
+
+export function aggregateModelProfileRequiredProviders(
+	requiredProviders: readonly string[],
+	definition: Pick<ModelProfileDefinition, "modelMapping">,
+): string[] {
+	const providers = new Set(requiredProviders);
+	for (const provider of deriveModelProfileMappedProviders(definition)) {
+		providers.add(provider);
+	}
+	return [...providers];
+}
+
 const profile = (
 	name: string,
 	requiredProviders: string[],
 	modelMapping: Record<ModelProfileRole, string>,
 ): ModelProfileDefinition => ({
 	name,
-	requiredProviders,
+	requiredProviders: aggregateModelProfileRequiredProviders(requiredProviders, { modelMapping }),
 	modelMapping,
 	source: "builtin",
 });
@@ -95,13 +122,18 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {
 	const profiles = new Map<string, ModelProfileDefinition>();
 	for (const definition of BUILTIN_MODEL_PROFILES) {
-		profiles.set(definition.name, { ...definition, requiredProviders: [...definition.requiredProviders], modelMapping: { ...definition.modelMapping } });
+		profiles.set(definition.name, {
+			...definition,
+			requiredProviders: [...definition.requiredProviders],
+			modelMapping: { ...definition.modelMapping },
+		});
 	}
 	for (const [name, definition] of Object.entries(userProfiles ?? {})) {
+		const modelMapping = { ...definition.model_mapping };
 		profiles.set(name, {
 			name,
-			requiredProviders: [...definition.required_providers],
-			modelMapping: { ...definition.model_mapping },
+			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
+			modelMapping,
 			source: "user",
 		});
 	}

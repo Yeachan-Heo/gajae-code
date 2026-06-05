@@ -1,20 +1,20 @@
+import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
-import { isAuthenticated, type GjcModelAssignmentTargetId, type ModelRegistry } from "./model-registry";
-import { formatAvailableProfileNames, resolveProfileBindings } from "./model-profiles";
+import type { AgentSession } from "../session/agent-session";
+import {
+	aggregateModelProfileRequiredProviders,
+	formatAvailableProfileNames,
+	resolveProfileBindings,
+} from "./model-profiles";
+import { type GjcModelAssignmentTargetId, isAuthenticated, type ModelRegistry } from "./model-registry";
 import { resolveModelRoleValue } from "./model-resolver";
 import type { Settings } from "./settings";
-import type { AgentSession } from "../session/agent-session";
-import type { ThinkingLevel } from "@gajae-code/agent-core";
 
 export interface PrepareModelProfileActivationOptions {
 	session: Pick<AgentSession, "model" | "thinkingLevel" | "sessionId">;
 	modelRegistry: Pick<
 		ModelRegistry,
-		| "getModelProfile"
-		| "getModelProfiles"
-		| "getAvailableModelProfileNames"
-		| "getApiKeyForProvider"
-		| "getAll"
+		"getModelProfile" | "getModelProfiles" | "getAvailableModelProfileNames" | "getApiKeyForProvider" | "getAll"
 	>;
 	settings: Pick<Settings, "get">;
 	profileName: string;
@@ -46,7 +46,7 @@ export async function prepareModelProfileActivation(
 	}
 
 	const missingProviders: string[] = [];
-	for (const provider of profile.requiredProviders) {
+	for (const provider of aggregateModelProfileRequiredProviders(profile.requiredProviders, profile)) {
 		const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.session.sessionId);
 		if (!isAuthenticated(apiKey)) {
 			missingProviders.push(provider);
@@ -65,11 +65,16 @@ export async function prepareModelProfileActivation(
 			})
 		: undefined;
 	if (bindings.defaultSelector && !resolvedDefault?.model) {
-		throw new Error(`Model profile "${options.profileName}" default selector did not resolve: ${bindings.defaultSelector}`);
+		throw new Error(
+			`Model profile "${options.profileName}" default selector did not resolve: ${bindings.defaultSelector}`,
+		);
 	}
 
 	const agentModelOverrides: Record<string, string> = {};
-	for (const [role, selector] of Object.entries(bindings.agentModelOverrides) as [GjcModelAssignmentTargetId, string][]) {
+	for (const [role, selector] of Object.entries(bindings.agentModelOverrides) as [
+		GjcModelAssignmentTargetId,
+		string,
+	][]) {
 		const resolved = resolveModelRoleValue(selector, availableModels, {
 			settings: options.settings as Settings,
 			modelRegistry: options.modelRegistry,

@@ -1,13 +1,13 @@
+import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import { describe, expect, test } from "bun:test";
 import { parseArgs } from "../src/cli/args";
 import { activateModelProfile } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 
 const model = (provider: string, id: string): Model =>
-	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 } as Model);
+	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
 
 function fakeRegistry(options?: {
 	missingProviders?: string[];
@@ -68,7 +68,13 @@ function instrumentSettings(settings: Settings) {
 	settings.flush = async () => {
 		flushCount += 1;
 	};
-	return { setCalls, overrideCalls, get flushCount() { return flushCount; } };
+	return {
+		setCalls,
+		overrideCalls,
+		get flushCount() {
+			return flushCount;
+		},
+	};
 }
 
 describe("model profile activation red-team", () => {
@@ -90,9 +96,9 @@ describe("model profile activation red-team", () => {
 			],
 		});
 
-		await expect(activateModelProfile({ session, modelRegistry: registry, settings, profileName: "bad-role" })).rejects.toThrow(
-			'Model profile "bad-role" executor selector did not resolve: provider-b/missing',
-		);
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "bad-role" }),
+		).rejects.toThrow('Model profile "bad-role" executor selector did not resolve: provider-b/missing');
 		expect(session.model?.id).toBe("initial");
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(session.setModelTemporaryCalls).toEqual([]);
@@ -122,8 +128,44 @@ describe("model profile activation red-team", () => {
 			],
 		});
 
-		await expect(activateModelProfile({ session, modelRegistry: registry, settings, profileName: "needs-two" })).rejects.toThrow(
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "needs-two" }),
+		).rejects.toThrow(
 			'Model profile "needs-two" requires credentials for: provider-b. Run /login and configure the missing provider(s), then retry.',
+		);
+		expect(session.model?.id).toBe("initial");
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(calls.setCalls).toEqual([]);
+		expect(calls.overrideCalls).toEqual([]);
+		expect(calls.flushCount).toBe(0);
+	});
+
+	test("AUTHZ: underdeclared mapped provider hard-blocks with zero mutation", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: "provider-a/original" },
+			"modelProfile.default": "old-profile",
+		});
+		const calls = instrumentSettings(settings);
+		const registry = fakeRegistry({
+			missingProviders: ["provider-b"],
+			profiles: [
+				{
+					name: "underdeclared-provider",
+					requiredProviders: ["provider-a"],
+					modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+					source: "user",
+				},
+			],
+		});
+
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "underdeclared-provider" }),
+		).rejects.toThrow(
+			'Model profile "underdeclared-provider" requires credentials for: provider-b. Run /login and configure the missing provider(s), then retry.',
 		);
 		expect(session.model?.id).toBe("initial");
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
@@ -151,7 +193,10 @@ describe("model profile activation red-team", () => {
 		});
 
 		await expect(
-			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "bad-default" }, { persistDefault: true }),
+			activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: "bad-default" },
+				{ persistDefault: true },
+			),
 		).rejects.toThrow('Model profile "bad-default" default selector did not resolve: provider-a/missing');
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
@@ -200,7 +245,12 @@ describe("model profile activation red-team", () => {
 		});
 
 		await expect(
-			activateModelProfile({ session: fakeSession(), modelRegistry: registry, settings: Settings.isolated(), profileName: "missing" }),
+			activateModelProfile({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "missing",
+			}),
 		).rejects.toThrow('Unknown model profile "missing". Available profiles: alpha, zeta');
 	});
 
@@ -218,13 +268,22 @@ describe("model profile activation red-team", () => {
 				{
 					name: "session-profile",
 					requiredProviders: [],
-					modelMapping: { default: "provider-a/alternate", executor: "provider-a/architect", architect: "provider-b/executor" },
+					modelMapping: {
+						default: "provider-a/alternate",
+						executor: "provider-a/architect",
+						architect: "provider-b/executor",
+					},
 					source: "user",
 				},
 			],
 		});
 
-		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: settings.get("modelProfile.default")! });
+		await activateModelProfile({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: settings.get("modelProfile.default")!,
+		});
 		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "session-profile" });
 		settings.override("task.agentModelOverrides", {
 			...settings.get("task.agentModelOverrides"),
