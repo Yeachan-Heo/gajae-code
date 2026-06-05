@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import type { SpawnPlanReceipt } from "./spawn-gate";
@@ -74,7 +75,7 @@ const spawnPlanSchema = z
 
 const createTaskItemSchema = (_contextEnabled: boolean) =>
 	z.object({
-		id: z.string().max(48).describe("camelcase identifier"),
+		id: z.string().max(48).refine(isValidTaskId, TASK_ID_DESCRIPTION).describe("filesystem-safe task identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
 		inheritContext: z

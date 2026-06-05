@@ -47,6 +47,7 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
+import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
@@ -125,10 +126,27 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.total += cost.total;
 }
 
+function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
+	const invalid: string[] = [];
+	for (let i = 0; i < tasks.length; i++) {
+		const error = getTaskIdValidationError(tasks[i]?.id);
+		if (error) invalid.push(`index ${i}: ${error}`);
+	}
+	return invalid.length > 0 ? `Invalid task ids: ${invalid.join(" ")}` : undefined;
+}
+
 // Re-export types and utilities
 export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
+export {
+	isValidAllocatedTaskId,
+	isValidTaskId,
+	TASK_ID_DESCRIPTION,
+	TASK_ID_PATTERN,
+	validateAllocatedTaskId,
+	validateTaskId,
+} from "./id";
 export { AgentOutputManager } from "./output-manager";
 export type { TaskResultReceipt } from "./receipt";
 export {
@@ -396,10 +414,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const taskItems = params.tasks ?? [];
+		const taskIdValidationError = validateTaskIdsForScheduling(taskItems);
+		if (taskIdValidationError) {
+			return createTaskModeError(taskIdValidationError);
+		}
 		if (taskItems.length === 0) {
 			return this.#executeSync(_toolCallId, params, signal, onUpdate);
 		}
-
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
 			const available =
@@ -603,7 +624,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				continue;
 			}
 
-			const uniqueId = uniqueIds[i];
+			const uniqueId = validateAllocatedTaskId(uniqueIds[i] ?? "");
 			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
@@ -1185,7 +1206,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
 				uniqueIds = await outputManager.allocateBatch(tasks.map(t => t.id));
 			}
-			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: uniqueIds[i] }));
+			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
 			const availableSkills = [...(this.session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills
@@ -1395,7 +1416,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					if (resultWithForkContext.exitCode === 0) {
 						try {
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
-							const patchPath = path.join(effectiveArtifactsDir, `${task.id}.patch`);
+							const artifactId = validateAllocatedTaskId(task.id);
+							const patchPath = path.join(effectiveArtifactsDir, `${artifactId}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
 							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
 							return {
