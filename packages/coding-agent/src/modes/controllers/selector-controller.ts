@@ -4,6 +4,7 @@ import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle } from "@gajae-code/tui";
 import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
+import { activateModelProfile } from "../../config/model-profile-activation";
 import { settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -30,6 +31,7 @@ import {
 import type { InteractiveModeContext } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
+import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
 import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
@@ -37,6 +39,7 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { ExtensionDashboard } from "../components/extensions";
@@ -117,7 +120,9 @@ export class SelectorController {
 			const selector = new ProviderOnboardingSelectorComponent(
 				(action: ProviderOnboardingAction) => {
 					done();
-					if (action === "oauth-login") {
+					if (action === "custom-provider-wizard") {
+						this.showCustomProviderWizard();
+					} else if (action === "oauth-login") {
 						void this.showOAuthSelector("login");
 					} else {
 						this.ctx.showStatus(formatProviderOnboardingCommandGuide());
@@ -129,6 +134,36 @@ export class SelectorController {
 				},
 			);
 			return { component: selector, focus: selector };
+		});
+	}
+
+	showCustomProviderWizard(): void {
+		this.showSelector(done => {
+			let wizard: CustomProviderWizardComponent;
+			const submit = async (input: CustomProviderWizardSubmit): Promise<void> => {
+				try {
+					const result = await addApiCompatibleProvider(input);
+					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.notifyConfigChanged?.();
+					this.ctx.showStatus(formatProviderSetupResult(result));
+					done();
+					this.ctx.ui.requestRender();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					wizard.setSubmitError(`Provider setup failed: ${message}`);
+				}
+			};
+			wizard = new CustomProviderWizardComponent(
+				input => {
+					void submit(input);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+				() => this.ctx.ui.requestRender(),
+			);
+			return { component: wizard, focus: wizard };
 		});
 	}
 
@@ -496,6 +531,27 @@ export class SelectorController {
 					try {
 						if (selection.kind === "preset") {
 							await this.#applyModelAssignmentPreset(selection);
+							done();
+							this.ctx.ui.requestRender();
+							return;
+						}
+						if (selection.kind === "profile") {
+							await activateModelProfile(
+								{
+									session: this.ctx.session,
+									modelRegistry: this.ctx.session.modelRegistry,
+									settings: this.ctx.settings,
+									profileName: selection.profileName,
+								},
+								{ persistDefault: selection.setDefault },
+							);
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+							this.ctx.showStatus(
+								selection.setDefault
+									? `Default model profile: ${selection.profileName}`
+									: `Model profile: ${selection.profileName}`,
+							);
 							done();
 							this.ctx.ui.requestRender();
 							return;

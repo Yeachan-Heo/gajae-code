@@ -147,6 +147,7 @@ export interface InteractiveModeContext {
 	showStatus(message: string, options?: { dim?: boolean }): void;
 	showError(message: string): void;
 	showWarning(message: string): void;
+	notifyConfigChanged?: () => Promise<void> | void;
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
