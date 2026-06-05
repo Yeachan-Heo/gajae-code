@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import type { Subprocess } from "bun";
 
 function createContainer() {
 	return {
@@ -13,6 +14,13 @@ function createContainer() {
 			this.children = [];
 		},
 	};
+}
+
+function createFakeProcess(exitCode = 0): Subprocess {
+	return {
+		pid: 12345,
+		exited: Promise.resolve(exitCode),
+	} as Subprocess;
 }
 
 describe("/handoff command", () => {
@@ -94,7 +102,7 @@ describe("/handoff command", () => {
 			},
 			statusContainer,
 			chatContainer,
-			ui: { requestRender },
+			ui: { requestRender, start: vi.fn(), stop: vi.fn() },
 			editor: { setText: vi.fn() },
 			rebuildChatFromMessages: vi.fn(),
 			statusLine: { invalidate: vi.fn() },
@@ -105,14 +113,69 @@ describe("/handoff command", () => {
 
 		await controller.handleContributionPrepCommand("focus on repro");
 
-		expect(ctx.session.prepareContributionPrep).toHaveBeenCalledWith({
-			customInstructions: "focus on repro",
-			spawnWorker: true,
-		});
+		expect(ctx.session.prepareContributionPrep).toHaveBeenCalledWith(
+			expect.objectContaining({
+				customInstructions: "focus on repro",
+				spawnWorker: true,
+				spawn: expect.any(Function),
+			}),
+		);
 		expect(ctx.rebuildChatFromMessages).not.toHaveBeenCalled();
 		expect(ctx.statusLine.invalidate).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringContaining("Manifest: /tmp/prep/manifest.json"));
 		expect(chatContainer.children).toHaveLength(1);
 		expect(requestRender).toHaveBeenCalled();
+	});
+
+	it("suspends the TUI while the spawned contribute-pr worker owns the terminal", async () => {
+		const spawnCalls: Array<unknown> = [];
+		vi.spyOn(Bun, "spawn").mockImplementation((first: unknown) => {
+			spawnCalls.push(first);
+			return createFakeProcess();
+		});
+
+		const chatContainer = createContainer();
+		const requestRender = vi.fn();
+		const start = vi.fn();
+		const stop = vi.fn();
+		const ctx = {
+			sessionManager: { getEntries: () => [{ type: "message" }, { type: "message" }] },
+			session: {
+				prepareContributionPrep: vi.fn(
+					async (options: {
+						spawn?: (args: string[], cwd: string, shell: boolean) => Promise<void>;
+						customInstructions?: string;
+						spawnWorker?: boolean;
+					}) => {
+						await options.spawn?.(["gjc", "--no-skills", "--", "@/tmp/prep/worker-prompt.md"], "/repo", false);
+						return {
+							manifestPath: "/tmp/prep/manifest.json",
+							workerPromptPath: "/tmp/prep/worker-prompt.md",
+							artifactDir: "/tmp/prep",
+							changedFiles: [],
+							spawned: true,
+						};
+					},
+				),
+			},
+			statusContainer: createContainer(),
+			chatContainer,
+			ui: { requestRender, start, stop },
+			editor: { setText: vi.fn() },
+			rebuildChatFromMessages: vi.fn(),
+			statusLine: { invalidate: vi.fn() },
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(ctx);
+
+		await controller.handleContributionPrepCommand();
+
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(requestRender).toHaveBeenCalledWith(true);
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]).toEqual(["gjc", "--no-skills", "--", "@/tmp/prep/worker-prompt.md"]);
+		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 });

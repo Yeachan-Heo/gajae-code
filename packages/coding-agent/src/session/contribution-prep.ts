@@ -179,6 +179,23 @@ async function writeArtifact(
 	return { path: filePath, description };
 }
 
+export async function spawnContributionPrepWorker(args: string[], cwd: string, shell: boolean): Promise<void> {
+	const child = shell
+		? Bun.spawn({
+				cmd: args,
+				cwd,
+				stdout: "inherit",
+				stderr: "inherit",
+				stdin: "inherit",
+				windowsVerbatimArguments: true,
+			})
+		: Bun.spawn(args, { cwd, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
+	const exitCode = await child.exited;
+	if (exitCode !== 0) {
+		throw new Error(`contribute-pr worker exited with code ${exitCode}`);
+	}
+}
+
 export function buildContributionPrepWorkerPrompt(manifestPath: string): string {
 	return [
 		"Prepare a maintainer-friendly contribution draft from the redacted context dump.",
@@ -291,22 +308,7 @@ export async function prepareContributionPrep(
 
 	let spawned = false;
 	if (options.spawnWorker) {
-		const spawn =
-			options.spawn ??
-			(async (args, cwd, shell) => {
-				if (shell) {
-					Bun.spawn({
-						cmd: args,
-						cwd,
-						stdout: "inherit",
-						stderr: "inherit",
-						stdin: "inherit",
-						windowsVerbatimArguments: true,
-					});
-					return;
-				}
-				Bun.spawn(args, { cwd, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
-			});
+		const spawn = options.spawn ?? spawnContributionPrepWorker;
 		const command = resolveGjcCommand();
 		await spawn(
 			[command.cmd, ...command.args, "--no-skills", "--", `@${workerPromptPath}`],

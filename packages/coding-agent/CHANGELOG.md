@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Suspended and restored the parent TUI around `/contribute-pr` worker launches and awaited the child exit so the fresh worker no longer races the original input box or leaves terminal state corrupted.
+
 ## [0.3.2] - 2026-06-05
 
 ### Added

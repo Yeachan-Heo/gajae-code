@@ -38,6 +38,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import { spawnContributionPrepWorker } from "../../session/contribution-prep";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -1252,7 +1253,19 @@ export class CommandController {
 	async handleContributionPrepCommand(customInstructions?: string): Promise<void> {
 		this.ctx.editor.setText("");
 		try {
-			const result = await this.ctx.session.prepareContributionPrep({ customInstructions, spawnWorker: true });
+			const result = await this.ctx.session.prepareContributionPrep({
+				customInstructions,
+				spawnWorker: true,
+				spawn: async (args, cwd, shell) => {
+					this.ctx.ui.stop();
+					try {
+						await spawnContributionPrepWorker(args, cwd, shell);
+					} finally {
+						this.ctx.ui.start();
+						this.ctx.ui.requestRender(true);
+					}
+				},
+			});
 			this.ctx.showStatus(
 				[
 					"Contribution prep artifacts written.",
