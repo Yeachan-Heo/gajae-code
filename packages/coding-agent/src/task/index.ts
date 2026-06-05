@@ -358,7 +358,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		discoveredAgents: AgentDefinition[],
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
-		this.#spawningAgentType = $env.PI_BLOCKED_AGENT;
+		this.#spawningAgentType = session.currentAgentType;
 		this.#discoveredAgents = discoveredAgents;
 	}
 

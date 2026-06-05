@@ -150,6 +150,8 @@ export interface ToolSession {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** Current role-agent type/name for nested task sessions. */
+	currentAgentType?: string;
 	/** Get session file */
 	getSessionFile: () => string | null;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */

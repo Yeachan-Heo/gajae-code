@@ -16,6 +16,12 @@ const TEST_AGENTS = [
 		source: "bundled" as const,
 	},
 	{
+		name: "explore",
+		description: "Explore task agent",
+		systemPrompt: "You are an explorer.",
+		source: "bundled" as const,
+	},
+	{
 		name: "reviewer",
 		description: "Reviewer task agent",
 		systemPrompt: "You are a reviewer.",
@@ -36,13 +42,17 @@ type CapturedRegister = {
 	options?: AsyncJobRegisterOptions;
 };
 
-function createSession(overrides: Partial<Record<string, unknown>> = {}): ToolSession {
+function createSession(
+	settingsOverrides: Partial<Record<string, unknown>> = {},
+	sessionOverrides: Partial<ToolSession> = {},
+): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated(overrides),
+		settings: Settings.isolated(settingsOverrides),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		...sessionOverrides,
 	} as unknown as ToolSession;
 }
 
@@ -141,6 +151,82 @@ describe("task.simple", () => {
 		expect(captured).toHaveLength(0);
 		expect(result.details?.results).toEqual([]);
 		expect(getFirstText(result)).toContain("Task spawn gate rejected this batch");
+	});
+
+	it("rejects reviewer spawning explore before scheduling without spawnPlan", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const captured: CapturedRegister[] = [];
+		const manager = {
+			register: (
+				type: "bash" | "task",
+				label: string,
+				_run: (ctx: {
+					jobId: string;
+					signal: AbortSignal;
+					reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+				}) => Promise<string>,
+				options?: AsyncJobRegisterOptions,
+			): string => {
+				captured.push({ type, label, options });
+				return options?.id ?? label;
+			},
+		};
+		AsyncJobManager.setInstance(manager as unknown as AsyncJobManager);
+
+		const tool = await TaskTool.create(createSession({}, { currentAgentType: "reviewer" }));
+		const result = await tool.execute("tool-reviewer-explore-gated", {
+			agent: "explore",
+			tasks: [{ id: "Explore", description: "label", assignment: "Explore safely." }],
+		} as TaskParams);
+
+		expect(captured).toHaveLength(0);
+		expect(result.details?.results).toEqual([]);
+		expect(getFirstText(result)).toContain("Task spawn gate rejected reviewer->explore");
+	});
+
+	it("does not use PI_BLOCKED_AGENT as the reviewer explore gate source", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const previous = process.env.PI_BLOCKED_AGENT;
+		process.env.PI_BLOCKED_AGENT = "reviewer";
+		const captured: CapturedRegister[] = [];
+		const manager = {
+			register: (
+				type: "bash" | "task",
+				label: string,
+				_run: (ctx: {
+					jobId: string;
+					signal: AbortSignal;
+					reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+				}) => Promise<string>,
+				options?: AsyncJobRegisterOptions,
+			): string => {
+				captured.push({ type, label, options });
+				return options?.id ?? label;
+			},
+		};
+		AsyncJobManager.setInstance(manager as unknown as AsyncJobManager);
+		try {
+			const tool = await TaskTool.create(createSession({}, { currentAgentType: "executor" }));
+			const result = await tool.execute("tool-executor-explore-allowed", {
+				agent: "explore",
+				tasks: [{ id: "Explore", description: "label", assignment: "Explore safely." }],
+			} as TaskParams);
+
+			expect(captured).toHaveLength(1);
+			expect(getFirstText(result)).toContain("Started 1 background task job");
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PI_BLOCKED_AGENT;
+			} else {
+				process.env.PI_BLOCKED_AGENT = previous;
+			}
+		}
 	});
 
 	it("allows a five-task batch with complete spawnPlan to schedule", async () => {

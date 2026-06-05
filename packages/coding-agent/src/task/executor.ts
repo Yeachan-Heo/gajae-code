@@ -1191,6 +1191,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					hasUI: false,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
+					currentAgentType: agent.name,
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
 					agentId: id,

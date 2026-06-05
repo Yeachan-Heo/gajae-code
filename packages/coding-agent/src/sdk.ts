@@ -319,6 +319,8 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/** Current role-agent type/name for nested task sessions. */
+	currentAgentType?: string;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Pre-allocated agent identity for IRC routing. Default: "0-Main" for top-level, parentTaskPrefix-derived for sub. */
@@ -1189,6 +1191,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
+			currentAgentType: options.currentAgentType,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
