@@ -60,6 +60,15 @@ describe("built-in model profile catalog", () => {
 		}
 	});
 
+	test("models.json package export is a plain relative path", async () => {
+		const manifest = (await Bun.file(new URL("../../ai/package.json", import.meta.url)).json()) as {
+			exports?: Record<string, { import?: string }>;
+		};
+		const exportTarget = manifest.exports?.["./models.json"]?.import;
+		expect(exportTarget).toBe("./src/models.json");
+		expect(exportTarget).not.toMatch(/^file:(?:file:)+/u);
+	});
+
 	test("every selector parses with schema validation and exists in models.json", () => {
 		const missing: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
