@@ -1436,6 +1436,8 @@ describe("ultragoal @goal decomposition", () => {
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("complete");
 		expect(modeState.status).toBe("complete");
+		expect(modeState.counts).toMatchObject({ complete: 1, pending: 0, active: 0 });
+		expect(modeState.active_goal_id).toBeUndefined();
 		expect(modeState.receipt).toMatchObject({ skill: "ultragoal", owner: "gjc-runtime" });
 
 		const activeState = await readJsonFile(path.join(root, ".gjc", "state", "skill-active-state.json"));
