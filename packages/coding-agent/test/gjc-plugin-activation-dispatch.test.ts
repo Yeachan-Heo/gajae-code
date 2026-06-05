@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	GjcPluginLoadError,
 	readActiveSubskillsForParent,
 	resolveSubskillActivationForSkillInvocation,
 	toActiveSubskillEntry,
@@ -19,6 +20,18 @@ async function tempProjectWithFixture(fixtureName: string): Promise<string> {
 	await fs.cp(path.join(fixturesRoot, fixtureName), path.join(cwd, ".gjc", "gjc-plugins", fixtureName), {
 		recursive: true,
 	});
+	return cwd;
+}
+
+async function tempProjectWithFixtures(fixtureNames: string[]): Promise<string> {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-activation-"));
+	tempRoots.push(cwd);
+	await fs.mkdir(path.join(cwd, ".gjc", "gjc-plugins"), { recursive: true });
+	for (const fixtureName of fixtureNames) {
+		await fs.cp(path.join(fixturesRoot, fixtureName), path.join(cwd, ".gjc", "gjc-plugins", fixtureName), {
+			recursive: true,
+		});
+	}
 	return cwd;
 }
 
@@ -52,6 +65,17 @@ describe("GJC sub-skill activation dispatch", () => {
 		expect(result.activeSubskillsToPersist[0]!.toolPaths.length).toBeGreaterThan(0);
 	});
 
+	test("rejects duplicate activation args across plugin roots instead of choosing a winner", async () => {
+		const cwd = await tempProjectWithFixtures(["valid-skill-plugin", "duplicate-arg"]);
+
+		await expect(
+			resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" }),
+		).rejects.toMatchObject({
+			constructor: GjcPluginLoadError,
+			code: "duplicate_arg",
+		});
+	});
+
 	test("persists resolved active sub-skill through real active state writer helper", async () => {
 		const cwd = await tempProjectWithFixture("valid-skill-plugin");
 		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
@@ -72,5 +96,31 @@ describe("GJC sub-skill activation dispatch", () => {
 			subskillName: "design",
 			activationArg: "design",
 		});
+
+		await syncSkillActiveState({
+			cwd,
+			skill: "ralplan",
+			active: true,
+			phase: "planner",
+		});
+
+		const preserved = await readActiveSubskillsForParent({ cwd, parent: "ralplan", phase: "planner" });
+		expect(preserved).toHaveLength(1);
+		expect(preserved[0]).toMatchObject({
+			plugin: "valid-skill-plugin",
+			subskillName: "design",
+			activationArg: "design",
+		});
+
+		await syncSkillActiveState({
+			cwd,
+			skill: "ralplan",
+			active: true,
+			phase: "planner",
+			active_subskills: [],
+		});
+
+		const cleared = await readActiveSubskillsForParent({ cwd, parent: "ralplan", phase: "planner" });
+		expect(cleared).toHaveLength(0);
 	});
 });

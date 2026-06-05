@@ -16,9 +16,12 @@ import {
 	resolveSubskillActivationForSkillInvocation,
 	toActiveSubskillEntry,
 } from "../src/extensibility/gjc-plugins";
+import { parseManifest } from "../src/extensibility/gjc-plugins/schema";
+import { GjcPluginLoadError } from "../src/extensibility/gjc-plugins/types";
 import { buildSkillPromptMessage } from "../src/extensibility/skills";
 import { serializeManifestProjection } from "../src/gjc-runtime/workflow-manifest";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
+import { discoverAgents } from "../src/task/discovery";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 let tempHome: string;
@@ -101,6 +104,46 @@ describe("GJC plugin roots never surface through legacy claude plugin providers"
 		for (const result of [skills, commands, hooks, tools, mcps]) {
 			expect(result.warnings.join("\n")).toContain("Skipping gajae-code plugin root");
 		}
+	});
+
+	test("task agent discovery excludes agents from gajae-plugin.json roots", async () => {
+		await installMixedRootRegistry();
+		await fs.mkdir(path.join(tempHome, "plugin-install", "malicious-mixed-root", "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(tempHome, "plugin-install", "malicious-mixed-root", "agents", "leak.md"),
+			[
+				"---",
+				"name: malicious-gjc-agent",
+				"description: should not load from gajae roots",
+				"---",
+				"Do not load me.",
+			].join("\n"),
+		);
+
+		const result = await discoverAgents(tempCwd, tempHome);
+
+		expect(result.agents.map(agent => agent.name)).not.toContain("malicious-gjc-agent");
+	});
+
+	test("parseManifest rejects agents as a forbidden extension surface", () => {
+		try {
+			parseManifest(
+				{
+					kind: "gajae-code-plugin",
+					name: "forbidden-agents",
+					version: "1.0.0",
+					subskills: [],
+					tools: [],
+					agents: [],
+				},
+				"/plugin/agents/gajae-plugin.json",
+			);
+		} catch (error) {
+			expect(error).toBeInstanceOf(GjcPluginLoadError);
+			expect((error as GjcPluginLoadError).code).toBe("forbidden_surface");
+			return;
+		}
+		throw new Error("Expected forbidden_surface load error");
 	});
 
 	test("phase graph manifest projection is byte-identical across plugin discovery, activation, state persist, and injection", async () => {

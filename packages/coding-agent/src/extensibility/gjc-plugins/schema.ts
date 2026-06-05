@@ -1,6 +1,6 @@
 import { GJC_PLUGIN_KIND, GjcPluginLoadError, type GjcPluginManifest, type SubskillFrontmatter } from "./types";
 
-const FORBIDDEN_MANIFEST_KEYS = ["skills", "slash-commands", "commands", "hooks", "mcp", "mcpServers"];
+const FORBIDDEN_MANIFEST_KEYS = ["skills", "slash-commands", "commands", "hooks", "mcp", "mcpServers", "agents"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

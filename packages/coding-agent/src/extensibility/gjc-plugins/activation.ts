@@ -21,20 +21,11 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 	try {
 		plugins = await loadGjcPlugins(roots);
 	} catch (error) {
-		if (!(error instanceof GjcPluginLoadError)) throw error;
-		console.warn(`Skipping invalid GJC plugin activation set: ${error.message}`);
+		if (error instanceof GjcPluginLoadError) throw error;
+		console.warn(
+			`Skipping GJC plugin activation set after load error: ${error instanceof Error ? error.message : String(error)}`,
+		);
 		plugins = [];
-		for (const root of roots) {
-			try {
-				plugins.push(...(await loadGjcPlugins([root])));
-			} catch (pluginError) {
-				if (pluginError instanceof GjcPluginLoadError) {
-					console.warn(`Skipping GJC plugin at ${root}: ${pluginError.message}`);
-					continue;
-				}
-				throw pluginError;
-			}
-		}
 	}
 
 	const activationsByArg = new Map<string, LoadedSubskillActivation>();

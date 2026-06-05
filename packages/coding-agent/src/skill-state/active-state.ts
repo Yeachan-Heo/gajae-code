@@ -594,7 +594,25 @@ async function rebuildActiveState(cwd: string, sessionScope?: ActiveSessionScope
 	await rebuildActiveSnapshot(cwd, sessionScope, { cwd, audit: activeStateWriterAudit("rebuild-active-snapshot") });
 }
 
+async function activeSubskillsForExistingEntry(
+	cwd: string,
+	sessionId: string | undefined,
+	skill: string,
+): Promise<ActiveSubskillEntry[] | undefined> {
+	const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+	const [rootState, sessionState] = await Promise.all([
+		readRawActiveStateForHandoff(rootPath, false),
+		sessionPath ? readRawActiveStateForHandoff(sessionPath, false) : Promise.resolve(null),
+	]);
+	const existing = mergeVisibleEntries(sessionState, rootState, sessionId).find(entry => entry.skill === skill);
+	return existing?.active_subskills;
+}
+
 export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
+	const preservedActiveSubskills =
+		options.active_subskills === undefined
+			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
+			: undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
 	const entry: SkillActiveEntry = {
@@ -611,7 +629,11 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
-		...(options.active_subskills ? { active_subskills: options.active_subskills } : {}),
+		...(options.active_subskills !== undefined
+			? { active_subskills: options.active_subskills }
+			: preservedActiveSubskills
+				? { active_subskills: preservedActiveSubskills }
+				: {}),
 	};
 	await persistActiveEntry(options.cwd, undefined, entry);
 	await rebuildActiveState(options.cwd);
