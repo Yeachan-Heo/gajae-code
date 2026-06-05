@@ -6,6 +6,9 @@
 
 - Added model profiles with a `--mpreset <profile>` CLI flag and a `/model` selector "Profiles" section that activate a named profile's default model plus per-agent-role model overrides in one step, validating required-provider credentials before applying and surfacing a custom provider onboarding wizard for missing API-compatible providers.
 - Integrated `ai-slop-cleaner` as an internal Ultragoal sub-skill fragment that runs as the mandatory completion-gate cleanup sweep over a story's changed files, reporting blocking and advisory findings without editing code or mutating `.gjc/` state.
+### Changed
+
+- Edit tool diff generation (`generateDiffString`) now uses the native `diffLines` from `@gajae-code/natives` (a byte-identical Rust port of jsdiff) instead of the pure-JS implementation, removing the multi-second Myers blowup on large-file edits (~16x faster on ~1MB files) with identical diff output.
 
 ### Fixed
 

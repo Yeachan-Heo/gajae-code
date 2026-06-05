@@ -4,6 +4,8 @@
  * Provides diff string generation and the replace-mode edit logic
  * used when not in patch mode.
  */
+
+import { diffLines as nativeDiffLines } from "@gajae-code/natives";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
@@ -59,7 +61,9 @@ function formatNumberedDiffLine(prefix: "+" | "-" | " ", lineNum: number, conten
  * Returns both the diff string and the first changed line number (in the new file).
  */
 export function generateDiffString(oldContent: string, newContent: string, contextLines = 4): DiffResult {
-	const parts = Diff.diffLines(oldContent, newContent);
+	// Native line diff (Rust port of jsdiff `Diff.diffLines`, byte-identical
+	// output) — avoids the pure-JS Myers blowup (>1s on ~1MB files).
+	const parts = nativeDiffLines(oldContent, newContent);
 	const output: string[] = [];
 
 	let oldLineNum = 1;

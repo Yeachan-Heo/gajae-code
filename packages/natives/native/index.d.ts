@@ -391,6 +391,12 @@ export declare function countTokens(input: string | Array<string>, encoding?: En
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
 
+/**
+ * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old, new)`
+ * with default options. Returns ordered `{added, removed, value}` parts.
+ */
+export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
+
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
   /** Use a single Unicode ellipsis character ("…"). */
@@ -886,6 +892,16 @@ export declare enum KeyEventType {
   Repeat = 2,
   /** Key release event. */
   Release = 3
+}
+
+/**
+ * One diff component, mirroring jsdiff's change object (sans `count`, which
+ * the TS `generateDiffString` formatter does not consume).
+ */
+export interface LineDiffPart {
+  added: boolean
+  removed: boolean
+  value: string
 }
 
 /**

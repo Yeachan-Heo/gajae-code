@@ -33,6 +33,7 @@ pub mod grep;
 pub mod highlight;
 pub mod html;
 pub mod keys;
+pub mod linediff;
 pub mod sixel;
 pub use pi_ast::language;
 
