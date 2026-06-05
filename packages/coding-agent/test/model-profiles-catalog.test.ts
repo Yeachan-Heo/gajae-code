@@ -110,6 +110,17 @@ describe("built-in model profile catalog", () => {
 		}
 	});
 
+	test("codex-pro default is GPT-5.5 xhigh", () => {
+		const profile = builtIn("codex-pro");
+		const parsed = parseModelString(profile.modelMapping.default ?? "");
+
+		expect(parsed?.provider).toBe("openai-codex");
+		expect(parsed?.id).toBe("gpt-5.5");
+		expect(parsed?.thinkingLevel).toBeUndefined();
+		const providerModels = modelsJson["openai-codex"] as Record<string, { thinking?: { defaultLevel?: string } }>;
+		expect(providerModels["gpt-5.5"]?.thinking?.defaultLevel).toBe(ThinkingLevel.XHigh);
+	});
+
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {
 		const merged = mergeModelProfiles({
 			"codex-standard": {
