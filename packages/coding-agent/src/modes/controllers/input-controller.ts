@@ -165,6 +165,12 @@ export class InputController {
 		);
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
+		this.ctx.editor.onPastePendingInputCleared = (reason, droppedInputCount) => {
+			const reasonText = reason === "timeout" ? "timed out" : "exceeded the input queue limit";
+			this.ctx.showWarning(
+				`Paste handling ${reasonText}; discarded ${droppedInputCount} buffered input event${droppedInputCount === 1 ? "" : "s"}.`,
+			);
+		};
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));

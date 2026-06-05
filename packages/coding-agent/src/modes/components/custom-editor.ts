@@ -41,6 +41,11 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
 };
 
+const PASTE_DECISION_TIMEOUT_MS = 5_000;
+const PENDING_PASTE_INPUT_MAX = 64;
+
+type PastePendingClearReason = "timeout" | "queue-limit";
+
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
@@ -66,6 +71,8 @@ export class CustomEditor extends Editor {
 	onPasteImage?: () => Promise<boolean>;
 	/** Called before bracketed paste content is inserted. Return true to consume it. */
 	onPasteText?: (text: string) => boolean | Promise<boolean>;
+	/** Called when async paste handling drops queued input instead of replaying it. */
+	onPastePendingInputCleared?: (reason: PastePendingClearReason, droppedInputCount: number) => void;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
 	/** Called when Caps Lock is pressed. */
@@ -78,6 +85,8 @@ export class CustomEditor extends Editor {
 	);
 	#pasteHandler = new BracketedPasteHandler();
 	#pasteDecisionPending = false;
+	#pasteDecisionToken = 0;
+	#pasteDecisionTimeout: NodeJS.Timeout | undefined;
 	#pendingPasteInput: string[] = [];
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
@@ -114,6 +123,37 @@ export class CustomEditor extends Editor {
 		this.#customKeyHandlers.clear();
 	}
 
+	#clearPasteDecisionTimeout(): void {
+		if (this.#pasteDecisionTimeout) {
+			clearTimeout(this.#pasteDecisionTimeout);
+			this.#pasteDecisionTimeout = undefined;
+		}
+	}
+
+	#clearPendingPasteState(): number {
+		this.#clearPasteDecisionTimeout();
+		this.#pasteDecisionPending = false;
+		this.#pasteDecisionToken += 1;
+		const droppedInputCount = this.#pendingPasteInput.length;
+		this.#pendingPasteInput = [];
+		return droppedInputCount;
+	}
+
+	#startPasteDecisionTimeout(token: number): void {
+		this.#clearPasteDecisionTimeout();
+		this.#pasteDecisionTimeout = setTimeout(() => {
+			if (token !== this.#pasteDecisionToken) return;
+			const droppedInputCount = this.#clearPendingPasteState();
+			this.onPastePendingInputCleared?.("timeout", droppedInputCount);
+		}, PASTE_DECISION_TIMEOUT_MS);
+		this.#pasteDecisionTimeout.unref?.();
+	}
+
+	dispose(): void {
+		this.#clearPendingPasteState();
+		this.#pasteHandler = new BracketedPasteHandler();
+	}
+
 	#drainPendingPasteInput(initialInput?: string): void {
 		if (initialInput && initialInput.length > 0) {
 			this.handleInput(initialInput);
@@ -126,7 +166,9 @@ export class CustomEditor extends Editor {
 	}
 
 	#handleBracketedPaste(pasteContent: string, remaining: string): void {
-		const applyPasteResult = (handled: boolean | undefined) => {
+		const applyPasteResult = (token: number, handled: boolean | undefined) => {
+			if (token !== this.#pasteDecisionToken) return;
+			this.#clearPasteDecisionTimeout();
 			if (!handled) {
 				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
 			}
@@ -136,16 +178,26 @@ export class CustomEditor extends Editor {
 		const pasteResult = this.onPasteText?.(pasteContent);
 
 		if (pasteResult instanceof Promise) {
+			const token = this.#pasteDecisionToken + 1;
+			this.#pasteDecisionToken = token;
 			this.#pasteDecisionPending = true;
-			void pasteResult.then(applyPasteResult, () => applyPasteResult(false));
+			this.#startPasteDecisionTimeout(token);
+			void pasteResult.then(
+				handled => applyPasteResult(token, handled),
+				() => applyPasteResult(token, false),
+			);
 		} else {
-			applyPasteResult(pasteResult);
+			applyPasteResult(this.#pasteDecisionToken, pasteResult);
 		}
 	}
 
 	handleInput(data: string): void {
 		if (this.#pasteDecisionPending) {
 			this.#pendingPasteInput.push(data);
+			if (this.#pendingPasteInput.length > PENDING_PASTE_INPUT_MAX) {
+				const droppedInputCount = this.#clearPendingPasteState();
+				this.onPastePendingInputCleared?.("queue-limit", droppedInputCount);
+			}
 			return;
 		}
 

@@ -1860,6 +1860,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#eventController.dispose();
 		this.statusLine.dispose();
 		this.#jobsObserver?.dispose();
+		this.editor.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
@@ -1961,6 +1962,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			nextEditor.setHistoryStorage(this.historyStorage);
 		}
 		nextEditor.setText(previousText);
+		previousEditor.dispose();
 
 		this.editorContainer.clear();
 		this.editor = nextEditor;
