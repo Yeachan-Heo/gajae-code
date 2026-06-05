@@ -1,8 +1,8 @@
 /**
  * Protocol handler for artifact:// URLs.
  *
- * Resolves artifact IDs against the artifacts directories of every active
- * session. Unlike agent://, artifacts are raw text with no JSON extraction.
+ * Resolves artifact IDs only against artifacts directories explicitly authorized
+ * by the caller's ResolveContext. Unlike agent://, artifacts are raw text.
  *
  * URL form:
  * - artifact://<id> - Full artifact content
@@ -12,7 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
-import { artifactsDirsFromRegistry } from "./registry-helpers";
+import { authorizedArtifactsDirsFromContext } from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class ArtifactProtocolHandler implements ProtocolHandler {
@@ -28,16 +28,14 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error(`artifact:// ID must be numeric, got: ${id}`);
 		}
 
-		const contextDir = context?.getArtifactsDir?.();
-		const dirs = contextDir ? [contextDir] : artifactsDirsFromRegistry(context);
+		const dirs = authorizedArtifactsDirsFromContext(context);
 
 		if (dirs.length === 0) {
 			throw new Error("No session - artifacts unavailable");
 		}
 
-		const candidatePaths: string[] = [];
+		let foundPath: string | undefined;
 		let anyDirExists = false;
-		const availableIds = new Set<string>();
 
 		for (const dir of dirs) {
 			let files: string[];
@@ -50,9 +48,10 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			}
 			for (const f of files) {
 				if (f.endsWith(".meta.json")) continue;
-				const m = f.match(/^(\d+)\./);
-				if (m) availableIds.add(m[1]);
-				if (f.startsWith(`${id}.`)) candidatePaths.push(path.join(dir, f));
+				if (f.startsWith(`${id}.`)) {
+					if (foundPath) throw new Error(`artifact://${id} ambiguous id in authorized artifacts`);
+					foundPath = path.join(dir, f);
+				}
 			}
 		}
 
@@ -60,16 +59,10 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (candidatePaths.length === 0) {
-			const sorted = [...availableIds].sort((a, b) => Number(a) - Number(b));
-			const availableStr = sorted.length > 0 ? sorted.join(", ") : "none";
-			throw new Error(`Artifact ${id} not found. Available: ${availableStr}`);
-		}
-		if (candidatePaths.length > 1) {
-			throw new Error(`artifact://${id} ambiguous id: ${candidatePaths.length} matching artifacts`);
+		if (!foundPath) {
+			throw new Error(`artifact://${id} not found`);
 		}
 
-		const foundPath = candidatePaths[0]!;
 		const content = await Bun.file(foundPath).text();
 		return {
 			url: url.href,

@@ -1,28 +1,28 @@
 /**
- * Shared helpers for internal-url protocol handlers that resolve IDs against
- * registered agent sessions.
+ * Shared helpers for internal-url protocol handlers that resolve session-scoped
+ * artifact IDs.
  */
-import { AgentRegistry } from "../registry/agent-registry";
+import * as path from "node:path";
 import type { ResolveContext } from "./types";
 
+function addDir(dirs: string[], dir: string | null | undefined): void {
+	if (!dir) return;
+	const normalized = path.resolve(dir);
+	if (!dirs.includes(normalized)) dirs.push(normalized);
+}
+
 /**
- * Snapshot of artifacts dirs for every registered session, deduped.
+ * Snapshot of artifacts dirs explicitly authorized for the calling session.
  *
- * Prefers `sessionManager.getArtifactsDir()` because subagents adopt their
- * parent's `ArtifactManager` and report the parent's dir there; dedup then
- * collapses parent + N subagents (the whole agent tree) to one entry. Falls
- * back to the raw session file (with the `.jsonl` suffix stripped) when no
- * live session reference is attached.
+ * Normal reads are scoped to the caller's artifacts directory. Parent/child
+ * agent tree sharing is allowed only when the caller supplies explicit
+ * authorized directories at the ResolveContext boundary. This intentionally
+ * does not enumerate AgentRegistry.global(); live but unrelated sessions are
+ * not an authorization source.
  */
-export function artifactsDirsFromRegistry(context?: ResolveContext): string[] {
+export function authorizedArtifactsDirsFromContext(context?: ResolveContext): string[] {
 	const dirs: string[] = [];
-	const contextDir = context?.getArtifactsDir?.();
-	if (contextDir) dirs.push(contextDir);
-	for (const ref of AgentRegistry.global().list()) {
-		const dir =
-			ref.session?.sessionManager.getArtifactsDir() ?? (ref.sessionFile ? ref.sessionFile.slice(0, -6) : null);
-		if (!dir) continue;
-		if (!dirs.includes(dir)) dirs.push(dir);
-	}
+	addDir(dirs, context?.getArtifactsDir?.());
+	for (const dir of context?.getAuthorizedArtifactsDirs?.() ?? []) addDir(dirs, dir);
 	return dirs;
 }

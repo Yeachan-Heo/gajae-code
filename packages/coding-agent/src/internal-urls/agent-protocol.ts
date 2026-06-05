@@ -1,10 +1,9 @@
 /**
  * Protocol handler for agent:// URLs.
  *
- * Resolves agent output IDs against the artifacts directories of every active
- * session. Parents and subagents share outputs via this registry: a subagent
- * can read its parent's output IDs because both sessions are registered in
- * the shared context.
+ * Resolves agent output IDs only against artifacts directories explicitly
+ * authorized by the caller's ResolveContext. Parents and subagents can share
+ * outputs by passing their tree's artifacts dir at that API boundary.
  *
  * URL forms:
  * - agent://<id> - Full output content
@@ -16,8 +15,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { applyQuery, pathToQuery } from "./json-query";
-import { artifactsDirsFromRegistry } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import { authorizedArtifactsDirsFromContext } from "./registry-helpers";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 interface AgentOutputMetadata {
 	id: string;
@@ -47,7 +46,7 @@ async function verifyAgentOutputMetadata(outputId: string, foundPath: string, by
 	try {
 		metaRaw = await Bun.file(metaPath).text();
 	} catch (err) {
-		if (isEnoent(err)) return;
+		if (isEnoent(err)) throw new Error(`agent://${outputId} missing metadata`);
 		throw err;
 	}
 	let parsed: unknown;
@@ -78,7 +77,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	readonly scheme = "agent";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const outputId = url.rawHost || url.hostname;
 		if (!outputId) {
 			throw new Error("agent:// URL requires an output ID: agent://<id>");
@@ -99,15 +98,14 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("agent:// URL cannot combine path extraction with ?q=");
 		}
 
-		const dirs = artifactsDirsFromRegistry();
+		const dirs = authorizedArtifactsDirsFromContext(context);
 
 		if (dirs.length === 0) {
 			throw new Error("No session - agent outputs unavailable");
 		}
 
-		const candidatePaths: string[] = [];
+		let foundPath: string | undefined;
 		let anyDirExists = false;
-		const availableIds = new Set<string>();
 
 		for (const dir of dirs) {
 			try {
@@ -120,17 +118,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			const candidate = path.join(dir, `${outputId}.md`);
 			try {
 				await fs.stat(candidate);
-				candidatePaths.push(candidate);
+				if (foundPath) throw new Error(`agent://${outputId} ambiguous id in authorized artifacts`);
+				foundPath = candidate;
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
-			}
-			try {
-				const files = await fs.readdir(dir);
-				for (const f of files) {
-					if (f.endsWith(".md")) availableIds.add(f.replace(/\.md$/, ""));
-				}
-			} catch {
-				// Listing failures are non-fatal; continue searching.
 			}
 		}
 
@@ -138,15 +129,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (candidatePaths.length === 0) {
-			const availableStr = availableIds.size > 0 ? [...availableIds].join(", ") : "none";
-			throw new Error(`Not found: ${outputId}\nAvailable: ${availableStr}`);
-		}
-		if (candidatePaths.length > 1) {
-			throw new Error(`agent://${outputId} ambiguous id: ${candidatePaths.length} matching outputs`);
+		if (!foundPath) {
+			throw new Error(`agent://${outputId} not found`);
 		}
 
-		const foundPath = candidatePaths[0]!;
 		const rawBytes = Buffer.from(await Bun.file(foundPath).arrayBuffer());
 		await verifyAgentOutputMetadata(outputId, foundPath, rawBytes);
 		const rawContent = rawBytes.toString("utf8");

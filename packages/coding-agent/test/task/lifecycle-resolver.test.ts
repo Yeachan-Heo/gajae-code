@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -8,16 +8,12 @@ import { ArtifactProtocolHandler } from "../../src/internal-urls/artifact-protoc
 import { buildTaskReceipt, findRawTaskLeakKeys } from "../../src/task/receipt";
 import type { SingleResult, TaskToolDetails } from "../../src/task/types";
 
-const registeredDirs: string[] = [];
+const authorizedDirs: string[] = [];
 const LEAK_SENTINEL = "LEAK_SENTINEL_DO_NOT_DIGEST";
-
-mock.module("../../src/internal-urls/registry-helpers", () => ({
-	artifactsDirsFromRegistry: () => registeredDirs,
-}));
 
 async function makeTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lifecycle-resolver-test-"));
-	registeredDirs.push(dir);
+	authorizedDirs.push(dir);
 	return dir;
 }
 
@@ -58,17 +54,21 @@ function makeRaw(overrides: Partial<SingleResult> = {}): SingleResult {
 	};
 }
 
-function resolveAgent(id: string) {
-	return new AgentProtocolHandler().resolve(new URL(`agent://${id}`) as never);
+function resolveContext(dir = authorizedDirs[0]) {
+	return { getArtifactsDir: () => dir ?? null, getAuthorizedArtifactsDirs: () => authorizedDirs };
 }
 
-function resolveArtifact(id: string) {
-	return new ArtifactProtocolHandler().resolve(new URL(`artifact://${id}`) as never);
+function resolveAgent(id: string, dir?: string) {
+	return new AgentProtocolHandler().resolve(new URL(`agent://${id}`) as never, resolveContext(dir));
+}
+
+function resolveArtifact(id: string, dir?: string) {
+	return new ArtifactProtocolHandler().resolve(new URL(`artifact://${id}`) as never, resolveContext(dir));
 }
 
 afterEach(async () => {
-	while (registeredDirs.length > 0) {
-		const dir = registeredDirs.pop()!;
+	while (authorizedDirs.length > 0) {
+		const dir = authorizedDirs.pop()!;
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 });
@@ -169,11 +169,11 @@ describe("lifecycle resolver hardening", () => {
 		await expect(resolveAgent("6-Parent.0-Nested")).resolves.toMatchObject({ content: nestedContent });
 	});
 
-	it("preserves PR1 legacy missing-sidecar behavior but fails closed for tampered sidecars", async () => {
+	it("fails closed when the agent output metadata sidecar is absent", async () => {
 		const dir = await makeTempDir();
 		const file = await writeAgentOutput(dir, "9-Legacy", "legacy content");
 		await fs.rm(`${file}.meta.json`);
-		await expect(resolveAgent("9-Legacy")).resolves.toMatchObject({ content: "legacy content" });
+		await expect(resolveAgent("9-Legacy")).rejects.toThrow(/missing metadata/);
 
 		await writeAgentOutput(dir, "10-Tampered", "tampered content");
 		await Bun.write(`${path.join(dir, "10-Tampered.md")}.meta.json`, JSON.stringify({ id: "different" }));

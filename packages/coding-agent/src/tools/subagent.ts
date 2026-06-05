@@ -3,7 +3,6 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, type SubagentRecord } from "../async";
-import { artifactsDirsFromRegistry } from "../internal-urls/registry-helpers";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
@@ -600,9 +599,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			const dir = path.dirname(record.sessionFile);
 			if (!dirs.includes(dir)) dirs.push(dir);
 		}
-		for (const dir of artifactsDirsFromRegistry()) {
-			if (!dirs.includes(dir)) dirs.push(dir);
-		}
+		const sessionDir = this.session.getArtifactsDir?.();
+		if (sessionDir && !dirs.includes(sessionDir)) dirs.push(sessionDir);
 		return dirs;
 	}
 

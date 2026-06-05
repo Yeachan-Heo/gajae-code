@@ -61,6 +61,8 @@ export interface ResolveContext {
 	settings?: unknown;
 	/** Artifacts directory of the calling session. */
 	getArtifactsDir?: () => string | null;
+	/** Additional artifacts directories explicitly authorized for this caller (for parent/child agent trees). */
+	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
 }

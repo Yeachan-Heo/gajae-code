@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -25,10 +25,6 @@ const CANONICAL_USAGE = {
 };
 
 const tempDirs: string[] = [];
-
-mock.module("../../src/internal-urls/registry-helpers", () => ({
-	artifactsDirsFromRegistry: () => tempDirs,
-}));
 
 function makeRaw(overrides: Partial<SingleResult> = {}): SingleResult {
 	return {
@@ -263,7 +259,10 @@ describe("agent protocol metadata verification", () => {
 	}
 
 	async function resolve(id: string) {
-		return new AgentProtocolHandler().resolve(new URL(`agent://${id}`) as never);
+		return new AgentProtocolHandler().resolve(new URL(`agent://${id}`) as never, {
+			getArtifactsDir: () => tempDirs[0] ?? null,
+			getAuthorizedArtifactsDirs: () => tempDirs,
+		});
 	}
 
 	it("resolves matching metadata and rejects hash and size mismatches", async () => {
@@ -278,9 +277,9 @@ describe("agent protocol metadata verification", () => {
 		await expect(resolve("verify")).rejects.toThrow(/size mismatch/);
 	});
 
-	it("preserves legacy behavior when the sidecar is absent", async () => {
+	it("fails closed when the sidecar is absent", async () => {
 		const file = await writeOutput("legacy", "legacy content");
 		await fs.rm(`${file}.meta.json`);
-		await expect(resolve("legacy")).resolves.toMatchObject({ content: "legacy content" });
+		await expect(resolve("legacy")).rejects.toThrow(/missing metadata/);
 	});
 });
