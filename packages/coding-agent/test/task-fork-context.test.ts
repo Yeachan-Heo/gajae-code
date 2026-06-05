@@ -410,6 +410,29 @@ describe("fork context policy surface", () => {
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
 	});
 
+	test("uses configured maxMessages to cap bounded fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(
+			createSession({ "task.forkContext.enabled": true, "task.forkContext.maxMessages": 3 }, seedBuilder),
+		);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "BoundedForkSeed",
+					description: "seed",
+					assignment: "Use bounded context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 250, signal: undefined });
+	});
+
 	test("uses reduced model-window fallback for full fork-context seeds", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();
@@ -422,6 +445,22 @@ describe("fork context policy surface", () => {
 		});
 
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 500, maxTokens: 150, signal: undefined });
+	});
+
+	test("uses configured maxMessages to cap full fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(
+			createSession({ "task.forkContext.enabled": true, "task.forkContext.maxMessages": 7 }, seedBuilder),
+		);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "FullForkSeed", description: "seed", assignment: "Use full context.", inheritContext: "full" }],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 7, maxTokens: 150, signal: undefined });
 	});
 
 	test("freezes inherited context seeds before detached job execution", async () => {

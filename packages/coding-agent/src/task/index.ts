@@ -285,9 +285,14 @@ function requestsForkContext(
 
 function resolveForkSeedParamsForMode(
 	mode: ForkContextMode,
+	configuredMaxMessages: number | undefined,
 	configuredMaxTokens: number,
 	model: Model | undefined,
 ): { maxMessages: number; maxTokens: number } | undefined {
+	const capMessages = (defaultMaxMessages: number): number =>
+		configuredMaxMessages === undefined
+			? defaultMaxMessages
+			: Math.min(defaultMaxMessages, Math.max(0, Math.trunc(configuredMaxMessages)));
 	switch (mode) {
 		case "none":
 			return undefined;
@@ -296,9 +301,9 @@ function resolveForkSeedParamsForMode(
 		case "last-turn":
 			return { maxMessages: 2, maxTokens: 250 };
 		case "bounded":
-			return { maxMessages: 50, maxTokens: 250 };
+			return { maxMessages: capMessages(50), maxTokens: 250 };
 		case "full":
-			return { maxMessages: 500, maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
+			return { maxMessages: capMessages(500), maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
 		default:
 			return undefined;
 	}
@@ -601,8 +606,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (!this.session.buildForkContextSeed) {
 				throw new Error("Current session cannot build fork-context seeds.");
 			}
+			const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
+				? this.session.settings.get("task.forkContext.maxMessages")
+				: undefined;
 			const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
-			const params = resolveForkSeedParamsForMode(task.inheritContext, configuredMaxTokens, this.session.model);
+			const params = resolveForkSeedParamsForMode(
+				task.inheritContext,
+				configuredMaxMessages,
+				configuredMaxTokens,
+				this.session.model,
+			);
 			if (!params) return undefined;
 			return await this.session.buildForkContextSeed({
 				...params,
@@ -1250,8 +1263,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!this.session.buildForkContextSeed) {
 					throw new Error("Current session cannot build fork-context seeds.");
 				}
+				const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
+					? this.session.settings.get("task.forkContext.maxMessages")
+					: undefined;
 				const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
-				const params = resolveForkSeedParamsForMode(task.inheritContext, configuredMaxTokens, this.session.model);
+				const params = resolveForkSeedParamsForMode(
+					task.inheritContext,
+					configuredMaxMessages,
+					configuredMaxTokens,
+					this.session.model,
+				);
 				if (!params) return undefined;
 				return await this.session.buildForkContextSeed({
 					...params,
