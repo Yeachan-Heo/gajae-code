@@ -3,6 +3,9 @@ import { findBestFuzzyMatch } from "../../src/edit/modes/replace";
 
 const native = await import("../../../natives/native/index.js").catch(() => undefined);
 
+const repeatedWords = (unitCount: number, tail: string) =>
+	`${"alpha ".repeat(Math.floor(unitCount / 6))}${"b".repeat(unitCount % 6)}${tail}`;
+
 const cases: Array<{ name: string; content: string; target: string; threshold?: number }> = [
 	{ name: "exact", content: "alpha\nbeta\ngamma", target: "beta" },
 	{
@@ -20,6 +23,54 @@ const cases: Array<{ name: string; content: string; target: string; threshold?: 
 	{ name: "Unicode", content: "quote “hello”\ndash – café\nemoji 👩‍💻", target: 'quote "hello"', threshold: 0.8 },
 	{ name: "indent", content: "if (x) {\n    callThing();\n}\ncallThing();", target: "callThang();", threshold: 0.8 },
 	{ name: "case-only", content: "AlphaBetaGamma", target: "alphabetagamma", threshold: 0.8 },
+	{
+		name: "long-pattern-dp-fallback",
+		content: `${"a".repeat(140)}x\n${"a".repeat(140)}y`,
+		target: `${"a".repeat(140)}z`,
+		threshold: 0.9,
+	},
+	{
+		name: "multi-line-ambiguous-depth-fallback",
+		content: "root\n  alpha beta\n    gamma delta\nother\nalpha beta\ngamma delto",
+		target: "alpha beta\ngamma delta",
+		threshold: 0.9,
+	},
+	{
+		name: "dash-and-space-normalization",
+		content: "alpha\t beta — gamma\nalpha beta - gammo",
+		target: "alpha beta - gamma",
+		threshold: 0.9,
+	},
+	{
+		name: "boundary-64-units",
+		content: `${"a".repeat(63)}x\n${"a".repeat(63)}y`,
+		target: `${"a".repeat(63)}z`,
+		threshold: 0.9,
+	},
+	{
+		name: "boundary-65-units",
+		content: `${"a".repeat(64)}x\n${"a".repeat(64)}y`,
+		target: `${"a".repeat(64)}z`,
+		threshold: 0.9,
+	},
+	{
+		name: "boundary-128-units",
+		content: `${"a".repeat(127)}x\n${"a".repeat(127)}y`,
+		target: `${"a".repeat(127)}z`,
+		threshold: 0.9,
+	},
+	{
+		name: "boundary-129-units",
+		content: `${"a".repeat(128)}x\n${"a".repeat(128)}y`,
+		target: `${"a".repeat(128)}z`,
+		threshold: 0.9,
+	},
+	{
+		name: "boundary-300-units-multi-word",
+		content: `${repeatedWords(299, "x")}\n${repeatedWords(299, "y")}`,
+		target: repeatedWords(299, "z"),
+		threshold: 0.9,
+	},
 ];
 
 describe("H01 native findBestFuzzyMatch differential", () => {

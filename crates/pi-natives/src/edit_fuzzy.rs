@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
 
@@ -210,7 +212,7 @@ fn normalize_for_fuzzy(line: Line<'_>) -> Vec<u16> {
 	normalize_line(line, None)
 }
 
-fn levenshtein(a: &[u16], b: &[u16]) -> usize {
+fn levenshtein_dp(a: &[u16], b: &[u16]) -> usize {
 	if a == b {
 		return 0;
 	}
@@ -239,7 +241,36 @@ fn levenshtein(a: &[u16], b: &[u16]) -> usize {
 	prev[b_len]
 }
 
-fn similarity(a: &[u16], b: &[u16]) -> f64 {
+struct MyersPattern {
+	units:       Vec<u16>,
+	masks:       HashMap<u16, u128>,
+	high_bit:    u128,
+	active_bits: u128,
+}
+
+enum FuzzyPattern {
+	Myers(MyersPattern),
+	Dp(Vec<u16>),
+}
+
+impl FuzzyPattern {
+	fn new(units: &[u16]) -> Self {
+		if units.is_empty() || units.len() > 128 {
+			Self::Dp(units.to_vec())
+		} else {
+			Self::Myers(MyersPattern::new(units))
+		}
+	}
+
+	fn similarity(&self, text: &[u16]) -> f64 {
+		match self {
+			Self::Myers(pattern) => pattern.similarity(text),
+			Self::Dp(units) => similarity_dp(units, text),
+		}
+	}
+}
+
+fn similarity_dp(a: &[u16], b: &[u16]) -> f64 {
 	if a.is_empty() && b.is_empty() {
 		return 1.0;
 	}
@@ -247,8 +278,80 @@ fn similarity(a: &[u16], b: &[u16]) -> f64 {
 	if max_len == 0 {
 		return 1.0;
 	}
-	let distance = levenshtein(a, b);
+	let distance = levenshtein_dp(a, b);
 	1.0 - (distance as f64) / (max_len as f64)
+}
+
+impl MyersPattern {
+	fn new(units: &[u16]) -> Self {
+		let mut masks = HashMap::with_capacity(units.len().min(64));
+		for (idx, &unit) in units.iter().enumerate() {
+			*masks.entry(unit).or_insert(0) |= 1u128 << idx;
+		}
+		let len = units.len();
+		if len == 0 {
+			return Self { units: Vec::new(), masks, high_bit: 0, active_bits: 0 };
+		}
+		let active_bits = if len == 128 {
+			u128::MAX
+		} else {
+			(1u128 << len) - 1
+		};
+		Self { units: units.to_vec(), masks, high_bit: 1u128 << (len - 1), active_bits }
+	}
+
+	fn distance(&self, text: &[u16]) -> usize {
+		if self.units == text {
+			return 0;
+		}
+		let pattern_len = self.units.len();
+		if pattern_len == 0 {
+			return text.len();
+		}
+		if text.is_empty() {
+			return pattern_len;
+		}
+		if pattern_len > 128 {
+			return levenshtein_dp(&self.units, text);
+		}
+
+		let mut score = pattern_len;
+		let mut pv = self.active_bits;
+		let mut mv = 0u128;
+		for &unit in text {
+			let eq = *self.masks.get(&unit).unwrap_or(&0);
+			let xv = eq | mv;
+			let xh = (((eq & pv).wrapping_add(pv)) ^ pv) | eq;
+			let ph = mv | !(xh | pv);
+			let mh = pv & xh;
+			if (ph & self.high_bit) != 0 {
+				score += 1;
+			} else if (mh & self.high_bit) != 0 {
+				score -= 1;
+			}
+			let ph = ((ph << 1) | 1) & self.active_bits;
+			let mh = (mh << 1) & self.active_bits;
+			pv = (mh | !(xv | ph)) & self.active_bits;
+			mv = (ph & xv) & self.active_bits;
+		}
+		score
+	}
+
+	fn similarity(&self, text: &[u16]) -> f64 {
+		if self.units.is_empty() && text.is_empty() {
+			return 1.0;
+		}
+		let max_len = self.units.len().max(text.len());
+		if max_len == 0 {
+			return 1.0;
+		}
+		let distance = self.distance(text);
+		1.0 - (distance as f64) / (max_len as f64)
+	}
+}
+
+fn similarity(a: &[u16], b: &[u16]) -> f64 {
+	FuzzyPattern::new(a).similarity(b)
 }
 
 fn best_core_one_line(
@@ -258,6 +361,7 @@ fn best_core_one_line(
 	threshold: f64,
 	include_depth: bool,
 ) -> H01BestFuzzyMatchResult {
+	let target_pattern = FuzzyPattern::new(target_norm);
 	let mut best: Option<H01BestFuzzyMatch> = None;
 	let mut best_score = -1.0f64;
 	let mut second_best_score = -1.0f64;
@@ -275,7 +379,7 @@ fn best_core_one_line(
 			out.append(&mut normalize_line(line, None));
 			out
 		};
-		let score = similarity(target_norm, &window_norm);
+		let score = target_pattern.similarity(&window_norm);
 		if score >= threshold {
 			above_threshold_count += 1;
 		}
@@ -303,6 +407,10 @@ fn best_core(
 	include_depth: bool,
 ) -> H01BestFuzzyMatchResult {
 	let target_norm = normalize_block_lines(target_lines, include_depth);
+	let target_patterns: Vec<FuzzyPattern> = target_norm
+		.iter()
+		.map(|norm| FuzzyPattern::new(norm))
+		.collect();
 	let mut best: Option<H01BestFuzzyMatch> = None;
 	let mut best_score = -1.0f64;
 	let mut second_best_score = -1.0f64;
@@ -312,7 +420,7 @@ fn best_core(
 		let window_norm = normalize_block_lines(window, include_depth);
 		let mut score = 0.0f64;
 		for i in 0..target_lines.len() {
-			score += similarity(&target_norm[i], &window_norm[i]);
+			score += target_patterns[i].similarity(&window_norm[i]);
 		}
 		score /= target_lines.len() as f64;
 		if score >= threshold {

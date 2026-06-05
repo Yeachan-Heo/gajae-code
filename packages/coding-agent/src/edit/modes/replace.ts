@@ -22,6 +22,12 @@ import {
 	stripBom,
 } from "../normalize";
 
+type NativeBestFuzzyMatchResult = {
+	best?: FuzzyMatch;
+	aboveThresholdCount: number;
+	secondBestScore: number;
+};
+
 type NativeSequenceFuzzyResult = {
 	index?: number;
 	confidence: number;
@@ -33,10 +39,16 @@ type NativeSequenceFuzzyResult = {
 let scoreSequenceFuzzyNative:
 	| ((lines: string[], pattern: string[], start: number, eof: boolean) => NativeSequenceFuzzyResult)
 	| undefined;
+let findBestFuzzyMatchNative:
+	| ((content: string, target: string, threshold: number) => NativeBestFuzzyMatchResult)
+	| undefined;
 void import("../../../../natives/native/index.js")
 	.then(mod => {
 		if (typeof mod.h02ScoreSequenceFuzzy === "function") {
 			scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
+		}
+		if (typeof mod.h01FindBestFuzzyMatch === "function") {
+			findBestFuzzyMatchNative = mod.h01FindBestFuzzyMatch;
 		}
 	})
 	.catch(() => {
@@ -511,7 +523,8 @@ export function findMatch(
 
 	// Try fuzzy match
 	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
-	const { best, aboveThresholdCount, secondBestScore } = findBestFuzzyMatch(content, target, threshold);
+	const { best, aboveThresholdCount, secondBestScore } =
+		findBestFuzzyMatchNative?.(content, target, threshold) ?? findBestFuzzyMatch(content, target, threshold);
 
 	if (!best) {
 		return {};
