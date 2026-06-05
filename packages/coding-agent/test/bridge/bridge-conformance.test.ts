@@ -33,6 +33,7 @@ describe("bridge protocol conformance", () => {
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
 			idempotencyCache: new Map(),
 			commandDispatcher: async command => {
 				calls += 1;
@@ -138,6 +139,7 @@ async function observeHandshake(): Promise<{ accepted_capabilities: string[]; fr
 		sessionId: "sess-1",
 		token: "secret",
 		commandScopes: BRIDGE_COMMAND_SCOPES,
+		endpointMatrix: { events: true, commands: true },
 	});
 	const response = await handle(
 		new Request("https://bridge.test/v1/handshake", {

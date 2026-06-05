@@ -42,6 +42,24 @@ const SERVER_CAPABILITIES: readonly BridgeCapability[] = [
 ];
 
 const DEFAULT_BRIDGE_SCOPES: readonly BridgeCommandScope[] = ["prompt"];
+interface BridgeEndpointMatrix {
+	events: boolean;
+	commands: boolean;
+	control: boolean;
+	uiResponses: boolean;
+	hostToolResults: boolean;
+	hostUriResults: boolean;
+}
+
+const FAIL_CLOSED_BRIDGE_ENDPOINTS: BridgeEndpointMatrix = {
+	events: false,
+	commands: false,
+	control: false,
+	uiResponses: false,
+	hostToolResults: false,
+	hostUriResults: false,
+};
+
 const MAX_IDEMPOTENCY_RECORDS = 1_000;
 
 const SERVER_FRAME_TYPES: readonly BridgeFrameType[] = [
@@ -67,6 +85,7 @@ interface BridgeFetchHandlerOptions {
 	uiBroker?: UiRequestBroker<BridgeUiRequestPayload, BridgeUiResult<unknown>>;
 	hostToolBridge?: RpcHostToolBridge;
 	hostUriBridge?: RpcHostUriBridge;
+	endpointMatrix?: Partial<BridgeEndpointMatrix>;
 }
 
 interface BridgeIdempotencyRecord {
@@ -139,6 +158,21 @@ function parseBridgeScopes(value: string | undefined): readonly BridgeCommandSco
 function hasScope(scopes: readonly BridgeCommandScope[] | undefined, scope: BridgeCommandScope): boolean {
 	return new Set(scopes ?? DEFAULT_BRIDGE_SCOPES).has(scope);
 }
+function bridgeEndpointMatrix(options: BridgeFetchHandlerOptions): BridgeEndpointMatrix {
+	return { ...FAIL_CLOSED_BRIDGE_ENDPOINTS, ...options.endpointMatrix };
+}
+
+function disabledEndpointResponse(endpoint: keyof BridgeEndpointMatrix): Response {
+	return jsonResponse(403, { error: "endpoint_disabled", endpoint });
+}
+
+function bridgeHelpResponse(matrix: BridgeEndpointMatrix): Response {
+	return jsonResponse(200, {
+		status: "experimental_gated",
+		message: "Bridge mode is experimental; session-control endpoints fail closed by default.",
+		endpoints: matrix,
+	});
+}
 
 function frameTypeForDispatchOutput(obj: RpcResponse | object): BridgeFrameType {
 	const type = typeof obj === "object" && obj !== null && "type" in obj ? (obj as { type?: unknown }).type : undefined;
@@ -151,15 +185,20 @@ function frameTypeForDispatchOutput(obj: RpcResponse | object): BridgeFrameType 
 
 export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (request: Request) => Promise<Response> {
 	return async request => {
+		const endpointMatrix = bridgeEndpointMatrix(options);
 		const url = new URL(request.url);
 		if (request.method === "GET" && url.pathname === "/healthz") {
 			return jsonResponse(200, { status: "ok" });
+		}
+		if (request.method === "GET" && url.pathname === "/v1/help") {
+			return bridgeHelpResponse(endpointMatrix);
 		}
 
 		if (request.method === "GET" && url.pathname === `/v1/sessions/${options.sessionId}/events`) {
 			if (!isBridgeTokenAuthorized(request.headers.get("Authorization"), { token: options.token })) {
 				return jsonResponse(401, { error: "unauthorized" });
 			}
+			if (!endpointMatrix.events) return disabledEndpointResponse("events");
 			const lastSeqRaw = url.searchParams.get("last_seq");
 			if (lastSeqRaw !== null && !/^\d+$/.test(lastSeqRaw)) return jsonResponse(400, { error: "invalid_last_seq" });
 			const lastSeq = lastSeqRaw === null ? 0 : Number.parseInt(lastSeqRaw, 10);
@@ -184,23 +223,32 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 				200,
 				negotiateBridgeHandshake(payload, {
 					sessionId: options.sessionId,
-					capabilities: SERVER_CAPABILITIES,
-					scopes: options.commandScopes ?? DEFAULT_BRIDGE_SCOPES,
+					capabilities: endpointMatrix.events ? SERVER_CAPABILITIES : [],
+					scopes: endpointMatrix.commands ? (options.commandScopes ?? DEFAULT_BRIDGE_SCOPES) : [],
 					endpoints: {
-						events: `/v1/sessions/${options.sessionId}/events`,
-						commands: `/v1/sessions/${options.sessionId}/commands`,
-						uiResponses: `/v1/sessions/${options.sessionId}/ui-responses/{correlation_id}`,
-						claimControl: `/v1/sessions/${options.sessionId}/control:claim`,
-						disconnectControl: `/v1/sessions/${options.sessionId}/control:disconnect`,
-						hostToolResults: `/v1/sessions/${options.sessionId}/host-tool-results/{correlation_id}`,
-						hostUriResults: `/v1/sessions/${options.sessionId}/host-uri-results/{correlation_id}`,
+						events: endpointMatrix.events ? `/v1/sessions/${options.sessionId}/events` : "",
+						commands: endpointMatrix.commands ? `/v1/sessions/${options.sessionId}/commands` : "",
+						uiResponses: endpointMatrix.uiResponses
+							? `/v1/sessions/${options.sessionId}/ui-responses/{correlation_id}`
+							: "",
+						claimControl: endpointMatrix.control ? `/v1/sessions/${options.sessionId}/control:claim` : "",
+						disconnectControl: endpointMatrix.control
+							? `/v1/sessions/${options.sessionId}/control:disconnect`
+							: "",
+						hostToolResults: endpointMatrix.hostToolResults
+							? `/v1/sessions/${options.sessionId}/host-tool-results/{correlation_id}`
+							: "",
+						hostUriResults: endpointMatrix.hostUriResults
+							? `/v1/sessions/${options.sessionId}/host-uri-results/{correlation_id}`
+							: "",
 					},
-					frameTypes: SERVER_FRAME_TYPES,
+					frameTypes: endpointMatrix.events ? SERVER_FRAME_TYPES : [],
 				}),
 			);
 		}
 
 		if (request.method === "POST" && url.pathname === `/v1/sessions/${options.sessionId}/commands`) {
+			if (!endpointMatrix.commands) return disabledEndpointResponse("commands");
 			if (!options.commandDispatcher) return jsonResponse(503, { error: "commands_unavailable" });
 			const idempotencyKey = request.headers.get("Idempotency-Key") ?? undefined;
 			const existingRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
@@ -266,6 +314,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			}
 		}
 		if (request.method === "POST" && url.pathname === `/v1/sessions/${options.sessionId}/control:claim`) {
+			if (!endpointMatrix.control) return disabledEndpointResponse("control");
 			if (!hasScope(options.commandScopes, "control"))
 				return jsonResponse(403, { error: "scope_denied", scope: "control" });
 			if (options.permissionBroker?.ownerToken || options.uiBroker?.ownerToken)
@@ -278,6 +327,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			return jsonResponse(200, { status: "claimed", ownerToken });
 		}
 		if (request.method === "POST" && url.pathname === `/v1/sessions/${options.sessionId}/control:disconnect`) {
+			if (!endpointMatrix.control) return disabledEndpointResponse("control");
 			if (!hasScope(options.commandScopes, "control"))
 				return jsonResponse(403, { error: "scope_denied", scope: "control" });
 			const ownerToken = request.headers.get("X-GJC-Bridge-Owner-Token") ?? "";
@@ -290,6 +340,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 
 		const uiResponsePrefix = `/v1/sessions/${options.sessionId}/ui-responses/`;
 		if (request.method === "POST" && url.pathname.startsWith(uiResponsePrefix)) {
+			if (!endpointMatrix.uiResponses) return disabledEndpointResponse("uiResponses");
 			if (!hasScope(options.commandScopes, "control"))
 				return jsonResponse(403, { error: "scope_denied", scope: "control" });
 			const correlationId = decodeURIComponent(url.pathname.slice(uiResponsePrefix.length));
@@ -341,6 +392,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 		}
 		const hostToolResultPrefix = `/v1/sessions/${options.sessionId}/host-tool-results/`;
 		if (request.method === "POST" && url.pathname.startsWith(hostToolResultPrefix)) {
+			if (!endpointMatrix.hostToolResults) return disabledEndpointResponse("hostToolResults");
 			if (!hasScope(options.commandScopes, "host_tools"))
 				return jsonResponse(403, { error: "scope_denied", scope: "host_tools" });
 			if (!options.hostToolBridge) return jsonResponse(503, { error: "host_tools_unavailable" });
@@ -365,6 +417,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 
 		const hostUriResultPrefix = `/v1/sessions/${options.sessionId}/host-uri-results/`;
 		if (request.method === "POST" && url.pathname.startsWith(hostUriResultPrefix)) {
+			if (!endpointMatrix.hostUriResults) return disabledEndpointResponse("hostUriResults");
 			if (!hasScope(options.commandScopes, "host_uri"))
 				return jsonResponse(403, { error: "scope_denied", scope: "host_uri" });
 			if (!options.hostUriBridge) return jsonResponse(503, { error: "host_uri_unavailable" });

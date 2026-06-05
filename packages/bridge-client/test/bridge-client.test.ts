@@ -32,6 +32,18 @@ describe("BridgeClient", () => {
 		expect(seen[0]?.body).toContain("protocol_version_range");
 	});
 
+	it("refuses bearer tokens over non-HTTPS except explicit localhost opt-in", () => {
+		expect(() => new BridgeClient({ baseUrl: "http://bridge.test", token: "secret" })).toThrow(
+			/non-HTTPS bridge URLs/,
+		);
+		expect(() => new BridgeClient({ baseUrl: "http://localhost:4077", token: "secret" })).toThrow(
+			/allowInsecureLocalhost/,
+		);
+		expect(
+			() => new BridgeClient({ baseUrl: "http://127.0.0.1:4077", token: "secret", allowInsecureLocalhost: true }),
+		).not.toThrow();
+	});
+
 	it("sends command idempotency keys and event cursors", async () => {
 		const seen: string[] = [];
 		const headersSeen: string[] = [];

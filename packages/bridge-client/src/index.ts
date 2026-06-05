@@ -88,6 +88,11 @@ export interface BridgeClientOptions {
 	baseUrl: string;
 	token: string;
 	fetch?: BridgeFetch;
+	allowInsecureLocalhost?: boolean;
+}
+
+function isLocalhostUrl(url: URL): boolean {
+	return url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }
 
 export class BridgeClient implements BridgeCommandHelpers {
@@ -97,6 +102,14 @@ export class BridgeClient implements BridgeCommandHelpers {
 
 	constructor(options: BridgeClientOptions) {
 		this.#baseUrl = new URL(options.baseUrl);
+		if (this.#baseUrl.protocol !== "https:" && !isLocalhostUrl(this.#baseUrl)) {
+			throw new Error("BridgeClient refuses bearer tokens over non-HTTPS bridge URLs");
+		}
+		if (isLocalhostUrl(this.#baseUrl) && !options.allowInsecureLocalhost) {
+			throw new Error(
+				"BridgeClient refuses bearer tokens over HTTP localhost unless allowInsecureLocalhost is true",
+			);
+		}
 		this.#token = options.token;
 		this.#fetch = options.fetch ?? fetch;
 	}

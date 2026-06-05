@@ -15,7 +15,15 @@ type HandshakeJson = {
 	accepted_capabilities: string[];
 	unsupported: string[];
 	accepted_scopes: string[];
-	endpoints: { events: string };
+	endpoints: {
+		events: string;
+		commands: string;
+		uiResponses: string;
+		claimControl: string;
+		disconnectControl: string;
+		hostToolResults: string;
+		hostUriResults: string;
+	};
 };
 
 describe("bridge mode fetch handler", () => {
@@ -55,11 +63,125 @@ describe("bridge mode fetch handler", () => {
 		expect(await response.json()).toEqual({ error: "invalid_request" });
 	});
 
+	it("advertises only health/help and no enabled session surface by default", async () => {
+		const handle = createBridgeFetchHandler({ sessionId: "sess-1", token: "secret", commandScopes: ["prompt"] });
+		const help = await handle(new Request("https://bridge.test/v1/help"));
+		expect(help.status).toBe(200);
+		expect(await help.json()).toEqual({
+			status: "experimental_gated",
+			message: "Bridge mode is experimental; session-control endpoints fail closed by default.",
+			endpoints: {
+				events: false,
+				commands: false,
+				control: false,
+				uiResponses: false,
+				hostToolResults: false,
+				hostUriResults: false,
+			},
+		});
+
+		const handshake = await handle(
+			new Request("https://bridge.test/v1/handshake", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({
+					protocol_version_range: { min: 1, max: 1 },
+					capabilities: ["events", "prompt", "host_tools"],
+					requested_scopes: ["prompt"],
+				}),
+			}),
+		);
+		expect(handshake.status).toBe(200);
+		const body = (await handshake.json()) as HandshakeJson;
+		expect(body.accepted_capabilities).toEqual([]);
+		expect(body.accepted_scopes).toEqual([]);
+		expect(body.endpoints).toEqual({
+			events: "",
+			commands: "",
+			uiResponses: "",
+			claimControl: "",
+			disconnectControl: "",
+			hostToolResults: "",
+			hostUriResults: "",
+		});
+	});
+
+	it("fails closed disabled session endpoints before body parsing, scope checks, dispatch, or broker mutation", async () => {
+		let calls = 0;
+		const permissionBroker = new UiRequestBroker<BridgePermissionRequestPayload, ClientBridgePermissionOutcome>({
+			emitRequest: () => {},
+		});
+		const hostToolBridge = new RpcHostToolBridge(() => {});
+		const hostUriBridge = new RpcHostUriBridge(() => {});
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["prompt", "control", "host_tools", "host_uri"],
+			permissionBroker,
+			hostToolBridge,
+			hostUriBridge,
+			commandDispatcher: async command => {
+				calls += 1;
+				return rpcSuccess(command.id, "prompt");
+			},
+		});
+		const authed = { Authorization: "Bearer secret" };
+		const disabledRequests = [
+			new Request("https://bridge.test/v1/sessions/sess-1/events?last_seq=not-a-number", { headers: authed }),
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: authed,
+				body: "not json",
+			}),
+			new Request("https://bridge.test/v1/sessions/sess-1/control:claim", { method: "POST", headers: authed }),
+			new Request("https://bridge.test/v1/sessions/sess-1/control:disconnect", { method: "POST", headers: authed }),
+			new Request("https://bridge.test/v1/sessions/sess-1/ui-responses/request-1", {
+				method: "POST",
+				headers: authed,
+				body: "not json",
+			}),
+			new Request("https://bridge.test/v1/sessions/sess-1/host-tool-results/tool-1", {
+				method: "POST",
+				headers: authed,
+				body: "not json",
+			}),
+			new Request("https://bridge.test/v1/sessions/sess-1/host-uri-results/uri-1", {
+				method: "POST",
+				headers: authed,
+				body: "not json",
+			}),
+		];
+		const expectedEndpoints = [
+			"events",
+			"commands",
+			"control",
+			"control",
+			"uiResponses",
+			"hostToolResults",
+			"hostUriResults",
+		];
+		for (const [index, request] of disabledRequests.entries()) {
+			const response = await handle(request);
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({ error: "endpoint_disabled", endpoint: expectedEndpoints[index] });
+		}
+		expect(calls).toBe(0);
+		expect(permissionBroker.ownerToken).toBeUndefined();
+	});
+
 	it("negotiates capabilities and scopes on handshake", async () => {
 		const handle = createBridgeFetchHandler({
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt", "bash"],
+			endpointMatrix: {
+				events: true,
+				commands: true,
+				control: true,
+				uiResponses: true,
+				hostToolResults: true,
+				hostUriResults: true,
+			},
 		});
 		const response = await handle(
 			new Request("https://bridge.test/v1/handshake", {
@@ -91,7 +213,12 @@ describe("bridge mode fetch handler", () => {
 			type: "event",
 			payload: { event_type: "agent_start", event: { type: "agent_start" } },
 		});
-		const handle = createBridgeFetchHandler({ sessionId: "sess-1", token: "secret", eventStream });
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			eventStream,
+			endpointMatrix: { events: true },
+		});
 		const unauthorized = await handle(new Request("https://bridge.test/v1/sessions/sess-1/events"));
 		expect(unauthorized.status).toBe(401);
 		const response = await handle(
@@ -123,6 +250,7 @@ describe("bridge mode fetch handler", () => {
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
 			idempotencyCache: new Map(),
 			commandDispatcher: async command => {
 				calls += 1;
@@ -149,6 +277,7 @@ describe("bridge mode fetch handler", () => {
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
 			commandDispatcher: async command => {
 				calls += 1;
 				return rpcSuccess(command.id, "prompt");
@@ -173,6 +302,7 @@ describe("bridge mode fetch handler", () => {
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
 			idempotencyCache: new Map(),
 			commandDispatcher: async command => {
 				calls += 1;
@@ -211,6 +341,7 @@ describe("bridge mode fetch handler", () => {
 			token: "secret",
 			permissionBroker,
 			commandScopes: ["prompt", "control"],
+			endpointMatrix: { control: true, uiResponses: true },
 			idempotencyCache: new Map(),
 		});
 		const claim = await handle(
@@ -301,6 +432,7 @@ describe("bridge mode fetch handler", () => {
 			hostToolBridge,
 			hostUriBridge,
 			commandScopes: ["prompt", "host_tools", "host_uri"],
+			endpointMatrix: { hostToolResults: true, hostUriResults: true },
 		});
 		const toolPromise = hostToolBridge.requestExecution(
 			{ name: "host_echo", label: "Echo", description: "Echo", parameters: { type: "object" } },
@@ -369,6 +501,7 @@ describe("bridge mode fetch handler", () => {
 			sessionId: "sess-1",
 			token: "secret",
 			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
 			idempotencyCache,
 			commandDispatcher: async command => {
 				calls += 1;

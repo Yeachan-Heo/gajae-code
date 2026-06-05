@@ -1,16 +1,37 @@
-# Bridge Protocol Reference (Experimental)
+# Bridge Protocol Reference (Experimental, Fail-Closed)
 
-Bridge mode runs the coding agent as a network-reachable control surface over
-**HTTPS REST + an authenticated SSE-style fetch event stream**. It exposes the
-full agent surface (events, commands, permission/elicitation, host tool/URI
-callbacks) to a remote client, and ships a TypeScript SDK in
-`@gajae-code/bridge-client`.
+Bridge mode runs the coding agent as an experimental network control surface over
+HTTPS. For the 0.3.1 release train, the session-control surface is intentionally
+**fail-closed by default** while the bridge security model is hardened.
 
-> **Stability: experimental.** The bridge protocol is versioned
-> (`BRIDGE_PROTOCOL_VERSION`, currently `1`) and negotiated through
-> `POST /v1/handshake`. Treat the wire format and SDK surface as experimental:
-> they may change in additive, version-negotiated ways before a stable release.
-> Do not assume long-term API stability yet.
+Default availability:
+
+- `GET /healthz` is available without auth and returns `{ "status": "ok" }`.
+- `GET /v1/help` is available without auth and reports the fail-closed endpoint
+  matrix.
+- `POST /v1/handshake` remains authenticated, but the default response advertises
+  no enabled session endpoints, no accepted capabilities, no accepted scopes, and
+  no frame types.
+- `GET /v1/sessions/{session_id}/events` fails closed with
+  `403 endpoint_disabled` after bearer auth succeeds.
+- `POST /v1/sessions/{session_id}/commands` fails closed with
+  `403 endpoint_disabled` after bearer auth succeeds and before body parsing,
+  command validation, scope checks, or dispatch.
+- `POST /v1/sessions/{session_id}/control:claim` and
+  `POST /v1/sessions/{session_id}/control:disconnect` fail closed with
+  `403 endpoint_disabled` after bearer auth succeeds.
+- `POST /v1/sessions/{session_id}/ui-responses/{correlation_id}` fails closed
+  with `403 endpoint_disabled` after bearer auth succeeds and before body parsing
+  or controller checks.
+- `POST /v1/sessions/{session_id}/host-tool-results/{correlation_id}` and
+  `POST /v1/sessions/{session_id}/host-uri-results/{correlation_id}` fail closed
+  with `403 endpoint_disabled` after bearer auth succeeds and before body parsing
+  or host callback handling.
+
+The implementation still contains the v1 protocol scaffolding and internal tests
+for the previously enabled surface, but external clients must treat events,
+commands, controller ownership, UI responses, host tool results, and host URI
+results as unavailable unless a future release explicitly re-enables them.
 
 Primary implementation:
 
@@ -35,7 +56,9 @@ Behavior notes:
 - `@file` CLI arguments are rejected in bridge mode (as in RPC mode).
 - Bridge mode reuses the RPC default-setting overrides and suppresses automatic
   session title generation.
-- One bridge process serves exactly **one live `AgentSession`** (see Limitations).
+- One bridge process serves exactly **one live `AgentSession`**.
+- The default endpoint matrix disables session events, commands, controller
+  ownership, UI responses, host tool results, and host URI results.
 
 ### Configuration (environment variables)
 
@@ -43,48 +66,27 @@ See `docs/environment-variables.md` for the authoritative table. Summary:
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token for all authenticated endpoints. **Secret — never commit.** |
+| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token for authenticated endpoints. **Secret — never commit.** |
 | `GJC_BRIDGE_TLS_CERT` | Yes | — | Path to the TLS certificate (PEM). |
 | `GJC_BRIDGE_TLS_KEY` | Yes | — | Path to the TLS private key (PEM). **Secret — never commit.** |
 | `GJC_BRIDGE_HOST` | No | `127.0.0.1` | Bind hostname. |
 | `GJC_BRIDGE_PORT` | No | `4077` | Bind port (1–65535). |
-| `GJC_BRIDGE_SCOPES` | No | `prompt` | Comma-separated command scopes to grant (see Commands and Scopes). |
+| `GJC_BRIDGE_SCOPES` | No | `prompt` | Parsed for internal compatibility, but default session endpoints are fail-closed. |
 
 ## Security and TLS
 
-The bridge is a network control surface that can drive a live agent (including
-running bash and editing files via commands), so it is **secure-by-default**:
+The bridge is a network control surface, so it is **secure-by-default**:
 
 - **TLS is mandatory for every bind, including loopback.** Startup fails closed
   with a clear error if `GJC_BRIDGE_TLS_CERT` and `GJC_BRIDGE_TLS_KEY` are not
   both set. There is no plaintext fallback and no insecure/trust-bypass switch.
-- **Bearer token is mandatory.** `GJC_BRIDGE_TOKEN` must be set; every endpoint
-  except `GET /healthz` requires `Authorization: Bearer <token>`. The event
-  stream uses an authenticated fetch GET (NOT a browser `EventSource`) so the
-  token is never placed in a URL.
-- `GET /healthz` is the only unauthenticated endpoint; it returns
-  `{ "status": "ok" }` and exposes no session data.
-
-### Handling secrets and local development
-
-- `GJC_BRIDGE_TOKEN` and the TLS **private key** are secrets. Never commit cert,
-  key, or token material to the repository. All examples below use placeholders.
-- Restrict the private key to owner-read only, e.g. `chmod 600 bridge-key.pem`
-  (or your platform's stricter equivalent).
-- For local development with a self-signed certificate, **add the local CA /
-  certificate to your client's trust store** (or configure your SDK client with
-  an explicit trusted CA). Always keep TLS certificate validation enabled on the
-  client; never bypass it with validation-skipping flags.
-
-Example (placeholders only — do not commit real values):
-
-```bash
-export GJC_BRIDGE_TOKEN="<your-secret-token>"     # secret
-export GJC_BRIDGE_TLS_CERT="/path/to/bridge-cert.pem"
-export GJC_BRIDGE_TLS_KEY="/path/to/bridge-key.pem" # secret; chmod 600
-export GJC_BRIDGE_SCOPES="prompt,control"
-gjc --mode bridge
-```
+- **Bearer token is mandatory** for every endpoint except `GET /healthz` and
+  `GET /v1/help`.
+- The TypeScript SDK refuses bearer-token clients over non-`https` URLs by
+  default. It allows plaintext only for `localhost`, `127.0.0.1`, or `[::1]`
+  when the caller explicitly passes the localhost/test opt-in.
+- Session endpoints fail closed by default even when bearer auth and scopes are
+  otherwise valid.
 
 ## Handshake
 
@@ -93,69 +95,54 @@ POST /v1/handshake   (authenticated)
 ```
 
 The client sends its supported protocol version range, requested capabilities,
-and requested scopes; the server replies with the negotiated result:
+and requested scopes. Version mismatch returns `status: "rejected"`,
+`reason: "incompatible_version"`. Malformed request bodies return
+`400 invalid_request`.
+
+In the default 0.3.1 fail-closed configuration, a successful authenticated
+handshake returns:
 
 - `protocol_version` — the server protocol version (`BRIDGE_PROTOCOL_VERSION`, `1`).
 - `session_id` — the single session id this bridge serves.
-- `accepted_capabilities` / `unsupported` — capabilities the server supports vs.
-  requested-but-unsupported.
-- `accepted_scopes` — the subset of requested scopes the server grants.
-- `endpoints` — the per-session endpoint descriptors.
-- `frame_types` — the server-advertised event-stream frame types.
+- `accepted_capabilities` — empty.
+- `accepted_scopes` — empty.
+- `unsupported` — every requested capability.
+- `endpoints` — all session endpoint descriptors present but empty strings.
+- `frame_types` — empty.
 
-Version mismatch returns `status: "rejected"`, `reason: "incompatible_version"`.
-Malformed request bodies return `400 invalid_request`.
+## Fail-Closed Endpoint Matrix
 
-### Capabilities
+The disabled endpoint matrix is:
 
-Server-advertised capabilities (observe the live set through the handshake
-response, not by importing internal constants):
+| Surface | Endpoint(s) | Default |
+| --- | --- | --- |
+| Events | `GET /v1/sessions/{session_id}/events?last_seq=<n>` | Disabled |
+| Commands | `POST /v1/sessions/{session_id}/commands` | Disabled |
+| Control | `POST /v1/sessions/{session_id}/control:claim`, `POST /v1/sessions/{session_id}/control:disconnect` | Disabled |
+| UI responses | `POST /v1/sessions/{session_id}/ui-responses/{correlation_id}` | Disabled |
+| Host tool results | `POST /v1/sessions/{session_id}/host-tool-results/{correlation_id}` | Disabled |
+| Host URI results | `POST /v1/sessions/{session_id}/host-uri-results/{correlation_id}` | Disabled |
 
-- `events`
-- `prompt`
-- `permission`
-- `elicitation`
-- `ui.declarative`
-- `host_tools`
-- `host_uri`
+Authenticated requests to disabled endpoints return:
 
-## Transport and Framing
+```json
+{ "error": "endpoint_disabled", "endpoint": "commands" }
+```
 
-The event stream is an authenticated `GET` that streams Server-Sent-Events-style
-frames (`data: <json>\n\n`). Every frame envelope carries:
+The `endpoint` value is one of `events`, `commands`, `control`, `uiResponses`,
+`hostToolResults`, or `hostUriResults`.
 
-- `protocol_version`
-- `session_id`
-- `seq` (monotonic per-session sequence)
-- `frame_id`
-- optional `correlation_id`
-- `type`
-- `payload`
+## Protocol Catalog Kept for Internal Compatibility
 
-### Frame types
+The bridge protocol module still defines the v1 command and scope catalog so
+existing internal tests can validate the dormant implementation and future
+re-enable work has a stable baseline.
 
-Server-advertised frame types (from the handshake `frame_types`):
-
-- `ready`
-- `event`
-- `response`
-- `ui_request`
-- `permission_request`
-- `host_tool_call`
-- `host_uri_request`
-- `reset`
-- `error`
-
-## Commands and Scopes
-
-Commands are posted to `POST /v1/sessions/{session_id}/commands` and dispatched
-through the shared agent-wire command dispatcher. Each command type is validated
-for shape before dispatch and mapped to exactly one coarse authorization scope.
+When internally enabled for compatibility tests, event replay still uses `last_seq` and the bounded replay reset marker `replay_window_exceeded`; command and UI response retries still use `Idempotency-Key`. These mechanisms are dormant for default external bridge clients because the endpoint matrix rejects the endpoints before they reach replay, body parsing, idempotency, scope, or dispatch logic.
 
 ### Scopes
 
-Authorization is coarse per-token. The configurable scope set
-(`BRIDGE_COMMAND_SCOPES`) is:
+The configurable scope set (`BRIDGE_COMMAND_SCOPES`) is:
 
 - `prompt`
 - `control`
@@ -168,13 +155,9 @@ Authorization is coarse per-token. The configurable scope set
 - `host_uri`
 - `admin`
 
-The mandatory compliance floor (`MANDATORY_FLOOR_COMMAND_SCOPES`) is always
-`prompt`: the `prompt` scope is the minimum floor that is always present even
-when `GJC_BRIDGE_SCOPES` requests a narrower set. A command whose scope is not
-granted is rejected with `403 scope_denied`.
-
-> Fine-grained per-token/per-command authorization policy is **future work**;
-> v1 enforces only these coarse scopes.
+The mandatory compliance floor (`MANDATORY_FLOOR_COMMAND_SCOPES`) remains
+`prompt` for the dormant command surface. Because commands are disabled by the
+endpoint matrix, the default handshake advertises no accepted scopes.
 
 ### Command catalog and scope mapping
 
@@ -216,82 +199,41 @@ granted is rejected with `403 scope_denied`.
 | `get_login_providers` | `admin` |
 | `login` | `admin` |
 
-## Controller Ownership and UI Responses
+### Dormant capabilities and frame types
 
-A single active controller per session is enforced via
-`POST /v1/sessions/{session_id}/control:claim`, which responds with
-`{ "status": "claimed", "ownerToken": "<token>" }`. (A client may also supply a
-preferred token via the `X-GJC-Bridge-Owner-Token` request header.)
+These names remain in the protocol code for future compatibility and internal
+conformance tests, but they are not advertised by the default fail-closed
+handshake:
 
-- Permission and elicitation prompts are emitted as `permission_request` /
-  `ui_request` frames and answered through
-  `POST /v1/sessions/{session_id}/ui-responses/{correlation_id}`, sending the
-  `ownerToken` back in the `X-GJC-Bridge-Owner-Token` header.
-- A duplicate response is `409`; an unauthorized (wrong-owner) response is
-  `403 not_controller`.
-- `POST /v1/sessions/{session_id}/control:disconnect` (also authorized by the
-  `X-GJC-Bridge-Owner-Token` header) releases the lock and cancels pending
-  requests.
+Capabilities: `events`, `prompt`, `permission`, `elicitation`, `ui.declarative`,
+`host_tools`, `host_uri`.
 
-## Event Stream and Replay
-
-```
-GET /v1/sessions/{session_id}/events?last_seq=<n>   (authenticated)
-```
-
-- Frames are delivered in `seq` order.
-- Reconnecting clients resume with `last_seq`; only an absent or all-decimal
-  `last_seq` is accepted (invalid cursors return `400`).
-- The replay buffer is bounded (default `1000` frames). If a client's `last_seq`
-  predates the retained window, the server emits a `reset` frame with payload
-  `{ reason: "replay_window_exceeded", first_seq }` so the client knows to
-  resynchronize rather than silently miss frames.
-
-## Idempotency and Retries
-
-The **commands** endpoint and the **ui-responses** endpoint honor an
-`Idempotency-Key` header (the controller claim/disconnect and host tool/URI
-result callbacks do not). Records are scoped by route, body, and (for UI
-responses) owner token, and in-flight requests are coalesced so concurrent
-retries dispatch the underlying command only once. The in-flight record is
-installed before dispatch.
-
-> Eviction nuance: the bounded idempotency cache prunes only when a **new**
-> record is inserted, and it evicts only **completed** (non-pending) records.
-> Pending records are never evicted, so a burst of concurrent pending requests
-> can push the cache above its nominal bound; it returns to the bound only as
-> later inserts evict completed records. There is no universal hard cap during
-> such a burst.
+Frame types: `ready`, `event`, `response`, `ui_request`, `permission_request`,
+`host_tool_call`, `host_uri_request`, `reset`, `error`.
 
 ## UI Capability Parity
 
-Bridge UI parity is **semantic, not pixel-perfect**. UI surfaces fall into three
-classes:
+Bridge UI parity remains **semantic, not pixel-perfect** when the dormant UI
+surface is explicitly enabled for internal validation. Local-only UI capabilities
+continue to report typed unsupported results instead of silent defaults:
 
-- **Core (mandatory):** `select`, `confirm`, `input`, `editor` elicitation —
-  bridged through the UI request broker.
-- **Declarative-advanced (optional):** `notify`, status, declarative widgets
-  (`lines`-based), title, editor text — emitted as serializable data
-  (`ui.declarative`).
-- **Local-only (unsupported):** executable component factories, synchronous
-  editor reads, raw terminal input, and theme switching are local-only and
-  return a typed `unsupported` result instead of a silent default. The reported
-  unsupported capabilities are:
-  - `ui.terminal_input`
-  - `ui.widget.component`
-  - `ui.footer.component`
-  - `ui.header.component`
-  - `ui.custom.component`
-  - `ui.editor.get_text`
-  - `ui.editor.component`
-  - `ui.tools_expanded`
-  - Theme switching is unsupported (`setTheme` returns `{ success: false }`).
+- `ui.terminal_input`
+- `ui.widget.component`
+- `ui.footer.component`
+- `ui.header.component`
+- `ui.custom.component`
+- `ui.editor.get_text`
+- `ui.editor.component`
+- `ui.tools_expanded`
+- Theme switching is unsupported (`setTheme` returns `{ success: false }`).
 
 ## SDK Usage
 
 `@gajae-code/bridge-client` exposes `BridgeClient` with handshake, command
 helpers mirroring the full RPC command catalog, an `events()` async generator,
-controller/UI/host-callback helpers, and an idempotency-key helper.
+controller/UI/host-callback helpers, and an idempotency-key helper. In 0.3.1,
+those helpers should be expected to fail against the default bridge because the
+server endpoint matrix disables the corresponding session endpoints.
 
 > Response typing: in this experimental version, `command()` and the typed
 > command helpers return `Promise<unknown>`. Callers narrow the response
@@ -305,6 +247,8 @@ controller/UI/host-callback helpers, and an idempotency-key helper.
   `AgentSession`. The `session_id` is present in every frame and endpoint for
   ordering and future additive multiplexing, but multi-session multiplexing is
   **not** implemented in v1.
+- Session events, commands, controller ownership, UI responses, host tool
+  results, and host URI results are disabled by default in 0.3.1.
 - Coarse per-token scopes only (no fine-grained per-command policy yet).
 - UI parity is semantic, not pixel-perfect (see UI Capability Parity).
 
@@ -320,6 +264,6 @@ Public orchestration boundaries:
 4. Use `gjc team ...` only when coordinated parallel tmux workers help with implementation or verification; single-lane work should stay in the leader session.
 5. Collect the handoff state: whether the session stopped cleanly, changed files, commands/checks run, failures, unresolved risks, and evidence summaries.
 
-Bridge mode remains the public remote-control protocol for an already-running GJC session. Keep lifecycle, worktree selection, and evidence policy above the bridge frames, and avoid documenting private deployment, routing, or credential internals. Introducing another authenticated remote-control protocol for the same purpose should require ADR-level rationale.
+Bridge mode remains the public remote-control protocol for an already-running GJC session, but the session-control endpoints are fail-closed by default in 0.3.1. Keep lifecycle, worktree selection, and evidence policy above the bridge frames, and avoid documenting private deployment, routing, or credential internals. Introducing another authenticated remote-control protocol for the same purpose should require ADR-level rationale.
 
 The same external-runner workflow is summarized in the README section [Using GJC with other coding agents](../README.md#using-gjc-with-other-coding-agents).

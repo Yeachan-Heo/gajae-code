@@ -469,16 +469,18 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 Consumed by `packages/coding-agent/src/modes/bridge/*`. The bridge is a
 network-reachable control surface and is **secure-by-default**: it refuses to
-start without TLS and a bearer token. See `docs/bridge.md` for protocol details.
+start without TLS and a bearer token, and the 0.3.1 default endpoint matrix
+fail-closes session events, commands, controller ownership, UI responses, host
+tool results, and host URI results. See `docs/bridge.md` for protocol details.
 
 | Variable | Required | Default | Behavior |
 | --- | --- | --- | --- |
-| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token required on every authenticated endpoint. **Secret — never commit.** |
+| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token required on authenticated endpoints. **Secret — never commit.** |
 | `GJC_BRIDGE_TLS_CERT` | Yes | — | Path to the TLS certificate (PEM). Startup fails closed if cert/key are missing (TLS is mandatory, including loopback). |
 | `GJC_BRIDGE_TLS_KEY` | Yes | — | Path to the TLS private key (PEM). **Secret — never commit; `chmod 600`.** |
 | `GJC_BRIDGE_HOST` | No | `127.0.0.1` | Bind hostname. |
 | `GJC_BRIDGE_PORT` | No | `4077` | Bind port (1–65535). |
-| `GJC_BRIDGE_SCOPES` | No | `prompt` | Comma-separated coarse command scopes to grant. Valid scopes: `prompt`, `control`, `bash`, `export`, `session`, `model`, `message:read`, `host_tools`, `host_uri`, `admin`. The `prompt` floor is always present. |
+| `GJC_BRIDGE_SCOPES` | No | `prompt` | Parsed for dormant command-surface compatibility. Valid scopes: `prompt`, `control`, `bash`, `export`, `session`, `model`, `message:read`, `host_tools`, `host_uri`, `admin`. The default endpoint matrix still advertises no accepted scopes and rejects commands before scope checks. |
 
 Local development with a self-signed certificate must add the local CA to the
 client trust store; there is no plaintext or certificate-verification-bypass mode.
