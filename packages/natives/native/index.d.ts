@@ -392,8 +392,8 @@ export declare function countTokens(input: string | Array<string>, encoding?: En
 export declare function detectMacOSAppearance(): MacOSAppearance | null
 
 /**
- * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old, new)`
- * with default options. Returns ordered `{added, removed, value}` parts.
+ * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old,
+ * new)` with default options. Returns ordered `{added, removed, value}` parts.
  */
 export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
 
