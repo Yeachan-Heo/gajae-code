@@ -590,6 +590,9 @@ export default class Harness extends Command {
 		if (process.env.GJC_HARNESS_RPC_COMMAND) {
 			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
 		}
+		if (process.env.GJC_HARNESS_TEST_NODE_MODULES) {
+			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
+		}
 		const ownerCommand = this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ");
 		const shellCommand = `exec env ${envAssignments.join(" ")} ${ownerCommand}`;
 		const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, "-c", cwd, shellCommand], {
@@ -620,7 +623,13 @@ export default class Harness extends Command {
 		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,
-			env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
+			env: {
+				...process.env,
+				GJC_HARNESS_STATE_ROOT: root,
+				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
+					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
+					: {}),
+			},
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
