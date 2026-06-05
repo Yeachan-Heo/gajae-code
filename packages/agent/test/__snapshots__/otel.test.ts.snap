@@ -1,0 +1,20 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`agent-loop OTEL instrumentation captures bounded dashboard summary content when requested: summary request messages include bounded real content 1`] = `
+[
+  {
+    "content": "sys-instruction",
+    "role": "system",
+  },
+  {
+    "content": "hi",
+    "role": "user",
+  },
+]
+`;
+
+exports[`agent-loop OTEL instrumentation captures bounded dashboard summary content when requested: summary response text includes bounded real content 1`] = `
+[
+  "hi back",
+]
+`;

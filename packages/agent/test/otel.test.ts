@@ -380,13 +380,10 @@ describe("agent-loop OTEL instrumentation", () => {
 		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
 
 		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
-		const request = JSON.parse(chat?.attributes[PiGenAIAttr.RequestMessages] as string) as Array<{
-			content: unknown;
-			role: string;
-		}>;
+		const request = JSON.parse(chat?.attributes[PiGenAIAttr.RequestMessages] as string);
 		const responseText = JSON.parse(chat?.attributes[PiGenAIAttr.ResponseText] as string);
-		expect(request.map(message => message.role)).toEqual(["system", "user"]);
-		expect(responseText).toEqual(["hi back"]);
+		expect(request).toMatchSnapshot("summary request messages include bounded real content");
+		expect(responseText).toMatchSnapshot("summary response text includes bounded real content");
 		expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
 		expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
 	});
@@ -433,10 +430,11 @@ describe("agent-loop OTEL instrumentation", () => {
 				...MOCK_IDENT,
 				responses: [{ content: ["hi back"], stopReason: "stop" }],
 			});
+			const warnings: unknown[] = [];
 			const config: AgentLoopConfig = {
 				model: mock.model,
 				convertToLlm: identityConverter,
-				telemetry: {},
+				telemetry: { onTelemetryWarning: warning => warnings.push(warning) },
 			};
 			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
 			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
@@ -447,6 +445,13 @@ describe("agent-loop OTEL instrumentation", () => {
 			]);
 			expect(JSON.parse(chat?.attributes[GenAIAttr.OutputMessages] as string)).toEqual([
 				{ role: "assistant", parts: [{ type: "text", content: "hi back" }], finish_reason: "stop" },
+			]);
+			expect(warnings).toEqual([
+				{
+					code: "full_content_capture_env_active",
+					message:
+						"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=full enables full GenAI message content capture. Use OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=summary for bounded telemetry summaries.",
+				},
 			]);
 		} finally {
 			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;

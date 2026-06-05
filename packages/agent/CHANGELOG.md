@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Moved the env-driven full message content capture warning into agent-core telemetry resolution so direct `@gajae-code/agent-core` consumers receive `full_content_capture_env_active` when `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=full` is used without an explicit `captureMessageContent` override.
+
+### Changed
+
+- Clarified that telemetry `summary` content capture emits bounded real-content snippets in `pi.gen_ai.*` attributes and is not redacted or PII-free.
+
 ## [0.2.4] - 2026-06-02
 
 ### Added

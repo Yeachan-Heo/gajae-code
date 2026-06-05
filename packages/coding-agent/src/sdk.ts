@@ -3,7 +3,6 @@ import {
 	type AgentEvent,
 	type AgentMessage,
 	type AgentTelemetryConfig,
-	type AgentTelemetryWarning,
 	type AgentTool,
 	AppendOnlyContextManager,
 	INTENT_FIELD,
@@ -32,35 +31,6 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
-
-const CONTENT_CAPTURE_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
-let hasWarnedFullCapture = false;
-
-export function resetFullCaptureEnvWarningForTest(): void {
-	hasWarnedFullCapture = false;
-}
-
-export function warnIfEnvFullContentCaptureActive(telemetry: AgentTelemetryConfig | undefined): void {
-	if (!telemetry || hasWarnedFullCapture) return;
-	if (telemetry.captureMessageContent !== undefined) return;
-	if (process.env[CONTENT_CAPTURE_ENV]?.trim().toLowerCase() !== "full") return;
-	hasWarnedFullCapture = true;
-	const warning = {
-		code: "full_content_capture_env_active" as const,
-		message:
-			`${CONTENT_CAPTURE_ENV}=full enables full GenAI message content capture. ` +
-			`Use ${CONTENT_CAPTURE_ENV}=summary for bounded telemetry summaries.`,
-	} satisfies AgentTelemetryWarning;
-	try {
-		telemetry.onTelemetryWarning?.(warning);
-	} catch (error) {
-		logger.warn("Telemetry warning hook failed", {
-			code: warning.code,
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
-	logger.warn(warning.message, { code: warning.code });
-}
 
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { loadCapability } from "./capability";
@@ -1780,7 +1750,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? undefined
 				: serviceTierSetting;
 
-		warnIfEnvFullContentCaptureActive(options.telemetry);
 		const appendOnlyContext =
 			model && resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
 				? new AppendOnlyContextManager()

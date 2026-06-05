@@ -55,6 +55,9 @@ export const DEFAULT_TRACER_NAME = "@gajae-code/agent-core";
 
 /** Env var matching the OTEL semconv content-capture toggle. */
 const CONTENT_CAPTURE_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
+const FULL_CONTENT_CAPTURE_ENV_WARNING =
+	`${CONTENT_CAPTURE_ENV}=full enables full GenAI message content capture. ` +
+	`Use ${CONTENT_CAPTURE_ENV}=summary for bounded telemetry summaries.`;
 
 const MAX_TELEMETRY_ARRAY_ITEMS = 64;
 const MAX_TELEMETRY_MESSAGE_COUNT = 16;
@@ -327,12 +330,16 @@ export interface AgentTelemetryConfig {
 	/**
 	 * Capture request/response content. Programmatic `true` preserves the
 	 * historical full payload capture because code config is an explicit opt-in;
-	 * `"summary"` emits bounded dashboard-friendly summaries; `"full"` emits
-	 * both summaries and full OTEL message payloads.
+	 * `"summary"` emits bounded dashboard-friendly summaries in
+	 * `pi.gen_ai.request.messages`, `pi.gen_ai.response.text`, and related
+	 * `pi.gen_ai.*` attributes. Summary mode is not redacted or PII-free: text is
+	 * truncated to bounded snippets, not removed. `"full"` emits both summaries
+	 * and full OTEL message payloads.
 	 *
 	 * Defaults to the value of the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
 	 * env var (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
-	 * `"full"` => `"full"`).
+	 * `"full"` => `"full"`). Env-driven `"full"` capture emits a
+	 * `full_content_capture_env_active` telemetry warning once per process.
 	 */
 	readonly captureMessageContent?: TelemetryContentCapture;
 	/** Extra attributes merged onto every emitted span. */
@@ -420,8 +427,9 @@ export function resolveTelemetry(
 ): AgentTelemetry | undefined {
 	if (!config) return undefined;
 	const tracer = config.tracer ?? trace.getTracer(config.tracerName ?? DEFAULT_TRACER_NAME);
+	const contentCaptureFromEnv = config.captureMessageContent === undefined;
 	const contentCapture = resolveContentCapture(config.captureMessageContent);
-	return {
+	const telemetry = {
 		config,
 		tracer,
 		captureMessageContent: contentCapture === "full",
@@ -430,9 +438,12 @@ export function resolveTelemetry(
 		agent: config.agent,
 		collector: new AgentRunCollector(),
 	};
+	warnIfEnvFullContentCaptureActive(telemetry, contentCaptureFromEnv);
+	return telemetry;
 }
 
 let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
+let hasWarnedFullContentCaptureEnv = false;
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
 	const raw = process.env[CONTENT_CAPTURE_ENV];
@@ -453,6 +464,7 @@ function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 
 export function resetContentCaptureEnvCacheForTest(): void {
 	contentCaptureEnvCache = undefined;
+	hasWarnedFullContentCaptureEnv = false;
 }
 
 function resolveContentCapture(value: TelemetryContentCapture | undefined): ResolvedTelemetryContentCapture {
@@ -460,6 +472,15 @@ function resolveContentCapture(value: TelemetryContentCapture | undefined): Reso
 	if (capture === true || capture === "full") return "full";
 	if (capture === "summary") return "summary";
 	return "none";
+}
+
+function warnIfEnvFullContentCaptureActive(telemetry: AgentTelemetry, contentCaptureFromEnv: boolean): void {
+	if (!contentCaptureFromEnv || telemetry.contentCapture !== "full" || hasWarnedFullContentCaptureEnv) return;
+	hasWarnedFullContentCaptureEnv = true;
+	emitTelemetryWarning(telemetry, {
+		code: "full_content_capture_env_active",
+		message: FULL_CONTENT_CAPTURE_ENV_WARNING,
+	});
 }
 
 /**
