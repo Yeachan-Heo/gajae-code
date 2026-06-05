@@ -22,6 +22,7 @@ import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
 import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
 import {
+	canonicalWorkspacePath,
 	generateSessionId,
 	readEvents,
 	readSessionState,
@@ -128,8 +129,12 @@ function gitOutput(workspace: string, args: string[]): string | null {
 	}
 }
 
+function resolveInputWorkspace(input: Record<string, unknown>): string {
+	return canonicalWorkspacePath(typeof input.workspace === "string" ? input.workspace : process.cwd());
+}
+
 function buildPreflight(input: Record<string, unknown>): HarnessPreflight {
-	const workspace = typeof input.workspace === "string" ? input.workspace : process.cwd();
+	const workspace = resolveInputWorkspace(input);
 	const declaredBranch = typeof input.branch === "string" && input.branch.trim() ? input.branch.trim() : null;
 	const blockers: string[] = [];
 	const gitRoot = gitOutput(workspace, ["rev-parse", "--show-toplevel"]);
@@ -448,7 +453,7 @@ export default class Harness extends Command {
 		try {
 			const input = parseInput(flags.input);
 			const sessionId = flags.session ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
-			const expectedWorkspace = typeof input.workspace === "string" ? input.workspace : undefined;
+			const expectedWorkspace = typeof input.workspace === "string" ? resolveInputWorkspace(input) : undefined;
 			if (verb !== "start" && sessionId) {
 				root = await resolveHarnessSessionRoot(root, sessionId, process.env, { expectedWorkspace });
 			}
@@ -671,7 +676,7 @@ export default class Harness extends Command {
 			process.exitCode = 1;
 			return;
 		}
-		const workspace = typeof input.workspace === "string" ? input.workspace : process.cwd();
+		const workspace = resolveInputWorkspace(input);
 		const sessionId = typeof input.sessionId === "string" ? input.sessionId : generateSessionId();
 		const eventsPath = `${root}/sessions/${sessionId}/events.jsonl`;
 		const leasePath = `${root}/sessions/${sessionId}/lease.json`;

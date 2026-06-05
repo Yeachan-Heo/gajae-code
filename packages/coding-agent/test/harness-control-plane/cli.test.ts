@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appendEvent, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
@@ -116,6 +116,32 @@ async function appendSignal(sessionId: string, cursor: number, signal: string): 
 }
 
 describe("gjc harness CLI (foundation)", () => {
+	it("test CLI env cleanup removes overlapping created links and preserves pre-existing links", async () => {
+		const fakeRepo = await mkdtemp(path.join(tmpdir(), "harness-cli-env-repo-"));
+		try {
+			const packageDir = path.join(fakeRepo, "packages", "ai");
+			await mkdir(packageDir, { recursive: true });
+			await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@gajae-code/ai" }), "utf8");
+			const linkPath = path.join(fakeRepo, "node_modules", "@gajae-code", "ai");
+
+			const first = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			const second = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+			first.cleanup();
+			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+			second.cleanup();
+			expect(await Bun.file(linkPath).exists()).toBe(false);
+
+			await mkdir(path.dirname(linkPath), { recursive: true });
+			await symlink(packageDir, linkPath, "dir");
+			const withPreexistingLink = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			withPreexistingLink.cleanup();
+			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+		} finally {
+			await rm(fakeRepo, { recursive: true, force: true });
+		}
+	});
+
 	it("preflight rejects a declared branch that differs from the actual checkout", async () => {
 		await initCleanGitWorkspace();
 		const res = runHarness([
@@ -173,6 +199,36 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.json.evidence.handle.issueOrPr).toBe("266");
 		expect(res.json.evidence.preflight.ok).toBe(true);
 	});
+
+	it("resolves documented relative workspace sessions across caller cwd changes", async () => {
+		await initCleanGitWorkspace();
+		const siblingCwd = await mkdtemp(path.join(tmpdir(), "harness-cli-other-cwd-"));
+		try {
+			const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace: "." })]);
+			expect(started.code).toBe(0);
+			const sessionId = started.json.state.sessionId;
+			expect(started.json.evidence.handle.workspace).toBe(workspace);
+
+			const observed = runHarnessInCwd(
+				["observe", "--session", sessionId, "--input", JSON.stringify({ workspace: "." })],
+				siblingCwd,
+				{ ...cliEnv.env },
+			);
+			expect(observed.code).toBe(1);
+			expect(observed.json.error).toContain("session_workspace_mismatch");
+
+			const observedFromWorkspace = runHarnessInCwd(
+				["observe", "--session", sessionId, "--input", JSON.stringify({ workspace: "." })],
+				workspace,
+				{ ...cliEnv.env },
+			);
+			expect(observedFromWorkspace.code).toBe(0);
+			expect(observedFromWorkspace.json.evidence.observation.cwd).toBe(workspace);
+		} finally {
+			await rm(siblingCwd, { recursive: true, force: true });
+		}
+	});
+
 	it("start creates a session and reports submit owner-not-live", () => {
 		const res = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
 		expect(res.code).toBe(0);

@@ -13,6 +13,12 @@ interface LinkedWorkspacePackage {
 	packageDir: string;
 }
 
+interface RepoLinkMarker {
+	createdAt: string;
+	done?: boolean;
+	links: string[];
+}
+
 export interface HarnessCliEnv {
 	env: NodeJS.ProcessEnv;
 	cleanup(): void;
@@ -40,16 +46,29 @@ function collectWorkspacePackages(repoRoot: string): LinkedWorkspacePackage[] {
 	return packages;
 }
 
-function linkWorkspacePackages(scopeDir: string, packages: LinkedWorkspacePackage[]): void {
+function linkWorkspacePackages(scopeDir: string, packages: LinkedWorkspacePackage[]): string[] {
 	fs.mkdirSync(scopeDir, { recursive: true });
+	const createdLinks: string[] = [];
 	for (const pkg of packages) {
 		const unscopedName = pkg.name.slice("@gajae-code/".length);
 		const linkPath = path.join(scopeDir, unscopedName);
 		try {
 			fs.symlinkSync(pkg.packageDir, linkPath, "dir");
+			createdLinks.push(linkPath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
+	}
+	return createdLinks;
+}
+
+function readRepoLinkMarker(file: string): RepoLinkMarker | null {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as RepoLinkMarker;
+		return Array.isArray(parsed.links) ? parsed : null;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
 	}
 }
 
@@ -59,29 +78,28 @@ function createRepoNodeModulesLinks(repoRoot: string, packages: LinkedWorkspaceP
 	const markerDir = path.join(nodeModulesDir, ".gjc-harness-test-links");
 	const marker = path.join(markerDir, `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
 	fs.mkdirSync(markerDir, { recursive: true });
-	linkWorkspacePackages(scopeDir, packages);
-	fs.writeFileSync(
-		marker,
-		JSON.stringify({ createdAt: new Date().toISOString(), packages: packages.map(pkg => pkg.name) }),
-	);
+	const createdLinks = linkWorkspacePackages(scopeDir, packages);
+	const markerData: RepoLinkMarker = { createdAt: new Date().toISOString(), links: createdLinks };
+	fs.writeFileSync(marker, JSON.stringify(markerData));
 	return () => {
-		fs.rmSync(marker, { force: true });
 		// Leave node_modules itself alone: it may be a real install. Remove only links
-		// that still point at this repo's workspace packages and only after this test
-		// process has released its marker. This keeps concurrent test files from
-		// deleting each other's resolver surface.
-		const activeMarkers = fs.existsSync(markerDir)
-			? fs.readdirSync(markerDir).filter(name => name.endsWith(".json"))
+		// these helpers actually created, and only after every overlapping helper has
+		// marked its marker done. Done markers retain link ownership metadata so the
+		// final cleanup removes links created by earlier helpers without touching
+		// pre-existing workspace-package symlinks.
+		fs.writeFileSync(marker, JSON.stringify({ ...markerData, done: true }));
+		const markerFiles = fs.existsSync(markerDir)
+			? fs
+					.readdirSync(markerDir)
+					.filter(name => name.endsWith(".json"))
+					.map(name => path.join(markerDir, name))
 			: [];
-		if (activeMarkers.length > 0) return;
-		for (const pkg of packages) {
-			const unscopedName = pkg.name.slice("@gajae-code/".length);
-			const linkPath = path.join(scopeDir, unscopedName);
+		const markers = markerFiles.map(file => readRepoLinkMarker(file)).filter(marker => marker !== null);
+		if (markers.some(marker => marker.done !== true)) return;
+		const linksToRemove = new Set(markers.flatMap(marker => marker.links));
+		for (const linkPath of linksToRemove) {
 			try {
-				if (
-					fs.lstatSync(linkPath).isSymbolicLink() &&
-					fs.realpathSync(linkPath) === fs.realpathSync(pkg.packageDir)
-				) {
+				if (fs.lstatSync(linkPath).isSymbolicLink()) {
 					fs.rmSync(linkPath, { force: true });
 				}
 			} catch (error) {
@@ -112,6 +130,7 @@ function createRepoNodeModulesLinks(repoRoot: string, packages: LinkedWorkspaceP
 
 export function createHarnessCliEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv = process.env): HarnessCliEnv {
 	const nodePathRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-harness-node-path-"));
+	const registryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-harness-root-registry-"));
 	const packages = collectWorkspacePackages(repoRoot);
 	linkWorkspacePackages(path.join(nodePathRoot, "@gajae-code"), packages);
 	const cleanupRepoLinks = createRepoNodeModulesLinks(repoRoot, packages);
@@ -120,6 +139,7 @@ export function createHarnessCliEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv
 	const env: NodeJS.ProcessEnv = {
 		...baseEnv,
 		[WORKSPACE_NODE_MODULES_ENV]: path.join(repoRoot, "node_modules"),
+		GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot,
 		NODE_PATH: existingNodePath ? `${nodePathRoot}${path.delimiter}${existingNodePath}` : nodePathRoot,
 	};
 
@@ -128,6 +148,7 @@ export function createHarnessCliEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv
 		cleanup() {
 			cleanupRepoLinks();
 			fs.rmSync(nodePathRoot, { recursive: true, force: true });
+			fs.rmSync(registryRoot, { recursive: true, force: true });
 		},
 	};
 }

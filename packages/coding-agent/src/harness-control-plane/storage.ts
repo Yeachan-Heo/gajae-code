@@ -34,8 +34,12 @@ interface ResolveHarnessSessionRootOptions {
 	expectedWorkspace?: string;
 }
 
+export function canonicalWorkspacePath(workspace: string): string {
+	return path.resolve(workspace);
+}
+
 function samePath(left: string, right: string): boolean {
-	return path.resolve(left) === path.resolve(right);
+	return canonicalWorkspacePath(left) === canonicalWorkspacePath(right);
 }
 
 async function ensurePrivateDir(dir: string): Promise<void> {
@@ -52,7 +56,9 @@ function sessionMatchesWorkspace(state: SessionState, expectedWorkspace: string)
 	return samePath(state.handle.workspace, expectedWorkspace);
 }
 
-function harnessRootRegistryDir(_env: NodeJS.ProcessEnv = process.env): string {
+function harnessRootRegistryDir(env: NodeJS.ProcessEnv = process.env): string {
+	const override = env.GJC_HARNESS_ROOT_REGISTRY_DIR?.trim();
+	if (override) return path.resolve(override);
 	return path.join(os.tmpdir(), `gjch${process.getuid?.() ?? "u"}`, "harness-roots");
 }
 
@@ -249,30 +255,38 @@ export async function resolveHarnessSessionRoot(
 ): Promise<string> {
 	assertSafeSessionId(sessionId);
 	const resolvedRoot = path.resolve(root);
-	const localState = await readSessionState(resolvedRoot, sessionId);
-	if (localState !== null) {
-		if (options.expectedWorkspace && !sessionMatchesWorkspace(localState, options.expectedWorkspace)) {
-			throw new StorageError(`session_workspace_mismatch:${sessionId}`, "session_workspace_mismatch");
+	const candidates: { root: string; state: SessionState }[] = [];
+	const seenRoots = new Set<string>();
+	const addCandidate = async (candidateRoot: string): Promise<void> => {
+		const candidate = path.resolve(candidateRoot);
+		if (seenRoots.has(candidate)) return;
+		seenRoots.add(candidate);
+		const state = await readSessionState(candidate, sessionId);
+		if (state !== null) candidates.push({ root: candidate, state });
+	};
+
+	await addCandidate(resolvedRoot);
+	const registry = await readHarnessRootRegistry(sessionId, env);
+	for (const entry of registry.roots) await addCandidate(entry.root);
+
+	if (!options.expectedWorkspace) {
+		if (candidates.some(candidate => candidate.root === resolvedRoot)) return resolvedRoot;
+		if (candidates.length === 1) return candidates[0].root;
+		if (candidates.length > 1) {
+			throw new StorageError(`ambiguous_harness_session_root:${sessionId}`, "ambiguous_harness_session_root");
 		}
 		return resolvedRoot;
 	}
 
-	const registry = await readHarnessRootRegistry(sessionId, env);
-	const candidates: { root: string; state: SessionState }[] = [];
-	for (const entry of registry.roots) {
-		const candidate = path.resolve(entry.root);
-		const state = await readSessionState(candidate, sessionId);
-		if (state !== null) candidates.push({ root: candidate, state });
-	}
-
-	const matchingCandidates = options.expectedWorkspace
-		? candidates.filter(candidate => sessionMatchesWorkspace(candidate.state, options.expectedWorkspace as string))
-		: candidates;
+	const expectedWorkspace = canonicalWorkspacePath(options.expectedWorkspace);
+	const matchingCandidates = candidates.filter(candidate =>
+		sessionMatchesWorkspace(candidate.state, expectedWorkspace),
+	);
 	if (matchingCandidates.length === 1) return matchingCandidates[0].root;
 	if (matchingCandidates.length > 1) {
 		throw new StorageError(`ambiguous_harness_session_root:${sessionId}`, "ambiguous_harness_session_root");
 	}
-	if (options.expectedWorkspace && candidates.length > 0) {
+	if (candidates.length > 0) {
 		throw new StorageError(`session_workspace_mismatch:${sessionId}`, "session_workspace_mismatch");
 	}
 	return resolvedRoot;
