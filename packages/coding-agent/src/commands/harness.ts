@@ -9,13 +9,17 @@
  * until the RuntimeOwner (M3+) lands.
  */
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
-import { RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
+import { type ResolvedOwner, RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
+import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
+import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
+import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
 import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
 import {
 	generateSessionId,
@@ -23,6 +27,7 @@ import {
 	readSessionState,
 	resolveHarnessRoot,
 	sessionPaths,
+	writeReceiptImmutable,
 	writeSessionState,
 } from "../harness-control-plane/storage";
 import {
@@ -31,6 +36,7 @@ import {
 	type GitDelta,
 	type Harness as HarnessKind,
 	type Observation,
+	type RecoveryClassification,
 	type RetryBudget,
 	SESSION_SCHEMA_VERSION,
 	type SessionHandle,
@@ -198,6 +204,7 @@ async function buildObservation(
 	const observedSignals = ["SessionStart"];
 	for (const event of events.slice(-200)) {
 		pushUnique(observedSignals, (event.evidence as { signal?: unknown } | undefined)?.signal);
+		if (event.kind === "prompt_accepted") pushUnique(observedSignals, "prompt-accepted");
 	}
 	const terminalEvent = completedTerminalEvent(events);
 	const lastEventAt = events.at(-1)?.createdAt;
@@ -214,6 +221,114 @@ async function buildObservation(
 		},
 		completedTerminalEvent: terminalEvent,
 	};
+}
+interface OwnerExitEvidence {
+	reason: string;
+	leaseStatus: string;
+	pid: number | null;
+	endpointPresent: boolean;
+	heartbeatAt: string | null;
+	expiresAt: string | null;
+	lastEventKind: string | null;
+	lastEventAt: string | null;
+	lastSignal: string | null;
+	promptAcceptedSeen: boolean;
+	completedSeen: boolean;
+}
+
+async function buildOwnerExitEvidence(root: string, state: SessionState): Promise<OwnerExitEvidence> {
+	const lease = await readLease(root, state.sessionId);
+	const leaseStatus = classifyLeaseStatus(lease);
+	const events = await readEvents(root, state.sessionId, 0);
+	const lastEvent = events.at(-1) ?? null;
+	let lastSignal: string | null = null;
+	let promptAcceptedSeen = false;
+	let completedSeen = false;
+	for (const event of events) {
+		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
+		if (typeof signal === "string") lastSignal = signal;
+		if (event.kind === "prompt_accepted" || signal === "prompt-accepted") promptAcceptedSeen = true;
+		if (event.kind === "rpc_agent_completed" || signal === "completed") completedSeen = true;
+	}
+	let reason = "owner-not-live";
+	if (!lease) {
+		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-lease-missing";
+	} else if (leaseStatus === "dead") {
+		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-process-dead";
+	} else if (leaseStatus === "expiredAlive") {
+		reason = "owner-lease-expired";
+	} else if (leaseStatus === "epermAlive") {
+		reason = "owner-liveness-unknown-permission-denied";
+	} else {
+		reason = "owner-endpoint-unreachable";
+	}
+	return {
+		reason,
+		leaseStatus,
+		pid: lease?.pid ?? null,
+		endpointPresent: Boolean(lease?.endpoint?.path),
+		heartbeatAt: lease?.heartbeatAt ?? null,
+		expiresAt: lease?.expiresAt ?? null,
+		lastEventKind: lastEvent?.kind ?? null,
+		lastEventAt: lastEvent?.createdAt ?? null,
+		lastSignal,
+		promptAcceptedSeen,
+		completedSeen,
+	};
+}
+
+async function writeVanishReceiptForDecision(
+	root: string,
+	state: SessionState,
+	observation: Observation,
+	classification: RecoveryClassification,
+): Promise<string | null> {
+	if (!requiresVanishBeforeAction(classification)) return null;
+	const dirty = observation.gitDelta === "dirty" || observation.gitDelta === "unknown";
+	const preservation = dirty ? preserveDirtyWorktree(observation.cwd) : null;
+	const evidence: VanishEvidence = {
+		classification,
+		gitDelta: observation.gitDelta,
+		gitStatusPorcelain: preservation
+			? `tracked:${preservation.trackedDiffSha256};untracked:${preservation.untrackedManifest.length}`
+			: observation.observedSignals.join(","),
+		untrackedManifest: preservation?.untrackedManifest ?? [],
+		preservation: preservation?.stashRef ? "stash" : "snapshot",
+		stashRef: preservation?.stashRef ?? null,
+		snapshotComplete: preservation?.snapshotComplete ?? true,
+		forbiddenActions: dirty ? ["restart-clean", "delete", "reset"] : [],
+	};
+	const receipt = buildReceipt<VanishEvidence>({
+		receiptId: `vanish-${Date.now()}-${randomBytes(4).toString("hex")}`,
+		sessionId: state.sessionId,
+		family: "vanish",
+		source: "cli-recover",
+		subject: {
+			workspace: observation.cwd,
+			branch: observation.branch,
+			head: null,
+			commit: null,
+		},
+		evidence,
+	});
+	await writeReceiptImmutable(root, state.sessionId, "vanish", receipt.receiptId, receipt);
+	return receipt.receiptId;
+}
+
+function updateStateWithRestoredOwner(state: SessionState, leasePath: string, resolved: ResolvedOwner): void {
+	state.lifecycle = "observing";
+	state.blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
+	state.handle.processHandle = {
+		kind: "runtime-owner",
+		ownerId: resolved.lease?.ownerId ?? null,
+		pid: resolved.lease?.pid ?? null,
+	};
+	state.handle.ownerHandle = {
+		leasePath,
+		endpoint: resolved.socketPath,
+		heartbeatAt: resolved.lease?.heartbeatAt ?? null,
+	};
+	state.updatedAt = nowIso();
 }
 
 function isOwnerLivenessBlocker(blocker: string): boolean {
@@ -676,6 +791,10 @@ export default class Harness extends Command {
 		state = await reconcileCompletedOwnerExited(root, state, observation, completedTerminalEvent);
 		const vanishedOwnerBlock = needsVanishedOwnerBlock(state, observation, completedTerminalEvent);
 		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
+		const ownerExit =
+			!ownerLive && (vanishedOwnerBlock || completedTerminalEvent)
+				? await buildOwnerExitEvidence(root, state)
+				: null;
 		writeJson(
 			buildResponse(state, ownerLive, {
 				observation: { ...observation, lifecycle: state.lifecycle },
@@ -686,6 +805,7 @@ export default class Harness extends Command {
 				...(completedTerminalEvent && !ownerLive
 					? { completedOwnerExited: true, terminalResult: completedTerminalEvent }
 					: {}),
+				...(ownerExit ? { ownerExit } : {}),
 			}),
 		);
 	}
@@ -767,7 +887,9 @@ export default class Harness extends Command {
 			buildResponse(state, ownerLiveFor(state), {
 				events,
 				cursor: nextCursor,
-				note: "tail-only; live producer (owner) lands in M3/M5",
+				note: "tail-only; events are preserved after owner exit",
+				ownerLive: ownerLiveFor(state),
+				ownerExit: ownerLiveFor(state) ? null : await buildOwnerExitEvidence(root, state),
 			}),
 		);
 	}
@@ -802,21 +924,62 @@ export default class Harness extends Command {
 	async #recoverWithoutOwner(root: string, sessionId: string, input: Record<string, unknown>): Promise<void> {
 		const budget = resolveRetryBudget(input);
 		let state = await loadState(root, sessionId);
+		const beforeExit = await buildOwnerExitEvidence(root, state);
 		const { observation, completedTerminalEvent } = await buildObservation(root, state, false);
 		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
 		const decision = classifyRecovery({
 			observation: { ...observation, lifecycle: state.lifecycle },
 			retryBudget: budget,
 		});
+		const vanishReceiptId = await writeVanishReceiptForDecision(root, state, observation, decision.classification);
+		const restoredOwner =
+			decision.ownerRequired && beforeExit.endpointPresent
+				? await this.#spawnDetachedOwner(root, sessionId, state.handle.workspace)
+				: null;
+		if (restoredOwner?.live) {
+			const resolved = await resolveOwner(root, sessionId);
+			if (resolved.live && resolved.socketPath) {
+				updateStateWithRestoredOwner(state, state.handle.ownerHandle.leasePath, resolved);
+				if (restoredOwner.tmuxSessionName)
+					state.handle.viewportHandle.tmuxSessionName = restoredOwner.tmuxSessionName;
+				await writeSessionState(root, state);
+				writeJson(
+					buildResponse(state, true, {
+						pending: false,
+						restoredOwner: true,
+						decision,
+						observation: { ...observation, lifecycle: state.lifecycle, ownerLive: true },
+						ownerExit: beforeExit,
+						ownerRuntime: restoredOwner.runtime,
+						...(restoredOwner.fallbackReason ? { ownerFallbackReason: restoredOwner.fallbackReason } : {}),
+						...(vanishReceiptId ? { vanishReceiptId } : {}),
+					}),
+				);
+				return;
+			}
+		}
+		const afterExit = await buildOwnerExitEvidence(root, state);
 		writeJson(
 			buildResponse(
 				state,
 				false,
 				{
 					pending: false,
-					reason: "owner-not-live",
+					reason: afterExit.reason,
 					decision,
 					observation: { ...observation, lifecycle: state.lifecycle },
+					ownerExit: afterExit,
+					...(restoredOwner
+						? {
+								restoreAttempt: {
+									runtime: restoredOwner.runtime,
+									live: restoredOwner.live,
+									fallbackReason: restoredOwner.fallbackReason,
+									blockerReason: restoredOwner.blockerReason,
+								},
+							}
+						: {}),
+					...(vanishReceiptId ? { vanishReceiptId } : {}),
 				},
 				false,
 			),

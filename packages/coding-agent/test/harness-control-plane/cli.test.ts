@@ -358,12 +358,100 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.code).toBe(1);
 		assertContract(res.json);
 		expect(res.json.evidence.pending).toBe(false);
-		expect(res.json.evidence.reason).toBe("owner-not-live");
+		expect(res.json.evidence.reason).toBe("owner-exited-after-prompt-acceptance");
 		expect(res.json.evidence.decision.classification).toBe("restart-clean");
 		expect(res.json.evidence.decision.requiredReceiptFamily).toBe("vanish");
 		expect(res.json.evidence.observation.lifecycle).toBe("blocked");
 		expect(res.json.state.lifecycle).toBe("blocked");
 		expect(res.json.state.blockers).toContain("owner-vanished:clean");
+	});
+
+	it("recover without owner preserves vanish evidence and explains post-acceptance owner exit", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		state.handle.ownerHandle.endpoint = "synthetic-dead-owner.sock";
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendEvent(root, sessionId, {
+			eventId: "evt-prompt-accepted",
+			cursor: 1,
+			createdAt: "2026-06-03T00:00:01.000Z",
+			severity: "info",
+			kind: "prompt_accepted",
+			state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { reason: "protocol-ack-single-flight", agentStartCursor: 1 },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-exited", leaseEpoch: 1 },
+		});
+		await appendSignal(sessionId, 2, "tool-call");
+
+		const res = runHarness(["recover", "--session", sessionId]);
+
+		expect(res.code).toBe(1);
+		assertContract(res.json);
+		expect(res.json.evidence.reason).toBe("owner-exited-after-prompt-acceptance");
+		expect(res.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-exited-after-prompt-acceptance",
+			leaseStatus: "missing",
+			lastEventKind: "rpc_tool_call",
+			lastSignal: "tool-call",
+			promptAcceptedSeen: true,
+			completedSeen: false,
+		});
+		expect(res.json.evidence.vanishReceiptId).toMatch(/^vanish-/);
+		expect(res.json.evidence.observation.observedSignals).toEqual(
+			expect.arrayContaining(["prompt-accepted", "tool-call"]),
+		);
+		expect(res.json.state.lifecycle).toBe("blocked");
+		expect(res.json.state.blockers).toContain("owner-vanished:clean");
+	});
+
+	it("observe and events expose public-safe owner exit evidence after prompt acceptance", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		expect(state).toBeTruthy();
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		state.updatedAt = "2026-06-03T00:00:00.000Z";
+		await writeSessionState(root, state);
+		await appendEvent(root, sessionId, {
+			eventId: "evt-prompt-accepted",
+			cursor: 1,
+			createdAt: "2026-06-03T00:00:01.000Z",
+			severity: "info",
+			kind: "prompt_accepted",
+			state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { reason: "protocol-ack-single-flight", agentStartCursor: 1 },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-exited", leaseEpoch: 1 },
+		});
+
+		const observed = runHarness(["observe", "--session", sessionId]);
+		const events = runHarness(["events", "--session", sessionId]);
+
+		expect(observed.code).toBe(0);
+		expect(observed.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-exited-after-prompt-acceptance",
+			lastEventKind: "prompt_accepted",
+			promptAcceptedSeen: true,
+			completedSeen: false,
+		});
+		expect(observed.json.evidence.observation.observedSignals).toContain("prompt-accepted");
+		expect(events.code).toBe(0);
+		expect(events.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-exited-after-prompt-acceptance",
+			lastEventKind: "prompt_accepted",
+			promptAcceptedSeen: true,
+			completedSeen: false,
+		});
+		expect(events.json.evidence.events).toHaveLength(1);
 	});
 
 	it("submit is blocked (accepted:false, owner-not-live) and never echoed-as-accepted", () => {
