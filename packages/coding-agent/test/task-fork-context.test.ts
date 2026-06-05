@@ -10,7 +10,7 @@ import { TaskTool } from "../src/task";
 import { getBundledAgent } from "../src/task/agents";
 import * as discoveryModule from "../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../src/task/types";
-import { taskSchema } from "../src/task/types";
+import { getTaskSchema, taskSchema } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -241,6 +241,23 @@ describe("fork context policy surface", () => {
 		).toBe(false);
 	});
 
+	test("independent task schema rejects inherited parent context", () => {
+		const independentSchema = getTaskSchema({ isolationEnabled: true, simpleMode: "independent" });
+
+		expect(
+			independentSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "ForkSeed", description: "d", assignment: "a", inheritContext: "bounded" }],
+			}).success,
+		).toBe(false);
+		expect(
+			independentSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "NoFork", description: "d", assignment: "a", inheritContext: "none" }],
+			}).success,
+		).toBe(true);
+	});
+
 	test("rejects inherited context before scheduling when the global gate is disabled", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": false }));
@@ -253,6 +270,27 @@ describe("fork context policy surface", () => {
 		} as TaskParams);
 
 		expect(getFirstText(result)).toContain("task.forkContext.enabled is false");
+		expect(registered).toBe(0);
+	});
+
+	test("rejects inherited context before scheduling in independent simple mode", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const tool = await TaskTool.create(
+			createSession({ "task.simple": "independent", "task.forkContext.enabled": true }, seedBuilder),
+		);
+		let registered = 0;
+		AsyncJobManager.setInstance({ register: () => `${++registered}` } as unknown as AsyncJobManager);
+
+		const result = await tool.execute("tool-call", {
+			agent: "executor",
+			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: "bounded" }],
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("task.simple is set to independent");
+		expect(getFirstText(result)).toContain("inheritContext for task(s) ForkSeed");
+		expect(result.details?.results).toEqual([]);
+		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(registered).toBe(0);
 	});
 

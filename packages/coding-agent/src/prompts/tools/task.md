@@ -26,6 +26,7 @@ Subagents have no conversation history. Every fact, file path, and direction the
 {{#if contextEnabled}}
 - `.inheritContext` (optional): fork-context mode for seeding the subagent with sanitized parent conversation. Omit it or set `"none"` for no copied context. `"receipt"` copies a minimal receipt-sized snapshot, `"last-turn"` copies only the latest exchange, `"bounded"` copies the bounded default snapshot, and `"full"` copies a larger snapshot up to the configured/model token cap. Non-`none` modes work only when global `task.forkContext.enabled` is true and the target agent declares `forkContext: allowed`; otherwise the call is rejected. Bundled agents that support it: `executor`, `architect`. Use inherited context only when the subagent's value depends on parent context; cloned tokens are billed to the child as fresh input and surfaced in task receipts as fork-context cloned-token accounting.
 {{/if}}
+{{#if independentMode}}- `.inheritContext`: independent mode cannot inherit parent conversation. Omit it or set `"none"`; any non-`none` value is rejected before scheduling.{{/if}}
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 - `spawnPlan` (optional): required before any batch with more than 4 tasks, and before a reviewer agent spawns `explore`; include whyParallel, whyNotLocal, independence, expectedReceiptShape, and maxInlineTokens.
 {{#if isolationEnabled}}- `isolated`: run in isolated env; use when tasks edit overlapping files{{/if}}

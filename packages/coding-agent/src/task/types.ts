@@ -81,7 +81,7 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 			.enum(["none", "receipt", "last-turn", "bounded", "full"])
 			.optional()
 			.describe(
-				"fork-context mode: none/omitted copies no parent context; receipt copies a minimal receipt-sized snapshot; last-turn copies only the latest exchange; bounded copies the sanitized bounded default; full copies a larger sanitized snapshot up to the configured/model token cap",
+				"fork-context mode: none/omitted copies no parent context; receipt copies a minimal receipt-sized snapshot; last-turn copies only the latest exchange; bounded copies the bounded default snapshot; full copies a larger sanitized snapshot up to the configured/model token cap",
 			),
 	});
 
@@ -91,7 +91,18 @@ export type TaskItem = z.infer<typeof taskItemSchema>;
 
 const createTaskSchema = (options: { isolationEnabled: boolean; simpleMode: TaskSimpleMode }) => {
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(options.simpleMode);
-	const itemSchema = createTaskItemSchema(contextEnabled);
+	let itemSchema = createTaskItemSchema(contextEnabled);
+	if (!contextEnabled) {
+		itemSchema = itemSchema.superRefine((item, ctx) => {
+			if (item.inheritContext !== undefined && item.inheritContext !== "none") {
+				ctx.addIssue({
+					code: "custom",
+					path: ["inheritContext"],
+					message: "Independent tasks cannot inherit parent context; omit inheritContext or set it to none.",
+				});
+			}
+		});
+	}
 
 	let schema = z.object({
 		agent: z.string().describe("agent type"),

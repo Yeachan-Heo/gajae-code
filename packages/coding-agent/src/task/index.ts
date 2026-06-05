@@ -215,6 +215,14 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 	if (!customSchemaEnabled && params.schema !== undefined) {
 		disallowedFields.push("schema");
 	}
+	if (!contextEnabled) {
+		const inheritedTaskIds = (params.tasks ?? [])
+			.filter(task => task.inheritContext !== undefined && task.inheritContext !== "none")
+			.map(task => task.id);
+		if (inheritedTaskIds.length > 0) {
+			disallowedFields.push(`inheritContext for task(s) ${inheritedTaskIds.join(", ")}`);
+		}
+	}
 	if (disallowedFields.length === 0) {
 		return undefined;
 	}
@@ -224,10 +232,10 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 	}
 
 	if (disallowedFields.length === 1) {
-		return `task.simple is set to independent, so the task tool does not accept \`${disallowedFields[0]}\`. Put everything the subagent needs inside each task assignment.`;
+		return `task.simple is set to independent, so the task tool does not accept ${disallowedFields[0].startsWith("inheritContext") ? disallowedFields[0] : `\`${disallowedFields[0]}\``}. Put everything the subagent needs inside each task assignment.`;
 	}
 
-	return "task.simple is set to independent, so the task tool does not accept `context` or `schema`. Put all required background and output expectations inside each task assignment or the selected agent definition.";
+	return `task.simple is set to independent, so the task tool does not accept ${disallowedFields.map(field => (field.startsWith("inheritContext") ? field : `\`${field}\``)).join(", ")}. Put all required background and output expectations inside each task assignment or the selected agent definition.`;
 }
 
 function getForkContextPolicy(agent: AgentDefinition): ForkContextPolicy {
