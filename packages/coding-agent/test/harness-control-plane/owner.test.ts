@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner } from "../../src/harness-control-plane/owner";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
-import { readEvents, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
+import {
+	readEvents,
+	readReceiptIndex,
+	readSessionState,
+	writeSessionState,
+} from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
 class FakeRpc implements HarnessRpc {
@@ -159,7 +164,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 		expect(warn?.severity).toBe("warn");
 	});
 
-	it("live owner reconcile clears stale vanished blockers and re-enables submit", async () => {
+	it("live owner reconcile preserves vanished blockers until recovery evidence", async () => {
 		const rpc = new FakeRpc();
 		await writeSessionState(root, {
 			...seedState(root),
@@ -172,12 +177,58 @@ describe("RuntimeOwner (in-process integration)", () => {
 		const obs = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>;
 
 		expect((obs.state as Record<string, unknown>).ownerLive).toBe(true);
-		expect((obs.state as Record<string, unknown>).lifecycle).toBe("observing");
-		expect((obs.state as Record<string, unknown>).blockers).not.toContain("owner-vanished:dirty");
-		expect(obs.nextAllowedActions).toContainEqual({ verb: "submit", available: true });
+		expect((obs.state as Record<string, unknown>).lifecycle).toBe("blocked");
+		expect((obs.state as Record<string, unknown>).blockers).toContain("owner-vanished:dirty");
+		expect(obs.nextAllowedActions).toContainEqual({ verb: "submit", available: false, reason: "lifecycle-blocked" });
+		const persisted = await readSessionState(root, SID);
+		expect(persisted?.lifecycle).toBe("blocked");
+		expect(persisted?.blockers).toContain("owner-vanished:dirty");
+	});
+
+	it("recover clears vanished blockers after writing vanish receipt evidence", async () => {
+		const rpc = new FakeRpc();
+		const init = Bun.spawnSync(["git", "init"], { cwd: root, stdout: "pipe", stderr: "pipe" });
+		expect(init.exitCode).toBe(0);
+		await writeSessionState(root, {
+			...seedState(root),
+			lifecycle: "blocked",
+			blockers: ["owner-vanished:dirty"],
+		});
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc, acceptanceTimeoutMs: 200 });
+		const info = await owner.start();
+
+		const res = (await callEndpoint(info.socketPath, { verb: "recover", input: {} })) as Record<string, unknown>;
+		const evidence = res.evidence as Record<string, unknown>;
+
+		expect(typeof evidence.vanishReceiptId).toBe("string");
+		expect((evidence.decision as Record<string, unknown>)?.classification).toBe("restart-preserve-delta");
+		expect((res.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((res.state as Record<string, unknown>).blockers).not.toContain("owner-vanished:dirty");
+		expect(await readReceiptIndex(root, SID, "vanish")).toHaveLength(1);
 		const persisted = await readSessionState(root, SID);
 		expect(persisted?.lifecycle).toBe("observing");
 		expect(persisted?.blockers).not.toContain("owner-vanished:dirty");
+	});
+
+	it("live owner reconcile clears detached startup false-negative blockers", async () => {
+		const rpc = new FakeRpc();
+		await writeSessionState(root, {
+			...seedState(root),
+			lifecycle: "blocked",
+			blockers: ["detached-owner-not-live"],
+		});
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc, acceptanceTimeoutMs: 200 });
+		const info = await owner.start();
+
+		const obs = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>;
+
+		expect((obs.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((obs.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((obs.state as Record<string, unknown>).blockers).not.toContain("detached-owner-not-live");
+		expect(obs.nextAllowedActions).toContainEqual({ verb: "submit", available: true });
+		const persisted = await readSessionState(root, SID);
+		expect(persisted?.lifecycle).toBe("observing");
+		expect(persisted?.blockers).not.toContain("detached-owner-not-live");
 	});
 
 	it("observe is owner-routed and reports ownerLive; retire releases the lease", async () => {

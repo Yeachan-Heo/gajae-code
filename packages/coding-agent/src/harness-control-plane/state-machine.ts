@@ -57,8 +57,9 @@ export function nextAllowedActions(lifecycle: HarnessLifecycle, ownerLive: boole
 	// `start` creates a new session; never re-applicable to an existing record.
 	add("start", false, "session-already-exists");
 
-	// `submit` is owner-routed: it requires a live owner and a non-terminal lifecycle.
+	// `submit` is owner-routed: it requires a live owner and a non-blocked, non-terminal lifecycle.
 	if (terminal) add("submit", false, `lifecycle-terminal:${lifecycle}`);
+	else if (lifecycle === "blocked") add("submit", false, "lifecycle-blocked");
 	else if (!ownerLive) add("submit", false, "owner-not-live");
 	else add("submit", true);
 

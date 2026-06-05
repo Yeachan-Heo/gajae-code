@@ -268,7 +268,7 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(persisted?.blockers).not.toContain("owner-vanished:clean");
 	});
 
-	it("observe reconciles completed clean owner exit away from stale dirty vanish blocker", async () => {
+	it("observe treats clean completed owner exit as terminal recovery evidence", async () => {
 		await initCleanGitWorkspace();
 		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
 		const sessionId = started.json.evidence.handle.sessionId as string;
