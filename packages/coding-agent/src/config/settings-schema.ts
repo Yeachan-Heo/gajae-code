@@ -1093,7 +1093,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "Auto-Promote Context",
-			description: "Promote to a larger-context model on context overflow instead of compacting",
+			description: "Temporarily switch to a configured larger-context target on context overflow before compacting",
 		},
 	},
 

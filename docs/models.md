@@ -631,24 +631,21 @@ Selecting a canonical entry stores the canonical selector. Selecting a provider 
 
 ## Context promotion (model-level fallback chains)
 
-Context promotion is an overflow recovery mechanism for small-context variants (for example `*-spark`) that automatically promotes to a larger-context sibling when the API rejects a request with a context length error.
+Context promotion is an overflow recovery mechanism for models with a configured `contextPromotionTarget`. When the API rejects a request with a context length error, the agent can temporarily switch to the configured larger-context target instead of compacting first.
+
+The target can look numerically older than the current model when that model has the larger configured prompt budget. For example, the OpenAI code provider links `gpt-5.5` to `gpt-5.4` because `gpt-5.4` is the larger-context target in that chain.
 
 ### Trigger and order
 
 When a turn fails with a context overflow error (e.g. `context_length_exceeded`), `AgentSession` attempts promotion **before** falling back to compaction:
 
-1. If `contextPromotion.enabled` is true, resolve a promotion target (see below).
-2. If a target is found, switch to it and retry the request — no compaction needed.
+1. If `contextPromotion.enabled` is true, resolve the current model's configured promotion target.
+2. If a target is found, temporarily switch to it and retry the request — no compaction needed.
 3. If no target is available, fall through to auto-compaction on the current model.
 
 ### Target selection
 
-Selection is model-driven, not role-driven:
-
-1. `currentModel.contextPromotionTarget` (if configured)
-2. smallest larger-context model on the same provider + API
-
-Candidates are ignored unless credentials resolve (`ModelRegistry.getApiKey(...)`).
+Selection is model-driven, not role-driven. The resolver uses `currentModel.contextPromotionTarget` and accepts either `provider/model-id` or a model id resolved within the current provider. A candidate is ignored if it is the current model, does not have a larger `contextWindow`, or cannot resolve credentials via `ModelRegistry.getApiKey(...)`.
 
 ### OpenAI code provider websocket handoff
 
@@ -659,7 +656,8 @@ If switching from/to `openai-codex-responses`, session provider state key `opena
 Promotion uses temporary switching (`setModelTemporary`):
 
 - recorded as a temporary `model_change` in session history
-- does not rewrite saved role mapping
+- does not rewrite saved role mapping or the user's default model preference
+- does not automatically switch the live session back after the retry succeeds; the promoted model remains active until the user selects another model or another recovery path changes it
 
 ### Configuring explicit fallback chains
 
@@ -680,7 +678,7 @@ providers:
         contextPromotionTarget: openai-code/gpt-5.3-openai-code
 ```
 
-The built-in model generator also assigns this automatically for `*-spark` models when a same-provider base model exists.
+Bundled OpenAI policy also assigns promotion targets automatically for known chains such as Spark variants -> `gpt-5.5` and `gpt-5.5` -> `gpt-5.4`.
 
 ## Compatibility and routing fields
 
