@@ -109,8 +109,14 @@ class CloseHoldingStorage implements SessionStorage {
 	rename(p: string, nextPath: string): Promise<void> {
 		return this.#inner.rename(p, nextPath);
 	}
+	renameSync(p: string, nextPath: string): void {
+		return this.#inner.renameSync(p, nextPath);
+	}
 	unlink(p: string): Promise<void> {
 		return this.#inner.unlink(p);
+	}
+	unlinkSync(p: string): void {
+		return this.#inner.unlinkSync(p);
 	}
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		return this.#inner.deleteSessionWithArtifacts(sessionPath);

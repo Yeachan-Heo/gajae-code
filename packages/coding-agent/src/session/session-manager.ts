@@ -38,8 +38,12 @@ import {
 	externalizeImageDataUrlSync,
 	isBlobRef,
 	isImageDataUrl,
+	MemoryBlobStore,
 	resolveImageData,
+	resolveImageDataSync,
 	resolveImageDataUrl,
+	resolveImageDataUrlSync,
+	resolveTextBlobSync,
 } from "./blob-store";
 import {
 	type BashExecutionMessage,
@@ -825,23 +829,44 @@ export async function loadEntriesFromFile(
  * Resolve blob references in loaded entries, restoring both session image blocks and persisted
  * provider image URLs back to the inline data expected by downstream transports. Mutates entries in place.
  */
-function hasImageUrl(value: unknown): value is { image_url: string } {
-	return typeof value === "object" && value !== null && "image_url" in value && typeof value.image_url === "string";
+function hasImageUrl(value: unknown): value is { image_url: string | { url?: string } } {
+	return typeof value === "object" && value !== null && "image_url" in value;
 }
 
-async function resolvePersistedImageUrlRefs(value: unknown, blobStore: BlobStore): Promise<void> {
+async function resolvePersistedBlobRefs(value: unknown, blobStore: BlobStore, key?: string): Promise<void> {
 	if (Array.isArray(value)) {
-		await Promise.all(value.map(item => resolvePersistedImageUrlRefs(item, blobStore)));
+		await Promise.all(value.map(item => resolvePersistedBlobRefs(item, blobStore, key)));
 		return;
 	}
 
 	if (typeof value !== "object" || value === null) return;
 
-	if (hasImageUrl(value) && isBlobRef(value.image_url)) {
-		value.image_url = await resolveImageDataUrl(blobStore, value.image_url);
+	if (isImageBlock(value) && isBlobRef(value.data)) {
+		value.data = await resolveImageData(blobStore, value.data);
 	}
 
-	await Promise.all(Object.values(value).map(item => resolvePersistedImageUrlRefs(item, blobStore)));
+	if (hasImageUrl(value)) {
+		if (typeof value.image_url === "string" && isBlobRef(value.image_url)) {
+			value.image_url = await resolveImageDataUrl(blobStore, value.image_url);
+		} else if (
+			typeof value.image_url === "object" &&
+			value.image_url !== null &&
+			typeof value.image_url.url === "string" &&
+			isBlobRef(value.image_url.url)
+		) {
+			value.image_url.url = await resolveImageDataUrl(blobStore, value.image_url.url);
+		}
+	}
+
+	await Promise.all(
+		Object.entries(value).map(async ([childKey, item]) => {
+			if (childKey === "data" && typeof item === "string" && isBlobRef(item) && key !== TEXT_CONTENT_KEY) {
+				(value as Record<string, unknown>)[childKey] = await resolveImageDataUrl(blobStore, item);
+				return;
+			}
+			await resolvePersistedBlobRefs(item, blobStore, childKey);
+		}),
+	);
 }
 
 async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
@@ -869,7 +894,7 @@ async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobSto
 			}
 		}
 
-		promises.push(resolvePersistedImageUrlRefs(entry, blobStore));
+		promises.push(resolvePersistedBlobRefs(entry, blobStore));
 	}
 
 	await Promise.all(promises);
@@ -1073,6 +1098,30 @@ const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
 /** Minimum base64 length to externalize to blob store (skip tiny inline images) */
 const BLOB_EXTERNALIZE_THRESHOLD = 1024;
 const TEXT_CONTENT_KEY = "content";
+const RESIDENT_BLOB_SENTINEL_KEY = "__gjcResidentBlob";
+type ResidentBlobKind = "text" | "imageUrl" | "imageData";
+interface ResidentBlobSentinel {
+	[RESIDENT_BLOB_SENTINEL_KEY]: true;
+	kind: ResidentBlobKind;
+	ref: string;
+}
+
+function residentBlobSentinel(kind: ResidentBlobKind, ref: string): ResidentBlobSentinel {
+	return { [RESIDENT_BLOB_SENTINEL_KEY]: true, kind, ref };
+}
+
+function isResidentBlobSentinel(value: unknown): value is ResidentBlobSentinel {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { [RESIDENT_BLOB_SENTINEL_KEY]?: unknown })[RESIDENT_BLOB_SENTINEL_KEY] === true &&
+		((value as { kind?: unknown }).kind === "text" ||
+			(value as { kind?: unknown }).kind === "imageUrl" ||
+			(value as { kind?: unknown }).kind === "imageData") &&
+		typeof (value as { ref?: unknown }).ref === "string" &&
+		isBlobRef((value as { ref: string }).ref)
+	);
+}
 
 /**
  * Recursively truncate large strings in an object for session persistence.
@@ -1104,10 +1153,138 @@ function isImageBlock(value: unknown): value is { type: "image"; data: string; m
 	);
 }
 
+const RESIDENT_EXTERNALIZE_STRING_EXCLUDED_KEYS = new Set([
+	"id",
+	"type",
+	"parentId",
+	"timestamp",
+	"role",
+	"provider",
+	"model",
+	"api",
+	"customType",
+	"mode",
+	"mimeType",
+	"stopReason",
+	"toolName",
+	"targetId",
+	"firstKeptEntryId",
+]);
+
+function shouldExternalizeResidentString(key: string | undefined): boolean {
+	return !key || !RESIDENT_EXTERNALIZE_STRING_EXCLUDED_KEYS.has(key);
+}
+
+function externalizeResidentValueSync(obj: unknown, blobStore: BlobStore, key?: string): unknown {
+	if (obj === null || obj === undefined) return obj;
+	if (typeof obj === "string") {
+		if (key === "image_url" && isImageDataUrl(obj) && obj.length >= BLOB_EXTERNALIZE_THRESHOLD)
+			return residentBlobSentinel("imageUrl", externalizeImageDataUrlSync(blobStore, obj));
+		if (shouldExternalizeResidentString(key) && obj.length >= BLOB_EXTERNALIZE_THRESHOLD)
+			return residentBlobSentinel("text", blobStore.putSync(Buffer.from(obj, "utf8")).ref);
+		return obj;
+	}
+	if (Array.isArray(obj)) {
+		let changed = false;
+		const result: unknown[] = new Array(obj.length);
+		for (let i = 0; i < obj.length; i++) {
+			const item = obj[i];
+			if (
+				key === TEXT_CONTENT_KEY &&
+				isImageBlock(item) &&
+				!isBlobRef(item.data) &&
+				item.data.length >= BLOB_EXTERNALIZE_THRESHOLD
+			) {
+				changed = true;
+				result[i] = {
+					...item,
+					data: residentBlobSentinel("imageData", externalizeImageDataSync(blobStore, item.data)),
+				};
+				continue;
+			}
+			const newItem = externalizeResidentValueSync(item, blobStore, key);
+			if (newItem !== item) changed = true;
+			result[i] = newItem;
+		}
+		return changed ? result : obj;
+	}
+	if (typeof obj === "object") {
+		let changed = false;
+		const entries: Array<readonly [string, unknown]> = [];
+		for (const [childKey, value] of Object.entries(obj)) {
+			const newValue = externalizeResidentValueSync(value, blobStore, childKey);
+			if (newValue !== value) changed = true;
+			entries.push([childKey, newValue]);
+		}
+		return changed ? Object.fromEntries(entries) : obj;
+	}
+	return obj;
+}
+
+function prepareEntryForResidentSync(entry: FileEntry, blobStore: BlobStore): FileEntry {
+	return externalizeResidentValueSync(entry, blobStore) as FileEntry;
+}
+
+function materializeResidentValueSync(
+	obj: unknown,
+	blobStore: BlobStore,
+	key?: string,
+	cache = new Map<string, string>(),
+): unknown {
+	if (obj === null || obj === undefined) return obj;
+	if (typeof obj === "string") return obj;
+	if (isResidentBlobSentinel(obj)) {
+		const cacheKey = `${obj.kind}:${obj.ref}`;
+		const cached = cache.get(cacheKey);
+		if (cached !== undefined) return cached;
+		const resolved =
+			obj.kind === "imageUrl"
+				? resolveImageDataUrlSync(blobStore, obj.ref)
+				: obj.kind === "imageData"
+					? resolveImageDataSync(blobStore, obj.ref)
+					: resolveTextBlobSync(blobStore, obj.ref);
+		cache.set(cacheKey, resolved);
+		return resolved;
+	}
+	if (Array.isArray(obj)) {
+		let changed = false;
+		const result = obj.map(item => {
+			const newItem = materializeResidentValueSync(item, blobStore, key, cache);
+			if (newItem !== item) changed = true;
+			return newItem;
+		});
+		return changed ? result : obj;
+	}
+	if (typeof obj === "object") {
+		let changed = false;
+		const entries = Object.entries(obj).map(([childKey, value]) => {
+			const newValue = materializeResidentValueSync(value, blobStore, childKey, cache);
+			if (newValue !== value) changed = true;
+			return [childKey, newValue] as const;
+		});
+		return changed ? Object.fromEntries(entries) : obj;
+	}
+	return obj;
+}
+
+function materializeResidentEntrySync<T extends FileEntry | SessionEntry>(
+	entry: T,
+	blobStore: BlobStore,
+	cache: Map<string, string>,
+): T {
+	return materializeResidentValueSync(entry, blobStore, undefined, cache) as T;
+}
+
+function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(entries: T[], blobStore: BlobStore): T[] {
+	const cache = new Map<string, string>();
+	return entries.map(entry => materializeResidentEntrySync(entry, blobStore, cache));
+}
+
 async function truncateForPersistence(obj: FileEntry, blobStore: BlobStore, key?: string): Promise<FileEntry>;
 async function truncateForPersistence(obj: string, blobStore: BlobStore, key?: string): Promise<string>;
 async function truncateForPersistence(obj: unknown[], blobStore: BlobStore, key?: string): Promise<unknown[]>;
 async function truncateForPersistence(obj: object, blobStore: BlobStore, key?: string): Promise<object>;
+async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): Promise<unknown>;
 async function truncateForPersistence(
 	obj: null | undefined,
 	blobStore: BlobStore,
@@ -1117,7 +1294,7 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 	if (obj === null || obj === undefined) return obj;
 
 	if (typeof obj === "string") {
-		if (key === "image_url" && isImageDataUrl(obj)) {
+		if ((key === "image_url" || key === "image_url.url") && isImageDataUrl(obj)) {
 			return externalizeImageDataUrl(blobStore, obj);
 		}
 
@@ -1139,7 +1316,9 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 		let changed = false;
 		const result = await Promise.all(
 			obj.map(async item => {
-				// Special handling: compress oversized images while preserving shape
+				// Keep durable JSONL bounded and lossless for large images. Resident
+				// sentinels are materialized before this serializer runs, so persistence
+				// still owns the existing blob-ref-on-disk contract.
 				if (key === TEXT_CONTENT_KEY && isImageBlock(item)) {
 					if (!isBlobRef(item.data) && item.data.length >= BLOB_EXTERNALIZE_THRESHOLD) {
 						changed = true;
@@ -1147,7 +1326,6 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 						return { ...item, data: blobRef };
 					}
 				}
-
 				const newItem = await truncateForPersistence(item, blobStore, key);
 				if (newItem !== item) changed = true;
 				return newItem;
@@ -1170,6 +1348,30 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 
 				return [
 					(async () => {
+						if (
+							childKey === "image_url" &&
+							typeof value === "object" &&
+							value !== null &&
+							typeof (value as { url?: unknown }).url === "string"
+						) {
+							let imageUrlChanged = false;
+							const imageUrlEntries = await Promise.all(
+								Object.entries(value).map(async ([imageUrlKey, imageUrlValue]) => {
+									const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
+									const newImageUrlValue = await truncateForPersistence(
+										imageUrlValue,
+										blobStore,
+										persistenceKey,
+									);
+									if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
+									return [imageUrlKey, newImageUrlValue] as const;
+								}),
+							);
+							if (imageUrlChanged) {
+								changed = true;
+								return [childKey, Object.fromEntries(imageUrlEntries)] as const;
+							}
+						}
 						const newValue = await truncateForPersistence(value, blobStore, childKey);
 						if (newValue !== value) changed = true;
 						return [childKey, newValue] as const;
@@ -1219,7 +1421,7 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 	if (obj === null || obj === undefined) return obj;
 
 	if (typeof obj === "string") {
-		if (key === "image_url" && isImageDataUrl(obj)) {
+		if ((key === "image_url" || key === "image_url.url") && isImageDataUrl(obj)) {
 			return externalizeImageDataUrlSync(blobStore, obj);
 		}
 		if (obj.length > MAX_PERSIST_CHARS) {
@@ -1259,6 +1461,25 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 			if (childKey === "partialJson" || childKey === "jsonlEvents") {
 				changed = true;
 				continue;
+			}
+			if (
+				childKey === "image_url" &&
+				typeof value === "object" &&
+				value !== null &&
+				typeof (value as { url?: unknown }).url === "string"
+			) {
+				let imageUrlChanged = false;
+				const imageUrlEntries = Object.entries(value).map(([imageUrlKey, imageUrlValue]) => {
+					const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
+					const newImageUrlValue = truncateForPersistenceSync(imageUrlValue, blobStore, persistenceKey);
+					if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
+					return [imageUrlKey, newImageUrlValue] as const;
+				});
+				if (imageUrlChanged) {
+					changed = true;
+					entries.push([childKey, Object.fromEntries(imageUrlEntries)]);
+					continue;
+				}
 			}
 			const newValue = truncateForPersistenceSync(value, blobStore, childKey);
 			if (newValue !== value) changed = true;
@@ -1429,6 +1650,13 @@ class NdjsonFileWriter {
 	/** True while the writer accepts new writes (not closing or closed). */
 	isOpen(): boolean {
 		return !this.#closed && !this.#closing;
+	}
+
+	closeSync(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#closing = true;
+		this.#writer.close().catch(() => {});
 	}
 }
 
@@ -1820,6 +2048,7 @@ export class SessionManager {
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
 	readonly #blobStore: BlobStore;
+	readonly #residentBlobStore = new MemoryBlobStore();
 
 	private constructor(
 		private cwd: string,
@@ -1827,7 +2056,7 @@ export class SessionManager {
 		private readonly persist: boolean,
 		private readonly storage: SessionStorage,
 	) {
-		this.#blobStore = new BlobStore(getBlobsDir());
+		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentBlobStore;
 		if (persist && sessionDir) {
 			this.storage.ensureDirSync(sessionDir);
 		}
@@ -1900,8 +2129,11 @@ export class SessionManager {
 			this.#titleSource = header?.titleSource;
 
 			this.#needsFullRewriteOnNextPersist = migrateToCurrentVersion(this.#fileEntries);
-
 			await resolveBlobRefsInEntries(this.#fileEntries, this.#blobStore);
+
+			this.#fileEntries = this.#fileEntries.map(entry =>
+				prepareEntryForResidentSync(entry, this.#residentBlobStore),
+			);
 			this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 
 			this.#buildIndex();
@@ -2212,6 +2444,14 @@ export class SessionManager {
 		this.#persistWriterPath = undefined;
 	}
 
+	#closePersistWriterInternalSync(): void {
+		if (this.#persistWriter) {
+			this.#persistWriter.closeSync();
+			this.#persistWriter = undefined;
+		}
+		this.#persistWriterPath = undefined;
+	}
+
 	async #closePersistWriter(): Promise<void> {
 		await this.#queuePersistTask(
 			async () => {
@@ -2226,6 +2466,49 @@ export class SessionManager {
 	// process crashes between the two renames, `recoverOrphanedBackups` can find it via the
 	// shared `*.bak` glob on both real and in-memory storage backends and promote it back to
 	// the primary on the next session-dir scan.
+
+	#replaceSessionFileAfterEpermSync(tempPath: string, targetPath: string, renameError: unknown): void {
+		const dir = path.resolve(targetPath, "..");
+		const backupPath = path.join(dir, `${path.basename(targetPath)}.${Snowflake.next()}.bak`);
+		try {
+			this.storage.renameSync(targetPath, backupPath);
+		} catch (err) {
+			if (isEnoent(err)) {
+				this.storage.renameSync(tempPath, targetPath);
+				return;
+			}
+			throw toError(renameError);
+		}
+
+		try {
+			this.storage.renameSync(tempPath, targetPath);
+		} catch (err) {
+			const replaceError = toError(err);
+			const originalError = toError(renameError);
+			try {
+				this.storage.renameSync(backupPath, targetPath);
+			} catch (rollbackErr) {
+				const rollbackError = toError(rollbackErr);
+				throw new Error(
+					`Failed to replace session file after EPERM (original: ${originalError.message}; retry: ${replaceError.message}); rollback from ${backupPath} also failed: ${rollbackError.message}`,
+					{ cause: originalError },
+				);
+			}
+			throw replaceError;
+		}
+
+		try {
+			this.storage.unlinkSync(backupPath);
+		} catch (err) {
+			if (!isEnoent(err)) {
+				logger.warn("Failed to remove session rewrite backup", {
+					sessionFile: targetPath,
+					backupPath,
+					error: toError(err).message,
+				});
+			}
+		}
+	}
 
 	async #replaceSessionFileAfterEperm(tempPath: string, targetPath: string, renameError: unknown): Promise<void> {
 		const dir = path.resolve(targetPath, "..");
@@ -2278,6 +2561,37 @@ export class SessionManager {
 			await this.#replaceSessionFileAfterEperm(tempPath, targetPath, err);
 		}
 	}
+
+	#replaceSessionFileSync(tempPath: string, targetPath: string): void {
+		try {
+			this.storage.renameSync(tempPath, targetPath);
+		} catch (err) {
+			if (hasFsCode(err, "EPERM")) {
+				this.#replaceSessionFileAfterEpermSync(tempPath, targetPath, err);
+				return;
+			}
+
+			throw toError(err);
+		}
+	}
+
+	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
+		if (!this.#sessionFile) return;
+		const dir = path.resolve(this.#sessionFile, "..");
+		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
+		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+		try {
+			for (const entry of entries) {
+				writer.writeSync(entry);
+			}
+			writer.closeSync();
+			this.#replaceSessionFileSync(tempPath, this.#sessionFile);
+		} catch (err) {
+			writer.closeSync();
+			void this.storage.unlink(tempPath).catch(() => {});
+			throw toError(err);
+		}
+	}
 	async #writeEntriesAtomically(entries: FileEntry[]): Promise<void> {
 		if (!this.#sessionFile) return;
 		const dir = path.resolve(this.#sessionFile, "..");
@@ -2311,12 +2625,27 @@ export class SessionManager {
 		await this.#queuePersistTask(async () => {
 			await this.#closePersistWriterInternal();
 			const entries = await Promise.all(
-				this.#fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
+				materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStore).map(entry =>
+					prepareEntryForPersistence(entry, this.#blobStore),
+				),
 			);
 			await this.#writeEntriesAtomically(entries);
 			this.#needsFullRewriteOnNextPersist = false;
 			this.#flushed = true;
+			this.#ensuredOnDisk = true;
 		});
+	}
+
+	#rewriteFileSync(): void {
+		if (!this.persist || !this.#sessionFile) return;
+		this.#closePersistWriterInternalSync();
+		const entries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStore).map(entry =>
+			prepareEntryForPersistenceSync(entry, this.#blobStore),
+		);
+		this.#writeEntriesAtomicallySync(entries);
+		this.#needsFullRewriteOnNextPersist = false;
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 	}
 
 	isPersisted(): boolean {
@@ -2580,6 +2909,7 @@ export class SessionManager {
 			if (!hasAssistant) {
 				// Mark as not flushed so when assistant arrives, all entries get written.
 				this.#flushed = false;
+				this.#ensuredOnDisk = false;
 				return;
 			}
 		}
@@ -2590,7 +2920,12 @@ export class SessionManager {
 			// `#persistChain` → `#recordPersistError`; we swallow the rejection
 			// here to avoid an unhandled rejection when the persist dir races with
 			// test-level tempDir cleanup.
-			this.#rewriteFile().catch(() => {});
+			try {
+				this.#rewriteFileSync();
+			} catch (err) {
+				this.#recordPersistError(err);
+				throw this.#persistError ?? toError(err);
+			}
 			return;
 		}
 
@@ -2609,18 +2944,21 @@ export class SessionManager {
 				this.#rewriteFile().catch(() => {});
 				return;
 			}
-			const persistedEntry = prepareEntryForPersistenceSync(entry, this.#blobStore);
+			const materializedEntry = materializeResidentEntrySync(entry, this.#residentBlobStore, new Map());
+			const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 			writer.writeSync(persistedEntry);
 		} catch (err) {
 			this.#recordPersistError(err);
+			throw this.#persistError ?? toError(err);
 		}
 	}
 
 	#appendEntry(entry: SessionEntry): void {
-		this.#fileEntries.push(entry);
-		this.#byId.set(entry.id, entry);
-		this.#leafId = entry.id;
-		this._persist(entry);
+		const residentEntry = prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry;
+		this.#fileEntries.push(residentEntry);
+		this.#byId.set(residentEntry.id, residentEntry);
+		this.#leafId = residentEntry.id;
+		this._persist(residentEntry);
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			const usage = entry.message.usage;
 			this.#usageStatistics.input += usage.input;
@@ -2894,7 +3232,9 @@ export class SessionManager {
 	}
 
 	getLeafEntry(): SessionEntry | undefined {
-		return this.#leafId ? this.#byId.get(this.#leafId) : undefined;
+		if (!this.#leafId) return undefined;
+		const entry = this.#byId.get(this.#leafId);
+		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStore, new Map()) : undefined;
 	}
 
 	/**
@@ -2913,17 +3253,19 @@ export class SessionManager {
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		return this.#byId.get(id);
+		const entry = this.#byId.get(id);
+		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStore, new Map()) : undefined;
 	}
 
 	/**
 	 * Get all direct children of an entry.
 	 */
 	getChildren(parentId: string): SessionEntry[] {
+		const cache = new Map<string, string>();
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
-				children.push(entry);
+				children.push(materializeResidentEntrySync(entry, this.#residentBlobStore, cache));
 			}
 		}
 		return children;
@@ -2968,11 +3310,12 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		const cache = new Map<string, string>();
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.#leafId;
 		let current = startId ? this.#byId.get(startId) : undefined;
 		while (current) {
-			path.unshift(current);
+			path.unshift(materializeResidentEntrySync(current, this.#residentBlobStore, cache));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		return path;
@@ -2983,7 +3326,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.#leafId, this.#byId);
+		return buildSessionContext(this.getEntries(), this.#leafId);
 	}
 
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
@@ -3020,7 +3363,10 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.#fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		return materializeResidentEntriesSync(
+			this.#fileEntries.filter((e): e is SessionEntry => e.type !== "session"),
+			this.#residentBlobStore,
+		);
 	}
 
 	/**
@@ -3159,7 +3505,7 @@ export class SessionManager {
 			const lines: string[] = [];
 			lines.push(JSON.stringify(header));
 			for (const entry of pathWithoutLabels) {
-				lines.push(JSON.stringify(entry));
+				lines.push(JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore)));
 			}
 			// Write fresh label entries at the end
 			const lastEntryId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
@@ -3174,13 +3520,19 @@ export class SessionManager {
 					targetId,
 					label,
 				};
-				lines.push(JSON.stringify(labelEntry));
+				lines.push(JSON.stringify(prepareEntryForPersistenceSync(labelEntry, this.#blobStore)));
 				pathEntryIds.add(labelEntry.id);
 				labelEntries.push(labelEntry);
 				parentId = labelEntry.id;
 			}
 			this.storage.writeTextSync(newSessionFile, `${lines.join("\n")}\n`);
-			this.#fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this.#fileEntries = [
+				header,
+				...pathWithoutLabels.map(
+					entry => prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry,
+				),
+				...labelEntries,
+			];
 			this.#sessionId = newSessionId;
 			this.#sessionFile = newSessionFile;
 			this.#flushed = true;
@@ -3203,7 +3555,11 @@ export class SessionManager {
 			labelEntries.push(labelEntry);
 			parentId = labelEntry.id;
 		}
-		this.#fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+		this.#fileEntries = [
+			header,
+			...pathWithoutLabels.map(entry => prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry),
+			...labelEntries,
+		];
 		this.#sessionId = newSessionId;
 		this.#buildIndex();
 		return undefined;
@@ -3247,8 +3603,9 @@ export class SessionManager {
 		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-		const sourceHeader = forkEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		manager.#fileEntries = forkEntries.map(entry => prepareEntryForResidentSync(entry, manager.#residentBlobStore));
+		const sourceHeader = manager.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
+		const historyEntries = manager.#fileEntries.filter(entry => entry.type !== "session") as SessionEntry[];
 		manager.#newSessionSync({ parentSession: sourceHeader?.id });
 		const newHeader = manager.#fileEntries[0] as SessionHeader;
 		newHeader.title = sourceHeader?.title;
