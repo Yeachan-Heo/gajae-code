@@ -25,6 +25,28 @@ export const REPAINT_STORM_THRESHOLD = 3;
 /** Hard cap on retained render-duration samples to keep memory bounded. */
 const MAX_DURATION_SAMPLES = 200_000;
 
+/** Hard cap on retained metric label keys; overflow is aggregated under `other`. */
+export const MAX_LABEL_MAP_ENTRIES = 128;
+
+const LABEL_OVERFLOW_KEY = "other";
+
+/**
+ * Normalize full-redraw causes before retaining them as metric labels. Some
+ * render paths include dimensions in debug-facing reason strings; metrics keep
+ * the stable cause class so resize/delete storms cannot create unbounded label
+ * cardinality.
+ */
+function normalizeFullRedrawCause(cause: string): string {
+	const c = cause.toLowerCase();
+	if (c.startsWith("first render")) return "first render";
+	if (c.startsWith("terminal width changed")) return "terminal width changed";
+	if (c.startsWith("terminal height changed")) return "terminal height changed";
+	if (c.startsWith("clearonshrink")) return "clearOnShrink";
+	if (c.startsWith("extralines > height")) return "extraLines > height";
+	if (c.startsWith("firstchanged < viewporttop")) return "firstChanged < viewportTop";
+	return cause;
+}
+
 /**
  * Full-redraw causes that are expected and do not count toward repaint storms.
  * These are legitimate, unavoidable full repaints (first frame, resize, shrink
@@ -40,6 +62,16 @@ function isExpectedFullRedraw(cause: string): boolean {
 		c.includes("forced") ||
 		c.includes("force")
 	);
+}
+
+function retainedLabel<T>(map: Map<string, T>, label: string): string {
+	if (map.has(label) || label === LABEL_OVERFLOW_KEY) return label;
+	return map.size < MAX_LABEL_MAP_ENTRIES - 1 ? label : LABEL_OVERFLOW_KEY;
+}
+
+function incrementCount(map: Map<string, number>, label: string): void {
+	const retained = retainedLabel(map, label);
+	map.set(retained, (map.get(retained) ?? 0) + 1);
 }
 
 export interface DurationStats {
@@ -173,7 +205,7 @@ export class RenderMetrics {
 	/** Record that a render was requested, attributed to a caller source. */
 	recordRequest(source = "unknown"): void {
 		if (!this.#enabled) return;
-		this.#requestSources.set(source, (this.#requestSources.get(source) ?? 0) + 1);
+		incrementCount(this.#requestSources, source);
 	}
 
 	/** Record one completed `#doRender` pass duration (ms). */
@@ -206,8 +238,9 @@ export class RenderMetrics {
 	recordFullRedraw(cause: string): void {
 		if (!this.#enabled) return;
 		this.#fullRedrawCount += 1;
-		this.#fullRedrawCauses.set(cause, (this.#fullRedrawCauses.get(cause) ?? 0) + 1);
-		if (!isExpectedFullRedraw(cause)) {
+		const normalizedCause = normalizeFullRedrawCause(cause);
+		incrementCount(this.#fullRedrawCauses, normalizedCause);
+		if (!isExpectedFullRedraw(normalizedCause)) {
 			this.#pendingUnexpectedFullRedraw = true;
 		}
 	}
@@ -238,10 +271,11 @@ export class RenderMetrics {
 	/** Accumulate timing/count for a named render helper (e.g. "renderTree"). */
 	recordHelper(name: string, durationMs: number): void {
 		if (!this.#enabled) return;
-		const cur = this.#helpers.get(name) ?? { count: 0, totalMs: 0 };
+		const retained = retainedLabel(this.#helpers, name);
+		const cur = this.#helpers.get(retained) ?? { count: 0, totalMs: 0 };
 		cur.count += 1;
 		cur.totalMs += durationMs;
-		this.#helpers.set(name, cur);
+		this.#helpers.set(retained, cur);
 	}
 
 	/**

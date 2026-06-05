@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { REPAINT_STORM_THRESHOLD, RenderMetrics } from "@gajae-code/tui/metrics";
+import { MAX_LABEL_MAP_ENTRIES, REPAINT_STORM_THRESHOLD, RenderMetrics } from "@gajae-code/tui/metrics";
 import { makeRecordedSession, runReplay } from "./replay-harness";
 
 function recordUnexpectedRender(metrics: RenderMetrics, cause = "extraLines > height"): void {
@@ -127,5 +127,45 @@ describe("RenderMetrics red-team coverage", () => {
 		expect(snapshot.rss.peakBytes).toBeGreaterThanOrEqual(snapshot.rss.baselineBytes ?? 0);
 		expect(snapshot.rss.peakBytes).toBeGreaterThanOrEqual(snapshot.rss.lastBytes ?? 0);
 		expect(snapshot.rss.growthBytes).toBeGreaterThanOrEqual(0);
+	});
+
+	it("bounds enabled metric label maps and aggregates overflow under other", () => {
+		const metrics = new RenderMetrics(true);
+
+		for (let i = 0; i < MAX_LABEL_MAP_ENTRIES * 4; i++) {
+			metrics.recordRequest(`plugin-source-${i}`);
+			metrics.recordHelper(`helper-${i}`, 2);
+		}
+
+		const snapshot = metrics.snapshot();
+		expect(Object.keys(snapshot.requestSources)).toHaveLength(MAX_LABEL_MAP_ENTRIES);
+		expect(snapshot.requestSources.other).toBe(MAX_LABEL_MAP_ENTRIES * 4 - (MAX_LABEL_MAP_ENTRIES - 1));
+		expect(Object.keys(snapshot.helperStats)).toHaveLength(MAX_LABEL_MAP_ENTRIES);
+		expect(snapshot.helperStats.other).toEqual({
+			count: MAX_LABEL_MAP_ENTRIES * 4 - (MAX_LABEL_MAP_ENTRIES - 1),
+			totalMs: (MAX_LABEL_MAP_ENTRIES * 4 - (MAX_LABEL_MAP_ENTRIES - 1)) * 2,
+			meanMs: 2,
+		});
+	});
+
+	it("normalizes dynamic full-redraw causes before retaining labels", () => {
+		const metrics = new RenderMetrics(true);
+
+		for (let i = 0; i < MAX_LABEL_MAP_ENTRIES * 4; i++) {
+			metrics.recordFullRedraw(`extraLines > height (${i + 1} > ${i % 37})`);
+			metrics.recordFullRedraw(`firstChanged < viewportTop (${i} < ${i + 10})`);
+			metrics.recordFullRedraw(`terminal height changed (${i + 20} -> ${i + 21})`);
+		}
+
+		const snapshot = metrics.snapshot();
+		expect(Object.keys(snapshot.fullRedrawCauses)).toEqual([
+			"extraLines > height",
+			"firstChanged < viewportTop",
+			"terminal height changed",
+		]);
+		expect(snapshot.fullRedrawCauses["extraLines > height"]).toBe(MAX_LABEL_MAP_ENTRIES * 4);
+		expect(snapshot.fullRedrawCauses["firstChanged < viewportTop"]).toBe(MAX_LABEL_MAP_ENTRIES * 4);
+		expect(snapshot.fullRedrawCauses["terminal height changed"]).toBe(MAX_LABEL_MAP_ENTRIES * 4);
+		expect(snapshot.fullRedrawCauses.other).toBeUndefined();
 	});
 });
