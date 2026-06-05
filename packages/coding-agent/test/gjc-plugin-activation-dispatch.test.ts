@@ -65,6 +65,54 @@ describe("GJC sub-skill activation dispatch", () => {
 		expect(result.activeSubskillsToPersist[0]!.toolPaths.length).toBeGreaterThan(0);
 	});
 
+	test("resolves a workflow flag to the whole same-plugin activation pack", async () => {
+		const cwd = await tempProjectWithFixture("combined-pack");
+
+		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
+
+		expect(result.cleanedArgs).toBe("");
+		expect(result.activation).toMatchObject({
+			plugin: "combined-pack",
+			subskillName: "ralplan-design",
+			parent: "ralplan",
+			bindsTo: "ralplan",
+			phase: "planner",
+			activationArg: "design",
+		});
+		expect(result.activeSubskillsToPersist).toHaveLength(2);
+		expect(result.activeSubskillsToPersist).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ parent: "ralplan", bindsTo: "ralplan", phase: "planner" }),
+				expect.objectContaining({ parent: "executor", bindsTo: "executor", phase: "prompt" }),
+			]),
+		);
+	});
+
+	test("persists a workflow activation pack so spawned agents can read agent-bound entries", async () => {
+		const cwd = await tempProjectWithFixture("combined-pack");
+		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
+		expect(result.activation).toBeDefined();
+
+		await syncSkillActiveState({
+			cwd,
+			skill: "ralplan",
+			active: true,
+			phase: result.activation!.phase,
+			active_subskills: result.activeSubskillsToPersist.map(toActiveSubskillEntry),
+		});
+
+		const executorSubskills = await readActiveSubskillsForParent({ cwd, parent: "executor", phase: "prompt" });
+		expect(executorSubskills).toHaveLength(1);
+		expect(executorSubskills[0]).toMatchObject({
+			plugin: "combined-pack",
+			subskillName: "executor-design",
+			parent: "executor",
+			bindsTo: "executor",
+			phase: "prompt",
+			activationArg: "design",
+		});
+	});
+
 	test("rejects duplicate activation args across plugin roots instead of choosing a winner", async () => {
 		const cwd = await tempProjectWithFixtures(["valid-skill-plugin", "duplicate-arg"]);
 

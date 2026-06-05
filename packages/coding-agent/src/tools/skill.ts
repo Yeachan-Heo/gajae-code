@@ -134,6 +134,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			});
 			const built = await buildSkillPromptMessage(skill, activationResult.cleanedArgs, {
 				subskillActivation: activationResult.activation,
+				subskillActivationSet: activationResult.activeSubskillsToPersist,
 				cwd: this.#session.cwd,
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 			});

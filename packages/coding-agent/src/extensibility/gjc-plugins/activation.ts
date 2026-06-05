@@ -28,8 +28,9 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		plugins = [];
 	}
 
+	const bindings = plugins.flatMap(plugin => plugin.bindings);
 	const activationsByArg = new Map<string, LoadedSubskillActivation>();
-	for (const binding of plugins.flatMap(plugin => plugin.bindings)) {
+	for (const binding of bindings) {
 		if (binding.parent !== input.skillName) continue;
 		activationsByArg.set(binding.activationArg, {
 			activationArg: binding.activationArg,
@@ -65,6 +66,21 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 	return {
 		cleanedArgs: consumed ? cleanedTokens.join(" ") : input.args,
 		activation,
-		activeSubskillsToPersist: activation ? [activation] : [],
+		activeSubskillsToPersist: activation
+			? bindings
+					.filter(
+						binding => binding.plugin === activation.plugin && binding.activationArg === activation.activationArg,
+					)
+					.map(binding => ({
+						activationArg: binding.activationArg,
+						plugin: binding.plugin,
+						subskillName: binding.subskillName,
+						parent: binding.parent,
+						bindsTo: binding.bindsTo,
+						phase: binding.phase,
+						filePath: binding.filePath,
+						toolPaths: binding.toolPaths,
+					}))
+			: [],
 	};
 }

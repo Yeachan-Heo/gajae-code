@@ -7,6 +7,7 @@ export async function loadActiveSubskillTools(input: {
 	sessionId?: string;
 	parent: string;
 	phase: string;
+	reservedToolNames?: string[];
 }): Promise<CustomTool[]> {
 	const entries = await readActiveSubskillsForParent(input);
 	const toolPaths = [
@@ -14,10 +15,11 @@ export async function loadActiveSubskillTools(input: {
 	];
 	if (toolPaths.length === 0) return [];
 
+	const reservedToolNames = new Set(input.reservedToolNames ?? []);
 	const result = await loadCustomTools(
 		toolPaths.map(path => ({ path })),
 		input.cwd,
-		[],
+		input.reservedToolNames ?? [],
 	);
 
 	for (const error of result.errors) {
@@ -28,6 +30,10 @@ export async function loadActiveSubskillTools(input: {
 	const seenNames = new Set<string>();
 	for (const loadedTool of result.tools) {
 		const name = loadedTool.tool.name;
+		if (reservedToolNames.has(name)) {
+			console.warn(`[gjc-plugin] Skipping sub-skill tool name "${name}" because it conflicts with a reserved tool`);
+			continue;
+		}
 		if (seenNames.has(name)) {
 			console.warn(`[gjc-plugin] Skipping duplicate sub-skill tool name "${name}" from ${loadedTool.path}`);
 			continue;

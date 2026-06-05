@@ -4412,15 +4412,25 @@ export class AgentSession {
 		// of relying on the skill prompt to run its own state-init steps.
 		if (active) {
 			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
-			const subskillActivation = (details as { subskillActivation?: LoadedSubskillActivation }).subskillActivation;
-			if (subskillActivation) {
+			const subskillDetails = details as {
+				subskillActivation?: LoadedSubskillActivation;
+				subskillActivationSet?: LoadedSubskillActivation[];
+			};
+			const subskillActivations =
+				subskillDetails.subskillActivationSet && subskillDetails.subskillActivationSet.length > 0
+					? subskillDetails.subskillActivationSet
+					: subskillDetails.subskillActivation
+						? [subskillDetails.subskillActivation]
+						: [];
+			if (subskillActivations.length > 0) {
+				const skillBoundActivation = subskillDetails.subskillActivation ?? subskillActivations[0];
 				await syncSkillActiveState({
 					cwd: this.sessionManager.getCwd(),
 					skill,
 					active: true,
-					phase: subskillActivation.phase,
+					phase: skillBoundActivation?.phase,
 					sessionId,
-					active_subskills: [toActiveSubskillEntry(subskillActivation)],
+					active_subskills: subskillActivations.map(toActiveSubskillEntry),
 				});
 			}
 		}

@@ -284,6 +284,7 @@ export interface BuiltSkillPromptMessage {
 
 export interface BuildSkillPromptMessageContext {
 	subskillActivation?: LoadedSubskillActivation;
+	subskillActivationSet?: LoadedSubskillActivation[];
 	currentPhase?: string;
 	cwd?: string;
 	sessionId?: string;
@@ -395,6 +396,9 @@ export async function buildSkillPromptMessage(
 		args: trimmedArgs || undefined,
 		lineCount: body ? body.split("\n").length : 0,
 	};
+	if (context?.subskillActivationSet) {
+		details.subskillActivationSet = context.subskillActivationSet;
+	}
 	if (context) {
 		const injection = context.cwd
 			? await buildSubskillInjection({

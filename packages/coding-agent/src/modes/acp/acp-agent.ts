@@ -731,6 +731,7 @@ export class AcpAgent implements Agent {
 				});
 				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
 					subskillActivation: activationResult.activation,
+					subskillActivationSet: activationResult.activeSubskillsToPersist,
 					cwd: record.session.sessionManager.getCwd(),
 					sessionId: record.session.sessionId,
 				});
@@ -776,6 +777,7 @@ export class AcpAgent implements Agent {
 		});
 		const built = await buildSkillPromptMessage(skill, activationResult.cleanedArgs, {
 			subskillActivation: activationResult.activation,
+			subskillActivationSet: activationResult.activeSubskillsToPersist,
 			cwd: record.session.sessionManager.getCwd(),
 			sessionId: record.session.sessionId,
 		});

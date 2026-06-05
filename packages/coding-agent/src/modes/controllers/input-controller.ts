@@ -481,6 +481,7 @@ export class InputController {
 				});
 				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
 					subskillActivation: activationResult.activation,
+					subskillActivationSet: activationResult.activeSubskillsToPersist,
 					cwd: this.ctx.sessionManager.getCwd(),
 					sessionId: this.ctx.session.sessionId,
 				});

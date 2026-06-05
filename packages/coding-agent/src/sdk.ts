@@ -1285,6 +1285,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			customTools.push(...getSearchTools());
 		}
 
+		const getReservedSubskillToolNames = () => [
+			...new Set([
+				...builtinTools.map(tool => tool.name),
+				...(options.toolNames?.map(name => name.toLowerCase()) ?? []),
+				...(options.customTools?.map(tool => (isCustomTool(tool) ? tool.name : tool.name)) ?? []),
+				...customTools.map(tool => tool.name),
+			]),
+		];
+
 		const gjcSubskillToolContext = options.gjcSubskillToolContext;
 		if (gjcSubskillToolContext?.parent.trim() && gjcSubskillToolContext.phase.trim()) {
 			const pluginTools = await loadActiveSubskillTools({
@@ -1292,6 +1301,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				sessionId: gjcSubskillToolContext.sessionId ?? logicalSessionId,
 				parent: gjcSubskillToolContext.parent,
 				phase: gjcSubskillToolContext.phase,
+				reservedToolNames: getReservedSubskillToolNames(),
 			});
 			if (pluginTools.length > 0) {
 				customTools.push(...pluginTools);
@@ -1308,6 +1318,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					sessionId: logicalSessionId,
 					parent: skill.name,
 					phase,
+					reservedToolNames: getReservedSubskillToolNames(),
 				});
 				if (pluginTools.length > 0) {
 					customTools.push(...pluginTools);
