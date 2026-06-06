@@ -178,6 +178,7 @@ import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
@@ -202,6 +203,7 @@ import {
 	isMCPToolName,
 	selectDiscoverableMCPToolNamesByServer,
 } from "../runtime-mcp/discoverable-tool-metadata";
+import { MCPManager } from "../runtime-mcp/manager";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
@@ -3130,6 +3132,14 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
+		const mcpManager = MCPManager.instance();
+		if (mcpManager) {
+			await mcpManager.disconnectAll();
+			if (MCPManager.instance() === mcpManager) {
+				MCPManager.setInstance(undefined);
+			}
+		}
+		await shutdownAllLspClients();
 		const pythonExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
 		if (!pythonExecutionsSettled) {
 			logger.warn(

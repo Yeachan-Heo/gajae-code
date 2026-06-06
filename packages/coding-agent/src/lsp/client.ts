@@ -61,6 +61,10 @@ function stopIdleChecker(): void {
 	}
 }
 
+export function isIdleCheckerActiveForTests(): boolean {
+	return idleCheckInterval !== null;
+}
+
 // =============================================================================
 // Client Capabilities
 // =============================================================================
@@ -919,6 +923,9 @@ export async function sendNotification(client: LspClient, method: string, params
  * Shutdown all LSP clients.
  */
 export async function shutdownAll(): Promise<void> {
+	stopIdleChecker();
+	clientLocks.clear();
+	fileOperationLocks.clear();
 	const clientsToShutdown = Array.from(clients.values());
 	clients.clear();
 	await Promise.allSettled(clientsToShutdown.map(client => shutdownClientInstance(client)));

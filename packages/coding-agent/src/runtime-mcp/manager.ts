@@ -152,6 +152,7 @@ export class MCPManager {
 	#connections = new Map<string, MCPServerConnection>();
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
+	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
@@ -164,6 +165,7 @@ export class MCPManager {
 	#subscribedResources = new Map<string, Set<string>>();
 	#pendingResourceRefresh = new Map<string, { connection: MCPServerConnection; promise: Promise<void> }>();
 	#pendingReconnections = new Map<string, Promise<MCPServerConnection | null>>();
+	#disconnectEpochs = new Map<string, number>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
@@ -348,10 +350,14 @@ export class MCPManager {
 			// and falls back to cached/deferred tools.
 			this.#serverConfigs.set(name, config);
 
+			const connectionEpoch = this.#epoch;
+			const connectionAbort = new AbortController();
+			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
 				return connectToServer(name, resolvedConfig, {
+					signal: connectionAbort.signal,
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
 					},
@@ -360,18 +366,26 @@ export class MCPManager {
 					},
 				});
 			})().then(
-				connection => {
+				async connection => {
 					// Store original config (without resolved tokens) to keep
 					// cache keys stable and avoid leaking rotating credentials.
 					connection.config = config;
-					this.#serverConfigs.set(name, config);
 					if (sources[name]) {
 						connection._source = sources[name];
 					}
-					if (this.#pendingConnections.get(name) === connectionPromise) {
+					const stillPending = this.#pendingConnections.get(name) === connectionPromise;
+					const stillCurrent = this.#epoch === connectionEpoch && this.#serverConfigs.get(name) === config;
+					if (stillPending) {
 						this.#pendingConnections.delete(name);
-						this.#connections.set(name, connection);
+						this.#pendingConnectionControllers.delete(name);
 					}
+					if (!stillPending || !stillCurrent) {
+						connection.transport.onClose = undefined;
+						await connection.transport.close().catch(() => {});
+						throw new Error(`Server "${name}" was disconnected during connection`);
+					}
+					this.#connections.set(name, connection);
+					this.#serverConfigs.set(name, config);
 
 					// Wire auth refresh for HTTP transports so 401s trigger token refresh.
 					if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
@@ -396,6 +410,7 @@ export class MCPManager {
 				error => {
 					if (this.#pendingConnections.get(name) === connectionPromise) {
 						this.#pendingConnections.delete(name);
+						this.#pendingConnectionControllers.delete(name);
 					}
 					throw error;
 				},
@@ -660,13 +675,16 @@ export class MCPManager {
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
+		this.#disconnectEpochs.set(name, nextEpoch);
+		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
+		this.#pendingConnectionControllers.delete(name);
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
 		this.#sources.delete(name);
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
-
 		const connection = this.#connections.get(name);
 
 		const subscribedUris = this.#subscribedResources.get(name);
@@ -705,6 +723,10 @@ export class MCPManager {
 		const promises = Array.from(this.#connections.values()).map(conn => disconnectServer(conn));
 		await Promise.allSettled(promises);
 
+		for (const controller of this.#pendingConnectionControllers.values()) {
+			controller.abort(new Error("MCP manager disconnected"));
+		}
+		this.#pendingConnectionControllers.clear();
 		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();
 		this.#pendingReconnections.clear();
@@ -808,14 +830,24 @@ export class MCPManager {
 		reconnectEpoch: number,
 	): Promise<MCPServerConnection> {
 		const resolvedConfig = await this.#resolveAuthConfig(config);
-		const connection = await connectToServer(name, resolvedConfig, {
-			onNotification: (method, params) => {
-				this.#handleServerNotification(name, method, params);
-			},
-			onRequest: (method, params) => {
-				return this.#handleServerRequest(method, params);
-			},
-		});
+		const connectionAbort = new AbortController();
+		this.#pendingConnectionControllers.set(name, connectionAbort);
+		let connection: MCPServerConnection;
+		try {
+			connection = await connectToServer(name, resolvedConfig, {
+				signal: connectionAbort.signal,
+				onNotification: (method, params) => {
+					this.#handleServerNotification(name, method, params);
+				},
+				onRequest: (method, params) => {
+					return this.#handleServerRequest(method, params);
+				},
+			});
+		} finally {
+			if (this.#pendingConnectionControllers.get(name) === connectionAbort) {
+				this.#pendingConnectionControllers.delete(name);
+			}
+		}
 
 		connection.config = config;
 		if (source) connection._source = source;

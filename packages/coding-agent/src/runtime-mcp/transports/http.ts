@@ -25,6 +25,8 @@ export class HttpTransport implements MCPTransport {
 	#connected = false;
 	#sessionId: string | null = null;
 	#sseConnection: AbortController | null = null;
+	#streamControllers = new Set<AbortController>();
+	#streamReaders = new Set<Promise<void>>();
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -52,6 +54,15 @@ export class HttpTransport implements MCPTransport {
 		this.#connected = true;
 	}
 
+	#trackReader(promise: Promise<void>, controller?: AbortController): void {
+		if (controller) this.#streamControllers.add(controller);
+		this.#streamReaders.add(promise);
+		void promise.finally(() => {
+			this.#streamReaders.delete(promise);
+			if (controller) this.#streamControllers.delete(controller);
+		});
+	}
+
 	/**
 	 * Start SSE listener for server-initiated messages.
 	 * Resolves once the SSE connection is established (or fails/unsupported).
@@ -61,7 +72,8 @@ export class HttpTransport implements MCPTransport {
 		if (!this.#connected) return;
 		if (this.#sseConnection) return;
 
-		this.#sseConnection = new AbortController();
+		const sseConnection = new AbortController();
+		this.#sseConnection = sseConnection;
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			...this.config.headers,
@@ -76,10 +88,10 @@ export class HttpTransport implements MCPTransport {
 			response = await fetch(this.config.url, {
 				method: "GET",
 				headers,
-				signal: this.#sseConnection.signal,
+				signal: sseConnection.signal,
 			});
 		} catch (error) {
-			this.#sseConnection = null;
+			this.#sseConnection = this.#sseConnection === sseConnection ? null : this.#sseConnection;
 			if (error instanceof Error && error.name !== "AbortError") {
 				this.onError?.(error);
 			}
@@ -87,19 +99,20 @@ export class HttpTransport implements MCPTransport {
 		}
 
 		if (response.status === 405 || !response.ok || !response.body) {
-			this.#sseConnection = null;
+			this.#sseConnection = this.#sseConnection === sseConnection ? null : this.#sseConnection;
 			return;
 		}
 
 		// Connection established — read messages in background.
 		// If the stream ends unexpectedly (server restart, network drop),
 		// fire onClose so the manager can trigger reconnection.
-		const signal = this.#sseConnection.signal;
-		void this.#readSSEStream(response.body!, signal).finally(() => {
+		const signal = sseConnection.signal;
+		const reader = this.#readSSEStream(response.body!, signal).finally(() => {
 			const wasConnected = this.#connected;
-			this.#sseConnection = null;
-			if (wasConnected) this.onClose?.();
+			if (this.#sseConnection === sseConnection) this.#sseConnection = null;
+			if (wasConnected && !signal.aborted) this.onClose?.();
 		});
+		this.#trackReader(reader, sseConnection);
 	}
 	async #readSSEStream(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<void> {
 		try {
@@ -266,6 +279,8 @@ export class HttpTransport implements MCPTransport {
 		// Re-reading `response.body` after `for await` breaks would lock the
 		// stream a second time and surface as "ReadableStream already has a
 		// controller", so we must not exit the loop early.
+		const drainController = abortController;
+		this.#streamControllers.add(drainController);
 		const drain = async (): Promise<void> => {
 			try {
 				for await (const raw of readSseJson<JsonRpcMessage | JsonRpcMessage[]>(response.body!, operationSignal)) {
@@ -306,10 +321,11 @@ export class HttpTransport implements MCPTransport {
 				}
 			} finally {
 				clearTimeout(timeoutId);
+				this.#streamControllers.delete(drainController);
 			}
 		};
 
-		void drain();
+		this.#trackReader(drain());
 		return promise;
 	}
 
@@ -417,9 +433,13 @@ export class HttpTransport implements MCPTransport {
 			// on the notification response (MCP Streamable HTTP spec). Read them.
 			const contentType = response.headers.get("Content-Type") ?? "";
 			if (contentType.includes("text/event-stream") && response.body) {
-				// Use the SSE connection's signal if available, otherwise read until stream ends
-				const signal = this.#sseConnection?.signal ?? AbortSignal.timeout(this.config.timeout ?? 30000);
-				void this.#readSSEStream(response.body, signal);
+				const streamController = new AbortController();
+				const streamTimeout = AbortSignal.timeout(this.config.timeout ?? 30000);
+				const signals = this.#sseConnection
+					? [this.#sseConnection.signal, streamController.signal, streamTimeout]
+					: [streamController.signal, streamTimeout];
+				const reader = this.#readSSEStream(response.body, AbortSignal.any(signals));
+				this.#trackReader(reader, streamController);
 			} else {
 				await response.body?.cancel();
 			}
@@ -433,14 +453,20 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	async close(): Promise<void> {
-		if (!this.#connected) return;
+		const wasConnected = this.#connected;
 		this.#connected = false;
 
-		// Abort SSE listener
+		// Abort all SSE/background readers and wait for them to settle.
+		for (const controller of this.#streamControllers) {
+			controller.abort();
+		}
 		if (this.#sseConnection) {
 			this.#sseConnection.abort();
 			this.#sseConnection = null;
 		}
+		await Promise.allSettled(Array.from(this.#streamReaders));
+
+		if (!wasConnected && !this.#sessionId) return;
 
 		// Send session termination if we have a session
 		if (this.#sessionId) {
