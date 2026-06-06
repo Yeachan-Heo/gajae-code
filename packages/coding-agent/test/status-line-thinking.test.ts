@@ -1,9 +1,9 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { SegmentContext } from "../src/modes/components/status-line/segments";
 import { renderSegment } from "../src/modes/components/status-line/segments";
 import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
 import { initTheme, theme } from "../src/modes/theme/theme";
-import type { SegmentContext } from "../src/modes/components/status-line/segments";
 
 function createCtx(thinkingLevel: ThinkingLevel): SegmentContext {
 	return {
