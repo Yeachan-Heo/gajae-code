@@ -209,7 +209,6 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-
 import { assertDeepInterviewMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -219,9 +218,11 @@ import {
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
 } from "../tool-discovery/tool-index";
+import type { ToolSession } from "../tools";
+import { AskTool } from "../tools/ask";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import type { CheckpointState } from "../tools/checkpoint";
-import { outputMeta } from "../tools/output-meta";
+import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -347,6 +348,8 @@ export interface AgentSessionConfig {
 	taskDepth?: number;
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
+	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider payload hook used by the active session request path */
@@ -934,6 +937,7 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	#workflowGateToolSession: ToolSession | undefined;
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
@@ -1113,6 +1117,7 @@ export class AgentSession {
 		}
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#onPayload = config.onPayload;
@@ -4224,6 +4229,37 @@ export class AgentSession {
 
 	setWorkflowGateEmitter(emitter: WorkflowGateEmitter | undefined): void {
 		this.#workflowGateEmitter = emitter;
+		if (emitter) {
+			this.#ensureWorkflowGateAskTool();
+		}
+	}
+
+	#ensureWorkflowGateAskTool(): void {
+		if (this.#toolRegistry.has("ask")) return;
+		if (!this.#workflowGateToolSession) return;
+
+		const askTool = AskTool.createIf(this.#workflowGateToolSession);
+		if (!askTool) return;
+
+		const wrappedTool = wrapToolWithMetaNotice(askTool as unknown as AgentTool);
+		const finalTool: AgentTool = this.#extensionRunner
+			? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner)
+			: wrappedTool;
+		this.#toolRegistry.set(finalTool.name, finalTool);
+
+		if (!this.getActiveToolNames().includes(finalTool.name)) {
+			const activeTools = [
+				...this.agent.state.tools,
+				this.#wrapToolForDeepInterviewMutationGuard(this.#wrapToolForAcpPermission(finalTool)),
+			];
+			this.agent.setTools(activeTools);
+			this.#invalidateDiscoveryCaches();
+			void this.refreshBaseSystemPrompt().catch(error => {
+				logger.warn("Failed to refresh system prompt after workflow gate ask tool registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}
 	}
 
 	get goalRuntime(): GoalRuntime {

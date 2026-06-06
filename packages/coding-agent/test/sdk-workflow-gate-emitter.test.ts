@@ -73,4 +73,62 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter (G011 real wiring)", (
 			await session.dispose();
 		}
 	});
+	it("late-registers ask when a headless session receives an unattended workflow gate emitter", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-headless-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.getWorkflowGateEmitter()).toBeUndefined();
+			expect(session.getToolByName("ask")).toBeUndefined();
+
+			const received: OpenGateInput[] = [];
+			const emitter: WorkflowGateEmitter = {
+				isUnattended: () => true,
+				emitGate: input => {
+					received.push(input);
+					return Promise.resolve({ selected: ["JWT"], other: false });
+				},
+			};
+			session.setWorkflowGateEmitter(emitter);
+
+			expect(session.getWorkflowGateEmitter()).toBe(emitter);
+			const askTool = session.getToolByName("ask");
+			expect(askTool).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("ask");
+
+			const ctx = {
+				hasUI: false,
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			const result = await askTool!.execute(
+				"call-headless",
+				{ questions: [{ id: "auth", question: "Which auth?", options: [{ label: "JWT" }, { label: "OAuth2" }] }] },
+				undefined,
+				undefined,
+				ctx,
+			);
+
+			expect(received).toHaveLength(1);
+			expect(received[0].options).toEqual([
+				{ value: "JWT", label: "JWT", description: undefined },
+				{ value: "OAuth2", label: "OAuth2", description: undefined },
+			]);
+			expect(JSON.stringify(result.details)).toContain("JWT");
+		} finally {
+			await session.dispose();
+		}
+	});
 });

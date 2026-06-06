@@ -1935,6 +1935,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			taskDepth,
 			toolRegistry,
+			workflowGateToolSession: toolSession,
 			transformContext,
 			onPayload,
 			onResponse,
