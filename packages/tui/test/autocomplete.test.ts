@@ -255,6 +255,22 @@ describe("trySyncSlashCompletion", () => {
 		expect(result).not.toBeNull();
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
 	});
+	it("ranks high-priority commands above higher fuzzy scores", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				// Lower priority, but exact-prefix match would normally win on fuzzy score.
+				{ name: "skim", description: "Skim the file", value: "skim" },
+				// Higher priority: pinned regardless of fuzzy score.
+				{ name: "skill:ralplan", description: "Plan the work", value: "skill:ralplan", priority: 100 },
+			],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/sk");
+		expect(result).not.toBeNull();
+		const values = result!.items.map(i => i.value);
+		expect(values[0]).toBe("skill:ralplan");
+		expect(values).toContain("skim");
+	});
 
 	it("uses priority as a tie-breaker within the same slash match tier", () => {
 		const provider = new CombinedAutocompleteProvider(
