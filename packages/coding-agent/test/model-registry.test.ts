@@ -360,6 +360,32 @@ describe("ModelRegistry", () => {
 			expect(variants.some(variant => variant.selector === "ollama/deepseek-v4-pro:cloud")).toBe(true);
 		});
 
+		test("accepts keyless Cursor ACP custom provider models", () => {
+			writeRawModelsJson({
+				"cursor-acp": {
+					baseUrl: "acp://cursor",
+					api: "acp-agent",
+					auth: "none",
+					models: [
+						{
+							id: "composer-2.5",
+							name: "Cursor Composer 2.5 ACP",
+							input: ["text"],
+							contextWindow: 200_000,
+							maxTokens: 64_000,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("cursor-acp", "composer-2.5");
+
+			expect(model?.api).toBe("acp-agent");
+			expect(model?.provider).toBe("cursor-acp");
+			expect(model?.id).toBe("composer-2.5");
+		});
+
 		test("collapses anthropic latest aliases into the best upstream claude family id", () => {
 			writeRawModelsJson({
 				demo: providerConfig("https://demo.example.com/v1", [
