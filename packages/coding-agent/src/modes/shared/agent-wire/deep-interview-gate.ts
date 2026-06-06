@@ -110,15 +110,21 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 		required: ["selected"],
 		additionalProperties: false,
 		anyOf: [
-			{ properties: { selected: selectedOnly, other: { const: false } } },
-			{ properties: { selected: selectedOnly }, required: ["selected"] },
 			{
+				type: "object",
+				properties: { selected: selectedOnly, other: { const: false } },
+				required: ["selected"],
+				additionalProperties: false,
+			},
+			{
+				type: "object",
 				properties: {
 					selected: selectedWithOther,
 					other: { const: true },
 					custom: { type: "string", minLength: 1 },
 				},
 				required: ["selected", "other", "custom"],
+				additionalProperties: false,
 			},
 		],
 	};

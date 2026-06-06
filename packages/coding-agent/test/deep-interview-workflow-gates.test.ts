@@ -84,9 +84,30 @@ describe("end-to-end via the broker", () => {
 		// A schema-invalid answer (selected not an array) is rejected, gate stays pending.
 		const bad = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: "OAuth2" } });
 		expect(bad.status).toBe("rejected");
+		// A schema-invalid single-select answer cannot combine a normal option and Other.
+		const combined = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: ["JWT"], other: true, custom: "Passkeys" },
+		});
+		expect(combined.status).toBe("rejected");
+		expect(combined.error?.errors.some(e => e.keyword === "anyOf")).toBe(true);
 		// A schema-valid answer is accepted and decodes to the human-path result.
 		const good = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["JWT"] } });
 		expect(good.status).toBe("accepted");
 		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
+	});
+
+	it("accepts single-select normal selection and Other-only paths", async () => {
+		const broker = new WorkflowGateBroker("run-di-valid", new MemoryGateStore());
+		const selectionGate = broker.openGate(questionToGate(singleQ));
+		const selection = await broker.resolve({ gate_id: selectionGate.gate_id, answer: { selected: ["JWT"] } });
+		expect(selection.status).toBe("accepted");
+
+		const otherGate = broker.openGate(questionToGate(singleQ));
+		const other = await broker.resolve({
+			gate_id: otherGate.gate_id,
+			answer: { selected: [], other: true, custom: "Passkeys" },
+		});
+		expect(other.status).toBe("accepted");
 	});
 });

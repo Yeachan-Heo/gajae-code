@@ -80,6 +80,11 @@ describe("deep-interview question gates red-team", () => {
 			{ name: "selected not an array", answer: { selected: "JWT" }, keyword: "type" },
 			{ name: "selected item outside enum", answer: { selected: ["Password"] }, keyword: "enum" },
 			{
+				name: "single-select combines option and Other",
+				answer: { selected: ["JWT"], other: true, custom: "Passkeys" },
+				keyword: "anyOf",
+			},
+			{
 				name: "additional unexpected property",
 				answer: { selected: ["JWT"], surprise: true },
 				keyword: "additionalProperties",
