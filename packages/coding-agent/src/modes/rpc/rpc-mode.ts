@@ -27,11 +27,9 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
-	RpcHostToolCallRequest,
-	RpcHostToolCancelRequest,
-	RpcHostUriCancelRequest,
-	RpcHostUriRequest,
 	RpcResponse,
+	RpcWorkflowGateEvent,
+	RpcWorkflowGateResponse,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -41,17 +39,6 @@ export type PendingExtensionRequest = {
 	resolve: (response: RpcExtensionUIResponse) => void;
 	reject: (error: Error) => void;
 };
-
-type RpcOutput = (
-	obj:
-		| RpcResponse
-		| RpcExtensionUIRequest
-		| RpcHostToolCallRequest
-		| RpcHostToolCancelRequest
-		| RpcHostUriRequest
-		| RpcHostUriCancelRequest
-		| object,
-) => void;
 
 function parseValueDialogResponse(
 	response: RpcExtensionUIResponse,
@@ -72,69 +59,98 @@ function shouldEmitRpcTitles(): boolean {
 	return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
-export function requestRpcEditor(
-	pendingRequests: Map<string, PendingExtensionRequest>,
-	output: RpcOutput,
-	title: string,
-	prefill?: string,
-	dialogOptions?: ExtensionUIDialogOptions,
-	editorOptions?: { promptStyle?: boolean },
-): Promise<string | undefined> {
-	if (dialogOptions?.signal?.aborted) return Promise.resolve(undefined);
-
-	const id = Snowflake.next() as string;
-	const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
-	let settled = false;
-
-	const cleanup = () => {
-		dialogOptions?.signal?.removeEventListener("abort", onAbort);
-		pendingRequests.delete(id);
-	};
-	const finish = (value: string | undefined) => {
-		if (settled) return;
-		settled = true;
-		cleanup();
-		resolve(value);
-	};
-	const fail = (error: Error) => {
-		if (settled) return;
-		settled = true;
-		cleanup();
-		reject(error);
-	};
-	const onAbort = () => {
-		output({
-			type: "extension_ui_request",
-			id: Snowflake.next() as string,
-			method: "cancel",
-			targetId: id,
-		} as RpcExtensionUIRequest);
-		finish(undefined);
-	};
-
-	dialogOptions?.signal?.addEventListener("abort", onAbort, { once: true });
-	pendingRequests.set(id, {
-		resolve: response => {
-			if ("cancelled" in response && response.cancelled) {
-				finish(undefined);
-			} else if ("value" in response) {
-				finish(response.value);
-			} else {
-				finish(undefined);
-			}
-		},
-		reject: fail,
-	});
-	output({
-		type: "extension_ui_request",
-		id,
-		method: "editor",
-		title,
-		prefill,
-		promptStyle: editorOptions?.promptStyle,
-	} as RpcExtensionUIRequest);
-	return promise;
+function schemaForWorkflowGate(request: Record<string, unknown>): Record<string, unknown> {
+	const method = request.method;
+	if (method === "confirm") return { type: "boolean" };
+	if (method === "select") {
+		const options = Array.isArray(request.options)
+			? request.options.filter(option => typeof option === "string")
+			: [];
+		return options.length > 0 ? { type: "string", enum: options } : { type: "string" };
+	}
+	if (method === "input" || method === "editor") return { type: "string" };
+	return {};
 }
+
+function workflowGateKindFor(request: Record<string, unknown>): RpcWorkflowGateEvent["kind"] {
+	return request.method === "confirm" ? "approval" : "question";
+}
+
+function validateWorkflowGateAnswer(schema: Record<string, unknown>, value: unknown, path = "answer"): string | null {
+	if (Array.isArray(schema.enum) && !schema.enum.some(item => Object.is(item, value))) {
+		return `${path} must match one of the advertised enum values`;
+	}
+	if ("const" in schema && !Object.is(schema.const, value)) {
+		return `${path} must match the advertised const value`;
+	}
+	const schemaType = schema.type;
+	if (typeof schemaType === "string") {
+		if (schemaType === "array") {
+			if (!Array.isArray(value)) return `${path} must be an array`;
+			const itemSchema = schema.items;
+			if (itemSchema && typeof itemSchema === "object" && !Array.isArray(itemSchema)) {
+				for (let i = 0; i < value.length; i++) {
+					const itemError = validateWorkflowGateAnswer(
+						itemSchema as Record<string, unknown>,
+						value[i],
+						`${path}[${i}]`,
+					);
+					if (itemError) return itemError;
+				}
+			}
+			return null;
+		}
+		if (schemaType === "object") {
+			if (!value || typeof value !== "object" || Array.isArray(value)) return `${path} must be an object`;
+			const record = value as Record<string, unknown>;
+			if (Array.isArray(schema.required)) {
+				for (const key of schema.required) {
+					if (typeof key === "string" && !(key in record)) return `${path}.${key} is required`;
+				}
+			}
+			const properties = schema.properties;
+			if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+				for (const [key, propertySchema] of Object.entries(properties)) {
+					if (
+						!(key in record) ||
+						!propertySchema ||
+						typeof propertySchema !== "object" ||
+						Array.isArray(propertySchema)
+					)
+						continue;
+					const propertyError = validateWorkflowGateAnswer(
+						propertySchema as Record<string, unknown>,
+						record[key],
+						`${path}.${key}`,
+					);
+					if (propertyError) return propertyError;
+				}
+			}
+			if (schema.additionalProperties === false) {
+				const allowed = new Set(Object.keys((properties as Record<string, unknown> | undefined) ?? {}));
+				for (const key of Object.keys(record)) {
+					if (!allowed.has(key)) return `${path}.${key} is not allowed`;
+				}
+			}
+			return null;
+		}
+		if (schemaType === "integer") return Number.isInteger(value) ? null : `${path} must be an integer`;
+		if (schemaType === "number")
+			return typeof value === "number" && Number.isFinite(value) ? null : `${path} must be a number`;
+		if (schemaType === "string") return typeof value === "string" ? null : `${path} must be a string`;
+		if (schemaType === "boolean") return typeof value === "boolean" ? null : `${path} must be a boolean`;
+		if (schemaType === "null") return value === null ? null : `${path} must be null`;
+	}
+	return null;
+}
+
+function workflowGateResponseToExtensionResponse(response: RpcWorkflowGateResponse): RpcExtensionUIResponse {
+	if (typeof response.answer === "boolean") {
+		return { type: "extension_ui_response", id: response.gate_id, confirmed: response.answer };
+	}
+	return { type: "extension_ui_response", id: response.gate_id, value: String(response.answer) };
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -157,6 +173,8 @@ export async function runRpcMode(
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
+	const pendingWorkflowGates = new Map<string, Record<string, unknown>>();
+
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 
@@ -169,7 +187,7 @@ export async function runRpcMode(
 	class RpcExtensionUIContext implements ExtensionUIContext {
 		constructor(
 			private pendingRequests: Map<string, PendingExtensionRequest>,
-			private output: (obj: RpcResponse | RpcExtensionUIRequest | object) => void,
+			private output: (obj: RpcResponse | RpcExtensionUIRequest | RpcWorkflowGateEvent | object) => void,
 		) {}
 
 		/** Helper for dialog methods with signal/timeout support */
@@ -189,6 +207,7 @@ export async function runRpcMode(
 				if (timeoutId) clearTimeout(timeoutId);
 				opts?.signal?.removeEventListener("abort", onAbort);
 				this.pendingRequests.delete(id);
+				pendingWorkflowGates.delete(id);
 			};
 
 			const onAbort = () => {
@@ -212,7 +231,30 @@ export async function runRpcMode(
 				},
 				reject,
 			});
+			const workflowSchema = schemaForWorkflowGate(request);
+			pendingWorkflowGates.set(id, workflowSchema);
+			const activeSkill = session.getActiveSkillState();
+			const activePhase = session.getActiveSkillPhase();
+			this.output({
+				type: "workflow_gate",
+				gate_id: id,
+				stage: activeSkill?.skill
+					? `${activeSkill.skill}:${activePhase ?? "unknown"}`
+					: String(request.method ?? "ui"),
+				kind: workflowGateKindFor(request),
+				schema: workflowSchema,
+				...(Array.isArray(request.options) ? { options: request.options as string[] } : {}),
+				context: {
+					method: request.method,
+					...(typeof request.title === "string" ? { title: request.title } : {}),
+					...(typeof request.message === "string" ? { message: request.message } : {}),
+					...(typeof request.timeout === "number" ? { timeout: request.timeout } : {}),
+					...(activeSkill?.skill ? { skill: activeSkill.skill } : {}),
+					...(activePhase ? { phase: activePhase } : {}),
+				},
+			} satisfies RpcWorkflowGateEvent);
 			this.output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+
 			return promise;
 		}
 
@@ -351,7 +393,12 @@ export async function runRpcMode(
 			dialogOptions?: ExtensionUIDialogOptions,
 			editorOptions?: { promptStyle?: boolean },
 		): Promise<string | undefined> {
-			return requestRpcEditor(this.pendingRequests, this.output, title, prefill, dialogOptions, editorOptions);
+			return this.#createDialogPromise(
+				dialogOptions,
+				undefined,
+				{ method: "editor", title, prefill, promptStyle: editorOptions?.promptStyle },
+				response => parseValueDialogResponse(response, dialogOptions),
+			);
 		}
 
 		get theme(): Theme {
@@ -445,6 +492,30 @@ export async function runRpcMode(
 				if (pending) {
 					pending.resolve(response);
 				}
+				continue;
+			}
+
+			if ((parsed as RpcWorkflowGateResponse).type === "workflow_gate_response") {
+				const response = parsed as RpcWorkflowGateResponse;
+				const schema = pendingWorkflowGates.get(response.gate_id);
+				const pending = pendingExtensionRequests.get(response.gate_id);
+				if (!schema || !pending) {
+					output({
+						...error(response.id, "workflow_gate_response", `workflow gate not found: ${response.gate_id}`),
+						errorCode: "workflow_gate_not_found",
+					});
+					continue;
+				}
+				const validationError = validateWorkflowGateAnswer(schema, response.answer);
+				if (validationError) {
+					output({
+						...error(response.id, "workflow_gate_response", `invalid_workflow_gate_response: ${validationError}`),
+						errorCode: "invalid_workflow_gate_response",
+					});
+					continue;
+				}
+				pending.resolve(workflowGateResponseToExtensionResponse(response));
+				output({ id: response.id, type: "response", command: "workflow_gate_response", success: true });
 				continue;
 			}
 

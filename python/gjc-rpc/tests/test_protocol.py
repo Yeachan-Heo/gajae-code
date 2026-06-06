@@ -6,6 +6,7 @@ from gjc_rpc import (
     AgentEndEvent,
     ExtensionUiRequest,
     SessionState,
+    WorkflowGateEvent,
     TodoReminderEvent,
     assistant_text,
     assistant_text_with_thinking,
@@ -140,6 +141,26 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
 
+
+    def test_parse_workflow_gate(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "workflow_gate",
+                "gate_id": "gate-1",
+                "stage": "ralplan:approval",
+                "kind": "approval",
+                "schema": {"type": "boolean"},
+                "options": ["Approve", "Reject"],
+                "context": {"skill": "ralplan", "phase": "approval"},
+            }
+        )
+
+        self.assertIsInstance(notification, WorkflowGateEvent)
+        self.assertEqual(notification.gate_id, "gate-1")
+        self.assertEqual(notification.kind, "approval")
+        self.assertEqual(notification.schema, {"type": "boolean"})
+        self.assertEqual(notification.options, ("Approve", "Reject"))
+        self.assertEqual(notification.context, {"skill": "ralplan", "phase": "approval"})
     def test_parse_todo_reminder_notification(self) -> None:
         notification = parse_notification(
             {

@@ -28,6 +28,7 @@ from .protocol import (
     CompactionResult,
     ExtensionError,
     ExtensionUiRequest,
+    WorkflowGateEvent,
     ImageContent,
     InterruptMode,
     JsonObject,
@@ -79,6 +80,7 @@ from .protocol import (
 AgentEventListener = Callable[[RpcAgentEvent], None]
 NotificationListener = Callable[[RpcNotification], None]
 UiRequestListener = Callable[[ExtensionUiRequest], None]
+WorkflowGateListener = Callable[[WorkflowGateEvent], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
@@ -342,6 +344,7 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
+        self._workflow_gates: queue.Queue[WorkflowGateEvent] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
         self._stopping = False
@@ -356,6 +359,7 @@ class RpcClient:
         self._ready_listeners: list[ReadyListener] = []
         self._unknown_notification_listeners: list[UnknownNotificationListener] = []
         self._ui_request_listeners: list[UiRequestListener] = []
+        self._workflow_gate_listeners: list[WorkflowGateListener] = []
         self._extension_error_listeners: list[ExtensionErrorListener] = []
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
         self._listener_error_listeners: list[ListenerErrorListener] = []
@@ -399,6 +403,7 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._ui_requests = queue.Queue()
+        self._workflow_gates = queue.Queue()
         with self._state_lock:
             self._stderr_chunks.clear()
         with self._state_lock:
@@ -576,6 +581,10 @@ class RpcClient:
         self._ui_request_listeners.append(listener)
         return lambda: self._remove_listener(self._ui_request_listeners, listener)
 
+    def on_workflow_gate(self, listener: WorkflowGateListener) -> Callable[[], None]:
+        self._workflow_gate_listeners.append(listener)
+        return lambda: self._remove_listener(self._workflow_gate_listeners, listener)
+
     def on_extension_error(self, listener: ExtensionErrorListener) -> Callable[[], None]:
         self._extension_error_listeners.append(listener)
         return lambda: self._remove_listener(self._extension_error_listeners, listener)
@@ -625,27 +634,33 @@ class RpcClient:
             if request.method == "cancel" or request.is_passive():
                 return
             if request.method == "confirm":
-                self.send_ui_confirmation(request.id, confirm)
+                self.send_workflow_gate_response(request.id, confirm)
                 return
             if request.method == "select":
                 if select_value is not None:
-                    self.send_ui_value(request.id, select_value)
+                    self.send_workflow_gate_response(request.id, select_value)
                 else:
                     self.cancel_ui_request(request.id)
                 return
             if request.method == "input":
                 if input_value is not None:
-                    self.send_ui_value(request.id, input_value)
+                    self.send_workflow_gate_response(request.id, input_value)
                 else:
                     self.cancel_ui_request(request.id)
                 return
             if request.method == "editor":
                 if editor_value is not None:
-                    self.send_ui_value(request.id, editor_value)
+                    self.send_workflow_gate_response(request.id, editor_value)
                 else:
                     self.cancel_ui_request(request.id)
 
         return self.on_ui_request(handle)
+
+    def next_workflow_gate(self, timeout: float | None = None) -> WorkflowGateEvent:
+        try:
+            return self._workflow_gates.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise RpcTimeoutError("Timed out waiting for a workflow gate") from exc
 
     def next_ui_request(self, timeout: float | None = None) -> ExtensionUiRequest:
         try:
@@ -658,6 +673,9 @@ class RpcClient:
 
     def send_ui_confirmation(self, request_id: str, confirmed: bool) -> None:
         self._send_notification({"type": "extension_ui_response", "id": request_id, "confirmed": confirmed})
+
+    def send_workflow_gate_response(self, gate_id: str, answer: JsonValue) -> None:
+        self._request("workflow_gate_response", gate_id=gate_id, answer=answer)
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:
         payload: JsonObject = {"type": "extension_ui_response", "id": request_id, "cancelled": True}
@@ -1392,6 +1410,16 @@ class RpcClient:
                         listener_notification.type,
                         self._ui_request_listeners,
                         cast(ExtensionUiRequest, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, WorkflowGateEvent):
+                    self._workflow_gates.put(notification)
+                    self._dispatch_listeners(
+                        "workflow_gate",
+                        listener_notification.type,
+                        self._workflow_gate_listeners,
+                        cast(WorkflowGateEvent, listener_notification),
                     )
                     continue
 

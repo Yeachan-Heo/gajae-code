@@ -98,6 +98,8 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 			return Array.isArray(value.tools) && value.tools.every(hostToolDefinition);
 		case "set_host_uri_schemes":
 			return Array.isArray(value.schemes) && value.schemes.every(hostUriScheme);
+		case "workflow_gate_response":
+			return stringField(value, "gate_id") && "answer" in value;
 		case "set_model":
 			return stringField(value, "provider") && stringField(value, "modelId");
 		case "set_thinking_level":

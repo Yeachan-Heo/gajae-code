@@ -233,6 +233,17 @@ FAKE_SERVER = textwrap.dedent(
         if command_type == "extension_ui_response":
             emit_prompt_turn("ui acknowledged")
             continue
+        if command_type == "workflow_gate_response":
+            answer = command.get("answer")
+            if command.get("gate_id") == "ui-2" and not isinstance(answer, bool):
+                respond(request_id, "workflow_gate_response", success=False, error="invalid_workflow_gate_response: answer must be a boolean")
+                continue
+            if command.get("gate_id") == "ui-select" and answer not in {"alpha", "beta"}:
+                respond(request_id, "workflow_gate_response", success=False, error="invalid_workflow_gate_response: answer must match one of the advertised enum values")
+                continue
+            respond(request_id, "workflow_gate_response", {})
+            emit_prompt_turn("ui acknowledged")
+            continue
 
         if command_type == "get_state":
             respond(request_id, "get_state", current_state())
@@ -354,10 +365,16 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, command_type, {})
             message = command["message"]
             if message == "needs ui":
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-1", "stage": "input", "kind": "question", "schema": {"type": "string"}, "context": {"method": "input", "title": "Need input"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
                 continue
             if message == "needs confirm":
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-2", "stage": "confirm", "kind": "approval", "schema": {"type": "boolean"}, "context": {"method": "confirm", "title": "Confirm", "message": "Continue?"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
+                continue
+            if message == "needs select":
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-select", "stage": "select", "kind": "question", "schema": {"type": "string", "enum": ["alpha", "beta"]}, "options": ["alpha", "beta"], "context": {"method": "select", "title": "Pick"}}), flush=True)
+                print(json.dumps({"type": "extension_ui_request", "id": "ui-select", "method": "select", "title": "Pick", "options": ["alpha", "beta"]}), flush=True)
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
@@ -860,12 +877,33 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(seen_extension_errors, ["boom"])
         self.assertEqual(seen_unknown, ["unknown_future_event"])
 
+    def test_workflow_gate_round_trip_and_validation(self) -> None:
+        seen_gates: list[str] = []
+        with self.make_client() as client:
+            client.on_workflow_gate(lambda gate: seen_gates.append(f"{gate.gate_id}:{gate.kind}"))
+            client.prompt("needs select")
+            gate = client.next_workflow_gate(timeout=2.0)
+            request = client.next_ui_request(timeout=2.0)
+
+            self.assertEqual(gate.gate_id, request.id)
+            self.assertEqual(gate.kind, "question")
+            self.assertEqual(gate.schema, {"type": "string", "enum": ["alpha", "beta"]})
+            self.assertEqual(gate.options, ("alpha", "beta"))
+            with self.assertRaises(RpcCommandError) as invalid:
+                client.send_workflow_gate_response(gate.gate_id, "gamma")
+            self.assertIn("invalid_workflow_gate_response", str(invalid.exception))
+
+            client.send_workflow_gate_response(gate.gate_id, "alpha")
+            client.wait_for_idle(timeout=2.0)
+
+        self.assertEqual(seen_gates, ["ui-select:question"])
+
     def test_ui_confirmation_and_cancel_round_trip(self) -> None:
         with self.make_client() as client:
             client.prompt("needs confirm")
             confirm_request = client.next_ui_request(timeout=2.0)
             self.assertEqual(confirm_request.method, "confirm")
-            client.send_ui_confirmation(confirm_request.id, True)
+            client.send_workflow_gate_response(confirm_request.id, True)
             client.wait_for_idle(timeout=2.0)
 
             client.prompt("needs cancel")

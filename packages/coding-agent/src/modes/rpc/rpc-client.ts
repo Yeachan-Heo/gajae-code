@@ -20,6 +20,8 @@ import type {
 	RpcHostToolUpdate,
 	RpcResponse,
 	RpcSessionState,
+	RpcWorkflowGateEvent,
+	RpcWorkflowGateResponse,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -130,6 +132,18 @@ function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest
 	return value.type === "extension_ui_request" && typeof value.id === "string" && typeof value.method === "string";
 }
 
+function isRpcWorkflowGateEvent(value: unknown): value is RpcWorkflowGateEvent {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "workflow_gate" &&
+		typeof value.gate_id === "string" &&
+		typeof value.stage === "string" &&
+		typeof value.kind === "string" &&
+		isRecord(value.schema) &&
+		isRecord(value.context)
+	);
+}
+
 function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): AgentToolResult<TDetails> {
 	if (typeof result === "string") {
 		return {
@@ -152,6 +166,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#workflowGateListeners: Set<(gate: RpcWorkflowGateEvent) => void> = new Set();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -576,6 +591,24 @@ export class RpcClient {
 	}
 
 	/**
+	 * Subscribe to workflow gate events emitted before interactive UI requests.
+	 */
+	onWorkflowGate(listener: (gate: RpcWorkflowGateEvent) => void): () => void {
+		this.#workflowGateListeners.add(listener);
+		return () => {
+			this.#workflowGateListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Answer a workflow_gate frame using the schema-validated gate response contract.
+	 */
+	async respondToWorkflowGate(gateId: string, answer: unknown): Promise<void> {
+		const response = await this.#send({ type: "workflow_gate_response", gate_id: gateId, answer });
+		this.#getData<void>(response);
+	}
+
+	/**
 	 * Replace the host-owned custom tools exposed to the RPC session.
 	 * Changes take effect before the next model call.
 	 */
@@ -682,6 +715,13 @@ export class RpcClient {
 
 		if (isRpcExtensionUiRequest(data)) {
 			for (const listener of this.#extensionUiListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcWorkflowGateEvent(data)) {
+			for (const listener of this.#workflowGateListeners) {
 				listener(data);
 			}
 			return;
@@ -798,7 +838,10 @@ export class RpcClient {
 		}
 	}
 
-	#writeFrame(frame: RpcCommand | RpcHostToolResult | RpcHostToolUpdate, onError?: (error: Error) => void): void {
+	#writeFrame(
+		frame: RpcCommand | RpcWorkflowGateResponse | RpcHostToolResult | RpcHostToolUpdate,
+		onError?: (error: Error) => void,
+	): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}

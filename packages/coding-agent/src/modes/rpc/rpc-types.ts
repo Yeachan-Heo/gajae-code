@@ -16,6 +16,9 @@ import type { TodoPhase } from "../../tools/todo-write";
 // RPC Commands (stdin)
 // ============================================================================
 
+export type RpcJsonSchema = Record<string, unknown>;
+export type RpcWorkflowGateKind = "question" | "approval" | "execution";
+
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -30,6 +33,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
+	| { id?: string; type: "workflow_gate_response"; gate_id: string; answer: unknown }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -123,6 +127,15 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_todos"; success: true; data: { todoPhases: TodoPhase[] } }
 	| { id?: string; type: "response"; command: "set_host_tools"; success: true; data: { toolNames: string[] } }
 	| { id?: string; type: "response"; command: "set_host_uri_schemes"; success: true; data: { schemes: string[] } }
+	| { id?: string; type: "response"; command: "workflow_gate_response"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "workflow_gate_response";
+			success: false;
+			error: string;
+			errorCode: "workflow_gate_not_found" | "invalid_workflow_gate_response";
+	  }
 
 	// Model
 	| {
@@ -211,6 +224,29 @@ export type RpcResponse =
 
 	// Error response (any command can fail)
 	| { id?: string; type: "response"; command: string; success: false; error: string };
+
+// ============================================================================
+// Workflow Gate Events (bidirectional)
+// ============================================================================
+
+/** Emitted when a workflow needs structured host/user input. */
+export interface RpcWorkflowGateEvent {
+	type: "workflow_gate";
+	gate_id: string;
+	stage: string;
+	kind: RpcWorkflowGateKind;
+	schema: RpcJsonSchema;
+	options?: string[];
+	context: Record<string, unknown>;
+}
+
+/** Sent by the host to answer a workflow_gate frame. */
+export interface RpcWorkflowGateResponse {
+	type: "workflow_gate_response";
+	id?: string;
+	gate_id: string;
+	answer: unknown;
+}
 
 // ============================================================================
 // Extension UI Events (stdout)
