@@ -9,6 +9,7 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 } from "./model-thinking";
+import { type AcpAgentOptions, streamAcpAgent } from "./providers/acp-agent";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
@@ -217,6 +218,8 @@ export function stream<TApi extends Api>(
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
+	} else if (model.api === "acp-agent") {
+		return streamAcpAgent(model as Model<"acp-agent">, context, (options || {}) as AcpAgentOptions);
 	}
 
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
@@ -262,6 +265,9 @@ export function stream<TApi extends Api>(
 
 		case "cursor-agent":
 			return streamCursor(model as Model<"cursor-agent">, context, providerOptions as CursorOptions);
+
+		case "acp-agent":
+			return streamAcpAgent(model as Model<"acp-agent">, context, providerOptions as AcpAgentOptions);
 
 		default:
 			throw new Error(`Unhandled API: ${api}`);
@@ -399,6 +405,9 @@ export function streamSimple<TApi extends Api>(
 		return stream(model, context, providerOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+		const providerOptions = mapOptionsForApi(model, options, undefined);
+		return stream(model, context, providerOptions);
+	} else if (model.api === "acp-agent") {
 		const providerOptions = mapOptionsForApi(model, options, undefined);
 		return stream(model, context, providerOptions);
 	}
@@ -862,6 +871,14 @@ function mapOptionsForApi<TApi extends Api>(
 				...base,
 				execHandlers,
 				onToolResult,
+			});
+		}
+
+		case "acp-agent": {
+			const execHandlers = options?.cursorExecHandlers ?? options?.execHandlers;
+			return castApi<"acp-agent">({
+				...base,
+				execHandlers,
 			});
 		}
 
