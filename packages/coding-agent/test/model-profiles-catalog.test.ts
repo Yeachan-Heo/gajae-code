@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import modelsJson from "@gajae-code/ai/models.json" with { type: "json" };
+import { type GeneratedProvider, getBundledModel } from "@gajae-code/ai/models";
 import {
 	BUILTIN_MODEL_PROFILES,
 	type ModelProfileDefinition,
@@ -31,8 +31,7 @@ function builtIn(name: string): ModelProfileDefinition {
 function selectorExists(selector: string): boolean {
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
-	const providerModels = modelsJson[parsed.provider as keyof typeof modelsJson] as Record<string, unknown> | undefined;
-	return providerModels?.[parsed.id] !== undefined;
+	return getBundledModel(parsed.provider as GeneratedProvider, parsed.id) !== undefined;
 }
 
 function effortOf(selector: string): number {
@@ -117,8 +116,8 @@ describe("built-in model profile catalog", () => {
 		expect(parsed?.provider).toBe("openai-codex");
 		expect(parsed?.id).toBe("gpt-5.5");
 		expect(parsed?.thinkingLevel).toBeUndefined();
-		const providerModels = modelsJson["openai-codex"] as Record<string, { thinking?: { defaultLevel?: string } }>;
-		expect(providerModels["gpt-5.5"]?.thinking?.defaultLevel).toBe(ThinkingLevel.XHigh);
+		const model = getBundledModel("openai-codex", "gpt-5.5");
+		expect(model?.thinking?.defaultLevel).toBe(ThinkingLevel.XHigh);
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {

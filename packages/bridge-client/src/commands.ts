@@ -36,7 +36,6 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 	"get_login_providers",
 	"login",
 	"negotiate_unattended",
-	"workflow_gate_response",
 ] as const;
 
 export type BridgeClientCommandType = (typeof BRIDGE_CLIENT_COMMAND_TYPES)[number];

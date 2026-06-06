@@ -30,6 +30,7 @@ const fixtures = [
 ];
 
 beforeAll(async () => {
+	Bun.env.COLORTERM = "truecolor";
 	await initTheme();
 });
 
