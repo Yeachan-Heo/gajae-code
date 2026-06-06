@@ -56,11 +56,13 @@ providers:
     authHeader: true
     auth: apiKey
     disableStrictTools: false  # set true for Anthropic-compatible endpoints that reject the strict field
+    cacheRetention: short  # none | short | long; model entries and modelOverrides can override this
     discovery:
       type: ollama
     modelOverrides:
       some-model-id:
         name: Renamed model
+        cacheRetention: long
     models:
       - id: some-model-id
         name: Some Model
@@ -76,6 +78,7 @@ providers:
         maxTokens: 16384
         headers:
           X-Model: value
+        cacheRetention: none
         thinking:
           minLevel: low
           maxLevel: xhigh
@@ -240,6 +243,7 @@ providers:
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
+- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
 
@@ -348,7 +352,7 @@ ModelRegistry pipeline (on refresh):
 
 1. Load built-in providers/models from `@gajae-code/ai`.
 2. Load `models.yml` custom config.
-3. Apply provider overrides (`baseUrl`, `headers`, `requestTransform`, `disableStrictTools`) to built-in models.
+3. Apply provider overrides (`baseUrl`, `headers`, `requestTransform`, `disableStrictTools`, `cacheRetention`) to built-in models.
 4. Apply `modelOverrides` (per provider + model id).
 5. Merge custom `models`:
    - same `provider + id` replaces existing

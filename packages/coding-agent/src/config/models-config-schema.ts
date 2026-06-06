@@ -47,6 +47,7 @@ export const OpenAICompatSchema = z.object({
 });
 
 const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
 	"effort",
@@ -150,6 +151,7 @@ const ModelDefinitionSchema = z
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 
@@ -175,6 +177,7 @@ export const ModelOverrideSchema = z
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 
@@ -226,6 +229,7 @@ const ProviderConfigSchema = z
 		 * and `apiKey` must carry the gateway bearer.
 		 */
 		transport: z.literal("pi-native").optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 

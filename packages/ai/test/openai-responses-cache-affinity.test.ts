@@ -20,6 +20,7 @@ function getHeader(headers: RequestInit["headers"], name: string): string | null
 
 async function captureOpenAIResponseHeaders(
 	options: OpenAIResponsesOptions,
+	modelOverride: Model<"openai-responses"> = model,
 ): Promise<{ sessionId: string | null; clientRequestId: string | null; body: Record<string, unknown> | null }> {
 	const captured = {
 		sessionId: null as string | null,
@@ -67,7 +68,7 @@ async function captureOpenAIResponseHeaders(
 		systemPrompt: ["stable system", "stable durable context"],
 		messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
 	};
-	const stream = streamOpenAIResponses(model, context, { apiKey: "test-key", ...options });
+	const stream = streamOpenAIResponses(modelOverride, context, { apiKey: "test-key", ...options });
 
 	for await (const event of stream) {
 		if (event.type === "done" || event.type === "error") break;
@@ -104,11 +105,52 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_key).toBe("session-123");
 	});
 
-	it("omits OpenAI session routing headers when cache retention is disabled", async () => {
+	it("keeps prompt_cache_key when cache retention is disabled", async () => {
 		const captured = await captureOpenAIResponseHeaders({ cacheRetention: "none", sessionId: "session-123" });
 
-		expect(captured.sessionId).toBeNull();
-		expect(captured.clientRequestId).toBeNull();
-		expect(captured.body?.prompt_cache_key).toBeUndefined();
+		expect(captured.sessionId).toBe("session-123");
+		expect(captured.clientRequestId).toBe("session-123");
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+		expect(captured.body?.prompt_cache_retention).toBeUndefined();
+	});
+
+	it("uses model cacheRetention for OpenAI Responses retention when request omits cacheRetention", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ authCredentialType: "oauth", sessionId: "session-123" },
+			{ ...model, baseUrl: "https://api.openai.com/v1", cacheRetention: "long" },
+		);
+
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+		expect(captured.body?.prompt_cache_retention).toBe("24h");
+	});
+
+	it("lets explicit request cacheRetention win over model cacheRetention", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ cacheRetention: "none", sessionId: "session-123" },
+			{ ...model, cacheRetention: "long" },
+		);
+
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+		expect(captured.body?.prompt_cache_retention).toBeUndefined();
+	});
+
+	it("uses GJC_CACHE_RETENTION when request and model omit cacheRetention", async () => {
+		const previous = Bun.env.GJC_CACHE_RETENTION;
+		Bun.env.GJC_CACHE_RETENTION = "long";
+		try {
+			const captured = await captureOpenAIResponseHeaders(
+				{ authCredentialType: "oauth", sessionId: "session-123" },
+				{ ...model, baseUrl: "https://api.openai.com/v1" },
+			);
+
+			expect(captured.body?.prompt_cache_key).toBe("session-123");
+			expect(captured.body?.prompt_cache_retention).toBe("24h");
+		} finally {
+			if (previous === undefined) {
+				delete Bun.env.GJC_CACHE_RETENTION;
+			} else {
+				Bun.env.GJC_CACHE_RETENTION = previous;
+			}
+		}
 	});
 });

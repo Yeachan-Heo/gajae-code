@@ -2,6 +2,7 @@ import * as path from "node:path";
 import {
 	type Api,
 	type AssistantMessageEventStream,
+	type CacheRetention,
 	type Context,
 	createModelManager,
 	enrichModelThinking,
@@ -240,6 +241,7 @@ interface ProviderValidationConfig {
 	compat?: Model<Api>["compat"];
 	requestTransform?: ModelRequestTransform;
 	disableStrictTools?: boolean;
+	cacheRetention?: CacheRetention;
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
 }
@@ -267,11 +269,12 @@ function validateProviderConfiguration(
 				!config.apiKeyEnv &&
 				!config.disableStrictTools &&
 				!config.requestTransform &&
+				!config.cacheRetention &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
 				);
 			}
 		}
@@ -384,6 +387,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					compat: providerConfig.compat,
 					requestTransform: providerConfig.requestTransform,
 					disableStrictTools: providerConfig.disableStrictTools,
+					cacheRetention: providerConfig.cacheRetention,
 					modelOverrides: providerConfig.modelOverrides,
 					models: (providerConfig.models ?? []) as ProviderValidationModel[],
 				},
@@ -402,6 +406,7 @@ interface ProviderOverride {
 	compat?: Model<Api>["compat"];
 	transport?: Model<Api>["transport"];
 	requestTransform?: ModelRequestTransform;
+	cacheRetention?: CacheRetention;
 }
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -449,7 +454,10 @@ function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
 export function mergeDiscoveredModel<TApi extends Api>(
 	model: Model<TApi>,
 	existing: Model<Api> | undefined,
-	providerOverride?: Pick<ProviderOverride, "baseUrl" | "headers" | "transport" | "requestTransform">,
+	providerOverride?: Pick<
+		ProviderOverride,
+		"baseUrl" | "headers" | "transport" | "requestTransform" | "cacheRetention"
+	>,
 ): Model<TApi> {
 	if (existing) {
 		return {
@@ -460,6 +468,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 				mergeRequestTransform(existing.requestTransform, model.requestTransform),
 				providerOverride?.requestTransform,
 			),
+			cacheRetention: model.cacheRetention ?? existing.cacheRetention ?? providerOverride?.cacheRetention,
 		};
 	}
 	if (providerOverride) {
@@ -481,6 +490,7 @@ interface DiscoveryProviderConfig {
 	headers?: Record<string, string>;
 	compat?: Model<Api>["compat"];
 	requestTransform?: ModelRequestTransform;
+	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }
@@ -678,6 +688,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.reasoning !== undefined) result.reasoning = override.reasoning;
 	if (override.thinking !== undefined) result.thinking = override.thinking as ThinkingConfig;
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
+	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
@@ -716,6 +727,7 @@ interface CustomModelDefinitionLike {
 	premiumMultiplier?: number;
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
+	cacheRetention?: CacheRetention;
 }
 
 interface CustomModelBuildOptions {
@@ -740,6 +752,7 @@ type CustomModelOverlay = {
 	premiumMultiplier?: number;
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
+	cacheRetention?: CacheRetention;
 	isOAuth?: boolean;
 };
 
@@ -791,6 +804,7 @@ function buildCustomModelOverlay(
 	providerCompat: Model<Api>["compat"] | undefined,
 	providerRequestTransform: ModelRequestTransform | undefined,
 	providerAuth: ProviderAuthMode | undefined,
+	providerCacheRetention: CacheRetention | undefined,
 	modelDef: CustomModelDefinitionLike,
 ): CustomModelOverlay | undefined {
 	const api = modelDef.api ?? providerApi;
@@ -813,6 +827,7 @@ function buildCustomModelOverlay(
 		wireModelId: modelDef.wireModelId,
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		premiumMultiplier: modelDef.premiumMultiplier,
+		cacheRetention: modelDef.cacheRetention ?? providerCacheRetention,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
 	};
 }
@@ -913,6 +928,7 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		contextPromotionTarget: resolvedModel.contextPromotionTarget,
 		wireModelId: resolvedModel.wireModelId,
 		requestTransform: resolvedModel.requestTransform,
+		cacheRetention: resolvedModel.cacheRetention ?? reference?.cacheRetention,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
 	} as Model<Api>);
@@ -1139,6 +1155,7 @@ export class ModelRegistry {
 				return {
 					...withTransportOverride,
 					compat: mergeCompat(m.compat, providerOverride.compat),
+					cacheRetention: m.cacheRetention ?? providerOverride.cacheRetention,
 				};
 			});
 		});
@@ -1295,6 +1312,7 @@ export class ModelRegistry {
 				requestTransform: providerConfig.requestTransform
 					? mergeRequestTransform(undefined, providerConfig.requestTransform)
 					: undefined,
+				cacheRetention: normalized.cacheRetention ?? providerConfig.cacheRetention,
 			};
 		});
 	}
@@ -1383,7 +1401,8 @@ export class ModelRegistry {
 				providerConfig.compat ||
 				providerConfig.disableStrictTools ||
 				providerConfig.requestTransform ||
-				providerConfig.transport
+				providerConfig.transport ||
+				providerConfig.cacheRetention
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				overrides.set(providerName, {
@@ -1394,6 +1413,7 @@ export class ModelRegistry {
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					transport: providerConfig.transport,
 					requestTransform: providerConfig.requestTransform,
+					cacheRetention: providerConfig.cacheRetention,
 				});
 			}
 
@@ -1410,6 +1430,7 @@ export class ModelRegistry {
 					headers: providerConfig.headers,
 					compat: providerConfig.compat,
 					requestTransform: providerConfig.requestTransform,
+					cacheRetention: providerConfig.cacheRetention,
 					discovery: providerConfig.discovery,
 					optional: false,
 				});
@@ -2101,13 +2122,16 @@ export class ModelRegistry {
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
 			transport: override.transport ?? baseOverride?.transport,
 			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
+			cacheRetention: override.cacheRetention ?? baseOverride?.cacheRetention,
 		};
 	}
-	#applyProviderTransportOverride<T extends { baseUrl?: string; headers?: Record<string, string> }>(
+	#applyProviderTransportOverride<
+		T extends { baseUrl?: string; headers?: Record<string, string>; cacheRetention?: CacheRetention },
+	>(
 		entry: T,
 		override: Pick<
 			ProviderOverride,
-			"baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "requestTransform"
+			"baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "requestTransform" | "cacheRetention"
 		>,
 	): T {
 		const headers = mergeAuthHeader(
@@ -2126,6 +2150,7 @@ export class ModelRegistry {
 				(entry as { requestTransform?: ModelRequestTransform }).requestTransform,
 				override.requestTransform,
 			),
+			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
@@ -2214,6 +2239,7 @@ export class ModelRegistry {
 					providerCompat,
 					providerConfig.requestTransform,
 					(providerConfig.auth as ProviderAuthMode | undefined) ?? undefined,
+					providerConfig.cacheRetention,
 					modelDef as CustomModelDefinitionLike,
 				);
 				if (!model) continue;
@@ -2575,6 +2601,7 @@ export class ModelRegistry {
 					config.authHeader,
 					config.compat,
 					config.requestTransform,
+					undefined,
 					undefined,
 					modelDef as CustomModelDefinitionLike,
 				);
