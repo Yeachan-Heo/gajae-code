@@ -138,18 +138,11 @@ export function questionToGate(question: AskGateQuestion): OpenGateInput {
 		stage: "deep-interview",
 		kind: "question",
 		schema,
-		options: [
-			...question.options.map((o, i) => ({
-				value: o.label,
-				label: o.label,
-				description: i === question.recommended ? "recommended" : undefined,
-			})),
-			{
-				value: { other: true },
-				label: GATE_OTHER_OPTION,
-				description: "free-text custom answer",
-			},
-		],
+		options: question.options.map((o, i) => ({
+			value: o.label,
+			label: o.label,
+			description: i === question.recommended ? "recommended" : undefined,
+		})),
 		context: {
 			title: question.question,
 			prompt: question.question,

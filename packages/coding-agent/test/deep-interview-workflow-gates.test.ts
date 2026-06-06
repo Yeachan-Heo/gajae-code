@@ -30,13 +30,17 @@ describe("questionToGate", () => {
 		const gate = questionToGate(singleQ);
 		expect(gate.stage).toBe("deep-interview");
 		expect(gate.kind).toBe("question");
-		expect(gate.options?.map(o => o.label)).toEqual(["JWT", "OAuth2", "Session cookies", "Other (type your own)"]);
+		expect(gate.options?.map(o => o.label)).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.options?.[0]?.description).toBe("recommended");
 		// schema is the documented subset and accepts {selected, custom?}
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.schema.properties?.other?.type).toBe("boolean");
 		expect(gate.schema.required).toEqual(["selected"]);
-		expect(gate.context?.stage_state).toMatchObject({ question_id: "q1", multi: false });
+		expect(gate.context?.stage_state).toMatchObject({
+			question_id: "q1",
+			multi: false,
+			other_option: "Other (type your own)",
+		});
 	});
 
 	it("maps a batch", () => {
