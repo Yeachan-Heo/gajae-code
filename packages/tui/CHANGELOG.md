@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Ranked slash command-name suggestions by stronger prefix/token matches before fuzzy fallback ordering, while keeping priority as an intra-tier tie-breaker.
+
 ## [0.3.1] - 2026-06-05
 
 ### Changed

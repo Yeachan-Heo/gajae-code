@@ -255,6 +255,7 @@ describe("trySyncSlashCompletion", () => {
 		expect(result).not.toBeNull();
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
 	});
+
 	it("ranks high-priority commands above higher fuzzy scores", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[

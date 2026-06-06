@@ -1,12 +1,7 @@
-import {
-	type AutocompleteItem,
-	type AutocompleteProvider,
-	CombinedAutocompleteProvider,
-	getKeybindings,
-	getSlashCommandMatchRank,
-	type SlashCommand,
-} from "@gajae-code/tui";
-import { formatKeyHints, type KeybindingsManager } from "../config/keybindings";
+import type { AutocompleteItem, AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
+import { CombinedAutocompleteProvider, getKeybindings, getSlashCommandMatchRank } from "@gajae-code/tui";
+import type { KeybindingsManager } from "../config/keybindings";
+import { formatKeyHints } from "../config/keybindings";
 import { isSettingsInitialized, settings } from "../config/settings";
 import { applyEmojiCompletion, getEmojiSuggestions, isEmojiPrefix, tryEmojiInlineReplace } from "./emoji-autocomplete";
 
