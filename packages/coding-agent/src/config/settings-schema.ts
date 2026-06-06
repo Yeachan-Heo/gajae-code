@@ -314,6 +314,16 @@ export const SETTINGS_SCHEMA = {
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	"modelProfile.default": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Default Model Profile",
+			description: "Model profile applied automatically at startup",
+			options: "runtime",
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 

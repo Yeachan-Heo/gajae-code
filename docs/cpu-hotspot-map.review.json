@@ -1,0 +1,38 @@
+{
+  "reviewer": "architect (bundled), read-only, task 0-VerifyHotspotMap",
+  "overallRecommendation": "APPROVE",
+  "architectureStatus": "CLEAR",
+  "productStatus": "WATCH->CLEAR after fixes",
+  "codeStatus": "CLEAR",
+  "blockers": [],
+  "summary": "All 11 CPU + 5 memory hotspots point to real source symbols/loops or retention paths; already-native exclusions respected; M01 persistence-vs-memory root cause valid. One MEDIUM finding (H02 full-matrix wording; source uses two-row DP) + one LOW (H01 range) \u2014 both fixed and re-verified.",
+  "sourceEvidenceInspected": [
+    "packages/coding-agent/src/edit/modes/replace.ts",
+    "packages/coding-agent/src/edit/diff.ts",
+    "packages/coding-agent/src/modes/components/diff.ts",
+    "packages/coding-agent/src/hindsight/mental-models.ts",
+    "packages/coding-agent/src/hashline/hash.ts",
+    "packages/agent/src/compaction/compaction.ts",
+    "packages/agent/src/compaction/openai.ts",
+    "packages/agent/src/append-only-context.ts",
+    "packages/coding-agent/src/session/agent-session.ts",
+    "packages/coding-agent/src/secrets/obfuscator.ts",
+    "packages/coding-agent/src/session/session-manager.ts",
+    "crates/pi-natives/src/lib.rs",
+    "packages/natives/native/index.js"
+  ],
+  "findingsResolved": [
+    {
+      "severity": "MEDIUM",
+      "id": "H02",
+      "issue": "full-matrix wording vs two-row DP",
+      "status": "fixed in docs/cpu-hotspot-map.{json,md}"
+    },
+    {
+      "severity": "LOW",
+      "id": "H01",
+      "issue": "line range slightly tight",
+      "status": "widened to 417-722"
+    }
+  ]
+}

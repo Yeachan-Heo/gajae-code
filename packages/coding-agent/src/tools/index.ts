@@ -10,6 +10,7 @@ import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { ForkContextSeed, ForkContextSeedOptions } from "../session/agent-session";
@@ -36,9 +37,6 @@ import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
-import { HindsightRecallTool } from "./hindsight-recall";
-import { HindsightReflectTool } from "./hindsight-reflect";
-import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
@@ -76,9 +74,6 @@ export * from "./debug";
 export * from "./eval";
 export * from "./find";
 export * from "./gh";
-export * from "./hindsight-recall";
-export * from "./hindsight-reflect";
-export * from "./hindsight-retain";
 export * from "./image-gen";
 export * from "./inspect-image";
 export * from "./irc";
@@ -198,6 +193,8 @@ export interface ToolSession {
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
+	/** Unattended workflow-gate emitter (present only when unattended mode is negotiated). */
+	getWorkflowGateEmitter?: () => WorkflowGateEmitter | undefined;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
@@ -302,7 +299,10 @@ export function computeEssentialBuiltinNames(settings: Settings): string[] {
 
 /**
  * Public callable factory map. External callers may invoke `BUILTIN_TOOLS.read(session)` or
- * `BUILTIN_TOOLS[name](session)` to construct a tool directly.
+ * `BUILTIN_TOOLS[name](session)` to construct a public coding-harness tool directly.
+ *
+ * Hindsight memory helpers are intentionally excluded: memory is a private backend
+ * integration, not a public gajae-code tool surface.
  */
 export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
@@ -337,9 +337,6 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	web_search: s => new WebSearchTool(s),
 	search_tool_bm25: SearchToolBm25Tool.createIf,
 	write: s => new WriteTool(s),
-	retain: HindsightRetainTool.createIf,
-	recall: HindsightRecallTool.createIf,
-	reflect: HindsightReflectTool.createIf,
 	skill: SkillTool.createIf,
 	goal: s => new GoalTool(s),
 };
@@ -460,11 +457,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		) {
 			requestedTools.push("recipe");
 		}
-		if (session.settings.get("memory.backend") === "hindsight") {
-			for (const name of ["recall", "retain", "reflect"]) {
-				if (!requestedTools.includes(name)) requestedTools.push(name);
-			}
-		}
 	}
 	// Resolve effective tool discovery mode.
 	// tools.discoveryMode takes precedence; mcp.discoveryMode is a back-compat alias for "mcp-only".
@@ -512,9 +504,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			return true;
 		}
 		if (name === "recipe") return session.settings.get("recipe.enabled");
-		if (name === "retain" || name === "recall" || name === "reflect") {
-			return session.settings.get("memory.backend") === "hindsight";
-		}
 		if (name === "task") {
 			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;
 			const currentDepth = session.taskDepth ?? 0;

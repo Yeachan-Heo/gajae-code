@@ -4,6 +4,7 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -472,9 +473,20 @@ export class InputController {
 			for (let index = 0; index < invocations.length; index += 1) {
 				const invocation = invocations[index];
 				if (!invocation) continue;
-				const built = await buildSkillPromptMessage(invocation.skill, invocation.args);
+				const activationResult = await resolveSubskillActivationForSkillInvocation({
+					cwd: this.ctx.sessionManager.getCwd(),
+					sessionId: this.ctx.session.sessionId,
+					skillName: invocation.skill.name,
+					args: invocation.args,
+				});
+				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
+					subskillActivation: activationResult.activation,
+					subskillActivationSet: activationResult.activeSubskillsToPersist,
+					cwd: this.ctx.sessionManager.getCwd(),
+					sessionId: this.ctx.session.sessionId,
+				});
 				const details: SkillPromptDetails = built.details;
-				const displayText = `/${invocation.commandName}${invocation.args ? ` ${invocation.args}` : ""}`;
+				const displayText = `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`;
 				// When the agent is streaming, register a compact slash-form text as
 				// the pending-display twin BEFORE dispatching the CustomMessage. The
 				// returned tag is embedded in details so AgentSession.#handleAgentEvent

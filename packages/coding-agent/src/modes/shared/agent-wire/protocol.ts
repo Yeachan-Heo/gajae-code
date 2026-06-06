@@ -64,6 +64,7 @@ export type BridgeFrameType =
 	| "host_tool_call"
 	| "host_uri_request"
 	| "reset"
+	| "workflow_gate"
 	| "error";
 
 /**
@@ -94,3 +95,9 @@ export interface BridgeEventPayload {
 
 /** An `AgentSessionEvent` serialized into a versioned wire frame. */
 export type BridgeEventFrame = BridgeFrameEnvelope<"event", BridgeEventPayload>;
+
+/** A `workflow_gate` event serialized into a versioned wire frame (#321). */
+export type BridgeWorkflowGateFrame = BridgeFrameEnvelope<
+	"workflow_gate",
+	import("../../rpc/rpc-types").RpcWorkflowGate
+>;

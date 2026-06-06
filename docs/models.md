@@ -168,6 +168,42 @@ The same presets are available inside the TUI:
 
 Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, or `ZAI_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider.
 
+## Model profiles (`--mpreset`)
+
+Model profiles are optional top-level `profiles:` entries in `~/.gjc/agent/models.yml`. A profile can require provider credentials before activation and can map one or more model roles; omitted roles inherit from the active defaults.
+
+```yaml
+profiles:
+  team-standard:
+    required_providers: [openai, anthropic]
+    model_mapping:
+      default: openai/gpt-5.2
+      executor: anthropic/claude-sonnet-4-6:medium
+      architect: openai/o3:high
+      planner: openai/o3:high
+      critic: openai/o3:high
+```
+
+`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Each role maps to exactly one model selector in the form `provider/modelId[:effort]`; comma-separated fallback chains are not supported in a single role value.
+`required_providers` is the aggregate set of providers required across the profile's mapped roles, not a per-role fallback chain.
+
+Built-in profiles are grouped by provider mix and tier:
+
+- `opencode-go-{eco,standard,pro}`
+- `codex-{eco,standard,pro}`
+- `opencode-go-codex-{eco,standard,pro}`
+
+The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. User-defined profiles override built-ins by exact profile name.
+
+Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
+
+```sh
+gjc --mpreset codex-standard
+gjc --mpreset opencode-go-pro --default
+```
+
+The `/model` command shows a `Profiles` section above model selection. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers.
+
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
 ```yaml

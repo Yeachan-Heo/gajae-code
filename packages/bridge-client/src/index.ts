@@ -3,6 +3,10 @@ import type { BridgeFrame } from "./reference-consumer";
 
 export * from "./commands";
 export * from "./reference-consumer";
+export * from "./workflow-gate";
+
+import type { UnattendedDeclaration, WorkflowGate, WorkflowGateResolver } from "./workflow-gate";
+import { isWorkflowGateFrame } from "./workflow-gate";
 export type BridgeCapability =
 	| "events"
 	| "prompt"
@@ -15,7 +19,8 @@ export type BridgeCapability =
 	| "host_uri"
 	| "client_bridge.read_text_file"
 	| "client_bridge.write_text_file"
-	| "client_bridge.create_terminal";
+	| "client_bridge.create_terminal"
+	| "workflow_gate";
 
 export type BridgeCommandScope =
 	| "prompt"
@@ -39,6 +44,7 @@ export interface BridgeHandshakeRequest {
 	capabilities: BridgeCapability[];
 	requested_scopes: BridgeCommandScope[];
 	last_seq?: number;
+	unattended?: UnattendedDeclaration;
 }
 
 export interface BridgeHandshakeAccepted {
@@ -58,6 +64,7 @@ export interface BridgeHandshakeAccepted {
 		hostUriResults: string;
 	};
 	frame_types: string[];
+	accepted_unattended?: UnattendedDeclaration;
 }
 
 export interface BridgeHandshakeRejected {
@@ -421,6 +428,48 @@ export class BridgeClient implements BridgeCommandHelpers {
 				},
 			},
 		);
+	}
+
+	/**
+	 * Answer a `workflow_gate` through the owner-token protected UI response
+	 * endpoint and return the gate resolution envelope.
+	 */
+	respondGate(
+		sessionId: string,
+		gateId: string,
+		ownerToken: string,
+		answer: unknown,
+		options: { idempotencyKey?: string; id?: string } = {},
+	): Promise<unknown> {
+		return this.#json(`/v1/sessions/${encodeURIComponent(sessionId)}/ui-responses/${encodeURIComponent(gateId)}`, {
+			method: "POST",
+			body: JSON.stringify({ gate_id: gateId, answer, idempotency_key: options.idempotencyKey }),
+			headers: {
+				"Content-Type": "application/json",
+				"X-GJC-Bridge-Owner-Token": ownerToken,
+				...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+			},
+		});
+	}
+
+	/**
+	 * Headless policy: stream the session's frames, route every received
+	 * `workflow_gate` to the agent `resolver`, and post its answer back. Yields
+	 * each handled gate. The resolver supplies the agent's memory-backed answer.
+	 */
+	async *consumeWorkflowGates(
+		sessionId: string,
+		ownerToken: string,
+		resolver: WorkflowGateResolver,
+		options: { lastSeq?: number } = {},
+	): AsyncGenerator<{ gate: WorkflowGate; answer: unknown }> {
+		for await (const frame of this.events(sessionId, options.lastSeq)) {
+			if (!isWorkflowGateFrame(frame)) continue;
+			const gate = frame.payload as WorkflowGate;
+			const answer = await resolver(gate);
+			await this.respondGate(sessionId, gate.gate_id, ownerToken, answer);
+			yield { gate, answer };
+		}
 	}
 
 	respondToHostTool(sessionId: string, correlationId: string, result: unknown): Promise<unknown> {

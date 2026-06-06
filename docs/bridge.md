@@ -140,6 +140,8 @@ re-enable work has a stable baseline.
 
 When internally enabled for compatibility tests, event replay still uses `last_seq` and the bounded replay reset marker `replay_window_exceeded`; command and UI response retries still use `Idempotency-Key`. These mechanisms are dormant for default external bridge clients because the endpoint matrix rejects the endpoints before they reach replay, body parsing, idempotency, scope, or dispatch logic.
 
+Workflow-gate responses are part of the UI-response surface, not the dormant command surface: when internally enabled, a controller answers `workflow_gate` frame `wg_...` by posting `{ "gate_id": "wg_...", "answer": ... }` to `POST /v1/sessions/{session_id}/ui-responses/{gate_id}`. The request must carry the current controller token in `X-GJC-Bridge-Owner-Token`; `Idempotency-Key` is optional and is also forwarded as `idempotency_key` when supplied by SDK helpers.
+
 ### Scopes
 
 The configurable scope set (`BRIDGE_COMMAND_SCOPES`) is:
@@ -198,6 +200,8 @@ endpoint matrix, the default handshake advertises no accepted scopes.
 | `get_messages` | `message:read` |
 | `get_login_providers` | `admin` |
 | `login` | `admin` |
+| `negotiate_unattended` | `control` |
+| `workflow_gate_response` | `prompt` |
 
 ### Dormant capabilities and frame types
 
@@ -206,10 +210,10 @@ conformance tests, but they are not advertised by the default fail-closed
 handshake:
 
 Capabilities: `events`, `prompt`, `permission`, `elicitation`, `ui.declarative`,
-`host_tools`, `host_uri`.
+`host_tools`, `host_uri`, `workflow_gate`.
 
 Frame types: `ready`, `event`, `response`, `ui_request`, `permission_request`,
-`host_tool_call`, `host_uri_request`, `reset`, `error`.
+`host_tool_call`, `host_uri_request`, `reset`, `workflow_gate`, `error`.
 
 ## UI Capability Parity
 
@@ -234,6 +238,8 @@ helpers mirroring the full RPC command catalog, an `events()` async generator,
 controller/UI/host-callback helpers, and an idempotency-key helper. In 0.3.1,
 those helpers should be expected to fail against the default bridge because the
 server endpoint matrix disables the corresponding session endpoints.
+
+`BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the owner-token protected UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`, because gate answers share controller ownership semantics with UI responses.
 
 > Response typing: in this experimental version, `command()` and the typed
 > command helpers return `Promise<unknown>`. Callers narrow the response

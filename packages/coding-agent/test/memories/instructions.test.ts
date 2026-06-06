@@ -15,7 +15,7 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 describe("buildMemoryToolDeveloperInstructions", () => {
-	it("uses memory:// URLs and does not expose raw memory root paths", async () => {
+	it("injects summary without exposing memory tool or raw root paths", async () => {
 		await withTempDir(async agentDir => {
 			const settings = Settings.isolated({ "memories.enabled": true });
 			const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
@@ -24,8 +24,9 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 
 			const instructions = await buildMemoryToolDeveloperInstructions(agentDir, settings);
 			expect(instructions).toBeDefined();
-			expect(instructions).toContain("memory://root/memory_summary.md");
-			expect(instructions).toContain("memory://root/skills/<name>/SKILL.md");
+			expect(instructions).toContain("Use structured retries for flaky network calls.");
+			expect(instructions).toContain("do not try to call or invent a `memory` tool");
+			expect(instructions).not.toContain("memory://");
 			expect(instructions).not.toContain(memoryRoot);
 		});
 	});

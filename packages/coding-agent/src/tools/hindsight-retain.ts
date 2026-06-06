@@ -22,8 +22,6 @@ export class HindsightRetainTool implements AgentTool<typeof hindsightRetainSche
 	readonly description = retainDescription;
 	readonly parameters = hindsightRetainSchema;
 	readonly strict = true;
-	readonly loadMode = "discoverable";
-	readonly summary = "Store important facts in hindsight memory";
 
 	constructor(private readonly session: ToolSession) {}
 

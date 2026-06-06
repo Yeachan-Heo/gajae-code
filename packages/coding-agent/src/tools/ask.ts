@@ -34,6 +34,7 @@ import {
 	renderDeepInterviewAskQuestion,
 } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { gateAnswerToResult, questionToGate } from "../modes/shared/agent-wire/deep-interview-gate";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
@@ -477,6 +478,28 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			options?: { previous?: QuestionResult; navigation?: NavigationControls },
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
+			// Unattended (#323/G011): route the question through the workflow-gate
+			// emitter instead of the interactive UI; the external agent answers over RPC.
+			const gateEmitter = this.session.getWorkflowGateEmitter?.();
+			if (gateEmitter?.isUnattended()) {
+				const gateQuestion = {
+					id: q.id,
+					question: q.question,
+					options: q.options,
+					multi: q.multi,
+					recommended: q.recommended,
+				};
+				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+				const decoded = gateAnswerToResult(gateQuestion, answer);
+				return {
+					optionLabels: rawOptionLabels,
+					selectedOptions: decoded.selectedOptions,
+					customInput: decoded.customInput,
+					navigation: undefined as NavigationControls | undefined,
+					cancelled: false,
+					timedOut: false,
+				};
+			}
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const displayQuestion = deepInterviewPrompt ?? q.question;

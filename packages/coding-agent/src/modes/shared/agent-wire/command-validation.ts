@@ -61,6 +61,26 @@ function hostUriScheme(value: unknown): boolean {
 	);
 }
 
+function unattendedBudget(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		typeof value.max_tokens === "number" &&
+		typeof value.max_tool_calls === "number" &&
+		typeof value.max_wall_time_ms === "number" &&
+		typeof value.max_cost_usd === "number"
+	);
+}
+
+function unattendedDeclaration(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		typeof value.actor === "string" &&
+		unattendedBudget(value.budget) &&
+		stringArray(value.scopes) &&
+		stringArray(value.action_allowlist)
+	);
+}
+
 export function isRpcCommand(value: unknown): value is RpcCommand {
 	if (!isRecord(value) || !optionalString(value.id) || !isRpcCommandType(value.type)) return false;
 	switch (value.type) {
@@ -98,8 +118,6 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 			return Array.isArray(value.tools) && value.tools.every(hostToolDefinition);
 		case "set_host_uri_schemes":
 			return Array.isArray(value.schemes) && value.schemes.every(hostUriScheme);
-		case "workflow_gate_response":
-			return stringField(value, "gate_id") && "answer" in value;
 		case "set_model":
 			return stringField(value, "provider") && stringField(value, "modelId");
 		case "set_thinking_level":
@@ -129,5 +147,9 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 			return optionalString(value.customInstructions);
 		case "login":
 			return stringField(value, "providerId");
+		case "negotiate_unattended":
+			return unattendedDeclaration(value.declaration);
+		case "workflow_gate_response":
+			return stringField(value, "gate_id") && "answer" in value && optionalString(value.idempotency_key);
 	}
 }

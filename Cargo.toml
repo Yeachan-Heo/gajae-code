@@ -4,7 +4,7 @@ exclude = ["crates/brush-core-vendored", "crates/brush-builtins-vendored"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 authors = ["Yeachan-Heo"]
@@ -219,7 +219,7 @@ smallvec = { version = "1.15.1", features = [
 # ──────────────────────────────────────────────────────────────────────────────
 # Hashing
 # ──────────────────────────────────────────────────────────────────────────────
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Memory Management & Allocators

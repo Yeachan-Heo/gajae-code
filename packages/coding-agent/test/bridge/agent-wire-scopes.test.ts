@@ -44,6 +44,8 @@ const EXPECTED_RPC_COMMAND_TYPES: readonly RpcCommand["type"][] = [
 	"get_messages",
 	"get_login_providers",
 	"login",
+	"negotiate_unattended",
+	"workflow_gate_response",
 ];
 
 describe("agent-wire RPC command scopes", () => {

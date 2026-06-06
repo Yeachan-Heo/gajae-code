@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
+import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,
@@ -275,6 +275,21 @@ function activeEntryPath(cwd: string, sessionScope: string | ActiveSessionScope 
 	return path.join(activeStateDir(cwd, sessionScope), `${encodePathSegment(normalizedSkill)}.json`);
 }
 
+function activeSubskillKey(entry: ActiveSubskillEntry): string {
+	return `${entry.parent}::${entry.phase}::${entry.activationArg}`;
+}
+
+function flattenActiveSubskills(entries: SkillActiveEntry[]): ActiveSubskillEntry[] {
+	const deduped = new Map<string, ActiveSubskillEntry>();
+	for (const entry of entries) {
+		if (entry.active === false || !Array.isArray(entry.active_subskills)) continue;
+		for (const subskill of entry.active_subskills) {
+			deduped.set(activeSubskillKey(subskill), subskill);
+		}
+	}
+	return [...deduped.values()];
+}
+
 function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 	const visible = entries.filter(entry => entry.active !== false);
 	const primary = visible[0];
@@ -288,6 +303,7 @@ function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 		thread_id: primary?.thread_id,
 		turn_id: primary?.turn_id,
 		active_skills: entries,
+		active_subskills: flattenActiveSubskills(visible),
 	};
 }
 

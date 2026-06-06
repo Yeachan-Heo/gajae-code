@@ -1,6 +1,30 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+
+- Preserved harness owner-vanish evidence after prompt acceptance: no-owner `recover` now either restores a detached owner when a prior endpoint exists or returns a public-safe concrete owner-exit reason plus a vanish receipt, and no-owner `observe`/`events` expose the preserved owner-exit summary.
+
+## [0.3.2] - 2026-06-05
+
+### Added
+
+- Added model profiles with a `--mpreset <profile>` CLI flag and a `/model` selector "Profiles" section that activate a named profile's default model plus per-agent-role model overrides in one step, validating required-provider credentials before applying and surfacing a custom provider onboarding wizard for missing API-compatible providers.
+- Integrated `ai-slop-cleaner` as an internal Ultragoal sub-skill fragment that runs as the mandatory completion-gate cleanup sweep over a story's changed files, reporting blocking and advisory findings without editing code or mutating `.gjc/` state.
+### Changed
+
+- Edit tool diff generation (`generateDiffString`) now uses the native `diffLines` from `@gajae-code/natives` (a byte-identical Rust port of jsdiff) instead of the pure-JS implementation, removing the multi-second Myers blowup on large-file edits (~16x faster on ~1MB files) with identical diff output.
+
+### Fixed
+
+- Reconciled native Ultragoal commands with workflow mode-state and the HUD: `gjc ultragoal create-goals`, `complete-goals`, `checkpoint`, steering, review-blocker recording, and status now sync `.gjc/state/ultragoal-state.json` plus `skill-active-state.json` from the durable `.gjc/ultragoal` plan/ledger, clearing stale active HUD chips after all goals complete.
+- Forwarded the parent session id when task subagents validate configured role-agent model overrides, preventing session-scoped OAuth providers from being misread as unauthenticated and falling back to the parent chat model.
+- Removed unintended public memory-tool guidance and registration: Hindsight retain/recall/reflect helpers are now compatibility-only, local memory prompt injection no longer advertises `memory://` reads, and regression tests guard the public tool surface.
+- Fixed `read` hashline anchors drifting on truncated reads so the `line+hash` anchors consumed by `edit`/`apply_patch` stay correct when a file is read past the truncation boundary.
+- Reconciled the ultragoal skill mode-state (`current_phase`/`active`) and HUD chip with the `.gjc/ultragoal` plan/ledger on every `gjc ultragoal` command (`create-goals`/`complete-goals`/`checkpoint`/`steer`/`record-review-blockers`/`status`), so `gjc state ultragoal read`, the skill-tool chain guard, and the HUD no longer sit at a stale `active:true`/`goal-planning` after a run completes (#342). A new `reconcileWorkflowSkillState` performs a session-scoped (`GJC_SESSION_ID`) derived write that bypasses only transition-edge validation while preserving schema/unknown-phase validation, version/checksum stamping, and audit provenance (`owner: gjc-runtime`, `verb: reconcile`); reconciliation is best-effort and surfaces failures via stderr and a `reconcile_failed` ledger event without changing command status/stdout. Removed the duplicate sessionless active-state sync from the `gjc ultragoal` command wrapper.
+
+## [0.3.1] - 2026-06-05
 ### Added
 
 - Added opt-in crash diagnostics for subprocess failures, with a shared crash taxonomy/report writer, bash/Python/LSP/DAP crash notices, and a native Rust panic-report hook gated by `GJC_NATIVE_CRASH_DIAGNOSTICS` / `GJC_CRASH_DIAGNOSTICS`.
@@ -16,10 +40,6 @@
 - Preserved `gjc harness` `owner-vanished:*` blockers when a replacement owner becomes live so unrecovered prior-owner evidence remains visible until explicit recovery or terminal completion evidence; only safe startup liveness false-negatives such as `detached-owner-not-live` are auto-cleared.
 - Fixed the interactive agent unexpectedly stopping after automatic context maintenance instead of resuming the in-flight task. Post-compaction continuation now schedules exactly one source per completion (overflow retry → queued messages → synthetic auto-continue prompt), the threshold/handoff auto-continue prompt skips a redundant pre-send compaction check, overflow retry strips only the context-overflow failed turn (never normal/aborted/silent-abort tails), and non-resumable or superseded continuations log a structured reason instead of stranding the session.
 - Fixed the native Stop skill-state hook letting active GJC workflow skills stop prematurely. The Stop hook no longer treats a missing/unreadable mode-state file as terminal for handoff workflows, and handoff skills (`deep-interview`, `ralplan`) now keep blocking Stop even in the `handoff` phase until they are demoted (`active:false`) or cleared, so they always end by offering the next handoff step via the ask tool. Non-handoff skills (`team`, `ultragoal`) retain the fail-open safety valve when their mode-state file is corrupt or invalid.
-
-### Fixed
-
-- Forwarded the parent session id when task subagents validate configured role-agent model overrides, preventing session-scoped OAuth providers from being misread as unauthenticated and falling back to the parent chat model.
 
 ## [0.3.0] - 2026-06-03
 

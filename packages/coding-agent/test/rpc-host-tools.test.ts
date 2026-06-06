@@ -9,7 +9,7 @@ import type {
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolUpdate,
-	RpcWorkflowGateEvent,
+	RpcWorkflowGate,
 } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 
 const tempPaths: string[] = [];
@@ -138,7 +138,7 @@ process.stdin.on("data", chunk => {
 function handle(frame) {
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
-		write({ type: "workflow_gate", gate_id: "gate-1", stage: "ralplan:approval", kind: "approval", schema: { type: "boolean" }, context: { method: "confirm" } });
+		write({ type: "workflow_gate", gate_id: "gate-1", stage: "ralplan", kind: "approval", schema: { type: "boolean" }, schema_hash: "mock-schema-hash", context: { method: "confirm" }, created_at: new Date().toISOString(), required: true });
 		return;
 	}
 	if (frame.type === "workflow_gate_response") {
@@ -146,14 +146,14 @@ function handle(frame) {
 			write({ id: frame.id, type: "response", command: "workflow_gate_response", success: false, error: "invalid_workflow_gate_response: answer must be a boolean", errorCode: "invalid_workflow_gate_response" });
 			return;
 		}
-		write({ id: frame.id, type: "response", command: "workflow_gate_response", success: true });
+		write({ id: frame.id, type: "response", command: "workflow_gate_response", success: true, data: { gate_id: frame.gate_id, status: "accepted", answer_hash: "mock-answer-hash" } });
 		write({ type: "agent_end", messages: [] });
 	}
 }
 `,
 		);
 		const client = new RpcClient({ cliPath: scriptPath });
-		const gates: RpcWorkflowGateEvent[] = [];
+		const gates: RpcWorkflowGate[] = [];
 		try {
 			await client.start();
 			client.onWorkflowGate(gate => gates.push(gate));
@@ -163,12 +163,14 @@ function handle(frame) {
 			expect(gates).toHaveLength(1);
 			expect(gates[0]).toMatchObject({
 				gate_id: "gate-1",
-				stage: "ralplan:approval",
+				stage: "ralplan",
 				kind: "approval",
 				schema: { type: "boolean" },
+				schema_hash: "mock-schema-hash",
+				required: true,
 			});
-			await expect(client.respondToWorkflowGate("gate-1", "yes")).rejects.toThrow("invalid_workflow_gate_response");
-			await client.respondToWorkflowGate("gate-1", true);
+			await expect(client.respondGate("gate-1", "yes")).rejects.toThrow("invalid_workflow_gate_response");
+			await client.respondGate("gate-1", true);
 			await client.waitForIdle(2_000);
 		} finally {
 			client.stop();

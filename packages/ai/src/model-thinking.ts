@@ -29,6 +29,8 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH: readonly Effort[] = [
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
+
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
 
@@ -433,6 +435,17 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 	}
 }
 
+function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel: ParsedModel): Effort | undefined {
+	if (
+		parsedModel.family === "openai" &&
+		model.provider === "openai-codex" &&
+		semverEqual(parsedModel.version, "5.5")
+	) {
+		return GPT_5_5_DEFAULT_EFFORT;
+	}
+	return undefined;
+}
+
 function inferModelThinking<TApi extends Api>(model: ApiModel<TApi>): ThinkingConfig {
 	const parsedModel = parseKnownModel(model.id);
 	const efforts = inferSupportedEfforts(parsedModel, model);
@@ -446,6 +459,10 @@ function inferModelThinking<TApi extends Api>(model: ApiModel<TApi>): ThinkingCo
 		minLevel,
 		maxLevel,
 	};
+	const defaultLevel = inferDefaultEffort(model, parsedModel);
+	if (defaultLevel && efforts.includes(defaultLevel)) {
+		config.defaultLevel = defaultLevel;
+	}
 	// Encode explicit levels only when the inferred set has gaps the min..max range cannot represent.
 	const minIndex = THINKING_EFFORTS.indexOf(minLevel);
 	const maxIndex = THINKING_EFFORTS.indexOf(maxLevel);
@@ -466,7 +483,13 @@ function normalizeThinkingConfig(thinking: ThinkingConfig | undefined): Thinking
 function thinkingsEqual(left: ThinkingConfig | undefined, right: ThinkingConfig | undefined): boolean {
 	if (left === right) return true;
 	if (!left || !right) return false;
-	if (left.mode !== right.mode || left.minLevel !== right.minLevel || left.maxLevel !== right.maxLevel) return false;
+	if (
+		left.mode !== right.mode ||
+		left.minLevel !== right.minLevel ||
+		left.maxLevel !== right.maxLevel ||
+		left.defaultLevel !== right.defaultLevel
+	)
+		return false;
 	const leftLevels = left.levels;
 	const rightLevels = right.levels;
 	if (leftLevels === rightLevels) return true;

@@ -15,6 +15,7 @@ import { logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import { listClaudePluginRoots } from "../discovery/helpers";
+import { rootContainsGjcManifest } from "../extensibility/gjc-plugins/paths";
 import { loadBundledAgents, parseAgent } from "./agents";
 import type { AgentDefinition, AgentSource } from "./types";
 
@@ -93,7 +94,12 @@ export async function discoverAgents(cwd: string, home: string = os.homedir()): 
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
 		? await listClaudePluginRoots(home, resolvedCwd)
 		: { roots: [] };
-	const sortedPluginRoots = [...pluginRoots].sort((a, b) => {
+	const nonGjcPluginRoots = [];
+	for (const plugin of pluginRoots) {
+		if (await rootContainsGjcManifest(plugin.path)) continue;
+		nonGjcPluginRoots.push(plugin);
+	}
+	const sortedPluginRoots = nonGjcPluginRoots.sort((a, b) => {
 		if (a.scope === b.scope) return 0;
 		return a.scope === "project" ? -1 : 1;
 	});

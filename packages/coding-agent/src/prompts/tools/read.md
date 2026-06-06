@@ -8,7 +8,7 @@ Read files, directories, archives, SQLite databases, images, documents, internal
 
 ## Parameters
 
-- `path` — required. Local path, internal URI (`agent://`, `artifact://`, `memory://`, `rule://`, `local://`), or URL. Append `:<sel>` for line ranges, raw mode, or special modes (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`).
+- `path` — required. Local path, internal URI (`agent://`, `artifact://`, `rule://`, `local://`), or URL. Append `:<sel>` for line ranges, raw mode, or special modes (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`).
 
 ## Selectors
 
@@ -70,7 +70,7 @@ For `.sqlite`, `.sqlite3`, `.db`, `.db3`:
 
 # Internal URIs
 
-`agent://<id>`, `artifact://<id>`, `memory://root`, `rule://<name>`, and `local://<name>.md` resolve transparently and accept the same line selectors as filesystem paths. Use `artifact://<id>` to recover full output that a previous bash/eval/tool result spilled or truncated.
+`agent://<id>`, `artifact://<id>`, `rule://<name>`, and `local://<name>.md` resolve transparently and accept the same line selectors as filesystem paths. Use `artifact://<id>` to recover full output that a previous bash/eval/tool result spilled or truncated.
 
 <critical>
 - You MUST use `read` for every file, directory, archive, and URL inspection. `cat`, `head`, `tail`, `less`, `more`, `ls`, `tar`, `unzip`, `curl`, `wget` are FORBIDDEN — any such bash call is a bug, regardless of how short or convenient it looks.

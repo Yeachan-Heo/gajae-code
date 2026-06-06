@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -12,7 +12,9 @@ import {
 	readEvents,
 	readReceiptIndex,
 	readSessionState,
+	rememberHarnessSessionRoot,
 	resolveHarnessRoot,
+	resolveHarnessSessionRoot,
 	StorageError,
 	sessionPaths,
 	writeReceiptImmutable,
@@ -26,13 +28,18 @@ import {
 } from "../../src/harness-control-plane/types";
 
 let root: string;
+let registryRoot: string;
+let registryEnv: NodeJS.ProcessEnv;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-store-"));
+	registryRoot = await mkdtemp(path.join(tmpdir(), "harness-root-registry-"));
+	registryEnv = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot };
 });
 
 afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
+	await rm(registryRoot, { recursive: true, force: true });
 });
 
 function state(sessionId: string): SessionState {
@@ -62,6 +69,14 @@ function envelope(cursor: number): EventEnvelope {
 		nextAllowedActions: [],
 		writer: { ownerId: "owner-1", leaseEpoch: 1 },
 	};
+}
+
+function registryPath(sessionId: string): string {
+	return path.join(registryRoot, `${sessionId}.json`);
+}
+
+function mode(bits: number): number {
+	return bits & 0o777;
 }
 
 describe("harness storage", () => {
@@ -182,5 +197,73 @@ describe("harness storage", () => {
 		);
 		const socketPath = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
 		expect(path.basename(socketPath)).toBe(`c-${digest.slice(0, 24)}.sock`);
+	});
+
+	it("does not pick an arbitrary registered root when explicit session ids collide", async () => {
+		const id = `h-collide-${process.pid}`;
+		const leftRoot = await mkdtemp(path.join(tmpdir(), "h-left-"));
+		const rightRoot = await mkdtemp(path.join(tmpdir(), "h-right-"));
+		try {
+			await writeSessionState(leftRoot, { ...state(id), handle: { ...state(id).handle, workspace: "/repo/left" } });
+			await writeSessionState(rightRoot, {
+				...state(id),
+				handle: { ...state(id).handle, workspace: "/repo/right" },
+			});
+			await rememberHarnessSessionRoot(leftRoot, id, registryEnv);
+			await rememberHarnessSessionRoot(rightRoot, id, registryEnv);
+
+			await expect(resolveHarnessSessionRoot(root, id, registryEnv)).rejects.toThrow(
+				/ambiguous_harness_session_root/,
+			);
+			expect(await resolveHarnessSessionRoot(root, id, registryEnv, { expectedWorkspace: "/repo/left" })).toBe(
+				path.resolve(leftRoot),
+			);
+			expect(await resolveHarnessSessionRoot(root, id, registryEnv, { expectedWorkspace: "/repo/right" })).toBe(
+				path.resolve(rightRoot),
+			);
+			await expect(
+				resolveHarnessSessionRoot(root, id, registryEnv, { expectedWorkspace: "/repo/missing" }),
+			).rejects.toThrow(/session_workspace_mismatch/);
+		} finally {
+			await rm(leftRoot, { recursive: true, force: true });
+			await rm(rightRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("uses expectedWorkspace registry disambiguation instead of stale local same-session state", async () => {
+		const id = `h-stale-local-${process.pid}`;
+		const registeredRoot = await mkdtemp(path.join(tmpdir(), "h-registered-"));
+		try {
+			await writeSessionState(root, { ...state(id), handle: { ...state(id).handle, workspace: "/repo/stale" } });
+			await writeSessionState(registeredRoot, {
+				...state(id),
+				handle: { ...state(id).handle, workspace: "/repo/expected" },
+			});
+			await rememberHarnessSessionRoot(registeredRoot, id, registryEnv);
+
+			expect(await resolveHarnessSessionRoot(root, id, registryEnv, { expectedWorkspace: "/repo/expected" })).toBe(
+				path.resolve(registeredRoot),
+			);
+		} finally {
+			await rm(registeredRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("stores global registry files with private permissions", async () => {
+		const id = `h-private-${process.pid}`;
+		const file = registryPath(id);
+		const dir = path.dirname(file);
+		await rm(dir, { recursive: true, force: true });
+		await rememberHarnessSessionRoot(root, id, registryEnv);
+		const dirStat = await stat(dir);
+		const fileStat = await stat(file);
+		expect(mode(dirStat.mode)).toBe(0o700);
+		expect(mode(fileStat.mode)).toBe(0o600);
+
+		await chmod(dir, 0o775);
+		await chmod(file, 0o664);
+		await rememberHarnessSessionRoot(root, id, registryEnv);
+		expect(mode((await stat(dir)).mode)).toBe(0o700);
+		expect(mode((await stat(file)).mode)).toBe(0o600);
 	});
 });

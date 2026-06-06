@@ -106,3 +106,16 @@ export function toBridgeEventFrame(event: AgentSessionEvent, sequencer: BridgeFr
 		event,
 	});
 }
+
+/**
+ * Serialize a `workflow_gate` event into a sequenced wire frame (#321). The
+ * gate_id is stamped as the correlation id so the answer (posted to the
+ * ui-responses endpoint) can be matched, and the monotonic `seq` gives replay
+ * while `frame_id` + gate_id give idempotency.
+ */
+export function toBridgeWorkflowGateFrame(
+	gate: import("../../rpc/rpc-types").RpcWorkflowGate,
+	sequencer: BridgeFrameSequencer,
+): import("./protocol").BridgeWorkflowGateFrame {
+	return sequencer.next("workflow_gate", gate, gate.gate_id);
+}

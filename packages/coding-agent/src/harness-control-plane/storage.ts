@@ -20,6 +20,85 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { EventEnvelope, ReceiptFamily, SessionState } from "./types";
 
+interface HarnessRootRegistryEntry {
+	root: string;
+	updatedAt: string;
+}
+
+interface HarnessRootRegistry {
+	sessionId: string;
+	roots: HarnessRootRegistryEntry[];
+}
+
+interface ResolveHarnessSessionRootOptions {
+	expectedWorkspace?: string;
+}
+
+export function canonicalWorkspacePath(workspace: string): string {
+	return path.resolve(workspace);
+}
+
+function samePath(left: string, right: string): boolean {
+	return canonicalWorkspacePath(left) === canonicalWorkspacePath(right);
+}
+
+async function ensurePrivateDir(dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+	await fs.chmod(dir, 0o700);
+}
+
+function ensurePrivateDirSync(dir: string): void {
+	fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	fsSync.chmodSync(dir, 0o700);
+}
+
+function sessionMatchesWorkspace(state: SessionState, expectedWorkspace: string): boolean {
+	return samePath(state.handle.workspace, expectedWorkspace);
+}
+
+function harnessRootRegistryDir(env: NodeJS.ProcessEnv = process.env): string {
+	const override = env.GJC_HARNESS_ROOT_REGISTRY_DIR?.trim();
+	if (override) return path.resolve(override);
+	return path.join(os.tmpdir(), `gjch${process.getuid?.() ?? "u"}`, "harness-roots");
+}
+
+function harnessRootRegistryPath(sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+	assertSafeSessionId(sessionId);
+	return path.join(harnessRootRegistryDir(env), `${sessionId}.json`);
+}
+
+async function readHarnessRootRegistry(
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<HarnessRootRegistry> {
+	const file = harnessRootRegistryPath(sessionId, env);
+	try {
+		const raw = await fs.readFile(file, "utf8");
+		const parsed = JSON.parse(raw) as HarnessRootRegistry;
+		if (parsed.sessionId === sessionId && Array.isArray(parsed.roots)) return parsed;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return { sessionId, roots: [] };
+}
+
+async function writeJsonAtomicPrivate(file: string, value: unknown): Promise<void> {
+	await ensurePrivateDir(path.dirname(file));
+	const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	await fs.rename(tmp, file);
+	await fs.chmod(file, 0o600);
+}
+
+async function writeHarnessRootRegistry(
+	registry: HarnessRootRegistry,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+	const dir = harnessRootRegistryDir(env);
+	await ensurePrivateDir(dir);
+	const file = harnessRootRegistryPath(registry.sessionId, env);
+	await writeJsonAtomicPrivate(file, registry);
+}
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const MAX_UNIX_SOCKET_PATH_BYTES = 100;
 
@@ -36,7 +115,7 @@ function socketBase(env: NodeJS.ProcessEnv, allowOverride: boolean): { base: str
 
 function socketPathForBase(root: string, sessionId: string, base: string): string {
 	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex");
-	fsSync.mkdirSync(base, { recursive: true });
+	ensurePrivateDirSync(base);
 	for (const len of [16, 24, 32, 48, 64]) {
 		const stem = `c-${digest.slice(0, len)}`;
 		const metadataPath = path.join(base, `${stem}.json`);
@@ -46,7 +125,10 @@ function socketPathForBase(root: string, sessionId: string, base: string): strin
 			if (existing.root === root && existing.sessionId === sessionId) return path.join(base, `${stem}.sock`);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+			fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
 			return path.join(base, `${stem}.sock`);
 		}
 	}
@@ -148,6 +230,66 @@ async function readJson<T>(file: string): Promise<T | null> {
 
 export async function readSessionState(root: string, sessionId: string): Promise<SessionState | null> {
 	return readJson<SessionState>(sessionPaths(root, sessionId).state);
+}
+export async function rememberHarnessSessionRoot(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+	assertSafeSessionId(sessionId);
+	const resolvedRoot = path.resolve(root);
+	const registry = await readHarnessRootRegistry(sessionId, env);
+	const now = new Date().toISOString();
+	registry.roots = [
+		{ root: resolvedRoot, updatedAt: now },
+		...registry.roots.filter(entry => path.resolve(entry.root) !== resolvedRoot),
+	].slice(0, 8);
+	await writeHarnessRootRegistry(registry, env);
+}
+
+export async function resolveHarnessSessionRoot(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+	options: ResolveHarnessSessionRootOptions = {},
+): Promise<string> {
+	assertSafeSessionId(sessionId);
+	const resolvedRoot = path.resolve(root);
+	const candidates: { root: string; state: SessionState }[] = [];
+	const seenRoots = new Set<string>();
+	const addCandidate = async (candidateRoot: string): Promise<void> => {
+		const candidate = path.resolve(candidateRoot);
+		if (seenRoots.has(candidate)) return;
+		seenRoots.add(candidate);
+		const state = await readSessionState(candidate, sessionId);
+		if (state !== null) candidates.push({ root: candidate, state });
+	};
+
+	await addCandidate(resolvedRoot);
+	const registry = await readHarnessRootRegistry(sessionId, env);
+	for (const entry of registry.roots) await addCandidate(entry.root);
+
+	if (!options.expectedWorkspace) {
+		if (candidates.some(candidate => candidate.root === resolvedRoot)) return resolvedRoot;
+		if (candidates.length === 1) return candidates[0].root;
+		if (candidates.length > 1) {
+			throw new StorageError(`ambiguous_harness_session_root:${sessionId}`, "ambiguous_harness_session_root");
+		}
+		return resolvedRoot;
+	}
+
+	const expectedWorkspace = canonicalWorkspacePath(options.expectedWorkspace);
+	const matchingCandidates = candidates.filter(candidate =>
+		sessionMatchesWorkspace(candidate.state, expectedWorkspace),
+	);
+	if (matchingCandidates.length === 1) return matchingCandidates[0].root;
+	if (matchingCandidates.length > 1) {
+		throw new StorageError(`ambiguous_harness_session_root:${sessionId}`, "ambiguous_harness_session_root");
+	}
+	if (candidates.length > 0) {
+		throw new StorageError(`session_workspace_mismatch:${sessionId}`, "session_workspace_mismatch");
+	}
+	return resolvedRoot;
 }
 
 export async function writeSessionState(root: string, state: SessionState): Promise<void> {

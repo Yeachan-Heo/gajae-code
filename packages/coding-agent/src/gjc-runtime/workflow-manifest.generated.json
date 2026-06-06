@@ -1172,6 +1172,10 @@
     "skill": "ultragoal",
     "states": [
       {
+        "id": "missing",
+        "terminal": true
+      },
+      {
         "id": "goal-planning",
         "initial": true
       },
@@ -1198,6 +1202,7 @@
       }
     ],
     "terminalStates": [
+      "missing",
       "failed",
       "complete",
       "handoff"

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
+import { normalizeFileDependencySpec } from "./ci-release-publish";
 
 interface PackageManifest {
 	name: string;
@@ -33,6 +34,15 @@ describe("unscoped gajae-code package publication", () => {
 		);
 		expect(aliasManifest.bin).toEqual({ gjc: "bin/gjc.js" });
 		expect(aliasManifest.dependencies?.["@gajae-code/coding-agent"]).toBe("catalog:");
+	});
+
+	test("release dependency normalization collapses repeated file prefixes", () => {
+		expect(normalizeFileDependencySpec("file:../packages/ai")).toBe("file:../packages/ai");
+		expect(normalizeFileDependencySpec("file:file:../packages/ai")).toBe("file:../packages/ai");
+		expect(normalizeFileDependencySpec("file:file:file:///tmp/gajae-code/packages/ai")).toBe(
+			"file:///tmp/gajae-code/packages/ai",
+		);
+		expect(normalizeFileDependencySpec("catalog:")).toBe("catalog:");
 	});
 
 	test("release publish order publishes the alias after its scoped dependency", async () => {

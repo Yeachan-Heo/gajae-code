@@ -26,6 +26,7 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
+import { activateModelProfile } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
@@ -194,9 +195,57 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey">;
+	parsedArgs: Pick<Args, "apiKey" | "default" | "model" | "mpreset" | "thinking">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+}
+
+export async function applyStartupModelProfiles(args: {
+	session: AgentSession;
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	startupModel?: CreateAgentSessionOptions["model"];
+	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+}): Promise<void> {
+	const applyProfile = async (profileName: string, persistDefault: boolean): Promise<void> => {
+		await activateModelProfile(
+			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+			{ persistDefault },
+		);
+	};
+
+	// Capture the explicitly-selected startup model BEFORE profile activation can
+	// override it. startupModel covers the eager path; session.model covers the
+	// deferred `--model <pattern>` path resolved inside createAgentSession.
+	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
+
+	const defaultProfile = args.settings.get("modelProfile.default");
+	if (defaultProfile) {
+		await applyProfile(defaultProfile, false);
+	}
+	if (args.parsedArgs.mpreset) {
+		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+	}
+
+	// Explicit CLI --model/--thinking must win over any activated profile.
+	if (explicitModel) {
+		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking);
+	} else if (args.parsedArgs.thinking && args.session.model) {
+		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking);
+	}
+}
+
+export async function applyStartupModelProfilesOrExit(
+	args: Parameters<typeof applyStartupModelProfiles>[0],
+): Promise<void> {
+	try {
+		await applyStartupModelProfiles(args);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+		process.exit(1);
+	}
 }
 
 /**
@@ -224,6 +273,14 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			agentId,
 			hasUI: false,
 			enableMCP: false,
+		});
+		await applyStartupModelProfilesOrExit({
+			session: nextSession,
+			settings: nextSettings,
+			modelRegistry: args.modelRegistry,
+			parsedArgs: args.parsedArgs,
+			startupModel: args.baseOptions.model,
+			startupThinkingLevel: args.baseOptions.thinkingLevel,
 		});
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
@@ -877,6 +934,15 @@ export async function runRootCommand(
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
+
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings: settingsInstance,
+			modelRegistry,
+			parsedArgs,
+			startupModel: sessionOptions.model,
+			startupThinkingLevel: sessionOptions.thinkingLevel,
+		});
 
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });

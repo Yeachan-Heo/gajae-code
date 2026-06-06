@@ -5,6 +5,20 @@
 
 import bigrams from "./bigrams.json" with { type: "json" };
 
+// Optional native acceleration for formatHashLines. Loaded WITHOUT throwing at
+// module evaluation so this core module (and its re-exported helpers) stays
+// usable and falls back to the TS loop if the native addon is unavailable.
+let formatHashLinesNative: ((text: string, startLine?: number) => string) | undefined;
+void import("../../../natives/native/index.js")
+	.then(mod => {
+		if (typeof mod.h06FormatHashLines === "function") {
+			formatHashLinesNative = mod.h06FormatHashLines;
+		}
+	})
+	.catch(() => {
+		// Native unavailable; formatHashLines uses the TS loop.
+	});
+
 /**
  * 647 single-token BPE bigrams for hashline anchors. Every entry tokenizes as
  * exactly one token in modern BPE vocabularies (cl100k / o200k / Anthropic model family),
@@ -168,6 +182,15 @@ export function formatHashLine(lineNumber: number, line: string): string {
  * ```
  */
 export function formatHashLines(text: string, startLine = 1): string {
+	// Native path only for the supported startLine domain (non-negative integer);
+	// other values fall through to JS numeric semantics in the TS loop.
+	if (formatHashLinesNative && Number.isInteger(startLine) && startLine >= 0) {
+		try {
+			return formatHashLinesNative(text, startLine);
+		} catch {
+			// Native hashline formatting is an optimization only; preserve the TS contract.
+		}
+	}
 	const lines = text.split("\n");
 	return lines.map((line, i) => formatHashLine(startLine + i, line)).join("\n");
 }

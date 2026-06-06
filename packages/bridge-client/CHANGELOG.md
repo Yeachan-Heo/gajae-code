@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-05
+
 ### Added
 
 - Added the initial `@gajae-code/bridge-client` TypeScript SDK for the GJC backend bridge, including authenticated handshake/command/event helpers, controller/UI/host callback APIs, idempotency-key helpers, and a minimal reference consumer renderer.

@@ -76,6 +76,39 @@ const ModelBindingsSchema = z.object({
 	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
 	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
 });
+export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
+
+function isValidProfileModelSelector(value: string): boolean {
+	if (value.includes(",")) return false;
+	const slashIdx = value.indexOf("/");
+	if (slashIdx <= 0 || slashIdx === value.length - 1) return false;
+	const provider = value.slice(0, slashIdx);
+	const modelId = value.slice(slashIdx + 1);
+	if (!provider || !modelId) return false;
+	const parts = modelId.split(":");
+	if (parts.length > 2) return false;
+	const [base, suffix] = parts;
+	if (!base) return false;
+	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh"].includes(suffix);
+}
+
+export const ProfileModelSelectorSchema = z
+	.string()
+	.min(1)
+	.refine(value => isValidProfileModelSelector(value), {
+		message: "Expected provider/modelId with optional :effort suffix",
+	});
+
+export const ProfileModelMappingSchema = z.partialRecord(ProfileRoleSchema, ProfileModelSelectorSchema);
+
+export const ProfileDefinitionSchema = z
+	.object({
+		required_providers: z.array(z.string().min(1)).min(1),
+		model_mapping: ProfileModelMappingSchema,
+	})
+	.strict();
+
+export const ProfilesSchema = z.record(z.string().min(1), ProfileDefinitionSchema);
 
 const ModelDefinitionSchema = z
 	.object({
@@ -205,7 +238,10 @@ export const ModelsConfigSchema = z
 		providers: z.record(z.string(), ProviderConfigSchema).optional(),
 		modelBindings: ModelBindingsSchema.optional(),
 		equivalence: EquivalenceConfigSchema.optional(),
+		profiles: ProfilesSchema.optional(),
 	})
 	.strict();
 
 export type ModelsConfig = z.infer<typeof ModelsConfigSchema>;
+export type ModelProfileConfig = z.infer<typeof ProfileDefinitionSchema>;
+export type ModelProfilesConfig = z.infer<typeof ProfilesSchema>;

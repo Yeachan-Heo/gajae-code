@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-05
+
 ### Changed
 
 - Added replay-gate helper timing for text-layout utilities so Stage 5 native offload decisions are benchmark-gated by measured hot paths rather than speculative rewrites.

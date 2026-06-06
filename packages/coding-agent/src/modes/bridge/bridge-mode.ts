@@ -1,10 +1,15 @@
+import * as path from "node:path";
 import type { ExtensionUIContext } from "../../extensibility/extensions";
 import type { AgentSession } from "../../session/agent-session";
 import type { ClientBridgePermissionOutcome } from "../../session/client-bridge";
-import type { RpcCommand, RpcResponse } from "../rpc/rpc-types";
+import type { RpcCommand, RpcResponse, RpcWorkflowGateResponse } from "../rpc/rpc-types";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
 import { isRpcCommand } from "../shared/agent-wire/command-validation";
-import { BridgeFrameSequencer, toBridgeEventFrame } from "../shared/agent-wire/event-envelope";
+import {
+	BridgeFrameSequencer,
+	toBridgeEventFrame,
+	toBridgeWorkflowGateFrame,
+} from "../shared/agent-wire/event-envelope";
 import type { BridgeCapability } from "../shared/agent-wire/handshake";
 import {
 	type BridgeHandshakeRequest,
@@ -23,6 +28,9 @@ import {
 } from "../shared/agent-wire/scopes";
 import { UiRequestBroker } from "../shared/agent-wire/ui-request-broker";
 import type { BridgeUiResult } from "../shared/agent-wire/ui-result";
+import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
+import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
+import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { assertSafeBridgeBind, isBridgeTokenAuthorized } from "./auth";
 import { type BridgePermissionRequestPayload, createBridgeClientBridge } from "./bridge-client-bridge";
 import { BridgeExtensionUIContext, type BridgeUiRequestPayload } from "./bridge-ui-context";
@@ -39,6 +47,7 @@ const SERVER_CAPABILITIES: readonly BridgeCapability[] = [
 	"ui.declarative",
 	"host_tools",
 	"host_uri",
+	"workflow_gate",
 ];
 
 const DEFAULT_BRIDGE_SCOPES: readonly BridgeCommandScope[] = ["prompt"];
@@ -71,6 +80,7 @@ const SERVER_FRAME_TYPES: readonly BridgeFrameType[] = [
 	"host_tool_call",
 	"host_uri_request",
 	"reset",
+	"workflow_gate",
 	"error",
 ];
 
@@ -86,6 +96,7 @@ interface BridgeFetchHandlerOptions {
 	hostToolBridge?: RpcHostToolBridge;
 	hostUriBridge?: RpcHostUriBridge;
 	endpointMatrix?: Partial<BridgeEndpointMatrix>;
+	unattendedControlPlane?: UnattendedSessionControlPlane;
 }
 
 interface BridgeIdempotencyRecord {
@@ -174,6 +185,15 @@ function bridgeHelpResponse(matrix: BridgeEndpointMatrix): Response {
 	});
 }
 
+function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "exceeded" | "aborted" | "info" {
+	if (event.includes("denied")) return "denied";
+	if (event.includes("exceeded")) return "exceeded";
+	if (event.includes("abort")) return "aborted";
+	if (event.includes("rejected") || event.includes("conflict")) return "rejected";
+	if (event.includes("accepted") || event.includes("negotiated") || event.includes("emitted")) return "accepted";
+	return "info";
+}
+
 function frameTypeForDispatchOutput(obj: RpcResponse | object): BridgeFrameType {
 	const type = typeof obj === "object" && obj !== null && "type" in obj ? (obj as { type?: unknown }).type : undefined;
 	if (type === "host_tool_call" || type === "host_tool_cancel") return "host_tool_call";
@@ -219,6 +239,24 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			if (!isBridgeHandshakeRequest(payload)) {
 				return jsonResponse(400, { error: "invalid_request" });
 			}
+			let acceptedUnattended = options.unattendedControlPlane?.isUnattended() ? payload.unattended : undefined;
+			if (
+				acceptedUnattended === undefined &&
+				payload.unattended !== undefined &&
+				endpointMatrix.events &&
+				options.unattendedControlPlane
+			) {
+				try {
+					options.unattendedControlPlane.negotiate(payload.unattended);
+					acceptedUnattended = payload.unattended;
+				} catch (err) {
+					const error =
+						err instanceof Error && "code" in err
+							? { code: (err as { code: unknown }).code, message: err.message }
+							: { error: err instanceof Error ? err.message : String(err) };
+					return jsonResponse(403, error);
+				}
+			}
 			return jsonResponse(
 				200,
 				negotiateBridgeHandshake(payload, {
@@ -243,6 +281,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 							: "",
 					},
 					frameTypes: endpointMatrix.events ? SERVER_FRAME_TYPES : [],
+					acceptedUnattended,
 				}),
 			);
 		}
@@ -359,6 +398,36 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 				payload = JSON.parse(body) as unknown;
 			} catch {
 				return jsonResponse(400, { error: "invalid_json" });
+			}
+			if (
+				payload !== null &&
+				typeof payload === "object" &&
+				"gate_id" in payload &&
+				"answer" in payload &&
+				(correlationId === (payload as RpcWorkflowGateResponse).gate_id || correlationId.startsWith("wg_"))
+			) {
+				try {
+					const resolution = await options.unattendedControlPlane?.resolveGate({
+						gate_id: (payload as RpcWorkflowGateResponse).gate_id,
+						answer: (payload as RpcWorkflowGateResponse).answer,
+						idempotency_key: (payload as RpcWorkflowGateResponse).idempotency_key ?? idempotencyKey,
+					});
+					if (resolution) {
+						rememberIdempotencyResponse(options.idempotencyCache, idempotencyKey, {
+							route: url.pathname,
+							ownerToken,
+							body,
+							response: resolution,
+						});
+						return jsonResponse(200, resolution);
+					}
+				} catch (err) {
+					const error =
+						err instanceof Error && "code" in err
+							? { code: (err as { code: unknown }).code, message: err.message }
+							: { error: err instanceof Error ? err.message : String(err) };
+					return jsonResponse(409, error);
+				}
 			}
 			const permissionResult = options.permissionBroker?.respond(
 				correlationId,
@@ -490,6 +559,57 @@ export async function runBridgeMode(
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const idempotencyCache: BridgeIdempotencyCache = new Map();
+	const auditLog = new UnattendedAuditLog(defaultAuditPath(session.sessionId, session.sessionManager.getCwd()), {
+		redactAnswers: true,
+	});
+	const recordAudit = (event: { event: string; [key: string]: unknown }) => {
+		const payload =
+			typeof event.payload === "object" && event.payload !== null
+				? (event.payload as Record<string, unknown>)
+				: undefined;
+		const gateId =
+			typeof event.gate_id === "string"
+				? event.gate_id
+				: typeof payload?.gate_id === "string"
+					? payload.gate_id
+					: undefined;
+		auditLog.record({
+			run_id: session.sessionId,
+			session_id: session.sessionId,
+			actor: typeof event.actor === "string" ? event.actor : undefined,
+			event: event.event,
+			outcome: auditOutcomeFor(event.event),
+			dedupe_key: `${event.event}:${gateId ?? "run"}:${JSON.stringify(payload ?? event)}`,
+			gate_id: gateId,
+			stage: typeof event.stage === "string" ? (event.stage as never) : undefined,
+			kind: typeof event.kind === "string" ? (event.kind as never) : undefined,
+			scope: typeof payload?.scope === "string" ? payload.scope : undefined,
+			action: typeof payload?.action === "string" ? payload.action : undefined,
+			budget: event.event === "budget_exceeded" ? (payload as never) : undefined,
+			answer_hash: typeof event.answer_hash === "string" ? event.answer_hash : undefined,
+			error: payload && event.event.endsWith("denied") ? payload : undefined,
+		});
+	};
+	const gateStore = new FileGateStore(
+		path.join(session.sessionManager.getCwd(), ".gjc", "state", "workflow-gates", `${session.sessionId}.json`),
+	);
+	const unattendedControlPlane = new UnattendedSessionControlPlane({
+		runId: session.sessionId,
+		sessionId: session.sessionId,
+		emitFrame: gate => eventStream.publish(toBridgeWorkflowGateFrame(gate, sequencer)),
+		store: gateStore,
+		audit: recordAudit,
+		getUsageSnapshot: () => {
+			const stats = session.getSessionStats();
+			return { tokens: stats.tokens.total, costUsd: stats.cost };
+		},
+	});
+	session.setWorkflowGateEmitter(unattendedControlPlane);
+	unattendedControlPlane
+		.recover()
+		.catch(err =>
+			eventStream.publish(sequencer.next("error", { error: err instanceof Error ? err.message : String(err) })),
+		);
 
 	Bun.serve({
 		hostname,
@@ -505,6 +625,7 @@ export async function runBridgeMode(
 			hostToolBridge,
 			hostUriBridge,
 			commandScopes,
+			unattendedControlPlane,
 			commandDispatcher: command =>
 				dispatchRpcCommand(command, {
 					session,
@@ -512,6 +633,7 @@ export async function runBridgeMode(
 					hostToolRegistry: hostToolBridge,
 					hostUriRegistry: hostUriBridge,
 					createUiContext: () => uiContext,
+					unattendedControlPlane,
 				}),
 		}),
 	});

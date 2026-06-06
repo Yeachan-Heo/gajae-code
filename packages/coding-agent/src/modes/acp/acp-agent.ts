@@ -50,6 +50,7 @@ import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../
 import type { ExtensionUIContext, ExtensionUIDialogOptions } from "../../extensibility/extensions";
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandNames,
@@ -722,7 +723,18 @@ export class AcpAgent implements Agent {
 			for (let index = 0; index < invocations.length; index += 1) {
 				const invocation = invocations[index];
 				if (!invocation) continue;
-				const built = await buildSkillPromptMessage(invocation.skill, invocation.args);
+				const activationResult = await resolveSubskillActivationForSkillInvocation({
+					cwd: record.session.sessionManager.getCwd(),
+					sessionId: record.session.sessionId,
+					skillName: invocation.skill.name,
+					args: invocation.args,
+				});
+				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
+					subskillActivation: activationResult.activation,
+					subskillActivationSet: activationResult.activeSubskillsToPersist,
+					cwd: record.session.sessionManager.getCwd(),
+					sessionId: record.session.sessionId,
+				});
 				if (index === invocations.length - 1) {
 					await record.session.promptCustomMessage({
 						customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -757,7 +769,18 @@ export class AcpAgent implements Agent {
 		if (!skill || skill.hide === true) {
 			return false;
 		}
-		const built = await buildSkillPromptMessage(skill, args);
+		const activationResult = await resolveSubskillActivationForSkillInvocation({
+			cwd: record.session.sessionManager.getCwd(),
+			sessionId: record.session.sessionId,
+			skillName: skill.name,
+			args,
+		});
+		const built = await buildSkillPromptMessage(skill, activationResult.cleanedArgs, {
+			subskillActivation: activationResult.activation,
+			subskillActivationSet: activationResult.activeSubskillsToPersist,
+			cwd: record.session.sessionManager.getCwd(),
+			sessionId: record.session.sessionId,
+		});
 		await record.session.promptCustomMessage({
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,

@@ -99,7 +99,7 @@ describe("SearchTool internal URL resolution", () => {
 		const tool = new SearchTool(session);
 
 		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(
-			"Artifact 999 not found",
+			"artifact://999 not found",
 		);
 	});
 
@@ -214,7 +214,7 @@ describe("SearchTool internal URL resolution", () => {
 		const tool = new SearchTool(session);
 
 		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(
-			"Artifact 999 not found",
+			"artifact://999 not found",
 		);
 	});
 });
