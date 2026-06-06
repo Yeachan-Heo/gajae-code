@@ -3,6 +3,7 @@ import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
 	getKeybindings,
+	getSlashCommandMatchRank,
 	type SlashCommand,
 } from "@gajae-code/tui";
 import { formatKeyHints, type KeybindingsManager } from "../config/keybindings";
@@ -104,6 +105,43 @@ function mergeAutocompleteSuggestions(
 	return { items, prefix: primary.prefix };
 }
 
+function sortSlashCommandSuggestions(
+	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
+	commands: SlashCommand[],
+): { items: AutocompleteItem[]; prefix: string } | null {
+	if (!suggestions) return null;
+	const query = suggestions.prefix.slice(1).toLowerCase();
+	const commandIndexes = new Map(commands.map((command, index) => [command.name, index]));
+	const commandByName = new Map(commands.map(command => [command.name, command]));
+	const items = suggestions.items
+		.map((item, index) => {
+			const command = commandByName.get(item.value);
+			const commandIndex = commandIndexes.get(item.value) ?? index;
+			const lowerName = item.value.toLowerCase();
+			const lowerDesc = command?.description?.toLowerCase() ?? item.description?.toLowerCase() ?? "";
+			const nameScore = fuzzyMatch(query, lowerName) ? fuzzyScore(query, lowerName) : 0;
+			const descScore = fuzzyMatch(query, lowerDesc) ? fuzzyScore(query, lowerDesc) * 0.5 : 0;
+			return {
+				item,
+				index,
+				commandIndex,
+				matchRank: getSlashCommandMatchRank(query, lowerName),
+				priority: command?.priority ?? 0,
+				score: Math.max(nameScore, descScore),
+			};
+		})
+		.sort(
+			(a, b) =>
+				a.matchRank - b.matchRank ||
+				b.priority - a.priority ||
+				b.score - a.score ||
+				a.commandIndex - b.commandIndex ||
+				a.index - b.index,
+		)
+		.map(({ item }) => item);
+	return { ...suggestions, items };
+}
+
 function withoutSkillCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
 ): { items: AutocompleteItem[]; prefix: string } | null {
@@ -182,7 +220,10 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
 			);
 			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
-			return mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions);
+			return sortSlashCommandSuggestions(
+				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
+				this.#commands,
+			);
 		}
 
 		if (!isSettingsInitialized() || settings.get("emojiAutocomplete")) {
@@ -253,7 +294,10 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			this.#baseProvider.trySyncSlashCompletion?.(textBeforeCursor) ?? null,
 		);
 		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
-		return mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions);
+		return sortSlashCommandSuggestions(
+			mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
+			this.#commands,
+		);
 	}
 	trySyncInlineReplace(textBeforeCursor: string): { replaceLen: number; insert: string } | null {
 		if (isSettingsInitialized() && !settings.get("emojiAutocomplete")) return null;
