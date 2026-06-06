@@ -632,6 +632,14 @@
 										}
 									},
 									"additionalProperties": false
+								},
+								"cacheRetention": {
+									"type": "string",
+									"enum": [
+										"none",
+										"short",
+										"long"
+									]
 								}
 							},
 							"required": [
@@ -971,6 +979,14 @@
 										}
 									},
 									"additionalProperties": false
+								},
+								"cacheRetention": {
+									"type": "string",
+									"enum": [
+										"none",
+										"short",
+										"long"
+									]
 								}
 							},
 							"additionalProperties": false
@@ -982,6 +998,14 @@
 					"transport": {
 						"type": "string",
 						"const": "pi-native"
+					},
+					"cacheRetention": {
+						"type": "string",
+						"enum": [
+							"none",
+							"short",
+							"long"
+						]
 					}
 				},
 				"additionalProperties": false
