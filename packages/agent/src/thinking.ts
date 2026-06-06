@@ -1,4 +1,4 @@
-import { Effort } from "@gajae-code/ai";
+import { Effort } from "@gajae-code/ai/model-thinking";
 
 /**
  * Agent-local thinking selector.

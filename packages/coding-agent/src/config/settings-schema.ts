@@ -1,4 +1,4 @@
-import { THINKING_EFFORTS } from "@gajae-code/ai";
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking";
 import { EDIT_MODES } from "../utils/edit-mode";

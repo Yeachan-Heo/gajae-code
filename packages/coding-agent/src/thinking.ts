@@ -1,5 +1,6 @@
 import { type ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
-import { clampThinkingLevelForModel, type Effort, type Model, THINKING_EFFORTS } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, type Effort, THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
+import type { Model } from "@gajae-code/ai/types";
 
 /**
  * Metadata used to render thinking selector values in the coding-agent UI.

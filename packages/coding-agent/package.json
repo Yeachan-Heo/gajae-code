@@ -36,6 +36,8 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
+		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
 		"fix": "biome check --write --unsafe . && bun run format-prompts && bun run generate-docs-index",
 		"fmt": "biome format --write . && bun run format-prompts",
 		"format-prompts": "bun scripts/format-prompts.ts",

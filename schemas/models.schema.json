@@ -1,0 +1,1083 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://gajae.ai/schemas/models.schema.json",
+	"title": "GJC models.yml",
+	"description": "Custom provider and model configuration for GJC. Generated from packages/coding-agent/src/config/models-config-schema.ts.",
+	"type": "object",
+	"properties": {
+		"providers": {
+			"type": "object",
+			"propertyNames": {
+				"type": "string"
+			},
+			"additionalProperties": {
+				"type": "object",
+				"properties": {
+					"baseUrl": {
+						"type": "string",
+						"minLength": 1
+					},
+					"apiKey": {
+						"type": "string",
+						"minLength": 1
+					},
+					"apiKeyEnv": {
+						"type": "string",
+						"minLength": 1
+					},
+					"api": {
+						"type": "string",
+						"enum": [
+							"openai-completions",
+							"openai-responses",
+							"openai-codex-responses",
+							"azure-openai-responses",
+							"anthropic-messages",
+							"bedrock-converse-stream",
+							"google-generative-ai",
+							"google-vertex",
+							"google-gemini-cli",
+							"ollama-chat",
+							"cursor-agent"
+						]
+					},
+					"headers": {
+						"type": "object",
+						"propertyNames": {
+							"type": "string"
+						},
+						"additionalProperties": {
+							"type": "string"
+						}
+					},
+					"compat": {
+						"type": "object",
+						"properties": {
+							"supportsStore": {
+								"type": "boolean"
+							},
+							"supportsDeveloperRole": {
+								"type": "boolean"
+							},
+							"supportsMultipleSystemMessages": {
+								"type": "boolean"
+							},
+							"supportsReasoningEffort": {
+								"type": "boolean"
+							},
+							"reasoningEffortMap": {
+								"type": "object",
+								"properties": {
+									"minimal": {
+										"type": "string"
+									},
+									"low": {
+										"type": "string"
+									},
+									"medium": {
+										"type": "string"
+									},
+									"high": {
+										"type": "string"
+									},
+									"xhigh": {
+										"type": "string"
+									},
+									"max": {
+										"type": "string"
+									}
+								},
+								"additionalProperties": false
+							},
+							"maxTokensField": {
+								"type": "string",
+								"enum": [
+									"max_completion_tokens",
+									"max_tokens"
+								]
+							},
+							"supportsUsageInStreaming": {
+								"type": "boolean"
+							},
+							"requiresToolResultName": {
+								"type": "boolean"
+							},
+							"requiresMistralToolIds": {
+								"type": "boolean"
+							},
+							"requiresAssistantAfterToolResult": {
+								"type": "boolean"
+							},
+							"requiresThinkingAsText": {
+								"type": "boolean"
+							},
+							"reasoningContentField": {
+								"type": "string",
+								"enum": [
+									"reasoning_content",
+									"reasoning",
+									"reasoning_text"
+								]
+							},
+							"requiresReasoningContentForToolCalls": {
+								"type": "boolean"
+							},
+							"allowsSyntheticReasoningContentForToolCalls": {
+								"type": "boolean"
+							},
+							"requiresAssistantContentForToolCalls": {
+								"type": "boolean"
+							},
+							"supportsToolChoice": {
+								"type": "boolean"
+							},
+							"disableReasoningOnForcedToolChoice": {
+								"type": "boolean"
+							},
+							"disableReasoningOnToolChoice": {
+								"type": "boolean"
+							},
+							"thinkingFormat": {
+								"type": "string",
+								"enum": [
+									"openai",
+									"openrouter",
+									"zai",
+									"qwen",
+									"qwen-chat-template"
+								]
+							},
+							"openRouterRouting": {
+								"type": "object",
+								"properties": {
+									"only": {
+										"type": "array",
+										"items": {
+											"type": "string"
+										}
+									},
+									"order": {
+										"type": "array",
+										"items": {
+											"type": "string"
+										}
+									}
+								},
+								"additionalProperties": false
+							},
+							"vercelGatewayRouting": {
+								"type": "object",
+								"properties": {
+									"only": {
+										"type": "array",
+										"items": {
+											"type": "string"
+										}
+									},
+									"order": {
+										"type": "array",
+										"items": {
+											"type": "string"
+										}
+									}
+								},
+								"additionalProperties": false
+							},
+							"extraBody": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string"
+								},
+								"additionalProperties": true
+							},
+							"supportsStrictMode": {
+								"type": "boolean"
+							},
+							"toolStrictMode": {
+								"type": "string",
+								"enum": [
+									"all_strict",
+									"none"
+								]
+							}
+						},
+						"additionalProperties": false
+					},
+					"authHeader": {
+						"type": "boolean"
+					},
+					"auth": {
+						"type": "string",
+						"enum": [
+							"apiKey",
+							"none",
+							"oauth"
+						]
+					},
+					"discovery": {
+						"type": "object",
+						"properties": {
+							"type": {
+								"type": "string",
+								"enum": [
+									"ollama",
+									"llama.cpp",
+									"lm-studio",
+									"openai-models-list"
+								]
+							}
+						},
+						"required": [
+							"type"
+						],
+						"additionalProperties": false
+					},
+					"requestTransform": {
+						"type": "object",
+						"properties": {
+							"profile": {
+								"type": "string",
+								"enum": [
+									"openai-proxy"
+								]
+							},
+							"stripHeaders": {
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							},
+							"setHeaders": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string"
+								},
+								"additionalProperties": {
+									"anyOf": [
+										{
+											"type": "string"
+										},
+										{
+											"type": "null"
+										}
+									]
+								}
+							},
+							"extraBody": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string"
+								},
+								"additionalProperties": true
+							}
+						},
+						"additionalProperties": false
+					},
+					"models": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"id": {
+									"type": "string",
+									"minLength": 1
+								},
+								"name": {
+									"type": "string",
+									"minLength": 1
+								},
+								"api": {
+									"type": "string",
+									"enum": [
+										"openai-completions",
+										"openai-responses",
+										"openai-codex-responses",
+										"azure-openai-responses",
+										"anthropic-messages",
+										"bedrock-converse-stream",
+										"google-generative-ai",
+										"google-vertex",
+										"google-gemini-cli",
+										"ollama-chat",
+										"cursor-agent"
+									]
+								},
+								"baseUrl": {
+									"type": "string",
+									"minLength": 1
+								},
+								"reasoning": {
+									"type": "boolean"
+								},
+								"thinking": {
+									"type": "object",
+									"properties": {
+										"minLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"maxLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"mode": {
+											"type": "string",
+											"enum": [
+												"effort",
+												"budget",
+												"google-level",
+												"anthropic-adaptive",
+												"anthropic-budget-effort"
+											]
+										},
+										"defaultLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"levels": {
+											"type": "array",
+											"items": {
+												"type": "string",
+												"enum": [
+													"minimal",
+													"low",
+													"medium",
+													"high",
+													"xhigh",
+													"max"
+												]
+											}
+										}
+									},
+									"required": [
+										"minLevel",
+										"maxLevel",
+										"mode"
+									],
+									"additionalProperties": false
+								},
+								"input": {
+									"type": "array",
+									"items": {
+										"type": "string",
+										"enum": [
+											"text",
+											"image"
+										]
+									}
+								},
+								"cost": {
+									"type": "object",
+									"properties": {
+										"input": {
+											"type": "number"
+										},
+										"output": {
+											"type": "number"
+										},
+										"cacheRead": {
+											"type": "number"
+										},
+										"cacheWrite": {
+											"type": "number"
+										}
+									},
+									"required": [
+										"input",
+										"output",
+										"cacheRead",
+										"cacheWrite"
+									],
+									"additionalProperties": false
+								},
+								"premiumMultiplier": {
+									"type": "number"
+								},
+								"contextWindow": {
+									"type": "number"
+								},
+								"maxTokens": {
+									"type": "number"
+								},
+								"headers": {
+									"type": "object",
+									"propertyNames": {
+										"type": "string"
+									},
+									"additionalProperties": {
+										"type": "string"
+									}
+								},
+								"compat": {
+									"type": "object",
+									"properties": {
+										"supportsStore": {
+											"type": "boolean"
+										},
+										"supportsDeveloperRole": {
+											"type": "boolean"
+										},
+										"supportsMultipleSystemMessages": {
+											"type": "boolean"
+										},
+										"supportsReasoningEffort": {
+											"type": "boolean"
+										},
+										"reasoningEffortMap": {
+											"type": "object",
+											"properties": {
+												"minimal": {
+													"type": "string"
+												},
+												"low": {
+													"type": "string"
+												},
+												"medium": {
+													"type": "string"
+												},
+												"high": {
+													"type": "string"
+												},
+												"xhigh": {
+													"type": "string"
+												},
+												"max": {
+													"type": "string"
+												}
+											},
+											"additionalProperties": false
+										},
+										"maxTokensField": {
+											"type": "string",
+											"enum": [
+												"max_completion_tokens",
+												"max_tokens"
+											]
+										},
+										"supportsUsageInStreaming": {
+											"type": "boolean"
+										},
+										"requiresToolResultName": {
+											"type": "boolean"
+										},
+										"requiresMistralToolIds": {
+											"type": "boolean"
+										},
+										"requiresAssistantAfterToolResult": {
+											"type": "boolean"
+										},
+										"requiresThinkingAsText": {
+											"type": "boolean"
+										},
+										"reasoningContentField": {
+											"type": "string",
+											"enum": [
+												"reasoning_content",
+												"reasoning",
+												"reasoning_text"
+											]
+										},
+										"requiresReasoningContentForToolCalls": {
+											"type": "boolean"
+										},
+										"allowsSyntheticReasoningContentForToolCalls": {
+											"type": "boolean"
+										},
+										"requiresAssistantContentForToolCalls": {
+											"type": "boolean"
+										},
+										"supportsToolChoice": {
+											"type": "boolean"
+										},
+										"disableReasoningOnForcedToolChoice": {
+											"type": "boolean"
+										},
+										"disableReasoningOnToolChoice": {
+											"type": "boolean"
+										},
+										"thinkingFormat": {
+											"type": "string",
+											"enum": [
+												"openai",
+												"openrouter",
+												"zai",
+												"qwen",
+												"qwen-chat-template"
+											]
+										},
+										"openRouterRouting": {
+											"type": "object",
+											"properties": {
+												"only": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												},
+												"order": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												}
+											},
+											"additionalProperties": false
+										},
+										"vercelGatewayRouting": {
+											"type": "object",
+											"properties": {
+												"only": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												},
+												"order": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												}
+											},
+											"additionalProperties": false
+										},
+										"extraBody": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": true
+										},
+										"supportsStrictMode": {
+											"type": "boolean"
+										},
+										"toolStrictMode": {
+											"type": "string",
+											"enum": [
+												"all_strict",
+												"none"
+											]
+										}
+									},
+									"additionalProperties": false
+								},
+								"contextPromotionTarget": {
+									"type": "string",
+									"minLength": 1
+								},
+								"wireModelId": {
+									"type": "string",
+									"minLength": 1
+								},
+								"requestTransform": {
+									"type": "object",
+									"properties": {
+										"profile": {
+											"type": "string",
+											"enum": [
+												"openai-proxy"
+											]
+										},
+										"stripHeaders": {
+											"type": "array",
+											"items": {
+												"type": "string",
+												"minLength": 1
+											}
+										},
+										"setHeaders": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": {
+												"anyOf": [
+													{
+														"type": "string"
+													},
+													{
+														"type": "null"
+													}
+												]
+											}
+										},
+										"extraBody": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": true
+										}
+									},
+									"additionalProperties": false
+								}
+							},
+							"required": [
+								"id"
+							],
+							"additionalProperties": false
+						}
+					},
+					"modelOverrides": {
+						"type": "object",
+						"propertyNames": {
+							"type": "string"
+						},
+						"additionalProperties": {
+							"type": "object",
+							"properties": {
+								"name": {
+									"type": "string",
+									"minLength": 1
+								},
+								"reasoning": {
+									"type": "boolean"
+								},
+								"thinking": {
+									"type": "object",
+									"properties": {
+										"minLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"maxLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"mode": {
+											"type": "string",
+											"enum": [
+												"effort",
+												"budget",
+												"google-level",
+												"anthropic-adaptive",
+												"anthropic-budget-effort"
+											]
+										},
+										"defaultLevel": {
+											"type": "string",
+											"enum": [
+												"minimal",
+												"low",
+												"medium",
+												"high",
+												"xhigh",
+												"max"
+											]
+										},
+										"levels": {
+											"type": "array",
+											"items": {
+												"type": "string",
+												"enum": [
+													"minimal",
+													"low",
+													"medium",
+													"high",
+													"xhigh",
+													"max"
+												]
+											}
+										}
+									},
+									"required": [
+										"minLevel",
+										"maxLevel",
+										"mode"
+									],
+									"additionalProperties": false
+								},
+								"input": {
+									"type": "array",
+									"items": {
+										"type": "string",
+										"enum": [
+											"text",
+											"image"
+										]
+									}
+								},
+								"cost": {
+									"type": "object",
+									"properties": {
+										"input": {
+											"type": "number"
+										},
+										"output": {
+											"type": "number"
+										},
+										"cacheRead": {
+											"type": "number"
+										},
+										"cacheWrite": {
+											"type": "number"
+										}
+									},
+									"additionalProperties": false
+								},
+								"premiumMultiplier": {
+									"type": "number"
+								},
+								"contextWindow": {
+									"type": "number"
+								},
+								"maxTokens": {
+									"type": "number"
+								},
+								"headers": {
+									"type": "object",
+									"propertyNames": {
+										"type": "string"
+									},
+									"additionalProperties": {
+										"type": "string"
+									}
+								},
+								"compat": {
+									"type": "object",
+									"properties": {
+										"supportsStore": {
+											"type": "boolean"
+										},
+										"supportsDeveloperRole": {
+											"type": "boolean"
+										},
+										"supportsMultipleSystemMessages": {
+											"type": "boolean"
+										},
+										"supportsReasoningEffort": {
+											"type": "boolean"
+										},
+										"reasoningEffortMap": {
+											"type": "object",
+											"properties": {
+												"minimal": {
+													"type": "string"
+												},
+												"low": {
+													"type": "string"
+												},
+												"medium": {
+													"type": "string"
+												},
+												"high": {
+													"type": "string"
+												},
+												"xhigh": {
+													"type": "string"
+												},
+												"max": {
+													"type": "string"
+												}
+											},
+											"additionalProperties": false
+										},
+										"maxTokensField": {
+											"type": "string",
+											"enum": [
+												"max_completion_tokens",
+												"max_tokens"
+											]
+										},
+										"supportsUsageInStreaming": {
+											"type": "boolean"
+										},
+										"requiresToolResultName": {
+											"type": "boolean"
+										},
+										"requiresMistralToolIds": {
+											"type": "boolean"
+										},
+										"requiresAssistantAfterToolResult": {
+											"type": "boolean"
+										},
+										"requiresThinkingAsText": {
+											"type": "boolean"
+										},
+										"reasoningContentField": {
+											"type": "string",
+											"enum": [
+												"reasoning_content",
+												"reasoning",
+												"reasoning_text"
+											]
+										},
+										"requiresReasoningContentForToolCalls": {
+											"type": "boolean"
+										},
+										"allowsSyntheticReasoningContentForToolCalls": {
+											"type": "boolean"
+										},
+										"requiresAssistantContentForToolCalls": {
+											"type": "boolean"
+										},
+										"supportsToolChoice": {
+											"type": "boolean"
+										},
+										"disableReasoningOnForcedToolChoice": {
+											"type": "boolean"
+										},
+										"disableReasoningOnToolChoice": {
+											"type": "boolean"
+										},
+										"thinkingFormat": {
+											"type": "string",
+											"enum": [
+												"openai",
+												"openrouter",
+												"zai",
+												"qwen",
+												"qwen-chat-template"
+											]
+										},
+										"openRouterRouting": {
+											"type": "object",
+											"properties": {
+												"only": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												},
+												"order": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												}
+											},
+											"additionalProperties": false
+										},
+										"vercelGatewayRouting": {
+											"type": "object",
+											"properties": {
+												"only": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												},
+												"order": {
+													"type": "array",
+													"items": {
+														"type": "string"
+													}
+												}
+											},
+											"additionalProperties": false
+										},
+										"extraBody": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": true
+										},
+										"supportsStrictMode": {
+											"type": "boolean"
+										},
+										"toolStrictMode": {
+											"type": "string",
+											"enum": [
+												"all_strict",
+												"none"
+											]
+										}
+									},
+									"additionalProperties": false
+								},
+								"contextPromotionTarget": {
+									"type": "string",
+									"minLength": 1
+								},
+								"wireModelId": {
+									"type": "string",
+									"minLength": 1
+								},
+								"requestTransform": {
+									"type": "object",
+									"properties": {
+										"profile": {
+											"type": "string",
+											"enum": [
+												"openai-proxy"
+											]
+										},
+										"stripHeaders": {
+											"type": "array",
+											"items": {
+												"type": "string",
+												"minLength": 1
+											}
+										},
+										"setHeaders": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": {
+												"anyOf": [
+													{
+														"type": "string"
+													},
+													{
+														"type": "null"
+													}
+												]
+											}
+										},
+										"extraBody": {
+											"type": "object",
+											"propertyNames": {
+												"type": "string"
+											},
+											"additionalProperties": true
+										}
+									},
+									"additionalProperties": false
+								}
+							},
+							"additionalProperties": false
+						}
+					},
+					"disableStrictTools": {
+						"type": "boolean"
+					},
+					"transport": {
+						"type": "string",
+						"const": "pi-native"
+					}
+				},
+				"additionalProperties": false
+			}
+		},
+		"modelBindings": {
+			"type": "object",
+			"properties": {
+				"modelRoles": {
+					"type": "object",
+					"propertyNames": {
+						"type": "string"
+					},
+					"additionalProperties": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"agentModelOverrides": {
+					"type": "object",
+					"propertyNames": {
+						"type": "string"
+					},
+					"additionalProperties": {
+						"type": "string",
+						"minLength": 1
+					}
+				}
+			},
+			"additionalProperties": false
+		},
+		"equivalence": {
+			"type": "object",
+			"properties": {
+				"overrides": {
+					"type": "object",
+					"propertyNames": {
+						"type": "string"
+					},
+					"additionalProperties": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"exclude": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					}
+				}
+			},
+			"additionalProperties": false
+		},
+		"profiles": {
+			"type": "object",
+			"propertyNames": {
+				"type": "string",
+				"minLength": 1
+			},
+			"additionalProperties": {
+				"type": "object",
+				"properties": {
+					"required_providers": {
+						"minItems": 1,
+						"type": "array",
+						"items": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"model_mapping": {
+						"type": "object",
+						"propertyNames": {
+							"type": "string",
+							"enum": [
+								"default",
+								"executor",
+								"architect",
+								"planner",
+								"critic"
+							]
+						},
+						"additionalProperties": {
+							"type": "string",
+							"minLength": 1
+						}
+					}
+				},
+				"required": [
+					"required_providers",
+					"model_mapping"
+				],
+				"additionalProperties": false
+			}
+		}
+	},
+	"additionalProperties": false
+}

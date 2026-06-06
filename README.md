@@ -71,7 +71,7 @@ Gajae-Code has two retry layers:
 - Session auto-retry (`retry.maxRetries`) retries a failed assistant turn after a terminal transient error.
 - Provider retry budgets control retries inside the provider transport before that terminal error reaches the session.
 
-Configure provider budgets in `~/.gjc/config.yml` (or the active project/user settings source):
+Configure provider budgets in `~/.gjc/config.yml` (or the active project/user settings source). JSON Schemas for YAML editor integration are checked in at `schemas/config.schema.json` and `schemas/models.schema.json`:
 
 ```yaml
 retry:

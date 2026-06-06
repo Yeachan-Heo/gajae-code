@@ -1,0 +1,1989 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://gajae.ai/schemas/config.schema.json",
+	"title": "GJC config.yml",
+	"description": "User and project settings for GJC. Generated from packages/coding-agent/src/config/settings-schema.ts.",
+	"type": "object",
+	"properties": {
+		"lastChangelogVersion": {
+			"type": "string"
+		},
+		"auth": {
+			"type": "object",
+			"properties": {
+				"broker": {
+					"type": "object",
+					"properties": {
+						"url": {
+							"type": "string"
+						},
+						"token": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"autoResume": {
+			"type": "boolean",
+			"description": "Automatically resume the most recent session in the current directory",
+			"default": false
+		},
+		"power": {
+			"type": "object",
+			"properties": {
+				"preventIdleSleep": {
+					"type": "boolean",
+					"description": "caffeinate -i: keep the system awake while a session is open",
+					"default": true
+				},
+				"preventSystemSleep": {
+					"type": "boolean",
+					"description": "caffeinate -s: block all system sleep while on AC power",
+					"default": false
+				},
+				"declareUserActive": {
+					"type": "boolean",
+					"description": "caffeinate -u: keep the display lit and treat the user as active",
+					"default": false
+				},
+				"preventDisplaySleep": {
+					"type": "boolean",
+					"description": "caffeinate -d: keep the display from idle-sleeping while a session is open",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"shellPath": {
+			"type": "string"
+		},
+		"extensions": {
+			"type": "array",
+			"items": true,
+			"default": []
+		},
+		"marketplace": {
+			"type": "object",
+			"properties": {
+				"autoUpdate": {
+					"type": "string",
+					"enum": [
+						"off",
+						"notify",
+						"auto"
+					],
+					"default": "off"
+				}
+			},
+			"additionalProperties": false
+		},
+		"enabledModels": {
+			"type": "array",
+			"items": true,
+			"default": []
+		},
+		"disabledProviders": {
+			"type": "array",
+			"items": true,
+			"default": []
+		},
+		"disabledExtensions": {
+			"type": "array",
+			"items": true,
+			"default": []
+		},
+		"modelRoles": {
+			"type": "object",
+			"additionalProperties": true,
+			"default": {}
+		},
+		"modelProfile": {
+			"type": "object",
+			"properties": {
+				"default": {
+					"type": "string",
+					"description": "Model profile applied automatically at startup"
+				}
+			},
+			"additionalProperties": false
+		},
+		"modelTags": {
+			"type": "object",
+			"additionalProperties": true,
+			"default": {}
+		},
+		"modelProviderOrder": {
+			"type": "array",
+			"items": true,
+			"default": []
+		},
+		"cycleOrder": {
+			"type": "array",
+			"items": {
+				"type": "string"
+			},
+			"default": [
+				"default"
+			]
+		},
+		"gjc": {
+			"type": "object",
+			"properties": {
+				"deepInterview": {
+					"type": "object",
+					"properties": {
+						"ambiguityThreshold": {
+							"type": "number",
+							"default": 0.05,
+							"exclusiveMinimum": 0,
+							"maximum": 1
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"theme": {
+			"type": "object",
+			"properties": {
+				"dark": {
+					"type": "string",
+					"description": "Theme used when terminal has dark background",
+					"default": "red-claw"
+				},
+				"light": {
+					"type": "string",
+					"description": "Theme used when terminal has light background",
+					"default": "blue-crab"
+				}
+			},
+			"additionalProperties": false
+		},
+		"symbolPreset": {
+			"type": "string",
+			"enum": [
+				"unicode",
+				"nerd",
+				"ascii"
+			],
+			"description": "Icon/symbol style",
+			"default": "unicode"
+		},
+		"colorBlindMode": {
+			"type": "boolean",
+			"description": "Use blue instead of green for diff additions",
+			"default": false
+		},
+		"statusLine": {
+			"type": "object",
+			"properties": {
+				"preset": {
+					"type": "string",
+					"enum": [
+						"default",
+						"minimal",
+						"compact",
+						"full",
+						"nerd",
+						"ascii",
+						"custom"
+					],
+					"description": "Pre-built status line configurations",
+					"default": "default"
+				},
+				"separator": {
+					"type": "string",
+					"enum": [
+						"powerline",
+						"powerline-thin",
+						"slash",
+						"pipe",
+						"block",
+						"none",
+						"ascii"
+					],
+					"description": "Style of separators between segments",
+					"default": "slash"
+				},
+				"sessionAccent": {
+					"type": "boolean",
+					"description": "Use the session name color for the editor border and status line gap",
+					"default": true
+				},
+				"showHookStatus": {
+					"type": "boolean",
+					"default": false
+				},
+				"showSkillHud": {
+					"type": "boolean",
+					"default": true
+				},
+				"leftSegments": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"rightSegments": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"segmentOptions": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"tools": {
+			"type": "object",
+			"properties": {
+				"artifactSpillThreshold": {
+					"type": "number",
+					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
+					"default": 50
+				},
+				"artifactTailBytes": {
+					"type": "number",
+					"description": "Amount of tail content kept inline when output spills to artifact",
+					"default": 20
+				},
+				"artifactHeadBytes": {
+					"type": "number",
+					"description": "Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+					"default": 20
+				},
+				"outputMaxColumns": {
+					"type": "number",
+					"description": "Per-line byte cap for streaming tool outputs (bash, ssh, python, js eval) and `read`. Lines wider than this are ellipsis-truncated; remaining bytes up to the next newline are dropped. 0 disables.",
+					"default": 768
+				},
+				"artifactTailLines": {
+					"type": "number",
+					"description": "Maximum lines of tail content kept inline when output spills to artifact",
+					"default": 500
+				},
+				"intentTracing": {
+					"type": "boolean",
+					"description": "Ask the agent to describe the intent of each tool call before executing it",
+					"default": true
+				},
+				"maxTimeout": {
+					"type": "number",
+					"description": "Maximum timeout in seconds the agent can set for any tool (0 = no limit)",
+					"default": 0
+				},
+				"discoveryMode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"all"
+					],
+					"description": "Hide non-essential built-in tools behind a search tool to save tokens.",
+					"default": "off"
+				},
+				"essentialOverride": {
+					"type": "array",
+					"items": true,
+					"description": "Override the always-loaded built-in tools (default: read, bash, edit). Leave empty to use defaults.",
+					"default": []
+				}
+			},
+			"additionalProperties": false
+		},
+		"terminal": {
+			"type": "object",
+			"properties": {
+				"showImages": {
+					"type": "boolean",
+					"description": "Render images inline in terminal",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"images": {
+			"type": "object",
+			"properties": {
+				"autoResize": {
+					"type": "boolean",
+					"description": "Resize large images to 2000x2000 max for better model compatibility",
+					"default": true
+				},
+				"blockImages": {
+					"type": "boolean",
+					"description": "Prevent images from being sent to LLM providers",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"tui": {
+			"type": "object",
+			"properties": {
+				"maxInlineImageColumns": {
+					"type": "number",
+					"description": "Maximum width in terminal columns for inline images (default 100). Set to 0 for unlimited (bounded only by terminal width).",
+					"default": 100
+				},
+				"maxInlineImageRows": {
+					"type": "number",
+					"description": "Maximum height in terminal rows for inline images (default 20). Set to 0 to use only the viewport-based limit (60% of terminal height).",
+					"default": 20
+				},
+				"hyperlinks": {
+					"type": "string",
+					"enum": [
+						"off",
+						"auto",
+						"always"
+					],
+					"description": "Wrap file paths in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+					"default": "auto"
+				}
+			},
+			"additionalProperties": false
+		},
+		"display": {
+			"type": "object",
+			"properties": {
+				"tabWidth": {
+					"type": "number",
+					"default": 3
+				},
+				"shimmer": {
+					"type": "string",
+					"enum": [
+						"classic",
+						"kitt",
+						"disabled"
+					],
+					"description": "Animation style for working/loading messages",
+					"default": "classic"
+				},
+				"showTokenUsage": {
+					"type": "boolean",
+					"description": "Show per-turn token usage on assistant messages",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"showHardwareCursor": {
+			"type": "boolean",
+			"description": "Show terminal cursor for IME support",
+			"default": true
+		},
+		"clearOnShrink": {
+			"type": "boolean",
+			"description": "Clear empty rows when content shrinks (may cause flicker)",
+			"default": false
+		},
+		"defaultThinkingLevel": {
+			"type": "string",
+			"enum": [
+				"minimal",
+				"low",
+				"medium",
+				"high",
+				"xhigh",
+				"max"
+			],
+			"description": "Reasoning depth for thinking-capable models",
+			"default": "high"
+		},
+		"hideThinkingBlock": {
+			"type": "boolean",
+			"description": "Hide thinking blocks in assistant responses",
+			"default": false
+		},
+		"repeatToolDescriptions": {
+			"type": "boolean",
+			"description": "Render full tool descriptions in the system prompt instead of a tool name list",
+			"default": false
+		},
+		"temperature": {
+			"type": "number",
+			"description": "Sampling temperature (0 = deterministic, 1 = creative, -1 = provider default)",
+			"default": -1
+		},
+		"topP": {
+			"type": "number",
+			"description": "Nucleus sampling cutoff (0-1, -1 = provider default)",
+			"default": -1
+		},
+		"topK": {
+			"type": "number",
+			"description": "Sample from top-K tokens (-1 = provider default)",
+			"default": -1
+		},
+		"minP": {
+			"type": "number",
+			"description": "Minimum probability threshold (0-1, -1 = provider default)",
+			"default": -1
+		},
+		"presencePenalty": {
+			"type": "number",
+			"description": "Penalty for introducing already-present tokens (-1 = provider default)",
+			"default": -1
+		},
+		"repetitionPenalty": {
+			"type": "number",
+			"description": "Penalty for repeated tokens (-1 = provider default)",
+			"default": -1
+		},
+		"serviceTier": {
+			"type": "string",
+			"enum": [
+				"none",
+				"auto",
+				"default",
+				"flex",
+				"scale",
+				"priority",
+				"openai-only",
+				"claude-only"
+			],
+			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
+			"default": "none"
+		},
+		"retry": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": true
+				},
+				"maxRetries": {
+					"type": "number",
+					"description": "Maximum retry attempts on API errors",
+					"default": 3
+				},
+				"baseDelayMs": {
+					"type": "number",
+					"default": 2000
+				},
+				"maxDelayMs": {
+					"type": "number",
+					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"default": 300000
+				},
+				"requestMaxRetries": {
+					"type": "number",
+					"description": "Maximum provider request retries before a stream is established. Counts retries, not the first attempt. Set to 0 to disable provider request retries.",
+					"default": 5
+				},
+				"streamMaxRetries": {
+					"type": "number",
+					"description": "Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+					"default": 5
+				},
+				"fallbackChains": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
+				},
+				"fallbackRevertPolicy": {
+					"type": "string",
+					"enum": [
+						"cooldown-expiry",
+						"never"
+					],
+					"description": "When to return to the primary model after a fallback",
+					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"steeringMode": {
+			"type": "string",
+			"enum": [
+				"all",
+				"one-at-a-time"
+			],
+			"description": "How to process queued messages while agent is working",
+			"default": "one-at-a-time"
+		},
+		"followUpMode": {
+			"type": "string",
+			"enum": [
+				"all",
+				"one-at-a-time"
+			],
+			"description": "How to drain follow-up messages after a turn completes",
+			"default": "one-at-a-time"
+		},
+		"interruptMode": {
+			"type": "string",
+			"enum": [
+				"immediate",
+				"wait"
+			],
+			"description": "When steering messages interrupt tool execution",
+			"default": "immediate"
+		},
+		"doubleEscapeAction": {
+			"type": "string",
+			"enum": [
+				"branch",
+				"tree",
+				"none"
+			],
+			"description": "Action when pressing Escape twice with empty editor",
+			"default": "tree"
+		},
+		"treeFilterMode": {
+			"type": "string",
+			"enum": [
+				"default",
+				"no-tools",
+				"user-only",
+				"labeled-only",
+				"all"
+			],
+			"description": "Default filter mode when opening the session tree",
+			"default": "default"
+		},
+		"autocompleteMaxVisible": {
+			"type": "number",
+			"description": "Max visible items in autocomplete dropdown (3-20)",
+			"default": 5
+		},
+		"emojiAutocomplete": {
+			"type": "boolean",
+			"description": "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
+			"default": true
+		},
+		"startup": {
+			"type": "object",
+			"properties": {
+				"quiet": {
+					"type": "boolean",
+					"description": "Skip welcome screen and startup status messages",
+					"default": false
+				},
+				"checkUpdate": {
+					"type": "boolean",
+					"description": "If false, skip update check",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"collapseChangelog": {
+			"type": "boolean",
+			"description": "Show condensed changelog after updates",
+			"default": false
+		},
+		"completion": {
+			"type": "object",
+			"properties": {
+				"notify": {
+					"type": "string",
+					"enum": [
+						"on",
+						"off"
+					],
+					"description": "Notify when the agent completes",
+					"default": "on"
+				}
+			},
+			"additionalProperties": false
+		},
+		"ask": {
+			"type": "object",
+			"properties": {
+				"timeout": {
+					"type": "number",
+					"description": "Auto-select recommended option after timeout (0 to disable)",
+					"default": 0
+				},
+				"notify": {
+					"type": "string",
+					"enum": [
+						"on",
+						"off"
+					],
+					"description": "Notify when ask tool is waiting for input",
+					"default": "on"
+				}
+			},
+			"additionalProperties": false
+		},
+		"stt": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable speech-to-text input via microphone",
+					"default": false
+				},
+				"language": {
+					"type": "string",
+					"default": "en"
+				},
+				"modelName": {
+					"type": "string",
+					"enum": [
+						"tiny",
+						"tiny.en",
+						"base",
+						"base.en",
+						"small",
+						"small.en",
+						"medium",
+						"medium.en",
+						"large"
+					],
+					"description": "Whisper model size (larger = more accurate but slower)",
+					"default": "base.en"
+				}
+			},
+			"additionalProperties": false
+		},
+		"contextPromotion": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Promote to a larger-context model on context overflow instead of compacting",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"compaction": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Automatically compact context when it gets too large",
+					"default": true
+				},
+				"strategy": {
+					"type": "string",
+					"enum": [
+						"context-full",
+						"handoff",
+						"off"
+					],
+					"description": "Choose in-place context-full maintenance, auto-handoff, or disable auto maintenance (off)",
+					"default": "context-full"
+				},
+				"thresholdPercent": {
+					"type": "number",
+					"description": "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+					"default": -1
+				},
+				"thresholdTokens": {
+					"type": "number",
+					"description": "Fixed token limit for context maintenance; overrides percentage if set",
+					"default": -1
+				},
+				"handoffSaveToDisk": {
+					"type": "boolean",
+					"description": "Save generated handoff documents to markdown files for the auto-handoff flow",
+					"default": false
+				},
+				"remoteEnabled": {
+					"type": "boolean",
+					"description": "Use remote compaction endpoints when available instead of local summarization",
+					"default": true
+				},
+				"reserveTokens": {
+					"type": "number",
+					"default": 16384
+				},
+				"keepRecentTokens": {
+					"type": "number",
+					"default": 20000
+				},
+				"autoContinue": {
+					"type": "boolean",
+					"default": true
+				},
+				"remoteEndpoint": {
+					"type": "string"
+				},
+				"idleEnabled": {
+					"type": "boolean",
+					"description": "Compact context while idle when token count exceeds threshold",
+					"default": false
+				},
+				"idleThresholdTokens": {
+					"type": "number",
+					"description": "Token count above which idle compaction triggers",
+					"default": 200000
+				},
+				"idleTimeoutSeconds": {
+					"type": "number",
+					"description": "Seconds to wait while idle before compacting",
+					"default": 300
+				}
+			},
+			"additionalProperties": false
+		},
+		"branchSummary": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Prompt to summarize when leaving a branch",
+					"default": false
+				},
+				"reserveTokens": {
+					"type": "number",
+					"default": 16384
+				}
+			},
+			"additionalProperties": false
+		},
+		"memories": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"maxRolloutsPerStartup": {
+					"type": "number",
+					"default": 64
+				},
+				"maxRolloutAgeDays": {
+					"type": "number",
+					"default": 30
+				},
+				"minRolloutIdleHours": {
+					"type": "number",
+					"default": 12
+				},
+				"threadScanLimit": {
+					"type": "number",
+					"default": 300
+				},
+				"maxRawMemoriesForGlobal": {
+					"type": "number",
+					"default": 200
+				},
+				"stage1Concurrency": {
+					"type": "number",
+					"default": 8
+				},
+				"stage1LeaseSeconds": {
+					"type": "number",
+					"default": 120
+				},
+				"stage1RetryDelaySeconds": {
+					"type": "number",
+					"default": 120
+				},
+				"phase2LeaseSeconds": {
+					"type": "number",
+					"default": 180
+				},
+				"phase2RetryDelaySeconds": {
+					"type": "number",
+					"default": 180
+				},
+				"phase2HeartbeatSeconds": {
+					"type": "number",
+					"default": 30
+				},
+				"rolloutPayloadPercent": {
+					"type": "number",
+					"default": 0.7
+				},
+				"phase1InputTokenLimit": {
+					"type": "number",
+					"default": 4000
+				},
+				"fallbackTokenLimit": {
+					"type": "number",
+					"default": 16000
+				},
+				"summaryInjectionTokenLimit": {
+					"type": "number",
+					"default": 5000
+				}
+			},
+			"additionalProperties": false
+		},
+		"memory": {
+			"type": "object",
+			"properties": {
+				"backend": {
+					"type": "string",
+					"enum": [
+						"off",
+						"local",
+						"hindsight"
+					],
+					"description": "Off, local memory pipeline, or Hindsight remote memory",
+					"default": "off"
+				}
+			},
+			"additionalProperties": false
+		},
+		"hindsight": {
+			"type": "object",
+			"properties": {
+				"apiUrl": {
+					"type": "string",
+					"description": "Hindsight server URL (Cloud or self-hosted)",
+					"default": "http://localhost:8888"
+				},
+				"apiToken": {
+					"type": "string"
+				},
+				"bankId": {
+					"type": "string",
+					"description": "Memory bank identifier (default: project name)"
+				},
+				"bankIdPrefix": {
+					"type": "string"
+				},
+				"scoping": {
+					"type": "string",
+					"enum": [
+						"global",
+						"per-project",
+						"per-project-tagged"
+					],
+					"description": "global = one shared bank; per-project = isolated bank per cwd; per-project-tagged = shared bank with project tags so global + project memories merge on recall",
+					"default": "per-project-tagged"
+				},
+				"bankMission": {
+					"type": "string"
+				},
+				"retainMission": {
+					"type": "string"
+				},
+				"autoRecall": {
+					"type": "boolean",
+					"description": "Recall memories on the first turn of each session",
+					"default": true
+				},
+				"autoRetain": {
+					"type": "boolean",
+					"description": "Retain transcript every N turns and at session boundaries",
+					"default": true
+				},
+				"retainMode": {
+					"type": "string",
+					"enum": [
+						"full-session",
+						"last-turn"
+					],
+					"description": "full-session = upsert one document per session, last-turn = chunked",
+					"default": "full-session"
+				},
+				"retainEveryNTurns": {
+					"type": "number",
+					"default": 3
+				},
+				"retainOverlapTurns": {
+					"type": "number",
+					"default": 2
+				},
+				"retainContext": {
+					"type": "string",
+					"default": "gjc"
+				},
+				"recallBudget": {
+					"type": "string",
+					"enum": [
+						"low",
+						"mid",
+						"high"
+					],
+					"default": "mid"
+				},
+				"recallMaxTokens": {
+					"type": "number",
+					"default": 1024
+				},
+				"recallContextTurns": {
+					"type": "number",
+					"default": 1
+				},
+				"recallMaxQueryChars": {
+					"type": "number",
+					"default": 800
+				},
+				"recallTypes": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [
+						"world",
+						"experience"
+					]
+				},
+				"debug": {
+					"type": "boolean",
+					"default": false
+				},
+				"mentalModelsEnabled": {
+					"type": "boolean",
+					"description": "Read curated reflect summaries (mental models) into developer instructions at boot. Loads existing models on the bank — does not write. Pair with hindsight.mentalModelAutoSeed to also auto-create the built-in seed set.",
+					"default": true
+				},
+				"mentalModelAutoSeed": {
+					"type": "boolean",
+					"description": "At session start, create any built-in mental models (project-conventions, project-decisions, user-preferences) that do not yet exist on the bank.",
+					"default": true
+				},
+				"mentalModelRefreshIntervalMs": {
+					"type": "number",
+					"default": 300000
+				},
+				"mentalModelMaxRenderChars": {
+					"type": "number",
+					"default": 16000
+				}
+			},
+			"additionalProperties": false
+		},
+		"ttsr": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Time Traveling Stream Rules: interrupt agent when output matches patterns",
+					"default": true
+				},
+				"contextMode": {
+					"type": "string",
+					"enum": [
+						"discard",
+						"keep"
+					],
+					"description": "What to do with partial output when TTSR triggers",
+					"default": "discard"
+				},
+				"interruptMode": {
+					"type": "string",
+					"enum": [
+						"never",
+						"prose-only",
+						"tool-only",
+						"always"
+					],
+					"description": "When to interrupt mid-stream vs inject warning after completion",
+					"default": "always"
+				},
+				"repeatMode": {
+					"type": "string",
+					"enum": [
+						"once",
+						"after-gap"
+					],
+					"description": "How rules can repeat: once per session or after a message gap",
+					"default": "once"
+				},
+				"repeatGap": {
+					"type": "number",
+					"description": "Messages before a rule can trigger again",
+					"default": 10
+				}
+			},
+			"additionalProperties": false
+		},
+		"edit": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"apply_patch",
+						"hashline",
+						"patch",
+						"replace",
+						"vim"
+					],
+					"description": "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+					"default": "hashline"
+				},
+				"fuzzyMatch": {
+					"type": "boolean",
+					"description": "Accept high-confidence fuzzy matches for whitespace differences",
+					"default": true
+				},
+				"fuzzyThreshold": {
+					"type": "number",
+					"description": "Similarity threshold for fuzzy matches",
+					"default": 0.95
+				},
+				"streamingAbort": {
+					"type": "boolean",
+					"description": "Abort streaming edit tool calls when patch preview fails",
+					"default": false
+				},
+				"hashlineAutoDropPureInsertDuplicates": {
+					"type": "boolean",
+					"description": "Drop 2+ pure-insert payload lines that duplicate adjacent file context",
+					"default": false
+				},
+				"blockAutoGenerated": {
+					"type": "boolean",
+					"description": "Prevent editing of files that appear to be auto-generated (protoc, sqlc, swagger, etc.)",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"readLineNumbers": {
+			"type": "boolean",
+			"description": "Prepend line numbers to read tool output by default",
+			"default": false
+		},
+		"readHashLines": {
+			"type": "boolean",
+			"description": "Include line hashes in read output for hashline edit mode (LINE+ID|content)",
+			"default": true
+		},
+		"read": {
+			"type": "object",
+			"properties": {
+				"defaultLimit": {
+					"type": "number",
+					"description": "Default number of lines returned when agent calls read without a limit",
+					"default": 300
+				},
+				"summarize": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Return structural code summaries when read is called without an explicit selector",
+							"default": true
+						},
+						"prose": {
+							"type": "boolean",
+							"description": "Return structural summaries for Markdown and plain text reads",
+							"default": false
+						},
+						"minBodyLines": {
+							"type": "number",
+							"description": "Minimum multiline body or literal length before read summaries collapse it",
+							"default": 4
+						},
+						"minCommentLines": {
+							"type": "number",
+							"description": "Minimum multiline block comment length before read summaries collapse it",
+							"default": 6
+						}
+					},
+					"additionalProperties": false
+				},
+				"toolResultPreview": {
+					"type": "boolean",
+					"description": "Render read tool results inline in the transcript instead of summary rows",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"lsp": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the lsp tool for language server protocol",
+					"default": true
+				},
+				"formatOnWrite": {
+					"type": "boolean",
+					"description": "Automatically format code files using LSP after writing",
+					"default": false
+				},
+				"diagnosticsOnWrite": {
+					"type": "boolean",
+					"description": "Return LSP diagnostics after writing code files",
+					"default": true
+				},
+				"diagnosticsOnEdit": {
+					"type": "boolean",
+					"description": "Return LSP diagnostics after editing code files",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"bashInterceptor": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Block shell commands that have dedicated tools",
+					"default": false
+				},
+				"patterns": {
+					"type": "array",
+					"items": true,
+					"default": [
+						{
+							"pattern": "^\\s*(cat|head|tail|less|more)\\s+",
+							"tool": "read",
+							"message": "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files."
+						},
+						{
+							"pattern": "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
+							"tool": "search",
+							"message": "Use the `search` tool instead of grep/rg. It respects .gitignore and provides structured output."
+						},
+						{
+							"pattern": "^\\s*(find|fd|locate)\\s+.*(-name|-iname|-type|--type|-glob)",
+							"tool": "find",
+							"message": "Use the `find` tool instead of find/fd. It respects .gitignore and is faster for glob patterns."
+						},
+						{
+							"pattern": "^\\s*sed\\s+(-i|--in-place)",
+							"tool": "edit",
+							"message": "Use the `edit` tool instead of sed -i. It provides diff preview and fuzzy matching."
+						},
+						{
+							"pattern": "^\\s*perl\\s+.*-[pn]?i",
+							"tool": "edit",
+							"message": "Use the `edit` tool instead of perl -i. It provides diff preview and fuzzy matching."
+						},
+						{
+							"pattern": "^\\s*awk\\s+.*-i\\s+inplace",
+							"tool": "edit",
+							"message": "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching."
+						},
+						{
+							"pattern": "^\\s*(echo|printf|cat\\s*<<)\\s+.*[^|]>\\s*\\S",
+							"tool": "write",
+							"message": "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation."
+						}
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"bash": {
+			"type": "object",
+			"properties": {
+				"stripTrailingHeadTail": {
+					"type": "boolean",
+					"description": "Silently drop trailing `| head`/`| tail` pipes from single-line bash commands. Output is already truncated automatically.",
+					"default": true
+				},
+				"autoBackground": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Automatically background long-running bash commands and deliver the result later",
+							"default": false
+						},
+						"thresholdMs": {
+							"type": "number",
+							"default": 60000
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"shellMinimizer": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Compress verbose shell output (git, npm, cargo, etc.) before returning it to the agent",
+					"default": true
+				},
+				"settingsPath": {
+					"type": "string"
+				},
+				"only": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"except": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"maxCaptureBytes": {
+					"type": "number",
+					"default": 4194304
+				}
+			},
+			"additionalProperties": false
+		},
+		"eval": {
+			"type": "object",
+			"properties": {
+				"py": {
+					"type": "boolean",
+					"description": "Allow the eval tool to dispatch to the IPython kernel",
+					"default": true
+				},
+				"js": {
+					"type": "boolean",
+					"description": "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"python": {
+			"type": "object",
+			"properties": {
+				"kernelMode": {
+					"type": "string",
+					"enum": [
+						"session",
+						"per-call"
+					],
+					"description": "Whether to keep IPython kernel alive across calls",
+					"default": "session"
+				}
+			},
+			"additionalProperties": false
+		},
+		"todo": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the todo_write tool for task tracking",
+					"default": true
+				},
+				"reminders": {
+					"type": "object",
+					"properties": {
+						"max": {
+							"type": "number",
+							"description": "Maximum reminders to complete todos before giving up",
+							"default": 3
+						}
+					},
+					"additionalProperties": false
+				},
+				"eager": {
+					"type": "boolean",
+					"description": "Automatically create a comprehensive todo list after the first message",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"find": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the find tool for file searching",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"search": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the search tool for content searching",
+					"default": true
+				},
+				"contextBefore": {
+					"type": "number",
+					"description": "Lines of context before each search match",
+					"default": 1
+				},
+				"contextAfter": {
+					"type": "number",
+					"description": "Lines of context after each search match",
+					"default": 3
+				}
+			},
+			"additionalProperties": false
+		},
+		"astGrep": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the ast_grep tool for structural AST search",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"astEdit": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the ast_edit tool for structural AST rewrites",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"irc": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable agent-to-agent IRC messaging via the irc tool",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"renderMermaid": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"debug": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the debug tool for DAP-based debugging",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"calc": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the calculator tool for basic calculations",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"recipe": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the recipe tool when a justfile / package.json / Cargo.toml / Makefile / Taskfile is present",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"inspect_image": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the inspect_image tool, delegating image understanding to a vision-capable model",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"checkpoint": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the checkpoint and rewind tools for context checkpointing",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"skill": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the skill tool so the agent can chain into another available skill on its next turn",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"fetch": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Allow the read tool to fetch and process URLs",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"github": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the github tool (op-based dispatch for repository, issue, pull request, diff, search, checkout, push, and Actions watch workflows)",
+					"default": false
+				},
+				"cache": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Cache rendered issue/PR view output in ~/.gjc/cache/github-cache.db so repeated reads are free",
+							"default": true
+						},
+						"softTtlSec": {
+							"type": "number",
+							"description": "Within this window, cached issue/PR view rows are returned directly. Default 5 minutes.",
+							"default": 300
+						},
+						"hardTtlSec": {
+							"type": "number",
+							"description": "Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
+							"default": 604800
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"web_search": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the web_search tool for web searching",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"browser": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the browser tool (Ulixee Hero)",
+					"default": true
+				},
+				"headless": {
+					"type": "boolean",
+					"description": "Launch browser in headless mode (disable to show browser UI)",
+					"default": true
+				},
+				"screenshotDir": {
+					"type": "string",
+					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
+				}
+			},
+			"additionalProperties": false
+		},
+		"async": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable async bash commands and background task execution",
+					"default": false
+				},
+				"maxJobs": {
+					"type": "number",
+					"default": 100
+				},
+				"pollWaitDuration": {
+					"type": "string",
+					"enum": [
+						"5s",
+						"10s",
+						"30s",
+						"1m",
+						"5m"
+					],
+					"description": "How long the poll tool waits for background job updates before returning the current state",
+					"default": "30s"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mcp": {
+			"type": "object",
+			"properties": {
+				"enableProjectConfig": {
+					"type": "boolean",
+					"default": false
+				},
+				"discoveryMode": {
+					"type": "boolean",
+					"default": false
+				},
+				"discoveryDefaultServers": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"notifications": {
+					"type": "boolean",
+					"default": false
+				},
+				"notificationDebounceMs": {
+					"type": "number",
+					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"plan": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable plan mode for read-only exploration and planning before execution",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"goal": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable per-session goal mode and the hidden goal tool",
+					"default": true
+				},
+				"statusInFooter": {
+					"type": "boolean",
+					"description": "Show goal usage alongside the goal indicator in the status line",
+					"default": true
+				},
+				"continuationModes": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Run modes where active goals may auto-continue between turns",
+					"default": [
+						"interactive"
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"task": {
+			"type": "object",
+			"properties": {
+				"isolation": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"none",
+								"auto",
+								"apfs",
+								"btrfs",
+								"zfs",
+								"reflink",
+								"overlayfs",
+								"projfs",
+								"block-clone",
+								"rcopy"
+							],
+							"description": "Isolation backend for subagents. \"auto\" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).",
+							"default": "none"
+						},
+						"merge": {
+							"type": "string",
+							"enum": [
+								"patch",
+								"branch"
+							],
+							"description": "How isolated task changes are integrated (patch apply or branch merge)",
+							"default": "patch"
+						},
+						"commits": {
+							"type": "string",
+							"enum": [
+								"generic",
+								"ai"
+							],
+							"description": "Commit message style for nested repo changes (generic or AI-generated)",
+							"default": "generic"
+						}
+					},
+					"additionalProperties": false
+				},
+				"eager": {
+					"type": "boolean",
+					"description": "Encourage the agent to delegate work to subagents unless changes are trivial",
+					"default": false
+				},
+				"simple": {
+					"type": "string",
+					"enum": [
+						"default",
+						"schema-free",
+						"independent"
+					],
+					"description": "How much shared structure the task tool accepts (default, schema-free, or independent)",
+					"default": "default"
+				},
+				"maxConcurrency": {
+					"type": "number",
+					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
+					"default": 8
+				},
+				"enableLsp": {
+					"type": "boolean",
+					"description": "Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
+					"default": false
+				},
+				"forkContext": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
+							"default": false
+						},
+						"maxMessages": {
+							"type": "number",
+							"description": "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
+							"default": 50
+						},
+						"maxTokens": {
+							"type": "number",
+							"description": "Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
+							"default": 0
+						}
+					},
+					"additionalProperties": false
+				},
+				"maxRecursionDepth": {
+					"type": "number",
+					"description": "How many levels deep subagents can spawn their own subagents",
+					"default": 2
+				},
+				"maxRuntimeMs": {
+					"type": "number",
+					"description": "Hard wall-clock limit per subagent (ms). 0 disables it. Defense-in-depth against provider-side stream hangs that escape the inference-layer watchdog; triggers a normal subagent abort with a 'timed out' reason.",
+					"default": 0
+				},
+				"disabledAgents": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"agentModelOverrides": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasks": {
+			"type": "object",
+			"properties": {
+				"todoClearDelay": {
+					"type": "number",
+					"description": "How long to wait before removing completed/abandoned tasks from the list",
+					"default": 60
+				}
+			},
+			"additionalProperties": false
+		},
+		"skills": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableSkillCommands": {
+					"type": "boolean",
+					"default": true
+				},
+				"enableCodexUser": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableClaudeUser": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableClaudeProject": {
+					"type": "boolean",
+					"default": false
+				},
+				"enablePiUser": {
+					"type": "boolean",
+					"default": false
+				},
+				"enablePiProject": {
+					"type": "boolean",
+					"default": false
+				},
+				"customDirectories": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"ignoredSkills": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"includeSkills": {
+					"type": "array",
+					"items": true,
+					"default": []
+				}
+			},
+			"additionalProperties": false
+		},
+		"commands": {
+			"type": "object",
+			"properties": {
+				"enableClaudeUser": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableClaudeProject": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableOpencodeUser": {
+					"type": "boolean",
+					"default": false
+				},
+				"enableOpencodeProject": {
+					"type": "boolean",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"secrets": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Obfuscate secrets before sending to AI providers",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"providers": {
+			"type": "object",
+			"properties": {
+				"webSearch": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"duckduckgo",
+						"exa",
+						"brave",
+						"jina",
+						"kimi",
+						"zai",
+						"perplexity",
+						"anthropic",
+						"gemini",
+						"codex",
+						"tavily",
+						"kagi",
+						"synthetic",
+						"parallel",
+						"searxng"
+					],
+					"description": "Provider for web search tool",
+					"default": "auto"
+				},
+				"image": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"openai",
+						"gemini",
+						"openrouter"
+					],
+					"description": "Provider for image generation tool",
+					"default": "auto"
+				},
+				"kimiApiFormat": {
+					"type": "string",
+					"enum": [
+						"openai",
+						"anthropic"
+					],
+					"description": "API format for Kimi Code provider",
+					"default": "anthropic"
+				},
+				"openaiWebsockets": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"off",
+						"on"
+					],
+					"description": "Websocket policy for OpenAI Codex models (auto uses model defaults, on forces, off disables)",
+					"default": "auto"
+				},
+				"parallelFetch": {
+					"type": "boolean",
+					"description": "Use Parallel extract API for URL fetching when credentials are available",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"provider": {
+			"type": "object",
+			"properties": {
+				"appendOnlyContext": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"on",
+						"off"
+					],
+					"description": "Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Anthropic) hit at maximum rate. Auto enables for DeepSeek.",
+					"default": "auto"
+				}
+			},
+			"additionalProperties": false
+		},
+		"exa": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Master toggle for all Exa search tools",
+					"default": true
+				},
+				"enableSearch": {
+					"type": "boolean",
+					"description": "Basic search, deep search, code search, crawl",
+					"default": true
+				},
+				"enableResearcher": {
+					"type": "boolean",
+					"description": "AI-powered deep research tasks",
+					"default": false
+				},
+				"enableWebsets": {
+					"type": "boolean",
+					"description": "Webset management and enrichment tools",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"searxng": {
+			"type": "object",
+			"properties": {
+				"endpoint": {
+					"type": "string",
+					"description": "Self-hosted search base URL"
+				},
+				"token": {
+					"type": "string"
+				},
+				"basicUsername": {
+					"type": "string"
+				},
+				"basicPassword": {
+					"type": "string"
+				},
+				"categories": {
+					"type": "string"
+				},
+				"language": {
+					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"commit": {
+			"type": "object",
+			"properties": {
+				"mapReduceEnabled": {
+					"type": "boolean",
+					"default": true
+				},
+				"mapReduceMinFiles": {
+					"type": "number",
+					"default": 4
+				},
+				"mapReduceMaxFileTokens": {
+					"type": "number",
+					"default": 50000
+				},
+				"mapReduceTimeoutMs": {
+					"type": "number",
+					"default": 120000
+				},
+				"mapReduceMaxConcurrency": {
+					"type": "number",
+					"default": 5
+				},
+				"changelogMaxDiffChars": {
+					"type": "number",
+					"default": 120000
+				}
+			},
+			"additionalProperties": false
+		},
+		"thinkingBudgets": {
+			"type": "object",
+			"properties": {
+				"minimal": {
+					"type": "number",
+					"default": 1024
+				},
+				"low": {
+					"type": "number",
+					"default": 2048
+				},
+				"medium": {
+					"type": "number",
+					"default": 8192
+				},
+				"high": {
+					"type": "number",
+					"default": 16384
+				},
+				"xhigh": {
+					"type": "number",
+					"default": 32768
+				},
+				"max": {
+					"type": "number",
+					"default": 65536
+				}
+			},
+			"additionalProperties": false
+		}
+	},
+	"additionalProperties": false
+}
