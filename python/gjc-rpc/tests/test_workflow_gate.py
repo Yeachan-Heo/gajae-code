@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from gjc_rpc import WorkflowGate, WorkflowGateOption, parse_notification
-from gjc_rpc.protocol import parse_workflow_gate
+from gjc_rpc import WorkflowGate, WorkflowGateEvent, WorkflowGateOption, parse_notification
+from gjc_rpc.protocol import parse_workflow_gate, parse_workflow_gate_event
 
 
 GATE_PAYLOAD = {
@@ -24,6 +24,27 @@ GATE_PAYLOAD = {
 
 
 class WorkflowGateParseTest(unittest.TestCase):
+    def test_parse_workflow_gate_event_accepts_legacy_payload(self) -> None:
+        gate = parse_workflow_gate_event(
+            {
+                "type": "workflow_gate",
+                "gate_id": "legacy-gate",
+                "stage": "input",
+                "kind": "question",
+                "schema": {"type": "string"},
+                "options": ["alpha", "beta"],
+                "context": {"method": "select"},
+            }
+        )
+
+        self.assertIsInstance(gate, WorkflowGateEvent)
+        self.assertEqual(gate.gate_id, "legacy-gate")
+        self.assertEqual(gate.options, ("alpha", "beta"))
+        self.assertEqual(gate.context, {"method": "select"})
+
+    def test_workflow_gate_parsers_are_distinct(self) -> None:
+        self.assertIsNot(parse_workflow_gate_event, parse_workflow_gate)
+
     def test_parse_workflow_gate_fields(self) -> None:
         gate = parse_workflow_gate(GATE_PAYLOAD)
         self.assertIsInstance(gate, WorkflowGate)

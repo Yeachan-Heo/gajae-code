@@ -91,8 +91,8 @@ from .protocol import (
     message_text_with_thinking,
     parse_notification,
     parse_workflow_gate,
+    parse_workflow_gate_event,
     parse_session_state,
-    parse_workflow_gate,
     parse_todo_phases,
 )
 
@@ -188,6 +188,7 @@ __all__ = [
     "message_text_with_thinking",
     "parse_notification",
     "parse_workflow_gate",
+    "parse_workflow_gate_event",
     "parse_session_state",
     "parse_todo_phases",
     "host_tool",

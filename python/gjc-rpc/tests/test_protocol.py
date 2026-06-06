@@ -6,12 +6,15 @@ from gjc_rpc import (
     AgentEndEvent,
     ExtensionUiRequest,
     SessionState,
+    WorkflowGate,
     WorkflowGateEvent,
     TodoReminderEvent,
     assistant_text,
     assistant_text_with_thinking,
     parse_notification,
     parse_session_state,
+    parse_workflow_gate,
+    parse_workflow_gate_event,
 )
 
 
@@ -142,8 +145,8 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertFalse(notification.is_passive())
 
 
-    def test_parse_workflow_gate(self) -> None:
-        notification = parse_notification(
+    def test_parse_workflow_gate_event(self) -> None:
+        gate = parse_workflow_gate_event(
             {
                 "type": "workflow_gate",
                 "gate_id": "gate-1",
@@ -155,12 +158,36 @@ class ProtocolParsingTests(unittest.TestCase):
             }
         )
 
-        self.assertIsInstance(notification, WorkflowGateEvent)
+        self.assertIsInstance(gate, WorkflowGateEvent)
+        self.assertEqual(gate.gate_id, "gate-1")
+        self.assertEqual(gate.kind, "approval")
+        self.assertEqual(gate.schema, {"type": "boolean"})
+        self.assertEqual(gate.options, ("Approve", "Reject"))
+        self.assertEqual(gate.context, {"skill": "ralplan", "phase": "approval"})
+
+    def test_parse_workflow_gate_notification(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "workflow_gate",
+                "gate_id": "gate-1",
+                "stage": "ralplan:approval",
+                "kind": "approval",
+                "schema": {"type": "boolean"},
+                "schema_hash": "hash-1",
+                "context": {"skill": "ralplan", "phase": "approval"},
+                "created_at": "2026-06-05T05:00:00.000Z",
+                "options": [{"value": "approve", "label": "Approve"}],
+            }
+        )
+
+        self.assertIsInstance(notification, WorkflowGate)
         self.assertEqual(notification.gate_id, "gate-1")
-        self.assertEqual(notification.kind, "approval")
-        self.assertEqual(notification.schema, {"type": "boolean"})
-        self.assertEqual(notification.options, ("Approve", "Reject"))
-        self.assertEqual(notification.context, {"skill": "ralplan", "phase": "approval"})
+        self.assertEqual(notification.schema_hash, "hash-1")
+        self.assertEqual(notification.created_at, "2026-06-05T05:00:00.000Z")
+
+    def test_workflow_gate_parsers_are_distinct(self) -> None:
+        self.assertIsNot(parse_workflow_gate_event, parse_workflow_gate)
+
     def test_parse_todo_reminder_notification(self) -> None:
         notification = parse_notification(
             {

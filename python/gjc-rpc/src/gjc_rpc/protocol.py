@@ -1322,7 +1322,7 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
     )
 
 
-def parse_workflow_gate(payload: JsonObject) -> WorkflowGateEvent:
+def parse_workflow_gate_event(payload: JsonObject) -> WorkflowGateEvent:
     return WorkflowGateEvent(
         gate_id=_require_str(payload, "gate_id"),
         stage=_require_str(payload, "stage"),
