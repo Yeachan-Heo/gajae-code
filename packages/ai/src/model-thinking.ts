@@ -8,6 +8,7 @@ export const enum Effort {
 	Medium = "medium",
 	High = "high",
 	XHigh = "xhigh",
+	Max = "max",
 }
 
 export const THINKING_EFFORTS: readonly Effort[] = [
@@ -16,6 +17,7 @@ export const THINKING_EFFORTS: readonly Effort[] = [
 	Effort.Medium,
 	Effort.High,
 	Effort.XHigh,
+	Effort.Max,
 ];
 
 const DEFAULT_REASONING_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
@@ -25,6 +27,21 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH: readonly Effort[] = [
 	Effort.Medium,
 	Effort.High,
 	Effort.XHigh,
+];
+const DEFAULT_REASONING_EFFORTS_WITH_MAX: readonly Effort[] = [
+	Effort.Minimal,
+	Effort.Low,
+	Effort.Medium,
+	Effort.High,
+	Effort.Max,
+];
+const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
+	Effort.Minimal,
+	Effort.Low,
+	Effort.Medium,
+	Effort.High,
+	Effort.XHigh,
+	Effort.Max,
 ];
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
@@ -283,6 +300,7 @@ export function mapEffortToGoogleThinkingLevel<TApi extends Api>(
 			return "MEDIUM";
 		case Effort.High:
 		case Effort.XHigh:
+		case Effort.Max:
 			return "HIGH";
 	}
 }
@@ -301,10 +319,8 @@ export function mapEffortToAnthropicAdaptiveEffort<TApi extends Api>(
 		case Effort.High:
 			return "high";
 		case Effort.XHigh:
-			// Opus 4.7+ introduced a distinct "xhigh" effort level (between "high" and "max").
-			// The Anthropic docs scope this to the Messages API only, so Bedrock Converse and
-			// older adaptive-thinking Opus 4.6 models keep the legacy "max" alias.
-			return anthropicModelHasRealXHighEffort(model) ? "xhigh" : "max";
+		case Effort.Max:
+			return effort === Effort.XHigh ? "xhigh" : "max";
 	}
 }
 
@@ -548,7 +564,10 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		return parsedModel.kind === "opus" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+		if (parsedModel.kind !== "opus") return DEFAULT_REASONING_EFFORTS;
+		return anthropicModelHasRealXHighEffort(model)
+			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
+			: DEFAULT_REASONING_EFFORTS_WITH_MAX;
 	}
 	return inferFallbackEfforts(model);
 }

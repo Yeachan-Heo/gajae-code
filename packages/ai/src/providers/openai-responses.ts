@@ -95,7 +95,7 @@ export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undef
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ServiceTier;
 	toolChoice?: ToolChoice;

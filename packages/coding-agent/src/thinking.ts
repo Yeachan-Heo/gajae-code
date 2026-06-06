@@ -34,6 +34,11 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevel, ThinkingLevelMetadata> = {
 		label: "xhigh",
 		description: "Maximum reasoning (~32k tokens)",
 	},
+	[ThinkingLevel.Max]: {
+		value: ThinkingLevel.Max,
+		label: "max",
+		description: "Opus maximum reasoning",
+	},
 };
 
 const THINKING_LEVELS = new Set<string>([ThinkingLevel.Inherit, ThinkingLevel.Off, ...THINKING_EFFORTS]);

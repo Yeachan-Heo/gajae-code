@@ -34,6 +34,18 @@ describe("model profile schema", () => {
 		expect(result.success).toBe(true);
 	});
 
+	test("max effort selector parses explicitly", () => {
+		const result = ModelsConfigSchema.safeParse({
+			profiles: {
+				opus: {
+					required_providers: ["anthropic"],
+					model_mapping: { default: "anthropic/claude-opus-4.7:max" },
+				},
+			},
+		});
+		expect(result.success).toBe(true);
+	});
+
 	test("unknown model_mapping key is rejected with model_mapping path", () => {
 		const result = ModelsConfigSchema.safeParse({
 			profiles: {

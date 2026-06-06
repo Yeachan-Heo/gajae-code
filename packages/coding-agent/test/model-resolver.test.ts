@@ -267,7 +267,15 @@ describe("parseModelPattern", () => {
 		});
 
 		test("all valid thinking levels work", () => {
-			const levels = ["off", Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] as const;
+			const levels = [
+				"off",
+				Effort.Minimal,
+				Effort.Low,
+				Effort.Medium,
+				Effort.High,
+				Effort.XHigh,
+				Effort.Max,
+			] as const;
 			for (const level of levels) {
 				const result = parseModelPattern(`sonnet:${level}`, allModels);
 				expect(result.model?.id).toBe("claude-sonnet-4-5");

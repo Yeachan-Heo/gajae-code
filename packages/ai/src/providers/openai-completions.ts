@@ -249,13 +249,13 @@ export function isOpenAICompletionsProgressChunk(chunk: unknown): boolean {
 
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: ToolChoice;
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Force-disable reasoning where supported, or request the lowest effort on generic effort endpoints. */
 	disableReasoning?: boolean;
 	serviceTier?: ServiceTier;
 }
 
-type OpenAICompletionsParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
+type OpenAICompletionsParams = Omit<OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming, "reasoning_effort"> & {
 	top_k?: number;
 	min_p?: number;
 	repetition_penalty?: number;
@@ -263,6 +263,7 @@ type OpenAICompletionsParams = OpenAI.Chat.Completions.ChatCompletionCreateParam
 	enable_thinking?: boolean;
 	chat_template_kwargs?: { enable_thinking: boolean };
 	reasoning?: { effort?: string } | { enabled: false };
+	reasoning_effort?: OpenAICompletionsOptions["reasoning"];
 	provider?: OpenAICompat["openRouterRouting"];
 	providerOptions?: { gateway?: { only?: string[]; order?: string[] } };
 };
@@ -479,7 +480,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					body: params,
 				};
 				const { data, response, request_id } = await client.chat.completions
-					.create(params, { signal: requestSignal })
+					.create(params as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming, { signal: requestSignal })
 					.withResponse();
 				await notifyProviderResponse(options, response, model, request_id);
 				return data;

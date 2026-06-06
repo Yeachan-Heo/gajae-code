@@ -1,6 +1,6 @@
 import type { Model, OpenAICompat } from "../types";
 
-type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
 
 export type ResolvedOpenAICompat = Required<
@@ -162,6 +162,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 					medium: "default",
 					high: "default",
 					xhigh: "default",
+					max: "default",
 				} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
 			: isDeepseekFamily && model.reasoning
 				? ({
@@ -170,6 +171,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 						medium: "high",
 						high: "high",
 						xhigh: "max",
+						max: "max",
 					} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
 				: isFireworks
 					? ({

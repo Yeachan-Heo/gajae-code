@@ -33,7 +33,14 @@ export type { ParsedRequest };
 type ReasoningEffort = NonNullable<ParsedRequest["options"]["reasoning"]>;
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
-	return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+	return (
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh" ||
+		value === "max"
+	);
 }
 
 function isServiceTier(value: unknown): value is ResolvedServiceTier {

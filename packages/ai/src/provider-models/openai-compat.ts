@@ -2135,7 +2135,7 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 			// sending unsupported effort strings.
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: true,
-			reasoningEffortMap: { minimal: "high", low: "high", medium: "high", high: "high", xhigh: "max" },
+			reasoningEffortMap: { minimal: "high", low: "high", medium: "high", high: "high", xhigh: "max", max: "max" },
 			maxTokensField: "max_tokens",
 			// DeepSeek V4 thinking mode rejects the `tool_choice` control parameter.
 			// Tool calls still work without it; the API defaults to auto when tools exist.
