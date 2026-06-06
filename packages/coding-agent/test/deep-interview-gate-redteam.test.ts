@@ -134,6 +134,7 @@ describe("deep-interview question gates red-team", () => {
 			{ label: "JWT", description: undefined },
 			{ label: "OAuth2", description: "recommended" },
 			{ label: "Session cookies", description: undefined },
+			{ label: "Other (type your own)", description: "free-text custom answer" },
 		]);
 	});
 
@@ -144,7 +145,9 @@ describe("deep-interview question gates red-team", () => {
 			options: [],
 		};
 		const gate = questionToGate(zeroQ);
-		expect(gate.options).toEqual([]);
+		expect(gate.options).toEqual([
+			{ value: { other: true }, label: "Other (type your own)", description: "free-text custom answer" },
+		]);
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual([]);
 
 		const answer = { selected: [], other: true, custom: "No cloud dependencies" };

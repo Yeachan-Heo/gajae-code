@@ -25,6 +25,9 @@ const SUPPORTED_KEYWORDS = new Set<keyof RpcJsonSchema>([
 	"items",
 	"minLength",
 	"maxLength",
+	"minItems",
+	"maxItems",
+	"uniqueItems",
 	"minimum",
 	"maximum",
 	"title",
@@ -104,11 +107,14 @@ function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
 			throw new WorkflowGateSchemaError(`${meta} at ${path} must be a string`);
 		}
 	}
-	for (const limit of ["minLength", "maxLength"] as const) {
+	for (const limit of ["minLength", "maxLength", "minItems", "maxItems"] as const) {
 		const v = schema[limit];
 		if (v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < 0)) {
 			throw new WorkflowGateSchemaError(`${limit} at ${path} must be a non-negative integer`);
 		}
+	}
+	if (schema.uniqueItems !== undefined && typeof schema.uniqueItems !== "boolean") {
+		throw new WorkflowGateSchemaError(`uniqueItems at ${path} must be a boolean`);
 	}
 	for (const limit of ["minimum", "maximum"] as const) {
 		const v = schema[limit];
@@ -262,9 +268,38 @@ function validateValue(schema: RpcJsonSchema, value: unknown, path: string, erro
 			}
 		}
 	}
-	if (Array.isArray(value) && schema.items) {
-		for (let i = 0; i < value.length; i++)
-			validateValue(schema.items as RpcJsonSchema, value[i], `${path}/${i}`, errors);
+	if (Array.isArray(value)) {
+		if (schema.minItems !== undefined && value.length < schema.minItems) {
+			errors.push({
+				path,
+				keyword: "minItems",
+				message: `fewer than ${schema.minItems} items`,
+				expected: schema.minItems,
+			});
+		}
+		if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+			errors.push({
+				path,
+				keyword: "maxItems",
+				message: `more than ${schema.maxItems} items`,
+				expected: schema.maxItems,
+			});
+		}
+		if (schema.uniqueItems) {
+			const seen = new Set<string>();
+			for (const item of value) {
+				const key = canonicalJson(item);
+				if (seen.has(key)) {
+					errors.push({ path, keyword: "uniqueItems", message: "array items must be unique" });
+					break;
+				}
+				seen.add(key);
+			}
+		}
+		if (schema.items) {
+			for (let i = 0; i < value.length; i++)
+				validateValue(schema.items as RpcJsonSchema, value[i], `${path}/${i}`, errors);
+		}
 	}
 	for (const combiner of ["oneOf", "anyOf"] as const) {
 		const branches = schema[combiner];

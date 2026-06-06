@@ -63,31 +63,87 @@ export class DeepInterviewGateError extends Error {
 	}
 }
 
-/** Build the `workflow_gate` open-input for one deep-interview question. */
-export function questionToGate(question: AskGateQuestion): OpenGateInput {
-	const labels = question.options.map(o => o.label);
-	const schema: RpcJsonSchema = {
+function deepInterviewQuestionState(questionText: string): Record<string, unknown> {
+	const roundMatch = /^Round\s+(\d+)\s+\|\s+([^|]+?)\s+\|\s+Ambiguity:\s*(.+?)\s*$/im.exec(questionText);
+	const state: Record<string, unknown> = {};
+	if (roundMatch) {
+		const round = Number(roundMatch[1]);
+		if (Number.isFinite(round)) state.round = round;
+		const mode = roundMatch[2]?.trim();
+		if (mode) {
+			state.mode = mode;
+			const normalized = mode.toLowerCase();
+			if (normalized.includes("topology")) state.topology_gate = true;
+			if (/(contrarian|simplifier|ontologist)/u.test(normalized)) state.challenge_mode = normalized;
+		}
+		const ambiguity = roundMatch[3]?.trim();
+		if (ambiguity) state.ambiguity = ambiguity;
+	}
+	if (/Round\s+0\s+\|\s+Topology confirmation/im.test(questionText)) {
+		state.round = 0;
+		state.mode = "Topology confirmation";
+		state.topology_gate = true;
+	}
+	return state;
+}
+
+function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJsonSchema {
+	const multi = question.multi ?? false;
+	const selectedItems: RpcJsonSchema = { type: "string", enum: labels };
+	const selectedBase: RpcJsonSchema = { type: "array", items: selectedItems, uniqueItems: true };
+	const selectedOnly: RpcJsonSchema = {
+		...selectedBase,
+		minItems: 1,
+		...(multi ? {} : { maxItems: 1 }),
+	};
+	const selectedWithOther: RpcJsonSchema = {
+		...selectedBase,
+		...(multi ? {} : { maxItems: 0 }),
+	};
+	return {
 		type: "object",
 		properties: {
-			selected: {
-				type: "array",
-				items: { type: "string", enum: labels },
-			},
+			selected: selectedBase,
 			other: { type: "boolean", description: "set true to provide a free-text answer in `custom`" },
-			custom: { type: "string", description: "free-text answer; required when `other` is true" },
+			custom: { type: "string", minLength: 1, description: "free-text answer; required when `other` is true" },
 		},
 		required: ["selected"],
 		additionalProperties: false,
+		anyOf: [
+			{ properties: { selected: selectedOnly, other: { const: false } } },
+			{ properties: { selected: selectedOnly }, required: ["selected"] },
+			{
+				properties: {
+					selected: selectedWithOther,
+					other: { const: true },
+					custom: { type: "string", minLength: 1 },
+				},
+				required: ["selected", "other", "custom"],
+			},
+		],
 	};
+}
+
+/** Build the `workflow_gate` open-input for one deep-interview question. */
+export function questionToGate(question: AskGateQuestion): OpenGateInput {
+	const labels = question.options.map(o => o.label);
+	const schema = questionAnswerSchema(question, labels);
 	return {
 		stage: "deep-interview",
 		kind: "question",
 		schema,
-		options: question.options.map((o, i) => ({
-			value: o.label,
-			label: o.label,
-			description: i === question.recommended ? "recommended" : undefined,
-		})),
+		options: [
+			...question.options.map((o, i) => ({
+				value: o.label,
+				label: o.label,
+				description: i === question.recommended ? "recommended" : undefined,
+			})),
+			{
+				value: { other: true },
+				label: GATE_OTHER_OPTION,
+				description: "free-text custom answer",
+			},
+		],
 		context: {
 			title: question.question,
 			prompt: question.question,
@@ -96,6 +152,7 @@ export function questionToGate(question: AskGateQuestion): OpenGateInput {
 				multi: question.multi ?? false,
 				options: labels,
 				other_option: GATE_OTHER_OPTION,
+				...deepInterviewQuestionState(question.question),
 			},
 		},
 	};

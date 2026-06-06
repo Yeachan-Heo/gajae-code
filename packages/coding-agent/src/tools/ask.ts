@@ -426,7 +426,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
-		return session.hasUI ? new AskTool(session) : null;
+		return session.hasUI || session.getWorkflowGateEmitter?.() ? new AskTool(session) : null;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -443,17 +443,25 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		// Headless fallback
-		if (!context?.hasUI || !context.ui) {
+		const gateEmitter = this.session.getWorkflowGateEmitter?.();
+		const canUseWorkflowGate = gateEmitter?.isUnattended() === true;
+
+		// Headless fallback: unattended workflow gates are the non-TUI answer path.
+		if (!canUseWorkflowGate && (!context?.hasUI || !context.ui)) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
 
-		const extensionUi = context.ui;
+		const extensionUi = context?.ui;
 		const ui: UIContext = {
-			select: (prompt, options, dialogOptions) => extensionUi.select(prompt, options, dialogOptions),
-			editor: (title, prefill, dialogOptions, editorOptions) =>
-				extensionUi.editor(title, prefill, dialogOptions, editorOptions),
+			select: (prompt, options, dialogOptions) => {
+				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+				return extensionUi.select(prompt, options, dialogOptions);
+			},
+			editor: (title, prefill, dialogOptions, editorOptions) => {
+				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+				return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+			},
 		};
 
 		// Determine timeout based on settings and plan mode
@@ -478,10 +486,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			options?: { previous?: QuestionResult; navigation?: NavigationControls },
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
-			// Unattended (#323/G011): route the question through the workflow-gate
+			// Unattended (#316/#323/G011): route the question through the workflow-gate
 			// emitter instead of the interactive UI; the external agent answers over RPC.
-			const gateEmitter = this.session.getWorkflowGateEmitter?.();
-			if (gateEmitter?.isUnattended()) {
+			if (gateEmitter && canUseWorkflowGate) {
 				const gateQuestion = {
 					id: q.id,
 					question: q.question,
@@ -552,7 +559,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			const { optionLabels, selectedOptions, customInput, cancelled, timedOut } = await askQuestion(q);
 
 			if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) {
-				context.abort();
+				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
 			const details: AskToolDetails = {
@@ -604,7 +611,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			} = await askQuestion(q, { previous, navigation });
 
 			if (cancelled && !timedOut) {
-				context.abort();
+				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
 

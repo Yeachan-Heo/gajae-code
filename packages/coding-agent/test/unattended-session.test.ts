@@ -53,6 +53,22 @@ describe("UnattendedSessionControlPlane", () => {
 		await expect(pending).resolves.toEqual({ decision: "approve" });
 	});
 
+	it("resolves a synchronously answered emitted gate without losing the answer", async () => {
+		let plane: UnattendedSessionControlPlane;
+		const emitted: RpcWorkflowGate[] = [];
+		plane = new UnattendedSessionControlPlane({
+			runId: "run-sync",
+			emitFrame: gate => {
+				emitted.push(gate);
+				void plane.resolveGate({ gate_id: gate.gate_id, answer: { decision: "approve" } });
+			},
+		});
+		plane.negotiate(DECL);
+
+		await expect(plane.emitGate(approvalGate({ summary: "sync?" }))).resolves.toEqual({ decision: "approve" });
+		expect(emitted).toHaveLength(1);
+	});
+
 	it("bridges a deep-interview question gate end-to-end", async () => {
 		const { plane, emitted } = makePlane();
 		plane.negotiate(DECL);

@@ -59,6 +59,7 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 	#controller: UnattendedRunController | undefined;
 	#broker: WorkflowGateBroker | undefined;
 	readonly #pending = new Map<string, { resolve: (answer: unknown) => void; reject: (err: Error) => void }>();
+	readonly #earlyAnswers = new Map<string, unknown>();
 
 	constructor(private readonly opts: UnattendedSessionOptions) {}
 
@@ -95,7 +96,12 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 				if (pending) {
 					this.#pending.delete(gate.gate_id);
 					pending.resolve(answer);
+					return;
 				}
+				// A controller may answer synchronously while emitFrame is still on the
+				// stack. Keep the accepted answer so emitGate can still resolve after
+				// openGate returns and the caller starts awaiting.
+				this.#earlyAnswers.set(gate.gate_id, answer);
 			},
 		});
 		return {
@@ -150,9 +156,14 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 			return Promise.reject(new Error("cannot emit a workflow gate before unattended mode is negotiated"));
 		}
 		const gate = this.#broker.openGate(input);
-		return new Promise<unknown>((resolve, reject) => {
-			this.#pending.set(gate.gate_id, { resolve, reject });
-		});
+		if (this.#earlyAnswers.has(gate.gate_id)) {
+			const answer = this.#earlyAnswers.get(gate.gate_id);
+			this.#earlyAnswers.delete(gate.gate_id);
+			return Promise.resolve(answer);
+		}
+		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+		this.#pending.set(gate.gate_id, { resolve, reject });
+		return promise;
 	}
 
 	async recover(): Promise<void> {
@@ -160,6 +171,7 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 	}
 
 	#rejectAllPending(error: Error): void {
+		this.#earlyAnswers.clear();
 		for (const [gateId, pending] of this.#pending) {
 			this.#pending.delete(gateId);
 			pending.reject(error);

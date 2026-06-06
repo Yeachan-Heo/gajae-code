@@ -13,6 +13,13 @@ import { AskTool } from "@gajae-code/coding-agent/tools/ask";
  * gate contract end-to-end.
  */
 
+function createHeadlessContext(): AgentToolContext {
+	return {
+		hasUI: false,
+		abort: () => {},
+	} as unknown as AgentToolContext;
+}
+
 function createContext(): AgentToolContext {
 	let selectCalls = 0;
 	const ctx = {
@@ -75,6 +82,63 @@ describe("ask tool unattended gate emission (G011)", () => {
 		// The decoded answer is surfaced as the tool result.
 		expect(result.content[0]).toMatchObject({ type: "text" });
 		expect(JSON.stringify(result.details)).toContain("OAuth2");
+	});
+
+	it("emits and resolves over workflow_gate without a TUI context", async () => {
+		const emitter = new StubEmitter(() => ({ selected: ["JWT"], other: false }));
+		const tool = new AskTool(createSession(emitter));
+
+		const result = await tool.execute(
+			"call-headless",
+			{ questions: [{ id: "auth", question: "Which auth?", options: [{ label: "JWT" }] }] },
+			undefined,
+			undefined,
+			createHeadlessContext(),
+		);
+
+		expect(emitter.received).toHaveLength(1);
+		expect(result.details).toMatchObject({ selectedOptions: ["JWT"] });
+	});
+
+	it("surfaces Round 0 topology and challenge-mode asks as question gates", async () => {
+		const emitter = new StubEmitter(input => {
+			const options = input.options ?? [];
+			return { selected: [options[0]?.label], other: false };
+		});
+		const tool = new AskTool(createSession(emitter));
+
+		await tool.execute(
+			"call-topology-challenge",
+			{
+				questions: [
+					{
+						id: "topology",
+						question: "Round 0 | Topology confirmation | Ambiguity: not scored yet\nIs that topology right?",
+						options: [{ label: "Looks right" }, { label: "Revise" }],
+					},
+					{
+						id: "contrarian",
+						question: "Round 4 | Contrarian mode | Ambiguity: 38%\nWhat if the opposite were true?",
+						options: [{ label: "Keep assumption" }, { label: "Drop assumption" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			createHeadlessContext(),
+		);
+
+		expect(emitter.received).toHaveLength(2);
+		expect(emitter.received[0].context?.stage_state).toMatchObject({
+			question_id: "topology",
+			round: 0,
+			topology_gate: true,
+		});
+		expect(emitter.received[1].context?.stage_state).toMatchObject({
+			question_id: "contrarian",
+			round: 4,
+			challenge_mode: "contrarian mode",
+		});
 	});
 
 	it("handles a free-text (Other) gate answer", async () => {

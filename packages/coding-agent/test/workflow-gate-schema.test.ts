@@ -34,6 +34,9 @@ describe("workflow-gate-schema", () => {
 			{ type: "object", additionalProperties: 1 }, // not boolean/object
 			{ type: "string", minLength: -1 }, // negative
 			{ type: "string", maxLength: 1.5 }, // non-integer
+			{ type: "array", minItems: -1 }, // negative
+			{ type: "array", maxItems: 1.5 }, // non-integer
+			{ type: "array", uniqueItems: "yes" }, // non-boolean
 			{ type: "number", minimum: Number.POSITIVE_INFINITY }, // non-finite
 			{ type: "string", title: 5 }, // non-string meta
 		];
@@ -71,6 +74,20 @@ describe("workflow-gate-schema", () => {
 			"additionalProperties",
 		);
 		expect(validateGateAnswer(compiled, "g2", { name: "x", age: -1 })?.errors[0]?.keyword).toBe("minimum");
+	});
+
+	it("validates array minItems, maxItems, and uniqueItems", () => {
+		const compiled = compileGateSchema({
+			type: "array",
+			items: { type: "string", enum: ["a", "b"] },
+			minItems: 1,
+			maxItems: 2,
+			uniqueItems: true,
+		});
+		expect(validateGateAnswer(compiled, "g-array", ["a", "b"])).toBeNull();
+		expect(validateGateAnswer(compiled, "g-array", [])?.errors[0]?.keyword).toBe("minItems");
+		expect(validateGateAnswer(compiled, "g-array", ["a", "b", "a"])?.errors[0]?.keyword).toBe("maxItems");
+		expect(validateGateAnswer(compiled, "g-array", ["a", "a"])?.errors[0]?.keyword).toBe("uniqueItems");
 	});
 
 	it("caches compiled schemas by hash", () => {
