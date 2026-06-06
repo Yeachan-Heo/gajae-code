@@ -123,7 +123,7 @@ describe("provider slash command", () => {
 		expect(parsed.providers["minimax-code"]?.api).toBe("openai-completions");
 		expect(parsed.providers["minimax-code"]?.baseUrl).toBe("https://api.minimax.io/v1");
 		expect(parsed.providers["minimax-code"]?.apiKeyEnv).toBe("MINIMAX_CODE_API_KEY");
-		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["MiniMax-M2.5"]);
+		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["minimax-m3"]);
 		expect(parsed.providers["glm-proxy"]?.api).toBe("openai-completions");
 		expect(parsed.providers["glm-proxy"]?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 		expect(parsed.providers["glm-proxy"]?.apiKeyEnv).toBe("ZAI_API_KEY");

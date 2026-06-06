@@ -34657,6 +34657,31 @@
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
 			}
+		},
+		"minimax-m3": {
+			"id": "minimax-m3",
+			"name": "MiniMax M3",
+			"api": "anthropic-messages",
+			"provider": "minimax",
+			"baseUrl": "https://api.minimax.io/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.6,
+				"output": 2.4,
+				"cacheRead": 0.12,
+				"cacheWrite": 0
+			},
+			"contextWindow": 512000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		}
 	},
 	"minimax-cn": {
@@ -34822,6 +34847,31 @@
 			},
 			"contextWindow": 204800,
 			"maxTokens": 131072,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"minimax-m3": {
+			"id": "minimax-m3",
+			"name": "MiniMax M3",
+			"api": "anthropic-messages",
+			"provider": "minimax-cn",
+			"baseUrl": "https://api.minimaxi.com/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.6,
+				"output": 2.4,
+				"cacheRead": 0.12,
+				"cacheWrite": 0
+			},
+			"contextWindow": 512000,
+			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -35069,6 +35119,37 @@
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
+		},
+		"minimax-m3": {
+			"id": "minimax-m3",
+			"name": "MiniMax M3",
+			"api": "openai-completions",
+			"provider": "minimax-code",
+			"baseUrl": "https://api.minimax.io/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 512000,
+			"maxTokens": 128000,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"reasoningContentField": "reasoning_content"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		}
 	},
 	"minimax-code-cn": {
@@ -35300,6 +35381,37 @@
 			},
 			"contextWindow": 204800,
 			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"reasoningContentField": "reasoning_content"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"minimax-m3": {
+			"id": "minimax-m3",
+			"name": "MiniMax M3",
+			"api": "openai-completions",
+			"provider": "minimax-code-cn",
+			"baseUrl": "https://api.minimaxi.com/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 512000,
+			"maxTokens": 128000,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,

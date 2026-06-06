@@ -120,7 +120,7 @@ describe("provider onboarding setup core", () => {
 		expect(result.providerId).toBe("minimax-code");
 		expect(result.api).toBe("openai-completions");
 		expect(result.preset).toBe("minimax");
-		expect(result.modelIds).toEqual(["MiniMax-M2.5"]);
+		expect(result.modelIds).toEqual(["minimax-m3"]);
 		expect(formatProviderSetupResult(result)).toContain("MiniMax Coding Plan");
 
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
@@ -141,7 +141,7 @@ describe("provider onboarding setup core", () => {
 		expect(parsed.providers["minimax-code"]?.compat?.supportsStore).toBe(false);
 		expect(parsed.providers["minimax-code"]?.compat?.supportsDeveloperRole).toBe(false);
 		expect(parsed.providers["minimax-code"]?.compat?.reasoningContentField).toBe("reasoning_content");
-		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["MiniMax-M2.5"]);
+		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["minimax-m3"]);
 	});
 
 	it("adds GLM/zAI through preset aliases with OpenAI-compatible config", async () => {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added minimax-m3 model support across MiniMax providers.
+
 ## [0.3.0] - 2026-06-03
 
 ### Added

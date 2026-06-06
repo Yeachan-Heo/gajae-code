@@ -1215,7 +1215,7 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
-			const minimax = registry.find("minimax-code", "MiniMax-M2.5");
+			const minimax = registry.find("minimax-code", "minimax-m3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
 
 			expect(minimax?.api).toBe("openai-completions");
@@ -1237,12 +1237,12 @@ describe("ModelRegistry", () => {
 					compat: {
 						extraBody: { source: "proxy" },
 					},
-					models: [{ id: "MiniMax-M2.5" }],
+					models: [{ id: "minimax-m3" }],
 				},
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const model = registry.find("minimax-code", "MiniMax-M2.5");
+			const model = registry.find("minimax-code", "minimax-m3");
 			const compat = getOpenAICompat(model);
 			expect(compat?.thinkingFormat).toBeUndefined();
 			expect(compat?.reasoningContentField).toBeUndefined();
