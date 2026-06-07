@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # GitHub Actions — keep pinned SHAs current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"
+
+  # Bun (npm-like) — packages/*/package.json + root
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+    ignore:
+      # Avoid major bumps unless explicitly reviewed
+      - update-types: ["version-update:semver-major"]

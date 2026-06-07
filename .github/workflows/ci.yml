@@ -31,7 +31,7 @@ jobs:
          hash: ${{ steps.compute.outputs.hash }}
          run-id: ${{ steps.find.outputs.run-id }}
       steps:
-         - uses: actions/checkout@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - name: Compute rust source hash
            id: compute
            shell: bash
@@ -85,17 +85,17 @@ jobs:
          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       steps:
-         - uses: actions/checkout@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
            with:
               fetch-depth: 0
-         - uses: actions/setup-node@v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -108,15 +108,15 @@ jobs:
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-node@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -138,7 +138,7 @@ jobs:
                - { variant: baseline, rust_checks: true }
                - { variant: modern }
       steps:
-         - uses: actions/checkout@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: ./.github/actions/build-native
            with:
               hash: ${{ needs.rust-hash.outputs.hash }}
@@ -162,7 +162,7 @@ jobs:
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
       runs-on: ${{ matrix.os }}
       steps:
-         - uses: actions/checkout@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: ./.github/actions/build-native
            with:
               hash: ${{ needs.rust-hash.outputs.hash }}
@@ -179,15 +179,15 @@ jobs:
          !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
       timeout-minutes: 30
       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-node@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -218,7 +218,7 @@ jobs:
                 echo "run-id=${{ needs.rust-hash.outputs.run-id }}" >> "$GITHUB_OUTPUT"
               fi
          - name: Download native addons
-           uses: actions/download-artifact@v4
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: pi-natives-linux-x64-*-h${{ needs.rust-hash.outputs.hash }}
               path: packages/natives/native
@@ -241,17 +241,17 @@ jobs:
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-node@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
-         - uses: dtolnay/rust-toolchain@nightly
+         - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
            with:
               toolchain: nightly-2026-04-29
-         - uses: Swatinem/rust-cache@v2
+         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
            with:
               shared-key: install-methods-linux-x64
               cache-on-failure: true
@@ -259,7 +259,7 @@ jobs:
                  startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -331,21 +331,21 @@ jobs:
       permissions:
          contents: read
       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-node@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Download native addon(s)
-           uses: actions/download-artifact@v4
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}
               path: packages/natives/native
@@ -371,7 +371,7 @@ jobs:
               & "${{ matrix.binary_path }}" --version
               & "${{ matrix.binary_path }}" --smoke-test
          - name: Upload release binary artifact
-           uses: actions/upload-artifact@v4
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
            with:
               name: gjc-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
@@ -386,15 +386,15 @@ jobs:
       permissions:
          contents: write
       steps:
-         - uses: actions/checkout@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - name: Download release binaries
-           uses: actions/download-artifact@v4
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: gjc-binary-*
               path: packages/coding-agent/binaries
               merge-multiple: true
          - name: Create GitHub Release
-           uses: softprops/action-gh-release@v2
+           uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
            with:
               files: |
                  packages/coding-agent/binaries/gjc-*
@@ -429,25 +429,25 @@ jobs:
       needs: [release_binary, release_github_verify, rust-hash]
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-node@v4
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-         - uses: oven-sh/setup-bun@v2
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
-         - uses: actions/setup-node@v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
               registry-url: "https://registry.npmjs.org"
          - name: Cache bun dependencies
-           uses: actions/cache@v4
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Download native addons
-           uses: actions/download-artifact@v4
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: pi-natives-*-h${{ needs.rust-hash.outputs.hash }}
               path: packages/natives/native
