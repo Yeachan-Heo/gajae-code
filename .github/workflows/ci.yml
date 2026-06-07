@@ -107,6 +107,7 @@ jobs:
    check:
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      timeout-minutes: 15
       steps:
          - uses: actions/checkout@v4
          - uses: actions/setup-node@v4
@@ -131,6 +132,7 @@ jobs:
       if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
          (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
       runs-on: ubuntu-22.04
+      timeout-minutes: 30
       strategy:
          fail-fast: false
          matrix:
@@ -161,6 +163,7 @@ jobs:
                - { os: macos-14, platform: darwin, arch: arm64 }
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
       runs-on: ${{ matrix.os }}
+      timeout-minutes: 30
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/build-native
@@ -240,6 +243,7 @@ jobs:
    install_methods:
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      timeout-minutes: 30
       steps:
          - uses: actions/checkout@v4
          - uses: actions/setup-node@v4
@@ -328,6 +332,7 @@ jobs:
                     binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe,
                  }
       runs-on: ${{ matrix.os }}
+      timeout-minutes: 20
       permissions:
          contents: read
       steps:
@@ -383,6 +388,7 @@ jobs:
          needs.release_binary.result == 'success' }}
       needs: [release_binary]
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      timeout-minutes: 10
       permissions:
          contents: write
       steps:
@@ -406,6 +412,7 @@ jobs:
          needs['release-github'].result == 'success' }}
       needs: [release-github]
       runs-on: macos-14
+      timeout-minutes: 10
       permissions:
          contents: read
       steps:
@@ -428,6 +435,7 @@ jobs:
          !inputs.skip_npm }}
       needs: [release_binary, release_github_verify, rust-hash]
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      timeout-minutes: 15
       steps:
          - uses: actions/checkout@v4
          - uses: actions/setup-node@v4
