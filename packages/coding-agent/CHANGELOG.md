@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- Improved the grep limit-reached message to show the current limit value and suggest using `--limit` for more results.
+- Added `timeout-minutes` to all CI workflow jobs (including `rust-hash`) to prevent indefinite hangs.
 
 ## [0.4.1] - 2026-06-07
 
