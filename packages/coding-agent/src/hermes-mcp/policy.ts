@@ -24,10 +24,16 @@ export interface HermesMutationRequest {
 const DEFAULT_ARTIFACT_BYTE_CAP = 64 * 1024;
 const MAX_ARTIFACT_BYTE_CAP = 1024 * 1024;
 const MUTATION_CLASSES = new Set<HermesMutationClass>(["sessions", "questions", "reports"]);
+const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, HermesMutationClass>([
+	["session", "sessions"],
+	["prompt", "sessions"],
+	["question", "questions"],
+	["report", "reports"],
+]);
 
 function parseList(value: string | undefined): string[] {
 	return (value ?? "")
-		.split(/[,:]/)
+		.split(/[\n,;:]+/)
 		.map(part => part.trim())
 		.filter(Boolean);
 }
@@ -35,11 +41,13 @@ function parseList(value: string | undefined): string[] {
 function parseMutationClasses(value: string | undefined): Set<HermesMutationClass> {
 	const classes = new Set<HermesMutationClass>();
 	for (const raw of parseList(value)) {
-		if (raw === "all") {
+		const normalized = raw.toLowerCase();
+		if (normalized === "all") {
 			for (const mutationClass of MUTATION_CLASSES) classes.add(mutationClass);
 			continue;
 		}
-		if (MUTATION_CLASSES.has(raw as HermesMutationClass)) classes.add(raw as HermesMutationClass);
+		const mutationClass = LEGACY_MUTATION_CLASS_ALIASES.get(normalized) ?? normalized;
+		if (MUTATION_CLASSES.has(mutationClass as HermesMutationClass)) classes.add(mutationClass as HermesMutationClass);
 	}
 	return classes;
 }

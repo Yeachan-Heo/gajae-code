@@ -85,7 +85,7 @@ describe("gjc mcp-serve hermes", () => {
 			{ env },
 		);
 		const payload = JSON.parse(called.result.content[0].text);
-		expect(payload).toEqual({ ok: false, reason: "mutation_class_disabled", mutationClass: "session" });
+		expect(payload).toEqual({ ok: false, reason: "hermes_mutation_class_disabled:sessions" });
 	});
 
 	it("requires startup mutation class and per-call allow_mutation for mutating tools", async () => {
@@ -113,8 +113,7 @@ describe("gjc mcp-serve hermes", () => {
 			);
 			expect(JSON.parse(missingPerCall.result.content[0].text)).toEqual({
 				ok: false,
-				reason: "mutation_not_allowed_for_call",
-				mutationClass: "session",
+				reason: "hermes_mutation_call_not_allowed:sessions",
 			});
 
 			const allowed = await handleHermesMcpRequest(
@@ -135,7 +134,16 @@ describe("gjc mcp-serve hermes", () => {
 			expect(created).toBe(true);
 			expect(JSON.parse(allowed.result.content[0].text)).toEqual({
 				ok: true,
-				session: { name: "x", attached: false, windows: 1, panes: 1, bindings: "root", createdAt: "now" },
+				session: {
+					session_id: "x",
+					name: "x",
+					attached: false,
+					windows: 1,
+					panes: 1,
+					bindings: "root",
+					created_at: "now",
+					createdAt: "now",
+				},
 			});
 		});
 	});

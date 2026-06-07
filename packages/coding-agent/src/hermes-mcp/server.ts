@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { VERSION } from "@gajae-code/utils";
+import { VERSION } from "@gajae-code/utils/dirs";
 import {
 	assertHermesArtifactPath,
 	assertHermesWorkdir,
@@ -10,7 +10,6 @@ import {
 	hermesNamespacePath,
 	requireHermesMutation,
 } from "./policy";
-import { createHermesSafetyPolicy, type HermesFailure, type HermesMutationClass } from "./safety";
 
 export const HERMES_MCP_PROTOCOL_VERSION = "2024-11-05";
 export const HERMES_MCP_SERVER_NAME = "gjc-hermes-mcp";
@@ -447,13 +446,6 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 	return { config, callTool, handleJsonRpc, handle: handleJsonRpc };
 }
 
-function legacyMutationClass(name: string): HermesMutationClass | null {
-	if (name === "gjc_hermes_start_session" || name === "gjc_hermes_send_prompt") return "session";
-	if (name === "gjc_hermes_submit_question_answer") return "question";
-	if (name === "gjc_hermes_report_status") return "report";
-	return null;
-}
-
 function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
 	const failed = typeof payload === "object" && payload !== null && (payload as { ok?: unknown }).ok === false;
 	return textResult(payload, failed);
@@ -491,18 +483,10 @@ export async function handleHermesMcpRequest(
 		};
 	const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 	const args = params.arguments ?? {};
-	const mutationClass = legacyMutationClass(params.name ?? "");
-	const policy = await createHermesSafetyPolicy({ env: options.env ?? process.env });
-	if (mutationClass) {
-		const allowed = policy.assertMutationAllowed(mutationClass, args);
-		if (allowed.ok === false)
-			return { jsonrpc: "2.0", id: request.id ?? null, result: legacyToolResult(allowed as HermesFailure) };
-	}
-	if (params.name === "gjc_hermes_start_session") {
-		const session = options.createSession ? options.createSession() : { session_id: "dry-run", cwd: args.cwd };
-		return { jsonrpc: "2.0", id: request.id ?? null, result: legacyToolResult({ ok: true, session }) };
-	}
-	const server = createHermesMcpServer({ env: options.env ?? process.env });
+	const server = createHermesMcpServer({
+		env: options.env ?? process.env,
+		services: options.createSession ? { startSession: () => options.createSession?.() } : undefined,
+	});
 	return {
 		jsonrpc: "2.0",
 		id: request.id ?? null,
