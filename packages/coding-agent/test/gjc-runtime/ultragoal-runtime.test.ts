@@ -115,7 +115,7 @@ function passingQualityGate(): string {
 	});
 }
 
-function goalSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
+function goalSnapshot(objective: string, status = "active", updatedAt: number | string = Date.now()): string {
 	return JSON.stringify({
 		goal: {
 			threadId: "test-thread",
@@ -244,7 +244,7 @@ async function expectRejectedCompleteGate(
 	return result.stderr ?? "";
 }
 
-function goalToolSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
+function goalToolSnapshot(objective: string, status = "active", updatedAt: number | string = Date.now()): string {
 	return JSON.stringify({
 		content: [{ type: "text", text: `Goal: ${objective}` }],
 		details: {
@@ -363,6 +363,18 @@ describe("native GJC ultragoal runtime", () => {
 		expect(receipt).not.toHaveProperty("goals");
 	});
 
+	it("prints checkpoint-specific help with receipt guidance", async () => {
+		const root = await tempDir();
+
+		const result = await runNativeUltragoalCommand(["checkpoint", "--help"], root);
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("gjc ultragoal checkpoint --goal-id");
+		expect(result.stdout).toContain("--quality-gate-json");
+		expect(result.stdout).toContain('goal({"op":"get"})');
+		expect(result.stdout).toContain("obligation");
+	});
+
 	it("prints receipt-only json for steering", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
@@ -473,6 +485,24 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalToolSnapshot(created.gjcObjective),
+			qualityGateJson: passingQualityGate(),
+		});
+
+		expect(plan.goals[0]?.status).toBe("complete");
+		expect(plan.goals[0]?.completionVerification?.gjcGoalSnapshotHash).toBeTruthy();
+	});
+
+	it("accepts ISO goal snapshot timestamps after normalizing freshness", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			gjcGoalJson: goalSnapshot(created.gjcObjective, "active", new Date().toISOString()),
 			qualityGateJson: passingQualityGate(),
 		});
 
@@ -710,6 +740,22 @@ describe("native GJC ultragoal runtime", () => {
 
 		expect(missingMatrixError).toContain("executorQa.contractCoverage");
 		expect(emptyMatrixError).toContain("executorQa.surfaceEvidence");
+	});
+
+	it("explains that contract coverage descriptions do not replace obligations", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const descriptionOnlyCoverage = mutateQualityGate(gate => {
+			const coverage = gate.executorQa!.contractCoverage as Array<Record<string, unknown>>;
+			coverage[0]!.description = coverage[0]!.obligation;
+			delete coverage[0]!.obligation;
+		});
+
+		const coverageError = await expectRejectedCompleteGate(root, created, descriptionOnlyCoverage);
+
+		expect(coverageError).toContain("executorQa.contractCoverage[0].obligation");
+		expect(coverageError).toContain("found description");
 	});
 
 	it("rejects all-not-applicable contract coverage before mutation", async () => {
