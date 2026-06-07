@@ -6,7 +6,7 @@ Example extensions for gajae-code.
 
 ```bash
 # Load an extension with --extension flag
-pi --extension examples/extensions/permission-gate.ts
+gjc --extension examples/extensions/permission-gate.ts
 
 # Or copy to extensions directory for auto-discovery
 cp permission-gate.ts ~/.gjc/agent/extensions/
@@ -67,7 +67,7 @@ cp permission-gate.ts ~/.gjc/agent/extensions/
 
 ## Writing Extensions
 
-See [docs/extensions.md](../../docs/extensions.md) for full documentation.
+The examples below show the core extension patterns used by this directory.
 
 ```typescript
 import type { ExtensionAPI } from "@gajae-code/coding-agent";
