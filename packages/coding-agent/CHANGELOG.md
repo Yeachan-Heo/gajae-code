@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Improved the grep limit-reached message to show the current limit value and suggest using `--limit` for more results.
+
 ## [0.4.1] - 2026-06-07
 
 ### Changed
