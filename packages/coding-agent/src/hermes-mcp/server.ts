@@ -920,8 +920,11 @@ export async function runHermesMcpStdio(options: HermesMcpServerOptions = {}): P
 			const line = buffer.slice(0, newline).trim();
 			buffer = buffer.slice(newline + 1);
 			if (line.length > 0) {
-				const response = await server.handleJsonRpc(JSON.parse(line));
-				process.stdout.write(`${JSON.stringify(response)}\n`);
+				const request = JSON.parse(line) as JsonRpcRequest;
+				if (request.id !== undefined && request.id !== null) {
+					const response = await server.handleJsonRpc(request);
+					process.stdout.write(`${JSON.stringify(response)}\n`);
+				}
 			}
 			newline = buffer.indexOf("\n");
 		}
