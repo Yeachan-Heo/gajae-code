@@ -250,6 +250,7 @@ providers:
 | `GJC_HERMES_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/hermes-mcp`). |
 | `GJC_HERMES_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_HERMES_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
+| `GJC_HERMES_MCP_SESSION_COMMAND` | Optional GJC-compatible command used by mutating session startup to launch a detached tmux session. When unset, startup records a bridge session without tmux actuation unless a service adapter is injected. |
 
 ### Google Vertex AI
 

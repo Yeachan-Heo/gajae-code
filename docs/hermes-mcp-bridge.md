@@ -26,6 +26,14 @@ export GJC_HERMES_MCP_MUTATIONS="sessions,questions,reports"
 
 Every mutating MCP call must also include `allow_mutation: true`. Missing startup opt-in or missing per-call consent returns an error instead of falling back to shell or terminal relay.
 
+Real tmux/GJC actuation is enabled by setting a GJC-compatible session command:
+
+```bash
+export GJC_HERMES_MCP_SESSION_COMMAND="/path/to/gjc"
+```
+
+When set, `gjc_hermes_start_session` launches a detached tmux session, `gjc_hermes_send_prompt` sends input to that pane, and `gjc_hermes_read_tail` reads bounded pane output.
+
 Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP`.
 
 ## Optional namespace
@@ -69,7 +77,8 @@ Mutating tools:
       "env": {
         "GJC_HERMES_MCP_WORKDIR_ROOTS": "/home/doyun/src/gajae-code",
         "GJC_HERMES_MCP_PROFILE": "meeseeks2",
-        "GJC_HERMES_MCP_REPO": "gajae-code"
+        "GJC_HERMES_MCP_REPO": "gajae-code",
+        "GJC_HERMES_MCP_SESSION_COMMAND": "/home/doyun/.local/bin/gjc-dev-meeseeks2"
       },
       "enabled": true
     }

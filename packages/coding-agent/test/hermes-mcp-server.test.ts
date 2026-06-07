@@ -23,11 +23,18 @@ describe("Hermes MCP server protocol", () => {
 		const initialized = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
 		expect(initialized.result.serverInfo.name).toBe("gjc-hermes-mcp");
 		expect(initialized.result.capabilities.tools).toEqual({});
+		expect(initialized.result.capabilities.prompts).toEqual({});
+		expect(initialized.result.capabilities.resources).toEqual({});
 
 		const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
 		expect(listed.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual(
 			[...HERMES_MCP_TOOL_NAMES].sort(),
 		);
+		const prompts = await server.handleJsonRpc({ jsonrpc: "2.0", id: 20, method: "prompts/list", params: {} });
+		expect(prompts.result.prompts).toEqual([]);
+
+		const resources = await server.handleJsonRpc({ jsonrpc: "2.0", id: 21, method: "resources/list", params: {} });
+		expect(resources.result.resources).toEqual([]);
 	});
 
 	it("rejects unknown mcp-serve subcommands before launch fallback", async () => {

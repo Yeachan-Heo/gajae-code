@@ -14,6 +14,7 @@ export interface HermesMcpConfig {
 	artifactByteCap: number;
 	namespace: HermesNamespace;
 	stateRoot: string;
+	sessionCommand: string | null;
 }
 
 export interface HermesMutationRequest {
@@ -66,6 +67,7 @@ export function buildHermesMcpConfig(env: NodeJS.ProcessEnv = process.env): Herm
 			repo: cleanScope(env.GJC_HERMES_MCP_REPO),
 		},
 		stateRoot: path.resolve(stateRoot),
+		sessionCommand: env.GJC_HERMES_MCP_SESSION_COMMAND?.trim() || null,
 	};
 }
 

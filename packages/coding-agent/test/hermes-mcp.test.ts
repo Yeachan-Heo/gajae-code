@@ -62,13 +62,18 @@ describe("gjc mcp-serve hermes", () => {
 			id: 1,
 			result: {
 				protocolVersion: "2024-11-05",
-				capabilities: { tools: {} },
+				capabilities: { tools: {}, prompts: {}, resources: {} },
 				serverInfo: { name: "gjc-hermes-mcp", version: expect.any(String) },
 			},
 		});
 
 		const listed = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
 		expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toContain("gjc_hermes_report_status");
+		const prompts = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 20, method: "prompts/list" }, { env });
+		expect(prompts.result.prompts).toEqual([]);
+
+		const resources = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 21, method: "resources/list" }, { env });
+		expect(resources.result.resources).toEqual([]);
 
 		const called = await handleHermesMcpRequest(
 			{

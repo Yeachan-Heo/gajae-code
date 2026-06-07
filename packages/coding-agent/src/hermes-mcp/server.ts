@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils";
@@ -215,6 +216,78 @@ async function listJsonFiles(dir: string): Promise<any[]> {
 		return [];
 	}
 }
+async function runCommand(command: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+function boundedLineCount(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return 80;
+	return Math.min(parsed, 400);
+}
+
+async function startTmuxSession(
+	config: HermesMcpConfig,
+	input: SessionStartInput,
+): Promise<Record<string, unknown> | null> {
+	if (!config.sessionCommand) return null;
+	const sessionName = `gjc-hermes-${randomUUID().slice(0, 8)}`;
+	const started = await runCommand([
+		"tmux",
+		"new-session",
+		"-d",
+		"-P",
+		"-F",
+		"#{session_name}:#{window_index}.#{pane_index} #{pane_id}",
+		"-s",
+		sessionName,
+		"-c",
+		input.cwd,
+		config.sessionCommand,
+	]);
+	if (started.exitCode !== 0) throw new Error(`hermes_tmux_start_failed:${started.stderr || started.stdout}`);
+	const [tmuxTarget, paneId] = started.stdout.trim().split(/\s+/, 2);
+	if (input.prompt) {
+		await runCommand(["tmux", "send-keys", "-t", tmuxTarget || sessionName, input.prompt, "C-m"]);
+	}
+	return {
+		sessionId: sessionName,
+		tmuxSession: sessionName,
+		tmuxTarget: tmuxTarget || sessionName,
+		paneId,
+		cwd: input.cwd,
+		createdAt: new Date().toISOString(),
+		sessionCommand: config.sessionCommand,
+	};
+}
+
+async function captureTmuxTail(session: Record<string, unknown>, lines: number): Promise<string[]> {
+	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
+	if (typeof target !== "string" || target.length === 0) return [];
+	const captured = await runCommand(["tmux", "capture-pane", "-t", target, "-p", "-S", `-${lines}`]);
+	if (captured.exitCode !== 0) return [];
+	return captured.stdout.split("\n").slice(-lines);
+}
+
+async function sendTmuxPrompt(session: Record<string, unknown>, prompt: string): Promise<boolean> {
+	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
+	if (typeof target !== "string" || target.length === 0) return false;
+	const sent = await runCommand(["tmux", "send-keys", "-t", target, prompt, "C-m"]);
+	return sent.exitCode === 0;
+}
+
+async function hasTmuxSession(session: Record<string, unknown>): Promise<boolean | null> {
+	const tmuxSession = typeof session.tmux_session === "string" ? session.tmux_session : session.tmuxSession;
+	if (typeof tmuxSession !== "string" || tmuxSession.length === 0) return null;
+	const checked = await runCommand(["tmux", "has-session", "-t", tmuxSession]);
+	return checked.exitCode === 0;
+}
 
 export async function readHermesArtifact(
 	config: HermesMcpConfig,
@@ -249,12 +322,25 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 		if (services.listSessions) return await services.listSessions();
 		return await listJsonFiles(path.join(namespaceDir, "sessions"));
 	}
+	function sessionFile(sessionId: unknown): string {
+		return path.join(namespaceDir, "sessions", `${String(sessionId ?? "")}.json`);
+	}
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
 		try {
 			if (name === "gjc_hermes_list_sessions") return { ok: true, sessions: await listSessions() };
-			if (name === "gjc_hermes_read_status") return { ok: true, sessions: await listSessions() };
-			if (name === "gjc_hermes_read_tail") return { ok: true, lines: [] };
+			if (name === "gjc_hermes_read_status") {
+				const sessionId = args.session_id;
+				if (sessionId) {
+					const session = await readJsonFile(sessionFile(sessionId));
+					return { ok: true, session, live: session ? await hasTmuxSession(session) : false };
+				}
+				return { ok: true, sessions: await listSessions() };
+			}
+			if (name === "gjc_hermes_read_tail") {
+				const session = await readJsonFile(sessionFile(args.session_id));
+				return { ok: true, lines: session ? await captureTmuxTail(session, boundedLineCount(args.lines)) : [] };
+			}
 			if (name === "gjc_hermes_list_questions")
 				return { ok: true, questions: await listJsonFiles(path.join(namespaceDir, "questions")) };
 			if (name === "gjc_hermes_list_artifacts") return { ok: true, roots: config.allowedRoots };
@@ -264,28 +350,35 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 			if (name === "gjc_hermes_start_session") {
 				requireHermesMutation(config, "sessions", args);
 				const cwd = await assertHermesWorkdir(config, args.cwd);
+				const input = {
+					cwd,
+					prompt: typeof args.prompt === "string" ? args.prompt : undefined,
+					namespace: config.namespace,
+					worktree: true as const,
+				};
 				const started = services.startSession
-					? await services.startSession({
-							cwd,
-							prompt: typeof args.prompt === "string" ? args.prompt : undefined,
-							namespace: config.namespace,
-							worktree: true,
-						})
-					: { sessionId: `gjc-hermes-${Date.now()}`, cwd, createdAt: new Date().toISOString() };
-				const session = normalizeSession(started);
-				await writeJsonFile(path.join(namespaceDir, "sessions", `${String(session.session_id)}.json`), session);
+					? await services.startSession(input)
+					: await startTmuxSession(config, input);
+				const session = normalizeSession(
+					started ?? { sessionId: `gjc-hermes-${Date.now()}`, cwd, createdAt: new Date().toISOString() },
+				);
+				await writeJsonFile(sessionFile(session.session_id), session);
 				return { ok: true, session };
 			}
 			if (name === "gjc_hermes_send_prompt") {
 				requireHermesMutation(config, "sessions", args);
+				const session = await readJsonFile(sessionFile(args.session_id));
+				const delivered =
+					session && typeof args.prompt === "string" ? await sendTmuxPrompt(session, args.prompt) : false;
 				const queued = {
 					session_id: args.session_id,
 					prompt: args.prompt,
-					queued: true,
+					queued: !delivered,
+					delivered,
 					created_at: new Date().toISOString(),
 				};
 				await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), queued);
-				return { ok: true, queued: true, prompt: queued };
+				return { ok: true, queued: !delivered, delivered, prompt: queued };
 			}
 			if (name === "gjc_hermes_submit_question_answer") {
 				requireHermesMutation(config, "questions", args);
@@ -329,13 +422,19 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 				id,
 				result: {
 					protocolVersion: HERMES_MCP_PROTOCOL_VERSION,
-					capabilities: { tools: {} },
+					capabilities: { tools: {}, prompts: {}, resources: {} },
 					serverInfo: { name: HERMES_MCP_SERVER_NAME, version: VERSION },
 				},
 			};
 		}
 		if (request.method === "tools/list") {
 			return { jsonrpc: "2.0", id, result: { tools: HERMES_MCP_TOOL_NAMES.map(toolSchema) } };
+		}
+		if (request.method === "prompts/list") {
+			return { jsonrpc: "2.0", id, result: { prompts: [] } };
+		}
+		if (request.method === "resources/list") {
+			return { jsonrpc: "2.0", id, result: { resources: [] } };
 		}
 		if (request.method === "tools/call") {
 			const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
@@ -370,13 +469,19 @@ export async function handleHermesMcpRequest(
 			id: request.id ?? null,
 			result: {
 				protocolVersion: HERMES_MCP_PROTOCOL_VERSION,
-				capabilities: { tools: {} },
+				capabilities: { tools: {}, prompts: {}, resources: {} },
 				serverInfo: { name: HERMES_MCP_SERVER_NAME, version: VERSION },
 			},
 		};
 	}
 	if (request.method === "tools/list") {
 		return { jsonrpc: "2.0", id: request.id ?? null, result: { tools: HERMES_MCP_TOOL_NAMES.map(toolSchema) } };
+	}
+	if (request.method === "prompts/list") {
+		return { jsonrpc: "2.0", id: request.id ?? null, result: { prompts: [] } };
+	}
+	if (request.method === "resources/list") {
+		return { jsonrpc: "2.0", id: request.id ?? null, result: { resources: [] } };
 	}
 	if (request.method !== "tools/call")
 		return {
