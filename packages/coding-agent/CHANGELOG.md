@@ -6,6 +6,10 @@
 
 - Improved the grep limit-reached message to show the current limit value and suggest using `--limit` for more results.
 
+### Changed
+
+- Added `timeout-minutes` to all CI workflow jobs to prevent indefinite hangs.
+
 ## [0.4.1] - 2026-06-07
 
 ### Changed
