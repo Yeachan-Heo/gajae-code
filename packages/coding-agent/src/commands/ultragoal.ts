@@ -12,6 +12,7 @@ export default class Ultragoal extends Command {
 	static description = "Run native GJC Ultragoal workflow commands";
 	static strict = false;
 	static examples = ["$ gjc ultragoal status --json"];
+	static delegateHelp = true;
 
 	async run(): Promise<void> {
 		const shouldActivateGoalMode = isUltragoalCreateGoalsInvocation(this.argv);

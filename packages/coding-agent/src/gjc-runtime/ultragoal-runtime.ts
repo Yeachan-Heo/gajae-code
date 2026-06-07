@@ -639,7 +639,11 @@ function requireObjectArray(value: unknown, fieldName: string): JsonObject[] {
 function requiredStringField(row: JsonObject, key: string, fieldName: string): string {
 	const value = row[key];
 	if (typeof value !== "string" || value.trim().length === 0) {
-		throw new Error(`qualityGate ${fieldName}.${key} must be a non-empty string`);
+		const hint =
+			key === "obligation" && typeof row.description === "string" && row.description.trim().length > 0
+				? "; found description, but complete-checkpoint contractCoverage rows require obligation"
+				: "";
+		throw new Error(`qualityGate ${fieldName}.${key} must be a non-empty string${hint}`);
 	}
 	return value.trim();
 }
@@ -1015,6 +1019,17 @@ async function readRequiredCompletionQualityGate(cwd: string, value: string | un
 	return gate;
 }
 
+function snapshotUpdatedAtMilliseconds(value: unknown): number | null {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value !== "string" || value.trim().length === 0) return null;
+	const trimmed = value.trim();
+	if (/^\d+$/.test(trimmed)) {
+		const parsed = Number.parseInt(trimmed, 10);
+		return Number.isFinite(parsed) ? parsed : null;
+	}
+	const parsed = Date.parse(trimmed);
+	return Number.isFinite(parsed) ? parsed : null;
+}
 async function readGjcGoalSnapshot(input: {
 	cwd: string;
 	value: string | undefined;
@@ -1026,16 +1041,23 @@ async function readGjcGoalSnapshot(input: {
 }): Promise<unknown> {
 	if (!input.value?.trim()) {
 		if (!input.required) return undefined;
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot; this is the GJC goal-mode receipt, not the .gjc/ultragoal/goals.json goal record`,
+		);
 	}
 	const snapshot = await readStructuredValue(input.cwd, input.value);
 	const snapshotObject = qualityGateObject(snapshot);
 	const detailsObject = qualityGateObject(snapshotObject?.details);
 	const goalObject = qualityGateObject(snapshotObject?.goal) ?? qualityGateObject(detailsObject?.goal);
-	if (!goalObject) throw new Error(`${input.errorPrefix} require --gjc-goal-json with a goal object`);
-	const updatedAt = typeof goalObject.updatedAt === "number" ? goalObject.updatedAt : null;
+	if (!goalObject)
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json with a goal object from goal({"op":"get"}); pass the active GJC goal-mode snapshot, not the .gjc/ultragoal/goals.json goal record`,
+		);
+	const updatedAt = snapshotUpdatedAtMilliseconds(goalObject.updatedAt);
 	if (!updatedAt)
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.updatedAt from goal({"op":"get"})`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json goal.updatedAt as epoch milliseconds or an ISO timestamp from goal({"op":"get"}); pass the active GJC goal-mode snapshot, not the .gjc/ultragoal/goals.json goal record`,
+		);
 	const nowMilliseconds = Date.now();
 	if (updatedAt < nowMilliseconds - GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS) {
 		throw new Error(`${input.errorPrefix} require a fresh --gjc-goal-json snapshot`);
@@ -1052,7 +1074,9 @@ async function readGjcGoalSnapshot(input: {
 		return snapshot;
 	}
 	if (!expectedObjectives.has(objective)) {
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json objective to match the active Ultragoal objective`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json objective to match the active GJC goal-mode objective from goal({"op":"get"}), not the .gjc/ultragoal/goals.json goal ${input.goal?.id ?? "record"}`,
+		);
 	}
 	if (goalObject.status !== "active") {
 		throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.status to be active`);
@@ -1235,6 +1259,8 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
 
+const HELP_FLAGS = new Set(["--help", "-h"]);
+
 const FLAGS_WITH_VALUES = new Set([
 	"--brief",
 	"--brief-file",
@@ -1250,6 +1276,10 @@ const FLAGS_WITH_VALUES = new Set([
 	"--rationale",
 ]);
 
+function isHelpArg(arg: string): boolean {
+	return HELP_FLAGS.has(arg);
+}
+
 function commandName(args: readonly string[]): string {
 	let skipNext = false;
 	for (const arg of args) {
@@ -1261,9 +1291,60 @@ function commandName(args: readonly string[]): string {
 			skipNext = true;
 			continue;
 		}
+		if (isHelpArg(arg)) continue;
 		if (!arg.startsWith("-")) return arg;
 	}
 	return "status";
+}
+
+function renderUltragoalHelp(args: readonly string[]): string | null {
+	if (!args.some(isHelpArg) && args[0] !== "help") return null;
+	const subject =
+		args[0] === "help" ? args.find((arg, index) => index > 0 && !arg.startsWith("-")) : commandName(args);
+	if (subject === "checkpoint") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal checkpoint --goal-id <id> --status <status> --evidence <text> [FLAGS]",
+			"",
+			"FLAGS",
+			"      --goal-id=<value>            Durable .gjc/ultragoal goal id, e.g. G001",
+			"      --status=<value>             pending|active|complete|failed|blocked|review_blocked|superseded",
+			"      --evidence=<value>           Completion or checkpoint evidence text",
+			"      --quality-gate-json=<value>  JSON string or path for complete checkpoints",
+			'      --gjc-goal-json=<value>      JSON string or path containing the current goal({"op":"get"}) snapshot',
+			"      --json                       Output a machine-readable receipt",
+			"",
+			"COMPLETE CHECKPOINT RECEIPTS",
+			"  --quality-gate-json must be an object with architectReview, executorQa, and iteration.",
+			"  executorQa.contractCoverage[] rows require an obligation field; description is not a substitute.",
+			'  --gjc-goal-json must contain the active GJC goal-mode snapshot from goal({"op":"get"}), not the .gjc/ultragoal/goals.json goal record.',
+			"  goal.updatedAt may be epoch milliseconds or an ISO timestamp and must be fresh.",
+			"",
+			"EXAMPLES",
+			'  $ gjc ultragoal checkpoint --goal-id G001 --status blocked --evidence "waiting on review"',
+			'  $ gjc ultragoal checkpoint --goal-id G001 --status complete --evidence "tests passed" --gjc-goal-json ./goal.json --quality-gate-json ./quality-gate.json --json',
+			"",
+		].join("\n");
+	}
+	return [
+		"Run native GJC Ultragoal workflow commands",
+		"",
+		"USAGE",
+		"  $ gjc ultragoal <command> [FLAGS]",
+		"",
+		"COMMANDS",
+		"  status",
+		"  create-goals",
+		"  complete-goals",
+		"  checkpoint",
+		"  steer",
+		"  record-review-blockers",
+		"",
+		"Run `gjc ultragoal checkpoint --help` for complete checkpoint receipt requirements.",
+		"",
+	].join("\n");
 }
 
 async function readBrief(cwd: string, args: readonly string[]): Promise<string> {
@@ -1308,6 +1389,8 @@ function renderCompleteHandoff(
 }
 
 async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
+	const help = renderUltragoalHelp(args);
+	if (help) return { status: 0, stdout: help };
 	try {
 		const command = commandName(args);
 		const json = hasFlag(args, "--json");
@@ -1469,7 +1552,8 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
 	const command = commandName(args);
 	const result = await dispatchUltragoalCommand(args, cwd);
-	if (result.status === 0 && RECONCILE_COMMANDS.has(command)) {
+	const isHelp = args.some(isHelpArg) || args[0] === "help";
+	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
 		await reconcileUltragoalState(cwd);
 	}
 	return result;
