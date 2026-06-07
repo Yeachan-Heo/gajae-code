@@ -25,6 +25,8 @@ export const HERMES_MCP_TOOL_NAMES = [
 	"gjc_hermes_start_session",
 	"gjc_hermes_send_prompt",
 	"gjc_hermes_submit_question_answer",
+	"gjc_hermes_read_turn",
+	"gjc_hermes_await_turn",
 	"gjc_hermes_report_status",
 ] as const;
 
@@ -66,6 +68,52 @@ interface LegacyHandlerOptions {
 	createSession?: () => unknown;
 }
 
+type TurnStatus =
+	| "queued"
+	| "delivering"
+	| "active"
+	| "waiting_for_answer"
+	| "completing"
+	| "completed"
+	| "failed"
+	| "cancelled"
+	| "superseded";
+
+interface TurnRecord {
+	schema_version: 1;
+	turn_id: string;
+	session_id: string;
+	namespace: { profile: string | null; repo: string | null };
+	status: TurnStatus;
+	prompt: { text: string; created_at: string; source: "mcp" | "question_answer" };
+	delivery: {
+		delivered: boolean;
+		queued: boolean;
+		target: string | null;
+		attempts: Array<{ delivered: boolean; created_at: string; reason: string | null }>;
+	};
+	question_ids: string[];
+	final_response: {
+		text: string | null;
+		format: "markdown";
+		source: string | null;
+		artifact_path: string | null;
+		truncated: boolean;
+	};
+	evidence: Array<Record<string, unknown>>;
+	error: { code: string; message: string; recoverable: boolean } | null;
+	liveness: { checked_at: string | null; live: boolean | null; reason: string | null };
+	created_at: string;
+	updated_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
+const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
+const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SAFE_EXTERNAL_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
+
 function textResult(
 	payload: unknown,
 	isError = false,
@@ -103,11 +151,46 @@ function toolSchema(name: HermesToolName): {
 	if (name === "gjc_hermes_send_prompt") {
 		return {
 			name,
-			description: "Queue a bounded follow-up prompt for a selected Hermes bridge session.",
+			description:
+				"Create a durable turn and deliver a bounded follow-up prompt for a selected Hermes bridge session.",
 			inputSchema: {
 				type: "object",
-				properties: { session_id: sessionId, prompt: { type: "string" }, allow_mutation: allowMutation },
+				properties: {
+					session_id: sessionId,
+					prompt: { type: "string" },
+					queue: { type: "boolean" },
+					force: { type: "boolean" },
+					allow_mutation: allowMutation,
+				},
 				required: ["session_id", "prompt", "allow_mutation"],
+			},
+		};
+	}
+	if (name === "gjc_hermes_read_turn") {
+		return {
+			name,
+			description: "Read authoritative durable turn state plus bounded advisory tmux status.",
+			inputSchema: {
+				type: "object",
+				properties: { session_id: sessionId, turn_id: { type: "string" }, lines: { type: "number" } },
+				required: ["turn_id"],
+			},
+		};
+	}
+	if (name === "gjc_hermes_await_turn") {
+		return {
+			name,
+			description: "Poll a durable turn for a bounded time and return the same shape as read_turn.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					turn_id: { type: "string" },
+					timeout_ms: { type: "number" },
+					poll_interval_ms: { type: "number" },
+					lines: { type: "number" },
+				},
+				required: ["turn_id"],
 			},
 		};
 	}
@@ -117,7 +200,13 @@ function toolSchema(name: HermesToolName): {
 			description: "Submit a bounded structured answer by question id.",
 			inputSchema: {
 				type: "object",
-				properties: { question_id: { type: "string" }, answer: {}, allow_mutation: allowMutation },
+				properties: {
+					session_id: sessionId,
+					turn_id: { type: "string" },
+					question_id: { type: "string" },
+					answer: {},
+					allow_mutation: allowMutation,
+				},
 				required: ["question_id", "answer", "allow_mutation"],
 			},
 		};
@@ -129,6 +218,8 @@ function toolSchema(name: HermesToolName): {
 			inputSchema: {
 				type: "object",
 				properties: {
+					session_id: sessionId,
+					turn_id: { type: "string" },
 					status: { type: "string" },
 					summary: { type: "string" },
 					blocker: { type: "string" },
@@ -204,14 +295,6 @@ async function writeJsonFile(file: string, value: unknown): Promise<void> {
 	await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function safeHermesStateId(value: unknown, field: string): string {
-	if (typeof value !== "string") throw new Error(`hermes_invalid_${field}`);
-	const id = value.trim();
-	if (id.length === 0 || id.length > 200) throw new Error(`hermes_invalid_${field}`);
-	if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(id)) throw new Error(`hermes_invalid_${field}`);
-	return id;
-}
-
 async function listJsonFiles(dir: string): Promise<any[]> {
 	try {
 		const entries = await fs.readdir(dir);
@@ -222,6 +305,105 @@ async function listJsonFiles(dir: string): Promise<any[]> {
 	} catch {
 		return [];
 	}
+}
+
+function safeExternalId(kind: "session" | "question", value: unknown): string {
+	if (typeof value !== "string" || !SAFE_EXTERNAL_ID_PATTERN.test(value)) throw new Error(`invalid_${kind}_id`);
+	return value;
+}
+
+function safeTurnId(value: unknown): string {
+	if (typeof value !== "string" || !TURN_ID_PATTERN.test(value)) throw new Error("invalid_turn_id");
+	return value;
+}
+
+function turnsDir(namespaceDir: string): string {
+	return path.join(namespaceDir, "turns");
+}
+
+function activeTurnFile(namespaceDir: string, sessionId: string): string {
+	return path.join(namespaceDir, "active-turns", `${safeExternalId("session", sessionId)}.json`);
+}
+
+function turnFile(namespaceDir: string, turnId: string): string {
+	return path.join(turnsDir(namespaceDir), `${safeTurnId(turnId)}.json`);
+}
+
+function questionFile(namespaceDir: string, questionId: string): string {
+	return path.join(namespaceDir, "questions", `${safeExternalId("question", questionId)}.json`);
+}
+
+async function readTurnRecord(namespaceDir: string, turnId: unknown): Promise<TurnRecord | null> {
+	return (await readJsonFile(turnFile(namespaceDir, safeTurnId(turnId)))) as TurnRecord | null;
+}
+
+async function writeTurnRecord(namespaceDir: string, turn: TurnRecord): Promise<void> {
+	await writeJsonFile(turnFile(namespaceDir, turn.turn_id), turn);
+}
+
+async function readActiveTurn(namespaceDir: string, sessionId: string): Promise<TurnRecord | null> {
+	const active = await readJsonFile(activeTurnFile(namespaceDir, sessionId));
+	if (!active || typeof active.turn_id !== "string") return null;
+	const turn = await readTurnRecord(namespaceDir, active.turn_id);
+	if (!turn || turn.session_id !== sessionId || !ACTIVE_TURN_STATUSES.has(turn.status)) return null;
+	return turn;
+}
+
+async function writeActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
+	await writeJsonFile(activeTurnFile(namespaceDir, turn.session_id), {
+		session_id: turn.session_id,
+		turn_id: turn.turn_id,
+		status: turn.status,
+		updated_at: turn.updated_at,
+	});
+}
+
+async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
+	const active = await readJsonFile(activeTurnFile(namespaceDir, turn.session_id));
+	if (active?.turn_id === turn.turn_id) await fs.rm(activeTurnFile(namespaceDir, turn.session_id), { force: true });
+}
+
+function makeTurnRecord(config: HermesMcpConfig, sessionId: string, prompt: string, status: TurnStatus): TurnRecord {
+	const timestamp = new Date().toISOString();
+	return {
+		schema_version: 1,
+		turn_id: `turn-${randomUUID()}`,
+		session_id: sessionId,
+		namespace: config.namespace,
+		status,
+		prompt: { text: prompt, created_at: timestamp, source: "mcp" },
+		delivery: { delivered: false, queued: true, target: null, attempts: [] },
+		question_ids: [],
+		final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
+		evidence: [],
+		error: null,
+		liveness: { checked_at: null, live: null, reason: null },
+		created_at: timestamp,
+		updated_at: timestamp,
+		started_at: status === "queued" ? null : timestamp,
+		completed_at: null,
+	};
+}
+
+function asTerminalTurnStatus(status: unknown): TurnStatus | null {
+	const normalized = String(status ?? "")
+		.trim()
+		.toLowerCase();
+	if (TERMINAL_TURN_STATUSES.has(normalized as TurnStatus)) return normalized as TurnStatus;
+	if (normalized === "blocked") return "failed";
+	return null;
+}
+
+function boundedTimeoutMs(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return 1000;
+	return Math.min(parsed, 30_000);
+}
+
+function boundedPollIntervalMs(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return 100;
+	return Math.min(Math.max(parsed, 10), 1000);
 }
 async function runCommand(command: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
@@ -389,10 +571,25 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 		return await listJsonFiles(path.join(namespaceDir, "sessions"));
 	}
 	function sessionFile(sessionId: unknown): string {
-		return path.join(namespaceDir, "sessions", `${safeHermesStateId(sessionId, "session_id")}.json`);
+		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
-	function questionFile(questionId: unknown): string {
-		return path.join(namespaceDir, "questions", `${safeHermesStateId(questionId, "question_id")}.json`);
+
+	async function readTurnPayload(
+		turnId: unknown,
+		sessionId: unknown,
+		lines: unknown,
+	): Promise<Record<string, unknown>> {
+		const turn = await readTurnRecord(namespaceDir, turnId);
+		if (!turn) return { ok: false, reason: "unknown_turn" };
+		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
+			return { ok: false, reason: "turn_session_mismatch" };
+		}
+		const session = await readJsonFile(sessionFile(turn.session_id));
+		return {
+			ok: true,
+			turn,
+			advisory_status: session ? await inspectTmuxSession(session, boundedLineCount(lines)) : { live: false },
+		};
 	}
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -444,24 +641,103 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 			}
 			if (name === "gjc_hermes_send_prompt") {
 				requireHermesMutation(config, "sessions", args);
-				const session = await readJsonFile(sessionFile(args.session_id));
-				const delivered =
-					session && typeof args.prompt === "string" ? await sendTmuxPrompt(session, args.prompt) : false;
+				const sessionId = safeExternalId("session", args.session_id);
+				const session = await readJsonFile(sessionFile(sessionId));
+				if (!session) return { ok: false, reason: "unknown_session", session_id: sessionId };
+				if (typeof args.prompt !== "string" || args.prompt.length === 0)
+					return { ok: false, reason: "prompt_required" };
+				const activeTurn = await readActiveTurn(namespaceDir, sessionId);
+				if (activeTurn && args.force !== true && args.queue !== true) {
+					return {
+						ok: false,
+						reason: "active_turn_exists",
+						session_id: sessionId,
+						active_turn_id: activeTurn.turn_id,
+					};
+				}
+				if (activeTurn && args.force === true) {
+					const timestamp = new Date().toISOString();
+					const superseded = {
+						...activeTurn,
+						status: "superseded" as const,
+						updated_at: timestamp,
+						completed_at: timestamp,
+					};
+					await writeTurnRecord(namespaceDir, superseded);
+					await clearActiveTurn(namespaceDir, superseded);
+				}
+				const shouldQueue = args.queue === true && args.force !== true;
+				const turn = makeTurnRecord(config, sessionId, args.prompt, shouldQueue ? "queued" : "active");
+				if (!shouldQueue) {
+					const delivered = await sendTmuxPrompt(session, args.prompt);
+					const timestamp = new Date().toISOString();
+					turn.delivery = {
+						delivered,
+						queued: !delivered,
+						target: typeof session.tmux_target === "string" ? session.tmux_target : null,
+						attempts: [
+							{ delivered, created_at: timestamp, reason: delivered ? null : "tmux_delivery_unavailable" },
+						],
+					};
+					turn.liveness = { checked_at: timestamp, live: await hasTmuxSession(session), reason: null };
+					turn.updated_at = timestamp;
+					await writeActiveTurn(namespaceDir, turn);
+				}
+				await writeTurnRecord(namespaceDir, turn);
 				const queued = {
-					session_id: args.session_id,
+					session_id: sessionId,
+					turn_id: turn.turn_id,
 					prompt: args.prompt,
-					queued: !delivered,
-					delivered,
-					created_at: new Date().toISOString(),
+					queued: turn.delivery.queued,
+					delivered: turn.delivery.delivered,
+					created_at: turn.created_at,
 				};
 				await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), queued);
-				return { ok: true, queued: !delivered, delivered, prompt: queued };
+				return {
+					ok: true,
+					session_id: sessionId,
+					turn_id: turn.turn_id,
+					active_turn_id: shouldQueue ? activeTurn?.turn_id : turn.turn_id,
+					status: turn.status,
+					queued: turn.delivery.queued,
+					delivered: turn.delivery.delivered,
+					delivery: turn.delivery,
+					prompt: queued,
+				};
+			}
+			if (name === "gjc_hermes_read_turn") {
+				return await readTurnPayload(args.turn_id, args.session_id, args.lines);
+			}
+			if (name === "gjc_hermes_await_turn") {
+				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
+				const deadline = Date.now() + timeoutMs;
+				let payload = await readTurnPayload(args.turn_id, args.session_id, args.lines);
+				while (
+					payload.ok === true &&
+					!TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status) &&
+					Date.now() < deadline
+				) {
+					await Bun.sleep(pollIntervalMs);
+					payload = await readTurnPayload(args.turn_id, args.session_id, args.lines);
+				}
+				if (payload.ok === true && !TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status)) {
+					return { ok: false, reason: "timeout", turn: payload.turn, advisory_status: payload.advisory_status };
+				}
+				return payload;
 			}
 			if (name === "gjc_hermes_submit_question_answer") {
 				requireHermesMutation(config, "questions", args);
-				const questionPath = questionFile(args.question_id);
+				const questionId = safeExternalId("question", args.question_id);
+				const questionPath = questionFile(namespaceDir, questionId);
 				const question = await readJsonFile(questionPath);
 				if (!question) return { ok: false, reason: "unknown_question" };
+				if (args.session_id != null && question.session_id !== safeExternalId("session", args.session_id)) {
+					return { ok: false, reason: "question_session_mismatch" };
+				}
+				if (args.turn_id != null && question.turn_id !== safeTurnId(args.turn_id)) {
+					return { ok: false, reason: "question_turn_mismatch" };
+				}
 				const answered = {
 					...question,
 					status: "answered",
@@ -469,11 +745,30 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 					answered_at: new Date().toISOString(),
 				};
 				await writeJsonFile(questionPath, answered);
-				return { ok: true, question: answered };
+				let turn: TurnRecord | null = null;
+				if (typeof answered.turn_id === "string") {
+					turn = await readTurnRecord(namespaceDir, answered.turn_id);
+					if (turn) {
+						const timestamp = new Date().toISOString();
+						turn = {
+							...turn,
+							status: "active",
+							question_ids: [...new Set([...turn.question_ids, questionId])],
+							updated_at: timestamp,
+						};
+						await writeTurnRecord(namespaceDir, turn);
+						await writeActiveTurn(namespaceDir, turn);
+						const session = await readJsonFile(sessionFile(turn.session_id));
+						if (session && typeof args.answer === "string") await sendTmuxPrompt(session, args.answer);
+					}
+				}
+				return { ok: true, question: answered, ...(turn ? { turn } : {}) };
 			}
 			if (name === "gjc_hermes_report_status") {
 				requireHermesMutation(config, "reports", args);
 				const report = {
+					session_id: args.session_id,
+					turn_id: args.turn_id,
 					status: args.status,
 					summary: args.summary,
 					blocker: args.blocker,
@@ -481,8 +776,52 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 					evidence_paths: args.evidence_paths ?? [],
 					created_at: new Date().toISOString(),
 				};
+				let turn: TurnRecord | null = null;
+				if (args.turn_id != null) {
+					turn = await readTurnRecord(namespaceDir, args.turn_id);
+					if (!turn) return { ok: false, reason: "unknown_turn" };
+					if (args.session_id != null && turn.session_id !== safeExternalId("session", args.session_id)) {
+						return { ok: false, reason: "turn_session_mismatch" };
+					}
+					const terminalStatus = asTerminalTurnStatus(args.status);
+					if (terminalStatus) {
+						const timestamp = new Date().toISOString();
+						turn = {
+							...turn,
+							status: terminalStatus,
+							final_response: {
+								text:
+									typeof args.summary === "string"
+										? args.summary
+										: typeof args.blocker === "string"
+											? args.blocker
+											: null,
+								format: "markdown",
+								source: "report_status",
+								artifact_path: null,
+								truncated: false,
+							},
+							evidence: Array.isArray(args.evidence_paths)
+								? args.evidence_paths.map(evidencePath => ({ path: evidencePath }))
+								: [],
+							error:
+								terminalStatus === "failed"
+									? {
+											code: "reported_failure",
+											message:
+												typeof args.blocker === "string" ? args.blocker : String(args.summary ?? "failed"),
+											recoverable: true,
+										}
+									: null,
+							updated_at: timestamp,
+							completed_at: timestamp,
+						};
+						await writeTurnRecord(namespaceDir, turn);
+						await clearActiveTurn(namespaceDir, turn);
+					}
+				}
 				await writeJsonFile(path.join(namespaceDir, "reports", `${Date.now()}.json`), report);
-				return { ok: true, report };
+				return { ok: true, report, ...(turn ? { turn } : {}) };
 			}
 			return { ok: false, reason: "unknown_tool", tool: name };
 		} catch (error) {

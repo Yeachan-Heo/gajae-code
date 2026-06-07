@@ -32,7 +32,7 @@ Real tmux/GJC actuation is enabled by setting a GJC-compatible session command:
 export GJC_HERMES_MCP_SESSION_COMMAND="/path/to/gjc"
 ```
 
-When set, `gjc_hermes_start_session` launches a detached tmux session, `gjc_hermes_send_prompt` sends input to that pane, and `gjc_hermes_read_tail` reads bounded pane output.
+When set, `gjc_hermes_start_session` launches a detached tmux session, `gjc_hermes_send_prompt` creates a durable turn and sends input to that pane, and `gjc_hermes_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_hermes_report_status`.
 
 Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP`.
 
@@ -58,6 +58,8 @@ Read tools:
 - `gjc_hermes_list_artifacts`
 - `gjc_hermes_read_artifact`
 - `gjc_hermes_read_coordination_status`
+- `gjc_hermes_read_turn`
+- `gjc_hermes_await_turn`
 
 Mutating tools:
 
@@ -66,6 +68,61 @@ Mutating tools:
 - `gjc_hermes_submit_question_answer`
 - `gjc_hermes_report_status`
 
+## Turn orchestration flow
+
+Hermes coordinators should treat turns, not terminal scrollback, as the unit of work:
+
+1. Call `gjc_hermes_start_session` with `allow_mutation: true`.
+2. Call `gjc_hermes_send_prompt` with `allow_mutation: true`.
+3. Store the returned `turn_id`.
+4. Poll `gjc_hermes_read_turn`, or call bounded `gjc_hermes_await_turn`, until the turn is terminal.
+5. If `gjc_hermes_list_questions` shows a question for that turn, answer with `gjc_hermes_submit_question_answer`.
+6. Use `gjc_hermes_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
+
+`gjc_hermes_send_prompt` preserves the legacy `queued` and `delivered` fields and adds turn fields:
+
+```json
+{
+  "ok": true,
+  "session_id": "gjc-hermes-demo",
+  "turn_id": "turn-00000000-0000-0000-0000-000000000000",
+  "active_turn_id": "turn-00000000-0000-0000-0000-000000000000",
+  "status": "active",
+  "queued": false,
+  "delivered": true
+}
+```
+
+A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable but are not delivered immediately. Force supersedes the previous active turn and audits that state in the turn journal.
+
+`gjc_hermes_read_turn` returns the authoritative durable turn plus advisory pane status:
+
+```json
+{
+  "ok": true,
+  "turn": {
+    "schema_version": 1,
+    "turn_id": "turn-00000000-0000-0000-0000-000000000000",
+    "session_id": "gjc-hermes-demo",
+    "status": "completed",
+    "final_response": {
+      "text": "Done",
+      "format": "markdown",
+      "source": "report_status",
+      "artifact_path": null,
+      "truncated": false
+    },
+    "evidence": [{ "path": "artifact.txt" }],
+    "error": null
+  },
+  "advisory_status": {
+    "live": true,
+    "state": "idle_or_unknown"
+  }
+}
+```
+
+External `session_id`, `turn_id`, and `question_id` values are validated before path use, and loaded records must match the requested session/turn owner.
 ## Hermes config snippet
 
 ```json

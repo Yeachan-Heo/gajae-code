@@ -204,9 +204,217 @@ describe("Hermes MCP server protocol", () => {
 			allow_mutation: true,
 		});
 
-		expect(status).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
-		expect(tail).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
-		expect(prompt).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
-		expect(answer).toEqual({ ok: false, reason: "hermes_invalid_question_id" });
+		expect(status).toEqual({ ok: false, reason: "invalid_session_id" });
+		expect(tail).toEqual({ ok: false, reason: "invalid_session_id" });
+		expect(prompt).toEqual({ ok: false, reason: "invalid_session_id" });
+		expect(answer).toEqual({ ok: false, reason: "invalid_question_id" });
+	});
+
+	it("creates durable turns, enforces active backpressure, and reads terminal reports", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-turns");
+		const server = createHermesMcpServer({
+			env: {
+				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
+				GJC_HERMES_MCP_STATE_ROOT: stateRoot,
+				GJC_HERMES_MCP_MUTATIONS: "sessions,questions,reports",
+				GJC_HERMES_MCP_PROFILE: "local",
+				GJC_HERMES_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					tmuxSession: "gjc-demo",
+					tmuxTarget: "missing-target",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_hermes_start_session", { cwd: root, allow_mutation: true });
+
+		const first = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "first",
+			allow_mutation: true,
+		});
+		expect(first.ok).toBe(true);
+		expect(first.turn_id).toMatch(/^turn-/);
+		expect(first.status).toBe("active");
+		expect(first.delivery).toMatchObject({ delivered: false, queued: true });
+
+		const rejected = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "second",
+			allow_mutation: true,
+		});
+		expect(rejected).toEqual({
+			ok: false,
+			reason: "active_turn_exists",
+			session_id: "gjc-demo",
+			active_turn_id: first.turn_id,
+		});
+
+		const queued = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "second",
+			queue: true,
+			allow_mutation: true,
+		});
+		expect(queued.status).toBe("queued");
+		expect(queued.delivery).toMatchObject({ delivered: false, queued: true });
+
+		const completed = await server.callTool("gjc_hermes_report_status", {
+			session_id: "gjc-demo",
+			turn_id: first.turn_id,
+			status: "completed",
+			summary: "Done",
+			evidence_paths: ["artifact.txt"],
+			allow_mutation: true,
+		});
+		expect(completed.ok).toBe(true);
+		const completedTurn = completed.turn as {
+			status: string;
+			final_response: Record<string, unknown>;
+			evidence: Array<Record<string, unknown>>;
+		};
+		expect(completedTurn.status).toBe("completed");
+		expect(completedTurn.final_response).toMatchObject({ text: "Done", source: "report_status" });
+		expect(completedTurn.evidence).toEqual([{ path: "artifact.txt" }]);
+
+		const read = await server.callTool("gjc_hermes_read_turn", { session_id: "gjc-demo", turn_id: first.turn_id });
+		expect(read.ok).toBe(true);
+		const readTurn = read.turn as { schema_version: number; status: string };
+		const advisoryStatus = read.advisory_status as { live: boolean | null };
+		expect(readTurn.schema_version).toBe(1);
+		expect(readTurn.status).toBe("completed");
+		expect(advisoryStatus.live).toBe(false);
+
+		const afterTerminal = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "third",
+			allow_mutation: true,
+		});
+		expect(afterTerminal.ok).toBe(true);
+		expect(afterTerminal.active_turn_id).toBe(afterTerminal.turn_id);
+	});
+
+	it("validates turn and question ownership before path-addressed mutations", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-ids");
+		const server = createHermesMcpServer({
+			env: {
+				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
+				GJC_HERMES_MCP_STATE_ROOT: stateRoot,
+				GJC_HERMES_MCP_MUTATIONS: "sessions,questions,reports",
+				GJC_HERMES_MCP_PROFILE: "local",
+				GJC_HERMES_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_hermes_start_session", { cwd: root, allow_mutation: true });
+		const turn = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "needs answer",
+			allow_mutation: true,
+		});
+		const questionsDir = path.join(stateRoot, "local", "repo", "questions");
+		await fs.mkdir(questionsDir, { recursive: true });
+		await Bun.write(
+			path.join(questionsDir, "q-safe.json"),
+			JSON.stringify({ id: "q-safe", session_id: "gjc-demo", turn_id: turn.turn_id, status: "open" }),
+		);
+		await Bun.write(
+			path.join(questionsDir, "q-other.json"),
+			JSON.stringify({ id: "q-other", session_id: "other-session", turn_id: turn.turn_id, status: "open" }),
+		);
+
+		expect(await server.callTool("gjc_hermes_read_turn", { turn_id: "../escape" })).toEqual({
+			ok: false,
+			reason: "invalid_turn_id",
+		});
+		expect(
+			await server.callTool("gjc_hermes_read_turn", { session_id: "other-session", turn_id: turn.turn_id }),
+		).toEqual({
+			ok: false,
+			reason: "turn_session_mismatch",
+		});
+		expect(
+			await server.callTool("gjc_hermes_submit_question_answer", {
+				session_id: "gjc-demo",
+				turn_id: turn.turn_id,
+				question_id: "../escape",
+				answer: "bad",
+				allow_mutation: true,
+			}),
+		).toEqual({ ok: false, reason: "invalid_question_id" });
+		expect(
+			await server.callTool("gjc_hermes_submit_question_answer", {
+				session_id: "gjc-demo",
+				turn_id: turn.turn_id,
+				question_id: "q-other",
+				answer: "bad",
+				allow_mutation: true,
+			}),
+		).toEqual({ ok: false, reason: "question_session_mismatch" });
+
+		const answered = await server.callTool("gjc_hermes_submit_question_answer", {
+			session_id: "gjc-demo",
+			turn_id: turn.turn_id,
+			question_id: "q-safe",
+			answer: "yes",
+			allow_mutation: true,
+		});
+		expect(answered.ok).toBe(true);
+		const answeredTurn = answered.turn as { status: string };
+		const answeredQuestion = answered.question as { status: string };
+		expect(answeredTurn.status).toBe("active");
+		expect(answeredQuestion.status).toBe("answered");
+	});
+
+	it("awaits turns with bounded timeout and preserves queued turns", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-await");
+		const server = createHermesMcpServer({
+			env: {
+				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
+				GJC_HERMES_MCP_STATE_ROOT: stateRoot,
+				GJC_HERMES_MCP_MUTATIONS: "sessions",
+				GJC_HERMES_MCP_PROFILE: "local",
+				GJC_HERMES_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_hermes_start_session", { cwd: root, allow_mutation: true });
+		const queued = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "queued",
+			queue: true,
+			allow_mutation: true,
+		});
+
+		const awaited = await server.callTool("gjc_hermes_await_turn", {
+			session_id: "gjc-demo",
+			turn_id: queued.turn_id,
+			timeout_ms: 1,
+			poll_interval_ms: 1,
+		});
+
+		expect(awaited.ok).toBe(false);
+		expect(awaited.reason).toBe("timeout");
+		const awaitedTurn = awaited.turn as { status: string };
+		expect(awaitedTurn.status).toBe("queued");
 	});
 });

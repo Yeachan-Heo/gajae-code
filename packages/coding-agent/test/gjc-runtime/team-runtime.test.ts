@@ -473,6 +473,84 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("split-window -v -t %2");
 		expect(tmuxLog).not.toContain("new-session");
 	});
+	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: [
+				"Shared context for the coordinated run.",
+				"",
+				"### Lane A — Schema contract",
+				"Define the durable schema and ID checks.",
+				"",
+				"### Lane B — Verification",
+				"Add focused regression coverage.",
+			].join("\n"),
+			teamName: "lane-distribution-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+
+		const task1 = await readGjcTeamTask("lane-distribution-team", "task-1", cleanupRoot, { PATH: "" });
+		const task2 = await readGjcTeamTask("lane-distribution-team", "task-2", cleanupRoot, { PATH: "" });
+
+		expect(snapshot.task_counts.pending).toBe(2);
+		expect(task1.subject).toBe("Lane A — Schema contract");
+		expect(task1.owner).toBe("worker-1");
+		expect(task1.lane).toBe("lane-a");
+		expect(task1.required_role).toBe("executor");
+		expect(task1.description).toContain("Define the durable schema");
+		expect(task1.description).not.toContain("Add focused regression coverage");
+		expect(task2.subject).toBe("Lane B — Verification");
+		expect(task2.owner).toBe("worker-2");
+		expect(task2.lane).toBe("lane-b");
+		expect(task2.description).toContain("Add focused regression coverage");
+		expect(task2.description).not.toContain("Define the durable schema");
+	});
+
+	it("rejects ambiguous inline lane splits before duplicating broad multi-worker work", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await expect(
+			startGjcTeam({
+				workerCount: 4,
+				agentType: "executor",
+				task: "Implement turn orchestration. Split lanes: A schema, B delivery, C read_turn, D docs/tests.",
+				teamName: "ambiguous-lane-team",
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: { PATH: "" },
+			}),
+		).rejects.toThrow("ambiguous_team_lane_split");
+		expect(await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "ambiguous-lane-team")).exists()).toBe(
+			false,
+		);
+	});
+
+	it("rejects ambiguous lane splits before non-dry-run state, worktree, or pane mutation", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+
+		await expect(
+			startGjcTeam({
+				workerCount: 2,
+				agentType: "executor",
+				task: "Implement approved plan. Split lanes: A runtime, B tests.",
+				teamName: "ambiguous-lane-worktree-team",
+				cwd: cleanupRoot,
+				env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+			}),
+		).rejects.toThrow("ambiguous_team_lane_split");
+
+		expect(
+			await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "ambiguous-lane-worktree-team")).exists(),
+		).toBe(false);
+		expect(await Bun.file(path.join(cleanupRoot, "tmux-split-count")).exists()).toBe(false);
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("split-window");
+	});
 
 	it("fails outside current tmux before creating team state or worktrees", async () => {
 		cleanupRoot = await createGitRepo();
