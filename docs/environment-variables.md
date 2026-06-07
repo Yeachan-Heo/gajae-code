@@ -238,6 +238,19 @@ providers:
 | `GJC_TEAM_WORKER_CLI` | Team worker CLI selector; accepted values are `auto` or `gjc` |
 | `GJC_TEAM_WORKER_CLI_MAP` | Comma-separated worker CLI selector map; entries must be `auto` or `gjc` |
 
+### Hermes MCP bridge
+
+`gjc mcp-serve hermes` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
+
+| Variable | Behavior |
+| --- | --- |
+| `GJC_HERMES_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. Values may be separated by the platform path delimiter, commas, semicolons, or newlines. |
+| `GJC_HERMES_MCP_MUTATIONS` | Enables mutating tool classes (`sessions`, `questions`, `reports`, or `all`). Per-call `allow_mutation: true` is still required. |
+| `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by artifact reads (default `65536`, capped at `1048576`). |
+| `GJC_HERMES_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/hermes-mcp`). |
+| `GJC_HERMES_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
+| `GJC_HERMES_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
+
 ### Google Vertex AI
 
 | Variable                         | Required?                      | Notes                                                                                                                     |
