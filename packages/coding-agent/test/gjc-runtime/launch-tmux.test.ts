@@ -62,6 +62,43 @@ describe("default GJC tmux launch", () => {
 			"'/bin/bun' '/repo/packages/coding-agent/src/cli.ts' '--tmux' 'hello world'",
 		);
 	});
+	it("uses a host command for compiled Bun virtual entrypoints", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["gjc", "/$bunfs/root/gjc-linux-x64"],
+			execPath: "/home/me/.local/bin/gjc",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+
+		expect(plan.innerCommand).not.toContain("$bunfs");
+		expect(plan.innerCommand).toContain(`${GJC_TMUX_LAUNCHED_ENV}=1`);
+		expect(plan.innerCommand).toContain("'/home/me/.local/bin/gjc' '--tmux' 'hello world'");
+	});
+
+	it("falls back to gjc when compiled Bun virtual entrypoint has no host exec path", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux"],
+			cwd: "/repo",
+			env: {},
+			argv: ["gjc", "/$bunfs/root/gjc-linux-x64"],
+			execPath: "/$bunfs/root/gjc-linux-x64",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan?.innerCommand).not.toContain("$bunfs");
+		expect(plan?.innerCommand).toContain("'gjc' '--tmux'");
+	});
 
 	it("attaches existing tagged session for matching worktree branch", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
@@ -218,8 +255,9 @@ describe("default GJC tmux launch", () => {
 		expect(calls[0].args[0]).toBe("new-session");
 	});
 
-	it("kills a detached session when required profile tagging fails", () => {
+	it("handles and reports partial launch when required profile tagging fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
@@ -230,16 +268,50 @@ describe("default GJC tmux launch", () => {
 			platform: "darwin",
 			tty: interactiveTty,
 			tmuxAvailable: true,
+			diagnosticWriter: message => diagnostics.push(message),
 			spawnSync: (command, spawnArgs, options) => {
 				calls.push({ command, args: spawnArgs, options });
-				if (spawnArgs.includes("@gjc-profile")) return { exitCode: 1 };
+				if (spawnArgs.includes("@gjc-profile")) return { exitCode: 1, stderr: "no server running on /tmp/tmux" };
 				return { exitCode: 0 };
 			},
 		});
 
-		expect(handled).toBe(false);
+		expect(handled).toBe(true);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
 		expect(calls.some(call => call.args[0] === "kill-session")).toBe(true);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: profile tagging failed.");
+		expect(diagnostics[0].length).toBeLessThan(320);
+	});
+
+	it("handles and reports partial launch when attach fails after profile succeeds", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+		expect(diagnostics[0].length).toBeLessThan(320);
 	});
 
 	it("falls through to direct launch when tmux is unavailable", () => {
