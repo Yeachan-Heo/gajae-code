@@ -25,6 +25,7 @@ jobs:
    # in that case, so the canary's retention window (see build-native action) is the
    # effective TTL of a cache hit before main rebuilds anyway.
    rust-hash:
+      timeout-minutes: 15
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       outputs:
@@ -105,6 +106,7 @@ jobs:
 
    # Fast lint + type check (no Rust, no native build needed)
    check:
+      timeout-minutes: 30
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
@@ -127,6 +129,7 @@ jobs:
    # Linux x64 baseline + modern: required by `test`, so it runs on every PR
    # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
    native_linux:
+      timeout-minutes: 60
       needs: [rust-hash]
       if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
          (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
@@ -150,6 +153,7 @@ jobs:
 
    # Remaining platforms only ship in release tags; PRs and main never build them.
    native_release:
+      timeout-minutes: 90
       needs: [rust-hash]
       if: ${{ startsWith(github.ref, 'refs/tags/v') }}
       strategy:
@@ -238,6 +242,7 @@ jobs:
            run: bun run ci:test:smoke
 
    install_methods:
+      timeout-minutes: 45
       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
@@ -284,6 +289,7 @@ jobs:
            run: bun run ci:test:install-methods
 
    release_binary:
+      timeout-minutes: 60
       if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.native_linux.result == 'success' && needs.native_release.result ==
          'success' && needs.check.result == 'success' }}
@@ -377,6 +383,7 @@ jobs:
               path: ${{ matrix.binary_path }}
 
    release-github:
+      timeout-minutes: 30
       if: ${{ (github.event_name != 'pull_request' ||
          github.event.pull_request.head.repo.full_name == github.repository) &&
          startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
@@ -402,6 +409,7 @@ jobs:
 
 
    release_github_verify:
+      timeout-minutes: 15
       if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs['release-github'].result == 'success' }}
       needs: [release-github]
@@ -420,6 +428,7 @@ jobs:
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
 
    release-npm:
+      timeout-minutes: 30
       if: ${{ (github.event_name != 'pull_request' ||
          github.event.pull_request.head.repo.full_name == github.repository) &&
          startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
