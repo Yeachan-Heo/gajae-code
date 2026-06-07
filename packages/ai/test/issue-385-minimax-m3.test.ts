@@ -23,4 +23,11 @@ describe("MiniMax M3 support (issue #385)", () => {
 		expect(DEFAULT_MODEL_PER_PROVIDER["minimax-code"]).toBe("minimax-m3");
 		expect(DEFAULT_MODEL_PER_PROVIDER["minimax-code-cn"]).toBe("minimax-m3");
 	});
+
+	test("surfaces minimax-m3 with MiniMax-M3 display casing (issue #404)", () => {
+		for (const provider of minimaxProviders) {
+			const model = getBundledModel(provider, "minimax-m3");
+			expect(model.name).toBe("MiniMax-M3");
+		}
+	});
 });
