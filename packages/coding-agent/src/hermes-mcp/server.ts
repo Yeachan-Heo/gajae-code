@@ -204,6 +204,14 @@ async function writeJsonFile(file: string, value: unknown): Promise<void> {
 	await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function safeHermesStateId(value: unknown, field: string): string {
+	if (typeof value !== "string") throw new Error(`hermes_invalid_${field}`);
+	const id = value.trim();
+	if (id.length === 0 || id.length > 200) throw new Error(`hermes_invalid_${field}`);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(id)) throw new Error(`hermes_invalid_${field}`);
+	return id;
+}
+
 async function listJsonFiles(dir: string): Promise<any[]> {
 	try {
 		const entries = await fs.readdir(dir);
@@ -327,26 +335,46 @@ async function inspectTmuxSession(session: Record<string, unknown>, lines = 80):
 	};
 }
 
+function decodeUtf8WithinByteCap(bytes: Buffer, byteCap: number): string {
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	for (let end = Math.min(bytes.length, byteCap); end >= 0; end--) {
+		try {
+			const text = decoder.decode(bytes.subarray(0, end));
+			if (Buffer.byteLength(text) <= byteCap) return text;
+		} catch {
+			// Keep trimming until the byte slice ends on a valid UTF-8 boundary.
+		}
+	}
+	return "";
+}
+
 export async function readHermesArtifact(
 	config: HermesMcpConfig,
 	args: { path: unknown },
 ): Promise<Record<string, unknown>> {
+	let handle: fs.FileHandle | null = null;
 	try {
 		const resolved = await assertHermesArtifactPath(config, args.path);
-		const file = await fs.readFile(resolved.path, "utf8");
-		const text = file.slice(0, resolved.byteCap);
+		handle = await fs.open(resolved.path, "r");
+		const readLimit = resolved.byteCap + 1;
+		const buffer = Buffer.alloc(readLimit);
+		const { bytesRead } = await handle.read(buffer, 0, readLimit, 0);
+		const boundedBytes = buffer.subarray(0, Math.min(bytesRead, resolved.byteCap));
+		const text = decodeUtf8WithinByteCap(boundedBytes, resolved.byteCap);
 		return {
 			ok: true,
 			path: resolved.path,
 			text,
 			bytes: Buffer.byteLength(text),
-			truncated: file.length > text.length,
+			truncated: bytesRead > resolved.byteCap,
 		};
 	} catch (error) {
 		return {
 			ok: false,
 			reason: (error instanceof Error ? error.message.split(":")[0] : String(error)).replace(/^hermes_/, ""),
 		};
+	} finally {
+		await handle?.close();
 	}
 }
 
@@ -361,7 +389,10 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 		return await listJsonFiles(path.join(namespaceDir, "sessions"));
 	}
 	function sessionFile(sessionId: unknown): string {
-		return path.join(namespaceDir, "sessions", `${String(sessionId ?? "")}.json`);
+		return path.join(namespaceDir, "sessions", `${safeHermesStateId(sessionId, "session_id")}.json`);
+	}
+	function questionFile(questionId: unknown): string {
+		return path.join(namespaceDir, "questions", `${safeHermesStateId(questionId, "question_id")}.json`);
 	}
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -428,8 +459,7 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 			}
 			if (name === "gjc_hermes_submit_question_answer") {
 				requireHermesMutation(config, "questions", args);
-				const questionId = String(args.question_id ?? "");
-				const questionPath = path.join(namespaceDir, "questions", `${questionId}.json`);
+				const questionPath = questionFile(args.question_id);
 				const question = await readJsonFile(questionPath);
 				if (!question) return { ok: false, reason: "unknown_question" };
 				const answered = {

@@ -176,4 +176,37 @@ describe("Hermes MCP server protocol", () => {
 		expect(JSON.parse(answer.result.content[0].text).question.status).toBe("answered");
 		expect(JSON.parse(report.result.content[0].text).report.status).toBe("blocked");
 	});
+
+	it("rejects traversal-shaped session and question ids before state file access", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-test");
+		const server = createHermesMcpServer({
+			env: {
+				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
+				GJC_HERMES_MCP_STATE_ROOT: stateRoot,
+				GJC_HERMES_MCP_MUTATIONS: "sessions,questions",
+				GJC_HERMES_MCP_PROFILE: "local",
+				GJC_HERMES_MCP_REPO: "repo",
+			},
+		});
+		const traversal = "../../reports/x";
+
+		const status = await server.callTool("gjc_hermes_read_status", { session_id: traversal });
+		const tail = await server.callTool("gjc_hermes_read_tail", { session_id: traversal });
+		const prompt = await server.callTool("gjc_hermes_send_prompt", {
+			session_id: traversal,
+			prompt: "continue",
+			allow_mutation: true,
+		});
+		const answer = await server.callTool("gjc_hermes_submit_question_answer", {
+			question_id: traversal,
+			answer: "yes",
+			allow_mutation: true,
+		});
+
+		expect(status).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
+		expect(tail).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
+		expect(prompt).toEqual({ ok: false, reason: "hermes_invalid_session_id" });
+		expect(answer).toEqual({ ok: false, reason: "hermes_invalid_question_id" });
+	});
 });

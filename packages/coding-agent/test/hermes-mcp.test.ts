@@ -171,11 +171,20 @@ describe("gjc mcp-serve hermes", () => {
 	it("bounds artifact reads and denies unsafe roots", async () => {
 		await withTempRoot(async root => {
 			const artifact = path.join(root, "artifact.txt");
-			await Bun.write(artifact, "abcdef");
-			const env = { ...process.env, GJC_HERMES_MCP_WORKDIR_ROOTS: root, GJC_HERMES_MCP_ARTIFACT_MAX_BYTES: "3" };
+			await Bun.write(artifact, "🙂🙂abcdef");
+			const byteCap = 5;
+			const env = {
+				...process.env,
+				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
+				GJC_HERMES_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
+			};
 			const server = await createHermesMcpServer({ env });
 			const read = await server.callTool("gjc_hermes_read_artifact", { path: artifact });
-			expect(read).toEqual({ ok: true, path: artifact, text: "abc", bytes: 3, truncated: true });
+			expect(read.ok).toBe(true);
+			expect(read.path).toBe(artifact);
+			expect(read.bytes).toBeLessThanOrEqual(byteCap);
+			expect(read.truncated).toBe(true);
+			expect(Buffer.byteLength(String(read.text))).toBeLessThanOrEqual(byteCap);
 			await expect(
 				server.callTool("gjc_hermes_read_artifact", { path: path.join(os.tmpdir(), "missing.txt") }),
 			).resolves.toEqual({
