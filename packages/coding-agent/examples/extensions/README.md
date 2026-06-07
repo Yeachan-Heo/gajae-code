@@ -5,57 +5,37 @@ Example extensions for gajae-code.
 ## Usage
 
 ```bash
-# Load an extension with --extension flag
-pi --extension examples/extensions/permission-gate.ts
+# Copy an existing extension into the user extension directory for auto-discovery
+mkdir -p ~/.gjc/agent/extensions
+cp packages/coding-agent/examples/extensions/hello.ts ~/.gjc/agent/extensions/
 
-# Or copy to extensions directory for auto-discovery
-cp permission-gate.ts ~/.gjc/agent/extensions/
+# Project-local extensions can live in .gjc/extensions/
+mkdir -p .gjc/extensions
+cp packages/coding-agent/examples/extensions/pirate.ts .gjc/extensions/
 ```
 
 ## Examples
 
-### Lifecycle & Safety
+### Custom Tools & API
 
-| Extension                | Description                                                                  |
-| ------------------------ | ---------------------------------------------------------------------------- |
-| `permission-gate.ts`     | Prompts for confirmation before dangerous bash commands (rm -rf, sudo, etc.) |
-| `protected-paths.ts`     | Blocks writes to protected paths (.env, .git/, node_modules/)                |
-| `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, branch)          |
-| `dirty-repo-guard.ts`    | Prevents session changes with uncommitted git changes                        |
-
-### Custom Tools
-
-| Extension     | Description                                                                   |
-| ------------- | ----------------------------------------------------------------------------- |
-| `todo.ts`     | Todo list tool + `/todos` command with custom rendering and state persistence |
-| `hello.ts`    | Minimal custom tool example                                                   |
-| `question.ts` | Demonstrates `ctx.ui.select()` for asking the user questions                  |
-| `subagent/`   | Delegate tasks to specialized subagents with isolated context windows         |
+| Extension     | Description                                                |
+| ------------- | ---------------------------------------------------------- |
+| `hello.ts`    | Minimal custom tool example                                |
+| `api-demo.ts` | Demonstrates logger access, injected `pi.zod`, and modules |
 
 ### Commands & UI
 
-| Extension        | Description                                                                    |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `plan-mode.ts`   | Anthropic Code-style plan mode for read-only exploration with `/plan` command     |
-| `tools.ts`       | Interactive `/tools` command to enable/disable tools with session persistence  |
-| `handoff.ts`     | Transfer context to a new focused session via `/handoff <goal>`                |
-| `qna.ts`         | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |
-| `status-line.ts` | Shows turn progress in footer via `ctx.ui.setStatus()` with themed colors      |
-| `snake.ts`       | Snake game with custom UI, keyboard handling, and session persistence          |
-
-### Git Integration
-
-| Extension                | Description                                                               |
-| ------------------------ | ------------------------------------------------------------------------- |
-| `git-checkpoint.ts`      | Creates git stash checkpoints at each turn for code restoration on branch |
-| `auto-commit-on-exit.ts` | Auto-commits on exit using last assistant message for commit message      |
+| Extension           | Description                                                                   |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `plan-mode.ts`      | Anthropic Code-style plan mode for read-only exploration with `/plan` command |
+| `tools.ts`          | Interactive `/tools` command to enable/disable tools with session persistence |
+| `reload-runtime.ts` | Adds a command and tool for reloading extensions, skills, prompts, and themes |
 
 ### System Prompt & Compaction
 
-| Extension              | Description                                                           |
-| ---------------------- | --------------------------------------------------------------------- |
-| `pirate.ts`            | Demonstrates `systemPromptAppend` to dynamically modify system prompt |
-| `custom-compaction.ts` | Custom compaction that summarizes entire conversation                 |
+| Extension   | Description                                                          |
+| ----------- | -------------------------------------------------------------------- |
+| `pirate.ts` | Demonstrates `systemPromptAppend` to dynamically modify system prompt |
 
 ### External Dependencies
 
@@ -63,11 +43,10 @@ cp permission-gate.ts ~/.gjc/agent/extensions/
 | ----------------- | ------------------------------------------------------------------------- |
 | `chalk-logger.ts` | Uses chalk from parent node_modules (demonstrates jiti module resolution) |
 | `with-deps/`      | Extension with its own package.json and dependencies                      |
-| `file-trigger.ts` | Watches a trigger file and injects contents into conversation             |
 
 ## Writing Extensions
 
-See [docs/extensions.md](../../docs/extensions.md) for full documentation.
+The examples below show the core extension patterns used by this directory.
 
 ```typescript
 import type { ExtensionAPI } from "@gajae-code/coding-agent";
