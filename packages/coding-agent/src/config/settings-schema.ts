@@ -9,7 +9,6 @@ import {
 } from "./skill-settings-defaults";
 
 /** Unified settings schema - single source of truth for all settings.
- * Unified settings schema - single source of truth for all settings.
  *
  * Each setting is defined once here with:
  * - Type and default value
