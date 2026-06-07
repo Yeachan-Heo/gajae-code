@@ -1673,9 +1673,10 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`You are ${worker.id} in gjc team ${config.team_name}.`,
 		`Team state root: ${config.state_root}.`,
 		workspace,
-		`Task: ${config.task}`,
+		`Team brief (context only): ${config.task}`,
+		"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
 		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
+		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
 		`GJC_TEAM_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
@@ -1689,7 +1690,80 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 	];
 	return `${env.join(" ")} ${config.worker_command} ${shellQuote(prompt)}`;
 }
+interface GjcTeamInitialLane {
+	label: string;
+	title: string;
+	body: string;
+}
+
+function normalizeLaneId(label: string): string {
+	return `lane-${sanitizeName(label).toLowerCase() || stableHash(label).slice(0, 8)}`;
+}
+
+function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
+	const lines = task.split(/\r?\n/);
+	const lanes: GjcTeamInitialLane[] = [];
+	let current: { label: string; title: string; body: string[] } | null = null;
+	const laneHeading = /^#{2,6}\s+Lane\s+([A-Za-z0-9]+)\s*(?:[—–-]\s*(.+))?\s*$/;
+	const boundaryHeading = /^#{1,6}\s+(?:Integration Owner|Verification Plan|ADR|Approval State)\b/i;
+
+	for (const line of lines) {
+		const match = line.match(laneHeading);
+		if (match) {
+			if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+			current = {
+				label: match[1] ?? `${lanes.length + 1}`,
+				title: (match[2] ?? `Lane ${match[1] ?? lanes.length + 1}`).trim(),
+				body: [],
+			};
+			continue;
+		}
+		if (current && boundaryHeading.test(line)) {
+			lanes.push({ ...current, body: current.body.join("\n").trim() });
+			current = null;
+			continue;
+		}
+		if (current) current.body.push(line);
+	}
+	if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+	return lanes.filter(lane => lane.body.length > 0 || lane.title.length > 0);
+}
+
+function hasAmbiguousLaneSplitIntent(task: string): boolean {
+	return (
+		/\bsplit\s+lanes?\s*:/i.test(task) || /\blanes?\s*:\s*[A-Z]\b/i.test(task) || /\bLane\s+[A-Z]\s*[—–-]/.test(task)
+	);
+}
+
 function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[] {
+	const lanes = parseExplicitTeamLanes(task);
+	if (lanes.length > 0)
+		return lanes.map((lane, index) => {
+			const worker = workers[index % workers.length];
+			if (!worker) throw new Error("team_lane_requires_worker");
+			const laneTitle = `Lane ${lane.label} — ${lane.title}`;
+			const objective = [`${laneTitle}`, lane.body].filter(part => part.trim().length > 0).join("\n\n");
+			return {
+				id: `task-${index + 1}`,
+				subject: laneTitle,
+				description: objective,
+				title: laneTitle,
+				objective,
+				status: "pending",
+				owner: worker.id,
+				lane: normalizeLaneId(lane.label),
+				required_role: worker.role,
+				version: 1,
+				created_at: now(),
+				updated_at: now(),
+			};
+		});
+
+	if (workers.length > 1 && hasAmbiguousLaneSplitIntent(task))
+		throw new Error(
+			"ambiguous_team_lane_split: multi-worker team launch mentions lanes but does not provide explicit markdown lane sections such as `### Lane A — Title`",
+		);
+
 	return workers.map(worker => ({
 		id: `task-${worker.index}`,
 		subject: `Execute team brief (${worker.id})`,
@@ -2456,6 +2530,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
 		: readCurrentTmuxLeaderContext(tmuxCommand, env);
 	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
+	const initialTasks = buildInitialTasks(options.task, initialWorkers);
 	const workers: GjcTeamWorker[] = [];
 	try {
 		for (const worker of initialWorkers)
@@ -2509,7 +2584,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		updated_at: createdAt,
 	});
 	await writePhase(dir, "starting");
-	for (const task of buildInitialTasks(options.task, config.workers)) await writeTask(dir, task);
+	for (const task of initialTasks) await writeTask(dir, task);
 	await appendEvent(dir, {
 		type: "team_started",
 		message: options.dryRun

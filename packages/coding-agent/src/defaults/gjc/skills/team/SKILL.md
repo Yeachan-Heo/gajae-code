@@ -124,6 +124,15 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
 - explain why each lane exists (delivery, verification, specialist support)
 - include an explicit launch hint (`gjc team "<task>"` / `$team "<task>"`) for the coordinated worker run; mention `$ultragoal` as the default durable follow-up/ledger path; mention a later separate Single-owner execution follow-up only when explicitly requested or genuinely needed as a fallback
 - if the ideal role is unavailable, choose the closest role from the roster and say so
+- For multi-worker follow-up execution, do not pass an inline "Split lanes: A..., B..." sentence as the whole team task. `gjc team` rejects ambiguous inline lane splits because they previously caused every worker to receive the same broad task. Use explicit markdown lane sections instead:
+  ```md
+  ### Lane A — Delivery
+  Implement delivery-only changes and evidence.
+
+  ### Lane B — Verification
+  Add focused tests and smoke evidence.
+  ```
+  Explicit `### Lane <id> — <title>` sections are converted into distinct worker-owned initial tasks.
 
 ## Current Runtime Behavior (As Implemented)
 
@@ -134,7 +143,7 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
 3. Initialize team state:
    - `.gjc/state/team/<team>/config.json`
    - `.gjc/state/team/<team>/manifest.v2.json`
-   - `.gjc/state/team/<team>/tasks/task-1.json`
+   - `.gjc/state/team/<team>/tasks/task-*.json` (one per explicit lane section, otherwise one worker-owned compatibility task per worker)
    - `.gjc/state/team/<team>/mailbox/worker-1.json`
    - `.gjc/state/team/<team>/workers/<worker>/status.json`
    - `.gjc/state/team/<team>/workers/<worker>/lifecycle.json`
