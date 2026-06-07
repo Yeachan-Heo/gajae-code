@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./harness-control-plane/cli-workspace-env";
@@ -14,8 +14,9 @@ import { createHarnessCliEnv, type HarnessCliEnv } from "./harness-control-plane
  *   - emitFrame -> stdout JSON serialization
  *   - the stdin JSONL parse loop routing negotiate_unattended / workflow_gate_response
  *     through the shared dispatcher.
- * No model/API key is needed: negotiation and answering route through the control
- * plane without running the agent loop.
+ * The spawned CLI still performs normal non-interactive startup, so the test
+ * provides an isolated keyless fixture model config instead of depending on
+ * developer or CI provider secrets.
  */
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -23,10 +24,29 @@ const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"
 
 let workspace: string;
 let cliEnv: HarnessCliEnv;
+const fixtureModelsYaml = `providers:
+  rpc-test:
+    auth: none
+    api: openai-responses
+    baseUrl: http://127.0.0.1:9/v1
+    models:
+      - id: rpc-test-model
+        contextWindow: 100000
+        maxTokens: 4096
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+`;
 
 beforeEach(async () => {
 	workspace = await mkdtemp(path.join(tmpdir(), "rpc-stdio-ws-"));
 	cliEnv = createHarnessCliEnv(repoRoot);
+	const agentDir = path.join(workspace, ".gjc", "agent");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(path.join(agentDir, "models.yml"), fixtureModelsYaml);
+	cliEnv.env.GJC_CODING_AGENT_DIR = agentDir;
 });
 
 afterEach(async () => {
