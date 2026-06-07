@@ -225,6 +225,11 @@ async function runCommand(command: string[]): Promise<{ exitCode: number; stdout
 	return { exitCode, stdout, stderr };
 }
 
+async function sendTmuxPromptKeys(target: string, prompt: string): Promise<boolean> {
+	const sent = await runCommand(["tmux", "send-keys", "-t", target, prompt, "C-m", "C-m"]);
+	return sent.exitCode === 0;
+}
+
 function boundedLineCount(value: unknown): number {
 	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
 	if (!Number.isFinite(parsed) || parsed <= 0) return 80;
@@ -253,7 +258,7 @@ async function startTmuxSession(
 	if (started.exitCode !== 0) throw new Error(`hermes_tmux_start_failed:${started.stderr || started.stdout}`);
 	const [tmuxTarget, paneId] = started.stdout.trim().split(/\s+/, 2);
 	if (input.prompt) {
-		await runCommand(["tmux", "send-keys", "-t", tmuxTarget || sessionName, input.prompt, "C-m"]);
+		await sendTmuxPromptKeys(tmuxTarget || sessionName, input.prompt);
 	}
 	return {
 		sessionId: sessionName,
@@ -277,8 +282,7 @@ async function captureTmuxTail(session: Record<string, unknown>, lines: number):
 async function sendTmuxPrompt(session: Record<string, unknown>, prompt: string): Promise<boolean> {
 	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
 	if (typeof target !== "string" || target.length === 0) return false;
-	const sent = await runCommand(["tmux", "send-keys", "-t", target, prompt, "C-m"]);
-	return sent.exitCode === 0;
+	return await sendTmuxPromptKeys(target, prompt);
 }
 
 async function hasTmuxSession(session: Record<string, unknown>): Promise<boolean | null> {
@@ -286,6 +290,41 @@ async function hasTmuxSession(session: Record<string, unknown>): Promise<boolean
 	if (typeof tmuxSession !== "string" || tmuxSession.length === 0) return null;
 	const checked = await runCommand(["tmux", "has-session", "-t", tmuxSession]);
 	return checked.exitCode === 0;
+}
+
+function lastMatchingLine(lines: string[], pattern: RegExp): string | null {
+	for (let index = lines.length - 1; index >= 0; index--) {
+		const line = lines[index]?.trim();
+		if (line && pattern.test(line)) return line;
+	}
+	return null;
+}
+
+function summarizePaneTail(lines: string[]): Record<string, unknown> {
+	const nonEmpty = lines.map(line => line.trim()).filter(Boolean);
+	const spinnerLine = lastMatchingLine(nonEmpty, /^[⠁-⣿]\s+/u);
+	const hudLine = lastMatchingLine(nonEmpty, /\/ 📁 | PR \d+|Status Review|Tracking/i);
+	const errorLine = lastMatchingLine(nonEmpty, /\b(error|failed|exception|404|not_found)\b/i);
+	const assistantLine = lastMatchingLine(nonEmpty, /^(gajae|assistant)\b/i);
+	const lastContent = nonEmpty.at(-1) ?? null;
+	return {
+		state: spinnerLine ? "working" : errorLine ? "error_or_warning" : "idle_or_unknown",
+		activity: spinnerLine ?? hudLine ?? lastContent,
+		hud: hudLine,
+		last_error: errorLine,
+		last_speaker: assistantLine,
+		last_content: lastContent,
+	};
+}
+
+async function inspectTmuxSession(session: Record<string, unknown>, lines = 80): Promise<Record<string, unknown>> {
+	const live = await hasTmuxSession(session);
+	const tail = live ? await captureTmuxTail(session, lines) : [];
+	return {
+		live,
+		...summarizePaneTail(tail),
+		tail_preview: tail.slice(-20),
+	};
 }
 
 export async function readHermesArtifact(
@@ -332,9 +371,17 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 				const sessionId = args.session_id;
 				if (sessionId) {
 					const session = await readJsonFile(sessionFile(sessionId));
-					return { ok: true, session, live: session ? await hasTmuxSession(session) : false };
+					return { ok: true, session, status: session ? await inspectTmuxSession(session) : { live: false } };
 				}
-				return { ok: true, sessions: await listSessions() };
+				const sessions = await listSessions();
+				const statuses = await Promise.all(
+					sessions.map(async session =>
+						typeof session === "object" && session !== null
+							? { session, status: await inspectTmuxSession(session as Record<string, unknown>, 40) }
+							: { session, status: { live: null } },
+					),
+				);
+				return { ok: true, sessions, statuses };
 			}
 			if (name === "gjc_hermes_read_tail") {
 				const session = await readJsonFile(sessionFile(args.session_id));
