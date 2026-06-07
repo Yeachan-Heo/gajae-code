@@ -641,6 +641,15 @@ export class TUI extends Container {
 		} catch {
 			this.#markTerminalUnavailable();
 		}
+		// Teardown: release the retained rendered transcript so a stopped TUI does
+		// not pin a flat copy of every emitted line for the process lifetime.
+		// Safe across temporary stop/start (Ctrl-Z resume, external editor): start()
+		// issues a forced render that rebuilds this state and fully redraws, and
+		// focus/listener state is intentionally preserved so input routing survives
+		// a resume.
+		this.#previousLines = [];
+		this.#previousWidth = 0;
+		this.#previousHeight = 0;
 	}
 
 	requestRender(force = false, source = "unknown"): void {
