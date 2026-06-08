@@ -9,8 +9,8 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../src/coordinator/contract";
-import { createHermesSafetyPolicy } from "../src/hermes-mcp/safety";
-import { createHermesMcpServer, handleHermesMcpRequest } from "../src/hermes-mcp/server";
+import { createCoordinatorSafetyPolicy } from "../src/coordinator-mcp/safety";
+import { createCoordinatorMcpServer, handleCoordinatorMcpRequest } from "../src/coordinator-mcp/server";
 
 const ORIGINAL_STDOUT_WRITE = process.stdout.write.bind(process.stdout);
 
@@ -86,7 +86,7 @@ describe("gjc mcp-serve coordinator", () => {
 
 	it("implements initialize, tools/list, and read-only mutating rejection", async () => {
 		const env = { ...process.env, GJC_COORDINATOR_MCP_REPO: "repo-a" };
-		const initialize = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" }, { env });
+		const initialize = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" }, { env });
 		expect(initialize).toEqual({
 			jsonrpc: "2.0",
 			id: 1,
@@ -97,15 +97,18 @@ describe("gjc mcp-serve coordinator", () => {
 			},
 		});
 
-		const listed = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
+		const listed = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
 		expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toContain("gjc_coordinator_report_status");
-		const prompts = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 20, method: "prompts/list" }, { env });
+		const prompts = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 20, method: "prompts/list" }, { env });
 		expect(prompts.result.prompts).toEqual([]);
 
-		const resources = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 21, method: "resources/list" }, { env });
+		const resources = await handleCoordinatorMcpRequest(
+			{ jsonrpc: "2.0", id: 21, method: "resources/list" },
+			{ env },
+		);
 		expect(resources.result.resources).toEqual([]);
 
-		const called = await handleHermesMcpRequest(
+		const called = await handleCoordinatorMcpRequest(
 			{
 				jsonrpc: "2.0",
 				id: 3,
@@ -126,7 +129,7 @@ describe("gjc mcp-serve coordinator", () => {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES: "session",
 			};
-			const missingPerCall = await handleHermesMcpRequest(
+			const missingPerCall = await handleCoordinatorMcpRequest(
 				{
 					jsonrpc: "2.0",
 					id: 1,
@@ -146,7 +149,7 @@ describe("gjc mcp-serve coordinator", () => {
 				reason: "coordinator_mutation_call_not_allowed:sessions",
 			});
 
-			const allowed = await handleHermesMcpRequest(
+			const allowed = await handleCoordinatorMcpRequest(
 				{
 					jsonrpc: "2.0",
 					id: 2,
@@ -184,7 +187,7 @@ describe("gjc mcp-serve coordinator", () => {
 			try {
 				const link = path.join(root, "escape");
 				await fs.symlink(outside, link);
-				const policy = await createHermesSafetyPolicy({
+				const policy = await createCoordinatorSafetyPolicy({
 					env: { ...process.env, GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root },
 				});
 				expect(await policy.resolveWorkdir(path.join(root, "..", path.basename(root)))).toBe(root);
@@ -208,7 +211,7 @@ describe("gjc mcp-serve coordinator", () => {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
 			};
-			const server = await createHermesMcpServer({ env });
+			const server = await createCoordinatorMcpServer({ env });
 			const read = await server.callTool("gjc_coordinator_read_artifact", { path: artifact });
 			expect(read.ok).toBe(true);
 			expect(read.path).toBe(artifact);

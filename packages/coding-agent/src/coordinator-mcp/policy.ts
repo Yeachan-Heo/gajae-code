@@ -1,30 +1,30 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-export type HermesMutationClass = "sessions" | "questions" | "reports";
+export type CoordinatorMutationClass = "sessions" | "questions" | "reports";
 
-export interface HermesNamespace {
+export interface CoordinatorNamespace {
 	profile: string | null;
 	repo: string | null;
 }
 
-export interface HermesMcpConfig {
+export interface CoordinatorMcpConfig {
 	allowedRoots: string[];
-	mutationClasses: Set<HermesMutationClass>;
+	mutationClasses: Set<CoordinatorMutationClass>;
 	artifactByteCap: number;
-	namespace: HermesNamespace;
+	namespace: CoordinatorNamespace;
 	stateRoot: string;
 	sessionCommand: string | null;
 }
 
-export interface HermesMutationRequest {
+export interface CoordinatorMutationRequest {
 	allow_mutation?: boolean;
 }
 
 const DEFAULT_ARTIFACT_BYTE_CAP = 64 * 1024;
 const MAX_ARTIFACT_BYTE_CAP = 1024 * 1024;
-const MUTATION_CLASSES = new Set<HermesMutationClass>(["sessions", "questions", "reports"]);
-const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, HermesMutationClass>([
+const MUTATION_CLASSES = new Set<CoordinatorMutationClass>(["sessions", "questions", "reports"]);
+const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, CoordinatorMutationClass>([
 	["session", "sessions"],
 	["prompt", "sessions"],
 	["question", "questions"],
@@ -38,8 +38,16 @@ function parseList(value: string | undefined): string[] {
 		.filter(Boolean);
 }
 
-function parseMutationClasses(value: string | undefined): Set<HermesMutationClass> {
-	const classes = new Set<HermesMutationClass>();
+function parseRootList(value: string | undefined): string[] {
+	const normalized = (value ?? "").replace(/[\n,;]+/g, path.delimiter);
+	return normalized
+		.split(path.delimiter)
+		.map(part => part.trim())
+		.filter(Boolean);
+}
+
+function parseMutationClasses(value: string | undefined): Set<CoordinatorMutationClass> {
+	const classes = new Set<CoordinatorMutationClass>();
 	for (const raw of parseList(value)) {
 		const normalized = raw.toLowerCase();
 		if (normalized === "all") {
@@ -47,7 +55,8 @@ function parseMutationClasses(value: string | undefined): Set<HermesMutationClas
 			continue;
 		}
 		const mutationClass = LEGACY_MUTATION_CLASS_ALIASES.get(normalized) ?? normalized;
-		if (MUTATION_CLASSES.has(mutationClass as HermesMutationClass)) classes.add(mutationClass as HermesMutationClass);
+		if (MUTATION_CLASSES.has(mutationClass as CoordinatorMutationClass))
+			classes.add(mutationClass as CoordinatorMutationClass);
 	}
 	return classes;
 }
@@ -64,11 +73,11 @@ function cleanScope(value: string | undefined): string | null {
 	return trimmed.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 100) || null;
 }
 
-export function buildHermesMcpConfig(env: NodeJS.ProcessEnv = process.env): HermesMcpConfig {
+export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorMcpConfig {
 	const stateRoot =
 		env.GJC_COORDINATOR_MCP_STATE_ROOT?.trim() || path.join(process.cwd(), ".gjc", "state", "coordinator-mcp");
 	return {
-		allowedRoots: parseList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
+		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
 		mutationClasses: parseMutationClasses(
 			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,
 		),
@@ -99,12 +108,12 @@ function isInside(candidate: string, root: string): boolean {
 	return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-async function canonicalAllowedRoots(config: HermesMcpConfig): Promise<string[]> {
+async function canonicalAllowedRoots(config: CoordinatorMcpConfig): Promise<string[]> {
 	const roots = await Promise.all(config.allowedRoots.map(root => realpathIfExists(root)));
 	return roots.map(root => path.resolve(root));
 }
 
-export async function assertHermesWorkdir(config: HermesMcpConfig, cwd: unknown): Promise<string> {
+export async function assertCoordinatorWorkdir(config: CoordinatorMcpConfig, cwd: unknown): Promise<string> {
 	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
 	const requested = path.resolve(cwd);
@@ -116,8 +125,8 @@ export async function assertHermesWorkdir(config: HermesMcpConfig, cwd: unknown)
 	return requested;
 }
 
-export async function assertHermesArtifactPath(
-	config: HermesMcpConfig,
+export async function assertCoordinatorArtifactPath(
+	config: CoordinatorMcpConfig,
 	artifactPath: unknown,
 ): Promise<{ path: string; byteCap: number }> {
 	if (typeof artifactPath !== "string" || artifactPath.trim().length === 0)
@@ -132,17 +141,17 @@ export async function assertHermesArtifactPath(
 	return { path: requested, byteCap: config.artifactByteCap };
 }
 
-export function requireHermesMutation(
-	config: HermesMcpConfig,
-	mutationClass: HermesMutationClass,
-	request: HermesMutationRequest,
+export function requireCoordinatorMutation(
+	config: CoordinatorMcpConfig,
+	mutationClass: CoordinatorMutationClass,
+	request: CoordinatorMutationRequest,
 ): void {
 	if (!config.mutationClasses.has(mutationClass))
 		throw new Error(`coordinator_mutation_class_disabled:${mutationClass}`);
 	if (request.allow_mutation !== true) throw new Error(`coordinator_mutation_call_not_allowed:${mutationClass}`);
 }
 
-export function hermesNamespacePath(config: HermesMcpConfig): string {
+export function coordinatorNamespacePath(config: CoordinatorMcpConfig): string {
 	return path.join(
 		config.stateRoot,
 		config.namespace.profile ?? "unscoped-profile",

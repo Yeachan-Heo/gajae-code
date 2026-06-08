@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { COORDINATOR_MCP_TOOL_NAMES, createHermesMcpServer } from "../src/hermes-mcp/server";
+import { COORDINATOR_MCP_TOOL_NAMES, createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
 
 const tempDirs: string[] = [];
 
@@ -16,9 +16,9 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
-describe("Hermes MCP server protocol", () => {
-	it("initializes with GJC Hermes server identity and lists GJC-named tools", async () => {
-		const server = createHermesMcpServer({ env: {} });
+describe("Coordinator MCP server protocol", () => {
+	it("initializes with GJC coordinator server identity and lists GJC-named tools", async () => {
+		const server = createCoordinatorMcpServer({ env: {} });
 
 		const initialized = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
 		expect(initialized.result.serverInfo.name).toBe("gjc-coordinator-mcp");
@@ -45,7 +45,7 @@ describe("Hermes MCP server protocol", () => {
 
 	it("fails closed for mutating calls unless startup and per-call mutation are both enabled", async () => {
 		const root = await tempRoot();
-		const server = createHermesMcpServer({ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } });
+		const server = createCoordinatorMcpServer({ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } });
 
 		const disabled = await server.handleJsonRpc({
 			jsonrpc: "2.0",
@@ -57,7 +57,7 @@ describe("Hermes MCP server protocol", () => {
 		expect(disabled.result.isError).toBe(true);
 		expect(disabled.result.content[0].text).toContain("coordinator_mutation_class_disabled:sessions");
 
-		const enabledServer = createHermesMcpServer({
+		const enabledServer = createCoordinatorMcpServer({
 			env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root, GJC_COORDINATOR_MCP_MUTATIONS: "sessions" },
 		});
 		const missingPerCall = await enabledServer.handleJsonRpc({
@@ -74,7 +74,7 @@ describe("Hermes MCP server protocol", () => {
 	it("starts sessions through the structured GJC service adapter, not arbitrary terminal relay", async () => {
 		const root = await tempRoot();
 		const calls: unknown[] = [];
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
@@ -115,7 +115,7 @@ describe("Hermes MCP server protocol", () => {
 	it("persists audited follow-up, question answers, and bounded reports", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-test");
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
@@ -180,7 +180,7 @@ describe("Hermes MCP server protocol", () => {
 	it("rejects traversal-shaped session and question ids before state file access", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-test");
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
@@ -213,7 +213,7 @@ describe("Hermes MCP server protocol", () => {
 	it("creates durable turns, enforces active backpressure, and reads terminal reports", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-turns");
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
@@ -305,7 +305,7 @@ describe("Hermes MCP server protocol", () => {
 	it("validates turn and question ownership before path-addressed mutations", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-ids");
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
@@ -384,7 +384,7 @@ describe("Hermes MCP server protocol", () => {
 	it("awaits turns with bounded timeout and preserves queued turns", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-await");
-		const server = createHermesMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,

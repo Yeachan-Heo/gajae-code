@@ -247,7 +247,7 @@ providers:
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
 | `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by artifact reads (default `65536`, capped at `1048576`). |
-| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/hermes-mcp`). |
+| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_SESSION_COMMAND` | Optional GJC-compatible command used by mutating session startup to launch a detached tmux session. When unset, startup records a bridge session without tmux actuation unless a service adapter is injected. `gjc setup hermes` omits this by default and never hard-codes a provider/model; explicit values are preserved as user intent. |

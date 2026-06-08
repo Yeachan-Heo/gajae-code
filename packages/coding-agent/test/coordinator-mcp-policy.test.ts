@@ -3,11 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	assertHermesArtifactPath,
-	assertHermesWorkdir,
-	buildHermesMcpConfig,
-	requireHermesMutation,
-} from "../src/hermes-mcp/policy";
+	assertCoordinatorArtifactPath,
+	assertCoordinatorWorkdir,
+	buildCoordinatorMcpConfig,
+	requireCoordinatorMutation,
+} from "../src/coordinator-mcp/policy";
 
 const tempDirs: string[] = [];
 
@@ -23,7 +23,7 @@ afterEach(async () => {
 
 describe("Hermes MCP safety policy", () => {
 	it("defaults to read-only with no implicit global namespace", () => {
-		const config = buildHermesMcpConfig({});
+		const config = buildCoordinatorMcpConfig({});
 
 		expect(config.mutationClasses.size).toBe(0);
 		expect(config.namespace.profile).toBeNull();
@@ -32,25 +32,27 @@ describe("Hermes MCP safety policy", () => {
 	});
 
 	it("requires startup mutation opt-in and per-call allow_mutation", () => {
-		const config = buildHermesMcpConfig({ GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports" });
+		const config = buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports" });
 
-		expect(() => requireHermesMutation(config, "sessions", { allow_mutation: false })).toThrow(
+		expect(() => requireCoordinatorMutation(config, "sessions", { allow_mutation: false })).toThrow(
 			"coordinator_mutation_call_not_allowed",
 		);
-		expect(() => requireHermesMutation(config, "questions", { allow_mutation: true })).toThrow(
+		expect(() => requireCoordinatorMutation(config, "questions", { allow_mutation: true })).toThrow(
 			"coordinator_mutation_class_disabled:questions",
 		);
-		expect(() => requireHermesMutation(config, "sessions", { allow_mutation: true })).not.toThrow();
+		expect(() => requireCoordinatorMutation(config, "sessions", { allow_mutation: true })).not.toThrow();
 	});
 
 	it("rejects workdirs outside canonical allowlisted roots", async () => {
 		const root = await tempRoot();
 		const outside = await tempRoot();
-		const config = buildHermesMcpConfig({ GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root });
+		const config = buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root });
 
-		await expect(assertHermesWorkdir(config, path.join(root, "child"))).resolves.toBe(path.join(root, "child"));
-		await expect(assertHermesWorkdir(config, outside)).rejects.toThrow("coordinator_workdir_outside_allowed_roots");
-		await expect(assertHermesWorkdir(config, path.join(root, "..", path.basename(outside)))).rejects.toThrow(
+		await expect(assertCoordinatorWorkdir(config, path.join(root, "child"))).resolves.toBe(path.join(root, "child"));
+		await expect(assertCoordinatorWorkdir(config, outside)).rejects.toThrow(
+			"coordinator_workdir_outside_allowed_roots",
+		);
+		await expect(assertCoordinatorWorkdir(config, path.join(root, "..", path.basename(outside)))).rejects.toThrow(
 			"coordinator_workdir_outside_allowed_roots",
 		);
 	});
@@ -63,15 +65,15 @@ describe("Hermes MCP safety policy", () => {
 		await Bun.write(safeFile, "abcdef");
 		await Bun.write(path.join(outside, "secret.txt"), "secret");
 		await fs.symlink(path.join(outside, "secret.txt"), escapedLink);
-		const config = buildHermesMcpConfig({
+		const config = buildCoordinatorMcpConfig({
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 			GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: "3",
 		});
 
-		const safe = await assertHermesArtifactPath(config, safeFile);
+		const safe = await assertCoordinatorArtifactPath(config, safeFile);
 		expect(safe.path).toBe(safeFile);
 		expect(safe.byteCap).toBe(3);
-		await expect(assertHermesArtifactPath(config, escapedLink)).rejects.toThrow(
+		await expect(assertCoordinatorArtifactPath(config, escapedLink)).rejects.toThrow(
 			"coordinator_artifact_outside_allowed_roots",
 		);
 	});

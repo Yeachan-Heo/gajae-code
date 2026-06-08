@@ -8,6 +8,7 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../coordinator/contract";
+import { createCoordinatorMcpServer } from "../coordinator-mcp/server";
 import operatorInstructionsTemplate from "./hermes/templates/operator-instructions.v1.md" with { type: "text" };
 
 export type HermesMutationClass = "sessions" | "questions" | "reports";
@@ -355,9 +356,12 @@ async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promis
 	return written;
 }
 
-function runSmoke(spec: CoordinatorSetupSpec): HermesSetupResult["smoke"] {
+async function runSmoke(spec: CoordinatorSetupSpec): Promise<HermesSetupResult["smoke"]> {
 	const requiredTools = [...COORDINATOR_MCP_TOOL_NAMES];
-	const missingTools = requiredTools.filter(tool => !COORDINATOR_MCP_TOOL_NAMES.includes(tool));
+	const server = createCoordinatorMcpServer({ env: {} });
+	const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+	const advertised = new Set((listed.result?.tools ?? []).map((tool: { name: string }) => tool.name));
+	const missingTools = requiredTools.filter(tool => !advertised.has(tool));
 	return {
 		ok: missingTools.length === 0,
 		protocolVersion: spec.protocolVersion,
@@ -385,7 +389,7 @@ export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSet
 		{ path: operatorPathForTarget(spec) ?? "operator-instructions.v1.md", content: renderOperatorTemplate(spec) },
 	];
 	const files_written = flags.install ? await installConfig(spec, Boolean(flags.force)) : [];
-	const smoke = flags.smoke ? runSmoke(spec) : null;
+	const smoke = flags.smoke ? await runSmoke(spec) : null;
 	if (smoke && !smoke.ok) {
 		throw new HermesSetupError(`Hermes MCP smoke failed; missing tools: ${smoke.missingTools.join(", ")}`, 4);
 	}

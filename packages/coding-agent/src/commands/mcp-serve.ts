@@ -4,7 +4,7 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../coordinator/contract";
-import { runHermesMcpStdio } from "../hermes-mcp/server";
+import { runCoordinatorMcpStdio } from "../coordinator-mcp/server";
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -57,6 +57,6 @@ export default class McpServe extends Command {
 			return;
 		}
 
-		await runHermesMcpStdio();
+		await runCoordinatorMcpStdio();
 	}
 }

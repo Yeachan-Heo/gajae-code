@@ -9,12 +9,12 @@ import {
 	type CoordinatorToolName,
 } from "../coordinator/contract";
 import {
-	assertHermesArtifactPath,
-	assertHermesWorkdir,
-	buildHermesMcpConfig,
-	type HermesMcpConfig,
-	hermesNamespacePath,
-	requireHermesMutation,
+	assertCoordinatorArtifactPath,
+	assertCoordinatorWorkdir,
+	buildCoordinatorMcpConfig,
+	type CoordinatorMcpConfig,
+	coordinatorNamespacePath,
+	requireCoordinatorMutation,
 } from "./policy";
 
 export type { CoordinatorToolName };
@@ -41,14 +41,14 @@ interface SessionStartInput {
 	worktree: true;
 }
 
-interface HermesServices {
+interface CoordinatorServices {
 	listSessions?: () => unknown[] | Promise<unknown[]>;
 	startSession?: (input: SessionStartInput) => unknown | Promise<unknown>;
 }
 
-interface HermesMcpServerOptions {
+interface CoordinatorMcpServerOptions {
 	env?: NodeJS.ProcessEnv;
-	services?: HermesServices;
+	services?: CoordinatorServices;
 }
 
 interface LegacyHandlerOptions {
@@ -122,13 +122,13 @@ function toolSchema(name: CoordinatorToolName): {
 		type: "string",
 		description: "Canonicalized GJC worktree or project directory inside configured roots.",
 	};
-	const sessionId = { type: "string", description: "GJC Hermes bridge session id." };
+	const sessionId = { type: "string", description: "GJC coordinator bridge session id." };
 	const pathField = { type: "string", description: "Artifact path inside configured safe roots." };
 	const common = { type: "object", properties: {} as Record<string, unknown> };
 	if (name === "gjc_coordinator_start_session") {
 		return {
 			name,
-			description: "Start a GJC worktree/tmux oriented session through the Hermes bridge.",
+			description: "Start a GJC worktree/tmux oriented session through the coordinator bridge.",
 			inputSchema: {
 				type: "object",
 				properties: { cwd, prompt: { type: "string" }, allow_mutation: allowMutation },
@@ -140,7 +140,7 @@ function toolSchema(name: CoordinatorToolName): {
 		return {
 			name,
 			description:
-				"Create a durable turn and deliver a bounded follow-up prompt for a selected Hermes bridge session.",
+				"Create a durable turn and deliver a bounded follow-up prompt for a selected coordinator bridge session.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -202,7 +202,7 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_report_status") {
 		return {
 			name,
-			description: "Write a bounded Hermes coordination status report.",
+			description: "Write a bounded coordinator coordination status report.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -229,7 +229,7 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_read_status") {
 		return {
 			name,
-			description: "Read selected Hermes bridge session status.",
+			description: "Read selected coordinator bridge session status.",
 			inputSchema: { type: "object", properties: { session_id: sessionId } },
 		};
 	}
@@ -243,17 +243,17 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_list_questions") {
 		return {
 			name,
-			description: "List bounded structured questions for Hermes coordination.",
+			description: "List bounded structured questions for coordinator coordination.",
 			inputSchema: { type: "object", properties: { session_id: sessionId, status: { type: "string" } } },
 		};
 	}
 	if (name === "gjc_coordinator_list_artifacts") {
-		return { name, description: "List known safe artifact roots for Hermes coordination.", inputSchema: common };
+		return { name, description: "List known safe artifact roots for coordinator coordination.", inputSchema: common };
 	}
 	if (name === "gjc_coordinator_read_coordination_status") {
-		return { name, description: "Read Hermes coordination reports.", inputSchema: common };
+		return { name, description: "Read coordinator coordination reports.", inputSchema: common };
 	}
-	return { name, description: "List known scoped GJC Hermes bridge sessions.", inputSchema: common };
+	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
 }
 
 function normalizeSession(session: any): Record<string, unknown> {
@@ -351,7 +351,12 @@ async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 	if (active?.turn_id === turn.turn_id) await fs.rm(activeTurnFile(namespaceDir, turn.session_id), { force: true });
 }
 
-function makeTurnRecord(config: HermesMcpConfig, sessionId: string, prompt: string, status: TurnStatus): TurnRecord {
+function makeTurnRecord(
+	config: CoordinatorMcpConfig,
+	sessionId: string,
+	prompt: string,
+	status: TurnStatus,
+): TurnRecord {
 	const timestamp = new Date().toISOString();
 	return {
 		schema_version: 1,
@@ -415,7 +420,7 @@ function boundedLineCount(value: unknown): number {
 }
 
 async function startTmuxSession(
-	config: HermesMcpConfig,
+	config: CoordinatorMcpConfig,
 	input: SessionStartInput,
 ): Promise<Record<string, unknown> | null> {
 	if (!config.sessionCommand) return null;
@@ -518,13 +523,13 @@ function decodeUtf8WithinByteCap(bytes: Buffer, byteCap: number): string {
 	return "";
 }
 
-export async function readHermesArtifact(
-	config: HermesMcpConfig,
+export async function readCoordinatorArtifact(
+	config: CoordinatorMcpConfig,
 	args: { path: unknown },
 ): Promise<Record<string, unknown>> {
 	let handle: fs.FileHandle | null = null;
 	try {
-		const resolved = await assertHermesArtifactPath(config, args.path);
+		const resolved = await assertCoordinatorArtifactPath(config, args.path);
 		handle = await fs.open(resolved.path, "r");
 		const readLimit = resolved.byteCap + 1;
 		const buffer = Buffer.alloc(readLimit);
@@ -548,10 +553,10 @@ export async function readHermesArtifact(
 	}
 }
 
-export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
-	const config = buildHermesMcpConfig(options.env ?? process.env);
+export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions = {}) {
+	const config = buildCoordinatorMcpConfig(options.env ?? process.env);
 	const services = options.services ?? {};
-	const namespaceDir = hermesNamespacePath(config);
+	const namespaceDir = coordinatorNamespacePath(config);
 
 	async function listSessions(): Promise<unknown[]> {
 		if (!config.namespace.profile || !config.namespace.repo) return [];
@@ -606,12 +611,13 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 			if (name === "gjc_coordinator_list_questions")
 				return { ok: true, questions: await listJsonFiles(path.join(namespaceDir, "questions")) };
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
-			if (name === "gjc_coordinator_read_artifact") return await readHermesArtifact(config, { path: args.path });
+			if (name === "gjc_coordinator_read_artifact")
+				return await readCoordinatorArtifact(config, { path: args.path });
 			if (name === "gjc_coordinator_read_coordination_status")
 				return { ok: true, reports: await listJsonFiles(path.join(namespaceDir, "reports")) };
 			if (name === "gjc_coordinator_start_session") {
-				requireHermesMutation(config, "sessions", args);
-				const cwd = await assertHermesWorkdir(config, args.cwd);
+				requireCoordinatorMutation(config, "sessions", args);
+				const cwd = await assertCoordinatorWorkdir(config, args.cwd);
 				const input = {
 					cwd,
 					prompt: typeof args.prompt === "string" ? args.prompt : undefined,
@@ -628,7 +634,7 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 				return { ok: true, session };
 			}
 			if (name === "gjc_coordinator_send_prompt") {
-				requireHermesMutation(config, "sessions", args);
+				requireCoordinatorMutation(config, "sessions", args);
 				const sessionId = safeExternalId("session", args.session_id);
 				const session = await readJsonFile(sessionFile(sessionId));
 				if (!session) return { ok: false, reason: "unknown_session", session_id: sessionId };
@@ -715,7 +721,7 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 				return payload;
 			}
 			if (name === "gjc_coordinator_submit_question_answer") {
-				requireHermesMutation(config, "questions", args);
+				requireCoordinatorMutation(config, "questions", args);
 				const questionId = safeExternalId("question", args.question_id);
 				const questionPath = questionFile(namespaceDir, questionId);
 				const question = await readJsonFile(questionPath);
@@ -753,7 +759,7 @@ export function createHermesMcpServer(options: HermesMcpServerOptions = {}) {
 				return { ok: true, question: answered, ...(turn ? { turn } : {}) };
 			}
 			if (name === "gjc_coordinator_report_status") {
-				requireHermesMutation(config, "reports", args);
+				requireCoordinatorMutation(config, "reports", args);
 				const report = {
 					session_id: args.session_id,
 					turn_id: args.turn_id,
@@ -855,7 +861,7 @@ function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; te
 	return textResult(payload, failed);
 }
 
-export async function handleHermesMcpRequest(
+export async function handleCoordinatorMcpRequest(
 	request: JsonRpcRequest,
 	options: LegacyHandlerOptions = {},
 ): Promise<any> {
@@ -887,7 +893,7 @@ export async function handleHermesMcpRequest(
 		};
 	const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 	const args = params.arguments ?? {};
-	const server = createHermesMcpServer({
+	const server = createCoordinatorMcpServer({
 		env: options.env ?? process.env,
 		services: options.createSession ? { startSession: () => options.createSession?.() } : undefined,
 	});
@@ -898,8 +904,8 @@ export async function handleHermesMcpRequest(
 	};
 }
 
-export async function runHermesMcpStdio(options: HermesMcpServerOptions = {}): Promise<void> {
-	const server = createHermesMcpServer(options);
+export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
+	const server = createCoordinatorMcpServer(options);
 	let buffer = "";
 	for await (const chunk of process.stdin) {
 		buffer += chunk.toString();

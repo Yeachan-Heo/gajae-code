@@ -10,14 +10,14 @@ The bridge is intentionally separate from GJC's client-side MCP runtime. It lets
 
 ## Core contract and adapters
 
-Hermes integration is intentionally a core contract with multiple adapters, not an MCP-only product direction:
+The coordinator bridge is intentionally a core contract with multiple adapters, not an MCP-only product direction. Hermes is one coordinator preset, not a product layer:
 
 - `packages/coding-agent/src/coordinator/contract.ts` owns transport-neutral server metadata and tool names.
 - `gjc mcp-serve coordinator` is the outward MCP adapter for Hermes-style agents.
-- `gjc hermes` is the read-only CLI/debug adapter for humans and scripts that need to inspect the same contract without starting MCP transport.
+- `gjc coordinator` is the read-only CLI/debug adapter for humans and scripts that need to inspect the same contract without starting MCP transport.
 - `gjc setup hermes` is the setup adapter that renders coordinator config and operator guidance.
 
-Future session, turn, question, artifact, and report behavior should move toward shared Hermes core services that both MCP and CLI adapters call instead of duplicating transport-specific logic.
+Future session, turn, question, artifact, and report behavior should move toward shared coordinator core services that both MCP and CLI adapters call instead of duplicating transport-specific logic.
 
 ## Standard Hermes setup
 
