@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import HermesCommand from "../src/commands/hermes";
 import McpServeCommand from "../src/commands/mcp-serve";
+import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../src/hermes/contract";
 import { createHermesSafetyPolicy } from "../src/hermes-mcp/safety";
 import { createHermesMcpServer, handleHermesMcpRequest } from "../src/hermes-mcp/server";
 
@@ -32,6 +34,21 @@ async function runCommand(argv: string[]): Promise<string> {
 	}
 }
 
+async function runHermesCommand(argv: string[]): Promise<string> {
+	let output = "";
+	const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+		output += chunk.toString();
+		return true;
+	});
+	try {
+		const command = new HermesCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
+		await command.run();
+		return output;
+	} finally {
+		writeSpy.mockRestore();
+	}
+}
+
 afterEach(() => {
 	process.stdout.write = ORIGINAL_STDOUT_WRITE;
 });
@@ -41,17 +58,26 @@ describe("gjc mcp-serve hermes", () => {
 		const ok = JSON.parse(await runCommand(["hermes", "--check", "--json"]));
 		expect(ok).toEqual({
 			ok: true,
-			server: { name: "gjc-hermes-mcp", protocolVersion: "2024-11-05" },
+			server: { name: HERMES_MCP_SERVER_NAME, protocolVersion: HERMES_MCP_PROTOCOL_VERSION },
 			readOnly: true,
-			tools: expect.arrayContaining([
-				"gjc_hermes_list_sessions",
-				"gjc_hermes_start_session",
-				"gjc_hermes_read_artifact",
-			]),
+			tools: [...HERMES_MCP_TOOL_NAMES],
 		});
 
 		const rejected = JSON.parse(await runCommand(["bogus", "--json"]));
 		expect(rejected).toEqual({ ok: false, reason: "unknown_mcp_serve_subcommand", subcommand: "bogus" });
+	});
+
+	it("exposes the same Hermes contract through the read-only CLI adapter", async () => {
+		const ok = JSON.parse(await runHermesCommand(["--json"]));
+		expect(ok).toEqual({
+			ok: true,
+			server: { name: HERMES_MCP_SERVER_NAME, protocolVersion: HERMES_MCP_PROTOCOL_VERSION },
+			readOnly: true,
+			tools: [...HERMES_MCP_TOOL_NAMES],
+		});
+
+		const tools = JSON.parse(await runHermesCommand(["tools", "--json"]));
+		expect(tools).toEqual({ ok: true, tools: [...HERMES_MCP_TOOL_NAMES] });
 	});
 
 	it("implements initialize, tools/list, and read-only mutating rejection", async () => {

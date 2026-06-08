@@ -1,10 +1,6 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import {
-	HERMES_MCP_PROTOCOL_VERSION,
-	HERMES_MCP_SERVER_NAME,
-	HERMES_MCP_TOOL_NAMES,
-	runHermesMcpStdio,
-} from "../hermes-mcp/server";
+import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../hermes/contract";
+import { runHermesMcpStdio } from "../hermes-mcp/server";
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);

@@ -8,6 +8,17 @@ gjc mcp-serve hermes
 
 The bridge is intentionally separate from GJC's client-side MCP runtime. It lets an external coordinator list sessions, start worktree/tmux-oriented sessions, queue bounded follow-up prompts, read status/tail/artifacts, handle structured questions, and write coordination reports without scraping terminal scrollback.
 
+## Core contract and adapters
+
+Hermes integration is intentionally a core contract with multiple adapters, not an MCP-only product direction:
+
+- `packages/coding-agent/src/hermes/contract.ts` owns transport-neutral server metadata and tool names.
+- `gjc mcp-serve hermes` is the outward MCP adapter for Hermes-style agents.
+- `gjc hermes` is the read-only CLI/debug adapter for humans and scripts that need to inspect the same contract without starting MCP transport.
+- `gjc setup hermes` is the setup adapter that renders coordinator config and operator guidance.
+
+Future session, turn, question, artifact, and report behavior should move toward shared Hermes core services that both MCP and CLI adapters call instead of duplicating transport-specific logic.
+
 ## Standard Hermes setup
 
 Use `gjc setup hermes` to render or install a portable Hermes MCP setup package:

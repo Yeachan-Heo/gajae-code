@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../hermes-mcp/server";
+import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../hermes/contract";
 import operatorInstructionsTemplate from "./hermes/templates/operator-instructions.v1.md" with { type: "text" };
 
 export type HermesMutationClass = "sessions" | "questions" | "reports";
