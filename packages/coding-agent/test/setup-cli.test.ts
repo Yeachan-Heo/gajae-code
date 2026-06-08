@@ -128,4 +128,169 @@ describe("setup CLI parsing", () => {
 		expect(parsed.providers["custom-minimax"]?.apiKeyEnv).toBe("CUSTOM_KEY");
 		expect(parsed.providers["custom-minimax"]?.models.map(model => model.id)).toEqual(["custom-model"]);
 	});
+
+	describe("Hermes setup", () => {
+		afterEach(async () => {
+			vi.restoreAllMocks();
+			if (tempRoot) {
+				await fs.rm(tempRoot, { recursive: true, force: true });
+				tempRoot = undefined;
+			}
+		});
+
+		it("parses Hermes setup flags without treating models as defaults", () => {
+			expect(
+				parseSetupArgs([
+					"setup",
+					"hermes",
+					"--root",
+					"/tmp/repo",
+					"--profile",
+					"bot",
+					"--repo",
+					"gajae-code",
+					"--session-command",
+					"gjc --model openai/gpt-5.5",
+					"--mutation",
+					"sessions,reports",
+					"--json",
+				]),
+			).toEqual({
+				component: "hermes",
+				flags: {
+					root: ["/tmp/repo"],
+					profile: "bot",
+					repo: "gajae-code",
+					sessionCommand: "gjc --model openai/gpt-5.5",
+					mutation: ["sessions,reports"],
+					json: true,
+				},
+			});
+		});
+
+		it("renders Hermes setup without a product-default model", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					root: [tempRoot],
+				},
+			});
+
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			const parsed = JSON.parse(output) as { previews: Array<{ path: string; content: string }> };
+			const configPreview = parsed.previews.find(preview => preview.path.endsWith(".yaml"))?.content ?? "";
+			expect(configPreview).not.toContain("openai/gpt-5.5");
+			expect(configPreview).not.toContain("--model");
+			expect(configPreview).not.toContain("GJC_HERMES_MCP_SESSION_COMMAND");
+		});
+
+		it("preserves explicit Hermes session commands exactly", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			const sessionCommand = "gjc --model anthropic/claude-sonnet-4";
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					root: [tempRoot],
+					sessionCommand,
+				},
+			});
+
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			expect(output).toContain(sessionCommand);
+		});
+
+		it("installs Hermes config without overwriting unrelated servers", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			const configPath = path.join(tempRoot, "config.yaml");
+			await Bun.write(
+				configPath,
+				YAML.stringify({
+					mcp_servers: {
+						other: {
+							command: "other",
+						},
+					},
+				}),
+			);
+			vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					install: true,
+					root: [tempRoot],
+					target: configPath,
+					mutation: ["sessions,questions"],
+				},
+			});
+
+			const parsed = YAML.parse(await Bun.file(configPath).text()) as {
+				mcp_servers: Record<string, { command: string; env?: Record<string, string> }>;
+			};
+			expect(parsed.mcp_servers.other?.command).toBe("other");
+			expect(parsed.mcp_servers.gjc_hermes?.command).toBe("gjc");
+			expect(parsed.mcp_servers.gjc_hermes?.env?.GJC_HERMES_MCP_MUTATIONS).toBe("sessions,questions");
+			expect(parsed.mcp_servers.gjc_hermes?.env?.GJC_HERMES_MCP_SESSION_COMMAND).toBeUndefined();
+		});
+
+		it("rejects unmanaged Hermes server conflicts unless forced", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			const configPath = path.join(tempRoot, "config.yaml");
+			await Bun.write(
+				configPath,
+				YAML.stringify({
+					mcp_servers: {
+						gjc_hermes: {
+							command: "custom",
+						},
+					},
+				}),
+			);
+			vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			vi.spyOn(process, "exit").mockImplementation((code?: string | number | null | undefined): never => {
+				throw new Error(`exit ${code}`);
+			});
+
+			await expect(
+				runSetupCommand({
+					component: "hermes",
+					flags: {
+						json: true,
+						install: true,
+						root: [tempRoot],
+						target: configPath,
+					},
+				}),
+			).rejects.toThrow("exit 3");
+		});
+
+		it("smoke checks the current Hermes MCP tool contract without provider credentials", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					smoke: true,
+					root: [tempRoot],
+				},
+			});
+
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			const parsed = JSON.parse(output) as { smoke: { requiredTools: string[] } };
+			expect(parsed.smoke.requiredTools).toContain("gjc_hermes_send_prompt");
+			expect(parsed.smoke.requiredTools).toContain("gjc_hermes_submit_question_answer");
+			expect(output).not.toContain("OPENAI");
+			expect(output).not.toContain("ANTHROPIC");
+		});
+	});
 });

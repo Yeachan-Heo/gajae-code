@@ -8,6 +8,45 @@ gjc mcp-serve hermes
 
 The bridge is intentionally separate from GJC's client-side MCP runtime. It lets an external coordinator list sessions, start worktree/tmux-oriented sessions, queue bounded follow-up prompts, read status/tail/artifacts, handle structured questions, and write coordination reports without scraping terminal scrollback.
 
+## Standard Hermes setup
+
+Use `gjc setup hermes` to render or install a portable Hermes MCP setup package:
+
+```bash
+gjc setup hermes --root /path/to/repo --profile my-bot --repo gajae-code
+```
+
+The default mode is render-only and writes no files. To install into a Hermes profile:
+
+```bash
+gjc setup hermes \
+  --root /path/to/repo \
+  --profile my-bot \
+  --repo gajae-code \
+  --mutation sessions,questions,reports \
+  --profile-dir /path/to/hermes/profile \
+  --install
+```
+
+The generated setup is model-agnostic. By default it does not render `GJC_HERMES_MCP_SESSION_COMMAND`, so spawned sessions use the user's normal GJC model/provider resolution. Users who need a specific local wrapper, dev checkout, or provider/model can opt in explicitly:
+
+```bash
+gjc setup hermes \
+  --root /path/to/repo \
+  --session-command "gjc --model <provider/model>"
+```
+
+Provider/model examples are examples only; GJC does not hard-code GPT, Anthropic, or any other provider as the Hermes bridge default.
+
+Run a non-mutating setup smoke check with:
+
+```bash
+gjc setup hermes --root /path/to/repo --smoke
+```
+
+Smoke verifies the MCP server/tool contract. It does not call a downstream LLM and does not validate provider credentials.
+
+
 ## Safety model
 
 The bridge is read-only and fail-closed by default.
@@ -35,6 +74,8 @@ export GJC_HERMES_MCP_SESSION_COMMAND="/path/to/gjc"
 When set, `gjc_hermes_start_session` launches a detached tmux session, `gjc_hermes_send_prompt` creates a durable turn and sends input to that pane, and `gjc_hermes_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_hermes_report_status`.
 
 Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP`.
+
+`gjc setup hermes` renders `GJC_HERMES_MCP_WORKDIR_ROOTS` with the host platform path delimiter (`:` on POSIX, `;` on Windows). Manual configs should prefer the same encoding.
 
 ## Optional namespace
 

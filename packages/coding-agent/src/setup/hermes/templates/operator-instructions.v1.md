@@ -1,0 +1,29 @@
+# GJC Hermes operator instructions v{{TEMPLATE_VERSION}}
+
+Server key: {{SERVER_KEY}}
+
+These instructions teach a Hermes-style coordinator how to operate GJC through the `{{TOOL_PREFIX}}_*` MCP tools. They are setup guidance, not a GJC workflow skill.
+
+## Core loop
+
+1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled.
+2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
+3. Store the returned `turn_id`.
+4. Poll `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for that `turn_id` until the turn is terminal.
+5. If GJC asks a structured question, use `{{TOOL_PREFIX}}_list_questions` and answer with `{{TOOL_PREFIX}}_submit_question_answer`.
+6. Use `{{TOOL_PREFIX}}_report_status` for coordinator-visible status and final reports.
+7. Use `{{TOOL_PREFIX}}_read_tail` only as advisory debug output when structured turn state is insufficient.
+
+Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
+
+## Model and provider policy
+
+The Hermes bridge does not choose a model/provider. When no session command is configured, GJC uses its normal local model/provider resolution. If the operator config supplies `GJC_HERMES_MCP_SESSION_COMMAND`, preserve it as explicit user intent.
+
+Provider-specific commands are examples only, never product defaults.
+
+## Safety
+
+- Mutating tools require bridge startup mutation classes and per-call consent.
+- Allowed roots restrict workdir and artifact paths.
+- Artifact reads are bounded and should be treated as evidence, not unlimited filesystem access.

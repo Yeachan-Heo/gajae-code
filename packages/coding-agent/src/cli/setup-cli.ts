@@ -15,13 +15,19 @@ import {
 } from "../hooks/codex-native-hooks-config";
 import { theme } from "../modes/theme/theme";
 import {
+	formatHermesSetupResult,
+	type HermesSetupFlags,
+	hermesSetupExitCode,
+	runHermesSetup,
+} from "../setup/hermes-setup";
+import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 
-export type SetupComponent = "defaults" | "hooks" | "provider" | "python" | "stt";
+export type SetupComponent = "defaults" | "hermes" | "hooks" | "provider" | "python" | "stt";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -36,10 +42,23 @@ export interface SetupCommandArgs {
 		apiKeyEnv?: string;
 		model?: string[];
 		modelsPath?: string;
+		smoke?: boolean;
+		install?: boolean;
+		root?: string[];
+		repo?: string;
+		profile?: string;
+		sessionCommand?: string;
+		stateRoot?: string;
+		mutation?: string[];
+		artifactByteCap?: string;
+		serverKey?: string;
+		gjcCommand?: string;
+		target?: string;
+		profileDir?: string;
 	};
 }
 
-const VALID_COMPONENTS: SetupComponent[] = ["defaults", "hooks", "provider", "python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = ["defaults", "hermes", "hooks", "provider", "python", "stt"];
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -88,6 +107,32 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.check = true;
 		} else if (arg === "--force" || arg === "-f") {
 			flags.force = true;
+		} else if (arg === "--smoke") {
+			flags.smoke = true;
+		} else if (arg === "--install") {
+			flags.install = true;
+		} else if (arg === "--root") {
+			flags.root = [...(flags.root ?? []), args[++i] ?? ""];
+		} else if (arg === "--repo") {
+			flags.repo = args[++i];
+		} else if (arg === "--profile") {
+			flags.profile = args[++i];
+		} else if (arg === "--session-command") {
+			flags.sessionCommand = args[++i];
+		} else if (arg === "--state-root") {
+			flags.stateRoot = args[++i];
+		} else if (arg === "--mutation") {
+			flags.mutation = [...(flags.mutation ?? []), args[++i] ?? ""];
+		} else if (arg === "--artifact-byte-cap") {
+			flags.artifactByteCap = args[++i];
+		} else if (arg === "--server-key") {
+			flags.serverKey = args[++i];
+		} else if (arg === "--gjc-command") {
+			flags.gjcCommand = args[++i];
+		} else if (arg === "--target") {
+			flags.target = args[++i];
+		} else if (arg === "--profile-dir") {
+			flags.profileDir = args[++i];
 		} else if (arg === "--compat") {
 			flags.compat = args[++i];
 		} else if (arg === "--preset") {
@@ -177,6 +222,9 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 		case "defaults":
 			await handleDefaultsSetup(cmd.flags);
 			break;
+		case "hermes":
+			await handleHermesSetup(cmd.flags);
+			break;
 		case "hooks":
 			await handleHooksSetup(cmd.flags);
 			break;
@@ -192,6 +240,26 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	}
 }
 
+async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
+	try {
+		const result = await runHermesSetup(flags);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+			return;
+		}
+		process.stdout.write(`${chalk.green(`${theme.status.success} Hermes MCP setup ready`)}\n`);
+		process.stdout.write(`${chalk.dim(formatHermesSetupResult(result))}\n`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+		} else {
+			process.stderr.write(`${chalk.red(`${theme.status.error} Hermes MCP setup failed`)}\n`);
+			process.stderr.write(`${chalk.dim(message)}\n`);
+		}
+		process.exit(hermesSetupExitCode(error));
+	}
+}
 async function handleProviderSetup(flags: {
 	json?: boolean;
 	force?: boolean;
@@ -410,6 +478,7 @@ ${chalk.bold("Usage:")}
 
 ${chalk.bold("Components:")}
   defaults  Install bundled GJC default workflow skills (default)
+  hermes   Optional: render/install a Hermes MCP bridge setup package
   hooks     Optional: install GJC native Codex UserPromptSubmit/Stop skill-state hooks
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
@@ -420,6 +489,11 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset minimax
   ${APP_NAME} setup provider --preset glm
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
+
+${chalk.bold("Hermes example:")}
+  ${APP_NAME} setup hermes --root /path/to/repo
+  ${APP_NAME} setup hermes --root /path/to/repo --profile my-bot --repo gajae-code --profile-dir /path/to/hermes/profile --install
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --model <provider/model>"
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -432,6 +506,15 @@ ${chalk.bold("Options:")}
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
   --models-path     Override models config path
+  --smoke           Run Hermes MCP setup smoke checks
+  --install         Install generated Hermes setup files
+  --root            Allowed Hermes MCP workdir/artifact root (repeatable)
+  --profile         Hermes MCP profile namespace
+  --repo            Hermes MCP repo namespace
+  --session-command Explicit GJC session command; omitted by default
+  --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
+  --target          Hermes config file target for config-only install
+  --profile-dir     Hermes profile directory for full setup install
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills
@@ -439,6 +522,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup defaults --check Check bundled GJC default workflow skills are installed
   ${APP_NAME} setup hooks            Install native Codex skill-state hooks
   ${APP_NAME} setup hooks --check    Check native Codex skill-state hooks
+  ${APP_NAME} setup hermes           Render a model-agnostic Hermes MCP setup preview
   ${APP_NAME} setup python           Install Python execution dependencies
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available

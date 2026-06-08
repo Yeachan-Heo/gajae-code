@@ -5,7 +5,7 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const COMPONENTS: SetupComponent[] = ["defaults", "hooks", "provider", "python", "stt"];
+const COMPONENTS: SetupComponent[] = ["defaults", "hermes", "hooks", "provider", "python", "stt"];
 
 export default class Setup extends Command {
 	static description = "Install GJC defaults or optional feature dependencies";
@@ -22,6 +22,22 @@ export default class Setup extends Command {
 		check: Flags.boolean({ char: "c", description: "Check if dependencies are installed" }),
 		force: Flags.boolean({ char: "f", description: "Overwrite existing default workflow skill files" }),
 		json: Flags.boolean({ description: "Output status as JSON" }),
+		smoke: Flags.boolean({ description: "Run Hermes MCP setup smoke checks" }),
+		install: Flags.boolean({ description: "Install generated Hermes setup files" }),
+		root: Flags.string({ description: "Allowed Hermes MCP workdir/artifact root (repeatable)", multiple: true }),
+		repo: Flags.string({ description: "Hermes MCP repo namespace" }),
+		profile: Flags.string({ description: "Hermes MCP profile namespace" }),
+		"session-command": Flags.string({ description: "Explicit GJC session command for Hermes to launch" }),
+		"state-root": Flags.string({ description: "Hermes MCP coordination state root" }),
+		mutation: Flags.string({
+			description: "Hermes MCP mutation classes: sessions,questions,reports,all",
+			multiple: true,
+		}),
+		"artifact-byte-cap": Flags.string({ description: "Hermes MCP artifact read byte cap" }),
+		"server-key": Flags.string({ description: "Hermes MCP server key in coordinator config" }),
+		"gjc-command": Flags.string({ description: "Command used to start `gjc mcp-serve hermes`" }),
+		target: Flags.string({ description: "Hermes config file target for config-only install" }),
+		"profile-dir": Flags.string({ description: "Hermes profile directory for full setup install" }),
 		preset: Flags.string({ description: "Provider preset: minimax, minimax-cn, or glm" }),
 		compat: Flags.string({ description: "Provider compatibility: openai or anthropic" }),
 		provider: Flags.string({ description: "Provider id to add to models.yml" }),
@@ -46,6 +62,19 @@ export default class Setup extends Command {
 				apiKeyEnv: flags["api-key-env"],
 				model: flags.model,
 				modelsPath: flags["models-path"],
+				smoke: flags.smoke,
+				install: flags.install,
+				root: flags.root,
+				repo: flags.repo,
+				profile: flags.profile,
+				sessionCommand: flags["session-command"],
+				stateRoot: flags["state-root"],
+				mutation: flags.mutation,
+				artifactByteCap: flags["artifact-byte-cap"],
+				serverKey: flags["server-key"],
+				gjcCommand: flags["gjc-command"],
+				target: flags.target,
+				profileDir: flags["profile-dir"],
 			},
 		};
 		await initTheme();
