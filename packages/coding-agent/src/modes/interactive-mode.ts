@@ -55,6 +55,11 @@ import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" wit
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
+import {
+	createStarReminderBeforeAgentStartContributor,
+	scheduleLaunchStarReminderAfterFirstRender,
+	starReminderLaunchGate,
+} from "../reminders/star-reminder";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
@@ -552,6 +557,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
 		this.ui.requestRender(true);
+
+		// GitHub star reminder (interactive-only). Register the decline-driven
+		// injection contributor and schedule the launch nudge after the first
+		// render so the networked gh check never blocks startup.
+		const starReminderGate = starReminderLaunchGate({
+			enabled: settings.get("starReminder.enabled"),
+			quiet: startupQuiet,
+		});
+		if (starReminderGate.register) {
+			this.session.registerBeforeAgentStartContributor(
+				createStarReminderBeforeAgentStartContributor({
+					getSessionId: () => this.sessionManager.getSessionId(),
+				}),
+			);
+		}
+		if (starReminderGate.schedule) {
+			scheduleLaunchStarReminderAfterFirstRender({
+				confirm: (title, message) => this.showHookConfirm(title, message),
+				isIdle: () => !this.session.isStreaming && !this.isBackgrounded && !this.hookSelector,
+			});
+		}
 
 		// Initialize hooks with TUI-based UI context
 		await this.initHooksAndCustomTools();

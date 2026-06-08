@@ -822,6 +822,23 @@ function extractPermissionLocations(
  *  rely on the existing text-equality match. */
 type QueuedDisplayEntry = { text: string; tag?: string };
 
+/** A custom message contributed at the before-agent-start point. */
+export type BeforeAgentStartInternalMessage = Pick<
+	CustomMessage,
+	"customType" | "content" | "display" | "details" | "attribution"
+>;
+
+/**
+ * Internal (first-party, non-user-hook) contributor invoked at the active
+ * before-agent-start point alongside the extension runner. Returns an optional
+ * custom message to append to the prompt context. Errors are nonfatal.
+ */
+export type BeforeAgentStartContributor = (event: {
+	prompt: string;
+	images?: ImageContent[];
+	sessionId: string | undefined;
+}) => Promise<BeforeAgentStartInternalMessage | undefined>;
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -922,6 +939,8 @@ export class AgentSession {
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#turnIndex = 0;
+	// First-party internal before-agent-start contributors (not user hooks).
+	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
 	#skills: Skill[];
 	#skillWarnings: SkillWarning[];
@@ -4756,6 +4775,9 @@ export class AgentSession {
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
 
+			const promptAttribution: "user" | "agent" | undefined =
+				"attribution" in message ? message.attribution : undefined;
+
 			// Emit before_agent_start extension event
 			if (this.#extensionRunner) {
 				const result = await this.#extensionRunner.emitBeforeAgentStart(
@@ -4764,19 +4786,7 @@ export class AgentSession {
 					beforeAgentStartSystemPrompt,
 				);
 				if (result?.messages) {
-					const promptAttribution: "user" | "agent" | undefined =
-						"attribution" in message ? message.attribution : undefined;
-					for (const msg of result.messages) {
-						messages.push({
-							role: "custom",
-							customType: msg.customType,
-							content: msg.content,
-							display: msg.display,
-							details: msg.details,
-							attribution: msg.attribution ?? promptAttribution ?? (message.role === "user" ? "user" : "agent"),
-							timestamp: Date.now(),
-						});
-					}
+					this.#appendBeforeAgentStartCustomMessages(messages, result.messages, promptAttribution, message.role);
 				}
 
 				if (result?.systemPrompt !== undefined) {
@@ -4786,6 +4796,26 @@ export class AgentSession {
 				}
 			} else {
 				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+			}
+
+			// Invoke first-party internal before-agent-start contributors. These run
+			// alongside the extension runner (not via user-loaded hooks) and append
+			// through the same custom-message attribution path. Errors are nonfatal.
+			if (this.#beforeAgentStartContributors.length > 0) {
+				const contributed: BeforeAgentStartInternalMessage[] = [];
+				for (const contributor of this.#beforeAgentStartContributors) {
+					try {
+						const msg = await contributor({
+							prompt: expandedText,
+							images: options?.images,
+							sessionId: this.sessionId,
+						});
+						if (msg) contributed.push(msg);
+					} catch (err) {
+						logger.debug("before_agent_start contributor failed", { error: String(err) });
+					}
+				}
+				this.#appendBeforeAgentStartCustomMessages(messages, contributed, promptAttribution, message.role);
 			}
 
 			// Bail out if a newer abort/prompt cycle has started since we began setup
@@ -9620,6 +9650,42 @@ export class AgentSession {
 	 */
 	hasExtensionHandlers(eventType: string): boolean {
 		return this.#extensionRunner?.hasHandlers(eventType) ?? false;
+	}
+
+	/**
+	 * Register a first-party internal before-agent-start contributor. Returns an
+	 * unregister function. This is NOT user-facing hook discovery; it is an
+	 * in-core seam invoked alongside the extension runner.
+	 */
+	registerBeforeAgentStartContributor(contributor: BeforeAgentStartContributor): () => void {
+		this.#beforeAgentStartContributors.push(contributor);
+		return () => {
+			const idx = this.#beforeAgentStartContributors.indexOf(contributor);
+			if (idx !== -1) this.#beforeAgentStartContributors.splice(idx, 1);
+		};
+	}
+
+	/**
+	 * Append before-agent-start custom messages (from the extension runner or
+	 * internal contributors) using one shared attribution/defaulting path.
+	 */
+	#appendBeforeAgentStartCustomMessages(
+		target: AgentMessage[],
+		returned: readonly BeforeAgentStartInternalMessage[],
+		promptAttribution: "user" | "agent" | undefined,
+		messageRole: string,
+	): void {
+		for (const msg of returned) {
+			target.push({
+				role: "custom",
+				customType: msg.customType,
+				content: msg.content,
+				display: msg.display,
+				details: msg.details,
+				attribution: msg.attribution ?? promptAttribution ?? (messageRole === "user" ? "user" : "agent"),
+				timestamp: Date.now(),
+			});
+		}
 	}
 
 	/**

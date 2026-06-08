@@ -1009,6 +1009,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"starReminder.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "GitHub Star Reminder",
+			description: "Show the interactive GitHub star reminder when gh is authenticated",
+		},
+	},
+
 	collapseChangelog: {
 		type: "boolean",
 		default: false,
