@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
@@ -287,5 +287,42 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 
 		const ret = await runHarness(["retire", "--session", SID]);
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
+	it("recover bootstraps a never-started owner in a dirty worktree without a vanish receipt and preserves the delta (#421)", async () => {
+		gitInit(workspace);
+		// Pre-existing uncommitted work makes the git delta `dirty` (classifier:
+		// restart-preserve-delta, ownerRequired:true). A never-started owner never touched this
+		// work, so bootstrapping it is by-design NOT a vanish — no receipt, no stash/reset.
+		const dirtyFile = path.join(workspace, "uncommitted.txt");
+		await writeFile(dirtyFile, "user-work", "utf8");
+
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		// By design: a never-started owner is not a vanish, so no vanish receipt is written
+		// even though the worktree is dirty.
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		const decision = evidence.decision as Record<string, unknown>;
+		expect(decision.classification).toBe("restart-preserve-delta");
+		expect(decision.ownerRequired).toBe(true);
+		expect((evidence.observation as Record<string, unknown>).gitDelta).toBe("dirty");
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		// The pre-existing uncommitted work is left untouched (never stashed or reset).
+		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		// retire routes to the live owner, which stops cleanly without mutating the worktree.
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
 	}, 60_000);
 });
