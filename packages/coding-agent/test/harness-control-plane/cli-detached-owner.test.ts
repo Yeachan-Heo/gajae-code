@@ -265,4 +265,27 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		const ret = await runHarness(["retire", "--session", SID]);
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
 	}, 60_000);
+	it("recover bootstraps a never-started owner even when the workspace is not a git repo (#421)", async () => {
+		// No gitInit: a bare workspace reports git delta `unknown`, so the vanish classifier
+		// returns `human-check` / `ownerRequired: false`. Bootstrap must not be gated on that.
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		expect((evidence.decision as Record<string, unknown>).ownerRequired).toBe(false);
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
 });
