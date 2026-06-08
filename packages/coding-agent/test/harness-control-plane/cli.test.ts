@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { appendEvent, readSessionState, writeSessionState } from "../../src/harness-control-plane/storage";
+import {
+	appendEvent,
+	readSessionState,
+	sessionPaths,
+	writeSessionState,
+} from "../../src/harness-control-plane/storage";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -576,6 +581,51 @@ describe("gjc harness CLI (foundation)", () => {
 			completedSeen: false,
 		});
 		expect(events.json.evidence.events).toHaveLength(1);
+	});
+
+	it("monitor distinguishes a transient endpoint gap from terminal owner loss when RPC activity continues", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		await writeSessionState(root, state);
+		// A live lease (fresh heartbeat, this test process pid) with recent RPC frames.
+		const nowMs = Date.now();
+		const lease = {
+			ownerId: "owner-live",
+			sessionId,
+			pid: process.pid,
+			leaseTokenHash: "0".repeat(64),
+			endpoint: { kind: "unix-socket" as const, path: "/tmp/unreachable.sock" },
+			eventsPath: sessionPaths(root, sessionId).events,
+			heartbeatAt: new Date(nowMs).toISOString(),
+			expiresAt: new Date(nowMs + 30_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-live", leaseEpoch: 1 },
+		};
+		await writeFile(sessionPaths(root, sessionId).lease, `${JSON.stringify(lease, null, 2)}\n`, "utf8");
+		await appendEvent(root, sessionId, {
+			eventId: "evt-rpc-activity",
+			cursor: 1,
+			createdAt: new Date(nowMs).toISOString(),
+			severity: "info",
+			kind: "rpc_activity",
+			state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { coalescedFrames: 3 },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-live", leaseEpoch: 1 },
+		});
+
+		const monitored = runHarness(["monitor", "--session", sessionId]);
+		expect(monitored.code).toBe(0);
+		expect(monitored.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-endpoint-observation-gap",
+			leaseStatus: "live",
+			terminal: false,
+		});
+		expect(monitored.json.evidence.ownerExit.lastRpcActivityAt).toBeTruthy();
 	});
 
 	it("submit is blocked (accepted:false, owner-not-live) and never echoed-as-accepted", () => {

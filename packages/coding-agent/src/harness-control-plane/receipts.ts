@@ -13,7 +13,13 @@
  *   - completion        the finalize gate: receipt-valid + commit + PR/issue + validations
  */
 import { createHash } from "node:crypto";
-import type { GitDelta, ReceiptFamily, RecoveryClassification } from "./types";
+import {
+	type GitDelta,
+	isReviewVerdict,
+	type ReceiptFamily,
+	type RecoveryClassification,
+	type ReviewVerdict,
+} from "./types";
 
 export interface ReceiptSubject {
 	workspace: string;
@@ -144,6 +150,23 @@ export interface CompletionEvidence {
 	blockers: string[];
 }
 
+export interface ReviewVerdictEvidence {
+	verdict: ReviewVerdict;
+	prTarget: string | null;
+	finalizedAt: string;
+	/** Bounded summary code/reference for the verdict; never raw assistant text. */
+	summaryRef: string | null;
+}
+
+export interface ReviewFailureEvidence {
+	/** Machine-actionable reason the review produced no terminal verdict. */
+	reason: string;
+	prTarget: string | null;
+	failedAt: string;
+	/** Routing hint for the operator/fallback path. */
+	fallback: string;
+}
+
 function validateFamily(receipt: ReceiptEnvelope<unknown>): string[] {
 	switch (receipt.family) {
 		case "vanish":
@@ -154,6 +177,10 @@ function validateFamily(receipt: ReceiptEnvelope<unknown>): string[] {
 			return validateValidation(receipt.evidence as ValidationEvidence);
 		case "completion":
 			return validateCompletion(receipt.evidence as CompletionEvidence);
+		case "review-verdict":
+			return validateReviewVerdict(receipt.evidence as ReviewVerdictEvidence);
+		case "review-failure":
+			return validateReviewFailure(receipt.evidence as ReviewFailureEvidence);
 		default:
 			return [`unknown-family:${receipt.family}`];
 	}
@@ -204,6 +231,17 @@ function validateCompletion(e: CompletionEvidence): string[] {
 	}
 	if (Array.isArray(e.blockers) && e.blockers.length > 0) reasons.push("completion-has-blockers");
 	return reasons;
+}
+
+function validateReviewVerdict(e: ReviewVerdictEvidence): string[] {
+	if (!e) return ["review-verdict-missing-evidence"];
+	if (!isReviewVerdict(e.verdict)) return ["review-verdict-not-in-vocabulary"];
+	return [];
+}
+
+function validateReviewFailure(e: ReviewFailureEvidence): string[] {
+	if (!e || typeof e.reason !== "string" || e.reason.length === 0) return ["review-failure-missing-reason"];
+	return [];
 }
 
 /** Classifications that MUST have a valid `vanish` receipt before the action proceeds. */

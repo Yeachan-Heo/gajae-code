@@ -54,6 +54,9 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+/** RPC activity newer than this (relative to wall clock) marks an endpoint gap as transient, not terminal. */
+const RPC_ACTIVITY_RECENT_MS = 60_000;
+
 function parseInput(raw: string | undefined): Record<string, unknown> {
 	if (!raw?.trim()) return {};
 	const parsed = JSON.parse(raw) as unknown;
@@ -241,6 +244,10 @@ interface OwnerExitEvidence {
 	lastSignal: string | null;
 	promptAcceptedSeen: boolean;
 	completedSeen: boolean;
+	/** True only when the owner is genuinely gone (lease missing or process dead). */
+	terminal: boolean;
+	/** ISO timestamp of the most recent RPC-derived owner event, if any. */
+	lastRpcActivityAt: string | null;
 }
 
 async function buildOwnerExitEvidence(root: string, state: SessionState): Promise<OwnerExitEvidence> {
@@ -251,23 +258,30 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 	let lastSignal: string | null = null;
 	let promptAcceptedSeen = false;
 	let completedSeen = false;
+	let lastRpcActivityAt: string | null = null;
 	for (const event of events) {
 		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
 		if (typeof signal === "string") lastSignal = signal;
 		if (event.kind === "prompt_accepted" || signal === "prompt-accepted") promptAcceptedSeen = true;
 		if (event.kind === "rpc_agent_completed" || signal === "completed") completedSeen = true;
+		if (event.kind === "rpc_activity" || event.kind.startsWith("rpc_")) lastRpcActivityAt = event.createdAt;
 	}
+	// Recent RPC frames mean the owner is still driving the session even if the control endpoint
+	// did not answer this stateless call — a transient observation gap, not terminal owner loss.
+	const rpcActivityRecent =
+		lastRpcActivityAt !== null && Date.now() - Date.parse(lastRpcActivityAt) <= RPC_ACTIVITY_RECENT_MS;
+	const terminal = !lease || leaseStatus === "dead";
 	let reason = "owner-not-live";
 	if (!lease) {
 		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-lease-missing";
 	} else if (leaseStatus === "dead") {
 		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-process-dead";
 	} else if (leaseStatus === "expiredAlive") {
-		reason = "owner-lease-expired";
+		reason = rpcActivityRecent ? "owner-endpoint-observation-gap" : "owner-lease-expired";
 	} else if (leaseStatus === "epermAlive") {
 		reason = "owner-liveness-unknown-permission-denied";
 	} else {
-		reason = "owner-endpoint-unreachable";
+		reason = rpcActivityRecent ? "owner-endpoint-observation-gap" : "owner-endpoint-unreachable";
 	}
 	return {
 		reason,
@@ -281,6 +295,8 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 		lastSignal,
 		promptAcceptedSeen,
 		completedSeen,
+		terminal,
+		lastRpcActivityAt,
 	};
 }
 
@@ -684,6 +700,7 @@ export default class Harness extends Command {
 		const handle: SessionHandle = {
 			sessionId,
 			harness,
+			mode: input.mode === "review" || input.reviewOnly === true ? "review" : "implement",
 			repo: typeof input.repo === "string" ? input.repo : null,
 			workspace,
 			branch: preflight.declaredBranch ?? preflight.actualBranch,

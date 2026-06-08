@@ -359,6 +359,14 @@ export class RuntimeOwner {
 
 	async #validate(): Promise<PrimitiveResponse> {
 		const state = await this.#loadState();
+		if (state.handle.mode === "review") {
+			// Review-only sessions do not run implementation validation and never attach PR metadata.
+			state.lifecycle = "validating";
+			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+			await writeSessionState(this.#opts.root, state);
+			await this.#emit("info", "validated", { count: 0, reviewOnly: true });
+			return this.#response(state, { validation: [], reviewOnly: true });
+		}
 		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace);
 		const commit = await checks.resolveCommit();
 		const subject: ReceiptSubject = {
@@ -495,11 +503,15 @@ export class RuntimeOwner {
 		const state = await this.#loadState();
 		const workspace = state.handle.workspace;
 		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(workspace);
+		const reviewOnly = state.handle.mode === "review";
 		const fin = await runFinalize({
 			root: this.#opts.root,
 			sessionId: this.#opts.sessionId,
 			workspace,
 			branch: state.handle.branch ?? "",
+			reviewOnly,
+			verdict: reviewOnly ? (typeof input.verdict === "string" ? input.verdict : null) : undefined,
+			prTarget: reviewOnly ? state.handle.issueOrPr : undefined,
 			requireTests: input.requireTests !== false,
 			requireCommit: input.requireCommit !== false,
 			requirePr: input.requirePr !== false,
@@ -514,6 +526,7 @@ export class RuntimeOwner {
 		await this.#emit(fin.completed ? "info" : "critical", "finalized", {
 			completed: fin.completed,
 			blockers: fin.blockers,
+			...(reviewOnly ? { verdict: fin.verdict ?? null, reviewOnly: true } : {}),
 		});
 		return this.#response(state, { finalize: fin }, fin.completed);
 	}
