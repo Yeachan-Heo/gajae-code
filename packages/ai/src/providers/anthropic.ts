@@ -2001,8 +2001,8 @@ function buildParams(
 				}
 				params.thinking = adaptive as typeof params.thinking;
 				if (effort) {
-					// SDK's OutputConfig.effort type is not yet widened to include the new "xhigh"
-					// level introduced with Anthropic model Opus 4.7. Cast until the SDK catches up.
+					// SDK OutputConfig.effort typings may lag Anthropic's adaptive effort literals.
+					// Cast so newly supported levels can pass through before the SDK catches up.
 					params.output_config = { effort } as typeof params.output_config;
 				}
 			} else {

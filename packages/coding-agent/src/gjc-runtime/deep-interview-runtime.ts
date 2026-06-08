@@ -2,12 +2,12 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildDeepInterviewHudSummary } from "../skill-state/workflow-hud";
+import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { runNativeStateCommand } from "./state-runtime";
-import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
+import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
 
 /**
  * Native implementation of `gjc deep-interview`.
@@ -96,16 +96,6 @@ function deepInterviewStatePath(cwd: string, sessionId: string | undefined): str
 	return path.join(stateDirFor(cwd, sessionId), "deep-interview-state.json");
 }
 
-async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
-	try {
-		const parsed = JSON.parse(await fs.readFile(filePath, "utf-8"));
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-	} catch {
-		// Missing/corrupt state should not prevent the sanctioned persistence CLI from writing a receipt.
-	}
-	return {};
-}
-
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
 	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
 	try {
@@ -145,6 +135,7 @@ export interface ResolvedDeepInterviewSpecWriteArgs {
 	json: boolean;
 	deliberate: boolean;
 	handoff?: "ralplan";
+	force: boolean;
 }
 
 export interface PersistedDeepInterviewSpec {
@@ -162,6 +153,8 @@ interface DeepInterviewSpecWriteSummary {
 	slug: string;
 	path: string;
 	sha256: string;
+	spec_path: string;
+	sha: string;
 	created_at: string;
 	state_path: string;
 	handoff?: {
@@ -197,11 +190,16 @@ async function readSettingsAmbiguityThreshold(
 	return { threshold: candidate, source: settingsPath };
 }
 
-async function readModernSettingsAmbiguityThreshold(
-	cwd: string,
-): Promise<{ threshold: number; source: string } | undefined> {
-	const settings = await Settings.init({ cwd });
-	const modernConfigPath = path.join(settings.getAgentDir(), "config.yml");
+function modernSettingsPath(): string {
+	const configDir = process.env.GJC_CODING_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
+	if (configDir) return path.join(configDir, "config.yml");
+	const configRoot = process.env.GJC_CONFIG_DIR?.trim() || process.env.PI_CONFIG_DIR?.trim();
+	if (configRoot) return path.join(configRoot, "agent", "config.yml");
+	return path.join(os.homedir(), ".gjc", "agent", "config.yml");
+}
+
+async function readModernSettingsAmbiguityThreshold(): Promise<{ threshold: number; source: string } | undefined> {
+	const modernConfigPath = modernSettingsPath();
 	let parsed: unknown;
 	try {
 		parsed = (await import("bun")).YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
@@ -218,7 +216,7 @@ async function readModernSettingsAmbiguityThreshold(
 async function resolveConfiguredAmbiguityThreshold(
 	cwd: string,
 ): Promise<{ threshold: number; source: string } | undefined> {
-	const modernValue = await readModernSettingsAmbiguityThreshold(cwd);
+	const modernValue = await readModernSettingsAmbiguityThreshold();
 	if (modernValue) return modernValue;
 	const projectSettings = path.join(cwd, ".gjc", "settings.json");
 	const projectValue = await readSettingsAmbiguityThreshold(projectSettings);
@@ -292,6 +290,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		"--handoff",
 		"--deliberate",
 		"--json",
+		"--force",
 	]);
 	let skipNext = false;
 	for (const arg of args) {
@@ -315,6 +314,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		sessionId,
 		json: hasFlag(args, "--json"),
 		deliberate: hasFlag(args, "--deliberate"),
+		force: hasFlag(args, "--force"),
 		handoff: rawHandoff as "ralplan" | undefined,
 	};
 }
@@ -388,6 +388,16 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "corrupt" && !resolved.force) {
+		throw new DeepInterviewCommandError(
+			2,
+			`existing deep-interview state is corrupt or tampered (${existingRead.error}); use --force to overwrite ${statePath}`,
+		);
+	}
+	const existing = existingRead.kind === "valid" ? existingRead.value : {};
+
 	const specPath = path.join(cwd, ".gjc", "specs", `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	await writeArtifact(specPath, content, {
@@ -403,14 +413,12 @@ export async function persistDeepInterviewSpec(
 		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview" } },
 	);
 
-	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
-	const existing = await readJsonObject(statePath);
 	const payload: Record<string, unknown> = {
 		...existing,
 		active: true,
 		current_phase: "handoff",
 		skill: "deep-interview",
-		version: typeof existing.version === "number" ? existing.version : 1,
+		version: WORKFLOW_STATE_VERSION,
 		spec_slug: resolved.slug,
 		spec_path: specPath,
 		spec_sha256: sha256,
@@ -419,9 +427,23 @@ export async function persistDeepInterviewSpec(
 		updated_at: createdAt,
 	};
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeJsonAtomic(statePath, payload, {
+	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-runtime",
+			command: "gjc deep-interview persist-spec-state",
+			sessionId: resolved.sessionId,
+			nowIso: createdAt,
+		},
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			forced: resolved.force,
+		},
 	});
 	await syncDeepInterviewHud({
 		cwd,
@@ -447,6 +469,7 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		active: true,
 		current_phase: "interviewing",
 		skill: "deep-interview",
+		version: WORKFLOW_STATE_VERSION,
 		resolution: resolved.resolution,
 		threshold: resolved.threshold,
 		threshold_source: resolved.thresholdSource,
@@ -464,8 +487,16 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		(payload.state as Record<string, unknown>).language = resolved.language;
 	}
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeJsonAtomic(statePath, payload, {
+	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-runtime",
+			command: "gjc deep-interview seed",
+			sessionId: resolved.sessionId,
+			nowIso: now,
+		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
 	});
 	return statePath;
@@ -512,6 +543,8 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 		slug: persisted.slug,
 		path: persisted.path,
 		sha256: persisted.sha256,
+		spec_path: persisted.path,
+		sha: persisted.sha256,
 		created_at: persisted.createdAt,
 		state_path: persisted.statePath,
 	};
@@ -549,10 +582,14 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 	}
 
 	const stdout = resolved.json
-		? `${JSON.stringify(summary, null, 2)}\n`
+		? `${JSON.stringify(summary)}\n`
 		: [
-				`Persisted deep-interview ${persisted.stage} spec at ${persisted.path}.`,
-				shouldHandoff ? "Handed off deep-interview to ralplan (deliberate)." : undefined,
+				`deep-interview spec_path=${persisted.path}`,
+				`sha=${persisted.sha256}`,
+				`state_path=${persisted.statePath}`,
+				shouldHandoff
+					? `handoff=ralplan run_id=${summary.handoff?.run_id ?? ""} state_path=${summary.handoff?.state_path ?? ""}`
+					: undefined,
 				"",
 			]
 				.filter((line): line is string => Boolean(line))
@@ -591,14 +628,14 @@ export async function runNativeDeepInterviewCommand(
 			idea: resolved.idea,
 			language: resolved.language,
 			state_path: statePath,
-			handoff: "Run `/skill:deep-interview` inside the GJC agent to drive the Socratic interview loop.",
+			handoff: "/skill:deep-interview",
 		};
 		const stdout = resolved.json
-			? `${JSON.stringify(summary, null, 2)}\n`
+			? `${JSON.stringify(summary)}\n`
 			: [
-					`Seeded deep-interview ${resolved.resolution} run at ${statePath}.`,
-					`Threshold: ${(resolved.threshold * 100).toFixed(0)}% (source: ${resolved.thresholdSource}).`,
-					"Run `/skill:deep-interview` inside the GJC agent to execute the interview.",
+					`deep-interview seed state_path=${statePath}`,
+					`resolution=${resolved.resolution} threshold=${resolved.threshold} threshold_source=${resolved.thresholdSource}`,
+					"handoff=/skill:deep-interview",
 					"",
 				].join("\n");
 		return { status: 0, stdout };

@@ -101,3 +101,77 @@ describe("runFinalize (evidence gate)", () => {
 		expect(res.issueArtifact).toBe("issue#42-resolved");
 	});
 });
+
+describe("runFinalize (review-only verdict gate)", () => {
+	const reviewBase = () => ({
+		root,
+		sessionId: SID,
+		workspace: "/ws",
+		branch: "gajae-code-pr-414-review",
+		reviewOnly: true as const,
+		prTarget: "PR-414",
+	});
+
+	it("completes with a terminal verdict and no PR/commit/validation metadata", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: "REQUEST_CHANGES",
+			// Stale checks would resolve an unrelated PR/commit; review-only must ignore them.
+			checks: checks({
+				resolveCommit: async () => "stale999",
+				prOrIssue: async () => ({ prUrl: "https://x/pr/59", issueArtifact: null }),
+			}),
+		});
+		expect(res.completed).toBe(true);
+		expect(res.verdict).toBe("REQUEST_CHANGES");
+		expect(res.blockers).toEqual([]);
+		expect(res.prUrl).toBeNull();
+		expect(res.issueArtifact).toBeNull();
+		expect(res.commitHash).toBeNull();
+		expect(res.validation).toEqual([]);
+		const verdicts = await readReceiptIndex(root, SID, "review-verdict");
+		expect(verdicts).toHaveLength(1);
+		expect(verdicts[0].valid).toBe(true);
+		expect(await readReceiptIndex(root, SID, "completion")).toHaveLength(0);
+	});
+
+	it("writes a durable bounded failure receipt when no verdict is supplied", async () => {
+		const res = await runFinalize({ ...reviewBase(), verdict: null, checks: checks() });
+		expect(res.completed).toBe(false);
+		expect(res.verdict).toBeNull();
+		expect(res.blockers).toEqual(["review-verdict-missing"]);
+		expect(res.prUrl).toBeNull();
+		const failures = await readReceiptIndex(root, SID, "review-failure");
+		expect(failures).toHaveLength(1);
+		expect(failures[0].valid).toBe(true);
+	});
+
+	it("blocks on a verdict outside the closed vocabulary", async () => {
+		const res = await runFinalize({ ...reviewBase(), verdict: "LGTM", checks: checks() });
+		expect(res.completed).toBe(false);
+		expect(res.blockers).toEqual(["review-verdict-invalid"]);
+		expect(await readReceiptIndex(root, SID, "review-failure")).toHaveLength(1);
+	});
+
+	it("records OWNER_CONFIRMATION_REQUIRED as a non-success human-action-required state", async () => {
+		const res = await runFinalize({ ...reviewBase(), verdict: "OWNER_CONFIRMATION_REQUIRED", checks: checks() });
+		expect(res.completed).toBe(false);
+		expect(res.verdict).toBe("OWNER_CONFIRMATION_REQUIRED");
+		expect(res.blockers).toEqual(["owner-confirmation-required"]);
+		// The verdict is still durably recorded even though it is not an autonomous success.
+		const verdicts = await readReceiptIndex(root, SID, "review-verdict");
+		expect(verdicts).toHaveLength(1);
+		expect(verdicts[0].valid).toBe(true);
+	});
+
+	it("never blocks review on validation-required-but-none-run", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: "APPROVE_MERGE_READY",
+			validationCommands: [],
+			checks: checks(),
+		});
+		expect(res.completed).toBe(true);
+		expect(res.blockers).not.toContain("validation-required-but-none-run");
+	});
+});

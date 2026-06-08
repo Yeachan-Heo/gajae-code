@@ -5,6 +5,7 @@ import { postmortem } from "@gajae-code/utils";
  * Run modes for the coding agent.
  */
 export { runAcpMode } from "./acp";
+export { runBridgeMode } from "./bridge/bridge-mode";
 export { InteractiveMode, type InteractiveModeOptions } from "./interactive-mode";
 export { type PrintModeOptions, runPrintMode } from "./print-mode";
 export {

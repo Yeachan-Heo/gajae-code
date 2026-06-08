@@ -38,6 +38,7 @@ interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.session.observe": true;
+	"app.jobs.open": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
 	"app.session.rename": true;
@@ -148,6 +149,11 @@ export const KEYBINDINGS = {
 	"app.session.observe": {
 		defaultKeys: "ctrl+s",
 		description: "Observe subagent sessions",
+	},
+
+	"app.jobs.open": {
+		defaultKeys: "alt+j",
+		description: "Open monitor/cron jobs overlay",
 	},
 	"app.session.togglePath": {
 		defaultKeys: "ctrl+p",

@@ -8,7 +8,6 @@
  *
  * Reported failures the test covers:
  *   - `@juicesharp/rpiv-ask-user-question` ⇒ `@earendil-works/pi-tui`
- *   - `@gajae-code/swarm-extension`         ⇒ `@gajae-code/utils`
  *   - `@plannotator/pi-extension`         ⇒ `@gajae-code/agent-core`
  *   - `@runfusion/fusion`                 ⇒ `@gajae-code/coding-agent/...`
  *

@@ -52,6 +52,31 @@ import {
 import type { EventEnvelope, GitDelta, Observation, PrimitiveResponse, SessionState, Severity } from "./types";
 import { DEFAULT_RETRY_BUDGET, OBSERVED_SIGNALS } from "./types";
 
+function isStartupLivenessBlocker(blocker: string): boolean {
+	return blocker === "detached-owner-not-live";
+}
+
+function isOwnerVanishedBlocker(blocker: string): boolean {
+	return blocker.startsWith("owner-vanished:");
+}
+
+function reconcileLiveOwnerState(state: SessionState): { state: SessionState; reconciled: boolean } {
+	const blockers = state.blockers.filter(blocker => !isStartupLivenessBlocker(blocker));
+	const hadLivenessBlocker = blockers.length !== state.blockers.length;
+	const lifecycle =
+		hadLivenessBlocker && state.lifecycle === "blocked" && blockers.length === 0 ? "observing" : state.lifecycle;
+	if (!hadLivenessBlocker && lifecycle === state.lifecycle) return { state, reconciled: false };
+	return {
+		state: {
+			...state,
+			lifecycle,
+			blockers,
+			updatedAt: new Date().toISOString(),
+		},
+		reconciled: true,
+	};
+}
+
 export interface OwnerOptions {
 	root: string;
 	sessionId: string;
@@ -139,6 +164,11 @@ export class RuntimeOwner {
 	async #loadState(): Promise<SessionState> {
 		const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 		if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+		const reconciled = reconcileLiveOwnerState(state);
+		if (reconciled.reconciled) {
+			await writeSessionState(this.#opts.root, reconciled.state);
+			return reconciled.state;
+		}
 		return state;
 	}
 
@@ -329,6 +359,14 @@ export class RuntimeOwner {
 
 	async #validate(): Promise<PrimitiveResponse> {
 		const state = await this.#loadState();
+		if (state.handle.mode === "review") {
+			// Review-only sessions do not run implementation validation and never attach PR metadata.
+			state.lifecycle = "validating";
+			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+			await writeSessionState(this.#opts.root, state);
+			await this.#emit("info", "validated", { count: 0, reviewOnly: true });
+			return this.#response(state, { validation: [], reviewOnly: true });
+		}
 		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace);
 		const commit = await checks.resolveCommit();
 		const subject: ReceiptSubject = {
@@ -369,17 +407,22 @@ export class RuntimeOwner {
 
 	async #recover(): Promise<PrimitiveResponse> {
 		const obs = await this.#observeGit();
-		const decision = classifyRecovery({ observation: obs, retryBudget: { ...DEFAULT_RETRY_BUDGET } });
+		const state = await this.#loadState();
+		const recoveringPriorVanish = state.blockers.some(isOwnerVanishedBlocker);
+		const recoveryObservation: Observation = recoveringPriorVanish
+			? { ...obs, ownerLive: false, risk: obs.gitDelta === "dirty" ? "vanished-dirty" : obs.risk }
+			: obs;
+		const decision = classifyRecovery({ observation: recoveryObservation, retryBudget: { ...DEFAULT_RETRY_BUDGET } });
 		let vanishReceiptId: string | null = null;
 		if (requiresVanishBeforeAction(decision.classification)) {
-			const dirty = obs.gitDelta === "dirty" || obs.gitDelta === "unknown";
-			const p = dirty ? preserveDirtyWorktree(obs.cwd) : null;
+			const dirty = recoveryObservation.gitDelta === "dirty" || recoveryObservation.gitDelta === "unknown";
+			const p = dirty ? preserveDirtyWorktree(recoveryObservation.cwd) : null;
 			const evidence: VanishEvidence = {
 				classification: decision.classification,
-				gitDelta: obs.gitDelta,
+				gitDelta: recoveryObservation.gitDelta,
 				gitStatusPorcelain: p
 					? `tracked:${p.trackedDiffSha256};untracked:${p.untrackedManifest.length}`
-					: obs.observedSignals.join(","),
+					: recoveryObservation.observedSignals.join(","),
 				untrackedManifest: p?.untrackedManifest ?? [],
 				preservation: p?.stashRef ? "stash" : "snapshot",
 				stashRef: p?.stashRef ?? null,
@@ -391,15 +434,25 @@ export class RuntimeOwner {
 				sessionId: this.#opts.sessionId,
 				family: "vanish",
 				source: "owner",
-				subject: { workspace: obs.cwd, branch: obs.branch, head: null, commit: null },
+				subject: {
+					workspace: recoveryObservation.cwd,
+					branch: recoveryObservation.branch,
+					head: null,
+					commit: null,
+				},
 				evidence,
 			});
 			await writeReceiptImmutable(this.#opts.root, this.#opts.sessionId, "vanish", receipt.receiptId, receipt);
 			vanishReceiptId = receipt.receiptId;
 		}
-		const state = await this.#loadState();
+		if (vanishReceiptId) {
+			state.blockers = state.blockers.filter(blocker => !isOwnerVanishedBlocker(blocker));
+			state.lifecycle = state.blockers.length === 0 ? "observing" : state.lifecycle;
+			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+			await writeSessionState(this.#opts.root, state);
+		}
 		await this.#emit(decision.severity, "recover_classified", { classification: decision.classification });
-		return this.#response(state, { decision, observation: obs, vanishReceiptId });
+		return this.#response(state, { decision, observation: recoveryObservation, vanishReceiptId });
 	}
 
 	async #operate(input: Record<string, unknown>): Promise<PrimitiveResponse> {
@@ -450,11 +503,15 @@ export class RuntimeOwner {
 		const state = await this.#loadState();
 		const workspace = state.handle.workspace;
 		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(workspace);
+		const reviewOnly = state.handle.mode === "review";
 		const fin = await runFinalize({
 			root: this.#opts.root,
 			sessionId: this.#opts.sessionId,
 			workspace,
 			branch: state.handle.branch ?? "",
+			reviewOnly,
+			verdict: reviewOnly ? (typeof input.verdict === "string" ? input.verdict : null) : undefined,
+			prTarget: reviewOnly ? state.handle.issueOrPr : undefined,
 			requireTests: input.requireTests !== false,
 			requireCommit: input.requireCommit !== false,
 			requirePr: input.requirePr !== false,
@@ -469,18 +526,21 @@ export class RuntimeOwner {
 		await this.#emit(fin.completed ? "info" : "critical", "finalized", {
 			completed: fin.completed,
 			blockers: fin.blockers,
+			...(reviewOnly ? { verdict: fin.verdict ?? null, reviewOnly: true } : {}),
 		});
 		return this.#response(state, { finalize: fin }, fin.completed);
 	}
 
 	async #submit(input: Record<string, unknown>): Promise<PrimitiveResponse> {
 		const prompt = typeof input.prompt === "string" ? input.prompt : "";
+		const state = await this.#loadState();
 		if (!prompt) {
-			const state = await this.#loadState();
 			return this.#response(state, { accepted: false, reason: "empty-prompt" }, false);
 		}
+		if (state.lifecycle === "blocked") {
+			return this.#response(state, { accepted: false, reason: "lifecycle-blocked" }, false);
+		}
 		const result = await singleFlightAccept(this.#opts.rpc, prompt, this.#opts.acceptanceTimeoutMs);
-		const state = await this.#loadState();
 		if (result.accepted) {
 			state.lifecycle = "observing";
 			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();

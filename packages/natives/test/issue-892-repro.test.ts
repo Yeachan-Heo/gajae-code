@@ -45,4 +45,11 @@ describe("issue 892: pi-natives public surface", () => {
 		const missing = symbols.filter(name => !esmExportsName(js, name));
 		expect(missing).toEqual([]);
 	});
+
+	it("keeps diffLines declared and explicitly exported", async () => {
+		const [js, dts] = await Promise.all([Bun.file(indexJsPath).text(), Bun.file(indexDtsPath).text()]);
+
+		expect(dts).toContain("export declare function diffLines");
+		expect(esmExportsName(js, "diffLines")).toBe(true);
+	});
 });

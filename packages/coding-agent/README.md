@@ -17,7 +17,7 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
 
 - `off` (default) — no memory subsystem runs.
 - `local` — existing rollout-summarisation pipeline; writes `memory_summary.md` and consolidated artifacts under the agent dir.
-- `hindsight` — talks to a [Hindsight](https://hindsight.vectorize.io) server (Cloud or self-hosted Docker), retains transcripts every Nth user turn, recalls memories on the first turn of a session, and exposes `retain`, `recall`, and `reflect`.
+- `hindsight` — talks to a [Hindsight](https://hindsight.vectorize.io) server (Cloud or self-hosted Docker). Hindsight uses private backend lifecycle hooks to retain transcripts and recall context; compatibility-only internals remain for legacy backend calls, but GJC does not expose public coding-harness memory tools such as `retain`, `recall`, or `reflect`.
 
 ### Hindsight quickstart
 

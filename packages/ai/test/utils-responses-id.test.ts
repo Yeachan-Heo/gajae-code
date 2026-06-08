@@ -1,5 +1,21 @@
-import { describe, expect, it } from "bun:test";
-import { normalizeResponsesToolCallId } from "../src/utils";
+import { afterEach, describe, expect, it } from "bun:test";
+import { normalizeResponsesToolCallId, resolveCacheRetention } from "../src/utils";
+
+const originalGjcCacheRetention = Bun.env.GJC_CACHE_RETENTION;
+const originalPiCacheRetention = Bun.env.PI_CACHE_RETENTION;
+
+afterEach(() => {
+	if (originalGjcCacheRetention === undefined) {
+		delete Bun.env.GJC_CACHE_RETENTION;
+	} else {
+		Bun.env.GJC_CACHE_RETENTION = originalGjcCacheRetention;
+	}
+	if (originalPiCacheRetention === undefined) {
+		delete Bun.env.PI_CACHE_RETENTION;
+	} else {
+		Bun.env.PI_CACHE_RETENTION = originalPiCacheRetention;
+	}
+});
 
 describe("normalizeResponsesToolCallId", () => {
 	it("preserves existing item prefix when truncating oversized ids", () => {
@@ -66,5 +82,35 @@ describe("normalizeResponsesToolCallId", () => {
 		expect(normalized.callId).toBe("call_abc");
 		expect(normalized.itemId.startsWith("ctc_")).toBe(true);
 		expect(normalized.itemId).not.toBe("legacy");
+	});
+});
+
+describe("resolveCacheRetention", () => {
+	it("uses documented GJC_CACHE_RETENTION for long retention", () => {
+		Bun.env.GJC_CACHE_RETENTION = "long";
+		delete Bun.env.PI_CACHE_RETENTION;
+
+		expect(resolveCacheRetention()).toBe("long");
+	});
+
+	it("prefers explicit cache retention over environment defaults", () => {
+		Bun.env.GJC_CACHE_RETENTION = "long";
+		Bun.env.PI_CACHE_RETENTION = "long";
+
+		expect(resolveCacheRetention("none")).toBe("none");
+	});
+
+	it("falls back to legacy PI_CACHE_RETENTION when documented env is unset", () => {
+		delete Bun.env.GJC_CACHE_RETENTION;
+		Bun.env.PI_CACHE_RETENTION = "long";
+
+		expect(resolveCacheRetention()).toBe("long");
+	});
+
+	it("prefers GJC_CACHE_RETENTION over legacy PI_CACHE_RETENTION", () => {
+		Bun.env.GJC_CACHE_RETENTION = "short";
+		Bun.env.PI_CACHE_RETENTION = "long";
+
+		expect(resolveCacheRetention()).toBe("short");
 	});
 });

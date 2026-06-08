@@ -55,6 +55,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
+const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
 
 describe("createAgentSession MCP discovery prompt gating", () => {
 	let tempDir: string;
@@ -282,113 +283,126 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(searchTool?.description).toContain("- `server_name`");
 	});
 
-	it("prunes deactivated builtin discoveries so they can be rediscovered", async () => {
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-		});
+	it(
+		"prunes deactivated builtin discoveries so they can be rediscovered",
+		async () => {
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
 
-		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
-		expect(session.getSelectedDiscoveredToolNames()).toContain("find");
+			expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+			expect(session.getSelectedDiscoveredToolNames()).toContain("find");
 
-		await session.setActiveToolsByName(["read", "search_tool_bm25"]);
+			await session.setActiveToolsByName(["read", "search_tool_bm25"]);
 
-		expect(session.getActiveToolNames()).not.toContain("find");
-		expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
-		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
-		expect(session.getActiveToolNames()).toContain("find");
-	}, 30_000);
-	it("restores explicit MCP, thinking, and service-tier entries when resuming without rewriting the session file", async () => {
-		const firstManager = SessionManager.create(tempDir, tempDir);
-		const { session: firstSession } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: firstManager,
-			settings: Settings.isolated({
-				"mcp.discoveryMode": true,
-				defaultThinkingLevel: "high",
-				serviceTier: "priority",
-			}),
-			model: createReasoningModel(),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25"],
-			customTools: [
-				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
-				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
-			],
-		});
-		await firstSession.activateDiscoveredMCPTools(["mcp__slack_post_message"]);
-		firstSession.sessionManager.appendThinkingLevelChange(ThinkingLevel.Off);
-		firstSession.sessionManager.appendServiceTierChange("priority");
-		expect(firstSession.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Off);
-		expect(firstSession.getSelectedMCPToolNames()).toEqual(["mcp__slack_post_message"]);
-		const sessionFile = firstSession.sessionFile;
-		expect(sessionFile).toBeDefined();
-		await firstSession.sessionManager.rewriteEntries();
-		fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
-		const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
-		const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
-		await firstSession.dispose();
-		const resumedManager = await SessionManager.open(sessionFile!, tempDir);
-		const { session: resumedSession } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: resumedManager,
-			settings: Settings.isolated({
-				"mcp.discoveryMode": true,
-				defaultThinkingLevel: "high",
-				serviceTier: "none",
-			}),
-			model: createReasoningModel(),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25"],
-			customTools: [
-				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
-				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
-			],
-		});
-		try {
-			expect(resumedSession.thinkingLevel).toBe(ThinkingLevel.Off);
-			expect(resumedSession.serviceTier).toBe("priority");
-			expect(resumedSession.getSelectedMCPToolNames()).toEqual([
-				"mcp__github_create_issue",
-				"mcp__slack_post_message",
-			]);
-			expect(resumedSession.getActiveToolNames()).toEqual(
-				expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue", "mcp__slack_post_message"]),
-			);
-			expect(resumedSession.systemPrompt.join("\n")).toContain("mcp__slack_post_message");
-			expect(fs.readFileSync(sessionFile!, "utf8")).toBe(persistedBeforeResume);
-			expect(fs.statSync(sessionFile!).mtimeMs).toBe(persistedMtimeBeforeResume);
-		} finally {
-			await resumedSession.dispose();
-		}
-	}, 30_000);
+			expect(session.getActiveToolNames()).not.toContain("find");
+			expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
+			expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+			expect(session.getActiveToolNames()).toContain("find");
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
+	it(
+		"restores explicit MCP, thinking, and service-tier entries when resuming without rewriting the session file",
+		async () => {
+			const firstManager = SessionManager.create(tempDir, tempDir);
+			const { session: firstSession } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: firstManager,
+				settings: Settings.isolated({
+					"mcp.discoveryMode": true,
+					defaultThinkingLevel: "high",
+					serviceTier: "priority",
+				}),
+				model: createReasoningModel(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["read", "search_tool_bm25"],
+				customTools: [
+					createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
+					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
+				],
+			});
+			await firstSession.activateDiscoveredMCPTools(["mcp__slack_post_message"]);
+			firstSession.sessionManager.appendThinkingLevelChange(ThinkingLevel.Off);
+			firstSession.sessionManager.appendServiceTierChange("priority");
+			expect(firstSession.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Off);
+			expect(firstSession.getSelectedMCPToolNames()).toEqual(["mcp__slack_post_message"]);
+			const sessionFile = firstSession.sessionFile;
+			expect(sessionFile).toBeDefined();
+			await firstSession.sessionManager.rewriteEntries();
+			fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
+			const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
+			const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
+			await firstSession.dispose();
+			const resumedManager = await SessionManager.open(sessionFile!, tempDir);
+			const { session: resumedSession } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: resumedManager,
+				settings: Settings.isolated({
+					"mcp.discoveryMode": true,
+					defaultThinkingLevel: "high",
+					serviceTier: "none",
+				}),
+				model: createReasoningModel(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["read", "search_tool_bm25"],
+				customTools: [
+					createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
+					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
+				],
+			});
+			try {
+				expect(resumedSession.thinkingLevel).toBe(ThinkingLevel.Off);
+				expect(resumedSession.serviceTier).toBe("priority");
+				expect(resumedSession.getSelectedMCPToolNames()).toEqual([
+					"mcp__github_create_issue",
+					"mcp__slack_post_message",
+				]);
+				expect(resumedSession.getActiveToolNames()).toEqual(
+					expect.arrayContaining([
+						"read",
+						"search_tool_bm25",
+						"mcp__github_create_issue",
+						"mcp__slack_post_message",
+					]),
+				);
+				expect(resumedSession.systemPrompt.join("\n")).toContain("mcp__slack_post_message");
+				expect(fs.readFileSync(sessionFile!, "utf8")).toBe(persistedBeforeResume);
+				expect(fs.statSync(sessionFile!).mtimeMs).toBe(persistedMtimeBeforeResume);
+			} finally {
+				await resumedSession.dispose();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 
 	it("restores fallback MCP, thinking, and service-tier state in memory without rewriting the session file", async () => {
 		const sessionManager = SessionManager.create(tempDir, tempDir);
@@ -444,66 +458,75 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	}, 30_000);
 
-	it("rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools", async () => {
-		const firstManager = SessionManager.create(tempDir, tempDir);
-		const { session: firstSession } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: firstManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25", "mcp__github_create_issue"],
-			customTools: [
-				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
-				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
-			],
-		});
-		await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
-		expect(firstSession.getSelectedMCPToolNames()).toEqual([]);
-		const sessionFile = firstSession.sessionFile;
-		expect(sessionFile).toBeDefined();
-		await firstSession.sessionManager.rewriteEntries();
-		await firstSession.dispose();
+	it(
+		"rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools",
+		async () => {
+			const firstManager = SessionManager.create(tempDir, tempDir);
+			const { session: firstSession } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: firstManager,
+				settings: Settings.isolated({ "mcp.discoveryMode": true }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["read", "search_tool_bm25", "mcp__github_create_issue"],
+				customTools: [
+					createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
+					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
+				],
+			});
+			await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
+			expect(firstSession.getSelectedMCPToolNames()).toEqual([]);
+			const sessionFile = firstSession.sessionFile;
+			expect(sessionFile).toBeDefined();
+			await firstSession.sessionManager.rewriteEntries();
+			await firstSession.dispose();
 
-		const resumedManager = await SessionManager.open(sessionFile!, tempDir);
-		const { session: resumedSession } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: resumedManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25", "mcp__github_create_issue"],
-			customTools: [
-				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
-				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
-			],
-		});
-		try {
-			expect(resumedSession.getSelectedMCPToolNames()).toEqual([
-				"mcp__github_create_issue",
-				"mcp__slack_post_message",
-			]);
-			expect(resumedSession.getActiveToolNames()).toEqual(
-				expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue", "mcp__slack_post_message"]),
-			);
-		} finally {
-			await resumedSession.dispose();
-		}
-	}, 30_000);
+			const resumedManager = await SessionManager.open(sessionFile!, tempDir);
+			const { session: resumedSession } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: resumedManager,
+				settings: Settings.isolated({ "mcp.discoveryMode": true }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["read", "search_tool_bm25", "mcp__github_create_issue"],
+				customTools: [
+					createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
+					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
+				],
+			});
+			try {
+				expect(resumedSession.getSelectedMCPToolNames()).toEqual([
+					"mcp__github_create_issue",
+					"mcp__slack_post_message",
+				]);
+				expect(resumedSession.getActiveToolNames()).toEqual(
+					expect.arrayContaining([
+						"read",
+						"search_tool_bm25",
+						"mcp__github_create_issue",
+						"mcp__slack_post_message",
+					]),
+				);
+			} finally {
+				await resumedSession.dispose();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 });

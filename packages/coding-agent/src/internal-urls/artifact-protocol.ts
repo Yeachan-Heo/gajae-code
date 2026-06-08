@@ -1,8 +1,8 @@
 /**
  * Protocol handler for artifact:// URLs.
  *
- * Resolves artifact IDs against the artifacts directories of every active
- * session. Unlike agent://, artifacts are raw text with no JSON extraction.
+ * Resolves artifact IDs only against artifacts directories explicitly authorized
+ * by the caller's ResolveContext. Unlike agent://, artifacts are raw text.
  *
  * URL form:
  * - artifact://<id> - Full artifact content
@@ -12,14 +12,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
-import { artifactsDirsFromRegistry } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import { authorizedArtifactsDirsFromContext } from "./registry-helpers";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class ArtifactProtocolHandler implements ProtocolHandler {
 	readonly scheme = "artifact";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const id = url.rawHost || url.hostname;
 		if (!id) {
 			throw new Error("artifact:// URL requires a numeric ID: artifact://0");
@@ -28,7 +28,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error(`artifact:// ID must be numeric, got: ${id}`);
 		}
 
-		const dirs = artifactsDirsFromRegistry();
+		const dirs = authorizedArtifactsDirsFromContext(context);
 
 		if (dirs.length === 0) {
 			throw new Error("No session - artifacts unavailable");
@@ -36,7 +36,6 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 
 		let foundPath: string | undefined;
 		let anyDirExists = false;
-		const availableIds = new Set<string>();
 
 		for (const dir of dirs) {
 			let files: string[];
@@ -47,14 +46,12 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 				if (isEnoent(err)) continue;
 				throw err;
 			}
-			const match = files.find(f => f.startsWith(`${id}.`));
-			if (match) {
-				foundPath = path.join(dir, match);
-				break;
-			}
 			for (const f of files) {
-				const m = f.match(/^(\d+)\./);
-				if (m) availableIds.add(m[1]);
+				if (f.endsWith(".meta.json")) continue;
+				if (f.startsWith(`${id}.`)) {
+					if (foundPath) throw new Error(`artifact://${id} ambiguous id in authorized artifacts`);
+					foundPath = path.join(dir, f);
+				}
 			}
 		}
 
@@ -63,9 +60,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 		}
 
 		if (!foundPath) {
-			const sorted = [...availableIds].sort((a, b) => Number(a) - Number(b));
-			const availableStr = sorted.length > 0 ? sorted.join(", ") : "none";
-			throw new Error(`Artifact ${id} not found. Available: ${availableStr}`);
+			throw new Error(`artifact://${id} not found`);
 		}
 
 		const content = await Bun.file(foundPath).text();

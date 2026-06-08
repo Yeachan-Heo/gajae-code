@@ -21,6 +21,22 @@ import { matchesAppExternalEditor, matchesSelectCancel } from "../../modes/utils
 import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
 
+const SGR_MOUSE_PRESS_PATTERN = /^\x1b\[<(\d+);\d+;\d+M$/;
+const MOUSE_WHEEL_TITLE_SCROLL_ROWS = 3;
+
+function getMouseWheelTitleScrollRows(keyData: string): number {
+	const match = SGR_MOUSE_PRESS_PATTERN.exec(keyData);
+	if (!match) return 0;
+
+	const button = Number.parseInt(match[1] ?? "", 10);
+	if (!Number.isFinite(button) || (button & 64) === 0) return 0;
+
+	const wheelDirection = button & 3;
+	if (wheelDirection === 0) return -MOUSE_WHEEL_TITLE_SCROLL_ROWS;
+	if (wheelDirection === 1) return MOUSE_WHEEL_TITLE_SCROLL_ROWS;
+	return 0;
+}
+
 export interface HookSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
@@ -125,11 +141,10 @@ class ScrollableTitle extends Container {
  * `maxVisibleRows`; everything that depends on terminal width is recomputed
  * on each render so resize Just Works.
  *
- * `maxVisibleRows` is a sibling budget before it is a hard cap: surrounding
- * options shrink first so the focused option is never clipped. The single
- * allowed overflow exception is when the focused option's wrapped block
- * alone exceeds the budget — in that case the focused option is rendered
- * fully with zero siblings.
+ * `maxVisibleRows` is a hard viewport budget for every rendered option-list
+ * row. Surrounding options shrink first; if the focused option alone would
+ * exceed the remaining budget, it is compacted to contextual rows plus an
+ * omitted-rows marker so controls stay reachable for untrusted long labels.
  */
 class FocusAwareList extends Container {
 	#options: string[] = [];
@@ -168,19 +183,20 @@ class FocusAwareList extends Container {
 			theme.fg("accent", t),
 		);
 		const focusedWrappedSegments = wrapTextWithAnsi(focusedLabel, availableLabelWidth);
-		const focusedRows = Math.max(1, focusedWrappedSegments.length);
 
-		// Decide whether the position marker is going to be shown. We make a
-		// pessimistic first pass assuming the marker is needed; if the window
-		// ends up covering every option we drop it.
+		// Reserve one row for the option position marker only when the focused
+		// block itself must be compacted. Moderate focused labels keep the legacy
+		// wrap-focused behavior and spend the full viewport on label context.
 		const totalOptions = this.#options.length;
-		const willHaveSiblings = totalOptions > 1;
-		const wouldNeedMarker = willHaveSiblings; // tentative; refined below
-		const markerSlot = wouldNeedMarker ? 1 : 0;
+		const mustCompactFocused = focusedWrappedSegments.length > this.#maxVisibleRows;
+		const positionMarkerSlot = mustCompactFocused && totalOptions > 1 ? 1 : 0;
+		const focusedBudget = Math.max(1, this.#maxVisibleRows - positionMarkerSlot);
+		const focusedSegments = this.#capFocusedSegments(focusedWrappedSegments, focusedBudget, availableLabelWidth);
+		const focusedRows = Math.max(1, focusedSegments.length);
 
-		// Sibling budget. If the focused block alone is over budget, render it
-		// fully with zero siblings (only allowed overflow exception).
-		const siblingBudget = Math.max(0, this.#maxVisibleRows - focusedRows - markerSlot);
+		// Sibling budget. If the focused block consumes the available viewport,
+		// render it with zero siblings and the reserved position marker.
+		const siblingBudget = Math.max(0, this.#maxVisibleRows - focusedRows - positionMarkerSlot);
 
 		// Distribute sibling slots around focus, preferring closest options.
 		const availableAbove = this.#selectedIndex;
@@ -203,8 +219,8 @@ class FocusAwareList extends Container {
 			if (i === this.#selectedIndex) {
 				// Emit focused wrapped rows. Cursor only on row 0; continuation
 				// rows are whitespace-aligned under the label start.
-				for (let r = 0; r < focusedWrappedSegments.length; r++) {
-					const segment = focusedWrappedSegments[r] ?? "";
+				for (let r = 0; r < focusedSegments.length; r++) {
+					const segment = focusedSegments[r] ?? "";
 					rows.push(r === 0 ? styledSelectedPrefix + segment : continuationPrefix + segment);
 				}
 			} else {
@@ -217,11 +233,31 @@ class FocusAwareList extends Container {
 			}
 		}
 
-		if (showMarker) {
+		if (showMarker && rows.length < this.#maxVisibleRows) {
 			rows.push(theme.fg("dim", `  (${this.#selectedIndex + 1}/${totalOptions})`));
 		}
 
 		return this.#outline ? this.#wrapOutline(rows, width) : rows;
+	}
+
+	#capFocusedSegments(segments: string[], maxRows: number, availableLabelWidth: number): string[] {
+		const rows = segments.length > 0 ? segments : [""];
+		const budget = Math.max(1, Math.floor(maxRows));
+		if (rows.length <= budget) return rows;
+
+		if (budget === 1) {
+			return [truncateToWidth(`… ${rows.length - 1} wrapped rows omitted …`, availableLabelWidth)];
+		}
+
+		if (budget === 2) {
+			return [rows[0] ?? "", truncateToWidth(`… ${rows.length - 1} wrapped rows omitted …`, availableLabelWidth)];
+		}
+
+		const tailRows = Math.max(1, Math.floor((budget - 2) / 2));
+		const headRows = Math.max(1, budget - 1 - tailRows);
+		const omittedRows = Math.max(1, rows.length - headRows - tailRows);
+		const marker = truncateToWidth(`… ${omittedRows} wrapped rows omitted …`, availableLabelWidth);
+		return [...rows.slice(0, headRows), marker, ...rows.slice(rows.length - tailRows)];
 	}
 
 	#wrapOutline(rows: string[], width: number): string[] {
@@ -381,6 +417,13 @@ export class HookSelectorComponent extends Container {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();
 
+		if (this.#scrollTitleRows !== undefined) {
+			const wheelRows = getMouseWheelTitleScrollRows(keyData);
+			if (wheelRows !== 0) {
+				this.#scrollableTitle?.scrollBy(wheelRows);
+				return;
+			}
+		}
 		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageUp")) {
 			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
 			return;

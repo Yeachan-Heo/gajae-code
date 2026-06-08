@@ -26,7 +26,6 @@ const ALLOWED_PACKAGE_BINARIES = new Map<string, readonly string[]>([
 	["@gajae-code/coding-agent", ["gjc"]],
 	["gajae-code", ["gjc"]],
 	["@gajae-code/stats", ["gjc-stats"]],
-	["@gajae-code/swarm-extension", ["gjc-swarm"]],
 	["@gajae-code/typescript-edit-benchmark", ["typescript-edit-benchmark"]],
 ]);
 const PUBLIC_DOC_FILES = ["README.md", "packages/coding-agent/README.md"] as const;

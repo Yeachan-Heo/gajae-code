@@ -88,13 +88,16 @@ export class ControlServer {
 }
 
 export class EndpointUnreachableError extends Error {
-	constructor(readonly socketPath: string) {
-		super(`endpoint_unreachable:${socketPath}`);
+	constructor(
+		readonly socketPath: string,
+		readonly reason = "unreachable",
+	) {
+		super(`endpoint_${reason}:${socketPath}`);
 		this.name = "EndpointUnreachableError";
 	}
 }
 
-/** Call the owner's control endpoint. Rejects with {@link EndpointUnreachableError} when no owner listens. */
+/** Call the owner's control endpoint. Rejects with {@link EndpointUnreachableError} when no owner listens or responds. */
 export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs = 5_000): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const socket = net.connect(socketPath);
@@ -107,7 +110,10 @@ export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs
 			socket.destroy();
 			fn();
 		};
-		const timer = setTimeout(() => done(() => reject(new Error(`endpoint_timeout:${socketPath}`))), timeoutMs);
+		const timer = setTimeout(
+			() => done(() => reject(new EndpointUnreachableError(socketPath, "timeout"))),
+			timeoutMs,
+		);
 		socket.setEncoding("utf8");
 		socket.on("connect", () => socket.write(frame(req)));
 		socket.on("data", (chunk: string) => {
@@ -118,16 +124,21 @@ export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs
 				done(() => {
 					try {
 						resolve(JSON.parse(line));
-					} catch (error) {
-						reject(error instanceof Error ? error : new Error(String(error)));
+					} catch {
+						reject(new EndpointUnreachableError(socketPath, "bad_frame"));
 					}
 				});
 			}
 		});
 		socket.on("error", (error: NodeJS.ErrnoException) => {
 			done(() => {
-				if (error.code === "ENOENT" || error.code === "ECONNREFUSED") {
-					reject(new EndpointUnreachableError(socketPath));
+				if (
+					error.code === "ENOENT" ||
+					error.code === "ECONNREFUSED" ||
+					error.code === "ECONNRESET" ||
+					error.code === "EPIPE"
+				) {
+					reject(new EndpointUnreachableError(socketPath, error.code.toLowerCase()));
 				} else {
 					reject(error);
 				}

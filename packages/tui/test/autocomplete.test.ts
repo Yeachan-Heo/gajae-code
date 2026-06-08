@@ -272,4 +272,44 @@ describe("trySyncSlashCompletion", () => {
 		expect(values[0]).toBe("skill:ralplan");
 		expect(values).toContain("skim");
 	});
+
+	it("uses priority as a tie-breaker within the same slash match tier", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "skill:team", description: "Team orchestration", value: "skill:team", priority: 100 },
+				{ name: "slash:team", description: "Alternate team command", value: "slash:team" },
+			],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/team");
+		expect(result).not.toBeNull();
+		expect(result!.items.map(i => i.value)).toEqual(["skill:team", "slash:team"]);
+	});
+
+	it("ranks stronger slash text matches above higher-priority fallback matches", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "init", description: "Generate team files", value: "init", priority: 100 },
+				{ name: "skill:team", description: "Team orchestration", value: "skill:team" },
+			],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/team");
+		expect(result).not.toBeNull();
+		expect(result!.items.map(i => i.value)).toEqual(["skill:team", "init"]);
+	});
+
+	it("normalizes separators for structured slash command prefixes", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "init", description: "Initialize skill template", value: "init", priority: 100 },
+				{ name: "skill:team", description: "Team orchestration", value: "skill:team" },
+			],
+			"/tmp",
+		);
+		const dashed = provider.trySyncSlashCompletion("/skill-te");
+		const colon = provider.trySyncSlashCompletion("/skill:te");
+		expect(dashed?.items[0]?.value).toBe("skill:team");
+		expect(colon?.items[0]?.value).toBe("skill:team");
+	});
 });

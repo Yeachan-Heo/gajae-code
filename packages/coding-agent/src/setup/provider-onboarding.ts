@@ -79,7 +79,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
 		providerId: "minimax-code",
 		baseUrl: "https://api.minimax.io/v1",
 		apiKeyEnv: "MINIMAX_CODE_API_KEY",
-		models: ["MiniMax-M2.5"],
+		models: ["minimax-m3"],
 		compat: MINIMAX_OPENAI_COMPAT,
 	},
 	{
@@ -92,7 +92,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
 		providerId: "minimax-code-cn",
 		baseUrl: "https://api.minimaxi.com/v1",
 		apiKeyEnv: "MINIMAX_CODE_CN_API_KEY",
-		models: ["MiniMax-M2.5"],
+		models: ["minimax-m3"],
 		compat: MINIMAX_OPENAI_COMPAT,
 	},
 	{

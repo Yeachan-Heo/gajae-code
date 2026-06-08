@@ -888,6 +888,8 @@ export interface Model<TApi extends Api = any> {
 	wireModelId?: string;
 	/** Declarative request shaping for OpenAI-compatible proxy providers. */
 	requestTransform?: ModelRequestTransform;
+	/** Default prompt-cache retention preference for this model when the request omits one. */
+	cacheRetention?: CacheRetention;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */

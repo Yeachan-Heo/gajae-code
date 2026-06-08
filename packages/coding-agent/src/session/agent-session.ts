@@ -163,6 +163,10 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
+import type { LoadedSubskillActivation } from "../extensibility/gjc-plugins";
+import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injection";
+import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
+import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
@@ -172,8 +176,11 @@ import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime"
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
+import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
@@ -196,9 +203,14 @@ import {
 	isMCPToolName,
 	selectDiscoverableMCPToolNamesByServer,
 } from "../runtime-mcp/discoverable-tool-metadata";
+import { MCPManager } from "../runtime-mcp/manager";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
-import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+import {
+	isCanonicalGjcWorkflowSkill,
+	readVisibleSkillActiveState,
+	syncSkillActiveState,
+} from "../skill-state/active-state";
 import { assertDeepInterviewMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -208,9 +220,11 @@ import {
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
 } from "../tool-discovery/tool-index";
+import type { ToolSession } from "../tools";
+import { AskTool } from "../tools/ask";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import type { CheckpointState } from "../tools/checkpoint";
-import { outputMeta } from "../tools/output-meta";
+import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -297,7 +311,7 @@ function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
-export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
+export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime" | "metadata">;
 
 export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
@@ -336,6 +350,8 @@ export interface AgentSessionConfig {
 	taskDepth?: number;
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
+	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider payload hook used by the active session request path */
@@ -843,6 +859,7 @@ export class AgentSession {
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#planModeState: PlanModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
+	#workflowGateEmitter: WorkflowGateEmitter | undefined;
 	#goalRuntime: GoalRuntime;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
@@ -872,6 +889,7 @@ export class AgentSession {
 	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#lastGoalReminderAssistantTimestamp: number | undefined = undefined;
 	#todoPhases: TodoPhase[] = [];
 	#toolChoiceQueue = new ToolChoiceQueue();
 
@@ -921,6 +939,7 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	#workflowGateToolSession: ToolSession | undefined;
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
@@ -948,6 +967,8 @@ export class AgentSession {
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
 	#rpcHostToolNames = new Set<string>();
+	#gjcSubskillToolNames = new Set<string>();
+	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
 	#sessionDefaultSelectedMCPToolNames = new Map<string, string[]>();
@@ -972,6 +993,12 @@ export class AgentSession {
 	 *  without producing an aborted message_end). */
 	#planCompactAbortPending = false;
 
+	/** One-shot flag armed by `abort({ silent: true })` (e.g. Esc consuming a
+	 *  queued steer). Consumed in #handleAgentEvent to stamp `SILENT_ABORT_MARKER`
+	 *  on the resulting aborted assistant `message_end` so the interrupt does not
+	 *  surface a red "Operation aborted" line; cleared by a later non-silent abort
+	 *  or by `abort`'s safety net when no aborted message_end is produced. */
+	#silentAbortPending = false;
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -1050,6 +1077,7 @@ export class AgentSession {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
 		}
 	}
@@ -1057,6 +1085,7 @@ export class AgentSession {
 	#resetInFlight(): void {
 		this.#promptInFlightCount = 0;
 		this.#releasePowerAssertion();
+		this.#flushPendingBackgroundExchanges();
 		this.#flushPendingAgentEnd();
 	}
 
@@ -1090,6 +1119,7 @@ export class AgentSession {
 		}
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#onPayload = config.onPayload;
@@ -1485,6 +1515,10 @@ export class AgentSession {
 		return tag;
 	}
 
+	getAgentId(): string | undefined {
+		return this.#agentId;
+	}
+
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
 		const manager = AsyncJobManager.instance();
 		if (!manager) return null;
@@ -1495,6 +1529,7 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			metadata: job.metadata,
 		}));
 		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
 			id: job.id,
@@ -1502,6 +1537,7 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			metadata: job.metadata,
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
@@ -1644,10 +1680,11 @@ export class AgentSession {
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
 			event.message.stopReason === "aborted" &&
-			this.#planCompactAbortPending
+			(this.#planCompactAbortPending || this.#silentAbortPending)
 		) {
 			(event.message as AssistantMessage).errorMessage = SILENT_ABORT_MARKER;
 			this.#planCompactAbortPending = false;
+			this.#silentAbortPending = false;
 		}
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
@@ -2015,6 +2052,9 @@ export class AgentSession {
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
+					return;
+				}
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
@@ -2048,6 +2088,9 @@ export class AgentSession {
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
 				if (this.#enforceRewindBeforeYield()) {
+					return;
+				}
+				if (await this.#checkGoalCompletion(msg)) {
 					return;
 				}
 				await this.#checkTodoCompletion();
@@ -2138,13 +2181,23 @@ export class AgentSession {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
-		onSkip?: () => void;
-		onError?: () => void;
+		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		onError?: (error: unknown) => void;
 	}): void {
+		const scheduledGeneration = options?.generation;
+		const signal = this.#postPromptTasksAbortController.signal;
 		this.#schedulePostPromptTask(
 			async () => {
+				if (signal.aborted) {
+					options?.onSkip?.("aborted_signal");
+					return;
+				}
+				if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+					options?.onSkip?.("generation_changed");
+					return;
+				}
 				if (options?.shouldContinue && !options.shouldContinue()) {
-					options.onSkip?.();
+					options.onSkip?.("queue_drained");
 					return;
 				}
 				try {
@@ -2154,15 +2207,43 @@ export class AgentSession {
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
 					});
-					options?.onError?.();
+					options?.onError?.(error);
 				}
 			},
-			{
-				delayMs: options?.delayMs,
-				generation: options?.generation,
-				onSkip: options?.onSkip,
-			},
+			{ delayMs: options?.delayMs },
 		);
+	}
+
+	#logCompactionContinuationSkipped(
+		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
+		reason: string,
+	): void {
+		logger.warn("Auto-compaction continuation skipped", { source, reason });
+	}
+
+	#logCompactionContinuationError(
+		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
+		error: unknown,
+	): void {
+		logger.warn("Auto-compaction continuation failed", {
+			source,
+			reason: error instanceof Error && error.name === "AgentBusyError" ? "queue_drained" : "not_resumable_tail",
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
+	#isResumableAgentTail(): boolean {
+		const lastMsg = this.agent.state.messages.at(-1);
+		return lastMsg !== undefined && lastMsg.role !== "assistant";
+	}
+
+	#stripOverflowFailedTurnForRetry(): void {
+		const messages = this.agent.state.messages;
+		const lastMsg = messages.at(-1);
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (lastMsg?.role === "assistant" && isContextOverflow(lastMsg as AssistantMessage, contextWindow)) {
+			this.agent.replaceMessages(messages.slice(0, -1));
+		}
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
@@ -2175,16 +2256,28 @@ export class AgentSession {
 					timestamp: Date.now(),
 				},
 				autoContinuePrompt,
-				{ skipPostPromptRecoveryWait: true },
+				{ skipPostPromptRecoveryWait: true, skipCompactionCheck: true },
 			);
 		};
-		this.#schedulePostPromptTask(
-			async signal => {
+		const scheduledGeneration = generation;
+		const signal = this.#postPromptTasksAbortController.signal;
+		this.#trackPostPromptTask(
+			(async () => {
 				await Promise.resolve();
-				if (signal.aborted) return;
-				await continuePrompt();
-			},
-			{ generation },
+				if (signal.aborted) {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+					return;
+				}
+				if (this.#promptGeneration !== scheduledGeneration) {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+					return;
+				}
+				try {
+					await continuePrompt();
+				} catch (error) {
+					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				}
+			})(),
 		);
 	}
 
@@ -3039,6 +3132,14 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
+		const mcpManager = MCPManager.instance();
+		if (mcpManager) {
+			await mcpManager.disconnectAll();
+			if (MCPManager.instance() === mcpManager) {
+				MCPManager.setInstance(undefined);
+			}
+		}
+		await shutdownAllLspClients();
 		const pythonExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
 		if (!pythonExecutionsSettled) {
 			logger.warn(
@@ -3869,6 +3970,123 @@ export class AgentSession {
 		);
 	}
 
+	async #hasActiveGjcSubskillTools(parent: string, sessionId: string | undefined): Promise<boolean> {
+		if (!parent.trim()) return false;
+		const cwd = this.sessionManager.getCwd();
+		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
+		const entries = await readActiveSubskillsForParent({ cwd, sessionId, parent, phase });
+		return entries.some(entry => (entry.toolPaths ?? []).some(toolPath => toolPath.trim().length > 0));
+	}
+
+	#getCustomToolContext(): CustomToolContext {
+		return {
+			sessionManager: this.sessionManager,
+			modelRegistry: this.#modelRegistry,
+			model: this.model,
+			isIdle: () => !this.isStreaming,
+			hasQueuedMessages: () => this.queuedMessageCount > 0,
+			abort: () => {
+				this.agent.abort();
+			},
+		};
+	}
+
+	#computeGjcSubskillToolSignature(tools: CustomTool[]): string {
+		return tools
+			.map(tool => `${tool.name}\u0000${tool.description}\u0000${JSON.stringify(tool.parameters)}`)
+			.sort()
+			.join("\u0001");
+	}
+
+	/**
+	 * Refresh plugin sub-skill tools after workflow/sub-skill activation or phase changes.
+	 */
+	async refreshGjcSubskillTools(): Promise<void> {
+		const activeState = await readVisibleSkillActiveState(
+			this.sessionManager.getCwd(),
+			this.sessionManager.getSessionId(),
+		);
+		const activeSkill =
+			this.#activeSkillState?.skill ??
+			activeState?.skill ??
+			activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+		const parent = activeSkill?.trim();
+		if (!parent) {
+			if (this.#gjcSubskillToolNames.size === 0) return;
+			const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
+			const previousActiveToolNames = this.getActiveToolNames();
+			for (const name of previousGjcSubskillToolNames) {
+				this.#toolRegistry.delete(name);
+			}
+			this.#gjcSubskillToolNames.clear();
+			this.#invalidateDiscoveryCaches();
+			await this.#applyActiveToolsByName(
+				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
+			);
+			return;
+		}
+
+		const cwd = this.sessionManager.getCwd();
+		const sessionId =
+			this.#activeSkillState?.sessionId ?? activeState?.session_id ?? this.sessionManager.getSessionId();
+		if (this.#gjcSubskillToolNames.size === 0 && !(await this.#hasActiveGjcSubskillTools(parent, sessionId))) return;
+
+		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
+		const reservedToolNames = Array.from(this.#toolRegistry.keys()).filter(
+			name => !this.#gjcSubskillToolNames.has(name),
+		);
+		const customTools = await loadActiveSubskillTools({ cwd, sessionId, parent, phase, reservedToolNames });
+		const nextToolNames = customTools.map(tool => tool.name);
+		const uniqueToolNames = new Set(nextToolNames);
+		if (uniqueToolNames.size !== nextToolNames.length) {
+			throw new Error("GJC sub-skill tool names must be unique");
+		}
+
+		const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
+		const nextSignature = this.#computeGjcSubskillToolSignature(customTools);
+		if (this.#gjcSubskillToolSignature === nextSignature) {
+			return;
+		}
+
+		const previousActiveToolNames = this.getActiveToolNames();
+		for (const name of previousGjcSubskillToolNames) {
+			this.#toolRegistry.delete(name);
+		}
+		this.#gjcSubskillToolNames.clear();
+		this.#gjcSubskillToolSignature = undefined;
+
+		const getCustomToolContext = () => this.#getCustomToolContext();
+		for (const customTool of customTools) {
+			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
+			const finalTool = (
+				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
+			) as AgentTool;
+			this.#toolRegistry.set(finalTool.name, finalTool);
+			this.#gjcSubskillToolNames.add(finalTool.name);
+		}
+		this.#gjcSubskillToolSignature = nextSignature;
+
+		this.#invalidateDiscoveryCaches();
+		const activeNonGjcSubskillToolNames = previousActiveToolNames.filter(
+			name => !previousGjcSubskillToolNames.has(name),
+		);
+		const preservedGjcSubskillToolNames = previousActiveToolNames.filter(
+			name => previousGjcSubskillToolNames.has(name) && this.#gjcSubskillToolNames.has(name),
+		);
+		const autoActivatedGjcSubskillToolNames = customTools
+			.filter(tool => !tool.hidden && !previousGjcSubskillToolNames.has(tool.name))
+			.map(tool => tool.name);
+		await this.#applyActiveToolsByName(
+			Array.from(
+				new Set([
+					...activeNonGjcSubskillToolNames,
+					...preservedGjcSubskillToolNames,
+					...autoActivatedGjcSubskillToolNames,
+				]),
+			),
+		);
+	}
+
 	/** Whether auto-compaction is currently running */
 	get isCompacting(): boolean {
 		return this.#autoCompactionAbortController !== undefined || this.#compactionAbortController !== undefined;
@@ -4013,6 +4231,45 @@ export class AgentSession {
 
 	setGoalModeState(state: GoalModeState | undefined): void {
 		this.#goalModeState = state;
+	}
+
+	getWorkflowGateEmitter(): WorkflowGateEmitter | undefined {
+		return this.#workflowGateEmitter;
+	}
+
+	setWorkflowGateEmitter(emitter: WorkflowGateEmitter | undefined): void {
+		this.#workflowGateEmitter = emitter;
+		if (emitter) {
+			this.#ensureWorkflowGateAskTool();
+		}
+	}
+
+	#ensureWorkflowGateAskTool(): void {
+		if (this.#toolRegistry.has("ask")) return;
+		if (!this.#workflowGateToolSession) return;
+
+		const askTool = AskTool.createIf(this.#workflowGateToolSession);
+		if (!askTool) return;
+
+		const wrappedTool = wrapToolWithMetaNotice(askTool as unknown as AgentTool);
+		const finalTool: AgentTool = this.#extensionRunner
+			? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner)
+			: wrappedTool;
+		this.#toolRegistry.set(finalTool.name, finalTool);
+
+		if (!this.getActiveToolNames().includes(finalTool.name)) {
+			const activeTools = [
+				...this.agent.state.tools,
+				this.#wrapToolForDeepInterviewMutationGuard(this.#wrapToolForAcpPermission(finalTool)),
+			];
+			this.agent.setTools(activeTools);
+			this.#invalidateDiscoveryCaches();
+			void this.refreshBaseSystemPrompt().catch(error => {
+				logger.warn("Failed to refresh system prompt after workflow gate ask tool registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}
 	}
 
 	get goalRuntime(): GoalRuntime {
@@ -4291,6 +4548,7 @@ export class AgentSession {
 		const message = options?.synthetic
 			? { role: "developer" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() }
 			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+		await this.refreshGjcSubskillTools();
 
 		if (eagerTodoPrelude) {
 			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
@@ -4327,13 +4585,42 @@ export class AgentSession {
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
 		// own their `.gjc/state/skill-active-state.json` row through the
 		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
-		// observer here used to overwrite the row with `phase: running` and
-		// later remove it with `active:false`, which clobbered handoff lineage
-		// (`handoff_from`/`handoff_at`) and made the HUD inconsistent with
-		// mode-state. The observational filesystem write is now skipped for
-		// canonical skills; the in-memory `#activeSkillState` tracking below
-		// keeps `getActiveSkillState` accurate for the chain guard.
+		// observer must not overwrite an existing row (that clobbered handoff
+		// lineage `handoff_from`/`handoff_at` and desynced the HUD). But a fresh
+		// `/skill:<name>` invocation has no row yet, so seed `.gjc/state`
+		// idempotently here: `ensureWorkflowSkillActivationState` writes the
+		// initial mode-state + active row only when the skill is not already
+		// active, so the mutation guard and Stop hook engage immediately instead
+		// of relying on the skill prompt to run its own state-init steps.
+		if (active) {
+			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
+			const subskillDetails = details as {
+				subskillActivation?: LoadedSubskillActivation;
+				subskillActivationSet?: LoadedSubskillActivation[];
+			};
+			const subskillActivations =
+				subskillDetails.subskillActivationSet && subskillDetails.subskillActivationSet.length > 0
+					? subskillDetails.subskillActivationSet
+					: subskillDetails.subskillActivation
+						? [subskillDetails.subskillActivation]
+						: [];
+			if (subskillActivations.length > 0) {
+				const skillBoundActivation = subskillDetails.subskillActivation ?? subskillActivations[0];
+				await syncSkillActiveState({
+					cwd: this.sessionManager.getCwd(),
+					skill,
+					active: true,
+					phase: skillBoundActivation?.phase,
+					sessionId,
+					active_subskills: subskillActivations.map(toActiveSubskillEntry),
+				});
+			}
+		}
+		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
+		if (active) {
+			await this.refreshGjcSubskillTools();
+		}
 	}
 
 	async #syncSkillPromptActiveStateSafely(
@@ -4978,6 +5265,13 @@ export class AgentSession {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
 	}
 
+	/** Whether the agent has queued steering messages that a `user_interrupt`
+	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	get hasQueuedSteering(): boolean {
+		return this.agent.hasQueuedSteering();
+	}
+
 	/** Get pending messages (read-only). Returns the public text-only view;
 	 *  internal `{text, tag?}` records are mapped to `.text` so callers
 	 *  (`updatePendingMessagesDisplay`, `restoreQueuedMessagesToEditor`) see
@@ -5074,7 +5368,17 @@ export class AgentSession {
 			| "handoff"
 			| "tool_abort"
 			| "internal";
+		/** Suppress the "Operation aborted" line on the resulting aborted message
+		 *  by stamping `SILENT_ABORT_MARKER`. Used when Esc consumes a queued steer
+		 *  and resumes via steer-on-interrupt, so the interrupt reads as a quiet
+		 *  hand-off rather than a failure. */
+		silent?: boolean;
 	}): Promise<void> {
+		if (options?.silent) {
+			this.#silentAbortPending = true;
+		} else {
+			this.#silentAbortPending = false;
+		}
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -5114,6 +5418,10 @@ export class AgentSession {
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
 		this.#resetInFlight();
+		// Safety net: clear the silent-abort flag if it was never consumed (the
+		// abort produced no aborted assistant message_end to stamp). Prevents the
+		// marker from leaking onto a later, unrelated abort.
+		this.#silentAbortPending = false;
 		// Safety net: if the agent loop aborted without producing an assistant
 		// message (e.g. failed before the first stream), the in-flight yield was
 		// never resolved or rejected by the normal message_end path. Reject it now
@@ -5188,6 +5496,9 @@ export class AgentSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+		if (this.model) {
+			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+		}
 		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 		if (nextDiscoverySessionToolNames) {
 			await this.#applyActiveToolsByName(nextDiscoverySessionToolNames, { persistMCPSelection: false });
@@ -5979,6 +6290,11 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#todoReminderCount = 0;
+			if (model) {
+				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+			}
+			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 
 			// Inject the handoff document as a custom message
 			const handoffContent = createHandoffContext(handoffText);
@@ -6265,6 +6581,39 @@ export class AgentSession {
 			},
 			toolChoice: todoWriteToolChoice,
 		};
+	}
+
+	async #checkGoalCompletion(assistantMessage: AssistantMessage): Promise<boolean> {
+		const state = this.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") {
+			this.#lastGoalReminderAssistantTimestamp = undefined;
+			return false;
+		}
+		if (this.#lastGoalReminderAssistantTimestamp === assistantMessage.timestamp) {
+			return false;
+		}
+		this.#lastGoalReminderAssistantTimestamp = assistantMessage.timestamp;
+
+		const continuationPrompt = this.#goalRuntime.buildContinuationPrompt();
+		if (!continuationPrompt) return false;
+		const reminder = [
+			"<system-reminder>",
+			"You stopped while a goal is still active and uncleared.",
+			"Continue working on the active goal until it is verified complete, paused, or dropped.",
+			"",
+			continuationPrompt,
+			"</system-reminder>",
+		].join("\n");
+
+		logger.debug("Goal completion: sending active-goal reminder", { goalId: state.goal.id });
+		this.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: reminder }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		return true;
 	}
 	/**
 	 * Check if agent stopped with incomplete todos and prompt to continue.
@@ -6909,12 +7258,34 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
-				if (!willRetry && this.agent.hasQueuedMessages()) {
+				if (willRetry) {
+					this.#stripOverflowFailedTurnForRetry();
+					if (this.#isResumableAgentTail()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							onSkip: skipReason => this.#logCompactionContinuationSkipped("overflow_retry", skipReason),
+							onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+						});
+					} else {
+						const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
+						logger.warn("Auto-compaction continuation skipped", {
+							source: "overflow_retry",
+							reason: "not_resumable_tail",
+							role: tail?.role,
+							stopReason: tail?.stopReason,
+						});
+					}
+				} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
+						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
+				} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+					this.#scheduleAutoContinuePrompt(generation);
 				}
 				return;
 			}
@@ -7116,26 +7487,36 @@ export class AgentSession {
 			};
 			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
 
-			if (!willRetry && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				this.#scheduleAutoContinuePrompt(generation);
-			}
-
 			if (willRetry) {
-				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.replaceMessages(messages.slice(0, -1));
+				this.#stripOverflowFailedTurnForRetry();
+				if (!this.#isResumableAgentTail()) {
+					const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
+					logger.warn("Auto-compaction continuation skipped", {
+						source: "overflow_retry",
+						reason: "not_resumable_tail",
+						role: tail?.role,
+						stopReason: tail?.stopReason,
+					});
+				} else {
+					this.#scheduleAgentContinue({
+						delayMs: 100,
+						generation,
+						onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
+						onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+					});
 				}
-
-				this.#scheduleAgentContinue({ delayMs: 100, generation });
-			} else if (this.agent.hasQueuedMessages()) {
+			} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this.#scheduleAgentContinue({
 					delayMs: 100,
 					generation,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
+					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
+					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
+			} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+				this.#scheduleAutoContinuePrompt(generation);
 			}
 		} catch (error) {
 			if (autoCompactionSignal.aborted) {
@@ -8377,13 +8758,17 @@ export class AgentSession {
 				return;
 			}
 			if (this.isStreaming) {
-				setTimeout(attempt, 50);
+				// Re-poll while streaming, but do not let this housekeeping timer
+				// keep the event loop alive on its own (CPU-7).
+				const pollTimer = setTimeout(attempt, 50);
+				pollTimer.unref?.();
 				return;
 			}
 			this.#scheduledBackgroundExchangeFlush = false;
 			this.#flushPendingBackgroundExchanges();
 		};
-		setTimeout(attempt, 0);
+		const kickoff = setTimeout(attempt, 0);
+		kickoff.unref?.();
 	}
 
 	#flushPendingBackgroundExchanges(): void {

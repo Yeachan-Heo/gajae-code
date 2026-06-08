@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
+import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+
 import { applyGjcTmuxProfile } from "./launch-tmux";
 import {
 	AlreadyExistsError,
@@ -13,6 +15,7 @@ import {
 	removeFileAudited,
 	writeJsonAtomic,
 	writeReport,
+	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE } from "./tmux-common";
 
@@ -281,6 +284,55 @@ export interface GjcTeamMailboxMessage {
 	delivered_at?: string;
 	notified_at?: string;
 	idempotency_key?: string;
+}
+
+function taskReceiptFields(teamName: string, task: GjcTeamTask): Record<string, unknown> {
+	return {
+		team_name: teamName,
+		task_id: task.id,
+		status: task.status,
+		owner: task.owner,
+		worker_id: task.claim?.owner ?? task.owner ?? task.assignee,
+	};
+}
+
+function mailboxMessageReceiptFields(teamName: string, message: GjcTeamMailboxMessage): Record<string, unknown> {
+	return {
+		team_name: teamName,
+		message_id: message.message_id,
+		from_worker: message.from_worker,
+		to_worker: message.to_worker,
+		delivered: Boolean(message.delivered_at),
+		notified: Boolean(message.notified_at),
+		delivered_at: message.delivered_at,
+		notified_at: message.notified_at,
+	};
+}
+
+function notificationReceiptFields(notification: GjcTeamNotification): Record<string, unknown> {
+	return {
+		team_name: notification.team_name,
+		notification_id: notification.id,
+		recipient: notification.recipient,
+		source_type: notification.source.type,
+		source_id: notification.source.id,
+		delivery_state: notification.delivery_state,
+		pane_attempt_result: notification.pane_attempt_result,
+		pane_attempt_reason: notification.pane_attempt_reason,
+		replay_count: notification.replay_count,
+	};
+}
+
+function notificationSummaryReceipt(
+	teamName: string,
+	result: { notifications: GjcTeamNotification[]; summary: GjcTeamNotificationSummary },
+): Record<string, unknown> {
+	return {
+		team_name: teamName,
+		notification_ids: result.notifications.map(notification => notification.id),
+		delivery_states: result.notifications.map(notification => notification.delivery_state),
+		summary: result.summary,
+	};
 }
 
 interface FsError {
@@ -950,11 +1002,11 @@ function teamModeStatePath(): string {
 export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, cwd = process.cwd()): Promise<void> {
 	const active = snapshot.phase !== "complete" && snapshot.phase !== "cancelled";
 	const updatedAt = now();
-	await writeJsonAtomic(
+	await writeWorkflowEnvelopeAtomic(
 		teamModeStatePath(),
 		{
 			skill: "team",
-			version: 1,
+			version: WORKFLOW_STATE_VERSION,
 			active,
 			current_phase: snapshot.phase,
 			team_name: snapshot.team_name,
@@ -1621,9 +1673,10 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`You are ${worker.id} in gjc team ${config.team_name}.`,
 		`Team state root: ${config.state_root}.`,
 		workspace,
-		`Task: ${config.task}`,
+		`Team brief (context only): ${config.task}`,
+		"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
 		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
+		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
 		`GJC_TEAM_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
@@ -1637,7 +1690,80 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 	];
 	return `${env.join(" ")} ${config.worker_command} ${shellQuote(prompt)}`;
 }
+interface GjcTeamInitialLane {
+	label: string;
+	title: string;
+	body: string;
+}
+
+function normalizeLaneId(label: string): string {
+	return `lane-${sanitizeName(label).toLowerCase() || stableHash(label).slice(0, 8)}`;
+}
+
+function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
+	const lines = task.split(/\r?\n/);
+	const lanes: GjcTeamInitialLane[] = [];
+	let current: { label: string; title: string; body: string[] } | null = null;
+	const laneHeading = /^#{2,6}\s+Lane\s+([A-Za-z0-9]+)\s*(?:[—–-]\s*(.+))?\s*$/;
+	const boundaryHeading = /^#{1,6}\s+(?:Integration Owner|Verification Plan|ADR|Approval State)\b/i;
+
+	for (const line of lines) {
+		const match = line.match(laneHeading);
+		if (match) {
+			if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+			current = {
+				label: match[1] ?? `${lanes.length + 1}`,
+				title: (match[2] ?? `Lane ${match[1] ?? lanes.length + 1}`).trim(),
+				body: [],
+			};
+			continue;
+		}
+		if (current && boundaryHeading.test(line)) {
+			lanes.push({ ...current, body: current.body.join("\n").trim() });
+			current = null;
+			continue;
+		}
+		if (current) current.body.push(line);
+	}
+	if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+	return lanes.filter(lane => lane.body.length > 0 || lane.title.length > 0);
+}
+
+function hasAmbiguousLaneSplitIntent(task: string): boolean {
+	return (
+		/\bsplit\s+lanes?\s*:/i.test(task) || /\blanes?\s*:\s*[A-Z]\b/i.test(task) || /\bLane\s+[A-Z]\s*[—–-]/.test(task)
+	);
+}
+
 function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[] {
+	const lanes = parseExplicitTeamLanes(task);
+	if (lanes.length > 0)
+		return lanes.map((lane, index) => {
+			const worker = workers[index % workers.length];
+			if (!worker) throw new Error("team_lane_requires_worker");
+			const laneTitle = `Lane ${lane.label} — ${lane.title}`;
+			const objective = [`${laneTitle}`, lane.body].filter(part => part.trim().length > 0).join("\n\n");
+			return {
+				id: `task-${index + 1}`,
+				subject: laneTitle,
+				description: objective,
+				title: laneTitle,
+				objective,
+				status: "pending",
+				owner: worker.id,
+				lane: normalizeLaneId(lane.label),
+				required_role: worker.role,
+				version: 1,
+				created_at: now(),
+				updated_at: now(),
+			};
+		});
+
+	if (workers.length > 1 && hasAmbiguousLaneSplitIntent(task))
+		throw new Error(
+			"ambiguous_team_lane_split: multi-worker team launch mentions lanes but does not provide explicit markdown lane sections such as `### Lane A — Title`",
+		);
+
 	return workers.map(worker => ({
 		id: `task-${worker.index}`,
 		subject: `Execute team brief (${worker.id})`,
@@ -2404,6 +2530,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
 		: readCurrentTmuxLeaderContext(tmuxCommand, env);
 	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
+	const initialTasks = buildInitialTasks(options.task, initialWorkers);
 	const workers: GjcTeamWorker[] = [];
 	try {
 		for (const worker of initialWorkers)
@@ -2457,7 +2584,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		updated_at: createdAt,
 	});
 	await writePhase(dir, "starting");
-	for (const task of buildInitialTasks(options.task, config.workers)) await writeTask(dir, task);
+	for (const task of initialTasks) await writeTask(dir, task);
 	await appendEvent(dir, {
 		type: "team_started",
 		message: options.dryRun
@@ -3746,121 +3873,142 @@ export async function executeGjcTeamApiOperation(
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
 			return { task: await readGjcTeamTask(teamName, String(input.task_id ?? input.taskId), cwd, env) };
-		case "create-task":
-			return {
-				task: await createGjcTeamTask(
-					teamName,
-					String(input.subject ?? "Task"),
-					String(input.description ?? ""),
-					cwd,
-					env,
-					taskMetadataFromInput(input, true),
-				),
-			};
-		case "update-task":
-			return {
-				task: await updateGjcTeamTask(
-					teamName,
-					String(input.task_id ?? input.taskId),
-					{
-						subject: typeof input.subject === "string" ? input.subject : undefined,
-						description: typeof input.description === "string" ? input.description : undefined,
-						...taskMetadataFromInput(input),
-					},
-					cwd,
-					env,
-				),
-			};
+		case "create-task": {
+			const task = await createGjcTeamTask(
+				teamName,
+				String(input.subject ?? "Task"),
+				String(input.description ?? ""),
+				cwd,
+				env,
+				taskMetadataFromInput(input, true),
+			);
+			return { ok: true, ...taskReceiptFields(teamName, task) };
+		}
+		case "update-task": {
+			const task = await updateGjcTeamTask(
+				teamName,
+				String(input.task_id ?? input.taskId),
+				{
+					subject: typeof input.subject === "string" ? input.subject : undefined,
+					description: typeof input.description === "string" ? input.description : undefined,
+					...taskMetadataFromInput(input),
+				},
+				cwd,
+				env,
+			);
+			return { ok: true, ...taskReceiptFields(teamName, task) };
+		}
 		case "claim-task": {
 			const requestedTaskId = input.task_id ?? input.taskId;
-			return claimGjcTeamTask(
+			const result = await claimGjcTeamTask(
 				teamName,
 				worker,
 				cwd,
 				env,
 				typeof requestedTaskId === "string" ? requestedTaskId : undefined,
 			);
+			return {
+				ok: result.ok,
+				reason: result.reason,
+				team_name: teamName,
+				worker_id: result.worker_id ?? worker,
+				...(result.task ? taskReceiptFields(teamName, result.task) : {}),
+				claim_token: result.claim_token,
+			};
 		}
 		case "transition-task":
-		case "transition-task-status":
+		case "transition-task-status": {
+			const task = await transitionGjcTeamTaskStatus(
+				teamName,
+				String(input.task_id ?? input.taskId),
+				parseGjcTeamTaskStatus(input.to ?? input.status),
+				cwd,
+				env,
+				typeof input.claim_token === "string" ? input.claim_token : undefined,
+				explicitWorker,
+				input.completion_evidence ?? input.completionEvidence,
+			);
 			return {
 				ok: true,
-				task: await transitionGjcTeamTaskStatus(
-					teamName,
-					String(input.task_id ?? input.taskId),
-					parseGjcTeamTaskStatus(input.to ?? input.status),
-					cwd,
-					env,
-					typeof input.claim_token === "string" ? input.claim_token : undefined,
-					explicitWorker,
-					input.completion_evidence ?? input.completionEvidence,
-				),
+				...taskReceiptFields(teamName, task),
+				worker_id: explicitWorker ?? task.owner ?? task.assignee,
 			};
-		case "release-task-claim":
+		}
+		case "release-task-claim": {
+			const task = await releaseGjcTeamTaskClaim(
+				teamName,
+				String(input.task_id),
+				String(input.claim_token),
+				worker,
+				cwd,
+				env,
+			);
+			return { ok: true, ...taskReceiptFields(teamName, task), worker_id: worker };
+		}
+		case "send-message": {
+			const message = await sendGjcTeamMessage(
+				teamName,
+				String(input.from_worker),
+				String(input.to_worker),
+				String(input.body),
+				cwd,
+				env,
+				typeof input.idempotency_key === "string" ? input.idempotency_key : undefined,
+			);
+			return { ok: true, ...mailboxMessageReceiptFields(teamName, message) };
+		}
+		case "broadcast": {
+			const messages = await broadcastGjcTeamMessage(
+				teamName,
+				String(input.from_worker),
+				String(input.body),
+				cwd,
+				env,
+				typeof input.idempotency_key === "string" ? input.idempotency_key : undefined,
+			);
 			return {
 				ok: true,
-				task: await releaseGjcTeamTaskClaim(
-					teamName,
-					String(input.task_id),
-					String(input.claim_token),
-					worker,
-					cwd,
-					env,
-				),
+				team_name: teamName,
+				message_ids: messages.map(message => message.message_id),
+				delivery_states: messages.map(message => ({
+					message_id: message.message_id,
+					to_worker: message.to_worker,
+					delivered: Boolean(message.delivered_at),
+					notified: Boolean(message.notified_at),
+				})),
 			};
-		case "send-message":
-			return {
-				message: await sendGjcTeamMessage(
-					teamName,
-					String(input.from_worker),
-					String(input.to_worker),
-					String(input.body),
-					cwd,
-					env,
-					typeof input.idempotency_key === "string" ? input.idempotency_key : undefined,
-				),
-			};
-		case "broadcast":
-			return {
-				messages: await broadcastGjcTeamMessage(
-					teamName,
-					String(input.from_worker),
-					String(input.body),
-					cwd,
-					env,
-					typeof input.idempotency_key === "string" ? input.idempotency_key : undefined,
-				),
-			};
+		}
 		case "mailbox-list":
 			return { messages: await listGjcTeamMailbox(teamName, worker, cwd, env) };
-		case "mailbox-mark-delivered":
-			return {
-				message: await markGjcTeamMailboxMessage(
-					teamName,
-					worker,
-					String(input.message_id),
-					"delivered_at",
-					cwd,
-					env,
-				),
-			};
-		case "mailbox-mark-notified":
-			return {
-				message: await markGjcTeamMailboxMessage(
-					teamName,
-					worker,
-					String(input.message_id),
-					"notified_at",
-					cwd,
-					env,
-				),
-			};
+		case "mailbox-mark-delivered": {
+			const message = await markGjcTeamMailboxMessage(
+				teamName,
+				worker,
+				String(input.message_id),
+				"delivered_at",
+				cwd,
+				env,
+			);
+			return { ok: true, ...mailboxMessageReceiptFields(teamName, message) };
+		}
+		case "mailbox-mark-notified": {
+			const message = await markGjcTeamMailboxMessage(
+				teamName,
+				worker,
+				String(input.message_id),
+				"notified_at",
+				cwd,
+				env,
+			);
+			return { ok: true, ...mailboxMessageReceiptFields(teamName, message) };
+		}
 		case "notification-list": {
 			const dir = await findTeamDir(teamName, cwd, env);
 			const config = await readConfig(dir);
 			await reconcileTeamNotifications(dir, config);
 			const notifications = await listNotificationRecords(dir);
-			return { notifications, summary: summarizeNotifications(notifications) };
+			const result = { notifications, summary: summarizeNotifications(notifications) };
+			return notificationSummaryReceipt(teamName, result);
 		}
 		case "notification-read":
 			return {
@@ -3870,20 +4018,19 @@ export async function executeGjcTeamApiOperation(
 				),
 			};
 		case "notification-replay":
-			return replayGjcTeamNotifications(teamName, cwd, env);
+			return notificationSummaryReceipt(teamName, await replayGjcTeamNotifications(teamName, cwd, env));
 		case "notification-mark-pane-attempt": {
 			const dir = await findTeamDir(teamName, cwd, env);
 			const notification = await readNotificationRecord(dir, String(input.notification_id));
-			return {
-				notification: await writeNotificationRecord(dir, {
-					...notification,
-					delivery_state: parsePaneAttemptResult(String(input.result ?? "failed")),
-					pane_attempt_result: parsePaneAttemptResult(String(input.result ?? "failed")),
-					pane_attempt_reason: String(input.reason ?? "manual_api"),
-					pane_attempt_at: now(),
-					updated_at: now(),
-				}),
-			};
+			const updated = await writeNotificationRecord(dir, {
+				...notification,
+				delivery_state: parsePaneAttemptResult(String(input.result ?? "failed")),
+				pane_attempt_result: parsePaneAttemptResult(String(input.result ?? "failed")),
+				pane_attempt_reason: String(input.reason ?? "manual_api"),
+				pane_attempt_at: now(),
+				updated_at: now(),
+			});
+			return { ok: true, ...notificationReceiptFields(updated) };
 		}
 		case "worker-startup-ack":
 			return writeGjcWorkerStartupAck(teamName, worker, cwd, env, input);

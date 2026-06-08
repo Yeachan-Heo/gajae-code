@@ -31,6 +31,7 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
+
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
@@ -67,6 +68,8 @@ import {
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
 import { ExtensionRuntime } from "./extensibility/extensions/loader";
+import { resolveCurrentPhaseForParent } from "./extensibility/gjc-plugins/injection";
+import { loadActiveSubskillTools } from "./extensibility/gjc-plugins/tools";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "./extensibility/skills";
 import type { FileSlashCommand } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
@@ -242,6 +245,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
+	/** Explicit parent/phase used to load active GJC sub-skill tools for this session. */
+	gjcSubskillToolContext?: { parent: string; phase: string; sessionId?: string; cwd?: string };
 	/** Inline extensions (merged with discovery). */
 	extensions?: ExtensionFactory[];
 	/** Additional extension paths to load (merged with discovery). */
@@ -288,7 +293,9 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
-	/** Parent Hindsight state to alias for subagent memory tools. */
+	/** Current role-agent type/name for nested task sessions. */
+	currentAgentType?: string;
+	/** Parent Hindsight state to alias for subagent private memory backend compatibility. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Pre-allocated agent identity for IRC routing. Default: "0-Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
@@ -1158,6 +1165,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
+			currentAgentType: options.currentAgentType,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
@@ -1179,6 +1187,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getActiveModelString,
 			getPlanModeState: () => session?.getPlanModeState(),
 			getGoalModeState: () => session?.getGoalModeState(),
+			getWorkflowGateEmitter: () => session?.getWorkflowGateEmitter(),
 			getGoalRuntime: () => session?.goalRuntime,
 			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
@@ -1275,6 +1284,47 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
 			customTools.push(...getSearchTools());
+		}
+
+		const getReservedSubskillToolNames = () => [
+			...new Set([
+				...builtinTools.map(tool => tool.name),
+				...(options.toolNames?.map(name => name.toLowerCase()) ?? []),
+				...(options.customTools?.map(tool => (isCustomTool(tool) ? tool.name : tool.name)) ?? []),
+				...customTools.map(tool => tool.name),
+			]),
+		];
+
+		const gjcSubskillToolContext = options.gjcSubskillToolContext;
+		if (gjcSubskillToolContext?.parent.trim() && gjcSubskillToolContext.phase.trim()) {
+			const pluginTools = await loadActiveSubskillTools({
+				cwd: gjcSubskillToolContext.cwd ?? cwd,
+				sessionId: gjcSubskillToolContext.sessionId ?? logicalSessionId,
+				parent: gjcSubskillToolContext.parent,
+				phase: gjcSubskillToolContext.phase,
+				reservedToolNames: getReservedSubskillToolNames(),
+			});
+			if (pluginTools.length > 0) {
+				customTools.push(...pluginTools);
+			}
+		} else {
+			for (const skill of skills) {
+				const phase = await resolveCurrentPhaseForParent({
+					cwd,
+					sessionId: logicalSessionId,
+					parent: skill.name,
+				});
+				const pluginTools = await loadActiveSubskillTools({
+					cwd,
+					sessionId: logicalSessionId,
+					parent: skill.name,
+					phase,
+					reservedToolNames: getReservedSubskillToolNames(),
+				});
+				if (pluginTools.length > 0) {
+					customTools.push(...pluginTools);
+				}
+			}
 		}
 
 		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
@@ -1885,6 +1935,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			taskDepth,
 			toolRegistry,
+			workflowGateToolSession: toolSession,
 			transformContext,
 			onPayload,
 			onResponse,

@@ -32,7 +32,7 @@ const repoRoot = process.cwd();
 const expectedBundledWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 const expectedBundledRoleAgents = ["architect", "critic", "executor", "planner"] as const;
 const expectedPackageScope = "@gajae-code/";
-const expectedCliBins = ["gjc", "gjc-stats", "gjc-swarm"] as const;
+const expectedCliBins = ["gjc", "gjc-stats"] as const;
 const expectedRootPackageName = "gajae-code";
 const allowedUnscopedPackageNames = new Set([expectedRootPackageName]);
 const rootPublicMetadataFields = ["name", "description", "homepage", "repository", "bugs"] as const;
@@ -72,7 +72,7 @@ const legacyAllowlist = [
 	},
 	{
 		name: "runtime-compatibility-internals",
-		path: /^packages\/(coding-agent|agent|ai|tui|utils|stats|swarm-extension|natives)\//,
+		path: /^packages\/(coding-agent|agent|ai|tui|utils|stats|natives)\//,
 		rationale: "Runtime internals may retain legacy aliases while user-facing copy is rebranded.",
 	},
 ] as const;
@@ -180,7 +180,25 @@ function rootScriptAllowlistFor(line: string): string | undefined {
 }
 
 function scanLegacyHits(): LegacyHit[] {
-	const roots = ["README.md", "docs", "packages", "python", "scripts", ".gjc", "assets", "package.json", "Cargo.toml", "Dockerfile", "Dockerfile.robogjc", "Dockerfile.dockerignore", "Dockerfile.robogjc.dockerignore"];
+	const roots = [
+		"README.md",
+		"docs",
+		"packages",
+		"python",
+		"scripts",
+		".gjc/skills",
+		".gjc/agents",
+		".gjc/commands",
+		".gjc/rules",
+		".gjc/settings.json",
+		"assets",
+		"package.json",
+		"Cargo.toml",
+		"Dockerfile",
+		"Dockerfile.robogjc",
+		"Dockerfile.dockerignore",
+		"Dockerfile.robogjc.dockerignore",
+	];
 	const files = roots.flatMap(root => {
 		const full = path.join(repoRoot, root);
 		if (!fs.existsSync(full)) return [];

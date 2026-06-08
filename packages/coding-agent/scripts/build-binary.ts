@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "gjc");
+const nativeDir = path.join(packageDir, "..", "natives", "native");
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
@@ -20,6 +21,11 @@ async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): 
 	if (exitCode !== 0) {
 		throw new Error(`Command failed with exit code ${exitCode}: ${command.join(" ")}`);
 	}
+}
+async function stageWorkspaceNativeAddons(): Promise<void> {
+	await Array.fromAsync(new Bun.Glob("pi_natives.*.node").scan({ cwd: nativeDir }), async filename => {
+		await Bun.write(path.join(packageDir, "dist", filename), Bun.file(path.join(nativeDir, filename)));
+	});
 }
 
 async function main(): Promise<void> {
@@ -62,6 +68,7 @@ async function main(): Promise<void> {
 				buildEnv,
 			);
 
+			await stageWorkspaceNativeAddons();
 			// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 			if (shouldAdhocSignDarwinBinary()) {
 				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);

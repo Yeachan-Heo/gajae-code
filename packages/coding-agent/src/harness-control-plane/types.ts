@@ -11,6 +11,22 @@
 /** Harnesses the control plane can operate. v1 implements `gajae-code` only. */
 export type Harness = "gajae-code" | "codex" | "omx";
 
+/** Operating mode of a session. `implement` builds/changes code; `review` produces a read-only verdict. */
+export type SessionMode = "implement" | "review";
+
+/** Closed vocabulary of terminal review verdicts a review-only session may emit. */
+export type ReviewVerdict = "APPROVE_MERGE_READY" | "REQUEST_CHANGES" | "OWNER_CONFIRMATION_REQUIRED";
+
+export const REVIEW_VERDICTS: readonly ReviewVerdict[] = [
+	"APPROVE_MERGE_READY",
+	"REQUEST_CHANGES",
+	"OWNER_CONFIRMATION_REQUIRED",
+];
+
+export function isReviewVerdict(value: unknown): value is ReviewVerdict {
+	return typeof value === "string" && (REVIEW_VERDICTS as readonly string[]).includes(value);
+}
+
 /** Lifecycle states of an operated session. */
 export type HarnessLifecycle =
 	| "new"
@@ -44,7 +60,13 @@ export type RecoveryClassification =
 	| "human-check";
 
 /** Receipt families persisted under the session storage dir. */
-export type ReceiptFamily = "vanish" | "prompt-acceptance" | "validation" | "completion";
+export type ReceiptFamily =
+	| "vanish"
+	| "prompt-acceptance"
+	| "validation"
+	| "completion"
+	| "review-verdict"
+	| "review-failure";
 
 /** The CLI verbs / primitives exposed by `gjc harness <verb>`. */
 export type HarnessVerb =
@@ -95,6 +117,8 @@ export interface PrimitiveResponse<E = Record<string, unknown>> {
 export interface SessionHandle {
 	sessionId: string;
 	harness: Harness;
+	/** Operating mode; absent on legacy records means `implement`. */
+	mode?: SessionMode;
 	repo: string | null;
 	workspace: string;
 	branch: string | null;

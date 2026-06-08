@@ -157,10 +157,14 @@ export async function* iterateWithIdleTimeout<T>(
 			activeTimeoutMs = firstItemTimeoutMs;
 		} else if (options.idleTimeoutMs !== undefined && options.idleTimeoutMs > 0) {
 			activeTimeoutMs = options.idleTimeoutMs - (Date.now() - lastProgressAt);
-			if (activeTimeoutMs <= 0) {
-				options.onIdle?.();
-				closeIterator();
-				throw new Error(options.errorMessage);
+			// The idle deadline may already have elapsed because the *consumer*
+			// was slow, not because the provider stalled — and the next item may
+			// already be buffered and ready to deliver. Clamp to 0 instead of
+			// throwing eagerly so the next() race below still gets a chance to
+			// win (it settles on a microtask, ahead of the 0ms timer). Only a
+			// genuinely hung iterator loses that race and surfaces as a stall.
+			if (activeTimeoutMs < 0) {
+				activeTimeoutMs = 0;
 			}
 		}
 
@@ -177,7 +181,10 @@ export async function* iterateWithIdleTimeout<T>(
 
 		let timer: NodeJS.Timeout | undefined;
 		let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
-		const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs > 0;
+		const enforceTimeout =
+			!noTimeoutEnforced &&
+			activeTimeoutMs !== undefined &&
+			(awaitingFirstItem ? activeTimeoutMs > 0 : activeTimeoutMs >= 0);
 		if (enforceTimeout) {
 			const { promise, resolve } = Promise.withResolvers<{ kind: "timeout" }>();
 			resolveTimeout = resolve;

@@ -31,6 +31,7 @@ import { formatBytes, formatDuration } from "../tools/render-utils";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type ForkContextMode,
 	type ForkContextPolicy,
 	getTaskSchema,
 	type SingleResult,
@@ -46,10 +47,13 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
+import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
+import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import { DEFAULT_SPAWN_THRESHOLD, evaluateReviewerExploreGate, evaluateSpawnGate } from "./spawn-gate";
 import {
 	applyNestedPatches,
 	captureBaseline,
@@ -122,11 +126,37 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.total += cost.total;
 }
 
+function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
+	const invalid: string[] = [];
+	for (let i = 0; i < tasks.length; i++) {
+		const error = getTaskIdValidationError(tasks[i]?.id);
+		if (error) invalid.push(`index ${i}: ${error}`);
+	}
+	return invalid.length > 0 ? `Invalid task ids: ${invalid.join(" ")}` : undefined;
+}
+
 // Re-export types and utilities
 export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
+export {
+	isValidAllocatedTaskId,
+	isValidTaskId,
+	TASK_ID_DESCRIPTION,
+	TASK_ID_PATTERN,
+	validateAllocatedTaskId,
+	validateTaskId,
+} from "./id";
 export { AgentOutputManager } from "./output-manager";
+export type { TaskResultReceipt } from "./receipt";
+export {
+	assertNoRawTaskFields,
+	buildTaskReceipt,
+	buildTaskRoi,
+	buildTaskRoiSummary,
+	findRawTaskLeakKeys,
+	sanitizeTaskToolDetails,
+} from "./receipt";
 export type {
 	AgentDefinition,
 	AgentProgress,
@@ -203,6 +233,14 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 	if (!customSchemaEnabled && params.schema !== undefined) {
 		disallowedFields.push("schema");
 	}
+	if (!contextEnabled) {
+		const inheritedTaskIds = (params.tasks ?? [])
+			.filter(task => task.inheritContext !== undefined && task.inheritContext !== "none")
+			.map(task => task.id);
+		if (inheritedTaskIds.length > 0) {
+			disallowedFields.push(`inheritContext for task(s) ${inheritedTaskIds.join(", ")}`);
+		}
+	}
 	if (disallowedFields.length === 0) {
 		return undefined;
 	}
@@ -212,14 +250,63 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 	}
 
 	if (disallowedFields.length === 1) {
-		return `task.simple is set to independent, so the task tool does not accept \`${disallowedFields[0]}\`. Put everything the subagent needs inside each task assignment.`;
+		return `task.simple is set to independent, so the task tool does not accept ${disallowedFields[0].startsWith("inheritContext") ? disallowedFields[0] : `\`${disallowedFields[0]}\``}. Put everything the subagent needs inside each task assignment.`;
 	}
 
-	return "task.simple is set to independent, so the task tool does not accept `context` or `schema`. Put all required background and output expectations inside each task assignment or the selected agent definition.";
+	return `task.simple is set to independent, so the task tool does not accept ${disallowedFields.map(field => (field.startsWith("inheritContext") ? field : `\`${field}\``)).join(", ")}. Put all required background and output expectations inside each task assignment or the selected agent definition.`;
 }
 
 function getForkContextPolicy(agent: AgentDefinition): ForkContextPolicy {
 	return agent.forkContext ?? "forbidden";
+}
+const FORK_CONTEXT_MODES = [
+	"none",
+	"receipt",
+	"last-turn",
+	"bounded",
+	"full",
+] as const satisfies readonly ForkContextMode[];
+const FORK_CONTEXT_MODE_SET = new Set<unknown>(FORK_CONTEXT_MODES);
+const FORK_CONTEXT_REQUEST_MODES = ["receipt", "last-turn", "bounded", "full"] as const satisfies readonly Exclude<
+	ForkContextMode,
+	"none"
+>[];
+const FORK_CONTEXT_REQUEST_MODE_SET = new Set<unknown>(FORK_CONTEXT_REQUEST_MODES);
+
+function isValidForkContextMode(value: unknown): value is ForkContextMode {
+	return FORK_CONTEXT_MODE_SET.has(value);
+}
+
+function requestsForkContext(
+	task: Pick<TaskItem, "inheritContext">,
+): task is TaskItem & { inheritContext: Exclude<ForkContextMode, "none"> } {
+	return FORK_CONTEXT_REQUEST_MODE_SET.has(task.inheritContext);
+}
+
+function resolveForkSeedParamsForMode(
+	mode: ForkContextMode,
+	configuredMaxMessages: number | undefined,
+	configuredMaxTokens: number,
+	model: Model | undefined,
+): { maxMessages: number; maxTokens: number } | undefined {
+	const capMessages = (defaultMaxMessages: number): number =>
+		configuredMaxMessages === undefined
+			? defaultMaxMessages
+			: Math.min(defaultMaxMessages, Math.max(0, Math.trunc(configuredMaxMessages)));
+	switch (mode) {
+		case "none":
+			return undefined;
+		case "receipt":
+			return { maxMessages: 1, maxTokens: 64 };
+		case "last-turn":
+			return { maxMessages: 2, maxTokens: 250 };
+		case "bounded":
+			return { maxMessages: capMessages(50), maxTokens: 250 };
+		case "full":
+			return { maxMessages: capMessages(500), maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
+		default:
+			return undefined;
+	}
 }
 
 function validateForkContextRequests(
@@ -227,7 +314,13 @@ function validateForkContextRequests(
 	agent: AgentDefinition,
 	forkContextEnabled: boolean,
 ): string | undefined {
-	const requested = tasks.filter(task => task.inheritContext === true);
+	const invalidTaskIds = tasks
+		.filter(task => task.inheritContext !== undefined && !isValidForkContextMode(task.inheritContext as unknown))
+		.map(task => task.id);
+	if (invalidTaskIds.length > 0) {
+		return `Invalid inheritContext for task(s) ${invalidTaskIds.join(", ")}. Allowed modes: ${FORK_CONTEXT_MODES.join(", ")}.`;
+	}
+	const requested = tasks.filter(requestsForkContext);
 	if (requested.length === 0) return undefined;
 	const taskIds = requested.map(task => task.id).join(", ");
 	if (!forkContextEnabled) {
@@ -239,10 +332,10 @@ function validateForkContextRequests(
 	return undefined;
 }
 
-function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
+export function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
 	if (configured > 0) return Math.trunc(configured);
 	const contextWindow = model?.contextWindow ?? 0;
-	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.25)) : 25_000;
+	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.15)) : 15_000;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -264,6 +357,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
+	readonly #spawningAgentType: string | undefined;
 
 	get parameters(): TaskToolSchemaInstance {
 		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
@@ -295,6 +389,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		discoveredAgents: AgentDefinition[],
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
+		this.#spawningAgentType = session.currentAgentType;
 		this.#discoveredAgents = discoveredAgents;
 	}
 
@@ -324,10 +419,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const taskItems = params.tasks ?? [];
+		const taskIdValidationError = validateTaskIdsForScheduling(taskItems);
+		if (taskIdValidationError) {
+			return createTaskModeError(taskIdValidationError);
+		}
 		if (taskItems.length === 0) {
 			return this.#executeSync(_toolCallId, params, signal, onUpdate);
 		}
-
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
 			const available =
@@ -363,6 +461,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		);
 		if (forkContextValidationError) {
 			return createTaskModeError(forkContextValidationError);
+		}
+
+		const batchGateDecision = evaluateSpawnGate({ childCount: taskItems.length, plan: params.spawnPlan });
+		if (batchGateDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected this batch: ${batchGateDecision.reason}. Batches with more than ${DEFAULT_SPAWN_THRESHOLD} tasks require spawnPlan fields: ${batchGateDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+			};
+		}
+
+		const reviewerExploreDecision = evaluateReviewerExploreGate({
+			spawningAgentType: this.#spawningAgentType,
+			targetAgent: params.agent,
+			plan: params.spawnPlan,
+		});
+		if (reviewerExploreDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected reviewer->explore: ${reviewerExploreDecision.reason}. Provide spawnPlan fields: ${reviewerExploreDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+			};
 		}
 
 		const manager = AsyncJobManager.instance();
@@ -474,15 +602,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
-			if (task.inheritContext !== true) return undefined;
+			if (!requestsForkContext(task)) return undefined;
 			if (!this.session.buildForkContextSeed) {
 				throw new Error("Current session cannot build fork-context seeds.");
 			}
-			const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
+			const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
+				? this.session.settings.get("task.forkContext.maxMessages")
+				: undefined;
 			const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+			const params = resolveForkSeedParamsForMode(
+				task.inheritContext,
+				configuredMaxMessages,
+				configuredMaxTokens,
+				this.session.model,
+			);
+			if (!params) return undefined;
 			return await this.session.buildForkContextSeed({
-				maxMessages,
-				maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+				...params,
 				signal,
 			});
 		};
@@ -501,7 +637,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				continue;
 			}
 
-			const uniqueId = uniqueIds[i];
+			const uniqueId = validateAllocatedTaskId(uniqueIds[i] ?? "");
 			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
@@ -548,7 +684,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									? "paused"
 									: singleResult?.aborted
 										? "aborted"
-										: (singleResult?.exitCode ?? 0) === 0
+										: singleResult?.status === "completed"
 											? "completed"
 											: "failed";
 								progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
@@ -556,8 +692,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								progress.contextTokens = singleResult?.contextTokens;
 								progress.contextWindow = singleResult?.contextWindow;
 								progress.cost = singleResult?.usage?.cost.total ?? 0;
-								progress.extractedToolData = singleResult?.extractedToolData;
-								progress.retryFailure = singleResult?.retryFailure;
+								progress.extractedToolData = undefined;
+								progress.retryFailure = singleResult?.retryFailure
+									? {
+											attempt: singleResult.retryFailure.attempt,
+											errorMessage: singleResult.retryFailure.errorSummary,
+										}
+									: undefined;
 								progress.retryState = undefined;
 							}
 							completedJobs += 1;
@@ -915,6 +1056,44 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
+		const batchGateDecision = evaluateSpawnGate({ childCount: tasks.length, plan: params.spawnPlan });
+		if (batchGateDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected this batch: ${batchGateDecision.reason}. Batches with more than ${DEFAULT_SPAWN_THRESHOLD} tasks require spawnPlan fields: ${batchGateDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: {
+					projectAgentsDir,
+					results: [],
+					totalDurationMs: Date.now() - startTime,
+				},
+			};
+		}
+
+		const reviewerExploreDecision = evaluateReviewerExploreGate({
+			spawningAgentType: this.#spawningAgentType,
+			targetAgent: agentName,
+			plan: params.spawnPlan,
+		});
+		if (reviewerExploreDecision.outcome === "rejected") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task spawn gate rejected reviewer->explore: ${reviewerExploreDecision.reason}. Provide spawnPlan fields: ${reviewerExploreDecision.missingFields.join(", ")}.`,
+					},
+				],
+				details: {
+					projectAgentsDir,
+					results: [],
+					totalDurationMs: Date.now() - startTime,
+				},
+			};
+		}
+
 		let repoRoot: string | null = null;
 		let baseline: WorktreeBaseline | null = null;
 		if (isIsolated) {
@@ -1040,7 +1219,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
 				uniqueIds = await outputManager.allocateBatch(tasks.map(t => t.id));
 			}
-			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: uniqueIds[i] }));
+			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
 			const availableSkills = [...(this.session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills
@@ -1080,15 +1259,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			emitProgress();
 
 			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number]) => {
-				if (task.inheritContext !== true) return undefined;
+				if (!requestsForkContext(task)) return undefined;
 				if (!this.session.buildForkContextSeed) {
 					throw new Error("Current session cannot build fork-context seeds.");
 				}
-				const maxMessages = this.session.settings.get("task.forkContext.maxMessages");
+				const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
+					? this.session.settings.get("task.forkContext.maxMessages")
+					: undefined;
 				const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+				const params = resolveForkSeedParamsForMode(
+					task.inheritContext,
+					configuredMaxMessages,
+					configuredMaxTokens,
+					this.session.model,
+				);
+				if (!params) return undefined;
 				return await this.session.buildForkContextSeed({
-					maxMessages,
-					maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, this.session.model),
+					...params,
 					signal,
 				});
 			};
@@ -1103,9 +1290,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 			) => {
 				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
+				const forkContext = requestsForkContext(task)
+					? { mode: task.inheritContext, clonedTokens: forkContextSeed?.metadata.approximateTokens ?? 0 }
+					: undefined;
 				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
 				if (!isIsolated) {
-					return runSubprocess({
+					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
@@ -1120,6 +1310,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -1149,6 +1340,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
+					return forkContext ? { ...result, forkContext } : result;
 				}
 
 				const taskStart = Date.now();
@@ -1178,6 +1370,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -1207,7 +1400,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					if (mergeMode === "branch" && result.exitCode === 0) {
+					const resultWithForkContext = forkContext ? { ...result, forkContext } : result;
+					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
 						try {
 							const commitMsg =
 								commitStyle === "ai" && this.session.modelRegistry
@@ -1227,35 +1421,40 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								task.description,
 								commitMsg,
 							);
+							const producedChanges = Boolean(commitResult?.branchName || commitResult?.nestedPatches.length);
 							return {
-								...result,
+								...resultWithForkContext,
 								branchName: commitResult?.branchName,
 								nestedPatches: commitResult?.nestedPatches,
+								producedChanges,
 							};
 						} catch (mergeErr) {
 							// Agent succeeded but branch commit failed — clean up stale branch
 							const branchName = `gjc/task/${task.id}`;
 							await git.branch.tryDelete(repoRoot, branchName);
 							const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-							return { ...result, error: `Merge failed: ${msg}` };
+							return { ...resultWithForkContext, error: `Merge failed: ${msg}` };
 						}
 					}
-					if (result.exitCode === 0) {
+					if (resultWithForkContext.exitCode === 0) {
 						try {
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
-							const patchPath = path.join(effectiveArtifactsDir, `${task.id}.patch`);
+							const artifactId = validateAllocatedTaskId(task.id);
+							const patchPath = path.join(effectiveArtifactsDir, `${artifactId}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
+							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
 							return {
-								...result,
+								...resultWithForkContext,
 								patchPath,
 								nestedPatches: delta.nestedPatches,
+								producedChanges,
 							};
 						} catch (patchErr) {
 							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-							return { ...result, error: `Patch capture failed: ${msg}` };
+							return { ...resultWithForkContext, error: `Patch capture failed: ${msg}` };
 						}
 					}
-					return result;
+					return resultWithForkContext;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const assignment = task.assignment.trim();
@@ -1274,6 +1473,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						durationMs: Date.now() - taskStart,
 						tokens: 0,
 						modelOverride,
+						forkContext,
 						error: message,
 					};
 				} finally {
@@ -1318,6 +1518,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					abortReason: "Cancelled before start",
 				};
 			});
+			if (!artifactsDir) {
+				for (const result of results) {
+					delete result.outputMeta;
+					delete result.outputPath;
+				}
+			}
+
+			const forkContextClonedTokens = results.reduce(
+				(total, result) => total + (result.forkContext?.clonedTokens ?? 0),
+				0,
+			);
 
 			// Aggregate usage from executor results (already accumulated incrementally)
 			const aggregatedUsage = createUsageTotals();
@@ -1329,13 +1540,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 			}
 
-			// Collect output paths (artifacts already written by executor in real-time)
-			const outputPaths: string[] = [];
 			const patchPaths: string[] = [];
 			for (const result of results) {
-				if (result.outputPath) {
-					outputPaths.push(result.outputPath);
-				}
 				if (result.patchPath) {
 					patchPaths.push(result.patchPath);
 				}
@@ -1431,7 +1637,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								"<system-notification>Patches were not applied and must be handled manually.</system-notification>";
 							const patchList =
 								patchPaths.length > 0
-									? `\n\nPatch artifacts:\n${patchPaths.map(patch => `- ${patch}`).join("\n")}`
+									? `\n\nPatch artifacts: ${patchPaths.length} preserved for internal merge recovery.`
 									: "";
 							mergeSummary = `\n\n${notification}${patchList}`;
 						}
@@ -1487,41 +1693,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const successCount = results.filter(r => r.exitCode === 0 && !r.error && !r.aborted).length;
 			const totalDuration = Date.now() - startTime;
 
-			const summaries = results.map(r => {
-				const status = r.aborted
-					? "cancelled"
-					: r.exitCode === 0 && r.error
-						? "merge failed"
-						: r.exitCode === 0
-							? "completed"
-							: `failed (exit ${r.exitCode})`;
-				const output = r.output.trim() || r.stderr.trim() || "(no output)";
-				const outputCharCount = r.outputMeta?.charCount ?? output.length;
-				const fullOutputThreshold = 5000;
-				let preview = output;
-				let truncated = false;
-				if (outputCharCount > fullOutputThreshold) {
-					const slice = output.slice(0, fullOutputThreshold);
-					const lastNewline = slice.lastIndexOf("\n");
-					preview = lastNewline >= 0 ? slice.slice(0, lastNewline) : slice;
-					truncated = true;
-				}
+			const receipts = results.map(buildTaskReceipt);
+			const roiSummary = buildTaskRoiSummary(receipts);
+			const summaries = receipts.map(r => {
+				const status = r.status === "merge_failed" ? "merge failed" : r.status;
 				return {
 					agent: r.agent,
 					status,
 					id: r.id,
-					preview,
-					truncated,
-					meta: r.outputMeta
+					synopsis: r.preview,
+					outputUri: r.outputRef?.uri,
+					meta: r.outputRef
 						? {
-								lineCount: r.outputMeta.lineCount,
-								charSize: formatBytes(r.outputMeta.charCount),
+								lineCount: r.outputRef.lineCount,
+								charSize: formatBytes(r.outputRef.sizeBytes),
 							}
 						: undefined,
 				};
 			});
 
-			const outputIds = results.filter(r => !r.aborted || r.output.trim()).map(r => `agent://${r.id}`);
 			const summary = prompt.render(taskSummaryTemplate, {
 				successCount,
 				totalCount: results.length,
@@ -1529,7 +1719,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				hasCancelledNote: aborted && cancelledCount > 0,
 				duration: formatDuration(totalDuration),
 				summaries,
-				outputIds,
 				agentName,
 				mergeSummary,
 			});
@@ -1541,15 +1730,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				await fs.rm(tempArtifactsDir, { recursive: true, force: true });
 			}
 
+			const details: TaskToolDetails = {
+				projectAgentsDir,
+				results: receipts,
+				totalDurationMs: totalDuration,
+				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
+				forkContextClonedTokens: forkContextClonedTokens > 0 ? forkContextClonedTokens : undefined,
+				roiSummary,
+			};
+			assertNoRawTaskFields(details, "task.return.details");
 			return {
 				content: [{ type: "text", text: summary }],
-				details: {
-					projectAgentsDir,
-					results: results,
-					totalDurationMs: totalDuration,
-					usage: hasAggregatedUsage ? aggregatedUsage : undefined,
-					outputPaths,
-				},
+				details,
 			};
 		} catch (err) {
 			return {

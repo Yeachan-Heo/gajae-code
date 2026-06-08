@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
+import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,
@@ -9,6 +9,7 @@ import {
 	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
+import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
 /**
  * Sole sanctioned project `.gjc/**` writer module (gate G1).
@@ -131,6 +132,27 @@ export class AlreadyExistsError extends Error {
 	}
 }
 
+export type StrictMutationReadResult =
+	| { kind: "absent" }
+	| { kind: "corrupt"; error: string }
+	| { kind: "valid"; value: Record<string, unknown> };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export async function readExistingStateForMutation(filePath: string): Promise<StrictMutationReadResult> {
+	try {
+		const raw = await fs.readFile(filePath, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (isPlainObject(parsed)) return { kind: "valid", value: parsed };
+		return { kind: "corrupt", error: "state file must contain a JSON object" };
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return { kind: "absent" };
+		return { kind: "corrupt", error: err.message };
+	}
+}
 function isErrno(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
@@ -253,6 +275,21 @@ function activeEntryPath(cwd: string, sessionScope: string | ActiveSessionScope 
 	return path.join(activeStateDir(cwd, sessionScope), `${encodePathSegment(normalizedSkill)}.json`);
 }
 
+function activeSubskillKey(entry: ActiveSubskillEntry): string {
+	return `${entry.parent}::${entry.phase}::${entry.activationArg}`;
+}
+
+function flattenActiveSubskills(entries: SkillActiveEntry[]): ActiveSubskillEntry[] {
+	const deduped = new Map<string, ActiveSubskillEntry>();
+	for (const entry of entries) {
+		if (entry.active === false || !Array.isArray(entry.active_subskills)) continue;
+		for (const subskill of entry.active_subskills) {
+			deduped.set(activeSubskillKey(subskill), subskill);
+		}
+	}
+	return [...deduped.values()];
+}
+
 function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 	const visible = entries.filter(entry => entry.active !== false);
 	const primary = visible[0];
@@ -266,6 +303,7 @@ function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 		thread_id: primary?.thread_id,
 		turn_id: primary?.turn_id,
 		active_skills: entries,
+		active_subskills: flattenActiveSubskills(visible),
 	};
 }
 
@@ -357,7 +395,16 @@ export async function writeWorkflowEnvelopeAtomic(
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
 	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
-	await atomicWrite(filePath, jsonText(stampWorkflowEnvelopeChecksum(withReceipt, filePath)));
+	const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
+	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
+	if (!parsed.success) {
+		throw new Error(
+			`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+				.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+				.join("; ")}`,
+		);
+	}
+	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;
 }

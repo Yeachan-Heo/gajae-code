@@ -52,6 +52,7 @@ describe("SearchTool internal URL resolution", () => {
 			cwd: tmpDir,
 			hasUI: false,
 			getSessionFile: () => null,
+			getArtifactsDir: () => artifactsDir,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated({ "search.contextBefore": 0, "search.contextAfter": 0 }),
 			...overrides,
@@ -98,7 +99,7 @@ describe("SearchTool internal URL resolution", () => {
 		const tool = new SearchTool(session);
 
 		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(
-			"Artifact 999 not found",
+			"artifact://999 not found",
 		);
 	});
 
@@ -213,7 +214,7 @@ describe("SearchTool internal URL resolution", () => {
 		const tool = new SearchTool(session);
 
 		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(
-			"Artifact 999 not found",
+			"artifact://999 not found",
 		);
 	});
 });

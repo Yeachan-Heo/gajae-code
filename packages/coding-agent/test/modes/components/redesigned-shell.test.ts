@@ -209,7 +209,13 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("keeps the default status preset dense and pulse-forward", () => {
 		expect(STATUS_LINE_PRESETS.default.leftSegments).toEqual(["model", "mode", "git", "pr", "path"]);
-		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual(["session_name", "token_rate", "context_pct", "cost"]);
+		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual([
+			"session_name",
+			"jobs",
+			"token_rate",
+			"context_pct",
+			"cost",
+		]);
 		expect(STATUS_LINE_PRESETS.default.segmentOptions?.path?.maxLength).toBe(32);
 	});
 

@@ -26,13 +26,14 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
+import { activateModelProfile } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
-import { InteractiveMode, runAcpMode, runPrintMode, runRpcMode } from "./modes";
+import { InteractiveMode, runAcpMode, runBridgeMode, runPrintMode, runRpcMode } from "./modes";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import type { MCPManager } from "./runtime-mcp";
@@ -194,9 +195,57 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey">;
+	parsedArgs: Pick<Args, "apiKey" | "default" | "model" | "mpreset" | "thinking">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+}
+
+export async function applyStartupModelProfiles(args: {
+	session: AgentSession;
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	startupModel?: CreateAgentSessionOptions["model"];
+	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+}): Promise<void> {
+	const applyProfile = async (profileName: string, persistDefault: boolean): Promise<void> => {
+		await activateModelProfile(
+			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+			{ persistDefault },
+		);
+	};
+
+	// Capture the explicitly-selected startup model BEFORE profile activation can
+	// override it. startupModel covers the eager path; session.model covers the
+	// deferred `--model <pattern>` path resolved inside createAgentSession.
+	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
+
+	const defaultProfile = args.settings.get("modelProfile.default");
+	if (defaultProfile) {
+		await applyProfile(defaultProfile, false);
+	}
+	if (args.parsedArgs.mpreset) {
+		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+	}
+
+	// Explicit CLI --model/--thinking must win over any activated profile.
+	if (explicitModel) {
+		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking);
+	} else if (args.parsedArgs.thinking && args.session.model) {
+		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking);
+	}
+}
+
+export async function applyStartupModelProfilesOrExit(
+	args: Parameters<typeof applyStartupModelProfiles>[0],
+): Promise<void> {
+	try {
+		await applyStartupModelProfiles(args);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+		process.exit(1);
+	}
 }
 
 /**
@@ -224,6 +273,14 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			agentId,
 			hasUI: false,
 			enableMCP: false,
+		});
+		await applyStartupModelProfilesOrExit({
+			session: nextSession,
+			settings: nextSettings,
+			modelRegistry: args.modelRegistry,
+			parsedArgs: args.parsedArgs,
+			startupModel: args.baseOptions.model,
+			startupThinkingLevel: args.baseOptions.thinkingLevel,
 		});
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
@@ -707,21 +764,35 @@ export async function runRootCommand(
 		process.exit(0);
 	}
 
-	if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
-		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
+	if (
+		(parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "bridge") &&
+		parsedArgs.fileArgs.length > 0
+	) {
+		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC or bridge mode")}\n`);
 		process.exit(1);
 	}
 
 	const cwd = getProjectDir();
 	const settingsInstance = deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd }));
-	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+	if (
+		parsedArgs.mode === "rpc" ||
+		parsedArgs.mode === "rpc-ui" ||
+		parsedArgs.mode === "acp" ||
+		parsedArgs.mode === "bridge"
+	) {
 		applyRpcDefaultSettingOverrides(settingsInstance);
 	}
 	modelRegistry.applyConfiguredModelBindings(settingsInstance);
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
-	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+	if (
+		parsedArgs.noTitle ||
+		parsedArgs.mode === "rpc" ||
+		parsedArgs.mode === "rpc-ui" ||
+		parsedArgs.mode === "acp" ||
+		parsedArgs.mode === "bridge"
+	) {
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
@@ -864,6 +935,15 @@ export async function runRootCommand(
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
 
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings: settingsInstance,
+			modelRegistry,
+			parsedArgs,
+			startupModel: sessionOptions.model,
+			startupThinkingLevel: sessionOptions.thinkingLevel,
+		});
+
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
@@ -894,6 +974,8 @@ export async function runRootCommand(
 
 		if (mode === "rpc" || mode === "rpc-ui") {
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined);
+		} else if (mode === "bridge") {
+			await runBridgeMode(session, setToolUIContext);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);

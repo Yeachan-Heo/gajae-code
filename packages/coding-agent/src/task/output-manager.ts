@@ -8,6 +8,7 @@
  * This enables reliable agent:// URL resolution and prevents artifact collisions.
  */
 import * as fs from "node:fs/promises";
+import { validateAllocatedTaskId, validateTaskId } from "./id";
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -73,8 +74,8 @@ export class AgentOutputManager {
 	 */
 	async allocate(id: string): Promise<string> {
 		await this.#ensureInitialized();
-		const prefix = this.#parentPrefix ? `${this.#parentPrefix}.` : "";
-		return `${prefix}${this.#nextId++}-${id}`;
+		const prefix = this.#parentPrefix ? `${validateAllocatedTaskId(this.#parentPrefix)}.` : "";
+		return `${prefix}${this.#nextId++}-${validateTaskId(id)}`;
 	}
 
 	/**
@@ -85,8 +86,8 @@ export class AgentOutputManager {
 	 */
 	async allocateBatch(ids: string[]): Promise<string[]> {
 		await this.#ensureInitialized();
-		const prefix = this.#parentPrefix ? `${this.#parentPrefix}.` : "";
-		return ids.map(id => `${prefix}${this.#nextId++}-${id}`);
+		const prefix = this.#parentPrefix ? `${validateAllocatedTaskId(this.#parentPrefix)}.` : "";
+		return ids.map(id => `${prefix}${this.#nextId++}-${validateTaskId(id)}`);
 	}
 
 	/**

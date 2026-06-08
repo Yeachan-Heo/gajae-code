@@ -30,7 +30,7 @@ Main `gjc` CLI and product runtime.
 - `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `team`, and the default launch path.
 - `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, RPC, RPC-UI, and ACP modes.
 - `packages/coding-agent/src/sdk.ts` assembles settings, model registry, auth, workspace/context discovery, skills, rules, tools, system prompt, and the underlying `@gajae-code/agent-core` agent.
-- `packages/coding-agent/src/tools/index.ts` is the built-in tool registry for file/code/runtime tools such as read, bash, edit, AST tools, eval, find/search, LSP, browser, task/subagent, recipe, IRC, todo, web search, write, and memory tools.
+- `packages/coding-agent/src/tools/index.ts` is the built-in tool registry for file/code/runtime tools such as read, bash, edit, AST tools, eval, find/search, LSP, browser, task/subagent, recipe, IRC, todo, web search, and write. Memory backends are private integrations, not public coding-harness tools.
 - `packages/coding-agent/src/defaults/gjc-defaults.ts` embeds and installs the default workflow skills.
 - `packages/coding-agent/src/task/agents.ts` embeds bundled task-agent prompts. The public contract is `executor`, `architect`, `planner`, and `critic`; other bundled prompts are internal/runtime utilities.
 
@@ -89,13 +89,6 @@ Local observability dashboard for session and model usage.
 - `packages/stats/src/aggregator.ts` parses session-derived request metrics and writes aggregated data through SQLite.
 - `packages/stats/src/server.ts` serves local dashboard API routes and static SPA assets.
 - `packages/stats/src/types.ts` and `packages/stats/src/shared-types.ts` define dashboard and aggregate metric shapes.
-
-### `packages/swarm-extension/`
-
-Optional YAML/DAG multi-agent extension outside the fixed default workflow surface.
-
-- `packages/swarm-extension/README.md` documents standalone `gjc-swarm` execution and in-TUI `/swarm` commands.
-- Swarm workflows define agents, tasks, dependency edges, waves, and shared workspace state under `.swarm_<name>/`.
 
 ### `packages/typescript-edit-benchmark/`
 

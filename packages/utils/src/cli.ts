@@ -111,6 +111,7 @@ export interface CommandCtor {
 	examples?: string[];
 	flags?: Record<string, FlagDescriptor>;
 	args?: Record<string, ArgDescriptor>;
+	delegateHelp?: boolean;
 }
 
 /** Configuration passed to every command instance and help renderers. */
@@ -392,16 +393,22 @@ export async function run(opts: RunOptions): Promise<void> {
 		return;
 	}
 
-	// Per-command help
+	// Per-command help. Commands with nested subcommands can opt into receiving
+	// help flags themselves so `cmd subcommand --help` can render subcommand help.
 	if (commandArgv.includes("--help") || commandArgv.includes("-h")) {
-		const config = await loadAllCommands(opts);
-		// Resolve aliases for help too
 		const entry = findEntry(opts.commands, commandId);
-		const Cmd = entry ? config.commands.get(entry.name) : undefined;
-		if (Cmd) {
-			renderCommandHelp(bin, entry!.name, Cmd);
-		} else {
+		if (!entry) {
 			process.stderr.write(`Unknown command: ${commandId}\n`);
+			return;
+		}
+		const Cmd = await entry.load();
+		if (Cmd.delegateHelp) {
+			const config: CliConfig = { bin, version, commands: new Map([[entry.name, Cmd]]) };
+			const instance = new Cmd(commandArgv, config);
+			await instance.run();
+		} else {
+			const config = await loadAllCommands(opts);
+			renderCommandHelp(bin, entry.name, config.commands.get(entry.name) ?? Cmd);
 		}
 		return;
 	}

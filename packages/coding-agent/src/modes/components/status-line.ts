@@ -11,6 +11,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { readVisibleSkillActiveState, type SkillActiveEntry } from "../../skill-state/active-state";
 import * as git from "../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../utils/session-color";
+import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 import { computeNonMessageTokens } from "../utils/context-usage";
 import { renderSkillHudBar } from "./skill-hud/render";
@@ -153,6 +154,7 @@ export class StatusLineComponent implements Component {
 	#autoCompactEnabled: boolean = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
+	#jobs: JobsSnapshot = EMPTY_JOBS_SNAPSHOT;
 	#sessionStartTime: number = Date.now();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
@@ -218,6 +220,10 @@ export class StatusLineComponent implements Component {
 
 	setSubagentCount(count: number): void {
 		this.#subagentCount = count;
+	}
+
+	setJobs(jobs: JobsSnapshot): void {
+		this.#jobs = jobs;
 	}
 
 	setSessionStartTime(time: number): void {
@@ -612,6 +618,7 @@ export class StatusLineComponent implements Component {
 			contextWindow,
 			autoCompactEnabled: this.#autoCompactEnabled,
 			subagentCount: this.#subagentCount,
+			jobs: this.#jobs,
 			sessionStartTime: this.#sessionStartTime,
 			git: {
 				branch: this.#getCurrentBranch(),
@@ -687,7 +694,8 @@ export class StatusLineComponent implements Component {
 			}
 		}
 
-		const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
+		const runningBackgroundJobs =
+			this.session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length ?? 0;
 		if (runningBackgroundJobs > 0) {
 			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
 			const label = `${formatCount("job", runningBackgroundJobs)} running`;

@@ -1,5 +1,6 @@
-import { type ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
-import { clampThinkingLevelForModel, type Effort, type Model, THINKING_EFFORTS } from "@gajae-code/ai";
+import { type ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core/thinking";
+import { clampThinkingLevelForModel, type Effort, THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
+import type { Model } from "@gajae-code/ai/types";
 
 /**
  * Metadata used to render thinking selector values in the coding-agent UI.
@@ -33,6 +34,11 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevel, ThinkingLevelMetadata> = {
 		value: ThinkingLevel.XHigh,
 		label: "xhigh",
 		description: "Maximum reasoning (~32k tokens)",
+	},
+	[ThinkingLevel.Max]: {
+		value: ThinkingLevel.Max,
+		label: "max",
+		description: "Opus maximum reasoning",
 	},
 };
 

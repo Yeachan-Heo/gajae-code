@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "skill": "ralplan",
+  "current_phase": "architect",
+  "active": true,
+  "updated_at": "2026-06-04T10:00:00.000Z",
+  "session_id": "sess-corpus-ralplan",
+  "plan_path": ".gjc/plans/ralplan/corpus-plan.md",
+  "rounds": [
+    {
+      "role": "planner",
+      "status": "complete"
+    },
+    {
+      "role": "architect",
+      "status": "active"
+    }
+  ],
+  "receipt": {
+    "version": 1,
+    "skill": "ralplan",
+    "owner": "gjc-state-cli",
+    "command": "gjc state ralplan write --input '<json>'",
+    "state_path": "/repo/.gjc/state/sessions/sess-corpus-ralplan/active-state.json",
+    "storage_path": "/repo/.gjc/state/sessions/sess-corpus-ralplan/ralplan-state.json",
+    "mutated_at": "2026-06-04T10:00:00.000Z",
+    "fresh_until": "2026-06-04T10:30:00.000Z",
+    "status": "fresh",
+    "mutation_id": "ralplan:2026-06-04T10:00:00.000Z",
+    "verb": "write-artifact",
+    "from_phase": "planner",
+    "to_phase": "architect",
+    "forced": false,
+    "paths": [
+      ".gjc/plans/ralplan/corpus-plan.md"
+    ],
+    "content_sha256": {
+      "algorithm": "sha256",
+      "value": "0a6b3d9edb7f9b8a3da6f53e8f4f7d621c7e8227f942fb1b9f97cdbf58b5e4a1",
+      "covered_path": "/repo/.gjc/state/sessions/sess-corpus-ralplan/ralplan-state.json",
+      "computed_at": "2026-06-04T10:00:00.000Z"
+    },
+    "audit_trace_id": "trace-ralplan-corpus"
+  },
+  "passthrough": {
+    "retained": true,
+    "owner_note": "golden corpus v2"
+  }
+}

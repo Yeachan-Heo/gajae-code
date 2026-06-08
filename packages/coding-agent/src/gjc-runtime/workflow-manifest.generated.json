@@ -78,7 +78,8 @@
           "write",
           "clear",
           "contract",
-          "handoff"
+          "handoff",
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -96,6 +97,7 @@
           "clear",
           "contract",
           "handoff",
+          "doctor",
           "kickoff",
           "write-spec",
           "write-artifact"
@@ -149,6 +151,26 @@
           "handoff"
         ],
         "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
         "type": "boolean"
       },
       {
@@ -265,6 +287,10 @@
       },
       {
         "name": "handoff",
+        "surface": "state-action"
+      },
+      {
+        "name": "doctor",
         "surface": "state-action"
       },
       {
@@ -426,7 +452,8 @@
           "write",
           "clear",
           "contract",
-          "handoff"
+          "handoff",
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -444,6 +471,7 @@
           "clear",
           "contract",
           "handoff",
+          "doctor",
           "kickoff",
           "write-spec",
           "write-artifact"
@@ -497,6 +525,26 @@
           "handoff"
         ],
         "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
         "type": "boolean"
       },
       {
@@ -602,6 +650,10 @@
       },
       {
         "name": "handoff",
+        "surface": "state-action"
+      },
+      {
+        "name": "doctor",
         "surface": "state-action"
       },
       {
@@ -783,7 +835,8 @@
           "write",
           "clear",
           "contract",
-          "handoff"
+          "handoff",
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -801,6 +854,7 @@
           "clear",
           "contract",
           "handoff",
+          "doctor",
           "kickoff",
           "write-spec",
           "write-artifact"
@@ -854,6 +908,26 @@
           "handoff"
         ],
         "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
         "type": "boolean"
       },
       {
@@ -1011,6 +1085,10 @@
         "surface": "state-action"
       },
       {
+        "name": "doctor",
+        "surface": "state-action"
+      },
+      {
         "name": "start",
         "surface": "command-positional"
       },
@@ -1094,6 +1172,10 @@
     "skill": "ultragoal",
     "states": [
       {
+        "id": "missing",
+        "terminal": true
+      },
+      {
         "id": "goal-planning",
         "initial": true
       },
@@ -1120,6 +1202,7 @@
       }
     ],
     "terminalStates": [
+      "missing",
       "failed",
       "complete",
       "handoff"
@@ -1196,7 +1279,8 @@
           "write",
           "clear",
           "contract",
-          "handoff"
+          "handoff",
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -1214,6 +1298,7 @@
           "clear",
           "contract",
           "handoff",
+          "doctor",
           "kickoff",
           "write-spec",
           "write-artifact"
@@ -1267,6 +1352,26 @@
           "handoff"
         ],
         "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
         "type": "boolean"
       },
       {
@@ -1442,6 +1547,10 @@
       },
       {
         "name": "handoff",
+        "surface": "state-action"
+      },
+      {
+        "name": "doctor",
         "surface": "state-action"
       },
       {

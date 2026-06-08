@@ -17,10 +17,13 @@ import {
 	type CompletionEvidence,
 	type ReceiptEnvelope,
 	type ReceiptSubject,
+	type ReviewFailureEvidence,
+	type ReviewVerdictEvidence,
 	type ValidationEvidence,
 	validateReceipt,
 } from "./receipts";
 import { readReceiptIndex, writeReceiptImmutable } from "./storage";
+import { isReviewVerdict, type ReviewVerdict } from "./types";
 
 export interface ValidationCommandSpec {
 	name: string;
@@ -49,6 +52,12 @@ export interface FinalizeOptions {
 	requireTests?: boolean;
 	requireCommit?: boolean;
 	requirePr?: boolean;
+	/** Review-only sessions produce a terminal verdict instead of implementation validation. */
+	reviewOnly?: boolean;
+	/** Operator/loop-supplied terminal review verdict (closed vocabulary). */
+	verdict?: string | null;
+	/** Bounded PR/issue reference for the review target (e.g. "PR-414"). Never resolved from the live repo. */
+	prTarget?: string | null;
 	validationCommands?: ValidationCommandSpec[];
 	checks: FinalizeChecks;
 	clock?: () => number;
@@ -60,6 +69,7 @@ export interface FinalizeResult {
 	validation: { name: string; valid: boolean; exitStatus: number }[];
 	commitHash: string | null;
 	prUrl: string | null;
+	verdict?: ReviewVerdict | null;
 	issueArtifact: string | null;
 	blockers: string[];
 }
@@ -69,6 +79,8 @@ function receiptId(prefix: string): string {
 }
 
 export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult> {
+	if (opts.reviewOnly) return runReviewFinalize(opts);
+
 	const now = () => new Date(opts.clock ? opts.clock() : Date.now()).toISOString();
 	const blockers: string[] = [];
 	const validation: FinalizeResult["validation"] = [];
@@ -178,6 +190,78 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 	};
 }
 
+/**
+ * Review-only finalizer: produces a terminal verdict receipt (no implementation validation,
+ * no commit/PR resolution) when a valid, autonomous verdict is supplied; otherwise writes a
+ * durable, bounded `review-failure` receipt suitable for fallback routing.
+ *
+ * It never *resolves* PR/commit metadata from the live repo; the only PR reference attached is
+ * the session's own declared review target (`prTarget`), so a review session cannot report an
+ * unrelated PR resolved from the current checkout.
+ *
+ * `OWNER_CONFIRMATION_REQUIRED` is a valid verdict but is NOT an autonomous success: it is
+ * recorded durably yet returns `completed: false` with an `owner-confirmation-required` blocker
+ * so downstream routing escalates to a human instead of treating it as merge-ready.
+ */
+async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult> {
+	const now = () => new Date(opts.clock ? opts.clock() : Date.now()).toISOString();
+	const prTarget = opts.prTarget ?? null;
+	const subject: ReceiptSubject = { workspace: opts.workspace, branch: opts.branch, head: null, commit: null };
+	const baseResult: Omit<FinalizeResult, "completed" | "receiptPath" | "verdict" | "blockers"> = {
+		validation: [],
+		commitHash: null,
+		prUrl: null,
+		issueArtifact: null,
+	};
+
+	if (!isReviewVerdict(opts.verdict)) {
+		const reason = opts.verdict == null ? "review-verdict-missing" : "review-verdict-invalid";
+		const failure: ReviewFailureEvidence = { reason, prTarget, failedAt: now(), fallback: "operator-or-omx-review" };
+		const receipt = buildReceipt<ReviewFailureEvidence>({
+			receiptId: receiptId("revfail"),
+			sessionId: opts.sessionId,
+			family: "review-failure",
+			source: "finalizer",
+			subject,
+			evidence: failure,
+			createdAt: now(),
+		});
+		const outcome = validateReceipt(receipt);
+		const entry = await writeReceiptImmutable(
+			opts.root,
+			opts.sessionId,
+			"review-failure",
+			receipt.receiptId,
+			receipt,
+		);
+		const blockers = outcome.valid ? [reason] : [reason, ...outcome.reasons];
+		return { ...baseResult, completed: false, receiptPath: entry.path, verdict: null, blockers };
+	}
+
+	const verdict = opts.verdict as ReviewVerdict;
+	const evidence: ReviewVerdictEvidence = {
+		verdict,
+		prTarget,
+		finalizedAt: now(),
+		summaryRef: typeof opts.prTarget === "string" ? `verdict:${verdict}@${opts.prTarget}` : `verdict:${verdict}`,
+	};
+	const receipt = buildReceipt<ReviewVerdictEvidence>({
+		receiptId: receiptId("verdict"),
+		sessionId: opts.sessionId,
+		family: "review-verdict",
+		source: "finalizer",
+		subject,
+		evidence,
+		createdAt: now(),
+	});
+	const outcome = validateReceipt(receipt);
+	const entry = await writeReceiptImmutable(opts.root, opts.sessionId, "review-verdict", receipt.receiptId, receipt);
+	// A confirmation-required verdict is recorded but never an autonomous success.
+	const humanActionRequired = verdict === "OWNER_CONFIRMATION_REQUIRED";
+	const completed = outcome.valid && !humanActionRequired;
+	const blockers = !outcome.valid ? outcome.reasons : humanActionRequired ? ["owner-confirmation-required"] : [];
+	return { ...baseResult, completed, receiptPath: entry.path, verdict, blockers };
+}
 function git(workspace: string, args: string[]): string | null {
 	try {
 		return execFileSync("git", args, {

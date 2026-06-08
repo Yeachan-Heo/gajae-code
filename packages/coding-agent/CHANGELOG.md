@@ -2,11 +2,93 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Added conservative `timeout-minutes` values to all CI workflow jobs to prevent indefinite hangs.
+
+### Fixed
+
+- Improved the grep limit-reached message to show the current limit value and suggest using `--limit` for more results.
+- Fixed a `gjc harness` recovery deadlock where a session created by `start` without `--detach` (persisted as `started` with no owner lease/endpoint) could never get a live owner: `recover` refused to spawn one because no prior endpoint existed, while `start` reported `session-already-exists`. `recover` now bootstraps a fresh owner for a never-started session (no lease, no endpoint, no owner-run evidence) without writing a misleading `vanish` receipt, reported via `bootstrappedOwner: true`. Bootstrap is independent of the vanish classifier's `ownerRequired` verdict (nothing has vanished), so a session started in a non-git workspace (git delta `unknown`) is recovered too, while a deleted worktree is still refused (#421).
+
+## [0.4.1] - 2026-06-07
+
+### Changed
+
+- Hardened the default system prompt with a `<skill-discipline>` block (never ignore skill text, keep read-only/interview skills from mutating, recommend and invoke the matching `/skill` on approval) and tightened `<communication>` to ban permission-begging/deferral phrasing and never announce remaining work instead of doing it (#392).
+- Cleaned up the bundled GJC workflow skill docs and defaulted execution handoff to ultragoal while prioritizing ralplan refinement (#395, #396).
+
+## [0.4.0] - 2026-06-06
+
+### Added
+
+- Added an agent-driven RPC workflow lifecycle control plane and a `workflow_gate` contract: `negotiate_unattended`, `workflow_gate`, and `workflow_gate_response` frames are validated by an answer-schema validator, persisted through a durable gate broker, and wired into live session dispatch (#314).
+- Added a binding-only `gjc-plugins` sub-skill plugin framework that loads, validates, and activates declarative plugin packs without granting implicit arbitrary execution surface (#347).
+- Added generated JSON Schemas for the config and models files (`schemas/config.schema.json`, `schemas/models.schema.json`) with a `check:schemas` drift gate (#377).
+- Added `cacheRetention` support in the models config (#381).
+- Added an Opus max reasoning preset (#372).
+
+### Changed
+
+- Improved slash command and `skill:*` suggestion ranking so `/team` surfaces the matching skill before weaker fallback candidates.
+
+### Removed
+
+- Removed the optional `@gajae-code/swarm-extension` package and its `gjc-swarm` CLI. The YAML/DAG swarm orchestration extension was a standalone optional feature not imported by any other package; it is no longer built or published.
+
+### Fixed
+
+- Routed unattended deep-interview ask-tool questions through `workflow_gate { kind: "question" }` events, including Round 0 topology and challenge-mode metadata, free-text option/schema shape, headless RPC answers, and synchronous response race handling (#316).
+- Preserved harness owner-vanish evidence after prompt acceptance: no-owner `recover` now either restores a detached owner when a prior endpoint exists or returns a public-safe concrete owner-exit reason plus a vanish receipt, and no-owner `observe`/`events` expose the preserved owner-exit summary.
+- Fixed LSP and MCP server lifecycle cleanup so clients/servers and their child processes are torn down on abort/exit instead of leaking (#389).
+- Preserved session retention across resident session rewrites.
+- Fixed harness session lookup testability without changing runtime owner-routing behavior.
+- Prevented release catalog file specs from recursing during catalog resolution (#351).
+- Reconciled the ultragoal skill mode-state and HUD with the plan/ledger so status reflects real goal progress (#342/#346).
+
+## [0.3.2] - 2026-06-05
+
+### Added
+
+- Added model profiles with a `--mpreset <profile>` CLI flag and a `/model` selector "Profiles" section that activate a named profile's default model plus per-agent-role model overrides in one step, validating required-provider credentials before applying and surfacing a custom provider onboarding wizard for missing API-compatible providers.
+- Integrated `ai-slop-cleaner` as an internal Ultragoal sub-skill fragment that runs as the mandatory completion-gate cleanup sweep over a story's changed files, reporting blocking and advisory findings without editing code or mutating `.gjc/` state.
+### Changed
+
+- Edit tool diff generation (`generateDiffString`) now uses the native `diffLines` from `@gajae-code/natives` (a byte-identical Rust port of jsdiff) instead of the pure-JS implementation, removing the multi-second Myers blowup on large-file edits (~16x faster on ~1MB files) with identical diff output.
+
+### Fixed
+
+- Reconciled native Ultragoal commands with workflow mode-state and the HUD: `gjc ultragoal create-goals`, `complete-goals`, `checkpoint`, steering, review-blocker recording, and status now sync `.gjc/state/ultragoal-state.json` plus `skill-active-state.json` from the durable `.gjc/ultragoal` plan/ledger, clearing stale active HUD chips after all goals complete.
+- Forwarded the parent session id when task subagents validate configured role-agent model overrides, preventing session-scoped OAuth providers from being misread as unauthenticated and falling back to the parent chat model.
+- Removed unintended public memory-tool guidance and registration: Hindsight retain/recall/reflect helpers are now compatibility-only, local memory prompt injection no longer advertises `memory://` reads, and regression tests guard the public tool surface.
+- Fixed `read` hashline anchors drifting on truncated reads so the `line+hash` anchors consumed by `edit`/`apply_patch` stay correct when a file is read past the truncation boundary.
+- Reconciled the ultragoal skill mode-state (`current_phase`/`active`) and HUD chip with the `.gjc/ultragoal` plan/ledger on every `gjc ultragoal` command (`create-goals`/`complete-goals`/`checkpoint`/`steer`/`record-review-blockers`/`status`), so `gjc state ultragoal read`, the skill-tool chain guard, and the HUD no longer sit at a stale `active:true`/`goal-planning` after a run completes (#342). A new `reconcileWorkflowSkillState` performs a session-scoped (`GJC_SESSION_ID`) derived write that bypasses only transition-edge validation while preserving schema/unknown-phase validation, version/checksum stamping, and audit provenance (`owner: gjc-runtime`, `verb: reconcile`); reconciliation is best-effort and surfaces failures via stderr and a `reconcile_failed` ledger event without changing command status/stdout. Removed the duplicate sessionless active-state sync from the `gjc ultragoal` command wrapper.
+
+## [0.3.1] - 2026-06-05
+### Added
+
+- Added opt-in crash diagnostics for subprocess failures, with a shared crash taxonomy/report writer, bash/Python/LSP/DAP crash notices, and a native Rust panic-report hook gated by `GJC_NATIVE_CRASH_DIAGNOSTICS` / `GJC_CRASH_DIAGNOSTICS`.
+- Started the GJC backend bridge foundation with a shared agent-wire protocol module, event envelopes, RPC command scope matrix, UI request broker, typed unsupported UI results, a guarded `--mode bridge` handshake surface, and RPC mode dispatch refactored onto the shared command dispatcher.
+- Documented the experimental `--mode bridge` protocol in `docs/bridge.md` and the `GJC_BRIDGE_*` environment variables in `docs/environment-variables.md` (TLS-mandatory startup, bearer auth, coarse command scopes with a `prompt` floor, single live `AgentSession` per process, bounded event-stream replay with `reset`, and the semantic-not-pixel UI capability matrix), and added bridge event-stream/idempotency regression tests plus a docs-conformance check that pins the docs against the protocol version, scope/command catalog, negotiated capabilities/frame types, and unsupported UI surfaces. The bridge protocol/SDK are experimental (`BRIDGE_PROTOCOL_VERSION` 1) and may change in additive, version-negotiated ways.
+
+### Fixed
+
+- Made opt-in crash diagnostics create/chmod report directories to `0700` and report files to `0600` so captured command, cwd, and stderr previews are private even under a permissive umask.
+- Scoped `agent://` and `artifact://` resolution to the caller's artifacts directory plus explicitly authorized parent/child tree directories, removed registry-wide live-session lookup/enumeration, and made missing agent-output metadata sidecars fail closed.
+- Fail-closed experimental bridge session endpoints by default for 0.3.1: events, commands, controller ownership, UI responses, host tool results, and host URI results are disabled unless an internal endpoint matrix explicitly enables them; only health/help and the authenticated handshake remain available, with the handshake advertising no enabled session surface by default.
+- Render terminal-pasted clipboard image temp paths as compact `[image N]` prompt placeholders while attaching the image payload, instead of inserting raw `/var/folders/.../clipboard-*.png` path text.
+- Preserved `gjc harness` `owner-vanished:*` blockers when a replacement owner becomes live so unrecovered prior-owner evidence remains visible until explicit recovery or terminal completion evidence; only safe startup liveness false-negatives such as `detached-owner-not-live` are auto-cleared.
+- Fixed the interactive agent unexpectedly stopping after automatic context maintenance instead of resuming the in-flight task. Post-compaction continuation now schedules exactly one source per completion (overflow retry → queued messages → synthetic auto-continue prompt), the threshold/handoff auto-continue prompt skips a redundant pre-send compaction check, overflow retry strips only the context-overflow failed turn (never normal/aborted/silent-abort tails), and non-resumable or superseded continuations log a structured reason instead of stranding the session.
+- Fixed the native Stop skill-state hook letting active GJC workflow skills stop prematurely. The Stop hook no longer treats a missing/unreadable mode-state file as terminal for handoff workflows, and handoff skills (`deep-interview`, `ralplan`) now keep blocking Stop even in the `handoff` phase until they are demoted (`active:false`) or cleared, so they always end by offering the next handoff step via the ask tool. Non-handoff skills (`team`, `ultragoal`) retain the fail-open safety valve when their mode-state file is corrupt or invalid.
+
+## [0.3.0] - 2026-06-03
+
 ### Added
 
 - Added runtime-enforced Ultragoal executor QA/red-team evidence matrices for completion checkpoints, with plan-first contract coverage, user-surface evidence, adversarial cases, artifact references, scoped Executor red-team guidance, and focused rejection tests for shallow or contradictory QA evidence.
 ### Fixed
 
+- Made `gjc harness observe` preserve completed RPC owner evidence after the owner exits, including a `completedOwnerExited` diagnostic and durable terminal-result cursor.
 - Clarified that `gjc team` requires an existing tmux-backed leader session from `gjc --tmux`, with actionable help, docs, and failure text.
 - Kept deep-interview ask options visible for long prompts by adding an opt-in scrollable selector title panel with selector-local `PageUp`/`PageDown` prompt scrolling, while leaving normal ask dialogs and global keybinding configuration unchanged.
 

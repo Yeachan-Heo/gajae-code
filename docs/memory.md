@@ -16,19 +16,12 @@ memories:
 At session start, if a memory summary exists for the current project, it is injected into the system prompt as a **Memory Guidance** block. The agent is instructed to:
 
 - Treat memory as heuristic context — useful for process and prior decisions, not authoritative on current repo state.
-- Cite the memory artifact path when memory changes the plan, and pair it with current-repo evidence before acting.
+- Pair memory-influenced decisions with current-repo evidence before acting.
 - Prefer repo state and user instruction when they conflict with memory; treat conflicting memory as stale.
 
-### Reading memory artifacts
+### Memory artifacts
 
-The agent can read memory files directly using `memory://` URLs with the `read` tool:
-
-| URL                                    | Content                             |
-| -------------------------------------- | ----------------------------------- |
-| `memory://root`                        | Compact summary injected at startup |
-| `memory://root/MEMORY.md`              | Full long-term memory document      |
-| `memory://root/skills/<name>/SKILL.md` | A generated skill playbook          |
-
+Generated local-memory artifacts are private runtime state, not a public tool or URI surface. They may be summarized into the system prompt when local memory is enabled, but users and model-facing tool docs should not rely on direct `memory://` reads. The legacy internal `memory://` resolver remains only for compatibility with existing persisted guidance and is not part of the public coding harness contract; remove it after legacy local-memory prompts no longer reference it.
 ### `/memory` slash command
 
 | Subcommand            | Effect                                         |
@@ -92,4 +85,4 @@ Additional tuning knobs (concurrency, lease durations, token budgets) are availa
 - `packages/coding-agent/src/memories/index.ts` — pipeline orchestration, injection, slash command handling
 - `packages/coding-agent/src/memories/storage.ts` — SQLite-backed job queue and thread registry
 - `packages/coding-agent/src/prompts/memories/` — memory prompt templates
-- `packages/coding-agent/src/internal-urls/memory-protocol.ts` — `memory://` URL handler
+- `packages/coding-agent/src/internal-urls/memory-protocol.ts` — legacy non-public `memory://` compatibility handler

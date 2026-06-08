@@ -42,6 +42,12 @@ describe("harness state machine", () => {
 		expect(submit.available).toBe(true);
 	});
 
+	it("submit is blocked while lifecycle is blocked even with a live owner", () => {
+		const submit = findAction(nextAllowedActions("blocked", true), "submit");
+		expect(submit.available).toBe(false);
+		expect(submit.reason).toBe("lifecycle-blocked");
+	});
+
 	it("terminal lifecycles block submit/recover/validate/finalize", () => {
 		for (const lifecycle of ["completed", "retired"] as const) {
 			const actions = nextAllowedActions(lifecycle, true);

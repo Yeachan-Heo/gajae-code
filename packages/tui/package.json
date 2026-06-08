@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/tui",
-	"version": "0.2.5",
+	"version": "0.4.1",
 	"description": "Terminal User Interface library with differential rendering for efficient text-based applications",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",
@@ -33,6 +33,7 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test test/*.test.ts",
+		"test:perf": "PI_TUI_PERF_GATES=1 bun test test/perf-gates.test.ts",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},

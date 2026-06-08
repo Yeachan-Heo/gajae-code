@@ -2,8 +2,10 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
+import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
+import { reconcileWorkflowSkillState } from "./state-runtime";
 import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
@@ -473,14 +475,58 @@ export function buildUltragoalHudSummary(
 		updatedAt: new Date().toISOString(),
 	});
 }
+function clampTitle(title: string): string {
+	return title.length > 80 ? `${title.slice(0, 77)}...` : title;
+}
 
-function titleFromBrief(brief: string): string {
-	const firstLine = brief
+function firstNonEmptyLine(text: string): string | undefined {
+	return text
 		.split(/\r?\n/)
 		.map(line => line.trim())
 		.find(line => line.length > 0);
+}
+
+function titleFromBrief(brief: string): string {
+	const firstLine = firstNonEmptyLine(brief);
 	if (!firstLine) return "Complete ultragoal brief";
-	return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+	return clampTitle(firstLine);
+}
+
+// A reserved, column-0 (unindented) `@goal` line opens a story. The character
+// right after `@goal` must be `:`, an ASCII space or tab, or end-of-line, so
+// `@goalish`, `@goals:`, `@goal-foo`, `@goal.foo`, `@goal/foo`, a non-breaking
+// space, and indented or mid-line `@goal:` are all ordinary objective text and
+// never delimiters.
+const GOAL_DELIMITER = /^@goal(?::|[ \t]+|$)[ \t]*(.*)$/;
+
+interface ParsedGoal {
+	title: string;
+	objective: string;
+}
+
+function parseGoalsFromBrief(brief: string): ParsedGoal[] {
+	const sections: { title: string; body: string[] }[] = [];
+	let current: { title: string; body: string[] } | undefined;
+	for (const line of brief.split(/\r?\n/)) {
+		const match = GOAL_DELIMITER.exec(line);
+		if (match) {
+			current = { title: match[1].trim(), body: [] };
+			sections.push(current);
+			continue;
+		}
+		current?.body.push(line);
+	}
+	if (sections.length === 0) {
+		return [{ title: titleFromBrief(brief), objective: brief.trim() }];
+	}
+	return sections.map((section, index) => {
+		const body = section.body.join("\n").trim();
+		const title = section.title || firstNonEmptyLine(body) || "";
+		if (!title && !body) {
+			throw new Error(`ultragoal @goal block ${index + 1} has no title or objective`);
+		}
+		return { title: clampTitle(title), objective: body || title };
+	});
 }
 
 export async function createUltragoalPlan(input: {
@@ -491,21 +537,23 @@ export async function createUltragoalPlan(input: {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
 	const now = new Date().toISOString();
+	// Parse the untrimmed brief so the raw-line delimiter contract holds: a
+	// leading-indented `@goal` on the first line must stay objective text rather
+	// than being promoted to column 0 by trimming.
+	const goals: UltragoalGoal[] = parseGoalsFromBrief(input.brief).map((goal, index) => ({
+		id: `G${String(index + 1).padStart(3, "0")}`,
+		title: goal.title,
+		objective: goal.objective,
+		status: "pending",
+		createdAt: now,
+		updatedAt: now,
+	}));
 	const plan: UltragoalPlan = {
 		version: 1,
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
-		goals: [
-			{
-				id: "G001",
-				title: titleFromBrief(brief),
-				objective: brief,
-				status: "pending",
-				createdAt: now,
-				updatedAt: now,
-			},
-		],
+		goals,
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -591,7 +639,11 @@ function requireObjectArray(value: unknown, fieldName: string): JsonObject[] {
 function requiredStringField(row: JsonObject, key: string, fieldName: string): string {
 	const value = row[key];
 	if (typeof value !== "string" || value.trim().length === 0) {
-		throw new Error(`qualityGate ${fieldName}.${key} must be a non-empty string`);
+		const hint =
+			key === "obligation" && typeof row.description === "string" && row.description.trim().length > 0
+				? "; found description, but complete-checkpoint contractCoverage rows require obligation"
+				: "";
+		throw new Error(`qualityGate ${fieldName}.${key} must be a non-empty string${hint}`);
 	}
 	return value.trim();
 }
@@ -967,6 +1019,17 @@ async function readRequiredCompletionQualityGate(cwd: string, value: string | un
 	return gate;
 }
 
+function snapshotUpdatedAtMilliseconds(value: unknown): number | null {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value !== "string" || value.trim().length === 0) return null;
+	const trimmed = value.trim();
+	if (/^\d+$/.test(trimmed)) {
+		const parsed = Number.parseInt(trimmed, 10);
+		return Number.isFinite(parsed) ? parsed : null;
+	}
+	const parsed = Date.parse(trimmed);
+	return Number.isFinite(parsed) ? parsed : null;
+}
 async function readGjcGoalSnapshot(input: {
 	cwd: string;
 	value: string | undefined;
@@ -978,16 +1041,23 @@ async function readGjcGoalSnapshot(input: {
 }): Promise<unknown> {
 	if (!input.value?.trim()) {
 		if (!input.required) return undefined;
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot; this is the GJC goal-mode receipt, not the .gjc/ultragoal/goals.json goal record`,
+		);
 	}
 	const snapshot = await readStructuredValue(input.cwd, input.value);
 	const snapshotObject = qualityGateObject(snapshot);
 	const detailsObject = qualityGateObject(snapshotObject?.details);
 	const goalObject = qualityGateObject(snapshotObject?.goal) ?? qualityGateObject(detailsObject?.goal);
-	if (!goalObject) throw new Error(`${input.errorPrefix} require --gjc-goal-json with a goal object`);
-	const updatedAt = typeof goalObject.updatedAt === "number" ? goalObject.updatedAt : null;
+	if (!goalObject)
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json with a goal object from goal({"op":"get"}); pass the active GJC goal-mode snapshot, not the .gjc/ultragoal/goals.json goal record`,
+		);
+	const updatedAt = snapshotUpdatedAtMilliseconds(goalObject.updatedAt);
 	if (!updatedAt)
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.updatedAt from goal({"op":"get"})`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json goal.updatedAt as epoch milliseconds or an ISO timestamp from goal({"op":"get"}); pass the active GJC goal-mode snapshot, not the .gjc/ultragoal/goals.json goal record`,
+		);
 	const nowMilliseconds = Date.now();
 	if (updatedAt < nowMilliseconds - GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS) {
 		throw new Error(`${input.errorPrefix} require a fresh --gjc-goal-json snapshot`);
@@ -1004,7 +1074,9 @@ async function readGjcGoalSnapshot(input: {
 		return snapshot;
 	}
 	if (!expectedObjectives.has(objective)) {
-		throw new Error(`${input.errorPrefix} require --gjc-goal-json objective to match the active Ultragoal objective`);
+		throw new Error(
+			`${input.errorPrefix} require --gjc-goal-json objective to match the active GJC goal-mode objective from goal({"op":"get"}), not the .gjc/ultragoal/goals.json goal ${input.goal?.id ?? "record"}`,
+		);
 	}
 	if (goalObject.status !== "active") {
 		throw new Error(`${input.errorPrefix} require --gjc-goal-json goal.status to be active`);
@@ -1187,6 +1259,8 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
 
+const HELP_FLAGS = new Set(["--help", "-h"]);
+
 const FLAGS_WITH_VALUES = new Set([
 	"--brief",
 	"--brief-file",
@@ -1202,6 +1276,10 @@ const FLAGS_WITH_VALUES = new Set([
 	"--rationale",
 ]);
 
+function isHelpArg(arg: string): boolean {
+	return HELP_FLAGS.has(arg);
+}
+
 function commandName(args: readonly string[]): string {
 	let skipNext = false;
 	for (const arg of args) {
@@ -1213,9 +1291,60 @@ function commandName(args: readonly string[]): string {
 			skipNext = true;
 			continue;
 		}
+		if (isHelpArg(arg)) continue;
 		if (!arg.startsWith("-")) return arg;
 	}
 	return "status";
+}
+
+function renderUltragoalHelp(args: readonly string[]): string | null {
+	if (!args.some(isHelpArg) && args[0] !== "help") return null;
+	const subject =
+		args[0] === "help" ? args.find((arg, index) => index > 0 && !arg.startsWith("-")) : commandName(args);
+	if (subject === "checkpoint") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal checkpoint --goal-id <id> --status <status> --evidence <text> [FLAGS]",
+			"",
+			"FLAGS",
+			"      --goal-id=<value>            Durable .gjc/ultragoal goal id, e.g. G001",
+			"      --status=<value>             pending|active|complete|failed|blocked|review_blocked|superseded",
+			"      --evidence=<value>           Completion or checkpoint evidence text",
+			"      --quality-gate-json=<value>  JSON string or path for complete checkpoints",
+			'      --gjc-goal-json=<value>      JSON string or path containing the current goal({"op":"get"}) snapshot',
+			"      --json                       Output a machine-readable receipt",
+			"",
+			"COMPLETE CHECKPOINT RECEIPTS",
+			"  --quality-gate-json must be an object with architectReview, executorQa, and iteration.",
+			"  executorQa.contractCoverage[] rows require an obligation field; description is not a substitute.",
+			'  --gjc-goal-json must contain the active GJC goal-mode snapshot from goal({"op":"get"}), not the .gjc/ultragoal/goals.json goal record.',
+			"  goal.updatedAt may be epoch milliseconds or an ISO timestamp and must be fresh.",
+			"",
+			"EXAMPLES",
+			'  $ gjc ultragoal checkpoint --goal-id G001 --status blocked --evidence "waiting on review"',
+			'  $ gjc ultragoal checkpoint --goal-id G001 --status complete --evidence "tests passed" --gjc-goal-json ./goal.json --quality-gate-json ./quality-gate.json --json',
+			"",
+		].join("\n");
+	}
+	return [
+		"Run native GJC Ultragoal workflow commands",
+		"",
+		"USAGE",
+		"  $ gjc ultragoal <command> [FLAGS]",
+		"",
+		"COMMANDS",
+		"  status",
+		"  create-goals",
+		"  complete-goals",
+		"  checkpoint",
+		"  steer",
+		"  record-review-blockers",
+		"",
+		"Run `gjc ultragoal checkpoint --help` for complete checkpoint receipt requirements.",
+		"",
+	].join("\n");
 }
 
 async function readBrief(cwd: string, args: readonly string[]): Promise<string> {
@@ -1235,21 +1364,33 @@ function renderStatus(summary: UltragoalStatusSummary, json: boolean): string {
 function renderCompleteHandoff(
 	result: { plan: UltragoalPlan; goal?: UltragoalGoal; allComplete: boolean },
 	json: boolean,
+	cwd: string,
 ): string {
-	if (json) return `${JSON.stringify(result, null, 2)}\n`;
-	if (result.allComplete) return "All ultragoal goals are complete.\n";
-	if (!result.goal) return "No schedulable ultragoal goal found.\n";
+	if (json) {
+		return renderCliWriteReceipt({
+			ok: true,
+			all_complete: result.allComplete,
+			next_action: result.allComplete ? "none" : "execute-goal",
+			goal_id: result.goal?.id,
+			goal_status: result.goal?.status,
+			gjc_objective: result.plan.gjcObjective,
+			goals_path: getUltragoalPaths(cwd).goalsPath,
+		});
+	}
+	if (result.allComplete) return "ultragoal complete all=true\n";
+	if (!result.goal) return "ultragoal next-action=none\n";
 	return [
-		`Ultragoal handoff: ${result.goal.id} — ${result.goal.title}`,
-		`Objective: ${result.goal.objective}`,
-		`GJC objective: ${result.plan.gjcObjective}`,
-		'Call goal({"op":"get"}); call goal({"op":"create","objective":"<printed objective>"}) only if no active GJC goal exists, then keep the GJC goal active while this Ultragoal story is verified and checkpointed.',
-		'Before checkpointing complete, obtain a passing architectReview (architecture/product/code CLEAR + APPROVE) and executorQa (e2e/red-team passed with contractCoverage, surfaceEvidence, adversarialCases, and artifactRefs matrix evidence), then checkpoint with --quality-gate-json and a fresh active goal snapshot; record blockers instead of completing on any finding, plan/code mismatch, shallow evidence, or missing artifact link; call goal({"op":"complete"}) only after the final aggregate receipt exists.',
+		`ultragoal next-action=execute-goal goal-id=${result.goal.id}`,
+		`objective=${result.goal.objective}`,
+		`gjc-objective=${result.plan.gjcObjective}`,
+		"checkpoint requires=architectReview:CLEAR+APPROVE,executorQa:passed",
 		"",
 	].join("\n");
 }
 
-export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
+	const help = renderUltragoalHelp(args);
+	if (help) return { status: 0, stdout: help };
 	try {
 		const command = commandName(args);
 		const json = hasFlag(args, "--json");
@@ -1264,8 +1405,13 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					status: 0,
 					createdPlan: true,
 					stdout: json
-						? `${JSON.stringify(plan, null, 2)}\n`
-						: `Created ultragoal plan with ${plan.goals.length} goal at ${getUltragoalPaths(cwd).goalsPath}.\n`,
+						? renderCliWriteReceipt({
+								ok: true,
+								goals_count: plan.goals.length,
+								goal_ids: plan.goals.map(goal => goal.id),
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+							})
+						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd).goalsPath}.\n`,
 				};
 			}
 			case "complete-goals":
@@ -1274,6 +1420,7 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					stdout: renderCompleteHandoff(
 						await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") }),
 						json,
+						cwd,
 					),
 				};
 			case "checkpoint": {
@@ -1288,9 +1435,19 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 					qualityGateJson: flagValue(args, "--quality-gate-json"),
 				});
+				const goal = plan.goals.find(item => item.id === goalId);
 				return {
 					status: 0,
-					stdout: json ? `${JSON.stringify(plan, null, 2)}\n` : `Checkpointed ${goalId} as ${status}.\n`,
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								goal_id: goalId,
+								status,
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+								completion_receipt_kind: goal?.completionVerification?.receiptKind,
+								quality_gate_hash: goal?.completionVerification?.qualityGateHash,
+							})
+						: `ultragoal checkpoint goal-id=${goalId} status=${status}\n`,
 				};
 			}
 			case "steer": {
@@ -1303,9 +1460,17 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					rationale: flagValue(args, "--rationale") ?? "",
 				});
+				const goal = plan.goals.at(-1);
 				return {
 					status: 0,
-					stdout: json ? `${JSON.stringify(plan, null, 2)}\n` : "Accepted add_subgoal steering.\n",
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								kind,
+								goal_id: goal?.id,
+								goals_path: getUltragoalPaths(cwd).goalsPath,
+							})
+						: "Accepted add_subgoal steering.\n",
 				};
 			}
 			case "record-review-blockers": {
@@ -1317,7 +1482,13 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 					evidence: flagValue(args, "--evidence") ?? "",
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 				});
-				return { status: 0, stdout: json ? `${JSON.stringify(plan, null, 2)}\n` : "Recorded review blockers.\n" };
+				const goal = plan.goals.at(-1);
+				return {
+					status: 0,
+					stdout: json
+						? renderCliWriteReceipt({ ok: true, goal_id: goal?.id, goals_path: getUltragoalPaths(cwd).goalsPath })
+						: "Recorded review blockers.\n",
+				};
 			}
 			default:
 				return { status: 1, stderr: `Unknown gjc ultragoal command: ${command}\n` };
@@ -1325,4 +1496,65 @@ export async function runNativeUltragoalCommand(args: string[], cwd = process.cw
 	} catch (error) {
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
+}
+
+const RECONCILE_COMMANDS = new Set([
+	"status",
+	"create",
+	"create-goals",
+	"complete-goals",
+	"checkpoint",
+	"steer",
+	"record-review-blockers",
+]);
+
+/**
+ * Derive a workflow-state payload from the ultragoal plan/ledger and reconcile the
+ * ultragoal mode-state + active-state/HUD so `gjc state ultragoal read`, the
+ * skill-tool chain guard, and the HUD chip mirror the plan/ledger. Session scope
+ * follows `gjc state` (`GJC_SESSION_ID`). This is a derived repair: it never changes
+ * the triggering command's status/stdout, but a failure is surfaced (stderr + a
+ * `reconcile_failed` ledger audit event) rather than silently swallowed. `status` is
+ * therefore a read PLUS a derived repair; it never mutates goals.json/ledger.jsonl
+ * beyond that reconcile-failure audit event.
+ */
+async function reconcileUltragoalState(cwd: string): Promise<void> {
+	const sessionId = process.env.GJC_SESSION_ID?.trim() || undefined;
+	try {
+		const summary = await getUltragoalStatus(cwd);
+		const status = summary.status;
+		const active = summary.exists && status !== "complete";
+		const payload: Record<string, unknown> = {
+			skill: "ultragoal",
+			status,
+			current_phase: status,
+			active,
+			goals: summary.goals.map(goal => ({ id: goal.id, title: goal.title, status: goal.status })),
+			counts: summary.counts,
+			active_goal_id: summary.currentGoal?.id ?? null,
+			ledger_path: summary.paths.ledgerPath,
+			brief_path: summary.paths.briefPath,
+			goals_path: summary.paths.goalsPath,
+		};
+		if (summary.gjcObjective) payload.gjc_objective = summary.gjcObjective;
+		await reconcileWorkflowSkillState({ cwd, mode: "ultragoal", sessionId, active, phase: status, payload });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`ultragoal state reconciliation failed: ${message}\n`);
+		try {
+			await appendLedger(cwd, { type: "reconcile_failed", error: message });
+		} catch {
+			// Best-effort audit; never let a secondary failure change command semantics.
+		}
+	}
+}
+
+export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+	const command = commandName(args);
+	const result = await dispatchUltragoalCommand(args, cwd);
+	const isHelp = args.some(isHelpArg) || args[0] === "help";
+	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
+		await reconcileUltragoalState(cwd);
+	}
+	return result;
 }

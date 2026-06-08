@@ -8,6 +8,33 @@
  */
 
 export {
+	type DefaultReductionBenchmarkEvidence,
+	type DefaultReductionDecision,
+	type DefaultReductionEvidence,
+	type DefaultReductionHumanApprovalEvidence,
+	evaluateDefaultReduction,
+} from "./default-reduction-gate";
+export {
+	APPLIED_DEFAULT_REDUCTIONS,
+	type AppliedDefaultReduction,
+	HELD_DEFAULT_REDUCTIONS,
+	type HeldDefaultReduction,
+} from "./default-reductions.ledger";
+export {
+	type DeltaReport,
+	LIVE_RUNNER_SCHEMA_VERSION,
+	type LiveRunDelta,
+	LiveRunnerError,
+	type LiveRunnerOptions,
+	type LiveRunRegression,
+	type LiveRunReport,
+	type LiveRunTotals,
+	type RunOneBinaryOptions,
+	renderMarkdownReport,
+	runLiveComparison,
+	runOneBinary,
+} from "./live-runner";
+export {
 	assertTokenLogShape,
 	cacheHitRate,
 	computeTokenMetrics,

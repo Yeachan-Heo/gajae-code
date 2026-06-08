@@ -175,4 +175,29 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.provider).toBe("opencode-zen");
 		expect(result.model?.id).toBe("qwen3.6-plus-free");
 	});
+
+	test("passes parent session id when checking role override auth", async () => {
+		const sessionIds: Array<string | undefined> = [];
+		const registry: ModelLookupRegistry & {
+			getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined>;
+		} = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async (_model: Model<Api>, sessionId?: string) => {
+				sessionIds.push(sessionId);
+				return sessionId === "parent-session" ? "sk-session-token" : undefined;
+			},
+		};
+
+		const result = await resolveModelOverrideWithAuthFallback(
+			["opencode-zen/qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+			undefined,
+			"parent-session",
+		);
+
+		expect(result.authFallbackUsed).toBe(false);
+		expect(result.model?.provider).toBe("opencode-zen");
+		expect(sessionIds).toEqual(["parent-session"]);
+	});
 });

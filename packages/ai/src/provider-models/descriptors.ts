@@ -301,9 +301,9 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-vertex": "gemini-3-pro-preview",
-	minimax: "MiniMax-M2.5",
-	"minimax-code": "MiniMax-M2.5",
-	"minimax-code-cn": "MiniMax-M2.5",
-	"openai-codex": "gpt-5.4",
+	minimax: "minimax-m3",
+	"minimax-code": "minimax-m3",
+	"minimax-code-cn": "minimax-m3",
+	"openai-codex": "gpt-5.5",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;

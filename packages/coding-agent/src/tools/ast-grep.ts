@@ -151,6 +151,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
+				getArtifactsDir: this.session.getArtifactsDir,
 				internalUrlAction: "search",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;

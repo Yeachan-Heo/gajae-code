@@ -5,8 +5,7 @@
  * Messages are newline-delimited JSON.
  */
 
-import { getProjectDir, readJsonl, Snowflake } from "@gajae-code/utils";
-import { type Subprocess, spawn } from "bun";
+import { getProjectDir, ptree, readJsonl, Snowflake } from "@gajae-code/utils";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -22,8 +21,10 @@ import { toJsonRpcError } from "../../runtime-mcp/types";
  * Stdio transport for MCP servers.
  * Spawns a subprocess and communicates via stdin/stdout.
  */
+const CLOSE_WAIT_MS = 1_000;
+
 export class StdioTransport implements MCPTransport {
-	#process: Subprocess<"pipe", "pipe", "pipe"> | null = null;
+	#process: ptree.ChildProcess<"pipe"> | null = null;
 	#pendingRequests = new Map<
 		string | number,
 		{
@@ -57,13 +58,11 @@ export class StdioTransport implements MCPTransport {
 			...this.config.env,
 		};
 
-		this.#process = spawn({
-			cmd: [this.config.command, ...args],
+		this.#process = ptree.spawn([this.config.command, ...args], {
 			cwd: this.config.cwd ?? getProjectDir(),
 			env,
 			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
+			stderr: "full",
 		});
 
 		this.#connected = true;
@@ -299,9 +298,11 @@ export class StdioTransport implements MCPTransport {
 		}
 		this.#pendingRequests.clear();
 
-		// Kill subprocess
-		if (this.#process) {
-			this.#process.kill();
+		// Terminate the subprocess tree and keep the handle until exit is observed.
+		const process = this.#process;
+		if (process) {
+			process.kill();
+			await Promise.race([process.exited.catch(() => {}), Bun.sleep(CLOSE_WAIT_MS)]);
 			this.#process = null;
 		}
 

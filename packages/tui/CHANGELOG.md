@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-06
+
+### Changed
+
+- Ranked slash command-name suggestions by stronger prefix/token matches before fuzzy fallback ordering, while keeping priority as an intra-tier tie-breaker.
+
+## [0.3.1] - 2026-06-05
+
+### Changed
+
+- Added replay-gate helper timing for text-layout utilities so Stage 5 native offload decisions are benchmark-gated by measured hot paths rather than speculative rewrites.
+
 ## [0.2.2] - 2026-05-31
 
 ### Changed

@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "skill": "deep-interview",
+  "current_phase": "interviewing",
+  "active": true,
+  "updated_at": "2026-06-04T11:00:00.000Z",
+  "session_id": "sess-corpus-deep",
+  "spec_path": ".gjc/specs/deep-interview/corpus-spec.md",
+  "ambiguity_score": 0.21,
+  "questions": [
+    {
+      "id": "q1",
+      "status": "answered"
+    }
+  ],
+  "receipt": {
+    "version": 1,
+    "skill": "deep-interview",
+    "owner": "gjc-state-cli",
+    "command": "gjc state deep-interview write --input '<json>'",
+    "state_path": "/repo/.gjc/state/sessions/sess-corpus-deep/active-state.json",
+    "storage_path": "/repo/.gjc/state/sessions/sess-corpus-deep/deep-interview-state.json",
+    "mutated_at": "2026-06-04T11:00:00.000Z",
+    "fresh_until": "2026-06-04T11:30:00.000Z",
+    "status": "fresh",
+    "mutation_id": "deep-interview:2026-06-04T11:00:00.000Z",
+    "verb": "write-spec",
+    "from_phase": "interviewing",
+    "to_phase": "interviewing",
+    "forced": false,
+    "paths": [
+      ".gjc/specs/deep-interview/corpus-spec.md"
+    ],
+    "content_sha256": {
+      "algorithm": "sha256",
+      "value": "1b6b3d9edb7f9b8a3da6f53e8f4f7d621c7e8227f942fb1b9f97cdbf58b5e4a2",
+      "covered_path": "/repo/.gjc/state/sessions/sess-corpus-deep/deep-interview-state.json",
+      "computed_at": "2026-06-04T11:00:00.000Z"
+    },
+    "audit_trace_id": "trace-deep-corpus"
+  },
+  "passthrough": {
+    "retained": true,
+    "topology_confirmed": true
+  }
+}

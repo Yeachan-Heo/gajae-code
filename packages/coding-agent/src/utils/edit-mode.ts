@@ -1,4 +1,4 @@
-import { $env } from "@gajae-code/utils";
+import { $env } from "@gajae-code/utils/env";
 
 export type EditMode = "replace" | "patch" | "hashline" | "vim" | "apply_patch";
 

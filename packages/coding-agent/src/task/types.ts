@@ -2,12 +2,16 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
+import type { TaskResultReceipt } from "./receipt";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
+import type { SpawnPlanReceipt } from "./spawn-gate";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
 export type ForkContextPolicy = "forbidden" | "allowed";
+export type ForkContextMode = "none" | "receipt" | "last-turn" | "bounded" | "full";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -59,16 +63,27 @@ export interface SubagentLifecyclePayload {
 }
 
 const assignmentDescription = "per-task instructions; self-contained";
+const spawnPlanSchema = z
+	.object({
+		whyParallel: z.string(),
+		whyNotLocal: z.string(),
+		independence: z.string(),
+		expectedReceiptShape: z.string(),
+		maxInlineTokens: z.number(),
+	})
+	.describe("justification required before spawning more than four tasks or reviewer-spawned explore tasks");
 
 const createTaskItemSchema = (_contextEnabled: boolean) =>
 	z.object({
-		id: z.string().max(48).describe("camelcase identifier"),
+		id: z.string().max(48).refine(isValidTaskId, TASK_ID_DESCRIPTION).describe("filesystem-safe task identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
 		inheritContext: z
-			.boolean()
+			.enum(["none", "receipt", "last-turn", "bounded", "full"])
 			.optional()
-			.describe("explicit request to seed a subagent with sanitized parent context"),
+			.describe(
+				"fork-context mode: none/omitted copies no parent context; receipt copies a minimal receipt-sized snapshot; last-turn copies only the latest exchange; bounded copies the bounded default snapshot; full copies a larger sanitized snapshot up to the configured/model token cap",
+			),
 	});
 
 /** Single task item for parallel execution (default shape with context enabled). */
@@ -77,11 +92,23 @@ export type TaskItem = z.infer<typeof taskItemSchema>;
 
 const createTaskSchema = (options: { isolationEnabled: boolean; simpleMode: TaskSimpleMode }) => {
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(options.simpleMode);
-	const itemSchema = createTaskItemSchema(contextEnabled);
+	let itemSchema = createTaskItemSchema(contextEnabled);
+	if (!contextEnabled) {
+		itemSchema = itemSchema.superRefine((item, ctx) => {
+			if (item.inheritContext !== undefined && item.inheritContext !== "none") {
+				ctx.addIssue({
+					code: "custom",
+					path: ["inheritContext"],
+					message: "Independent tasks cannot inherit parent context; omit inheritContext or set it to none.",
+				});
+			}
+		});
+	}
 
 	let schema = z.object({
 		agent: z.string().describe("agent type"),
 		tasks: z.array(itemSchema).describe("tasks to execute in parallel"),
+		spawnPlan: spawnPlanSchema.optional(),
 	});
 	if (contextEnabled) {
 		schema = schema.extend({
@@ -139,6 +166,7 @@ export interface TaskParams {
 	agent: string;
 	context?: string;
 	schema?: string;
+	spawnPlan?: SpawnPlanReceipt;
 	tasks: TaskItem[];
 	isolated?: boolean;
 }
@@ -291,6 +319,8 @@ export interface SingleResult {
 	branchName?: string;
 	/** Nested repo patches to apply after parent merge */
 	nestedPatches?: NestedRepoPatch[];
+	/** Whether isolated execution produced a non-empty root or nested patch. */
+	producedChanges?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -304,17 +334,28 @@ export interface SingleResult {
 		errorMessage: string;
 	};
 	/** Output metadata for agent:// URL integration */
-	outputMeta?: { lineCount: number; charCount: number };
+	outputMeta?: { lineCount: number; charCount: number; byteSize?: number; sha256?: string };
+	/** Fork-context seed accounting for this subagent, when inherited parent context was cloned. */
+	forkContext?: { mode: ForkContextMode; clonedTokens: number };
 }
 
 /** Tool details for TUI rendering */
 export interface TaskToolDetails {
 	projectAgentsDir: string | null;
-	results: SingleResult[];
+	results: TaskResultReceipt[];
 	totalDurationMs: number;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
-	outputPaths?: string[];
+	/** Aggregate cloned tokens copied into fork-context seeds across subagents. */
+	forkContextClonedTokens?: number;
+	roiSummary?: {
+		childCount: number;
+		totalTokens: number;
+		totalCostTotal?: number;
+		totalClonedTokens?: number;
+		/** Advisory ids for terminal children that spent tokens without detectable output/review/changes. */
+		lowRoiChildIds: string[];
+	};
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

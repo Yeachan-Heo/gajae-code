@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
-import { writeSessionState } from "../../src/harness-control-plane/storage";
+import { acquireLease } from "../../src/harness-control-plane/session-lease";
+import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
+import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -33,6 +36,8 @@ class FakeRpc implements HarnessRpc {
 
 let root: string;
 let owner: RuntimeOwner | null = null;
+let hungServer: net.Server | null = null;
+let cliEnv: HarnessCliEnv;
 
 function seed(workspace: string): SessionState {
 	const now = new Date().toISOString();
@@ -54,7 +59,7 @@ function seed(workspace: string): SessionState {
 async function runHarness(args: string[]): Promise<{ code: number; json: Record<string, unknown> | null }> {
 	const proc = Bun.spawn(["bun", cliEntry, "harness", ...args], {
 		cwd: root,
-		env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
+		env: { ...cliEnv.env, GJC_HARNESS_STATE_ROOT: root },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -86,6 +91,7 @@ const passingFinalizeChecks: FinalizeChecks = {
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
+	cliEnv = createHarnessCliEnv(repoRoot);
 	await writeSessionState(root, seed(root));
 	owner = new RuntimeOwner({
 		root,
@@ -99,7 +105,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	cliEnv.cleanup();
 	await owner?.stop();
+	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
+	hungServer = null;
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -133,4 +142,37 @@ describe("gjc harness CLI -> live owner routing", () => {
 		expect((evidence.finalize as Record<string, unknown>).completed).toBe(true);
 		expect(state.lifecycle).toBe("completed");
 	}, 30_000);
+
+	it("falls back to bounded observe when a live owner endpoint accepts but never responds", async () => {
+		await owner?.stop();
+		owner = null;
+		const socketPath = controlSocketPath(root, SID);
+		hungServer = net.createServer(socket => {
+			socket.on("data", () => {});
+		});
+		await new Promise<void>((resolve, reject) => {
+			hungServer?.once("error", reject);
+			hungServer?.listen(socketPath, () => {
+				hungServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+		await acquireLease(root, SID, {
+			ownerId: "hung-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: socketPath },
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+
+		const res = await runHarness(["observe", "--session", SID]);
+
+		expect(res.code).toBe(0);
+		expect(res.json?.ok).toBe(true);
+		expect(res.json).toHaveProperty("state");
+		expect(res.json).toHaveProperty("evidence");
+		expect(res.json).toHaveProperty("nextAllowedActions");
+		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).ownerRouted).toBeUndefined();
+	}, 10_000);
 });

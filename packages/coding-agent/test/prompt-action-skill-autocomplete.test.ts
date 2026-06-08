@@ -10,6 +10,9 @@ function createProvider() {
 			{ name: "skill:deep-interview", description: "Deep interview" },
 			{ name: "skill:fast", description: "Colliding skill" },
 			{ name: "skill:mode", description: "Mode skill" },
+			{ name: "skill:team", description: "Multi-worker team orchestration" },
+			{ name: "init", description: "Generate team AGENTS.md for current codebase" },
+			{ name: "goal", description: "Toggle team goal mode for this session" },
 		],
 		basePath: "/tmp",
 		keybindings: { getKeys: () => [] } as unknown as KeybindingsManager,
@@ -56,5 +59,21 @@ describe("prompt action skill autocomplete", () => {
 		expect(suggestions?.prefix).toBe("/mode");
 		expect(suggestions?.items.some(item => item.value === "model")).toBe(true);
 		expect(suggestions?.items.some(item => item.value === "skill:mode")).toBe(true);
+	});
+	it("ranks skill word matches before weaker merged slash candidates", async () => {
+		const provider = createProvider();
+		const suggestions = await provider.getSuggestions(["/team"], 0, 5);
+		expect(suggestions?.prefix).toBe("/team");
+		expect(suggestions?.items[0]?.value).toBe("skill:team");
+		expect(suggestions?.items.map(item => item.value)).toEqual(
+			expect.arrayContaining(["init", "goal", "skill:team"]),
+		);
+	});
+
+	it("ranks normalized skill prefixes before weaker merged slash candidates", async () => {
+		const provider = createProvider();
+		const suggestions = await provider.trySyncSlashCompletion("/skill-te");
+		expect(suggestions?.prefix).toBe("/skill-te");
+		expect(suggestions?.items[0]?.value).toBe("skill:team");
 	});
 });

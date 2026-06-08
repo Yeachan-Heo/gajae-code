@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-06
+
+### Added
+
+- Added minimax-m3 model support across MiniMax providers.
+- Honored the `GJC_CACHE_RETENTION` environment variable and `cacheRetention` model config so hosts can control provider prompt-cache retention (#379/#381).
+- Added an Opus max reasoning preset to the model thinking presets (#372).
+- Refreshed the generated models schema for the new model/config surface (#382).
+
+### Changed
+
+- Pinned the OpenAI Codex provider default to GPT-5.5 at `xhigh` reasoning effort (#352). This changes the default model and effort for Codex users (latency/cost/quality impact) and is a behavior change, not an API break; pass an explicit model/effort to override.
+- Bumped the spoofed Gemini CLI user-agent version to 0.45.2 to track the upstream release.
+
+## [0.3.0] - 2026-06-03
+
 ### Added
 
 - Added xAI to the `/login` provider catalog as a Grok OAuth login with PKCE, refresh-token storage, and mocked login/refresh coverage.

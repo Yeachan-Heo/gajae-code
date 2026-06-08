@@ -141,6 +141,8 @@ export async function connectToServer(
 ): Promise<MCPServerConnection> {
 	const timeoutMs = config.timeout ?? CONNECTION_TIMEOUT_MS;
 	let transport: MCPTransport | undefined;
+	const connectAbort = new AbortController();
+	const connectSignal = options?.signal ? AbortSignal.any([options.signal, connectAbort.signal]) : connectAbort.signal;
 
 	const connect = async (): Promise<MCPServerConnection> => {
 		transport = await createTransport(config);
@@ -155,7 +157,7 @@ export async function connectToServer(
 
 		try {
 			const initResult = await initializeConnection(transport, {
-				signal: options?.signal,
+				signal: connectSignal,
 				async onInitialized() {
 					// Open the SSE stream before sending initialized, so server-to-client
 					// requests triggered by on_initialized (e.g. roots/list) are delivered.
@@ -184,13 +186,14 @@ export async function connectToServer(
 			connect(),
 			timeoutMs,
 			`Connection to MCP server "${name}" timed out after ${timeoutMs}ms`,
-			options?.signal,
+			connectSignal,
 		);
 	} catch (error) {
 		// If withTimeout rejected (timeout/abort) while connect() was still pending,
-		// the transport may be alive with an open SSE listener. Close it.
+		// abort initialization and wait for transport cleanup before returning.
+		connectAbort.abort(error);
 		if (transport) {
-			void transport.close().catch(() => {});
+			await transport.close().catch(() => {});
 		}
 		throw error;
 	}

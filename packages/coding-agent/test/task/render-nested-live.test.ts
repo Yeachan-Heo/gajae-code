@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { AgentProgress, SingleResult, TaskToolDetails } from "@gajae-code/coding-agent/task";
+import type { AgentProgress, TaskResultReceipt, TaskToolDetails } from "@gajae-code/coding-agent/task";
 import { taskToolRenderer } from "@gajae-code/coding-agent/task/render";
 
 // Defends the live-rendering contract for the `task` tool: while a Level-1
@@ -35,7 +35,7 @@ describe("task renderer: nested live rendering", () => {
 		};
 	}
 
-	function makeCompletedSubResult(id: string, description: string): SingleResult {
+	function makeCompletedSubResult(id: string, description: string): TaskResultReceipt {
 		return {
 			index: 0,
 			id,
@@ -44,12 +44,14 @@ describe("task renderer: nested live rendering", () => {
 			task: "sub assignment",
 			assignment: "sub assignment",
 			description,
+			status: "completed",
 			exitCode: 0,
-			output: "sub-final-output",
-			stderr: "",
 			truncated: false,
 			durationMs: 500,
 			tokens: 200,
+			preview: "sub-final-output",
+			previewTruncated: false,
+			outputUnavailable: true,
 		};
 	}
 

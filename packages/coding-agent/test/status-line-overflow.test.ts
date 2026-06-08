@@ -9,6 +9,7 @@ import type { StatusLineSegmentId } from "../src/config/settings-schema";
 import { StatusLineComponent } from "../src/modes/components/status-line";
 import type { SegmentContext } from "../src/modes/components/status-line/segments";
 import { renderSegment } from "../src/modes/components/status-line/segments";
+import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
 import { initTheme, theme } from "../src/modes/theme/theme";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../src/utils/session-color";
 
@@ -57,6 +58,7 @@ function createCtx(overrides?: { pathMaxLength?: number; branch?: string | null 
 		contextWindow: 0,
 		autoCompactEnabled: false,
 		subagentCount: 0,
+		jobs: EMPTY_JOBS_SNAPSHOT,
 		sessionStartTime: Date.now(),
 		git: {
 			branch: overrides?.branch ?? null,

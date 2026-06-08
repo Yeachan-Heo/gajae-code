@@ -4,7 +4,7 @@
  * Where the OpenAI / Anthropic / Responses route modules translate foreign
  * wire shapes through pi-ai's canonical {@link Context}, this module accepts
  * the canonical shape *directly* — for clients that already speak pi-ai
- * (containerized gjc, the swarm extension, robogjc's sidecar auth-gateway).
+ * (containerized gjc and robogjc's sidecar auth-gateway).
  * Skipping the wire-format → Context → wire-format round-trip cuts
  * per-request CPU but, more importantly, avoids the quantization that those
  * translations impose on first-class pi-ai fields (service tier, cache

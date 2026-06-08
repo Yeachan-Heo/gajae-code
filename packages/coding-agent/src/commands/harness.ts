@@ -9,27 +9,37 @@
  * until the RuntimeOwner (M3+) lands.
  */
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
-import { RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
+import { type ResolvedOwner, RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
+import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
+import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
+import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
 import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
 import {
+	canonicalWorkspacePath,
 	generateSessionId,
 	readEvents,
 	readSessionState,
+	rememberHarnessSessionRoot,
 	resolveHarnessRoot,
+	resolveHarnessSessionRoot,
 	sessionPaths,
+	writeReceiptImmutable,
 	writeSessionState,
 } from "../harness-control-plane/storage";
 import {
 	DEFAULT_RETRY_BUDGET,
+	type EventEnvelope,
 	type GitDelta,
 	type Harness as HarnessKind,
 	type Observation,
+	type RecoveryClassification,
 	type RetryBudget,
 	SESSION_SCHEMA_VERSION,
 	type SessionHandle,
@@ -76,25 +86,322 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 		return { gitDelta: "unknown", branch, deleted: false };
 	}
 }
+interface HarnessPreflight {
+	ok: boolean;
+	blockers: string[];
+	workspace: string;
+	actualBranch: string | null;
+	declaredBranch: string | null;
+	normalizedIssueOrPr: string | null;
+}
 
-/** Owner liveness — always false in the foundation build (RuntimeOwner is M3). */
+function normalizeIssueOrPr(value: unknown): string | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value === "number") {
+		if (Number.isSafeInteger(value) && value > 0) return String(value);
+		throw new Error(`invalid_issue_or_pr:${value}`);
+	}
+	if (typeof value !== "string") throw new Error("invalid_issue_or_pr:not-string-or-number");
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	const patterns = [
+		/^#?(\d+)$/i,
+		/^(?:pr|pull|issue)[-_#]?(\d+)$/i,
+		/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#(\d+)$/,
+		/^(?:https?:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:pull|issues)\/(\d+)\/?$/i,
+	];
+	for (const pattern of patterns) {
+		const match = trimmed.match(pattern);
+		if (match?.[1]) return match[1];
+	}
+	throw new Error(`invalid_issue_or_pr:${trimmed}`);
+}
+
+function gitOutput(workspace: string, args: string[]): string | null {
+	try {
+		return execFileSync("git", args, {
+			cwd: workspace,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+	} catch {
+		return null;
+	}
+}
+
+function resolveInputWorkspace(input: Record<string, unknown>): string {
+	return canonicalWorkspacePath(typeof input.workspace === "string" ? input.workspace : process.cwd());
+}
+
+function buildPreflight(input: Record<string, unknown>): HarnessPreflight {
+	const workspace = resolveInputWorkspace(input);
+	const declaredBranch = typeof input.branch === "string" && input.branch.trim() ? input.branch.trim() : null;
+	const blockers: string[] = [];
+	const gitRoot = gitOutput(workspace, ["rev-parse", "--show-toplevel"]);
+	const actualBranch = gitRoot ? gitOutput(workspace, ["rev-parse", "--abbrev-ref", "HEAD"]) : null;
+	let normalizedIssueOrPr: string | null = null;
+
+	if (!gitRoot) blockers.push("workspace-not-git-repo");
+	if (gitRoot && actualBranch === "HEAD") blockers.push("detached-head");
+	if (declaredBranch && actualBranch && actualBranch !== "HEAD" && declaredBranch !== actualBranch) {
+		blockers.push("branch-mismatch");
+	}
+	try {
+		normalizedIssueOrPr = normalizeIssueOrPr(input.issueOrPr ?? input.pr ?? input.issue);
+	} catch (error) {
+		blockers.push(error instanceof Error ? error.message : String(error));
+	}
+
+	return {
+		ok: blockers.length === 0,
+		blockers,
+		workspace,
+		actualBranch: actualBranch === "HEAD" ? null : actualBranch,
+		declaredBranch,
+		normalizedIssueOrPr,
+	};
+}
+
+function startFatalPreflightBlockers(input: Record<string, unknown>, preflight: HarnessPreflight): string[] {
+	const strict = input.strictPreflight === true || typeof input.branch === "string";
+	return preflight.blockers.filter(blocker => {
+		if (blocker === "branch-mismatch") return true;
+		if (blocker.startsWith("invalid_issue_or_pr:")) return true;
+		if (strict && (blocker === "workspace-not-git-repo" || blocker === "detached-head")) return true;
+		return false;
+	});
+}
+
+/** Fallback liveness after owner routing failed: no reachable owner handled this CLI call. */
 function ownerLiveFor(_state: SessionState): boolean {
 	return false;
 }
 
-function buildObservation(state: SessionState, ownerLive: boolean): Observation {
+function pushUnique(out: string[], value: unknown): void {
+	if (typeof value === "string" && !out.includes(value)) out.push(value);
+}
+
+interface CompletedTerminalEvent {
+	cursor: number;
+	createdAt: string;
+	kind: string;
+}
+
+function completedTerminalEvent(events: EventEnvelope[]): CompletedTerminalEvent | null {
+	for (const event of [...events].reverse()) {
+		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
+		if (event.kind === "rpc_agent_completed" || signal === "completed") {
+			return { cursor: event.cursor, createdAt: event.createdAt, kind: event.kind };
+		}
+	}
+	return null;
+}
+
+async function buildObservation(
+	root: string,
+	state: SessionState,
+	ownerLive: boolean,
+): Promise<{
+	observation: Observation;
+	completedTerminalEvent: CompletedTerminalEvent | null;
+}> {
 	const workspace = state.handle.workspace;
 	const { gitDelta, branch, deleted } = gitDeltaFor(workspace);
+	const events = await readEvents(root, state.sessionId, 0);
+	const observedSignals = ["SessionStart"];
+	for (const event of events.slice(-200)) {
+		pushUnique(observedSignals, (event.evidence as { signal?: unknown } | undefined)?.signal);
+		if (event.kind === "prompt_accepted") pushUnique(observedSignals, "prompt-accepted");
+	}
+	const terminalEvent = completedTerminalEvent(events);
+	const lastEventAt = events.at(-1)?.createdAt;
 	return {
-		lifecycle: state.lifecycle,
-		ownerLive,
-		cwd: workspace,
-		branch: branch ?? state.handle.branch,
-		gitDelta,
-		lastActivityAt: state.updatedAt,
-		observedSignals: ["SessionStart"],
-		risk: deleted ? "deleted-worktree" : "normal",
+		observation: {
+			lifecycle: state.lifecycle,
+			ownerLive,
+			cwd: workspace,
+			branch: branch ?? state.handle.branch,
+			gitDelta,
+			lastActivityAt: lastEventAt ?? state.updatedAt,
+			observedSignals,
+			risk: deleted ? "deleted-worktree" : !ownerLive && gitDelta === "dirty" ? "vanished-dirty" : "normal",
+		},
+		completedTerminalEvent: terminalEvent,
 	};
+}
+interface OwnerExitEvidence {
+	reason: string;
+	leaseStatus: string;
+	pid: number | null;
+	endpointPresent: boolean;
+	heartbeatAt: string | null;
+	expiresAt: string | null;
+	lastEventKind: string | null;
+	lastEventAt: string | null;
+	lastSignal: string | null;
+	promptAcceptedSeen: boolean;
+	completedSeen: boolean;
+	/** True only when the owner is genuinely gone (lease missing or process dead). */
+	terminal: boolean;
+	/** True when the owner process is provably alive (live lease + fresh heartbeat) but the endpoint did not route. */
+	transient: boolean;
+	/** ISO timestamp of the most recent non-terminal RPC-derived owner event, if any (observability only). */
+	lastRpcActivityAt: string | null;
+}
+
+async function buildOwnerExitEvidence(root: string, state: SessionState): Promise<OwnerExitEvidence> {
+	const lease = await readLease(root, state.sessionId);
+	const leaseStatus = classifyLeaseStatus(lease);
+	const events = await readEvents(root, state.sessionId, 0);
+	const lastEvent = events.at(-1) ?? null;
+	let lastSignal: string | null = null;
+	let promptAcceptedSeen = false;
+	let completedSeen = false;
+	let lastRpcActivityAt: string | null = null;
+	for (const event of events) {
+		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
+		if (typeof signal === "string") lastSignal = signal;
+		if (event.kind === "prompt_accepted" || signal === "prompt-accepted") promptAcceptedSeen = true;
+		if (event.kind === "rpc_agent_completed" || signal === "completed") completedSeen = true;
+		// Terminal completion/failure frames are NOT owner liveness — exclude them from activity.
+		if (event.kind.startsWith("rpc_") && event.kind !== "rpc_agent_completed" && event.kind !== "rpc_agent_failed") {
+			lastRpcActivityAt = event.createdAt;
+		}
+	}
+	// Owner liveness is the lease heartbeat, never RPC frames: a "live" lease means the owner process
+	// is alive and heartbeating within TTL, so a failed endpoint call is a transient observation gap.
+	// Real owner loss (missing/dead lease) stays terminal and keeps its original reason string so
+	// existing consumers that match on the reason continue to escalate.
+	const terminal = !lease || leaseStatus === "dead";
+	const transient = leaseStatus === "live";
+	let reason = "owner-not-live";
+	if (!lease) {
+		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-lease-missing";
+	} else if (leaseStatus === "dead") {
+		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-process-dead";
+	} else if (leaseStatus === "expiredAlive") {
+		reason = "owner-lease-expired";
+	} else if (leaseStatus === "epermAlive") {
+		reason = "owner-liveness-unknown-permission-denied";
+	} else {
+		reason = "owner-endpoint-unreachable";
+	}
+	return {
+		reason,
+		leaseStatus,
+		pid: lease?.pid ?? null,
+		endpointPresent: Boolean(lease?.endpoint?.path),
+		heartbeatAt: lease?.heartbeatAt ?? null,
+		expiresAt: lease?.expiresAt ?? null,
+		lastEventKind: lastEvent?.kind ?? null,
+		lastEventAt: lastEvent?.createdAt ?? null,
+		lastSignal,
+		promptAcceptedSeen,
+		completedSeen,
+		terminal,
+		transient,
+		lastRpcActivityAt,
+	};
+}
+
+async function writeVanishReceiptForDecision(
+	root: string,
+	state: SessionState,
+	observation: Observation,
+	classification: RecoveryClassification,
+): Promise<string | null> {
+	if (!requiresVanishBeforeAction(classification)) return null;
+	const dirty = observation.gitDelta === "dirty" || observation.gitDelta === "unknown";
+	const preservation = dirty ? preserveDirtyWorktree(observation.cwd) : null;
+	const evidence: VanishEvidence = {
+		classification,
+		gitDelta: observation.gitDelta,
+		gitStatusPorcelain: preservation
+			? `tracked:${preservation.trackedDiffSha256};untracked:${preservation.untrackedManifest.length}`
+			: observation.observedSignals.join(","),
+		untrackedManifest: preservation?.untrackedManifest ?? [],
+		preservation: preservation?.stashRef ? "stash" : "snapshot",
+		stashRef: preservation?.stashRef ?? null,
+		snapshotComplete: preservation?.snapshotComplete ?? true,
+		forbiddenActions: dirty ? ["restart-clean", "delete", "reset"] : [],
+	};
+	const receipt = buildReceipt<VanishEvidence>({
+		receiptId: `vanish-${Date.now()}-${randomBytes(4).toString("hex")}`,
+		sessionId: state.sessionId,
+		family: "vanish",
+		source: "cli-recover",
+		subject: {
+			workspace: observation.cwd,
+			branch: observation.branch,
+			head: null,
+			commit: null,
+		},
+		evidence,
+	});
+	await writeReceiptImmutable(root, state.sessionId, "vanish", receipt.receiptId, receipt);
+	return receipt.receiptId;
+}
+
+function updateStateWithRestoredOwner(state: SessionState, leasePath: string, resolved: ResolvedOwner): void {
+	state.lifecycle = "observing";
+	state.blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
+	state.handle.processHandle = {
+		kind: "runtime-owner",
+		ownerId: resolved.lease?.ownerId ?? null,
+		pid: resolved.lease?.pid ?? null,
+	};
+	state.handle.ownerHandle = {
+		leasePath,
+		endpoint: resolved.socketPath,
+		heartbeatAt: resolved.lease?.heartbeatAt ?? null,
+	};
+	state.updatedAt = nowIso();
+}
+
+function isOwnerLivenessBlocker(blocker: string): boolean {
+	return blocker === "detached-owner-not-live" || blocker.startsWith("owner-vanished:");
+}
+
+async function reconcileCompletedOwnerExited(
+	root: string,
+	state: SessionState,
+	observation: Observation,
+	completedTerminal: CompletedTerminalEvent | null,
+): Promise<SessionState> {
+	if (!completedTerminal || observation.ownerLive || observation.gitDelta !== "clean") return state;
+	if (state.lifecycle === "completed" || state.lifecycle === "retired") return state;
+	state.lifecycle = "completed";
+	state.blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
+	state.updatedAt = nowIso();
+	await writeSessionState(root, state);
+	return state;
+}
+
+function needsVanishedOwnerBlock(
+	state: SessionState,
+	observation: Observation,
+	completedTerminal: CompletedTerminalEvent | null,
+): boolean {
+	if (observation.ownerLive || state.lifecycle !== "observing") return false;
+	if (completedTerminal || observation.observedSignals.includes("completed")) return false;
+	return observation.observedSignals.some(
+		signal => signal === "prompt-accepted" || signal === "tool-call" || signal === "streaming",
+	);
+}
+
+async function markVanishedOwnerBlocked(
+	root: string,
+	state: SessionState,
+	observation: Observation,
+	completedTerminal: CompletedTerminalEvent | null,
+): Promise<SessionState> {
+	if (!needsVanishedOwnerBlock(state, observation, completedTerminal)) return state;
+	const blocker = `owner-vanished:${observation.gitDelta}`;
+	state.lifecycle = "blocked";
+	state.blockers = state.blockers.includes(blocker) ? state.blockers : [...state.blockers, blocker];
+	state.updatedAt = nowIso();
+	await writeSessionState(root, state);
+	return state;
 }
 
 function resolveRetryBudget(input: Record<string, unknown>): RetryBudget {
@@ -139,7 +446,7 @@ export default class Harness extends Command {
 
 	static args = {
 		verb: Args.string({
-			description: "start|submit|observe|classify|recover|validate|finalize|retire|events|monitor|operate",
+			description: "start|preflight|submit|observe|classify|recover|validate|finalize|retire|events|monitor|operate",
 			required: true,
 		}),
 	};
@@ -162,12 +469,19 @@ export default class Harness extends Command {
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Harness);
 		const verb = String(args.verb);
-		const root = resolveHarnessRoot();
+		let root = resolveHarnessRoot();
 		try {
 			const input = parseInput(flags.input);
+			const sessionId = flags.session ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
+			const expectedWorkspace = typeof input.workspace === "string" ? resolveInputWorkspace(input) : undefined;
+			if (verb !== "start" && sessionId) {
+				root = await resolveHarnessSessionRoot(root, sessionId, process.env, { expectedWorkspace });
+			}
 			switch (verb) {
 				case "start":
 					return await this.#start(root, input);
+				case "preflight":
+					return this.#preflight(input);
 				case "observe":
 					return await this.#observe(root, input, flags.session);
 				case "classify":
@@ -196,6 +510,20 @@ export default class Harness extends Command {
 		}
 	}
 
+	#preflight(input: Record<string, unknown>): void {
+		const preflight = buildPreflight(input);
+		writeJson({
+			ok: preflight.ok,
+			evidence: {
+				preflight,
+				guidance: preflight.ok
+					? "workspace metadata is normalized"
+					: "fix blockers before gjc harness start; branch must match the actual checkout and issueOrPr must be numeric or a recognized PR/issue form",
+			},
+		});
+		if (!preflight.ok) process.exitCode = 1;
+	}
+
 	async #finalizeVerb(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
 		const sessionId = requireSessionId(input, flagSession);
 		if (await this.#tryOwnerRoute(root, sessionId, "finalize", { ...input, sessionId })) return;
@@ -214,6 +542,7 @@ export default class Harness extends Command {
 	): Promise<void> {
 		const sessionId = flagSession ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
 		if (sessionId && (await this.#tryOwnerRoute(root, sessionId, verb, { ...input, sessionId }))) return;
+		if (verb === "recover" && sessionId) return this.#recoverWithoutOwner(root, sessionId, input);
 		return this.#pending(root, verb, input, flagSession);
 	}
 
@@ -286,6 +615,9 @@ export default class Harness extends Command {
 		if (process.env.GJC_HARNESS_RPC_COMMAND) {
 			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
 		}
+		if (process.env.GJC_HARNESS_TEST_NODE_MODULES) {
+			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
+		}
 		const ownerCommand = this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ");
 		const shellCommand = `exec env ${envAssignments.join(" ")} ${ownerCommand}`;
 		const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, "-c", cwd, shellCommand], {
@@ -316,7 +648,13 @@ export default class Harness extends Command {
 		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,
-			env: { ...process.env, GJC_HARNESS_STATE_ROOT: root },
+			env: {
+				...process.env,
+				GJC_HARNESS_STATE_ROOT: root,
+				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
+					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
+					: {}),
+			},
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -343,7 +681,22 @@ export default class Harness extends Command {
 			process.exitCode = 1;
 			return;
 		}
-		const workspace = typeof input.workspace === "string" ? input.workspace : process.cwd();
+		const preflight = buildPreflight(input);
+		const fatalBlockers = startFatalPreflightBlockers(input, preflight);
+		if (fatalBlockers.length > 0) {
+			writeJson({
+				ok: false,
+				error: "harness_preflight_failed",
+				evidence: {
+					preflight: { ...preflight, blockers: fatalBlockers, ok: false },
+					guidance:
+						"fix blockers before start; run gjc harness preflight with the same input for branch and issue/PR diagnostics",
+				},
+			});
+			process.exitCode = 1;
+			return;
+		}
+		const workspace = resolveInputWorkspace(input);
 		const sessionId = typeof input.sessionId === "string" ? input.sessionId : generateSessionId();
 		const eventsPath = `${root}/sessions/${sessionId}/events.jsonl`;
 		const leasePath = `${root}/sessions/${sessionId}/lease.json`;
@@ -351,11 +704,12 @@ export default class Harness extends Command {
 		const handle: SessionHandle = {
 			sessionId,
 			harness,
+			mode: input.mode === "review" || input.reviewOnly === true ? "review" : "implement",
 			repo: typeof input.repo === "string" ? input.repo : null,
 			workspace,
-			branch: typeof input.branch === "string" ? input.branch : null,
+			branch: preflight.declaredBranch ?? preflight.actualBranch,
 			base: typeof input.base === "string" ? input.base : null,
-			issueOrPr: typeof input.issueOrPr === "string" ? input.issueOrPr : null,
+			issueOrPr: preflight.normalizedIssueOrPr,
 			processHandle: { kind: "runtime-owner", ownerId: null, pid: null },
 			rpcHandle: { kind: "rpc-subprocess", pid: null, sessionDir: `${root}/sessions/${sessionId}/gjc-session` },
 			ownerHandle: { leasePath, endpoint: null, heartbeatAt: null },
@@ -376,6 +730,7 @@ export default class Harness extends Command {
 			updatedAt: startedAt,
 		};
 		await writeSessionState(root, state);
+		await rememberHarnessSessionRoot(root, sessionId);
 		let ownerLive = false;
 		let ownerRuntime: OwnerSpawnResult["runtime"] = "manual";
 		let ownerFallbackReason: string | null = null;
@@ -408,6 +763,25 @@ export default class Harness extends Command {
 			}
 		}
 		if (ownerBlockerReason) {
+			const resolved = await resolveOwner(root, sessionId);
+			if (resolved.live && resolved.socketPath) {
+				ownerLive = true;
+				ownerBlockerReason = null;
+				handle.processHandle = {
+					kind: "runtime-owner",
+					ownerId: resolved.lease?.ownerId ?? null,
+					pid: resolved.lease?.pid ?? null,
+				};
+				handle.ownerHandle = {
+					leasePath,
+					endpoint: resolved.socketPath,
+					heartbeatAt: resolved.lease?.heartbeatAt ?? null,
+				};
+				state.handle = handle;
+				await writeSessionState(root, state);
+			}
+		}
+		if (ownerBlockerReason) {
 			state.lifecycle = "blocked";
 			state.blockers = [...state.blockers, ownerBlockerReason];
 			state.handle = handle;
@@ -421,6 +795,7 @@ export default class Harness extends Command {
 				{
 					handle,
 					ownerRuntime,
+					preflight,
 					...(ownerFallbackReason ? { ownerFallbackReason } : {}),
 					...(ownerBlockerReason ? { reason: ownerBlockerReason } : {}),
 				},
@@ -453,10 +828,29 @@ export default class Harness extends Command {
 	async #observe(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
 		const sessionId = requireSessionId(input, flagSession);
 		if (await this.#tryOwnerRoute(root, sessionId, "observe", { ...input, sessionId })) return;
-		const state = await loadState(root, sessionId);
+		let state = await loadState(root, sessionId);
 		const ownerLive = ownerLiveFor(state);
-		const observation = buildObservation(state, ownerLive);
-		writeJson(buildResponse(state, ownerLive, { observation, readOnly: !ownerLive }));
+		const { observation, completedTerminalEvent } = await buildObservation(root, state, ownerLive);
+		state = await reconcileCompletedOwnerExited(root, state, observation, completedTerminalEvent);
+		const vanishedOwnerBlock = needsVanishedOwnerBlock(state, observation, completedTerminalEvent);
+		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
+		const ownerExit =
+			!ownerLive && (vanishedOwnerBlock || completedTerminalEvent)
+				? await buildOwnerExitEvidence(root, state)
+				: null;
+		writeJson(
+			buildResponse(state, ownerLive, {
+				observation: { ...observation, lifecycle: state.lifecycle },
+				readOnly: !ownerLive,
+				...(vanishedOwnerBlock
+					? { ownerVanished: true, blockerReason: `owner-vanished:${observation.gitDelta}` }
+					: {}),
+				...(completedTerminalEvent && !ownerLive
+					? { completedOwnerExited: true, terminalResult: completedTerminalEvent }
+					: {}),
+				...(ownerExit ? { ownerExit } : {}),
+			}),
+		);
 	}
 
 	async #classify(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
@@ -466,7 +860,16 @@ export default class Harness extends Command {
 		const sessionId = flagSession ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
 		if (sessionId) {
 			stateView = await loadState(root, sessionId);
-			if (!observation) observation = buildObservation(stateView, ownerLiveFor(stateView));
+			if (!observation) {
+				const built = await buildObservation(root, stateView, ownerLiveFor(stateView));
+				observation = built.observation;
+				stateView = await markVanishedOwnerBlocked(
+					root,
+					stateView,
+					built.observation,
+					built.completedTerminalEvent,
+				);
+			}
 		}
 		if (!observation) throw new Error("classify_requires_observation_or_session");
 		const full: Observation = {
@@ -481,7 +884,12 @@ export default class Harness extends Command {
 		};
 		const decision = classifyRecovery({ observation: full, retryBudget: budget });
 		if (stateView) {
-			writeJson(buildResponse(stateView, ownerLiveFor(stateView), { decision, observation: full }));
+			writeJson(
+				buildResponse(stateView, ownerLiveFor(stateView), {
+					decision,
+					observation: { ...full, lifecycle: stateView.lifecycle },
+				}),
+			);
 			return;
 		}
 		// Pure classify without a session: synthesize a minimal state view.
@@ -522,7 +930,9 @@ export default class Harness extends Command {
 			buildResponse(state, ownerLiveFor(state), {
 				events,
 				cursor: nextCursor,
-				note: "tail-only; live producer (owner) lands in M3/M5",
+				note: "tail-only; events are preserved after owner exit",
+				ownerLive: ownerLiveFor(state),
+				ownerExit: ownerLiveFor(state) ? null : await buildOwnerExitEvidence(root, state),
 			}),
 		);
 	}
@@ -531,7 +941,7 @@ export default class Harness extends Command {
 		const sessionId = requireSessionId(input, flagSession);
 		if (await this.#tryOwnerRoute(root, sessionId, "retire", { ...input, sessionId })) return;
 		const state = await loadState(root, sessionId);
-		const observation = buildObservation(state, ownerLiveFor(state));
+		const { observation } = await buildObservation(root, state, ownerLiveFor(state));
 		if (observation.gitDelta === "dirty" || observation.gitDelta === "unknown") {
 			writeJson(
 				buildResponse(
@@ -552,6 +962,90 @@ export default class Harness extends Command {
 		state.updatedAt = nowIso();
 		await writeSessionState(root, state);
 		writeJson(buildResponse(state, false, { retired: true }));
+	}
+
+	async #recoverWithoutOwner(root: string, sessionId: string, input: Record<string, unknown>): Promise<void> {
+		const budget = resolveRetryBudget(input);
+		let state = await loadState(root, sessionId);
+		const beforeExit = await buildOwnerExitEvidence(root, state);
+		const { observation, completedTerminalEvent } = await buildObservation(root, state, false);
+		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
+		const decision = classifyRecovery({
+			observation: { ...observation, lifecycle: state.lifecycle },
+			retryBudget: budget,
+		});
+		// A session persisted as `started` whose owner was never spawned (no lease,
+		// no endpoint, no owner-run evidence) is not a vanish — it simply never had
+		// an owner. Bootstrap a fresh owner instead of deadlocking on the missing
+		// prior endpoint (which `start` without `--detach` never records).
+		const ownerNeverStarted =
+			state.lifecycle === "started" &&
+			!beforeExit.endpointPresent &&
+			!beforeExit.promptAcceptedSeen &&
+			!beforeExit.completedSeen &&
+			beforeExit.lastEventKind === null &&
+			observation.risk !== "deleted-worktree";
+		// Bootstrapping a never-started owner is not a vanish, so it needs no vanish receipt.
+		const vanishReceiptId = ownerNeverStarted
+			? null
+			: await writeVanishReceiptForDecision(root, state, observation, decision.classification);
+		// A never-started owner has no in-flight work to preserve, so bootstrapping it does not
+		// depend on the vanish classifier's `ownerRequired` verdict — that gate exists to protect a
+		// vanished owner's worktree. Without this, a session started in a non-git workspace (git
+		// delta `unknown` → classifier `human-check` with `ownerRequired: false`) would stay stuck.
+		const restoredOwner =
+			ownerNeverStarted || (decision.ownerRequired && beforeExit.endpointPresent)
+				? await this.#spawnDetachedOwner(root, sessionId, state.handle.workspace)
+				: null;
+		if (restoredOwner?.live) {
+			const resolved = await resolveOwner(root, sessionId);
+			if (resolved.live && resolved.socketPath) {
+				updateStateWithRestoredOwner(state, state.handle.ownerHandle.leasePath, resolved);
+				if (restoredOwner.tmuxSessionName)
+					state.handle.viewportHandle.tmuxSessionName = restoredOwner.tmuxSessionName;
+				await writeSessionState(root, state);
+				writeJson(
+					buildResponse(state, true, {
+						pending: false,
+						...(ownerNeverStarted ? { bootstrappedOwner: true } : { restoredOwner: true }),
+						decision,
+						observation: { ...observation, lifecycle: state.lifecycle, ownerLive: true },
+						ownerExit: beforeExit,
+						ownerRuntime: restoredOwner.runtime,
+						...(restoredOwner.fallbackReason ? { ownerFallbackReason: restoredOwner.fallbackReason } : {}),
+						...(vanishReceiptId ? { vanishReceiptId } : {}),
+					}),
+				);
+				return;
+			}
+		}
+		const afterExit = await buildOwnerExitEvidence(root, state);
+		writeJson(
+			buildResponse(
+				state,
+				false,
+				{
+					pending: false,
+					reason: afterExit.reason,
+					decision,
+					observation: { ...observation, lifecycle: state.lifecycle },
+					ownerExit: afterExit,
+					...(restoredOwner
+						? {
+								restoreAttempt: {
+									runtime: restoredOwner.runtime,
+									live: restoredOwner.live,
+									fallbackReason: restoredOwner.fallbackReason,
+									blockerReason: restoredOwner.blockerReason,
+								},
+							}
+						: {}),
+					...(vanishReceiptId ? { vanishReceiptId } : {}),
+				},
+				false,
+			),
+		);
+		process.exitCode = 1;
 	}
 
 	async #pending(

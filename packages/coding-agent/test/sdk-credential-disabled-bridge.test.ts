@@ -18,6 +18,8 @@ interface SessionDirs {
 	agentDir: string;
 }
 
+const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
+
 const expiredOAuth = () =>
 	({
 		type: "oauth" as const,
@@ -208,77 +210,81 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(ext.events[0]?.provider).toBe("anthropic");
 	});
 
-	it("concurrent sessions each subscribe their own listener; each dispose only removes its own", async () => {
-		const sharedDirs = makeDirs("concurrent");
-		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(sharedDirs.agentDir, "agent.db"), {
-			onCredentialDisabled: event => {
-				embedderEvents.push(event);
-			},
-		});
+	it(
+		"concurrent sessions each subscribe their own listener; each dispose only removes its own",
+		async () => {
+			const sharedDirs = makeDirs("concurrent");
+			const embedderEvents: CredentialDisabledEvent[] = [];
+			const authStorage = await AuthStorage.create(path.join(sharedDirs.agentDir, "agent.db"), {
+				onCredentialDisabled: event => {
+					embedderEvents.push(event);
+				},
+			});
 
-		const ext1 = makeRecordingExtension();
-		const ext2 = makeRecordingExtension();
-		const ext3 = makeRecordingExtension();
-		const dirs1 = makeDirs("concurrent-1");
-		const dirs2 = makeDirs("concurrent-2");
-		const dirs3 = makeDirs("concurrent-3");
-		const session1 = await createAgentSession(baseOptions(dirs1, authStorage, [ext1.factory]));
-		const session2 = await createAgentSession(baseOptions(dirs2, authStorage, [ext2.factory]));
-		const session3 = await createAgentSession(baseOptions(dirs3, authStorage, [ext3.factory]));
-		initializeRunnerForTest(session1.session.extensionRunner);
-		initializeRunnerForTest(session2.session.extensionRunner);
-		initializeRunnerForTest(session3.session.extensionRunner);
+			const ext1 = makeRecordingExtension();
+			const ext2 = makeRecordingExtension();
+			const ext3 = makeRecordingExtension();
+			const dirs1 = makeDirs("concurrent-1");
+			const dirs2 = makeDirs("concurrent-2");
+			const dirs3 = makeDirs("concurrent-3");
+			const session1 = await createAgentSession(baseOptions(dirs1, authStorage, [ext1.factory]));
+			const session2 = await createAgentSession(baseOptions(dirs2, authStorage, [ext2.factory]));
+			const session3 = await createAgentSession(baseOptions(dirs3, authStorage, [ext3.factory]));
+			initializeRunnerForTest(session1.session.extensionRunner);
+			initializeRunnerForTest(session2.session.extensionRunner);
+			initializeRunnerForTest(session3.session.extensionRunner);
 
-		failOAuthRefresh();
+			failOAuthRefresh();
 
-		// All three sessions + embedder receive the first event.
-		await authStorage.set("anthropic", [expiredOAuth()]);
-		const wait1All = Promise.all([ext1.next(), ext2.next(), ext3.next()]);
-		await authStorage.getApiKey("anthropic", "concurrent-1");
-		await wait1All;
-		expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic"]);
-		expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
-		expect(ext2.events.map(e => e.provider)).toEqual(["anthropic"]);
-		expect(ext3.events.map(e => e.provider)).toEqual(["anthropic"]);
+			// All three sessions + embedder receive the first event.
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			const wait1All = Promise.all([ext1.next(), ext2.next(), ext3.next()]);
+			await authStorage.getApiKey("anthropic", "concurrent-1");
+			await wait1All;
+			expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic"]);
+			expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
+			expect(ext2.events.map(e => e.provider)).toEqual(["anthropic"]);
+			expect(ext3.events.map(e => e.provider)).toEqual(["anthropic"]);
 
-		// Dispose session1; sessions 2 and 3 + embedder still receive.
-		await session1.session.dispose();
+			// Dispose session1; sessions 2 and 3 + embedder still receive.
+			await session1.session.dispose();
 
-		await authStorage.set("openai", [expiredOAuth()]);
-		const wait2 = Promise.all([ext2.next(), ext3.next()]);
-		await authStorage.getApiKey("openai", "concurrent-2");
-		await wait2;
-		await drainCredentialDisabledDispatch();
-		expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai"]);
-		expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
-		expect(ext2.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
-		expect(ext3.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
+			await authStorage.set("openai", [expiredOAuth()]);
+			const wait2 = Promise.all([ext2.next(), ext3.next()]);
+			await authStorage.getApiKey("openai", "concurrent-2");
+			await wait2;
+			await drainCredentialDisabledDispatch();
+			expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai"]);
+			expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
+			expect(ext2.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
+			expect(ext3.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
 
-		// Dispose session2; only session3 + embedder receive.
-		await session2.session.dispose();
+			// Dispose session2; only session3 + embedder receive.
+			await session2.session.dispose();
 
-		await authStorage.set("google", [expiredOAuth()]);
-		const wait3 = ext3.next();
-		await authStorage.getApiKey("google", "concurrent-3");
-		await wait3;
-		await drainCredentialDisabledDispatch();
-		expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai", "google"]);
-		expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
-		expect(ext2.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
-		expect(ext3.events.map(e => e.provider)).toEqual(["anthropic", "openai", "google"]);
+			await authStorage.set("google", [expiredOAuth()]);
+			const wait3 = ext3.next();
+			await authStorage.getApiKey("google", "concurrent-3");
+			await wait3;
+			await drainCredentialDisabledDispatch();
+			expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai", "google"]);
+			expect(ext1.events.map(e => e.provider)).toEqual(["anthropic"]);
+			expect(ext2.events.map(e => e.provider)).toEqual(["anthropic", "openai"]);
+			expect(ext3.events.map(e => e.provider)).toEqual(["anthropic", "openai", "google"]);
 
-		// Dispose the last session; only the embedder receives.
-		await session3.session.dispose();
+			// Dispose the last session; only the embedder receives.
+			await session3.session.dispose();
 
-		await authStorage.set("anthropic", [expiredOAuth()]);
-		await authStorage.getApiKey("anthropic", "concurrent-final");
-		await drainCredentialDisabledDispatch();
-		expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai", "google", "anthropic"]);
-		expect(ext1.events).toHaveLength(1);
-		expect(ext2.events).toHaveLength(2);
-		expect(ext3.events).toHaveLength(3);
-	}, 30_000);
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			await authStorage.getApiKey("anthropic", "concurrent-final");
+			await drainCredentialDisabledDispatch();
+			expect(embedderEvents.map(e => e.provider)).toEqual(["anthropic", "openai", "google", "anthropic"]);
+			expect(ext1.events).toHaveLength(1);
+			expect(ext2.events).toHaveLength(2);
+			expect(ext3.events).toHaveLength(3);
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 
 	it("buffers credential_disabled events fired before runner.initialize and replays them once initialize runs", async () => {
 		// Without deferral the runner would fan out with `hasUI=false`, an unset model, and

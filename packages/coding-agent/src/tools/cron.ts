@@ -137,6 +137,7 @@ function deleteRecord(ownerId: string | undefined, id: string): boolean {
 	disposeRecord(record);
 	const deleted = state.jobs.delete(id);
 	if (state.jobs.size === 0) schedulesByOwner.delete(key);
+	if (deleted) notifyCronChange();
 	return deleted;
 }
 
@@ -158,6 +159,7 @@ export function clearOwnerSchedules(ownerId: string | undefined): void {
 	state.jobs.clear();
 	state.cleanupRegistered = false;
 	schedulesByOwner.delete(key);
+	notifyCronChange();
 }
 
 /** Reset every owner's schedule store. Test-only. */
@@ -167,6 +169,51 @@ export function resetCronRegistryForTests(): void {
 		clearOwnerSchedules(ownerId);
 	}
 	schedulesByOwner.clear();
+	notifyCronChange();
+}
+
+/** Module-level listeners notified whenever the cron schedule set changes. */
+const cronChangeListeners = new Set<() => void>();
+
+/** Subscribe to cron schedule-set changes. Returns an unsubscribe function. */
+export function onCronChange(cb: () => void): () => void {
+	cronChangeListeners.add(cb);
+	return () => {
+		cronChangeListeners.delete(cb);
+	};
+}
+
+function notifyCronChange(): void {
+	for (const cb of cronChangeListeners) {
+		try {
+			cb();
+		} catch (error) {
+			logger.warn("Cron change listener failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
+
+/** Snapshot the scheduled cron jobs for an owner (or all owners when omitted). */
+export function listCronSnapshots(ownerId?: string): CronJobSnapshot[] {
+	const out: CronJobSnapshot[] = [];
+	if (ownerId !== undefined) {
+		const state = schedulesByOwner.get(ownerKey(ownerId));
+		if (state) {
+			for (const record of state.jobs.values()) out.push(record.snapshot);
+		}
+		return out;
+	}
+	for (const state of schedulesByOwner.values()) {
+		for (const record of state.jobs.values()) out.push(record.snapshot);
+	}
+	return out;
+}
+
+/** Delete a scheduled cron job by owner-scoped id. Returns true when removed. */
+export function deleteCronJobById(ownerId: string | undefined, id: string): boolean {
+	return deleteRecord(ownerId, id);
 }
 
 const CRON_FIELD_BOUNDS: Array<{ name: string; min: number; max: number }> = [
@@ -448,6 +495,7 @@ function scheduleRecord(ownerId: string | undefined, state: OwnerScheduleState, 
 	});
 	record.snapshot.nextFireAt = fireAt;
 	record.timer = setCronTimeout(() => fireRecord(ownerId, state, record.snapshot.id), fireAt - now);
+	notifyCronChange();
 }
 
 function scheduleExpiry(ownerId: string | undefined, record: CronScheduleRecord): void {

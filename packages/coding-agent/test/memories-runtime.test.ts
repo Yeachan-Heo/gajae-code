@@ -263,7 +263,7 @@ describe("memories runtime", () => {
 			);
 			const payload = await localBackend.buildDeveloperInstructions(fx.agentDir, fx.settings, fx.session);
 			expect(payload).toContain("Local backend persisted summary");
-			expect(payload).toContain("memory://root/memory_summary.md");
+			expect(payload).not.toContain("memory://");
 			expect(payload).not.toContain(memoryRoot);
 		});
 
@@ -415,7 +415,7 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		expect(missingPayload).toBeDefined();
 		expect(missingPayload).toContain("no confirmed memory payload");
 		expect(missingPayload).toContain("Do not claim");
-		expect(missingPayload).toContain("memory://root");
+		expect(missingPayload).not.toContain("memory://");
 		expect(missingPayload).not.toContain(agentDir);
 
 		const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
@@ -442,7 +442,7 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 
 		const payload = await buildMemoryToolDeveloperInstructions(agentDir, settings);
 		expect(payload).toBeDefined();
-		expect(payload).toContain("memory://root/memory_summary.md");
+		expect(payload).not.toContain("memory://");
 		expect(payload).not.toContain(memoryRoot);
 		expect(payload).toContain("...[truncated]...");
 	});

@@ -1,0 +1,190 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
+import { getBundledModel } from "@gajae-code/ai/models";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { TempDir } from "@gajae-code/utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
+
+describe("AgentSession active goal reminders", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@pi-goal-reminder-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({
+				"goal.enabled": true,
+				"todo.reminders": true,
+				"todo.reminders.max": 3,
+			}),
+			modelRegistry,
+		});
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	function setActiveGoal(): void {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "Ship the idle reminder fix",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+	}
+
+	async function emitAssistantStop(timestamp: number): Promise<void> {
+		const assistantMessage = { ...createAssistantMessage("I stopped."), timestamp };
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+	}
+
+	function developerReminderCount(): number {
+		return session.agent.state.messages.filter(message => {
+			if (message.role !== "developer" || typeof message.content === "string") return false;
+			return message.content.some(
+				part => part.type === "text" && part.text.includes("goal is still active and uncleared"),
+			);
+		}).length;
+	}
+
+	it("continues after an assistant stop when an active goal remains uncleared", async () => {
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+		const reminder = session.agent.state.messages.find(message => message.role === "developer");
+		expect(JSON.stringify(reminder?.content)).toContain("Ship the idle reminder fix");
+		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
+	});
+
+	it("continues after a successful yield when an active goal remains uncleared", async () => {
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const yieldCall: ToolCall = {
+			type: "toolCall",
+			id: "call_yield_done",
+			name: "yield",
+			arguments: { result: { data: { done: true } } },
+		};
+		const assistantMessage: AssistantMessage = {
+			...createAssistantMessage(""),
+			content: [yieldCall],
+			stopReason: "toolUse",
+			timestamp: 150,
+		};
+
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: "yield",
+			result: {
+				content: [{ type: "text", text: "Result submitted." }],
+				details: { status: "success", data: { done: true } },
+			},
+			isError: false,
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+		const reminder = session.agent.state.messages.find(message => message.role === "developer");
+		expect(JSON.stringify(reminder?.content)).toContain("Ship the idle reminder fix");
+		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
+	});
+
+	it("deduplicates the same assistant stop but reminds again on a later uncleared stop", async () => {
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(100);
+		await emitAssistantStop(100);
+		await emitAssistantStop(200);
+
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+		expect(developerReminderCount()).toBe(2);
+	});
+
+	it("suppresses reminders when the goal is complete, paused, or dropped", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const terminalStates: Array<GoalModeState | undefined> = [
+			{
+				enabled: false,
+				mode: "exiting",
+				reason: "completed",
+				goal: {
+					id: "goal-complete",
+					objective: "Done",
+					status: "complete",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: 0,
+					updatedAt: 0,
+				},
+			},
+			{
+				enabled: false,
+				mode: "active",
+				goal: {
+					id: "goal-paused",
+					objective: "Held",
+					status: "paused",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: 0,
+					updatedAt: 0,
+				},
+			},
+			undefined,
+		];
+
+		for (const [index, state] of terminalStates.entries()) {
+			session.setGoalModeState(state);
+			await emitAssistantStop(300 + index);
+		}
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(developerReminderCount()).toBe(0);
+	});
+});

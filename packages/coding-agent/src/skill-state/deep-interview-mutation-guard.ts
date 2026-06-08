@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
+import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/local-protocol";
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolError } from "../tools/tool-errors";
@@ -76,19 +77,37 @@ function modeStatePath(cwd: string, skill: string, sessionId?: string): string {
 	return path.join(stateDir, fileName);
 }
 
-async function readJsonFile<T>(filePath: string): Promise<T | null> {
+function warnInvalidModeState(filePath: string, error: string): void {
+	console.warn(`gjc skill-state: invalid mode-state at ${filePath}: ${error}`);
+}
+
+async function readValidatedModeState(filePath: string): Promise<ModeState | null> {
+	let raw: string;
 	try {
-		return JSON.parse(await Bun.file(filePath).text()) as T;
+		raw = await Bun.file(filePath).text();
 	} catch {
 		return null;
 	}
+	let state: ModeState;
+	try {
+		state = JSON.parse(raw) as ModeState;
+	} catch (error) {
+		warnInvalidModeState(filePath, `invalid JSON: ${(error as Error).message}`);
+		return null;
+	}
+	const parsed = ModeStateSchema.safeParse(state);
+	if (!parsed.success) {
+		warnInvalidModeState(filePath, parsed.error.message);
+		return null;
+	}
+	return state;
 }
 async function readVisibleModeState(cwd: string, skill: string, sessionId?: string): Promise<ModeState | null> {
 	if (sessionId) {
-		const sessionState = await readJsonFile<ModeState>(modeStatePath(cwd, skill, sessionId));
+		const sessionState = await readValidatedModeState(modeStatePath(cwd, skill, sessionId));
 		if (sessionState) return sessionState;
 	}
-	return await readJsonFile<ModeState>(modeStatePath(cwd, skill));
+	return await readValidatedModeState(modeStatePath(cwd, skill));
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {

@@ -1029,7 +1029,7 @@ describe("Anthropic request fingerprint alignment", () => {
 				thinking: {
 					mode: "anthropic-adaptive",
 					minLevel: Effort.Minimal,
-					maxLevel: Effort.XHigh,
+					maxLevel: Effort.Max,
 				},
 			},
 			{
@@ -1056,6 +1056,31 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.top_k).toBeUndefined();
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "high" });
+	});
+
+	it("maps Opus max reasoning to Anthropic adaptive max", async () => {
+		const payload = (await captureAnthropicPayload(
+			{
+				...ANTHROPIC_MODEL,
+				id: "claude-opus-4-7",
+				name: "Claude Opus 4.7",
+				thinking: {
+					mode: "anthropic-adaptive",
+					minLevel: Effort.Minimal,
+					maxLevel: Effort.Max,
+				},
+			},
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.Max,
+			},
+		)) as { output_config?: { effort?: string } };
+
+		expect(payload.output_config).toEqual({ effort: "max" });
 	});
 
 	it("treats tool prefix helpers as no-ops when prefix is empty", () => {

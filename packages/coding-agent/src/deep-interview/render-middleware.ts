@@ -330,6 +330,12 @@ export function renderDeepInterviewAskQuestion(question: string, uiTheme: Theme)
 	return renderModel(model, uiTheme);
 }
 
+export function isDeepInterviewAskQuestion(question: string): boolean {
+	if (parseTopologyQuestion(question) ?? parseRoundQuestion(question)) return true;
+	const normalized = normalizeText(question);
+	return /(?:^|\n)\s*Round\s+\d+\s*\|.*?\bAmbiguity\b/i.test(normalized);
+}
+
 export function formatDeepInterviewSelectorPrompt(question: string): string | null {
 	const model = parseTopologyQuestion(question) ?? parseRoundQuestion(question);
 	if (!model) return null;

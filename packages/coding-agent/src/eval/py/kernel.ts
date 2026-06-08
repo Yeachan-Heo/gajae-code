@@ -183,6 +183,8 @@ export class PythonKernel {
 	#disposed = false;
 	#shutdownConfirmed = false;
 	#exitedPromise: Promise<number> | null = null;
+	#exitCode: number | null = null;
+	#stderrTail = "";
 	#pending = new Map<string, PendingExecution>();
 	#readBuffer = "";
 
@@ -230,6 +232,7 @@ export class PythonKernel {
 		kernel.#stdin = proc.stdin;
 		kernel.#exitedPromise = proc.exited;
 		void kernel.#exitedPromise.then(code => {
+			kernel.#exitCode = code;
 			kernel.#alive = false;
 			kernel.#abortPendingExecutions(`Python kernel exited with code ${code}`, { kernelKilled: true });
 		});
@@ -253,6 +256,14 @@ export class PythonKernel {
 
 	isAlive(): boolean {
 		return this.#alive && !this.#disposed;
+	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	peekStderr(): string {
+		return this.#stderrTail;
 	}
 
 	async execute(code: string, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
@@ -493,6 +504,10 @@ export class PythonKernel {
 					const { done, value } = await reader.read();
 					if (done) break;
 					const text = decoder.decode(value);
+					this.#stderrTail += text;
+					if (this.#stderrTail.length > 4096) {
+						this.#stderrTail = this.#stderrTail.slice(-4096);
+					}
 					if (text.trim()) {
 						logger.warn("Python runner stderr", { text });
 					}

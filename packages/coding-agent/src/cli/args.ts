@@ -7,7 +7,7 @@ import chalk from "chalk";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
 
-export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
+export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge";
 
 export interface Args {
 	cwd?: string;
@@ -17,6 +17,8 @@ export interface Args {
 	smol?: string;
 	slow?: string;
 	plan?: string;
+	mpreset?: string;
+	default?: boolean;
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
@@ -96,7 +98,14 @@ export function parseArgs(args: string[]): Args {
 			result.allowHome = true;
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
-			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "rpc-ui") {
+			if (
+				mode === "text" ||
+				mode === "json" ||
+				mode === "rpc" ||
+				mode === "acp" ||
+				mode === "rpc-ui" ||
+				mode === "bridge"
+			) {
 				result.mode = mode;
 			}
 		} else if (arg === "--continue" || arg === "-c") {
@@ -120,6 +129,10 @@ export function parseArgs(args: string[]): Args {
 			result.slow = args[++i];
 		} else if (arg === "--plan" && i + 1 < args.length) {
 			result.plan = args[++i];
+		} else if (arg === "--mpreset" && i + 1 < args.length) {
+			result.mpreset = args[++i];
+		} else if (arg === "--default") {
+			result.default = true;
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
@@ -190,6 +203,10 @@ export function parseArgs(args: string[]): Args {
 		} else if (!arg.startsWith("-")) {
 			result.messages.push(arg);
 		}
+	}
+
+	if (result.default && !result.mpreset) {
+		throw new Error("--default requires --mpreset <name>");
 	}
 
 	return result;

@@ -24,14 +24,18 @@
 pub mod appearance;
 pub mod ast;
 pub mod clipboard;
+pub mod crash;
+pub mod edit_fuzzy;
 pub mod fd;
 pub mod fs_cache;
 pub mod glob;
 pub mod glob_util;
 pub mod grep;
+pub mod hashline;
 pub mod highlight;
 pub mod html;
 pub mod keys;
+pub mod linediff;
 pub mod sixel;
 pub use pi_ast::language;
 
@@ -67,5 +71,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_2_5")]
+#[napi(js_name = "__piNativesV0_4_1")]
 pub const fn pi_natives_version_sentinel() {}

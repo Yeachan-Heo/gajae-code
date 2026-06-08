@@ -95,7 +95,7 @@ export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undef
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ServiceTier;
 	toolChoice?: ToolChoice;
@@ -425,11 +425,9 @@ function createClient(
 }
 
 function getOpenAIResponsesCacheSessionId(
-	options: Pick<OpenAIResponsesOptions, "cacheRetention" | "sessionId"> | undefined,
+	options: Pick<OpenAIResponsesOptions, "sessionId"> | undefined,
 ): string | undefined {
-	return resolveCacheRetention(options?.cacheRetention) === "none"
-		? undefined
-		: normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
+	return normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
 }
 
 function buildParams(
@@ -470,7 +468,7 @@ function buildParams(
 		}
 	}
 
-	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
 	const promptCacheKey = getOpenAIResponsesCacheSessionId(options);
 	const params: OpenAIResponsesSamplingParams = {
 		model: model.wireModelId ?? model.id,
@@ -478,9 +476,7 @@ function buildParams(
 		instructions: systemInstructions,
 		stream: true,
 		prompt_cache_key: promptCacheKey,
-		prompt_cache_retention: promptCacheKey
-			? getPromptCacheRetention(resolvedBaseUrl || model.baseUrl, cacheRetention)
-			: undefined,
+		prompt_cache_retention: getPromptCacheRetention(resolvedBaseUrl || model.baseUrl, cacheRetention),
 		store: false,
 		stream_options: model.provider === "openai" ? { include_obfuscation: false } : undefined,
 	};

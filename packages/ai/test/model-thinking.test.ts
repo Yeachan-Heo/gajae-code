@@ -114,20 +114,25 @@ describe("model thinking metadata", () => {
 		expect(opus46.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
-			maxLevel: Effort.XHigh,
+			maxLevel: Effort.Max,
+			levels: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		});
 		expect(sonnet46.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
 			maxLevel: Effort.High,
 		});
-		// Opus 4.6 has no real xhigh level — pi-ai aliases XHigh to Anthropic's "max".
-		expect(mapEffortToAnthropicAdaptiveEffort(opus46, Effort.XHigh)).toBe("max");
-		// Opus 4.7 on Messages API sends the new literal "xhigh" level.
+		// Older Opus adaptive models expose max but not the newer xhigh literal.
+		expect(() => mapEffortToAnthropicAdaptiveEffort(opus46, Effort.XHigh)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(opus46, Effort.Max)).toBe("max");
+		// Opus 4.7+ on Messages API exposes both Anthropic's real xhigh and max presets.
 		expect(mapEffortToAnthropicAdaptiveEffort(opus47, Effort.XHigh)).toBe("xhigh");
-		// Bedrock Converse is not the Messages API, so xhigh is not available there yet.
-		expect(mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.XHigh)).toBe("max");
+		expect(mapEffortToAnthropicAdaptiveEffort(opus47, Effort.Max)).toBe("max");
+		// Bedrock Converse supports max, but not the Messages-only xhigh preset.
+		expect(() => mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.XHigh)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
 	});
 });
 
@@ -202,7 +207,8 @@ describe("generated model policies", () => {
 		expect(models[1]?.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
-			maxLevel: Effort.XHigh,
+			maxLevel: Effort.Max,
+			levels: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		});
 		expect(models[1]?.cost.cacheRead).toBe(0.5);
 		expect(models[1]?.cost.cacheWrite).toBe(6.25);
@@ -340,6 +346,17 @@ describe("model thinking runtime helpers", () => {
 		expect(clampThinkingLevelForModel(model, Effort.Minimal)).toBe(Effort.Medium);
 		expect(clampThinkingLevelForModel(model, Effort.XHigh)).toBe(Effort.High);
 		expect(clampThinkingLevelForModel(model, Effort.High)).toBe(Effort.High);
+	});
+
+	it("does not clamp unsupported xhigh to max for Opus models without xhigh support", () => {
+		const model = createModel({
+			id: "claude-opus-4.6",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
+
+		expect(clampThinkingLevelForModel(model, Effort.XHigh)).toBe(Effort.High);
+		expect(clampThinkingLevelForModel(model, Effort.Max)).toBe(Effort.Max);
 	});
 
 	it('forces "off" for non-reasoning models', () => {

@@ -21,11 +21,60 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		const root = await tempDir();
 		const result = await runNativeRalplanCommand(["--interactive", "--deliberate", "make state native"], root);
 		expect(result.status).toBe(0);
-		expect(result.stdout).toContain("Seeded ralplan deliberate run (interactive)");
+		expect(result.stdout).toContain("ralplan seed run_id=");
 		const state = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
 		expect(state.mode).toBe("deliberate");
 		expect(state.interactive).toBe(true);
 		expect(state.task).toBe("make state native");
+	});
+
+	it("emits receipt-only json for consensus handoff", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(["--json", "--deliberate", "make state native"], root);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload).toMatchObject({
+			ok: true,
+			skill: "ralplan",
+			mode: "deliberate",
+			handoff: "/skill:ralplan",
+		});
+		expect(typeof payload.run_id).toBe("string");
+		expect(payload.state_path).toContain(path.join(".gjc", "state", "ralplan-state.json"));
+		expect(payload.task).toBeUndefined();
+	});
+
+	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, "{broken json", "utf-8");
+
+		const result = await runNativeRalplanCommand(["--json", "make state native"], root);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("existing ralplan state is corrupt or tampered");
+		expect(await fs.readFile(statePath, "utf-8")).toBe("{broken json");
+	});
+
+	it("reuses a valid active run id during consensus handoff seeding", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({ skill: "ralplan", active: true, current_phase: "planner", run_id: "existing-run" }),
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(["--json", "continue existing"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string };
+		expect(payload.run_id).toBe("existing-run");
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string; task: string };
+		expect(state.run_id).toBe("existing-run");
+		expect(state.task).toBe("continue existing");
 	});
 
 	it("--architect openai-code seeds the kind into state", async () => {
@@ -299,5 +348,344 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(write.status).toBe(0);
 		const writePayload = JSON.parse(write.stdout ?? "{}") as { run_id: string };
 		expect(writePayload.run_id).toBe(handoffPayload.run_id);
+	});
+});
+
+describe("native gjc ralplan runtime — persisted Planner state", () => {
+	const statePath = (root: string) => path.join(root, ".gjc", "state", "ralplan-state.json");
+
+	async function readState(root: string): Promise<Record<string, unknown>> {
+		const raw = await fs.readFile(statePath(root), "utf-8");
+		return JSON.parse(raw) as Record<string, unknown>;
+	}
+
+	it("records planner id + resumable into run state and echoes planner_state", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"pp-run",
+				"--planner-id",
+				"0-Planner",
+				"--planner-resumable",
+				"true",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.planner_state).toEqual({
+			planner_subagent_id: "0-Planner",
+			planner_resumable: true,
+		});
+		const state = await readState(root);
+		expect(state.planner_subagent_id).toBe("0-Planner");
+		expect(state.planner_resumable).toBe(true);
+		expect(state.run_id).toBe("pp-run");
+	});
+
+	it("accepts --planner-resumable false", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# Rev",
+				"--run-id",
+				"pp-false",
+				"--planner-resumable",
+				"false",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const state = await readState(root);
+		expect(state.planner_resumable).toBe(false);
+	});
+
+	it("omits planner fields when no planner flags are supplied (existing writes unaffected)", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "plain", "--json"],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.planner_state).toBeUndefined();
+		const state = await readState(root);
+		expect("planner_subagent_id" in state).toBe(false);
+		expect("planner_resumable" in state).toBe(false);
+	});
+
+	it("rejects corrupt ralplan state before persisting an active run id", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+		await fs.writeFile(statePath(root), "{broken json", "utf-8");
+
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "corrupt", "--json"],
+			root,
+		);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("existing ralplan state is corrupt or tampered");
+		expect(await fs.readFile(statePath(root), "utf-8")).toBe("{broken json");
+	});
+
+	it("rejects corrupt ralplan state before applying planner metadata", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+		await fs.writeFile(statePath(root), "{broken json", "utf-8");
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"corrupt-planner",
+				"--planner-id",
+				"0-Planner",
+				"--json",
+			],
+			root,
+		);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("existing ralplan state is corrupt or tampered");
+		expect(await fs.readFile(statePath(root), "utf-8")).toBe("{broken json");
+	});
+
+	it("records fallback metadata together with a fresh planner id", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"3",
+				"--artifact",
+				"# Rev",
+				"--run-id",
+				"pp-fb",
+				"--planner-id",
+				"1-PlannerFresh",
+				"--fallback-reason",
+				"context_unavailable",
+				"--fallback-attempted-id",
+				"0-PlannerOld",
+				"--fallback-stage-n",
+				"3",
+				"--fallback-receipt-path",
+				".gjc/plans/ralplan/pp-fb/stage-03-revision.md",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const state = await readState(root);
+		expect(state.planner_fallback_reason).toBe("context_unavailable");
+		expect(state.planner_fallback_attempted_id).toBe("0-PlannerOld");
+		expect(state.planner_fallback_stage_n).toBe(3);
+		expect(state.planner_fallback_receipt_path).toBe(".gjc/plans/ralplan/pp-fb/stage-03-revision.md");
+		expect(state.planner_subagent_id).toBe("1-PlannerFresh");
+	});
+
+	it("rejects invalid --planner-resumable with exit 2", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"bad-bool",
+				"--planner-resumable",
+				"yes",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("invalid --planner-resumable");
+	});
+
+	it("rejects invalid --planner-id with exit 2", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"x",
+				"--run-id",
+				"bad-id",
+				"--planner-id",
+				"bad id!",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("invalid --planner-id");
+	});
+
+	it("rejects unknown --fallback-reason with exit 2", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"x",
+				"--run-id",
+				"bad-reason",
+				"--fallback-reason",
+				"because",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("invalid --fallback-reason");
+	});
+
+	it("requires --fallback-reason when other fallback flags are present", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"x",
+				"--run-id",
+				"missing-reason",
+				"--fallback-attempted-id",
+				"0-Old",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--fallback-reason is required");
+	});
+
+	it("does not persist an artifact when planner flags are invalid (fail-fast)", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"no-side-effect",
+				"--planner-resumable",
+				"maybe",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		const filePath = path.join(root, ".gjc", "plans", "ralplan", "no-side-effect", "stage-01-planner.md");
+		await expect(fs.readFile(filePath, "utf-8")).rejects.toThrow();
+	});
+
+	it("requires --fallback-attempted-id alongside --fallback-reason", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"x",
+				"--run-id",
+				"fb-missing-id",
+				"--fallback-reason",
+				"context_unavailable",
+				"--fallback-stage-n",
+				"2",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--fallback-attempted-id is required");
+	});
+
+	it("requires --fallback-stage-n alongside --fallback-reason", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"revision",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"x",
+				"--run-id",
+				"fb-missing-stage",
+				"--fallback-reason",
+				"context_unavailable",
+				"--fallback-attempted-id",
+				"0-Old",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--fallback-stage-n is required");
+	});
+
+	it("rejects a planner flag supplied without a value (missing value at EOF)", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"eof-flag",
+				"--planner-id",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("missing value for --planner-id");
 	});
 });

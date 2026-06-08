@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Effort, type Model } from "@gajae-code/ai";
 import {
 	expandRoleAlias,
+	findInitialModel,
 	parseModelPattern,
 	parseModelString,
 	resolveAgentModelPatterns,
@@ -10,6 +11,7 @@ import {
 	resolveModelOverride,
 	resolveModelRoleValue,
 	resolveModelScope,
+	restoreModelFromSession,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 
@@ -265,7 +267,15 @@ describe("parseModelPattern", () => {
 		});
 
 		test("all valid thinking levels work", () => {
-			const levels = ["off", Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] as const;
+			const levels = [
+				"off",
+				Effort.Minimal,
+				Effort.Low,
+				Effort.Medium,
+				Effort.High,
+				Effort.XHigh,
+				Effort.Max,
+			] as const;
 			for (const level of levels) {
 				const result = parseModelPattern(`sonnet:${level}`, allModels);
 				expect(result.model?.id).toBe("claude-sonnet-4-5");
@@ -859,6 +869,72 @@ describe("parseModelString", () => {
 			// Empty string is not a valid thinking level, so colon stays as part of ID
 			expect(result).toEqual({ provider: "anthropic", id: "claude-sonnet-4-5:" });
 		});
+	});
+});
+
+const codexDefaultModels: Model<"anthropic-messages">[] = [
+	{
+		id: "gpt-5.4",
+		name: "GPT-5.4",
+		api: "anthropic-messages",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
+		input: ["text"],
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	{
+		id: "gpt-5.5",
+		name: "GPT-5.5",
+		api: "anthropic-messages",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh, defaultLevel: Effort.XHigh },
+		input: ["text"],
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 272000,
+		maxTokens: 128000,
+	},
+];
+
+const codexDefaultRegistry = {
+	getAvailable: () => codexDefaultModels,
+	find: (provider: string, id: string) =>
+		codexDefaultModels.find(model => model.provider === provider && model.id === id),
+	getApiKey: async () => "test-key",
+};
+
+describe("OpenAI Codex default resolution", () => {
+	test("fresh startup prefers gpt-5.5 over gpt-5.4 when no persisted default exists", async () => {
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: codexDefaultRegistry,
+		});
+
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.5");
+		expect(result.model?.thinking?.defaultLevel).toBe(Effort.XHigh);
+	});
+
+	test("restore fallback keeps visible fallback on gpt-5.5 instead of silently drifting to gpt-5.4", async () => {
+		const result = await restoreModelFromSession(
+			"openai-codex",
+			"missing-gpt",
+			undefined,
+			false,
+			codexDefaultRegistry,
+		);
+
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.5");
+		expect(result.fallbackMessage).toBe(
+			"Could not restore model openai-codex/missing-gpt (model no longer exists). Using openai-codex/gpt-5.5.",
+		);
 	});
 });
 

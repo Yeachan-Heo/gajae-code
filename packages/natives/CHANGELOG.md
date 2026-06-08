@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-06
+
+### Added
+
+- Added a native `diffLines(oldStr, newStr)` export — a byte-identical Rust port of jsdiff's line diff (`crates/pi-natives/src/linediff.rs`) for the coding-agent edit tool, avoiding the pure-JS Myers blowup on large files.
+- Added native fuzzy edit matching (`crates/pi-natives/src/edit_fuzzy.rs`) and a native `hashline` helper (`crates/pi-natives/src/hashline.rs`) for the coding-agent edit hot paths.
+- Optimized CPU/memory hotspots with native ports (H06 + H02), byte-identical output at roughly 2x or better throughput on the affected paths (#356).
+
 ## [0.2.2] - 2026-05-31
 
 ### Changed

@@ -21,6 +21,7 @@ export default class DeepInterview extends Command {
 		deliberate: Flags.boolean({
 			description: "Shortcut for --write handoff to ralplan in deliberate consensus mode",
 		}),
+		force: Flags.boolean({ description: "Overwrite corrupt existing deep-interview state during --write" }),
 		json: Flags.boolean({ description: "Output JSON" }),
 	};
 	static examples = [

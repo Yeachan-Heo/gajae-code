@@ -1,5 +1,6 @@
 import { getProjectDir, logger } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
+import { formatCrashDiagnosticNotice, writeCrashReport } from "../../debug/crash-diagnostics";
 import { OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -62,6 +63,8 @@ export interface PythonExecutorOptions {
 
 export interface PythonKernelExecutor {
 	execute: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>;
+	getExitCode?: () => number | null;
+	peekStderr?: () => string;
 }
 
 export interface PythonResult {
@@ -446,12 +449,29 @@ async function executeWithKernel(
 			const annotation = result.timedOut
 				? formatKernelTimeoutAnnotation(executionTimeoutMs, result.kernelKilled ?? false)
 				: undefined;
+			let crashNotice: string | null = null;
+			if (result.kernelKilled) {
+				crashNotice = formatCrashDiagnosticNotice(
+					await writeCrashReport(
+						{
+							kind: "python",
+							exitCode: kernel.getExitCode?.(),
+							cancelled: false,
+							timedOut: result.timedOut,
+							stderr: kernel.peekStderr?.(),
+							protocol: "eval.py.kernel",
+						},
+						{ cwd: options?.cwd },
+					),
+				);
+			}
+			const notice = [annotation, crashNotice].filter(text => text).join("; ") || undefined;
 			return {
 				exitCode: undefined,
 				cancelled: true,
 				displayOutputs,
 				stdinRequested: result.stdinRequested,
-				...(await sink.dump(annotation)),
+				...(await sink.dump(notice)),
 			};
 		}
 

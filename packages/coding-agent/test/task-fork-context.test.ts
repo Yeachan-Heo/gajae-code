@@ -10,7 +10,7 @@ import { TaskTool } from "../src/task";
 import { getBundledAgent } from "../src/task/agents";
 import * as discoveryModule from "../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../src/task/types";
-import { taskSchema } from "../src/task/types";
+import { getTaskSchema, taskSchema } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -200,7 +200,7 @@ describe("fork context policy surface", () => {
 		expect(fields?.forkContext).toBeUndefined();
 	});
 
-	test("accepts inheritContext on task items", () => {
+	test("accepts inheritContext enum modes and rejects booleans or unknown strings", () => {
 		const result = taskSchema.safeParse({
 			agent: "executor",
 			context: "shared context",
@@ -209,15 +209,53 @@ describe("fork context policy surface", () => {
 					id: "ForkSeed",
 					description: "seed context",
 					assignment: "Use inherited context.",
-					inheritContext: true,
+					inheritContext: "bounded",
 				},
 			],
 		});
 
 		expect(result.success).toBe(true);
 		if (result.success) {
-			expect(result.data.tasks[0]?.inheritContext).toBe(true);
+			expect(result.data.tasks[0]?.inheritContext).toBe("bounded");
 		}
+
+		for (const mode of ["none", "receipt", "last-turn", "bounded", "full"] as const) {
+			const modeResult = taskSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: `Fork${mode.replace("-", "")}`, description: "d", assignment: "a", inheritContext: mode }],
+			});
+			expect(modeResult.success).toBe(true);
+		}
+
+		expect(
+			taskSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "BoolFork", description: "d", assignment: "a", inheritContext: true }],
+			}).success,
+		).toBe(false);
+		expect(
+			taskSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "BadFork", description: "d", assignment: "a", inheritContext: "wide" }],
+			}).success,
+		).toBe(false);
+	});
+
+	test("independent task schema rejects inherited parent context", () => {
+		const independentSchema = getTaskSchema({ isolationEnabled: true, simpleMode: "independent" });
+
+		expect(
+			independentSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "ForkSeed", description: "d", assignment: "a", inheritContext: "bounded" }],
+			}).success,
+		).toBe(false);
+		expect(
+			independentSchema.safeParse({
+				agent: "executor",
+				tasks: [{ id: "NoFork", description: "d", assignment: "a", inheritContext: "none" }],
+			}).success,
+		).toBe(true);
 	});
 
 	test("rejects inherited context before scheduling when the global gate is disabled", async () => {
@@ -228,10 +266,31 @@ describe("fork context policy surface", () => {
 
 		const result = await tool.execute("tool-call", {
 			agent: "executor",
-			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: true }],
+			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: "bounded" }],
 		} as TaskParams);
 
 		expect(getFirstText(result)).toContain("task.forkContext.enabled is false");
+		expect(registered).toBe(0);
+	});
+
+	test("rejects inherited context before scheduling in independent simple mode", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const tool = await TaskTool.create(
+			createSession({ "task.simple": "independent", "task.forkContext.enabled": true }, seedBuilder),
+		);
+		let registered = 0;
+		AsyncJobManager.setInstance({ register: () => `${++registered}` } as unknown as AsyncJobManager);
+
+		const result = await tool.execute("tool-call", {
+			agent: "executor",
+			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: "bounded" }],
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("task.simple is set to independent");
+		expect(getFirstText(result)).toContain("inheritContext for task(s) ForkSeed");
+		expect(result.details?.results).toEqual([]);
+		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(registered).toBe(0);
 	});
 
@@ -243,10 +302,48 @@ describe("fork context policy surface", () => {
 
 		const result = await tool.execute("tool-call", {
 			agent: "executor",
-			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: true }],
+			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use context.", inheritContext: "bounded" }],
 		} as TaskParams);
 
 		expect(getFirstText(result)).toContain("does not declare forkContext: allowed");
+		expect(registered).toBe(0);
+	});
+
+	test("rejects runtime inheritContext boolean true before scheduling", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+		let registered = 0;
+		AsyncJobManager.setInstance({ register: () => `${++registered}` } as unknown as AsyncJobManager);
+
+		const result = await tool.execute("tool-call", {
+			agent: "executor",
+			tasks: [{ id: "BoolFork", description: "seed", assignment: "Use context.", inheritContext: true }],
+		} as unknown as TaskParams);
+
+		expect(getFirstText(result)).toContain("Invalid inheritContext for task(s) BoolFork");
+		expect(getFirstText(result)).toContain("Allowed modes: none, receipt, last-turn, bounded, full");
+		expect(result.details?.results).toEqual([]);
+		expect(seedBuilder).not.toHaveBeenCalled();
+		expect(registered).toBe(0);
+	});
+
+	test("rejects runtime inheritContext unknown string before scheduling", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+		let registered = 0;
+		AsyncJobManager.setInstance({ register: () => `${++registered}` } as unknown as AsyncJobManager);
+
+		const result = await tool.execute("tool-call", {
+			agent: "executor",
+			tasks: [{ id: "GarbageFork", description: "seed", assignment: "Use context.", inheritContext: "garbage" }],
+		} as unknown as TaskParams);
+
+		expect(getFirstText(result)).toContain("Invalid inheritContext for task(s) GarbageFork");
+		expect(getFirstText(result)).toContain("Allowed modes: none, receipt, last-turn, bounded, full");
+		expect(result.details?.results).toEqual([]);
+		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(registered).toBe(0);
 	});
 
@@ -265,6 +362,28 @@ describe("fork context policy surface", () => {
 		expect(getOptions()?.forkContextSeed).toBeUndefined();
 	});
 
+	test("does not build or pass a seed when inheritContext is none", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const { getOptions } = mockCreateAgentSession();
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "NoFork",
+					description: "seed",
+					assignment: "Work without inherited context.",
+					inheritContext: "none",
+				},
+			],
+		});
+
+		expect(seedBuilder).not.toHaveBeenCalled();
+		expect(getOptions()?.forkContextSeed).toBeUndefined();
+	});
+
 	test("passes a sanitized fork seed and cache identity without sharing provider state", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();
@@ -274,7 +393,9 @@ describe("fork context policy surface", () => {
 
 		await executeDetached(tool, {
 			agent: "executor",
-			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use inherited context.", inheritContext: true }],
+			tasks: [
+				{ id: "ForkSeed", description: "seed", assignment: "Use inherited context.", inheritContext: "bounded" },
+			],
 		});
 
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 250, signal: undefined });
@@ -287,6 +408,59 @@ describe("fork context policy surface", () => {
 			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
 		expect(renderedPrompt?.join("\n")).toContain("executor system prompt");
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
+	});
+
+	test("uses configured maxMessages to cap bounded fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(
+			createSession({ "task.forkContext.enabled": true, "task.forkContext.maxMessages": 3 }, seedBuilder),
+		);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "BoundedForkSeed",
+					description: "seed",
+					assignment: "Use bounded context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 250, signal: undefined });
+	});
+
+	test("uses reduced model-window fallback for full fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "FullForkSeed", description: "seed", assignment: "Use full context.", inheritContext: "full" }],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 500, maxTokens: 150, signal: undefined });
+	});
+
+	test("uses configured maxMessages to cap full fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		const seedBuilder = vi.fn(async () => seed);
+		const tool = await TaskTool.create(
+			createSession({ "task.forkContext.enabled": true, "task.forkContext.maxMessages": 7 }, seedBuilder),
+		);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "FullForkSeed", description: "seed", assignment: "Use full context.", inheritContext: "full" }],
+		});
+
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 7, maxTokens: 150, signal: undefined });
 	});
 
 	test("freezes inherited context seeds before detached job execution", async () => {
@@ -312,7 +486,9 @@ describe("fork context policy surface", () => {
 		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
 		await tool.execute("tool-call", {
 			agent: "executor",
-			tasks: [{ id: "ForkSeed", description: "seed", assignment: "Use inherited context.", inheritContext: true }],
+			tasks: [
+				{ id: "ForkSeed", description: "seed", assignment: "Use inherited context.", inheritContext: "bounded" },
+			],
 		} as TaskParams);
 
 		expect(seedBuilder).toHaveBeenCalledTimes(1);
@@ -368,7 +544,7 @@ describe("fork context policy surface", () => {
 			const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
 			await executeDetached(tool, {
 				agent: "executor",
-				tasks: [{ id: "Fork", description: "d", assignment: "a", inheritContext: true }],
+				tasks: [{ id: "Fork", description: "d", assignment: "a", inheritContext: "bounded" }],
 			});
 			expect(seedBuilder).toHaveBeenCalledTimes(1);
 			expect(getOptions()?.forkContextSeed).toBeDefined();

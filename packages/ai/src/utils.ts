@@ -153,10 +153,12 @@ export function getOpenAIResponsesHistoryItems(
 
 /**
  * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
+ * Defaults to "short" and uses GJC_CACHE_RETENTION, with PI_CACHE_RETENTION as a legacy fallback.
  */
 export function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) return cacheRetention;
+	if ($env.GJC_CACHE_RETENTION === "long") return "long";
+	if ($env.GJC_CACHE_RETENTION !== undefined) return "short";
 	if ($env.PI_CACHE_RETENTION === "long") return "long";
 	return "short";
 }

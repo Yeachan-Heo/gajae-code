@@ -25,7 +25,7 @@ Do not add a fifth default skill, fifth public role agent, new command, new conf
 | CLI bootstrap    | `packages/coding-agent/src/cli.ts`                   | Registers top-level CLI commands and routes default launch behavior.                              |
 | Session launch   | `packages/coding-agent/src/main.ts`                  | Converts CLI/runtime settings into agent-session creation and mode dispatch.                      |
 | Agent assembly   | `packages/coding-agent/src/sdk.ts`                   | Loads settings, default skills, rules, tools, auth/model state, system prompt, and agent runtime. |
-| Built-in tools   | `packages/coding-agent/src/tools/index.ts`           | Registers file, shell, edit, search, browser, task/subagent, memory, and related tools.           |
+| Built-in tools   | `packages/coding-agent/src/tools/index.ts`           | Registers file, shell, edit, search, browser, task/subagent, and related public coding-harness tools. Memory backends are private integrations, not public tools. |
 | Default skills   | `packages/coding-agent/src/defaults/gjc-defaults.ts` | Embeds and installs the four default workflow skills plus deep-interview fragments.               |
 | Role agents      | `packages/coding-agent/src/task/agents.ts`           | Embeds bundled task-agent prompts; tests enforce public role-agent expectations.                  |
 | Product overview | `README.md`                                          | Explains installation, product story, fixed workflow surface, and development entry commands.     |
@@ -40,7 +40,6 @@ Do not add a fifth default skill, fifth public role agent, new command, new conf
 - `packages/natives/` plus `crates/*` — native helpers, Rust/N-API bindings, shell/PTY, text search, AST, filesystem, and media utilities.
 - `packages/utils/` — shared TypeScript utilities, logging, formatting, process helpers, JSON/frontmatter, and sanitization.
 - `packages/stats/` — local observability dashboard and session/model usage aggregation.
-- `packages/swarm-extension/` — optional YAML/DAG multi-agent extension outside the fixed default workflow surface.
 - `packages/typescript-edit-benchmark/` — TypeScript edit benchmark tooling.
 - `python/gjc-rpc/` — Python client for `gjc --mode rpc`.
 - `python/robogjc/` — GitHub triage/fix bot that drives `gjc --mode rpc`; this subtree has its own `AGENTS.md`.

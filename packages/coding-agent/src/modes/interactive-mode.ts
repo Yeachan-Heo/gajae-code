@@ -28,6 +28,7 @@ import {
 } from "@gajae-code/tui";
 import { APP_NAME, adjustHsv, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@gajae-code/utils";
 import chalk from "chalk";
+import { AsyncJobManager } from "../async";
 import { KeybindingsManager } from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
@@ -88,6 +89,7 @@ import { InputController } from "./controllers/input-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
+import { JobsObserver } from "./jobs-observer";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
@@ -330,6 +332,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	#jobsObserver?: JobsObserver;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -524,6 +527,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.statusLine.setSubagentCount(this.#observerRegistry.getActiveSubagentCount());
 			this.ui.requestRender();
 		});
+
+		// Event-driven monitor/cron jobs widget. Scoped to this session's owner so
+		// overlay actions cannot mutate another agent's background work.
+		const jobManager = AsyncJobManager.instance();
+		if (jobManager) {
+			const jobsObserver = new JobsObserver(jobManager, this.session.getAgentId());
+			this.#jobsObserver = jobsObserver;
+			this.statusLine.setJobs(jobsObserver.getSnapshot());
+			jobsObserver.onChange(() => {
+				this.statusLine.setJobs(jobsObserver.getSnapshot());
+				this.ui.requestRender();
+			});
+		}
 
 		// Load initial todos
 		await this.#loadTodoList();
@@ -1843,6 +1859,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
 		this.statusLine.dispose();
+		this.#jobsObserver?.dispose();
+		this.editor.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
@@ -1944,6 +1962,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			nextEditor.setHistoryStorage(this.historyStorage);
 		}
 		nextEditor.setText(previousText);
+		previousEditor.dispose();
 
 		this.editorContainer.clear();
 		this.editor = nextEditor;
@@ -2315,6 +2334,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#selectorController.showSessionObserver(this.#observerRegistry);
+	}
+
+	showJobsOverlay(): void {
+		if (!this.#jobsObserver) {
+			this.showStatus("Background jobs are unavailable in this session");
+			return;
+		}
+		this.#selectorController.showJobsOverlay(this.#jobsObserver);
 	}
 
 	resetObserverRegistry(): void {

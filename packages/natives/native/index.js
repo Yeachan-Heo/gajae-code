@@ -14,6 +14,7 @@ import { loadNative } from "./loader-state.js";
  */
 
 const nativeBindings = loadNative();
+nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
@@ -23,13 +24,14 @@ export const PtySession = nativeBindings.PtySession;
 export const Shell = nativeBindings.Shell;
 
 // functions
-export const __piNativesV0_2_5 = nativeBindings.__piNativesV0_2_5;
+export const __piNativesV0_4_1 = nativeBindings.__piNativesV0_4_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const countTokens = nativeBindings.countTokens;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
+export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
@@ -38,9 +40,13 @@ export const getSupportedLanguages = nativeBindings.getSupportedLanguages;
 export const getWorkProfile = nativeBindings.getWorkProfile;
 export const glob = nativeBindings.glob;
 export const grep = nativeBindings.grep;
+export const h01FindBestFuzzyMatch = nativeBindings.h01FindBestFuzzyMatch;
+export const h02ScoreSequenceFuzzy = nativeBindings.h02ScoreSequenceFuzzy;
+export const h06FormatHashLines = nativeBindings.h06FormatHashLines;
 export const hasMatch = nativeBindings.hasMatch;
 export const highlightCode = nativeBindings.highlightCode;
 export const htmlToMarkdown = nativeBindings.htmlToMarkdown;
+export const initNativeCrashDiagnostics = nativeBindings.initNativeCrashDiagnostics;
 export const invalidateFsScanCache = nativeBindings.invalidateFsScanCache;
 export const isoBackend = nativeBindings.isoBackend;
 export const isoDiff = nativeBindings.isoDiff;

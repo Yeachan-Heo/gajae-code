@@ -61,7 +61,7 @@ function createControllerContext() {
 		setFocus: vi.fn(),
 		start: vi.fn(),
 		stop: vi.fn(),
-		terminal: { columns: 120 },
+		terminal: { columns: 120, rows: 30, write: vi.fn() },
 	} as unknown as TestContext["ui"] & {
 		setFocus: ReturnType<typeof vi.fn>;
 		requestRender: ReturnType<typeof vi.fn>;
@@ -358,5 +358,32 @@ describe("ExtensionUiController hook editor abort", () => {
 		const result = await promise;
 		// Result depends on what the editor captured. The key thing is it resolved.
 		expect(result).toBeDefined();
+	});
+
+	it("lets scrollable hook selectors use the available terminal height", async () => {
+		const { ctx, editorContainer, ui } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		const title = Array.from({ length: 40 }, (_, index) => `Prompt row ${index + 1}`).join("\n");
+		const promise = controller.showHookSelector(title, ["Alpha", "Beta", "Gamma"], {
+			outline: true,
+			wrapFocused: true,
+			scrollTitleRows: Number.MAX_SAFE_INTEGER,
+		});
+
+		expect(editorContainer.children).toHaveLength(1);
+		expect(ctx.hookSelector).toBeDefined();
+
+		const rendered = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
+		const lines = rendered.split("\n");
+		expect(lines).toHaveLength(30);
+		expect(rendered).toContain("Prompt row 18");
+		expect(rendered).not.toContain("Prompt row 19");
+		expect(rendered).toContain("Alpha");
+		expect(rendered).toContain("Gamma");
+		expect(ui.terminal.write).toHaveBeenCalledWith("\x1b[?1006h\x1b[?1000h");
+
+		ctx.hookSelector!.handleInput("\n");
+		expect(await promise).toBe("Alpha");
+		expect(ui.terminal.write).toHaveBeenCalledWith("\x1b[?1000l\x1b[?1006l");
 	});
 });

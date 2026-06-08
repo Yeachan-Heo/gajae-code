@@ -85,6 +85,7 @@ function createStubInputControllerContext(opts: { skillCommands: Map<string, Ski
 		ui: { requestRender },
 		skillCommands: opts.skillCommands,
 		session: {
+			sessionId: "stub-session",
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
 			isBashRunning: false,
@@ -93,6 +94,9 @@ function createStubInputControllerContext(opts: { skillCommands: Map<string, Ski
 			enqueueCustomMessageDisplay,
 			sendCustomMessage,
 			promptCustomMessage,
+		},
+		sessionManager: {
+			getCwd: () => process.cwd(),
 		},
 		showError,
 		updatePendingMessagesDisplay,

@@ -252,6 +252,60 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("cache retention config", () => {
+		test("applies provider cacheRetention to bundled provider models", () => {
+			writeRawModelsJson({
+				openai: { cacheRetention: "long" },
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const openaiModel = registry.find("openai", "gpt-5-mini");
+
+			expect(openaiModel?.cacheRetention).toBe("long");
+		});
+
+		test("modelOverrides cacheRetention wins over provider cacheRetention", () => {
+			writeRawModelsJson({
+				openai: {
+					cacheRetention: "long",
+					modelOverrides: {
+						"gpt-5-mini": { cacheRetention: "none" },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const overridden = registry.find("openai", "gpt-5-mini");
+			const inherited = registry.find("openai", "gpt-5");
+
+			expect(overridden?.cacheRetention).toBe("none");
+			expect(inherited?.cacheRetention).toBe("long");
+		});
+
+		test("inline custom model cacheRetention wins over provider cacheRetention", () => {
+			writeRawModelsJson({
+				custom: {
+					baseUrl: "https://custom.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					cacheRetention: "long",
+					models: [
+						{
+							id: "fast",
+							cacheRetention: "short",
+						},
+						{ id: "defaulted" },
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("custom", "fast")?.cacheRetention).toBe("short");
+			expect(registry.find("custom", "defaulted")?.cacheRetention).toBe("long");
+		});
+	});
+
 	describe("canonical equivalence", () => {
 		test("groups dotted provider variants under the bundled canonical id", () => {
 			writeRawModelsJson({
@@ -1161,7 +1215,7 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
-			const minimax = registry.find("minimax-code", "MiniMax-M2.5");
+			const minimax = registry.find("minimax-code", "minimax-m3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
 
 			expect(minimax?.api).toBe("openai-completions");
@@ -1183,12 +1237,12 @@ describe("ModelRegistry", () => {
 					compat: {
 						extraBody: { source: "proxy" },
 					},
-					models: [{ id: "MiniMax-M2.5" }],
+					models: [{ id: "minimax-m3" }],
 				},
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const model = registry.find("minimax-code", "MiniMax-M2.5");
+			const model = registry.find("minimax-code", "minimax-m3");
 			const compat = getOpenAICompat(model);
 			expect(compat?.thinkingFormat).toBeUndefined();
 			expect(compat?.reasoningContentField).toBeUndefined();

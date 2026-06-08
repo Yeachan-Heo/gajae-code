@@ -8,10 +8,21 @@ import {
 	type SliceResult,
 } from "@gajae-code/natives";
 import { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+import { renderMetrics } from "./metrics";
 
 export { Ellipsis } from "@gajae-code/natives";
 
 export { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+
+function recordTextHelper<T>(name: string, fn: () => T): T {
+	if (!renderMetrics.enabled) return fn();
+	const start = renderMetrics.now();
+	try {
+		return fn();
+	} finally {
+		renderMetrics.recordHelper(name, renderMetrics.now() - start);
+	}
+}
 
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
 	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getDefaultTabWidth());
@@ -98,31 +109,37 @@ export function visibleWidthRaw(str: string): number {
 	if (!str) {
 		return 0;
 	}
+	if (str.length === 1) {
+		const code = str.charCodeAt(0);
+		if (code >= 0x20 && code <= 0x7e) return 1;
+		if (code === 9) return getDefaultTabWidth();
+	}
 
-	// Fast path: pure ASCII printable
-	let tabLength = 0;
-	const tabWidth = getDefaultTabWidth();
+	let tabCount = 0;
 	let isPureAscii = true;
 	for (let i = 0; i < str.length; i++) {
 		const code = str.charCodeAt(i);
 		if (code === 9) {
-			tabLength += tabWidth;
+			tabCount += 1;
 		} else if (code < 0x20 || code > 0x7e) {
 			isPureAscii = false;
 		}
 	}
 	if (isPureAscii) {
-		return str.length + tabLength;
+		return str.length + tabCount * (getDefaultTabWidth() - 1);
 	}
-	return Bun.stringWidth(normalizeForWidth(str)) + tabLength;
+
+	const normalized = normalizeForWidth(str);
+	if (tabCount === 0) return Bun.stringWidth(normalized);
+	return Bun.stringWidth(normalized.replaceAll("\t", " ".repeat(getDefaultTabWidth())));
 }
 
 /**
  * Calculate the visible width of a string in terminal columns.
  */
 export function visibleWidth(str: string): number {
-	if (!str) return 0;
-	return visibleWidthRaw(str);
+	if (!renderMetrics.enabled) return visibleWidthRaw(str);
+	return recordTextHelper("text.visibleWidth", () => visibleWidthRaw(str));
 }
 
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;

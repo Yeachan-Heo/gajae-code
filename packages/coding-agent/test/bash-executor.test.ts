@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { executeBash } from "@gajae-code/coding-agent/exec/bash-executor";
+import { getRuntimeResourceCounts } from "@gajae-code/coding-agent/debug/runtime-gauges";
+import {
+	disposeAllShellSessions,
+	executeBash,
+	getShellSessionCount,
+} from "@gajae-code/coding-agent/exec/bash-executor";
 import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-output";
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
@@ -41,6 +46,28 @@ describe("executeBash", () => {
 		const result = await executeBash("exit 7", { cwd: tempDir, timeout: 5000 });
 		expect(result.exitCode).toBe(7);
 		expect(result.cancelled).toBe(false);
+	});
+
+	it("retains then fully disposes persistent shell sessions (MEM-7)", async () => {
+		await disposeAllShellSessions();
+		expect(getShellSessionCount()).toBe(0);
+		await executeBash("echo hi", { cwd: tempDir, timeout: 5000, sessionKey: "leak-test" });
+		expect(getShellSessionCount()).toBeGreaterThanOrEqual(1);
+		// Disposal must await native aborts (not fire-and-forget) so shutdown
+		// cleanup does not return before resources are released.
+		const pending = disposeAllShellSessions();
+		expect(pending).toBeInstanceOf(Promise);
+		await pending;
+		expect(getShellSessionCount()).toBe(0);
+	});
+
+	it("reports the bash shell-session owner count via runtime resource gauges", async () => {
+		await disposeAllShellSessions();
+		expect(getRuntimeResourceCounts()["bash.shellSessions"]).toBe(0);
+		await executeBash("echo hi", { cwd: tempDir, timeout: 5000, sessionKey: "gauge-test" });
+		expect(getRuntimeResourceCounts()["bash.shellSessions"]).toBeGreaterThanOrEqual(1);
+		await disposeAllShellSessions();
+		expect(getRuntimeResourceCounts()["bash.shellSessions"]).toBe(0);
 	});
 
 	it("honors cwd", async () => {

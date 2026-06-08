@@ -1,7 +1,11 @@
 import * as fs from "node:fs/promises";
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
-import { canonicalWorkflowSkill, WORKFLOW_STATE_RECEIPT_VERSION } from "../skill-state/workflow-state-contract";
+import {
+	canonicalWorkflowSkill,
+	WORKFLOW_STATE_RECEIPT_VERSION,
+	WORKFLOW_STATE_VERSION,
+} from "../skill-state/workflow-state-contract";
 import { writeWorkflowEnvelopeAtomic } from "./state-writer";
 import { getSkillManifest } from "./workflow-manifest";
 
@@ -21,6 +25,17 @@ export interface MigrateAndPersistLegacyStateResult {
 	migrated: boolean;
 	path: string;
 }
+export interface MigrateWorkflowStateResult {
+	state: Record<string, unknown>;
+	fromVersion: number;
+	toVersion: number;
+	changed: boolean;
+}
+
+export type WorkflowStateMigration = (
+	state: Record<string, unknown>,
+	skill: CanonicalGjcWorkflowSkill,
+) => Record<string, unknown>;
 
 const RECEIPT_STRING_FIELDS = [
 	"command",
@@ -75,6 +90,41 @@ function receiptWithRequiredFields(raw: unknown, skill: CanonicalGjcWorkflowSkil
 function recordsEqual(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
 	return JSON.stringify(left) === JSON.stringify(right);
 }
+function migrateV1ToV2(state: Record<string, unknown>, skill: CanonicalGjcWorkflowSkill): Record<string, unknown> {
+	const migrated = cloneRecord(state);
+	migrated.version = WORKFLOW_STATE_VERSION;
+	migrated.skill = skill;
+
+	const sourcePhase = typeof migrated.current_phase === "string" ? migrated.current_phase : migrated.phase;
+	const normalizedPhase = normalizePhase(skill, sourcePhase);
+	migrated.current_phase = normalizedPhase;
+	if ("phase" in migrated && typeof migrated.phase === "string") migrated.phase = normalizedPhase;
+
+	return migrated;
+}
+
+const MIGRATIONS: Record<number, WorkflowStateMigration> = {
+	1: migrateV1ToV2,
+};
+
+export function migrateWorkflowState(raw: Record<string, unknown>, skill: string): MigrateWorkflowStateResult {
+	const canonicalSkill = canonicalSkillOrThrow(skill);
+	const fromVersion = typeof raw.version === "number" ? raw.version : 1;
+	if (fromVersion >= WORKFLOW_STATE_VERSION) {
+		return { state: raw, fromVersion, toVersion: fromVersion, changed: false };
+	}
+
+	let version = fromVersion;
+	let state = raw;
+	let changed = false;
+	while (version < WORKFLOW_STATE_VERSION && MIGRATIONS[version]) {
+		state = MIGRATIONS[version](state, canonicalSkill);
+		version += 1;
+		changed = true;
+	}
+
+	return { state, fromVersion, toVersion: version, changed };
+}
 
 /**
  * Pure legacy state normalizer for background/internal readers.
@@ -90,14 +140,11 @@ export function normalizeLegacyState(raw: Record<string, unknown>, skill: string
 	state.skill = canonicalSkill;
 	if (typeof state.version !== "number") state.version = 1;
 	if (typeof state.active !== "boolean") state.active = true;
-
-	const sourcePhase = typeof state.current_phase === "string" ? state.current_phase : state.phase;
-	const normalizedPhase = normalizePhase(canonicalSkill, sourcePhase);
-	state.current_phase = normalizedPhase;
-	if ("phase" in state && typeof state.phase === "string") state.phase = normalizedPhase;
+	if (typeof state.updated_at !== "string") state.updated_at = new Date().toISOString();
 	state.receipt = receiptWithRequiredFields(state.receipt, canonicalSkill);
 
-	return { state, changed: !recordsEqual(raw, state) };
+	const migrated = migrateWorkflowState(state, canonicalSkill).state;
+	return { state: migrated, changed: !recordsEqual(raw, migrated) };
 }
 
 export async function migrateAndPersistLegacyState(

@@ -48,6 +48,7 @@ export interface TmuxLaunchContext {
 	currentBranch?: string | null;
 	existingBranchSessionName?: string | null;
 	project?: string | null;
+	diagnosticWriter?: (message: string) => void;
 }
 
 export interface TmuxSpawnResult {
@@ -120,6 +121,16 @@ function isInteractiveRootLaunch(parsed: Args, tty: TtyState): boolean {
 	);
 }
 
+function isBunVirtualPath(value: string | undefined): boolean {
+	return value?.startsWith("/$bunfs/") === true;
+}
+
+function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
+	const detail = stderr?.trim();
+	const suffix = detail ? ` ${detail.slice(0, 240)}` : "";
+	return `gjc --tmux failed after creating tmux session: ${stage}.${suffix}\n`;
+}
+
 function shellQuote(value: string): string {
 	if (value.length === 0) return "''";
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -148,6 +159,9 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 	const entrypoint = context.argv[1];
 	if (!entrypoint) return ["gjc"];
+	if (isBunVirtualPath(entrypoint)) {
+		return isBunVirtualPath(context.execPath) ? ["gjc"] : [context.execPath];
+	}
 	const resolvedEntrypoint = path.isAbsolute(entrypoint) ? entrypoint : path.resolve(context.cwd, entrypoint);
 	if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs")) {
 		return [context.execPath, resolvedEntrypoint];
@@ -264,10 +278,19 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		});
 		if (profile.failures.length > 0) {
 			cleanupCreatedTmuxSession(plan, spawnSync, options);
-			return false;
+			const failure =
+				profile.failures.find(item => item.command.args.includes("@gjc-profile")) ?? profile.failures[0];
+			(context.diagnosticWriter ?? process.stderr.write.bind(process.stderr))(
+				formatTmuxLaunchDiagnostic("profile tagging failed", failure?.stderr),
+			);
+			return true;
 		}
 	}
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", plan.sessionName], options);
-	return attached.exitCode === 0;
+	if (attached.exitCode === 0) return true;
+	(context.diagnosticWriter ?? process.stderr.write.bind(process.stderr))(
+		formatTmuxLaunchDiagnostic("attach failed", attached.stderr),
+	);
+	return true;
 }

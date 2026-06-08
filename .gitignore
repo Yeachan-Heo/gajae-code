@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+node_modules
 .npm/
 
 # Build output
@@ -83,3 +84,4 @@ python/robogjc/.cache/
 python/robogjc/src/robogjc/static/
 python/robogjc/web/dist/
 python/robogjc/.env
+.release-040-artifacts/

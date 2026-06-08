@@ -125,7 +125,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
 ```json
 {
   "active": true,
-  "current_phase": "deep-interview",
+  "current_phase": "interviewing",
   "state": {
     "interview_id": "<uuid>",
     "type": "greenfield|brownfield",
@@ -530,28 +530,24 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 **Options:**
 
-1. **Refine with ralplan consensus (Recommended)**
-   - Description: "Consensus-refine this spec with Planner/Architect/Critic, then stop for explicit execution approval. Maximum quality."
-   - Action: Only after the user selects this option, invoke `/skill:ralplan --consensus --direct` with the spec file path as context. The `--direct` flag skips the ralplan skill's interview phase (the deep interview already gathered requirements), while `--consensus` triggers the Planner/Architect/Critic loop. When consensus completes and produces a plan in `.gjc/plans/`, stop with that plan marked `pending approval`; do not automatically invoke execution or any other execution skill.
-   - Pipeline: `deep-interview spec → explicit approval to refine → ralplan --consensus --direct → pending approval → separate execution approval`
+1. **Refine with ralplan consensus (Recommended — default for almost all specs)**
+   - Description: "Consensus-refine this spec with Planner/Architect/Critic, then stop for explicit execution approval. Maximum quality. Prefer this unless the spec is already implementation-ready and trivially simple."
+   - Action: Only after the user selects this option, invoke `/skill:ralplan` with the spec file path as context. Ralplan is already the Planner → Architect → Critic consensus workflow, so no extra slash-skill flags are required or supported. When consensus completes and produces a plan in `.gjc/plans/`, stop with that plan marked `pending approval`; do not automatically invoke execution or any other execution skill.
+   - Pipeline: `deep-interview spec → explicit approval to refine → ralplan → pending approval → separate execution approval`
 
-2. **Execute with team**
-   - Description: "Full autonomous pipeline — planning, parallel implementation, QA, validation. Faster but without consensus refinement."
-   - Action: Invoke `/skill:team` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces team planning input.
+2. **Execute with ultragoal (only when spec is already implementation-ready and really simple)**
+   - Description: "Goal-tracked autonomous execution — drives the spec to completion with verification. Skip ralplan refinement only when the spec is concrete, low-risk, and trivially small."
+   - Action: Invoke `/skill:ultragoal` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces ultragoal planning input. Recommend this only when the spec needs no further planning; otherwise route through ralplan refinement first.
 
-3. **Execute with team**
-   - Description: "Persistence loop with architect verification — keeps working until all acceptance criteria pass"
-   - Action: Invoke `/skill:team` with the spec file path as the task definition.
+3. **Execute with team (only when implementation-ready, simple, AND tmux parallelization is required)**
+   - Description: "N coordinated parallel agents in tmux — only when the spec is already implementation-ready and genuinely needs tmux-based interactive worker parallelization."
+   - Action: Invoke `/skill:team` with the spec file path as the shared plan only after the user explicitly selects this option. Reserve this for the narrow case where the spec is simple/ready and tmux interactive parallel workers are actually needed; otherwise prefer ralplan refinement, then ultragoal.
 
-4. **Execute with team**
-   - Description: "N coordinated parallel agents — fastest execution for large specs"
-   - Action: Invoke `/skill:team` with the spec file path as the shared plan.
-
-5. **Refine further**
+4. **Refine further**
    - Description: "Continue interviewing to improve clarity (current: {score}%)"
    - Action: Return to Phase 2 interview loop.
 
-**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:team`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. `gjc team` is a native tmux runtime command and may be used only when the Team workflow explicitly requires the CLI runtime. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
+**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan`, `/skill:ultragoal`, or `/skill:team`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. Implementation handoff defaults to `/skill:ultragoal`; `/skill:team` is reserved for when tmux-based interactive worker parallelization is genuinely required, and `gjc team` is a native tmux runtime command used only when the Team workflow explicitly requires the CLI runtime. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
 
 ### Phase 5b: Handoff before chain
 
@@ -577,7 +573,7 @@ Stage 1: Deep Interview          Stage 2: ralplan consensus       Stage 3: Separ
 ┌─────────────────────┐    ┌───────────────────────────┐    ┌──────────────────────┐
 │ Socratic Q&A        │    │ Planner creates plan      │    │ User chooses if/how  │
 │ Ambiguity scoring   │───>│ Architect reviews         │───>│ execution proceeds   │
-│ Challenge agents    │    │ Critic validates          │    │ via team or ultragoal  │
+│ Challenge agents    │    │ Critic validates          │    │ via ultragoal (default) │
 │ Spec crystallization│    │ Loop until consensus      │    │ no auto-handoff      │
 │ Gate: ≤<resolvedThresholdPercent> ambiguity│    │ ADR + RALPLAN-DR summary  │    │                      │
 └─────────────────────┘    └───────────────────────────┘    └──────────────────────┘
@@ -604,7 +600,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
 - Use `gjc state write` / `gjc state read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/state` directly without force override.
 - Use the GJC workflow CLI to save the final spec at `.gjc/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
-- Use public GJC workflow entrypoints to bridge to ralplan/team only after explicit execution approval — never implement directly
+- Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - Challenge agent modes are prompt injections, not separate agent spawns
 - Use internal fragment auto-modes only at their documented hooks: `auto-research-greenfield.md` between Step 2a and 2b for greenfield `research: true` questions, and `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring.
 - Fragment auto-modes are loaded on demand as `kind: "skill-fragment"`; they are not public workflow skills, not slash-command/discoverable, and not `skill://` registrations.
@@ -734,7 +730,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Spec includes: topology, goal, constraints, acceptance criteria, clarity breakdown, transcript
 - [ ] Execution bridge presented via the `ask` tool
 - [ ] Selected execution mode invoked via public GJC workflow entrypoint only after explicit execution approval (never direct implementation)
-- [ ] If 3-stage pipeline selected: ralplan --consensus --direct invoked, then stopped with the consensus plan marked `pending approval` until the user explicitly approves execution
+- [ ] If 3-stage pipeline selected: `/skill:ralplan` invoked with the spec as context, then stopped with the consensus plan marked `pending approval` until the user explicitly approves execution
 - [ ] State cleaned up after approved workflow handoff
 - [ ] Brownfield confirmation questions cite repo evidence (file/path/pattern) before asking the user to decide
 - [ ] Scope-fuzzy tasks can trigger ontology-style questioning to stabilize the core entity before feature elaboration
@@ -783,7 +779,7 @@ Team routing: "Your request is quite open-ended. Would you like to run a deep in
   [Yes, interview first] [No, expand directly]
 ```
 
-If the user chooses interview, team routing invokes `/skill:deep-interview`. When the interview completes and the user selects "Execute with team", the spec becomes Phase 0 output and team proceeds from the approved spec.
+If the user chooses interview, team routing invokes `/skill:deep-interview`. When the interview completes and the user selects an execution path (ultragoal by default, or team when tmux-based interactive parallelization is required), the spec becomes Phase 0 output and the chosen workflow proceeds from the approved spec.
 
 ## Approval-Gated Pipeline: deep-interview → ralplan → pending approval
 
@@ -794,17 +790,17 @@ The recommended refinement path chains clarity and feasibility gates, then stops
   → Socratic Q&A until ambiguity ≤ <resolvedThresholdPercent>
   → Spec written to .gjc/specs/deep-interview-{slug}.md
   → User explicitly selects "Refine with ralplan consensus"
-  → /skill:ralplan --consensus --direct (spec as input, skip interview)
+  → /skill:ralplan (spec as input)
     → Planner creates implementation plan from spec
     → Architect reviews for architectural soundness
     → Critic validates quality and testability
     → Loop until consensus (max 5 iterations)
     → Consensus plan written to .gjc/plans/
   → Stop with the consensus plan marked pending approval
-  → Only a separate explicit execution approval may invoke team or ultragoal
+  → Only a separate explicit execution approval may invoke execution (ultragoal by default; team only when tmux-based interactive worker parallelization is required)
 ```
 
-**The ralplan skill receives the spec with `--consensus --direct` flags** because the deep interview already did the requirements gathering. The `--direct` flag (supported by the ralplan skill, which ralplan aliases) skips the interview phase and goes straight to Planner → Architect → Critic consensus. The consensus plan includes:
+**The ralplan skill receives the spec as context through `/skill:ralplan`** because ralplan is already the GJC Planner → Architect → Critic consensus workflow. The consensus plan includes:
 - RALPLAN-DR summary (Principles, Decision Drivers, Options)
 - ADR (Decision, Drivers, Alternatives, Why chosen, Consequences)
 - Testable acceptance criteria (inherited from deep-interview spec)

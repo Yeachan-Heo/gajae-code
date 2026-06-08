@@ -64,7 +64,7 @@ const AGENTS_RETENTION: RetentionPolicy = { category: "agents" };
 const PRUNE_RETENTION: RetentionPolicy = { category: "prune/delete", maxAgeDays: 30 };
 const FORCE_RETENTION: RetentionPolicy = { category: "force", maxAgeDays: 90 };
 
-const STATE_VERBS = ["read", "write", "clear", "contract", "handoff"] as const;
+const STATE_VERBS = ["read", "write", "clear", "contract", "handoff", "doctor"] as const;
 const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as const;
 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
@@ -82,6 +82,8 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	},
 	{ name: "replace", type: "boolean", appliesToVerbs: ["write"] },
 	{ name: "force", type: "boolean", appliesToVerbs: ["write", "clear", "handoff"] },
+	{ name: "skill", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: ["doctor"] },
+	{ name: "json", type: "boolean", appliesToVerbs: ["doctor"] },
 ];
 
 function verb(name: string, surface: WorkflowVerb["surface"]): WorkflowVerb {
@@ -210,8 +212,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",
-		states: ["goal-planning", "pending", "active", "blocked", "failed", "complete", "handoff"],
-		terminalStates: ["failed", "complete", "handoff"],
+		states: ["missing", "goal-planning", "pending", "active", "blocked", "failed", "complete", "handoff"],
+		terminalStates: ["missing", "failed", "complete", "handoff"],
 		transitions: [
 			{ from: "goal-planning", to: "pending", verb: "create-goals" },
 			{ from: "pending", to: "active", verb: "complete-goals" },

@@ -73,6 +73,17 @@ export class BlobStore {
 		}
 	}
 
+	/** Synchronously read blob by hash, returns Buffer or null if not found. */
+	getSync(hash: string): Buffer | null {
+		const blobPath = path.join(this.dir, hash);
+		try {
+			return fs.readFileSync(blobPath);
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
 	/** Check if a blob exists. */
 	async has(hash: string): Promise<boolean> {
 		try {
@@ -81,6 +92,43 @@ export class BlobStore {
 		} catch {
 			return false;
 		}
+	}
+}
+
+export class MemoryBlobStore extends BlobStore {
+	#blobs = new Map<string, Buffer>();
+
+	constructor() {
+		super(":memory:");
+	}
+
+	async put(data: Buffer): Promise<BlobPutResult> {
+		return this.putSync(data);
+	}
+
+	putSync(data: Buffer): BlobPutResult {
+		const hash = new Bun.SHA256().update(data).digest("hex");
+		this.#blobs.set(hash, Buffer.from(data));
+		return {
+			hash,
+			path: `memory:${hash}`,
+			get ref() {
+				return `${BLOB_PREFIX}${hash}`;
+			},
+		};
+	}
+
+	async get(hash: string): Promise<Buffer | null> {
+		return this.getSync(hash);
+	}
+
+	getSync(hash: string): Buffer | null {
+		const data = this.#blobs.get(hash);
+		return data ? Buffer.from(data) : null;
+	}
+
+	async has(hash: string): Promise<boolean> {
+		return this.#blobs.has(hash);
 	}
 }
 
@@ -165,4 +213,40 @@ export async function resolveImageData(blobStore: BlobStore, data: string): Prom
 		return data; // Return the ref as-is; downstream will see invalid base64 but won't crash
 	}
 	return buffer.toString("base64");
+}
+
+/** Synchronously resolve an externalized provider image data URL back to its original string. */
+export function resolveImageDataUrlSync(blobStore: BlobStore, data: string): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	if (!buffer) {
+		logger.warn("Blob not found for persisted image data URL", { hash });
+		return data;
+	}
+	return buffer.toString("utf8");
+}
+
+/** Synchronously resolve a blob reference back to base64 data. */
+export function resolveImageDataSync(blobStore: BlobStore, data: string): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	if (!buffer) {
+		logger.warn("Blob not found for image reference", { hash });
+		return data;
+	}
+	return buffer.toString("base64");
+}
+
+/** Synchronously resolve a blob reference back to utf8 text. */
+export function resolveTextBlobSync(blobStore: BlobStore, data: string): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	if (!buffer) {
+		logger.warn("Blob not found for text reference", { hash });
+		return data;
+	}
+	return buffer.toString("utf8");
 }

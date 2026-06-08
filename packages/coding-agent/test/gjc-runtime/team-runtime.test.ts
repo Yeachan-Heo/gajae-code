@@ -473,6 +473,84 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("split-window -v -t %2");
 		expect(tmuxLog).not.toContain("new-session");
 	});
+	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: [
+				"Shared context for the coordinated run.",
+				"",
+				"### Lane A — Schema contract",
+				"Define the durable schema and ID checks.",
+				"",
+				"### Lane B — Verification",
+				"Add focused regression coverage.",
+			].join("\n"),
+			teamName: "lane-distribution-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+
+		const task1 = await readGjcTeamTask("lane-distribution-team", "task-1", cleanupRoot, { PATH: "" });
+		const task2 = await readGjcTeamTask("lane-distribution-team", "task-2", cleanupRoot, { PATH: "" });
+
+		expect(snapshot.task_counts.pending).toBe(2);
+		expect(task1.subject).toBe("Lane A — Schema contract");
+		expect(task1.owner).toBe("worker-1");
+		expect(task1.lane).toBe("lane-a");
+		expect(task1.required_role).toBe("executor");
+		expect(task1.description).toContain("Define the durable schema");
+		expect(task1.description).not.toContain("Add focused regression coverage");
+		expect(task2.subject).toBe("Lane B — Verification");
+		expect(task2.owner).toBe("worker-2");
+		expect(task2.lane).toBe("lane-b");
+		expect(task2.description).toContain("Add focused regression coverage");
+		expect(task2.description).not.toContain("Define the durable schema");
+	});
+
+	it("rejects ambiguous inline lane splits before duplicating broad multi-worker work", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await expect(
+			startGjcTeam({
+				workerCount: 4,
+				agentType: "executor",
+				task: "Implement turn orchestration. Split lanes: A schema, B delivery, C read_turn, D docs/tests.",
+				teamName: "ambiguous-lane-team",
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: { PATH: "" },
+			}),
+		).rejects.toThrow("ambiguous_team_lane_split");
+		expect(await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "ambiguous-lane-team")).exists()).toBe(
+			false,
+		);
+	});
+
+	it("rejects ambiguous lane splits before non-dry-run state, worktree, or pane mutation", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+
+		await expect(
+			startGjcTeam({
+				workerCount: 2,
+				agentType: "executor",
+				task: "Implement approved plan. Split lanes: A runtime, B tests.",
+				teamName: "ambiguous-lane-worktree-team",
+				cwd: cleanupRoot,
+				env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+			}),
+		).rejects.toThrow("ambiguous_team_lane_split");
+
+		expect(
+			await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "ambiguous-lane-worktree-team")).exists(),
+		).toBe(false);
+		expect(await Bun.file(path.join(cleanupRoot, "tmux-split-count")).exists()).toBe(false);
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("split-window");
+	});
 
 	it("fails outside current tmux before creating team state or worktrees", async () => {
 		cleanupRoot = await createGitRepo();
@@ -725,6 +803,100 @@ describe("native gjc team runtime", () => {
 		).json()) as { mode?: string; request_id?: string };
 		expect(shutdownRequest.mode).toBe("graceful");
 		expect(shutdownRequest.request_id).toBe(stopped.worker_lifecycle_by_id["worker-1"]?.shutdown_request_id);
+	});
+
+	it("chains claim, transition, and release using receipt-only task fields", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Receipt lifecycle",
+			teamName: "receipt-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+
+		const claimReceipt = (await executeGjcTeamApiOperation(
+			"claim-task",
+			{ team_name: "receipt-team", worker_id: "worker-1" },
+			cleanupRoot,
+			{ PATH: "" },
+		)) as {
+			ok: boolean;
+			team_name: string;
+			worker_id: string;
+			task_id: string;
+			status: string;
+			claim_token: string;
+			task?: unknown;
+		};
+		expect(claimReceipt).toMatchObject({
+			ok: true,
+			team_name: "receipt-team",
+			worker_id: "worker-1",
+			task_id: "task-1",
+			status: "in_progress",
+		});
+		expect(claimReceipt.claim_token).toBeTruthy();
+		expect(claimReceipt.task).toBeUndefined();
+
+		const releaseReceipt = (await executeGjcTeamApiOperation(
+			"release-task-claim",
+			{
+				team_name: claimReceipt.team_name,
+				worker_id: claimReceipt.worker_id,
+				task_id: claimReceipt.task_id,
+				claim_token: claimReceipt.claim_token,
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		)) as { ok: boolean; worker_id: string; task_id: string; status: string; task?: unknown };
+		expect(releaseReceipt).toMatchObject({ ok: true, worker_id: "worker-1", task_id: "task-1", status: "pending" });
+		expect(releaseReceipt.task).toBeUndefined();
+
+		const secondClaimReceipt = (await executeGjcTeamApiOperation(
+			"claim-task",
+			{ team_name: "receipt-team", worker_id: releaseReceipt.worker_id, task_id: releaseReceipt.task_id },
+			cleanupRoot,
+			{ PATH: "" },
+		)) as { ok: boolean; worker_id: string; task_id: string; status: string; claim_token: string; task?: unknown };
+		expect(secondClaimReceipt).toMatchObject({
+			ok: true,
+			worker_id: "worker-1",
+			task_id: "task-1",
+			status: "in_progress",
+		});
+		expect(secondClaimReceipt.claim_token).toBeTruthy();
+		expect(secondClaimReceipt.task).toBeUndefined();
+
+		const transitionReceipt = (await executeGjcTeamApiOperation(
+			"transition-task-status",
+			{
+				team_name: "receipt-team",
+				worker_id: secondClaimReceipt.worker_id,
+				task_id: secondClaimReceipt.task_id,
+				to: "blocked",
+				claim_token: secondClaimReceipt.claim_token,
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		)) as {
+			ok: boolean;
+			worker_id: string;
+			task_id: string;
+			status: string;
+			task?: unknown;
+			completion_evidence?: unknown;
+		};
+		expect(transitionReceipt).toMatchObject({
+			ok: true,
+			worker_id: "worker-1",
+			task_id: "task-1",
+			status: "blocked",
+		});
+		expect(transitionReceipt.task).toBeUndefined();
+		expect(transitionReceipt.completion_evidence).toBeUndefined();
 	});
 
 	it("writes versioned structured traces linked to legacy events", async () => {
@@ -1208,10 +1380,9 @@ describe("native gjc team runtime", () => {
 			},
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { task: { id: string; lane?: string; required_role?: string; depends_on?: string[] } };
-		expect(dependentTask.task.lane).toBe("verification");
-		expect(dependentTask.task.required_role).toBe("executor");
-		expect(dependentTask.task.depends_on).toEqual(["task-1"]);
+		)) as { task_id: string; status: string; owner?: string; task?: unknown };
+		expect(dependentTask).toMatchObject({ task_id: "task-3", status: "pending", owner: "worker-1" });
+		expect(dependentTask.task).toBeUndefined();
 
 		const blockedByDependency = await claimGjcTeamTask("lane-team", "worker-1", cleanupRoot, { PATH: "" }, "task-3");
 		expect(blockedByDependency.ok).toBe(false);
@@ -1294,35 +1465,37 @@ describe("native gjc team runtime", () => {
 			{ team_name: "api-team", subject: "Extra", description: "Extra work" },
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { task: { id: string } };
+		)) as { task_id: string; task?: unknown };
+		expect(created.task).toBeUndefined();
 		const read = (await executeGjcTeamApiOperation(
 			"read-task",
-			{ team_name: "api-team", task_id: created.task.id },
+			{ team_name: "api-team", task_id: created.task_id },
 			cleanupRoot,
 			{ PATH: "" },
 		)) as { task: { subject: string } };
 		expect(read.task.subject).toBe("Extra");
-		await executeGjcTeamApiOperation(
+		const updated = (await executeGjcTeamApiOperation(
 			"update-task",
-			{ team_name: "api-team", task_id: created.task.id, subject: "Updated" },
+			{ team_name: "api-team", task_id: created.task_id, subject: "Updated" },
 			cleanupRoot,
 			{ PATH: "" },
-		);
+		)) as { task_id: string; task?: unknown };
+		expect(updated.task).toBeUndefined();
 		const claim = (await executeGjcTeamApiOperation(
 			"claim-task",
-			{ team_name: "api-team", task_id: created.task.id, worker: "worker-1" },
+			{ team_name: "api-team", task_id: created.task_id, worker: "worker-1" },
 			cleanupRoot,
 			{ PATH: "" },
 		)) as { claim_token: string };
 		await executeGjcTeamApiOperation(
 			"release-task-claim",
-			{ team_name: "api-team", task_id: created.task.id, worker: "worker-1", claim_token: claim.claim_token },
+			{ team_name: "api-team", task_id: created.task_id, worker: "worker-1", claim_token: claim.claim_token },
 			cleanupRoot,
 			{ PATH: "" },
 		);
 		const claimed = (await executeGjcTeamApiOperation(
 			"claim-task",
-			{ team_name: "api-team", task_id: created.task.id, worker: "worker-1" },
+			{ team_name: "api-team", task_id: created.task_id, worker: "worker-1" },
 			cleanupRoot,
 			{ PATH: "" },
 		)) as { claim_token: string };
@@ -1330,7 +1503,7 @@ describe("native gjc team runtime", () => {
 			"transition-task-status",
 			{
 				team_name: "api-team",
-				task_id: created.task.id,
+				task_id: created.task_id,
 				to: "completed",
 				claim_token: claimed.claim_token,
 				completionEvidence: artifactCompletionEvidence("API parity task completed by artifact"),
@@ -1344,16 +1517,17 @@ describe("native gjc team runtime", () => {
 			{ team_name: "api-team", from_worker: "worker-1", to_worker: "worker-2", body: "hello" },
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { message: { message_id: string } };
+		)) as { message_id: string; body?: string };
+		expect(message.body).toBeUndefined();
 		await executeGjcTeamApiOperation(
 			"mailbox-mark-delivered",
-			{ team_name: "api-team", worker: "worker-2", message_id: message.message.message_id },
+			{ team_name: "api-team", worker: "worker-2", message_id: message.message_id },
 			cleanupRoot,
 			{ PATH: "" },
 		);
 		await executeGjcTeamApiOperation(
 			"mailbox-mark-notified",
-			{ team_name: "api-team", worker: "worker-2", message_id: message.message.message_id },
+			{ team_name: "api-team", worker: "worker-2", message_id: message.message_id },
 			cleanupRoot,
 			{ PATH: "" },
 		);
@@ -1417,13 +1591,13 @@ describe("native gjc team runtime", () => {
 		expect(monitor.ok).toBe(true);
 		await executeGjcTeamApiOperation(
 			"write-task-approval",
-			{ team_name: "api-team", task_id: created.task.id, status: "approved", reviewer: "leader" },
+			{ team_name: "api-team", task_id: created.task_id, status: "approved", reviewer: "leader" },
 			cleanupRoot,
 			{ PATH: "" },
 		);
 		const approval = (await executeGjcTeamApiOperation(
 			"read-task-approval",
-			{ team_name: "api-team", task_id: created.task.id },
+			{ team_name: "api-team", task_id: created.task_id },
 			cleanupRoot,
 			{ PATH: "" },
 		)) as { status: string };
@@ -1459,7 +1633,7 @@ describe("native gjc team runtime", () => {
 			},
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { message: { message_id: string } };
+		)) as { message_id: string; body?: string };
 		const second = (await executeGjcTeamApiOperation(
 			"send-message",
 			{
@@ -1471,8 +1645,10 @@ describe("native gjc team runtime", () => {
 			},
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { message: { message_id: string } };
-		expect(second.message.message_id).toBe(first.message.message_id);
+		)) as { message_id: string; body?: string };
+		expect(first.body).toBeUndefined();
+		expect(second.body).toBeUndefined();
+		expect(second.message_id).toBe(first.message_id);
 		expect(
 			await Bun.file(
 				path.join(
@@ -1483,7 +1659,7 @@ describe("native gjc team runtime", () => {
 					"notification-team",
 					"mailbox",
 					"worker-2",
-					`${first.message.message_id}.json`,
+					`${first.message_id}.json`,
 				),
 			).exists(),
 		).toBe(true);
@@ -1494,15 +1670,16 @@ describe("native gjc team runtime", () => {
 			cleanupRoot,
 			{ PATH: "" },
 		)) as {
-			notifications: Array<{ delivery_state: string; pane_attempt_result?: string }>;
+			notification_ids: string[];
+			delivery_states: string[];
 			summary: { total: number };
 		};
 		expect(notifications.summary.total).toBe(1);
-		expect(notifications.notifications[0]?.pane_attempt_result).toBe("sent");
+		expect(notifications.delivery_states[0]).toBe("sent");
 
 		await executeGjcTeamApiOperation(
 			"mailbox-mark-notified",
-			{ team_name: "notification-team", worker: "worker-2", message_id: first.message.message_id },
+			{ team_name: "notification-team", worker: "worker-2", message_id: first.message_id },
 			cleanupRoot,
 			{ PATH: "" },
 		);
@@ -1511,12 +1688,12 @@ describe("native gjc team runtime", () => {
 			{ team_name: "notification-team" },
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { notifications: Array<{ delivery_state: string }>; summary: { total: number } };
-		expect(notifications.notifications[0]?.delivery_state).toBe("delivered");
+		)) as { notification_ids: string[]; delivery_states: string[]; summary: { total: number } };
+		expect(notifications.delivery_states[0]).toBe("delivered");
 
 		await executeGjcTeamApiOperation(
 			"mailbox-mark-delivered",
-			{ team_name: "notification-team", worker: "worker-2", message_id: first.message.message_id },
+			{ team_name: "notification-team", worker: "worker-2", message_id: first.message_id },
 			cleanupRoot,
 			{ PATH: "" },
 		);
@@ -1525,8 +1702,8 @@ describe("native gjc team runtime", () => {
 			{ team_name: "notification-team" },
 			cleanupRoot,
 			{ PATH: "" },
-		)) as { notifications: Array<{ delivery_state: string }>; summary: { total: number } };
-		expect(notifications.notifications[0]?.delivery_state).toBe("acknowledged");
+		)) as { notification_ids: string[]; delivery_states: string[]; summary: { total: number } };
+		expect(notifications.delivery_states[0]).toBe("acknowledged");
 	});
 
 	it("rejects path-like worker ids and reports lifecycle nudges without automatic worker action", async () => {

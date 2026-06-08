@@ -1,4 +1,4 @@
-import { THINKING_EFFORTS } from "@gajae-code/ai";
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking";
 import { EDIT_MODES } from "../utils/edit-mode";
@@ -9,7 +9,6 @@ import {
 } from "./skill-settings-defaults";
 
 /** Unified settings schema - single source of truth for all settings.
- * Unified settings schema - single source of truth for all settings.
  *
  * Each setting is defined once here with:
  * - Type and default value
@@ -74,6 +73,7 @@ export type StatusLineSegmentId =
 	| "git"
 	| "pr"
 	| "subagents"
+	| "jobs"
 	| "token_in"
 	| "token_out"
 	| "token_total"
@@ -313,6 +313,16 @@ export const SETTINGS_SCHEMA = {
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	"modelProfile.default": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Default Model Profile",
+			description: "Model profile applied automatically at startup",
+			options: "runtime",
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
@@ -1078,11 +1088,11 @@ export const SETTINGS_SCHEMA = {
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "context",
 			label: "Auto-Promote Context",
-			description: "Promote to a larger-context model on context overflow instead of compacting",
+			description: "Promote to a larger-context model on context overflow instead of compacting (off by default; opt in to enable)",
 		},
 	},
 
@@ -2352,11 +2362,12 @@ export const SETTINGS_SCHEMA = {
 
 	"task.maxConcurrency": {
 		type: "number",
-		default: 32,
+		default: 8,
 		ui: {
 			tab: "tasks",
 			label: "Max Concurrent Tasks",
-			description: "Concurrent limit for subagents",
+			description:
+				"Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
 			options: [
 				{ value: "0", label: "Unlimited" },
 				{ value: "1", label: "1 task" },
@@ -2408,7 +2419,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tasks",
 			label: "Fork Context Max Tokens",
-			description: "Approximate token cap for fork-context seeds. 0 uses 25% of the target model context window.",
+			description:
+				"Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
 		},
 	},
 
@@ -2762,6 +2774,8 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+
+	"thinkingBudgets.max": { type: "number", default: 65536 },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2942,6 +2956,7 @@ export interface ThinkingBudgetsSettings {
 	medium: number;
 	high: number;
 	xhigh: number;
+	max: number;
 }
 
 export interface SttSettings {

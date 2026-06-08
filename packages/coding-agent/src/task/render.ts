@@ -6,12 +6,13 @@
  */
 import path from "node:path";
 import type { Component } from "@gajae-code/tui";
-import { Container, Text } from "@gajae-code/tui";
+import { Text } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
 	formatBadge,
+	formatBytes,
 	formatDuration,
 	formatMoreItems,
 	formatStatusIcon,
@@ -27,8 +28,9 @@ import {
 	type SubmitReviewDetails,
 } from "../tools/review";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine } from "../tui";
+import type { TaskResultReceipt } from "./receipt";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
-import type { AgentProgress, SingleResult, TaskParams, TaskToolDetails } from "./types";
+import type { AgentProgress, TaskParams, TaskToolDetails } from "./types";
 
 /**
  * Get status icon for agent state.
@@ -137,21 +139,6 @@ function formatTaskId(id: string): string {
 	const indices = parsed.map(match => match![1]).join(".");
 	const labels = parsed.map(match => match![2]).join(">");
 	return `${indices} ${labels}`;
-}
-
-const MISSING_YIELD_WARNING_PREFIX = "SYSTEM WARNING: Subagent exited without calling yield tool";
-
-function extractMissingYieldWarning(output: string): { warning?: string; rest: string } {
-	const lines = output.split("\n");
-	const firstLine = lines[0]?.trim() ?? "";
-	if (!firstLine.startsWith(MISSING_YIELD_WARNING_PREFIX)) {
-		return { rest: output };
-	}
-	const rest = lines
-		.slice(1)
-		.join("\n")
-		.replace(/^\s*\n+/, "");
-	return { warning: firstLine, rest };
 }
 
 function buildTreePrefix(ancestors: boolean[], theme: Theme): string {
@@ -804,35 +791,24 @@ function renderFindings(
 /**
  * Render final result for a single agent.
  */
-function renderAgentResult(result: SingleResult, isLast: boolean, expanded: boolean, theme: Theme): string[] {
+function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded: boolean, theme: Theme): string[] {
 	const lines: string[] = [];
 	const prefix = isLast ? theme.fg("dim", theme.tree.last) : theme.fg("dim", theme.tree.branch);
 	const continuePrefix = isLast ? "   " : `${theme.fg("dim", theme.tree.vertical)}  `;
 
-	const { warning: missingCompleteWarning, rest: outputWithoutWarning } = extractMissingYieldWarning(result.output);
-	const aborted = result.aborted ?? false;
-	const mergeFailed = !aborted && result.exitCode === 0 && !!result.error;
-	const success = !aborted && result.exitCode === 0 && !result.error;
-	const needsWarning = Boolean(missingCompleteWarning) && success;
-	const icon = aborted
-		? theme.status.aborted
-		: needsWarning
-			? theme.status.warning
-			: success
-				? theme.status.success
+	const success = result.status === "completed";
+	const mergeFailed = result.status === "merge_failed";
+	const aborted = result.status === "aborted";
+	const icon = success
+		? theme.status.success
+		: aborted
+			? theme.status.aborted
+			: mergeFailed
+				? theme.status.warning
 				: theme.status.error;
-	const iconColor = needsWarning ? "warning" : success ? "success" : mergeFailed ? "warning" : "error";
-	const statusText = aborted
-		? "aborted"
-		: needsWarning
-			? "warning"
-			: success
-				? "done"
-				: mergeFailed
-					? "merge failed"
-					: "failed";
+	const iconColor = success ? "success" : mergeFailed ? "warning" : "error";
+	const statusText = mergeFailed ? "merge failed" : success ? "done" : result.status;
 
-	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const description = result.description?.trim();
 	const displayId = formatTaskId(result.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
@@ -847,121 +823,62 @@ function renderAgentResult(result: SingleResult, isLast: boolean, expanded: bool
 			tokens: result.tokens,
 			contextTokens: result.contextTokens,
 			contextWindow: result.contextWindow,
-			cost: result.usage?.cost.total ?? 0,
+			cost: result.cost ?? result.usage?.cost.total ?? 0,
 		},
 		theme,
 	);
 	statusLine += `${theme.sep.dot}${theme.fg("dim", formatDuration(result.durationMs))}`;
-
-	if (result.truncated) {
+	if (result.truncated || result.previewTruncated) {
 		statusLine += ` ${theme.fg("warning", "[truncated]")}`;
 	}
-
 	lines.push(statusLine);
 
 	lines.push(...renderTaskSection(result.assignment ?? result.task, continuePrefix, expanded, theme));
 
-	if (aborted && result.abortReason) {
-		lines.push(
-			`${continuePrefix}${theme.fg("error", theme.status.aborted)} ${theme.fg("dim", truncateToWidth(replaceTabs(result.abortReason), 80))}`,
-		);
-	}
-	// Check for review result (yield with review schema + report_finding)
-	const completeData = result.extractedToolData?.yield as Array<{ data: unknown }> | undefined;
-	const reportFindingData = normalizeReportFindings(result.extractedToolData?.report_finding);
-
-	// Extract review verdict from yield tool's data field if it matches SubmitReviewDetails
-	const reviewData = completeData
-		?.map(c => c.data as SubmitReviewDetails)
-		.filter(d => d && typeof d === "object" && "overall_correctness" in d);
-	const submitReviewData = reviewData && reviewData.length > 0 ? reviewData : undefined;
-
-	if (submitReviewData && submitReviewData.length > 0) {
-		// Use combined review renderer
-		const summary = submitReviewData[submitReviewData.length - 1];
-		const findings = reportFindingData;
-		lines.push(...renderReviewResult(summary, findings, continuePrefix, expanded, theme));
-		return lines;
-	}
-	if (reportFindingData.length > 0) {
-		const hasCompleteData = completeData && completeData.length > 0;
-		const message = hasCompleteData
-			? "Review verdict missing expected fields"
-			: "Review incomplete (yield not called)";
-		lines.push(`${continuePrefix}${theme.fg("warning", theme.status.warning)} ${theme.fg("dim", message)}`);
-		lines.push(`${continuePrefix}${formatFindingSummary(reportFindingData, theme)}`);
-		lines.push(...renderFindings(reportFindingData, continuePrefix, expanded, theme));
-		return lines;
-	}
-
-	// Check for extracted tool data with custom renderers (skip review tools)
-	let hasCustomRendering = false;
-	const deferredToolLines: string[] = [];
-	if (result.extractedToolData) {
-		for (const [toolName, dataArray] of Object.entries(result.extractedToolData)) {
-			// Skip review tools - handled above
-			if (toolName === "yield" || toolName === "report_finding") continue;
-
-			const handler = subprocessToolRegistry.getHandler(toolName);
-			if (handler?.renderFinal && (dataArray as unknown[]).length > 0) {
-				const isTaskTool = toolName === "task";
-				const component = handler.renderFinal(dataArray as unknown[], theme, expanded);
-				const target = isTaskTool ? deferredToolLines : lines;
-				if (!isTaskTool) {
-					hasCustomRendering = true;
-					target.push(`${continuePrefix}${theme.fg("dim", `Tool: ${toolName}`)}`);
-				}
-				if (component instanceof Text) {
-					// Prefix each line with continuePrefix
-					const text = component.getText();
-					for (const line of text.split("\n")) {
-						target.push(`${continuePrefix}${line}`);
-					}
-				} else if (component instanceof Container) {
-					// For containers, render each child
-					for (const child of (component as Container).children) {
-						if (child instanceof Text) {
-							target.push(`${continuePrefix}${child.getText()}`);
-						}
-					}
+	if (result.review) {
+		if (result.review.overallCorrectness) {
+			lines.push(`${continuePrefix}${theme.fg("dim", `Review: ${result.review.overallCorrectness}`)}`);
+		}
+		if (result.review.findingCount > 0) {
+			lines.push(`${continuePrefix}${theme.fg("dim", `${result.review.findingCount} findings`)}`);
+			if (expanded && result.review.findings) {
+				for (const finding of result.review.findings) {
+					const severity = finding.severity ? `${finding.severity}: ` : "";
+					lines.push(`${continuePrefix}${theme.fg("dim", `- ${severity}${finding.summary}`)}`);
 				}
 			}
 		}
+	} else {
+		lines.push(...renderOutputSection(result.preview, continuePrefix, expanded, theme, 3, 12));
+	}
+	if (result.roi?.lowRoi) {
+		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);
 	}
 
-	if (hasCustomRendering && missingCompleteWarning) {
+	if (result.outputRef) {
 		lines.push(
-			`${continuePrefix}${theme.fg("warning", theme.status.warning)} ${theme.fg(
+			`${continuePrefix}${theme.fg(
 				"dim",
-				truncateToWidth(missingCompleteWarning, 80),
+				`Output: ${result.outputRef.uri} (${formatBytes(result.outputRef.sizeBytes)}, ${result.outputRef.lineCount} lines)`,
 			)}`,
 		);
+	} else if (result.outputUnavailable) {
+		lines.push(`${continuePrefix}${theme.fg("dim", "Output artifact unavailable")}`);
 	}
 
-	// Fallback to output preview if no custom rendering
-	if (!hasCustomRendering) {
-		lines.push(
-			...renderOutputSection(outputWithoutWarning, continuePrefix, expanded, theme, 3, 12, missingCompleteWarning),
-		);
-	}
-
-	if (deferredToolLines.length > 0) {
-		lines.push(...deferredToolLines);
-	}
-
-	if (result.patchPath && !aborted && result.exitCode === 0) {
-		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${result.patchPath}`)}`);
-	} else if (result.branchName && !aborted && result.exitCode === 0) {
+	if (result.branchName && success) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}
-
-	// Error message
-	if (result.error && (!success || mergeFailed) && (!aborted || result.error !== result.abortReason)) {
+	if (result.abortSummary) {
 		lines.push(
-			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", truncateToWidth(replaceTabs(result.error), 70))}`,
+			`${continuePrefix}${theme.fg("error", theme.status.aborted)} ${theme.fg("dim", truncateToWidth(replaceTabs(result.abortSummary), 80))}`,
 		);
 	}
-
+	if (result.errorSummary && (!success || mergeFailed)) {
+		lines.push(
+			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", truncateToWidth(replaceTabs(result.errorSummary), 70))}`,
+		);
+	}
 	return lines;
 }
 
@@ -1009,9 +926,9 @@ export function renderResult(
 					lines.push(...renderAgentResult(res, isLast, expanded, theme));
 				});
 
-				const abortedCount = details.results.filter(r => r.aborted).length;
-				const mergeFailedCount = details.results.filter(r => !r.aborted && r.exitCode === 0 && r.error).length;
-				const successCount = details.results.filter(r => !r.aborted && r.exitCode === 0 && !r.error).length;
+				const abortedCount = details.results.filter(r => r.status === "aborted").length;
+				const mergeFailedCount = details.results.filter(r => r.status === "merge_failed").length;
+				const successCount = details.results.filter(r => r.status === "completed").length;
 				const failCount = details.results.length - successCount - mergeFailedCount - abortedCount;
 				let summary = `${theme.fg("dim", "Total:")} `;
 				if (abortedCount > 0) {

@@ -147,6 +147,48 @@ function fuzzyScore(query: string, target: string): number {
 	// Base score 40 for subsequence, minus penalty for gaps
 	return Math.max(1, 40 - gaps * 5);
 }
+export function getSlashCommandMatchRank(query: string, commandName: string): number {
+	const normalizedQuery = normalizeSlashCommandText(query);
+	if (normalizedQuery.length === 0) return 4;
+
+	const normalizedName = normalizeSlashCommandText(commandName);
+	if (commandName.toLowerCase().startsWith(query.toLowerCase()) || normalizedName.startsWith(normalizedQuery)) {
+		return 0;
+	}
+
+	const queryTokens = normalizedQuery.split(" ").filter(Boolean);
+	const nameTokens = normalizedName.split(" ").filter(Boolean);
+	if (queryTokens.length === 1 && nameTokens.includes(queryTokens[0]!)) {
+		return 1;
+	}
+
+	if (
+		queryTokens.length > 1 &&
+		queryTokens.every((token, index) => {
+			const nameToken = nameTokens[index];
+			return nameToken ? nameToken.startsWith(token) : false;
+		})
+	) {
+		return 2;
+	}
+
+	if (
+		queryTokens.length === 1 &&
+		nameTokens.some(token => token.startsWith(queryTokens[0]!) || token.includes(queryTokens[0]!))
+	) {
+		return 3;
+	}
+
+	return 4;
+}
+
+function normalizeSlashCommandText(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim()
+		.replace(/\s+/g, " ");
+}
 
 export interface AutocompleteItem {
 	value: string;
@@ -273,12 +315,13 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					.filter(cmd => {
 						const name = "name" in cmd ? cmd.name : cmd.value;
 						if (!name) return false;
-						// Match name or description
+						// Match name, normalized slash-name aliases, or description.
 						if (fuzzyMatch(lowerPrefix, name.toLowerCase())) return true;
+						if (getSlashCommandMatchRank(lowerPrefix, name.toLowerCase()) < 4) return true;
 						const desc = cmd.description?.toLowerCase();
 						return desc ? fuzzyMatch(lowerPrefix, desc) : false;
 					})
-					.map(cmd => {
+					.map((cmd, index) => {
 						const name = "name" in cmd ? cmd.name : cmd.value;
 						const lowerName = name?.toLowerCase() ?? "";
 						const lowerDesc = cmd.description?.toLowerCase() ?? "";
@@ -294,11 +337,16 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 							label: "name" in cmd ? cmd.name : cmd.label,
 							score: Math.max(nameScore, descScore),
 							priority,
+							matchRank: getSlashCommandMatchRank(lowerPrefix, lowerName),
+							index,
 							...(fullDesc && { description: fullDesc }),
 						};
 					})
-					.sort((a, b) => b.priority - a.priority || b.score - a.score)
-					.map(({ score: _score, priority: _priority, ...rest }) => rest);
+					.sort(
+						(a, b) =>
+							a.matchRank - b.matchRank || b.priority - a.priority || b.score - a.score || a.index - b.index,
+					)
+					.map(({ score: _score, priority: _priority, matchRank: _matchRank, index: _index, ...rest }) => rest);
 
 				if (matches.length === 0) return null;
 
@@ -815,10 +863,11 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				const name = "name" in cmd ? cmd.name : cmd.value;
 				if (!name) return false;
 				if (fuzzyMatch(lowerPrefix, name.toLowerCase())) return true;
+				if (getSlashCommandMatchRank(lowerPrefix, name.toLowerCase()) < 4) return true;
 				const desc = cmd.description?.toLowerCase();
 				return desc ? fuzzyMatch(lowerPrefix, desc) : false;
 			})
-			.map(cmd => {
+			.map((cmd, index) => {
 				const name = "name" in cmd ? cmd.name : cmd.value;
 				const lowerName = name?.toLowerCase() ?? "";
 				const lowerDesc = cmd.description?.toLowerCase() ?? "";
@@ -833,11 +882,13 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					label: "name" in cmd ? cmd.name : cmd.label,
 					score: Math.max(nameScore, descScore),
 					priority,
+					matchRank: getSlashCommandMatchRank(lowerPrefix, lowerName),
+					index,
 					...(fullDesc && { description: fullDesc }),
-				} as AutocompleteItem & { score: number; priority: number };
+				} as AutocompleteItem & { score: number; priority: number; matchRank: number; index: number };
 			})
-			.sort((a, b) => b.priority - a.priority || b.score - a.score)
-			.map(({ score: _score, priority: _priority, ...rest }) => rest);
+			.sort((a, b) => a.matchRank - b.matchRank || b.priority - a.priority || b.score - a.score || a.index - b.index)
+			.map(({ score: _score, priority: _priority, matchRank: _matchRank, index: _index, ...rest }) => rest);
 
 		if (matches.length === 0) return null;
 		return { items: matches, prefix: textBeforeCursor };

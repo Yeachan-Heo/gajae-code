@@ -482,6 +482,28 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 ---
 
+## 11) Bridge mode (`--mode bridge`)
+
+Consumed by `packages/coding-agent/src/modes/bridge/*`. The bridge is a
+network-reachable control surface and is **secure-by-default**: it refuses to
+start without TLS and a bearer token, and the 0.3.1 default endpoint matrix
+fail-closes session events, commands, controller ownership, UI responses, host
+tool results, and host URI results. See `docs/bridge.md` for protocol details.
+
+| Variable | Required | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token required on authenticated endpoints. **Secret — never commit.** |
+| `GJC_BRIDGE_TLS_CERT` | Yes | — | Path to the TLS certificate (PEM). Startup fails closed if cert/key are missing (TLS is mandatory, including loopback). |
+| `GJC_BRIDGE_TLS_KEY` | Yes | — | Path to the TLS private key (PEM). **Secret — never commit; `chmod 600`.** |
+| `GJC_BRIDGE_HOST` | No | `127.0.0.1` | Bind hostname. |
+| `GJC_BRIDGE_PORT` | No | `4077` | Bind port (1–65535). |
+| `GJC_BRIDGE_SCOPES` | No | `prompt` | Parsed for dormant command-surface compatibility. Valid scopes: `prompt`, `control`, `bash`, `export`, `session`, `model`, `message:read`, `host_tools`, `host_uri`, `admin`. The default endpoint matrix still advertises no accepted scopes and rejects commands before scope checks. |
+
+Local development with a self-signed certificate must add the local CA to the
+client trust store; there is no plaintext or certificate-verification-bypass mode.
+
+---
+
 ## Security-sensitive variables
 
 Treat these as secrets; do not log or commit them:
@@ -490,5 +512,6 @@ Treat these as secrets; do not log or commit them:
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
 - Foundry mTLS material (`ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
+- Bridge auth/TLS material (`GJC_BRIDGE_TOKEN` and the `GJC_BRIDGE_TLS_KEY` private key; never commit cert/key/token material)
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).

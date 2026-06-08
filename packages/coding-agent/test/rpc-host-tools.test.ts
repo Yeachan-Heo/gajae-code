@@ -3,12 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentEvent } from "@gajae-code/agent-core";
-import { defineRpcClientTool, RpcClient } from "@gajae-code/coding-agent/modes";
 import { RpcHostToolBridge } from "@gajae-code/coding-agent/modes/rpc/host-tools";
+import { defineRpcClientTool, RpcClient } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
 import type {
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolUpdate,
+	RpcWorkflowGate,
 } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 
 const tempPaths: string[] = [];
@@ -115,6 +116,66 @@ describe("RpcHostToolBridge", () => {
 });
 
 describe("RpcClient custom tools", () => {
+	it("delivers workflow gates and answers with the schema-validated response contract", async () => {
+		const scriptPath = path.join(os.tmpdir(), `gjc-rpc-workflow-gate-${Date.now()}.js`);
+		tempPaths.push(scriptPath);
+		await Bun.write(
+			scriptPath,
+			`
+let buffer = "";
+function write(frame) { process.stdout.write(JSON.stringify(frame) + "\\n"); }
+write({ type: "ready" });
+process.stdin.on("data", chunk => {
+	buffer += chunk.toString("utf8");
+	let index = buffer.indexOf("\\n");
+	while (index !== -1) {
+		const line = buffer.slice(0, index).trim();
+		buffer = buffer.slice(index + 1);
+		if (line) handle(JSON.parse(line));
+		index = buffer.indexOf("\\n");
+	}
+});
+function handle(frame) {
+	if (frame.type === "prompt") {
+		write({ id: frame.id, type: "response", command: "prompt", success: true });
+		write({ type: "workflow_gate", gate_id: "gate-1", stage: "ralplan", kind: "approval", schema: { type: "boolean" }, schema_hash: "mock-schema-hash", context: { method: "confirm" }, created_at: new Date().toISOString(), required: true });
+		return;
+	}
+	if (frame.type === "workflow_gate_response") {
+		if (typeof frame.answer !== "boolean") {
+			write({ id: frame.id, type: "response", command: "workflow_gate_response", success: false, error: "invalid_workflow_gate_response: answer must be a boolean", errorCode: "invalid_workflow_gate_response" });
+			return;
+		}
+		write({ id: frame.id, type: "response", command: "workflow_gate_response", success: true, data: { gate_id: frame.gate_id, status: "accepted", answer_hash: "mock-answer-hash" } });
+		write({ type: "agent_end", messages: [] });
+	}
+}
+`,
+		);
+		const client = new RpcClient({ cliPath: scriptPath });
+		const gates: RpcWorkflowGate[] = [];
+		try {
+			await client.start();
+			client.onWorkflowGate(gate => gates.push(gate));
+			await client.prompt("Open gate");
+			await Bun.sleep(50);
+
+			expect(gates).toHaveLength(1);
+			expect(gates[0]).toMatchObject({
+				gate_id: "gate-1",
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "boolean" },
+				schema_hash: "mock-schema-hash",
+				required: true,
+			});
+			await expect(client.respondGate("gate-1", "yes")).rejects.toThrow("invalid_workflow_gate_response");
+			await client.respondGate("gate-1", true);
+			await client.waitForIdle(2_000);
+		} finally {
+			client.stop();
+		}
+	});
 	it("registers host custom tools and serves tool calls over the RPC transport", async () => {
 		const scriptPath = path.join(os.tmpdir(), `gjc-rpc-host-tools-${Date.now()}.js`);
 		tempPaths.push(scriptPath);

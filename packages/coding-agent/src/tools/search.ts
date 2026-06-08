@@ -280,6 +280,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const scope = await resolveToolSearchScope({
 					rawPaths: resolvedPaths,
 					cwd: this.session.cwd,
+					getArtifactsDir: this.session.getArtifactsDir,
 					internalUrlAction: "search",
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,

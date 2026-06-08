@@ -4,6 +4,8 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
+import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
@@ -17,6 +19,7 @@ import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import { buildAgentSubskillInjection } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -121,6 +124,7 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
+	parentSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -1092,6 +1096,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
+					options.parentSessionId,
 				),
 			);
 			if (authFallbackUsed && model) {
@@ -1155,6 +1160,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live; use IRC for live coordination when enabled.`
 				: "";
 
+			const agentSubskillBlock = await buildAgentSubskillInjection({
+				cwd,
+				sessionId: options.parentSessionId,
+				agentName: agent.name,
+			});
+
 			const { session } = await awaitAbortable(
 				createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1181,14 +1192,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							ircSelfId: ircEnabled ? id : "",
 							forkContext: forkContextNotice,
 						});
+						const promptWithSubskills = `${subagentPrompt}${agentSubskillBlock}`;
 						return defaultPrompt.length === 0
-							? [subagentPrompt]
-							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+							? [promptWithSubskills]
+							: [...defaultPrompt.slice(0, -1), promptWithSubskills, defaultPrompt[defaultPrompt.length - 1]];
 					},
 					sessionManager,
 					hasUI: false,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
+					currentAgentType: agent.name,
+					gjcSubskillToolContext: {
+						cwd,
+						sessionId: options.parentSessionId,
+						parent: agent.name,
+						phase: "prompt",
+					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
 					agentId: id,
@@ -1536,18 +1555,39 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	// Write output artifact (input and jsonl already written in real-time)
 	// Compute output metadata for agent:// URL integration
-	let outputMeta: { lineCount: number; charCount: number } | undefined;
+	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
 	let outputPath: string | undefined;
 	if (options.artifactsDir) {
-		outputPath = path.join(options.artifactsDir, `${id}.md`);
+		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
 		try {
-			await Bun.write(outputPath, rawOutput);
+			await Bun.write(candidateOutputPath, rawOutput);
+			const byteSize = Buffer.byteLength(rawOutput, "utf8");
+			const lineCount = rawOutput.split("\n").length;
+			const sha256 = createHash("sha256").update(rawOutput).digest("hex");
+			const createdAt = new Date().toISOString();
+			await Bun.write(
+				`${candidateOutputPath}.meta.json`,
+				JSON.stringify({ id, kind: "agent-output", sizeBytes: byteSize, lineCount, sha256, createdAt }, null, 2),
+			);
+			outputPath = candidateOutputPath;
 			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
+				lineCount,
 				charCount: rawOutput.length,
+				byteSize,
+				sha256,
 			};
 		} catch {
-			// Non-fatal
+			// Output or metadata write failed: never advertise an unverifiable
+			// artifact. Best-effort remove any orphaned `.md`/sidecar so a later
+			// agent:// read cannot serve unverified content. Non-fatal.
+			outputPath = undefined;
+			outputMeta = undefined;
+			try {
+				await fs.rm(candidateOutputPath, { force: true });
+				await fs.rm(`${candidateOutputPath}.meta.json`, { force: true });
+			} catch {
+				// best-effort cleanup; ignore
+			}
 		}
 	}
 

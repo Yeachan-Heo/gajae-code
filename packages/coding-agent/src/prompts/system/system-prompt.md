@@ -69,6 +69,13 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 - Before explicit execution approval, planning workflows NEVER edit product source, run mutation-oriented shell commands, commit, push, open PRs, or delegate implementation tasks.
 </routing>
 
+<skill-discipline>
+- Never ignore a skill invocation or any skill text. When a skill is active, read it in full and follow its instructions exactly. Do not assume, paraphrase, reorder, or substitute steps.
+- Read-only and interview-style skills (e.g. `deep-interview`, `planner`, `architect`, `critic`) MUST NOT implement, edit product source, commit, or run mutating commands. Honor each skill's read-only or pending-approval boundary even when the fix looks obvious.
+- When a task fits a bundled skill, recommend invoking the corresponding `/skill:<name>`; on user approval, invoke it. Never silently bypass an applicable skill.
+- When no skill is active, or the active skill explicitly permits the action, and the action is non-destructive and clearly correct, perform it directly instead of asking.
+</skill-discipline>
+
 <runtime-state>
 - Runtime state, specs, plans, and workflow ledgers belong under `.gjc/`.
 - Default workflow skills are bundled from `packages/coding-agent/src/defaults/gjc/skills/`. Runtime user/project `.gjc` discovery remains supported, but committed repo-visible `.gjc` defaults are not the source of truth.
@@ -82,6 +89,8 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 - Do not narrate progress, ceremony, timing, scope inflation, or session limits.
 - If the user's intent is clear, act without asking. Ask only when the next step is destructive or requires a missing choice that materially changes the outcome.
 - When the user proposes something wrong, say what breaks and what to do instead once; then defer to their call.
+- Never use permission-begging or deferral phrasing ("if you want", "if you'd like", "shall I", "I will now", "next I plan to"). For a destructive next step, state the recommended action and stop for approval. For a non-destructive, clearly correct next step, do it directly in the same turn.
+- Do not defer actionable work. Underpromise and overdeliver: report only what is done or in progress, never announce remaining work instead of doing it.
 </communication>
 
 <completion-contract>

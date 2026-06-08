@@ -1,19 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
 import { readLease } from "../../src/harness-control-plane/session-lease";
+import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const SID = "d";
 const FAKE_RPC = path.join(import.meta.dir, "fixtures", "fake-rpc.ts");
 
+function gitInit(dir: string): void {
+	const run = (args: string[]): void => {
+		const r = Bun.spawnSync(["git", ...args], { cwd: dir, stdout: "ignore", stderr: "ignore" });
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
+	};
+	run(["init"]);
+	run(["config", "user.email", "test@example.com"]);
+	run(["config", "user.name", "Test"]);
+	run(["commit", "--allow-empty", "-m", "init"]);
+}
+
 let root: string;
 let workspace: string;
 let tmuxCommand: string;
 let rpcCommandEnv: string;
+let cliEnv: HarnessCliEnv;
 
 async function createFakeTmuxBin(
 	rootDir: string,
@@ -55,7 +68,7 @@ async function runHarness(args: string[]): Promise<{ code: number; json: Record<
 	const proc = Bun.spawn(["bun", cliEntry, "harness", ...args], {
 		cwd: workspace,
 		env: {
-			...process.env,
+			...cliEnv.env,
 			GJC_HARNESS_STATE_ROOT: root,
 			// Drive the REAL GajaeCodeRpc against a protocol fixture (no shipped fake seam).
 			GJC_HARNESS_RPC_COMMAND: rpcCommandEnv,
@@ -81,11 +94,13 @@ beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
+	cliEnv = createHarnessCliEnv(repoRoot);
 	tmuxCommand = await createFakeTmuxBin(root);
 	rpcCommandEnv = JSON.stringify(["bun", FAKE_RPC]);
 });
 
 afterEach(async () => {
+	cliEnv.cleanup();
 	// Safety net: kill any lingering detached owner.
 	try {
 		const lease = await readLease(root, SID);
@@ -173,7 +188,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
 	}, 60_000);
 
-	it("blocks start when tmux ghosts and detached owner endpoint is not routable", async () => {
+	it("reports blocked only after detached owner endpoint remains unavailable", async () => {
 		tmuxCommand = await createFakeTmuxBin(root, { skipOwnerLaunch: true });
 		const originalRpcCommandEnv = rpcCommandEnv;
 		rpcCommandEnv = "{";
@@ -202,7 +217,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			expect(submit.json?.nextAllowedActions).toContainEqual({
 				verb: "submit",
 				available: false,
-				reason: "owner-not-live",
+				reason: "lifecycle-blocked",
 			});
 		} finally {
 			rpcCommandEnv = originalRpcCommandEnv;
@@ -223,5 +238,91 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 
 		const ret = await runHarness(["retire", "--session", SID]);
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
+	it("recover bootstraps an owner for a started session whose owner was never spawned (#421)", async () => {
+		gitInit(workspace);
+		// start WITHOUT --detach persists a `started` session with no owner lease/endpoint.
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		expect((started.json?.evidence as Record<string, unknown>).ownerRuntime).toBe("manual");
+
+		// recover must bootstrap a fresh owner instead of deadlocking on the missing prior endpoint.
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		expect(evidence.restoredOwner).toBeUndefined();
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
+	it("recover bootstraps a never-started owner even when the workspace is not a git repo (#421)", async () => {
+		// No gitInit: a bare workspace reports git delta `unknown`, so the vanish classifier
+		// returns `human-check` / `ownerRequired: false`. Bootstrap must not be gated on that.
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		expect((evidence.decision as Record<string, unknown>).ownerRequired).toBe(false);
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
+	it("recover bootstraps a never-started owner in a dirty worktree without a vanish receipt and preserves the delta (#421)", async () => {
+		gitInit(workspace);
+		// Pre-existing uncommitted work makes the git delta `dirty` (classifier:
+		// restart-preserve-delta, ownerRequired:true). A never-started owner never touched this
+		// work, so bootstrapping it is by-design NOT a vanish — no receipt, no stash/reset.
+		const dirtyFile = path.join(workspace, "uncommitted.txt");
+		await writeFile(dirtyFile, "user-work", "utf8");
+
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		// By design: a never-started owner is not a vanish, so no vanish receipt is written
+		// even though the worktree is dirty.
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		const decision = evidence.decision as Record<string, unknown>;
+		expect(decision.classification).toBe("restart-preserve-delta");
+		expect(decision.ownerRequired).toBe(true);
+		expect((evidence.observation as Record<string, unknown>).gitDelta).toBe("dirty");
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		// The pre-existing uncommitted work is left untouched (never stashed or reset).
+		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		// retire routes to the live owner, which stops cleanly without mutating the worktree.
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
 	}, 60_000);
 });

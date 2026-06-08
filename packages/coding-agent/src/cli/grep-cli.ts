@@ -98,7 +98,7 @@ export async function runGrepCommand(cmd: GrepCommandArgs): Promise<void> {
 		console.log(chalk.green(`Files with matches: ${result.filesWithMatches}`));
 		console.log(chalk.green(`Files searched: ${result.filesSearched}`));
 		if (result.limitReached) {
-			console.log(chalk.yellow(`Limit reached: true`));
+			console.log(chalk.yellow(`Result limit reached (${cmd.limit} matches). Use --limit to show more.`));
 		}
 		console.log("");
 

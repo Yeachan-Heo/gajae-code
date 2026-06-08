@@ -8,6 +8,8 @@ import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
+import type { LoadedSubskillActivation } from "./gjc-plugins";
+import { buildSubskillInjection } from "./gjc-plugins/injection";
 export interface Skill {
 	name: string;
 	description: string;
@@ -280,6 +282,14 @@ export interface BuiltSkillPromptMessage {
 	details: SkillPromptDetails;
 }
 
+export interface BuildSkillPromptMessageContext {
+	subskillActivation?: LoadedSubskillActivation;
+	subskillActivationSet?: LoadedSubskillActivation[];
+	currentPhase?: string;
+	cwd?: string;
+	sessionId?: string;
+}
+
 export function getSkillSlashCommandName(skill: Pick<Skill, "name">): string {
 	return `skill:${skill.name}`;
 }
@@ -370,6 +380,7 @@ export function resolveSkillSlashCommands(
 export async function buildSkillPromptMessage(
 	skill: Pick<Skill, "name" | "filePath" | "content">,
 	args: string,
+	context?: BuildSkillPromptMessageContext,
 ): Promise<BuiltSkillPromptMessage> {
 	const content = typeof skill.content === "string" ? skill.content : await Bun.file(skill.filePath).text();
 	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
@@ -378,14 +389,35 @@ export async function buildSkillPromptMessage(
 	if (trimmedArgs) {
 		metaLines.push(`User: ${trimmedArgs}`);
 	}
-	const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+	let message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+	const details: SkillPromptDetails = {
+		name: skill.name,
+		path: skill.filePath,
+		args: trimmedArgs || undefined,
+		lineCount: body ? body.split("\n").length : 0,
+	};
+	if (context?.subskillActivationSet) {
+		details.subskillActivationSet = context.subskillActivationSet;
+	}
+	if (context) {
+		const injection = context.cwd
+			? await buildSubskillInjection({
+					cwd: context.cwd,
+					sessionId: context.sessionId,
+					skillName: skill.name,
+					activation: context.subskillActivation,
+					currentPhase: context.currentPhase,
+				})
+			: null;
+		if (injection) {
+			message += injection.block;
+			details.subskillActivation = injection.details ?? context.subskillActivation;
+		} else if (context.subskillActivation) {
+			details.subskillActivation = context.subskillActivation;
+		}
+	}
 	return {
 		message,
-		details: {
-			name: skill.name,
-			path: skill.filePath,
-			args: trimmedArgs || undefined,
-			lineCount: body ? body.split("\n").length : 0,
-		},
+		details,
 	};
 }

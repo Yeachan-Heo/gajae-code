@@ -40,7 +40,9 @@ export interface SessionStorage {
 	readTextPrefix(path: string, maxBytes: number): Promise<string>;
 	writeText(path: string, content: string): Promise<void>;
 	rename(path: string, nextPath: string): Promise<void>;
+	renameSync(path: string, nextPath: string): void;
 	unlink(path: string): Promise<void>;
+	unlinkSync(path: string): void;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
 }
@@ -198,8 +200,20 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	renameSync(path: string, nextPath: string): void {
+		try {
+			fs.renameSync(path, nextPath);
+		} catch (err) {
+			throw toError(err);
+		}
+	}
+
 	unlink(path: string): Promise<void> {
 		return fs.promises.unlink(path);
+	}
+
+	unlinkSync(path: string): void {
+		fs.unlinkSync(path);
 	}
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
@@ -375,10 +389,22 @@ export class MemorySessionStorage implements SessionStorage {
 		return Promise.resolve();
 	}
 
+	renameSync(path: string, nextPath: string): void {
+		const entry = this.#files.get(path);
+		if (!entry) throw new Error(`File not found: ${path}`);
+		this.#files.set(nextPath, entry);
+		this.#files.delete(path);
+	}
+
 	unlink(path: string): Promise<void> {
 		this.#files.delete(path);
 		return Promise.resolve();
 	}
+
+	unlinkSync(path: string): void {
+		this.#files.delete(path);
+	}
+
 	deleteSessionWithArtifacts(_sessionPath: string): Promise<void> {
 		return Promise.resolve();
 	}

@@ -1,4 +1,5 @@
 import { Editor, type KeyId, matchesKey, parseKittySequence } from "@gajae-code/tui";
+import { BracketedPasteHandler } from "@gajae-code/tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
 
 type ConfigurableEditorAction = Extract<
@@ -40,6 +41,11 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
 };
 
+const PASTE_DECISION_TIMEOUT_MS = 5_000;
+const PENDING_PASTE_INPUT_MAX = 64;
+
+type PastePendingClearReason = "timeout" | "queue-limit";
+
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
@@ -63,6 +69,10 @@ export class CustomEditor extends Editor {
 	onCopyPrompt?: () => void;
 	/** Called when the configured image-paste shortcut is pressed. */
 	onPasteImage?: () => Promise<boolean>;
+	/** Called before bracketed paste content is inserted. Return true to consume it. */
+	onPasteText?: (text: string) => boolean | Promise<boolean>;
+	/** Called when async paste handling drops queued input instead of replaying it. */
+	onPastePendingInputCleared?: (reason: PastePendingClearReason, droppedInputCount: number) => void;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
 	/** Called when Caps Lock is pressed. */
@@ -73,6 +83,11 @@ export class CustomEditor extends Editor {
 	#actionKeys = new Map<ConfigurableEditorAction, KeyId[]>(
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
+	#pasteHandler = new BracketedPasteHandler();
+	#pasteDecisionPending = false;
+	#pasteDecisionToken = 0;
+	#pasteDecisionTimeout: NodeJS.Timeout | undefined;
+	#pendingPasteInput: string[] = [];
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
 		this.#actionKeys.set(action, [...keys]);
@@ -108,7 +123,84 @@ export class CustomEditor extends Editor {
 		this.#customKeyHandlers.clear();
 	}
 
+	#clearPasteDecisionTimeout(): void {
+		if (this.#pasteDecisionTimeout) {
+			clearTimeout(this.#pasteDecisionTimeout);
+			this.#pasteDecisionTimeout = undefined;
+		}
+	}
+
+	#clearPendingPasteState(): number {
+		this.#clearPasteDecisionTimeout();
+		this.#pasteDecisionPending = false;
+		this.#pasteDecisionToken += 1;
+		const droppedInputCount = this.#pendingPasteInput.length;
+		this.#pendingPasteInput = [];
+		return droppedInputCount;
+	}
+
+	#startPasteDecisionTimeout(token: number): void {
+		this.#clearPasteDecisionTimeout();
+		this.#pasteDecisionTimeout = setTimeout(() => {
+			if (token !== this.#pasteDecisionToken) return;
+			const droppedInputCount = this.#clearPendingPasteState();
+			this.onPastePendingInputCleared?.("timeout", droppedInputCount);
+		}, PASTE_DECISION_TIMEOUT_MS);
+		this.#pasteDecisionTimeout.unref?.();
+	}
+
+	dispose(): void {
+		this.#clearPendingPasteState();
+		this.#pasteHandler = new BracketedPasteHandler();
+	}
+
+	#drainPendingPasteInput(initialInput?: string): void {
+		if (initialInput && initialInput.length > 0) {
+			this.handleInput(initialInput);
+		}
+		while (!this.#pasteDecisionPending) {
+			const nextInput = this.#pendingPasteInput.shift();
+			if (nextInput === undefined) break;
+			this.handleInput(nextInput);
+		}
+	}
+
+	#handleBracketedPaste(pasteContent: string, remaining: string): void {
+		const applyPasteResult = (token: number, handled: boolean | undefined) => {
+			if (token !== this.#pasteDecisionToken) return;
+			this.#clearPasteDecisionTimeout();
+			if (!handled) {
+				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
+			}
+			this.#pasteDecisionPending = false;
+			this.#drainPendingPasteInput(remaining);
+		};
+		const pasteResult = this.onPasteText?.(pasteContent);
+
+		if (pasteResult instanceof Promise) {
+			const token = this.#pasteDecisionToken + 1;
+			this.#pasteDecisionToken = token;
+			this.#pasteDecisionPending = true;
+			this.#startPasteDecisionTimeout(token);
+			void pasteResult.then(
+				handled => applyPasteResult(token, handled),
+				() => applyPasteResult(token, false),
+			);
+		} else {
+			applyPasteResult(this.#pasteDecisionToken, pasteResult);
+		}
+	}
+
 	handleInput(data: string): void {
+		if (this.#pasteDecisionPending) {
+			this.#pendingPasteInput.push(data);
+			if (this.#pendingPasteInput.length > PENDING_PASTE_INPUT_MAX) {
+				const droppedInputCount = this.#clearPendingPasteState();
+				this.onPastePendingInputCleared?.("queue-limit", droppedInputCount);
+			}
+			return;
+		}
+
 		const parsed = parseKittySequence(data);
 		if (parsed && (parsed.modifier & 64) !== 0 && this.onCapsLock) {
 			// Caps Lock is modifier bit 64
@@ -116,6 +208,15 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		if (this.onPasteText) {
+			const paste = this.#pasteHandler.process(data);
+			if (paste.handled) {
+				if (paste.pasteContent !== undefined) {
+					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
+				}
+				return;
+			}
+		}
 		// Intercept configured image paste (async - fires and handles result)
 		if (this.#matchesAction(data, "app.clipboard.pasteImage") && this.onPasteImage) {
 			void this.onPasteImage();

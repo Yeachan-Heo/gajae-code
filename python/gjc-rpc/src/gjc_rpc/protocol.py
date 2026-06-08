@@ -19,6 +19,7 @@ StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
 TodoStatus: TypeAlias = Literal["pending", "in_progress", "completed", "abandoned"]
+WorkflowGateKind: TypeAlias = Literal["question", "approval", "execution"]
 ExtensionUiMethod: TypeAlias = Literal[
     "select",
     "confirm",
@@ -43,6 +44,7 @@ INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]]
 )
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset({"select", "input", "editor"})
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+_WORKFLOW_GATE_KIND_VALUES: Final[frozenset[str]] = frozenset({"question", "approval", "execution"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset({"stop", "length", "toolUse", "error", "aborted"})
@@ -811,6 +813,17 @@ class ExtensionUiRequest:
 
 
 @dataclass(slots=True, frozen=True)
+class WorkflowGateEvent:
+    gate_id: str
+    stage: str
+    kind: WorkflowGateKind
+    schema: JsonObject
+    options: tuple[str, ...] | None = None
+    context: JsonObject | None = None
+    type: Literal["workflow_gate"] = "workflow_gate"
+
+
+@dataclass(slots=True, frozen=True)
 class ExtensionError:
     extension_path: str
     event: str
@@ -962,6 +975,29 @@ class UnknownNotification:
     type: Literal["unknown"] = "unknown"
 
 
+
+@dataclass(slots=True, frozen=True)
+class WorkflowGateOption:
+    value: JsonValue
+    label: str
+    description: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class WorkflowGate:
+    """A machine-addressable workflow gate (#316/#317 over RPC, #322 client)."""
+
+    gate_id: str
+    stage: str
+    kind: str
+    schema: JsonValue
+    schema_hash: str
+    context: JsonObject
+    created_at: str
+    options: tuple[WorkflowGateOption, ...] | None = None
+    type: Literal["workflow_gate"] = "workflow_gate"
+
+
 RpcAgentEvent: TypeAlias = (
     AgentStartEvent
     | AgentEndEvent
@@ -984,7 +1020,9 @@ RpcAgentEvent: TypeAlias = (
     | TodoAutoClearEvent
 )
 
-RpcNotification: TypeAlias = ReadyEvent | ExtensionUiRequest | ExtensionError | RpcAgentEvent | UnknownNotification
+RpcNotification: TypeAlias = (
+    ReadyEvent | ExtensionUiRequest | ExtensionError | RpcAgentEvent | WorkflowGate | UnknownNotification
+)
 
 
 def image_from_path(path: str | Path, mime_type: str | None = None) -> ImageContent:
@@ -1284,11 +1322,54 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
     )
 
 
+def parse_workflow_gate_event(payload: JsonObject) -> WorkflowGateEvent:
+    return WorkflowGateEvent(
+        gate_id=_require_str(payload, "gate_id"),
+        stage=_require_str(payload, "stage"),
+        kind=cast(
+            WorkflowGateKind,
+            _require_literal(payload.get("kind"), _WORKFLOW_GATE_KIND_VALUES, field="workflow_gate.kind"),
+        ),
+        schema=_clone_json_object(payload.get("schema"), field="workflow_gate.schema"),
+        options=_tuple_of_strings(payload.get("options"), field="workflow_gate.options"),
+        context=_optional_json_object(payload.get("context"), field="workflow_gate.context") or {},
+    )
+
+
 def parse_extension_error(payload: JsonObject) -> ExtensionError:
     return ExtensionError(
         extension_path=_require_str(payload, "extensionPath"),
         event=_require_str(payload, "event"),
         error=_require_str(payload, "error"),
+    )
+
+
+def parse_workflow_gate(payload: JsonObject) -> WorkflowGate:
+    raw_options = payload.get("options")
+    options: tuple[WorkflowGateOption, ...] | None = None
+    if isinstance(raw_options, list):
+        parsed: list[WorkflowGateOption] = []
+        for entry in raw_options:
+            if isinstance(entry, dict):
+                parsed.append(
+                    WorkflowGateOption(
+                        value=_clone_json_value(entry.get("value"), field="workflow_gate.option.value"),
+                        label=_require_str(cast(JsonObject, entry), "label"),
+                        description=_optional_str(cast(JsonObject, entry), "description"),
+                    )
+                )
+        options = tuple(parsed)
+    raw_context = payload.get("context")
+    context = cast(JsonObject, raw_context) if isinstance(raw_context, dict) else {}
+    return WorkflowGate(
+        gate_id=_require_str(payload, "gate_id"),
+        stage=_require_str(payload, "stage"),
+        kind=_require_str(payload, "kind"),
+        schema=_clone_json_value(payload.get("schema"), field="workflow_gate.schema"),
+        schema_hash=_require_str(payload, "schema_hash"),
+        context=context,
+        created_at=_require_str(payload, "created_at"),
+        options=options,
     )
 
 
@@ -1298,6 +1379,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return ReadyEvent()
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
+    if event_type == "workflow_gate":
+        return parse_workflow_gate(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
     if event_type == "agent_start":

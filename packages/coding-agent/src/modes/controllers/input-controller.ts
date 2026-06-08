@@ -1,8 +1,10 @@
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -13,7 +15,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../sessio
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { ensureSupportedImageInput } from "../../utils/image-loading";
+import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 
@@ -22,6 +24,8 @@ interface Expandable {
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+const CLIPBOARD_TEMP_IMAGE_FILE_PATTERN = /^clipboard-\d{4}-\d{2}-\d{2}-\d{6}-[A-Za-z0-9]+\.(?:png|jpe?g|gif|webp)$/i;
+const MACOS_CLIPBOARD_TEMP_DIR_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T$/;
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
@@ -30,8 +34,17 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
-	#abortInteractive(): Promise<void> {
-		return this.ctx.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS, cause: "user_interrupt" });
+	/** Set after a first Esc silently consumes a queued steer. Kept until the
+	 *  queued steer is either cancelled by a second Esc or drained by continuation,
+	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
+	#steerConsumePending = false;
+
+	#abortInteractive(options?: { silent?: boolean }): Promise<void> {
+		return this.ctx.session.abort({
+			timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS,
+			cause: "user_interrupt",
+			silent: options?.silent,
+		});
 	}
 
 	setupKeyHandlers(): void {
@@ -40,6 +53,7 @@ export class InputController {
 			Boolean(
 				this.ctx.loadingAnimation ||
 					this.ctx.hasActiveBtw() ||
+					(this.#steerConsumePending && this.ctx.session.hasQueuedSteering) ||
 					this.ctx.session.isStreaming ||
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isGeneratingHandoff ||
@@ -53,6 +67,17 @@ export class InputController {
 		this.ctx.editor.onEscape = () => {
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
+			}
+			if (this.#steerConsumePending) {
+				if (this.ctx.session.hasQueuedSteering) {
+					// Second Esc before the scheduled steer continuation drains the
+					// queue: restore/drop the queued steer and perform a real abort,
+					// even if abort cleanup already made the session look idle.
+					this.#steerConsumePending = false;
+					this.restoreQueuedMessagesToEditor({ abort: true });
+					return;
+				}
+				this.#steerConsumePending = false;
 			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
@@ -73,7 +98,15 @@ export class InputController {
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isStreaming) {
-				void this.#abortInteractive();
+				if (this.ctx.session.hasQueuedSteering && !this.#steerConsumePending) {
+					// First Esc with a queued steer: silently consume it and
+					// auto-continue via steer-on-interrupt instead of stalling on
+					// "Operation aborted".
+					this.#steerConsumePending = true;
+					void this.#abortInteractive({ silent: true });
+				} else {
+					void this.#abortInteractive();
+				}
 			} else if (!this.ctx.editor.getText().trim()) {
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
 				const action = settings.get("doubleEscapeAction");
@@ -132,6 +165,13 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
 		);
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
+		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
+		this.ctx.editor.onPastePendingInputCleared = (reason, droppedInputCount) => {
+			const reasonText = reason === "timeout" ? "timed out" : "exceeded the input queue limit";
+			this.ctx.showWarning(
+				`Paste handling ${reasonText}; discarded ${droppedInputCount} buffered input event${droppedInputCount === 1 ? "" : "s"}.`,
+			);
+		};
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
@@ -169,6 +209,9 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.observe")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionObserver());
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.jobs.open")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showJobsOverlay());
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -430,9 +473,20 @@ export class InputController {
 			for (let index = 0; index < invocations.length; index += 1) {
 				const invocation = invocations[index];
 				if (!invocation) continue;
-				const built = await buildSkillPromptMessage(invocation.skill, invocation.args);
+				const activationResult = await resolveSubskillActivationForSkillInvocation({
+					cwd: this.ctx.sessionManager.getCwd(),
+					sessionId: this.ctx.session.sessionId,
+					skillName: invocation.skill.name,
+					args: invocation.args,
+				});
+				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
+					subskillActivation: activationResult.activation,
+					subskillActivationSet: activationResult.activeSubskillsToPersist,
+					cwd: this.ctx.sessionManager.getCwd(),
+					sessionId: this.ctx.session.sessionId,
+				});
 				const details: SkillPromptDetails = built.details;
-				const displayText = `/${invocation.commandName}${invocation.args ? ` ${invocation.args}` : ""}`;
+				const displayText = `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`;
 				// When the agent is streaming, register a compact slash-form text as
 				// the pending-display twin BEFORE dispatching the CustomMessage. The
 				// returned tag is embedded in details so AgentSession.#handleAgentEvent
@@ -602,6 +656,55 @@ export class InputController {
 		process.kill(0, "SIGTSTP");
 	}
 
+	handleTextPaste(text: string): boolean | Promise<boolean> {
+		const imagePath = this.#getPastedImagePathCandidate(text);
+		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
+	}
+
+	async #attachPastedImagePath(imagePath: string): Promise<boolean> {
+		try {
+			const image = await loadImageInput({
+				path: imagePath,
+				cwd: this.ctx.sessionManager.getCwd(),
+				autoResize: this.ctx.settings.get("images.autoResize"),
+			});
+			if (!image) {
+				this.ctx.showStatus("Unsupported pasted clipboard image file");
+				return true;
+			}
+
+			this.ctx.pendingImages.push({
+				type: "image",
+				data: image.data,
+				mimeType: image.mimeType,
+			});
+			this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
+			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
+			this.ctx.ui.requestRender();
+			return true;
+		} catch (error) {
+			if (error instanceof ImageInputTooLargeError) {
+				this.ctx.showStatus(error.message);
+				return true;
+			}
+			this.ctx.showStatus("Failed to attach pasted clipboard image");
+			return true;
+		}
+	}
+
+	#getPastedImagePathCandidate(text: string): string | undefined {
+		const resolvedPath = path.resolve(text.trim());
+		const parentDir = path.dirname(resolvedPath);
+		const isClipboardTempPath =
+			(parentDir === "/tmp" || MACOS_CLIPBOARD_TEMP_DIR_PATTERN.test(parentDir)) &&
+			CLIPBOARD_TEMP_IMAGE_FILE_PATTERN.test(path.basename(resolvedPath));
+		return isClipboardTempPath ? resolvedPath : undefined;
+	}
+
+	#nextImagePlaceholder(): string {
+		return `[image ${this.ctx.pendingImages.length}]`;
+	}
+
 	async handleImagePaste(): Promise<boolean> {
 		try {
 			const image = await readImageFromClipboard();
@@ -616,7 +719,7 @@ export class InputController {
 					this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
 					return false;
 				}
-				if (settings.get("images.autoResize")) {
+				if (this.ctx.settings.get("images.autoResize")) {
 					try {
 						const resized = await resizeImage({
 							type: "image",
@@ -634,10 +737,7 @@ export class InputController {
 					data: imageData.data,
 					mimeType: imageData.mimeType,
 				});
-				// Insert placeholder at cursor like Anthropic model does
-				const imageNum = this.ctx.pendingImages.length;
-				const placeholder = `[Image #${imageNum}]`;
-				this.ctx.editor.insertText(`${placeholder} `);
+				this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
 				this.ctx.ui.requestRender();
 				return true;
 			}

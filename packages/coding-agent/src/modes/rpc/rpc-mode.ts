@@ -10,7 +10,7 @@
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
-import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
+import * as path from "node:path";
 import { $env, readJsonl, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
@@ -20,6 +20,11 @@ import type {
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
+import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
+import { rpcError as error } from "../shared/agent-wire/responses";
+import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
+import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
+import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import type {
@@ -28,11 +33,9 @@ import type {
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
-	RpcHostToolDefinition,
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcResponse,
-	RpcSessionState,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -54,30 +57,6 @@ type RpcOutput = (
 		| object,
 ) => void;
 
-function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
-	return tools.map((tool, index) => {
-		const name = typeof tool.name === "string" ? tool.name.trim() : "";
-		if (!name) {
-			throw new Error(`Host tool at index ${index} must provide a non-empty name`);
-		}
-		const description = typeof tool.description === "string" ? tool.description.trim() : "";
-		if (!description) {
-			throw new Error(`Host tool "${name}" must provide a non-empty description`);
-		}
-		if (!tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters)) {
-			throw new Error(`Host tool "${name}" must provide a JSON Schema object`);
-		}
-		const label = typeof tool.label === "string" && tool.label.trim() ? tool.label.trim() : name;
-		return {
-			name,
-			label,
-			description,
-			parameters: tool.parameters,
-			hidden: tool.hidden === true,
-		};
-	});
-}
-
 function parseValueDialogResponse(
 	response: RpcExtensionUIResponse,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
@@ -95,6 +74,15 @@ function shouldEmitRpcTitles(): boolean {
 	if (!raw) return false;
 	const normalized = raw.trim().toLowerCase();
 	return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "exceeded" | "aborted" | "info" {
+	if (event.includes("denied")) return "denied";
+	if (event.includes("exceeded")) return "exceeded";
+	if (event.includes("abort")) return "aborted";
+	if (event.includes("rejected") || event.includes("conflict")) return "rejected";
+	if (event.includes("accepted") || event.includes("negotiated") || event.includes("emitted")) return "accepted";
+	return "info";
 }
 
 export function requestRpcEditor(
@@ -181,24 +169,62 @@ export async function runRpcMode(
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
-	const success = <T extends RpcCommand["type"]>(
-		id: string | undefined,
-		command: T,
-		data?: object | null,
-	): RpcResponse => {
-		if (data === undefined) {
-			return { id, type: "response", command, success: true } as RpcResponse;
-		}
-		return { id, type: "response", command, success: true, data } as RpcResponse;
-	};
-
-	const error = (id: string | undefined, command: string, message: string): RpcResponse => {
-		return { id, type: "response", command, success: false, error: message };
-	};
-
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
+	const auditLog = new UnattendedAuditLog(defaultAuditPath(session.sessionId, session.sessionManager.getCwd()), {
+		redactAnswers: true,
+	});
+	const recordAudit = (event: { event: string; [key: string]: unknown }) => {
+		const payload =
+			typeof event.payload === "object" && event.payload !== null
+				? (event.payload as Record<string, unknown>)
+				: undefined;
+		const gateId =
+			typeof event.gate_id === "string"
+				? event.gate_id
+				: typeof payload?.gate_id === "string"
+					? payload.gate_id
+					: undefined;
+		auditLog.record({
+			run_id: session.sessionId,
+			session_id: session.sessionId,
+			actor: typeof event.actor === "string" ? event.actor : undefined,
+			event: event.event,
+			outcome: auditOutcomeFor(event.event),
+			dedupe_key: `${event.event}:${gateId ?? "run"}:${JSON.stringify(payload ?? event)}`,
+			gate_id: gateId,
+			stage: typeof event.stage === "string" ? (event.stage as never) : undefined,
+			kind: typeof event.kind === "string" ? (event.kind as never) : undefined,
+			scope: typeof payload?.scope === "string" ? payload.scope : undefined,
+			action: typeof payload?.action === "string" ? payload.action : undefined,
+			budget: event.event === "budget_exceeded" ? (payload as never) : undefined,
+			answer_hash: typeof event.answer_hash === "string" ? event.answer_hash : undefined,
+			error: payload && event.event.endsWith("denied") ? payload : undefined,
+		});
+	};
+	// Unattended control plane (#318/#319/#323/G011): routes negotiate_unattended +
+	// workflow_gate_response and lets skill runtimes emit gates over RPC.
+	const gateStore = new FileGateStore(
+		path.join(session.sessionManager.getCwd(), ".gjc", "state", "workflow-gates", `${session.sessionId}.json`),
+	);
+	const unattendedControlPlane = new UnattendedSessionControlPlane({
+		runId: session.sessionId,
+		sessionId: session.sessionId,
+		emitFrame: gate => output(gate),
+		store: gateStore,
+		audit: recordAudit,
+		getUsageSnapshot: () => {
+			const stats = session.getSessionStats();
+			return { tokens: stats.tokens.total, costUsd: stats.cost };
+		},
+	});
+	unattendedControlPlane
+		.recover()
+		.catch(err =>
+			output(error(undefined, "workflow_gate_recover", err instanceof Error ? err.message : String(err))),
+		);
+	session.setWorkflowGateEmitter(unattendedControlPlane);
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -450,345 +476,17 @@ export async function runRpcMode(
 		output(event);
 	});
 
-	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
-		const id = command.id;
-
-		switch (command.type) {
-			// =================================================================
-			// Prompting
-			// =================================================================
-
-			case "prompt": {
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-					})
-					.catch(e => output(error(id, "prompt", e.message)));
-				return success(id, "prompt");
-			}
-
-			case "steer": {
-				await session.steer(command.message, command.images);
-				return success(id, "steer");
-			}
-
-			case "follow_up": {
-				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
-			}
-
-			case "abort": {
-				await session.abort();
-				return success(id, "abort");
-			}
-
-			case "abort_and_prompt": {
-				await session.abort();
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
-				return success(id, "abort_and_prompt");
-			}
-
-			case "new_session": {
-				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-				const cancelled = !(await session.newSession(options));
-				return success(id, "new_session", { cancelled });
-			}
-
-			// =================================================================
-			// State
-			// =================================================================
-
-			case "get_state": {
-				const state: RpcSessionState = {
-					model: session.model,
-					thinkingLevel: session.thinkingLevel,
-					isStreaming: session.isStreaming,
-					isCompacting: session.isCompacting,
-					steeringMode: session.steeringMode,
-					followUpMode: session.followUpMode,
-					interruptMode: session.interruptMode,
-					sessionFile: session.sessionFile,
-					sessionId: session.sessionId,
-					sessionName: session.sessionName,
-					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
-					queuedMessageCount: session.queuedMessageCount,
-					todoPhases: session.getTodoPhases(),
-					systemPrompt: session.systemPrompt,
-					dumpTools: session.agent.state.tools.map(tool => ({
-						name: tool.name,
-						description: tool.description,
-						parameters: tool.parameters,
-					})),
-					contextUsage: session.getContextUsage(),
-				};
-				return success(id, "get_state", state);
-			}
-
-			case "set_todos": {
-				session.setTodoPhases(command.phases);
-				return success(id, "set_todos", { todoPhases: session.getTodoPhases() });
-			}
-
-			case "set_host_tools": {
-				const tools = normalizeHostToolDefinitions(command.tools);
-				const rpcTools = hostToolBridge.setTools(tools);
-				await session.refreshRpcHostTools(rpcTools);
-				return success(id, "set_host_tools", { toolNames: tools.map(tool => tool.name) });
-			}
-
-			case "set_host_uri_schemes": {
-				try {
-					const schemes = hostUriBridge.setSchemes(command.schemes);
-					return success(id, "set_host_uri_schemes", { schemes });
-				} catch (err) {
-					return error(id, "set_host_uri_schemes", err instanceof Error ? err.message : String(err));
-				}
-			}
-
-			// =================================================================
-			// Model
-			// =================================================================
-
-			case "set_model": {
-				const models = session.getAvailableModels();
-				const model = models.find(m => m.provider === command.provider && m.id === command.modelId);
-				if (!model) {
-					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
-				}
-				await session.setModel(model);
-				return success(id, "set_model", model);
-			}
-
-			case "cycle_model": {
-				const result = await session.cycleModel();
-				if (!result) {
-					return success(id, "cycle_model", null);
-				}
-				return success(id, "cycle_model", result);
-			}
-
-			case "get_available_models": {
-				const models = session.getAvailableModels();
-				return success(id, "get_available_models", { models });
-			}
-
-			// =================================================================
-			// Thinking
-			// =================================================================
-
-			case "set_thinking_level": {
-				session.setThinkingLevel(command.level);
-				return success(id, "set_thinking_level");
-			}
-
-			case "cycle_thinking_level": {
-				const level = session.cycleThinkingLevel();
-				if (!level) {
-					return success(id, "cycle_thinking_level", null);
-				}
-				return success(id, "cycle_thinking_level", { level });
-			}
-
-			// =================================================================
-			// Queue Modes
-			// =================================================================
-
-			case "set_steering_mode": {
-				session.setSteeringMode(command.mode);
-				return success(id, "set_steering_mode");
-			}
-
-			case "set_follow_up_mode": {
-				session.setFollowUpMode(command.mode);
-				return success(id, "set_follow_up_mode");
-			}
-
-			case "set_interrupt_mode": {
-				session.setInterruptMode(command.mode);
-				return success(id, "set_interrupt_mode");
-			}
-
-			// =================================================================
-			// Compaction
-			// =================================================================
-
-			case "compact": {
-				const result = await session.compact(command.customInstructions);
-				return success(id, "compact", result);
-			}
-
-			case "set_auto_compaction": {
-				session.setAutoCompactionEnabled(command.enabled);
-				return success(id, "set_auto_compaction");
-			}
-
-			// =================================================================
-			// Retry
-			// =================================================================
-
-			case "set_auto_retry": {
-				session.setAutoRetryEnabled(command.enabled);
-				return success(id, "set_auto_retry");
-			}
-
-			case "abort_retry": {
-				session.abortRetry();
-				return success(id, "abort_retry");
-			}
-
-			// =================================================================
-			// Bash
-			// =================================================================
-
-			case "bash": {
-				const result = await session.executeBash(command.command);
-				return success(id, "bash", result);
-			}
-
-			case "abort_bash": {
-				session.abortBash();
-				return success(id, "abort_bash");
-			}
-
-			// =================================================================
-			// Session
-			// =================================================================
-
-			case "get_session_stats": {
-				const stats = session.getSessionStats();
-				return success(id, "get_session_stats", stats);
-			}
-
-			case "export_html": {
-				const path = await session.exportToHtml(command.outputPath);
-				return success(id, "export_html", { path });
-			}
-
-			case "switch_session": {
-				const cancelled = !(await session.switchSession(command.sessionPath));
-				return success(id, "switch_session", { cancelled });
-			}
-
-			case "branch": {
-				const result = await session.branch(command.entryId);
-				return success(id, "branch", { text: result.selectedText, cancelled: result.cancelled });
-			}
-
-			case "get_branch_messages": {
-				const messages = session.getUserMessagesForBranching();
-				return success(id, "get_branch_messages", { messages });
-			}
-
-			case "get_last_assistant_text": {
-				const text = session.getLastAssistantText();
-				return success(id, "get_last_assistant_text", { text });
-			}
-
-			case "set_session_name": {
-				const name = command.name.trim();
-				if (!name) {
-					return error(id, "set_session_name", "Session name cannot be empty");
-				}
-				const applied = await session.setSessionName(name, "user");
-				if (!applied) {
-					return error(id, "set_session_name", "Session name cannot be empty");
-				}
-				return success(id, "set_session_name");
-			}
-
-			case "handoff": {
-				const result = await session.handoff(command.customInstructions);
-				return success(id, "handoff", result ? { savedPath: result.savedPath } : null);
-			}
-
-			// =================================================================
-			// Messages
-			// =================================================================
-
-			case "get_messages": {
-				return success(id, "get_messages", { messages: session.messages });
-			}
-
-			// =================================================================
-			// Login
-			// =================================================================
-
-			case "get_login_providers": {
-				const providers = getOAuthProviders().map(provider => ({
-					id: provider.id,
-					name: provider.name,
-					available: provider.available,
-					authenticated: session.modelRegistry.authStorage.hasAuth(provider.id),
-				}));
-				return success(id, "get_login_providers", { providers });
-			}
-
-			case "login": {
-				const knownProvider = getOAuthProviders().find(p => p.id === command.providerId);
-				if (!knownProvider) {
-					return error(id, "login", `Unknown OAuth provider: ${command.providerId}`);
-				}
-				const uiCtx = new RpcExtensionUIContext(pendingExtensionRequests, output);
-				// Track whether onAuth has fired. Providers that use OAuthCallbackFlow
-				// always call onAuth first (emit browser URL), then onManualCodeInput as
-				// a fallback. Providers that require interactive input (API-key paste,
-				// GitHub Enterprise URL, device-code entry) call onPrompt before onAuth.
-				// We use this ordering to self-classify at runtime — no static allowlist.
-				let authEmitted = false;
-				try {
-					await session.modelRegistry.authStorage.login(command.providerId, {
-						onAuth: info => {
-							authEmitted = true;
-							output({
-								type: "extension_ui_request",
-								id: Snowflake.next() as string,
-								method: "open_url",
-								url: info.url,
-								instructions: info.instructions,
-							} as RpcExtensionUIRequest);
-						},
-						onProgress: message => {
-							uiCtx.notify(message, "info");
-						},
-						onPrompt: () => {
-							if (!authEmitted) {
-								// onPrompt called before any auth URL — provider requires
-								// interactive input that cannot be satisfied headlessly.
-								return Promise.reject(
-									new Error(
-										`Provider '${command.providerId}' requires interactive prompts ` +
-											"which are not supported in RPC mode. Use the terminal UI to log in.",
-									),
-								);
-							}
-							// onAuth has already fired — we are inside OAuthCallbackFlow's
-							// manual-redirect fallback race. Returning a never-settling promise
-							// lets the race block until the callback server wins; a rejection
-							// would be caught as null and spin the while(true) loop.
-							return new Promise<string>(() => {});
-						},
-					});
-					await session.modelRegistry.refresh();
-					return success(id, "login", { providerId: command.providerId });
-				} catch (err: unknown) {
-					return error(id, "login", err instanceof Error ? err.message : String(err));
-				}
-			}
-
-			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
-			}
-		}
-	};
+	// Handle a single command through the shared agent-wire dispatcher so RPC
+	// and bridge mode use one command surface.
+	const handleCommand = (command: RpcCommand): Promise<RpcResponse> =>
+		dispatchRpcCommand(command, {
+			session,
+			output,
+			hostToolRegistry: hostToolBridge,
+			hostUriRegistry: hostUriBridge,
+			createUiContext: () => new RpcExtensionUIContext(pendingExtensionRequests, output),
+			unattendedControlPlane,
+		});
 
 	/**
 	 * Check if shutdown was requested and perform shutdown if so.

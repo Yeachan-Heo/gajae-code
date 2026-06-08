@@ -16,6 +16,7 @@ const ReasoningEffortMapSchema = z.object({
 	medium: z.string().optional(),
 	high: z.string().optional(),
 	xhigh: z.string().optional(),
+	max: z.string().optional(),
 });
 
 export const OpenAICompatSchema = z.object({
@@ -45,7 +46,8 @@ export const OpenAICompatSchema = z.object({
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
 });
 
-const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
+const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
 	"effort",
@@ -76,6 +78,39 @@ const ModelBindingsSchema = z.object({
 	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
 	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
 });
+export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
+
+function isValidProfileModelSelector(value: string): boolean {
+	if (value.includes(",")) return false;
+	const slashIdx = value.indexOf("/");
+	if (slashIdx <= 0 || slashIdx === value.length - 1) return false;
+	const provider = value.slice(0, slashIdx);
+	const modelId = value.slice(slashIdx + 1);
+	if (!provider || !modelId) return false;
+	const parts = modelId.split(":");
+	if (parts.length > 2) return false;
+	const [base, suffix] = parts;
+	if (!base) return false;
+	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix);
+}
+
+export const ProfileModelSelectorSchema = z
+	.string()
+	.min(1)
+	.refine(value => isValidProfileModelSelector(value), {
+		message: "Expected provider/modelId with optional :effort suffix",
+	});
+
+export const ProfileModelMappingSchema = z.partialRecord(ProfileRoleSchema, ProfileModelSelectorSchema);
+
+export const ProfileDefinitionSchema = z
+	.object({
+		required_providers: z.array(z.string().min(1)).min(1),
+		model_mapping: ProfileModelMappingSchema,
+	})
+	.strict();
+
+export const ProfilesSchema = z.record(z.string().min(1), ProfileDefinitionSchema);
 
 const ModelDefinitionSchema = z
 	.object({
@@ -116,6 +151,7 @@ const ModelDefinitionSchema = z
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 
@@ -141,6 +177,7 @@ export const ModelOverrideSchema = z
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 
@@ -192,6 +229,7 @@ const ProviderConfigSchema = z
 		 * and `apiKey` must carry the gateway bearer.
 		 */
 		transport: z.literal("pi-native").optional(),
+		cacheRetention: CacheRetentionSchema.optional(),
 	})
 	.strict();
 
@@ -205,7 +243,10 @@ export const ModelsConfigSchema = z
 		providers: z.record(z.string(), ProviderConfigSchema).optional(),
 		modelBindings: ModelBindingsSchema.optional(),
 		equivalence: EquivalenceConfigSchema.optional(),
+		profiles: ProfilesSchema.optional(),
 	})
 	.strict();
 
 export type ModelsConfig = z.infer<typeof ModelsConfigSchema>;
+export type ModelProfileConfig = z.infer<typeof ProfileDefinitionSchema>;
+export type ModelProfilesConfig = z.infer<typeof ProfilesSchema>;

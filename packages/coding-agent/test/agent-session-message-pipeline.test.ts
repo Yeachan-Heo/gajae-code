@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import type { Message, SimpleStreamOptions } from "@gajae-code/ai";
+import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 function createAgent(): Agent {
 	return new Agent({
@@ -177,5 +179,64 @@ describe("AgentSession message pipeline", () => {
 
 		resolve();
 		await Bun.sleep(0);
+	});
+
+	it("flushes queued background exchanges during prompt teardown without waiting for polling timers", async () => {
+		const model: Model = {
+			id: "background-flush-model",
+			name: "background-flush-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["system prompt"],
+				messages: [],
+				tools: [],
+			},
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					started.resolve();
+					await finish.promise;
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				})();
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: { getApiKey: async () => "test-key" } as never,
+		});
+		sessions.push(session);
+
+		const promptPromise = session.prompt("hello");
+		await started.promise;
+		expect(session.isStreaming).toBe(true);
+
+		await session.respondAsBackground({ from: "0-Main", message: "ping", awaitReply: false });
+		expect(agent.state.messages.some(message => message.role === "custom")).toBe(false);
+
+		finish.resolve();
+		await promptPromise;
+
+		const customMessages = agent.state.messages.filter(message => message.role === "custom");
+		expect(customMessages).toHaveLength(1);
+		expect(customMessages[0]?.customType).toBe("irc:incoming");
+		expect(customMessages[0]?.content).toContain("ping");
+		expect(agent.state.messages.at(-1)).toBe(customMessages[0]);
 	});
 });

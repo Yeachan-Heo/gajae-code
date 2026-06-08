@@ -20,6 +20,11 @@ import type {
 	RpcHostToolUpdate,
 	RpcResponse,
 	RpcSessionState,
+	RpcUnattendedAccepted,
+	RpcUnattendedDeclaration,
+	RpcWorkflowGate,
+	RpcWorkflowGateResolution,
+	RpcWorkflowGateResponse,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -97,7 +102,7 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	if (typeof value.success !== "boolean") return false;
 	if (value.id !== undefined && typeof value.id !== "string") return false;
 	if (value.success === false) {
-		return typeof value.error === "string";
+		return typeof value.error === "string" || isRecord(value.error);
 	}
 	return true;
 }
@@ -130,6 +135,21 @@ function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest
 	return value.type === "extension_ui_request" && typeof value.id === "string" && typeof value.method === "string";
 }
 
+function isRpcWorkflowGate(value: unknown): value is RpcWorkflowGate {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "workflow_gate" &&
+		typeof value.gate_id === "string" &&
+		typeof value.stage === "string" &&
+		typeof value.kind === "string" &&
+		isRecord(value.schema) &&
+		typeof value.schema_hash === "string" &&
+		isRecord(value.context) &&
+		typeof value.created_at === "string" &&
+		value.required === true
+	);
+}
+
 function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): AgentToolResult<TDetails> {
 	if (typeof result === "string") {
 		return {
@@ -152,6 +172,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#workflowGateListeners: Set<(gate: RpcWorkflowGate) => void> = new Set();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -186,7 +207,12 @@ export class RpcClient {
 			cwd: this.options.cwd,
 			env: { ...Bun.env, ...this.options.env },
 			stdin: "pipe",
+			stderr: "full",
 		});
+		const startupStderrPromise = this.#process.stderr
+			? new Response(this.#process.stderr).text().catch(() => "")
+			: Promise.resolve("");
+		const getStartupStderr = async () => this.#process?.peekStderr() || (await startupStderrPromise);
 
 		// Wait for the "ready" signal or process exit
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
@@ -203,10 +229,20 @@ export class RpcClient {
 				}
 				this.#handleLine(line);
 			}
-			// Stream ended without ready signal — process exited
+			// Stream ended without ready signal — process exited. Wait for the
+			// managed process wrapper so stderr is fully drained before reporting.
 			if (!readySettled) {
-				readySettled = true;
-				readyReject(new Error(`Agent process exited before ready. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+				const proc = this.#process;
+				const exitCode = proc ? await proc.exited.catch(() => proc.exitCode ?? -1) : undefined;
+				if (!readySettled) {
+					const stderr = await getStartupStderr();
+					readySettled = true;
+					readyReject(
+						new Error(
+							`Agent process exited${exitCode === undefined ? "" : ` with code ${exitCode}`} before ready. Stderr: ${stderr}`,
+						),
+					);
+				}
 			}
 		})().catch((err: Error) => {
 			if (!readySettled) {
@@ -216,12 +252,12 @@ export class RpcClient {
 		});
 
 		// Also race against process exit (in case stdout closes before we read it)
-		void this.#process.exited.then((exitCode: number) => {
+		void this.#process.exited.then(async (exitCode: number) => {
 			if (!readySettled) {
+				const stderr = await getStartupStderr();
+				if (readySettled) return;
 				readySettled = true;
-				readyReject(
-					new Error(`Agent process exited with code ${exitCode}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-				);
+				readyReject(new Error(`Agent process exited with code ${exitCode}. Stderr: ${stderr}`));
 			}
 		});
 
@@ -229,9 +265,9 @@ export class RpcClient {
 		const readyTimeout = this.#startTimeout(30000, () => {
 			if (readySettled) return;
 			readySettled = true;
-			readyReject(
-				new Error(`Timeout waiting for agent to become ready. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-			);
+			void getStartupStderr().then(stderr => {
+				readyReject(new Error(`Timeout waiting for agent to become ready. Stderr: ${stderr}`));
+			});
 		});
 
 		try {
@@ -282,6 +318,49 @@ export class RpcClient {
 				this.#eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Subscribe to workflow lifecycle gates emitted by RPC mode.
+	 */
+	onWorkflowGate(listener: (gate: RpcWorkflowGate) => void): () => void {
+		this.#workflowGateListeners.add(listener);
+		return () => {
+			this.#workflowGateListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Answer a workflow lifecycle gate and wait for the server resolution envelope.
+	 */
+	async respondGate(gateId: string, answer: unknown, idempotencyKey?: string): Promise<RpcWorkflowGateResolution> {
+		const response = await this.#send({
+			type: "workflow_gate_response",
+			gate_id: gateId,
+			answer,
+			idempotency_key: idempotencyKey,
+		});
+		return this.#getData(response);
+	}
+
+	/**
+	 * Subscribe to extension UI requests emitted by the server (e.g. select /
+	 * input / editor / confirm). Returns an unsubscribe function.
+	 */
+	onExtensionUiRequest(listener: (req: RpcExtensionUIRequest) => void): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => {
+			this.#extensionUiListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Enter unattended mode by declaring budget + scopes + action allowlist.
+	 * Returns the accepted declaration, or rejects (fail-closed) on refusal.
+	 */
+	async negotiateUnattended(declaration: RpcUnattendedDeclaration): Promise<RpcUnattendedAccepted> {
+		const response = await this.#send({ type: "negotiate_unattended", declaration });
+		return this.#getData(response);
 	}
 
 	/**
@@ -672,6 +751,13 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcWorkflowGate(data)) {
+			for (const listener of this.#workflowGateListeners) {
+				listener(data);
+			}
+			return;
+		}
+
 		if (isRpcHostToolCancelRequest(data)) {
 			this.#pendingHostToolCalls.get(data.targetId)?.controller.abort();
 			return;
@@ -783,7 +869,10 @@ export class RpcClient {
 		}
 	}
 
-	#writeFrame(frame: RpcCommand | RpcHostToolResult | RpcHostToolUpdate, onError?: (error: Error) => void): void {
+	#writeFrame(
+		frame: RpcCommand | RpcWorkflowGateResponse | RpcHostToolResult | RpcHostToolUpdate,
+		onError?: (error: Error) => void,
+	): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
@@ -800,7 +889,9 @@ export class RpcClient {
 	#getData<T>(response: RpcResponse): T {
 		if (!response.success) {
 			const errorResponse = response as Extract<RpcResponse, { success: false }>;
-			throw new Error(errorResponse.error);
+			throw new Error(
+				typeof errorResponse.error === "string" ? errorResponse.error : JSON.stringify(errorResponse.error),
+			);
 		}
 		// Type assertion: we trust response.data matches T based on the command sent.
 		// This is safe because each public method specifies the correct T for its command.

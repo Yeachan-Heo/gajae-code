@@ -587,6 +587,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "monitors",
+		description: "Open the monitor/cron jobs overlay",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showJobsOverlay();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "tree",
 		description: "Navigate session tree (switch branches)",
 		handleTui: (_command, runtime) => {
@@ -740,7 +748,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 
-			void runtime.ctx.showOAuthSelector("login");
+			runtime.ctx.showProviderOnboarding();
 			runtime.ctx.editor.setText("");
 		},
 	},

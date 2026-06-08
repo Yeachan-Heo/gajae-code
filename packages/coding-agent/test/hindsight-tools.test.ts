@@ -1,10 +1,11 @@
 /**
- * Contract tests for the three Hindsight tool factories.
+ * Compatibility tests for the three legacy Hindsight helper factories.
  *
- * These exercise the public tool surface (factory gating + execute path) by
- * spying on `HindsightApi.prototype.{retain, recall, reflect}` and stubbing
+ * These helpers are no longer registered as public coding-harness tools. They are
+ * retained only for direct legacy backend/tool-call compatibility, and these tests
+ * spy on `HindsightApi.prototype.{retain, recall, reflect}` while stubbing
  * Hindsight state on the fake ToolSession. We deliberately do not boot a real
- * session — these tools only need a populated state accessor and Settings.
+ * session — these helpers only need a populated state accessor and Settings.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
