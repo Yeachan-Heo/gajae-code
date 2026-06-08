@@ -53264,7 +53264,7 @@
 				"cacheRead": 0.5,
 				"cacheWrite": 0
 			},
-			"contextWindow": 272000,
+			"contextWindow": 400000,
 			"maxTokens": 128000,
 			"preferWebsockets": true,
 			"priority": 9,
@@ -53274,8 +53274,7 @@
 				"maxLevel": "xhigh",
 				"defaultLevel": "xhigh"
 			},
-			"applyPatchToolType": "freeform",
-			"contextPromotionTarget": "openai-codex/gpt-5.4"
+			"applyPatchToolType": "freeform"
 		}
 	},
 	"opencode": {

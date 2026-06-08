@@ -195,7 +195,9 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
  * When a model's context is exhausted, the agent can promote to a sibling
  * model with a larger context window on the same provider:
  * - `OpenAI code backend-spark` variants promote to `gpt-5.5`.
- * - `gpt-5.5` (270K input) promotes to `gpt-5.4` (1M input).
+ *
+ * `gpt-5.5` itself is a 400K-context model and is not demoted to `gpt-5.4`
+ * (which has a smaller window), so it has no promotion target.
  */
 export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
 	for (const candidate of models) {
@@ -204,8 +206,6 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
 		let targetId: string | undefined;
 		if (parsedCandidate.variant === "codex-spark") {
 			targetId = "gpt-5.5";
-		} else if (parsedCandidate.variant === "base" && semverEqual(parsedCandidate.version, "5.5")) {
-			targetId = "gpt-5.4";
 		} else {
 			continue;
 		}
@@ -430,7 +430,22 @@ function inferGeneratedApplyPatchToolType(
 	return undefined;
 }
 
+function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
+	// gpt-5.5 is a 400K-context model. OpenAI code backend discovery can omit the
+	// context window, falling back to the 272K default, which incorrectly trips
+	// context-cap / auto-promote thresholds (a ~272K session would look over-cap
+	// and demote to gpt-5.4). Pin gpt-5.5 to its true 400K window.
+	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
+		model.contextWindow = 400000;
+		return true;
+	}
+	return false;
+}
+
 function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel): void {
+	if (applyGpt55ContextWindow(model, parsedModel)) {
+		return;
+	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
 		model.contextWindow = 272000;

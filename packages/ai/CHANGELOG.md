@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Treated `gpt-5.5` as a 400K-context model wherever context caps / auto-promote thresholds are resolved, so a ~272K session is no longer considered over-cap and no longer demotes to `gpt-5.4`. Pinned the OpenAI Codex `gpt-5.5` context window to 400K and removed its `gpt-5.4` promotion target (the smaller window made it a demotion) ([#428](https://github.com/Yeachan-Heo/gajae-code/issues/428)).
+
 ## [0.4.0] - 2026-06-06
 
 ### Added

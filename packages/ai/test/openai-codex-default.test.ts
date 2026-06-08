@@ -16,6 +16,8 @@ describe("OpenAI Codex defaults", () => {
 			maxLevel: Effort.XHigh,
 			defaultLevel: Effort.XHigh,
 		});
-		expect(model.contextPromotionTarget).toBe("openai-codex/gpt-5.4");
+		// gpt-5.5 is a 400K-context model and must not demote to the smaller gpt-5.4.
+		expect(model.contextWindow).toBe(400000);
+		expect(model.contextPromotionTarget).toBeUndefined();
 	});
 });

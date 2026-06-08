@@ -259,7 +259,7 @@ describe("generated model policies", () => {
 		expect(models[2]?.maxTokens).toBe(64000);
 	});
 
-	it("links spark variants and gpt-5.5 to their context promotion targets", () => {
+	it("links spark variants to gpt-5.5 and leaves gpt-5.5 with no demotion target", () => {
 		const models = [
 			createModel({
 				id: "gpt-5.3-codex-spark",
@@ -281,7 +281,27 @@ describe("generated model policies", () => {
 		linkOpenAIPromotionTargets(models);
 
 		expect(models[0]?.contextPromotionTarget).toBe("openai-codex/gpt-5.5");
-		expect(models[1]?.contextPromotionTarget).toBe("openai-codex/gpt-5.4");
+		// gpt-5.5 is a 400K model and must not demote to the smaller gpt-5.4.
+		expect(models[1]?.contextPromotionTarget).toBeUndefined();
+	});
+
+	it("treats gpt-5.5 as a 400K-context model so it is not over-cap at ~272K", () => {
+		const models: Model<Api>[] = [
+			{
+				...createModel({
+					id: "gpt-5.5",
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+				}),
+				// OpenAI code discovery can fall back to the stale 272K default.
+				contextWindow: 272000,
+				maxTokens: 128000,
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(400000);
 	});
 
 	it("sets freeform apply_patch metadata for first-party GPT-5 Responses models", () => {
