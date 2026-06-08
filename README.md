@@ -1,5 +1,3 @@
-> Disclaimer: Gajae-Code is an experimental, beta-stage early project. Expect rough edges and verify outputs before relying on it for important work.
-
 <p align="center">
   <img src="assets/hero.png" alt="Gajae-Code autonomous coding-agent hero illustration" width="100%" />
 </p>
@@ -7,110 +5,83 @@
 <h1 align="center">Gajae-Code</h1>
 
 <p align="center">
-  A red-claw coding-agent harness for crisp interviews, resilient plans, tmux-native execution, and durable verification.
+  <strong>Encode intention. Decode software.</strong><br />
+  A focused coding-agent runner for interviews, reviewed plans, tmux-native execution, and durable verification.
 </p>
 
 <p align="center">
-  <img src="assets/character.png" alt="Gajae-Code character mascot" width="360" />
+  <a href="https://www.npmjs.com/package/gajae-code"><img alt="npm package" src="https://img.shields.io/npm/v/gajae-code?style=flat-square"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
+  <a href="https://discord.gg/sj4exxQ9v"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/sj4exxQ9v">Join the Discord community</a>
+  <img src="assets/character.png" alt="Gajae-Code character mascot" width="320" />
 </p>
 
-## Story
+> Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
 
-I created an earlier OpenAI code harness and `an earlier Anthropic-code harness`. After living with those harnesses, I felt the same thing kept happening: the harness got bloated, but the work still collapsed into one useful loop.
+## What is Gajae-Code?
 
-## Usage
-
-Gajae-Code is published through the normal npm registry as `gajae-code`; that package installs the standalone `gjc` binary:
-
-```sh
-bun install -g gajae-code
-```
-
-The scoped package is also available as `@gajae-code/coding-agent`. Install `gjc` once in your shell environment, then launch it from the repository you want it to operate on. Installing GJC does **not** inject it into Codex CLI, Claude Code, OpenCode, Claw Code, or every editor/agent runtime automatically.
-
-Recommended launch paths:
-
-| Situation                             | Command                        | Notes                                                                                                                                 |
-| ------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Direct interactive session            | `gjc`                          | Runs in the current checkout without creating or attaching a tmux session.                                                            |
-| Long-running or pane-friendly session | `gjc --tmux`                   | Creates or attaches a GJC-managed tmux-backed leader session. Run `gjc team ...` inside that session when parallel tmux workers help. |
-| Branch-local or risky work            | `gjc --tmux --worktree <path>` | Use a dedicated Git worktree path so edits, evidence, and tool output stay isolated from the main checkout.                           |
-
-Use a worktree-backed run when the task may touch many files, needs a clean branch for review, or should not risk polluting your primary checkout. For repository development, use the source checkout commands in [Development](#development).
-
-### Using GJC with other coding agents
-
-GJC is an external runner, not runtime injection. Start `gjc` from the same repository or dedicated Git worktree where Hermes, Claw Code, or another coding tool is operating, then use GJC to drive the public workflow surface: `deep-interview`, `ralplan`, `ultragoal`, and optional `team` workers. Installing GJC does **not** patch another agent runtime, install hidden routing, or make GJC run inside that tool.
-
-Canonical orchestration flow:
-
-1. Create or choose the target checkout, usually a branch-specific Git worktree for reviewable work.
-2. Launch or attach the GJC leader from that directory with `gjc --tmux`, or use `gjc --tmux --worktree <path>` when GJC should create/use the worktree path.
-3. Submit the appropriate workflow command inside the session: `/skill:deep-interview` for ambiguous requirements, `/skill:ralplan` for a reviewed plan, then `gjc ultragoal ...` for durable execution/evidence tracking.
-4. Add `gjc team ...` only when parallel tmux workers materially help; it is an optional execution lane, not a required handoff.
-5. Collect the stop state before handing work back: changed files, checks run, failures, remaining risks, and evidence links or summaries.
-
-| Tool                         | Recommended GJC command                                                         | Boundary / limitation                                                                                                           |
-| ---------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Codex CLI                    | `gjc --tmux --worktree <path>` for branch-local work, or `gjc` for a quick pass | External-runner workflow: run both from the same repo/worktree. GJC is not installed inside Codex CLI.                          |
-| Claude Code                  | `gjc --tmux` from the target repo, optionally with `--worktree <path>`          | External-runner workflow: keep Claude Code pointed at the same checkout. GJC does not become a Claude Code extension.           |
-| OpenCode                     | `gjc` or `gjc --tmux` from the same checkout OpenCode uses                      | External-runner workflow only today. Treat deeper adapter behavior as future work unless documented in a release note.          |
-| Rust `claw-code` / Claw Code | `gjc --tmux --worktree <path>` when you want isolated evidence and review state | External-runner workflow only today. GJC does not install into Claw Code, replace its runtime, or expose private routing logic. |
-
-For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). The bridge is a public control surface for an already-running GJC session; it is not a deployment recipe for private Hermes/Claw routing.
-
-
-## Provider retry budgets
-
-Gajae-Code has two retry layers:
-
-- Session auto-retry (`retry.maxRetries`) retries a failed assistant turn after a terminal transient error.
-- Provider retry budgets control retries inside the provider transport before that terminal error reaches the session.
-
-Configure provider budgets in `~/.gjc/config.yml` (or the active project/user settings source). JSON Schemas for YAML editor integration are checked in at `schemas/config.schema.json` and `schemas/models.schema.json`:
-
-```yaml
-retry:
-  # Similar to codex-cli request_max_retries. Counts retries, not the initial request.
-  requestMaxRetries: 4
-  # Similar to codex-cli stream_max_retries. Counts replay-safe stream retries.
-  streamMaxRetries: 100
-  # Session-level terminal-error retries remain separately configurable.
-  maxRetries: 3
-  maxDelayMs: 300000
-```
-
-`requestMaxRetries` applies to provider SDK/fetch retries before a stream is established. `streamMaxRetries` applies only when a provider can safely replay a transient stream failure before user-visible content or in provider-specific replay-safe paths. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast instead of being hidden by retry loops.
-
-## Default TUI identity
-
-The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Explicit user theme settings still win.
-
-## Why Gajae-Code?
-
-Gajae-Code (`gjc`) keeps the public agent surface intentionally small while making the runtime around it dependable. It focuses on one useful loop:
+Gajae-Code (`gjc`) is an external coding-agent harness. It runs from the repository or worktree you choose, then gives the agent a small, explicit workflow surface:
 
 ```text
 deep-interview -> ralplan -> ultragoal
                          └─ optional team execution when parallel tmux workers help
 ```
 
-Use `deep-interview` to clarify intent, `ralplan` to critique the approach, and `ultragoal` to carry the work through implementation, revision, verification, and an evidence summary. Add `team` only when the task benefits from coordinated parallel workers; `team` is an optional execution mode, not a required handoff step. The result is a compact CLI that stays easy to reason about, but still gives you session state, worktree isolation, tmux orchestration, tool execution, and persistent evidence when the work needs it.
+It is intentionally not a hidden plugin for Codex CLI, Claude Code, OpenCode, or Claw Code. Start `gjc` beside those tools when you want structured planning, persistent evidence, tmux-backed workers, or an isolated worktree.
+
+## Install
+
+```sh
+bun install -g gajae-code
+```
+
+The scoped package is also available as `@gajae-code/coding-agent`.
+
+## Quick start
+
+```sh
+# Run directly in the current checkout
+gjc
+
+# Use a tmux-backed leader session
+gjc --tmux
+
+# Use an isolated worktree for risky or reviewable work
+gjc --tmux --worktree ../my-task-worktree
+```
+
+Inside a GJC session, use the public workflow surface:
+
+```text
+/skill:deep-interview clarify ambiguous requirements
+/skill:ralplan build and critique the implementation plan
+gjc ultragoal create-goals --brief-file <approved-plan>
+gjc ultragoal complete-goals
+```
+
+Add `gjc team ...` only when coordinated tmux workers materially help.
+
+## Core capabilities
+
+- **Interview before guessing**: `deep-interview` turns vague requests into concrete requirements.
+- **Plan before mutation**: `ralplan` reviews the approach before code changes.
+- **Execute with evidence**: `ultragoal` tracks goals, revisions, checks, and completion evidence.
+- **Parallelize when useful**: `team` coordinates tmux-backed workers for larger tasks.
+- **Stay external and reviewable**: run from a chosen repo or worktree without patching another agent runtime.
 
 ## Workflow surface
 
 Gajae-Code ships four default workflow skills:
 
-| Skill            | What it does                                                                                        |
-| ---------------- | --------------------------------------------------------------------------------------------------- |
-| `deep-interview` | Removes ambiguity before planning or code changes.                                                  |
-| `ralplan`        | Builds and critiques a plan before mutation.                                                        |
-| `team`           | Optionally coordinates tmux-backed parallel execution when the work benefits from multiple workers. |
-| `ultragoal`      | Tracks durable goals through implementation, revisions, verification, and evidence summaries.       |
+| Skill            | What it does                                                          |
+| ---------------- | --------------------------------------------------------------------- |
+| `deep-interview` | Clarifies ambiguous requirements before planning or code changes.     |
+| `ralplan`        | Builds and critiques an implementation plan before mutation.          |
+| `ultragoal`      | Tracks goals through execution, revision, verification, and evidence. |
+| `team`           | Coordinates tmux-backed workers when parallel execution is worth it.  |
 
 And four bundled role agents:
 
@@ -121,20 +92,36 @@ And four bundled role agents:
 | `planner`   | Read-only sequencing and acceptance criteria.      |
 | `critic`    | Read-only plan critique and actionability review.  |
 
-No sprawling default skill zoo: the harness improves by making this small method better.
+No sprawling default skill zoo: GJC improves by making this small method better.
 
-A concrete bug-fix pass might look like this:
+## Works beside your existing agent
 
-```text
-/skill:deep-interview clarify the bug, affected behavior, non-goals, and acceptance checks
-/skill:ralplan turn the clarified bug report into a reviewed fix plan
-gjc ultragoal create-goals --brief-file <approved-plan>
-# Optional only for parallel work, from inside `gjc --tmux`:
-gjc team 2:executor "split implementation and verification for this bug fix"
-gjc ultragoal complete-goals
+| Tool        | Recommended GJC command                        | Boundary                                               |
+| ----------- | ---------------------------------------------- | ------------------------------------------------------ |
+| Codex CLI   | `gjc --tmux --worktree <path>` or `gjc`        | External runner; run both from the same repo/worktree. |
+| Claude Code | `gjc --tmux` or `gjc --tmux --worktree <path>` | GJC does not become a Claude Code extension.           |
+| OpenCode    | `gjc` or `gjc --tmux`                          | External-runner workflow only today.                   |
+| Claw Code   | `gjc --tmux --worktree <path>`                 | GJC does not install into or replace Claw Code.        |
+
+For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md).
+
+## Configuration
+
+Provider retry budgets live in `~/.gjc/config.yml`:
+
+```yaml
+retry:
+  requestMaxRetries: 4
+  streamMaxRetries: 100
+  maxRetries: 3
+  maxDelayMs: 300000
 ```
 
-That flow is meant to describe the operator sequence, not to guarantee hidden automation: the agent still reports what it changed, what it revised after findings, what checks ran, and what evidence supports the fix.
+`requestMaxRetries` applies before a stream is established. `streamMaxRetries` applies only to replay-safe transient stream failures. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast.
+
+## TUI identity
+
+The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Explicit user theme settings still win.
 
 ## Development
 
