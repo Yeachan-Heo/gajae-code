@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
-import { addUltragoalSubgoal, checkpointUltragoalGoal, createUltragoalPlan, startNextUltragoalGoal } from "../src/gjc-runtime/ultragoal-runtime";
+import {
+	addUltragoalSubgoal,
+	checkpointUltragoalGoal,
+	createUltragoalPlan,
+	startNextUltragoalGoal,
+} from "../src/gjc-runtime/ultragoal-runtime";
 import {
 	mergeGjcManagedCodexHooksConfig,
 	readGjcManagedCodexHooksStatus,
@@ -44,91 +49,92 @@ describe("GJC native skill-state hooks", () => {
 		return tempDir;
 	}
 
-function ultragoalQualityGate(): string {
-	return JSON.stringify({
-		architectReview: {
-			architectureStatus: "CLEAR",
-			productStatus: "CLEAR",
-			codeStatus: "CLEAR",
-			recommendation: "APPROVE",
-			evidence: "architect reviewed architecture product and code surfaces",
-			commands: ["architect-review"],
-			blockers: [],
-		},
-		executorQa: {
-			status: "passed",
-			e2eStatus: "passed",
-			redTeamStatus: "passed",
-			evidence: "executor ran e2e and red-team verification for the approved contract",
-			e2eCommands: ["bun test:e2e"],
-			redTeamCommands: ["bun test:red-team"],
-			artifactRefs: [
-				{
-					id: "cli-run",
-					kind: "test-report",
-					description: "CLI verification transcript",
-					inlineEvidence: "The CLI test report verified the approved flow and recorded the passing result.",
-				},
-				{
-					id: "adversarial",
-					kind: "failure-mode-test",
-					description: "Adversarial verification report",
-					inlineEvidence: "Adversarial cases covered invalid input, missing state, and repeated operation boundaries.",
-				},
-			],
-			contractCoverage: [
-				{
-					id: "contract",
-					contractRef: "approved-plan",
-					obligation: "The story satisfies the approved contract",
-					status: "covered",
-					surfaceEvidenceRefs: ["surface"],
-					adversarialCaseRefs: ["case"],
-				},
-			],
-			surfaceEvidence: [
-				{
-					id: "surface",
-					contractRef: "approved-plan",
-					surface: "cli",
-					invocation: "Run the focused CLI verification scenario",
-					verdict: "passed",
-					artifactRefs: ["cli-run"],
-				},
-			],
-			adversarialCases: [
-				{
-					id: "case",
-					contractRef: "approved-plan",
-					scenario: "Exercise invalid and repeated command paths",
-					expectedBehavior: "The runtime preserves the durable goal contract",
-					verdict: "passed",
-					artifactRefs: ["adversarial"],
-				},
-			],
-			blockers: [],
-		},
-		iteration: {
-			status: "passed",
-			evidence: "full verification reran cleanly after the implementation pass",
-			fullRerun: true,
-			rerunCommands: ["bun test:e2e", "bun test:red-team"],
-			blockers: [],
-		},
-	});
-}
+	function ultragoalQualityGate(): string {
+		return JSON.stringify({
+			architectReview: {
+				architectureStatus: "CLEAR",
+				productStatus: "CLEAR",
+				codeStatus: "CLEAR",
+				recommendation: "APPROVE",
+				evidence: "architect reviewed architecture product and code surfaces",
+				commands: ["architect-review"],
+				blockers: [],
+			},
+			executorQa: {
+				status: "passed",
+				e2eStatus: "passed",
+				redTeamStatus: "passed",
+				evidence: "executor ran e2e and red-team verification for the approved contract",
+				e2eCommands: ["bun test:e2e"],
+				redTeamCommands: ["bun test:red-team"],
+				artifactRefs: [
+					{
+						id: "cli-run",
+						kind: "test-report",
+						description: "CLI verification transcript",
+						inlineEvidence: "The CLI test report verified the approved flow and recorded the passing result.",
+					},
+					{
+						id: "adversarial",
+						kind: "failure-mode-test",
+						description: "Adversarial verification report",
+						inlineEvidence:
+							"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.",
+					},
+				],
+				contractCoverage: [
+					{
+						id: "contract",
+						contractRef: "approved-plan",
+						obligation: "The story satisfies the approved contract",
+						status: "covered",
+						surfaceEvidenceRefs: ["surface"],
+						adversarialCaseRefs: ["case"],
+					},
+				],
+				surfaceEvidence: [
+					{
+						id: "surface",
+						contractRef: "approved-plan",
+						surface: "cli",
+						invocation: "Run the focused CLI verification scenario",
+						verdict: "passed",
+						artifactRefs: ["cli-run"],
+					},
+				],
+				adversarialCases: [
+					{
+						id: "case",
+						contractRef: "approved-plan",
+						scenario: "Exercise invalid and repeated command paths",
+						expectedBehavior: "The runtime preserves the durable goal contract",
+						verdict: "passed",
+						artifactRefs: ["adversarial"],
+					},
+				],
+				blockers: [],
+			},
+			iteration: {
+				status: "passed",
+				evidence: "full verification reran cleanly after the implementation pass",
+				fullRerun: true,
+				rerunCommands: ["bun test:e2e", "bun test:red-team"],
+				blockers: [],
+			},
+		});
+	}
 
-function goalSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
-	return JSON.stringify({
-		goal: {
-			threadId: "test-thread",
-			objective,
-			status,
-			createdAt: updatedAt,
-			updatedAt,
-		},
-	});
-}
+	function goalSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
+		return JSON.stringify({
+			goal: {
+				threadId: "test-thread",
+				objective,
+				status,
+				createdAt: updatedAt,
+				updatedAt,
+			},
+		});
+	}
 
 	it("detects only the public GJC workflow skill surface", () => {
 		expect(detectSkillKeywords("$deep-interview then $team").map(match => match.skill)).toEqual([
@@ -861,7 +867,14 @@ disabledExtensions:
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = path.join(root, ".gjc", "state", "sessions", "session-ultra-stop-pending", "ultragoal-state.json");
+		const statePath = path.join(
+			root,
+			".gjc",
+			"state",
+			"sessions",
+			"session-ultra-stop-pending",
+			"ultragoal-state.json",
+		);
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
@@ -906,7 +919,14 @@ disabledExtensions:
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = path.join(root, ".gjc", "state", "sessions", "session-ultra-bypass-pending", "ultragoal-state.json");
+		const statePath = path.join(
+			root,
+			".gjc",
+			"state",
+			"sessions",
+			"session-ultra-bypass-pending",
+			"ultragoal-state.json",
+		);
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 

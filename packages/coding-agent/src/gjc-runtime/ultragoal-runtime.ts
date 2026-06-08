@@ -1478,7 +1478,12 @@ function renderCompleteHandoff(
 		"",
 	].join("\n");
 }
-function renderCheckpointContinuation(result: UltragoalCheckpointContinuation, status: UltragoalGoalStatus, json: boolean, cwd: string): string {
+function renderCheckpointContinuation(
+	result: UltragoalCheckpointContinuation,
+	status: UltragoalGoalStatus,
+	json: boolean,
+	cwd: string,
+): string {
 	if (json)
 		return renderCliWriteReceipt({
 			ok: true,
@@ -1510,7 +1515,9 @@ function renderCheckpointContinuation(result: UltragoalCheckpointContinuation, s
 	} else if (status === "failed") {
 		lines.push("Resume failed goals with `gjc ultragoal complete-goals --retry-failed` after the blocker is fixed.");
 	} else if (status === "blocked" || status === "review_blocked") {
-		lines.push("Blocked ultragoal work must be resolved with explicit blocker work or steering before final completion.");
+		lines.push(
+			"Blocked ultragoal work must be resolved with explicit blocker work or steering before final completion.",
+		);
 	}
 	lines.push("");
 	return lines.join("\n");
