@@ -1088,11 +1088,11 @@ export const SETTINGS_SCHEMA = {
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "context",
 			label: "Auto-Promote Context",
-			description: "Promote to a larger-context model on context overflow instead of compacting",
+			description: "Promote to a larger-context model on context overflow instead of compacting (off by default; opt in to enable)",
 		},
 	},
 

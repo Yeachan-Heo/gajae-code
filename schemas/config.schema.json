@@ -651,8 +651,8 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean",
-					"description": "Promote to a larger-context model on context overflow instead of compacting",
-					"default": true
+					"description": "Promote to a larger-context model on context overflow instead of compacting (off by default; opt in to enable)",
+					"default": false
 				}
 			},
 			"additionalProperties": false

@@ -635,7 +635,7 @@ Selecting a canonical entry stores the canonical selector. Selecting a provider 
 
 ## Context promotion (model-level fallback chains)
 
-Context promotion is an overflow recovery mechanism for small-context variants (for example `*-spark`) that automatically promotes to a larger-context sibling when the API rejects a request with a context length error.
+Context promotion is an overflow recovery mechanism for small-context variants (for example `*-spark`) that automatically promotes to a larger-context sibling when the API rejects a request with a context length error. It is **off by default** (`contextPromotion.enabled` is `false`); opt in to enable it.
 
 ### Trigger and order
 
