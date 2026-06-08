@@ -35,7 +35,7 @@ export default class Setup extends Command {
 		}),
 		"artifact-byte-cap": Flags.string({ description: "Hermes MCP artifact read byte cap" }),
 		"server-key": Flags.string({ description: "Hermes MCP server key in coordinator config" }),
-		"gjc-command": Flags.string({ description: "Command used to start `gjc mcp-serve hermes`" }),
+		"gjc-command": Flags.string({ description: "Command used to start `gjc mcp-serve coordinator`" }),
 		target: Flags.string({ description: "Hermes config file target for config-only install" }),
 		"profile-dir": Flags.string({ description: "Hermes profile directory for full setup install" }),
 		preset: Flags.string({ description: "Provider preset: minimax, minimax-cn, or glm" }),

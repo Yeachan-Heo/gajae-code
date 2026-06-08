@@ -169,7 +169,7 @@ describe("setup CLI parsing", () => {
 		});
 
 		it("renders Hermes setup without a product-default model", async () => {
-			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
 			await runSetupCommand({
@@ -185,11 +185,11 @@ describe("setup CLI parsing", () => {
 			const configPreview = parsed.previews.find(preview => preview.path.endsWith(".yaml"))?.content ?? "";
 			expect(configPreview).not.toContain("openai/gpt-5.5");
 			expect(configPreview).not.toContain("--model");
-			expect(configPreview).not.toContain("GJC_HERMES_MCP_SESSION_COMMAND");
+			expect(configPreview).not.toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND");
 		});
 
 		it("preserves explicit Hermes session commands exactly", async () => {
-			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 			const sessionCommand = "gjc --model anthropic/claude-sonnet-4";
 
@@ -207,7 +207,7 @@ describe("setup CLI parsing", () => {
 		});
 
 		it("installs Hermes config without overwriting unrelated servers", async () => {
-			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const configPath = path.join(tempRoot, "config.yaml");
 			await Bun.write(
 				configPath,
@@ -236,19 +236,19 @@ describe("setup CLI parsing", () => {
 				mcp_servers: Record<string, { command: string; env?: Record<string, string> }>;
 			};
 			expect(parsed.mcp_servers.other?.command).toBe("other");
-			expect(parsed.mcp_servers.gjc_hermes?.command).toBe("gjc");
-			expect(parsed.mcp_servers.gjc_hermes?.env?.GJC_HERMES_MCP_MUTATIONS).toBe("sessions,questions");
-			expect(parsed.mcp_servers.gjc_hermes?.env?.GJC_HERMES_MCP_SESSION_COMMAND).toBeUndefined();
+			expect(parsed.mcp_servers.gjc_coordinator?.command).toBe("gjc");
+			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_MUTATIONS).toBe("sessions,questions");
+			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_SESSION_COMMAND).toBeUndefined();
 		});
 
 		it("rejects unmanaged Hermes server conflicts unless forced", async () => {
-			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const configPath = path.join(tempRoot, "config.yaml");
 			await Bun.write(
 				configPath,
 				YAML.stringify({
 					mcp_servers: {
-						gjc_hermes: {
+						gjc_coordinator: {
 							command: "custom",
 						},
 					},
@@ -273,7 +273,7 @@ describe("setup CLI parsing", () => {
 		});
 
 		it("smoke checks the current Hermes MCP tool contract without provider credentials", async () => {
-			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-setup-"));
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
 			await runSetupCommand({
@@ -287,8 +287,8 @@ describe("setup CLI parsing", () => {
 
 			const output = stdout.mock.calls.map(call => String(call[0])).join("");
 			const parsed = JSON.parse(output) as { smoke: { requiredTools: string[] } };
-			expect(parsed.smoke.requiredTools).toContain("gjc_hermes_send_prompt");
-			expect(parsed.smoke.requiredTools).toContain("gjc_hermes_submit_question_answer");
+			expect(parsed.smoke.requiredTools).toContain("gjc_coordinator_send_prompt");
+			expect(parsed.smoke.requiredTools).toContain("gjc_coordinator_submit_question_answer");
 			expect(output).not.toContain("OPENAI");
 			expect(output).not.toContain("ANTHROPIC");
 		});

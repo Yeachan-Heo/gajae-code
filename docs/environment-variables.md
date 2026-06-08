@@ -240,20 +240,20 @@ providers:
 
 ### Hermes MCP bridge
 
-`gjc mcp-serve hermes` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
+`gjc mcp-serve coordinator` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
 
 | Variable | Behavior |
 | --- | --- |
-| `GJC_HERMES_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
-| `GJC_HERMES_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
-| `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by artifact reads (default `65536`, capped at `1048576`). |
-| `GJC_HERMES_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/hermes-mcp`). |
-| `GJC_HERMES_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
-| `GJC_HERMES_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
-| `GJC_HERMES_MCP_SESSION_COMMAND` | Optional GJC-compatible command used by mutating session startup to launch a detached tmux session. When unset, startup records a bridge session without tmux actuation unless a service adapter is injected. `gjc setup hermes` omits this by default and never hard-codes a provider/model; explicit values are preserved as user intent. |
-| `GJC_HERMES_MCP_SETUP_MANAGED_BY` | Marker written by `gjc setup hermes` for safe managed config updates. |
-| `GJC_HERMES_MCP_SETUP_SCHEMA_VERSION` | Managed setup schema version written by `gjc setup hermes`. |
-| `GJC_HERMES_MCP_SETUP_SIGNATURE` | Deterministic managed setup signature used to detect safe updates versus unmanaged conflicts. |
+| `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
+| `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
+| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by artifact reads (default `65536`, capped at `1048576`). |
+| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/hermes-mcp`). |
+| `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
+| `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
+| `GJC_COORDINATOR_MCP_SESSION_COMMAND` | Optional GJC-compatible command used by mutating session startup to launch a detached tmux session. When unset, startup records a bridge session without tmux actuation unless a service adapter is injected. `gjc setup hermes` omits this by default and never hard-codes a provider/model; explicit values are preserved as user intent. |
+| `GJC_COORDINATOR_MCP_SETUP_MANAGED_BY` | Marker written by `gjc setup hermes` for safe managed config updates. |
+| `GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION` | Managed setup schema version written by `gjc setup hermes`. |
+| `GJC_COORDINATOR_MCP_SETUP_SIGNATURE` | Deterministic managed setup signature used to detect safe updates versus unmanaged conflicts. |
 
 ### Google Vertex AI
 

@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../hermes/contract";
+import {
+	COORDINATOR_MCP_PROTOCOL_VERSION,
+	COORDINATOR_MCP_SERVER_NAME,
+	COORDINATOR_MCP_TOOL_NAMES,
+} from "../coordinator/contract";
 import operatorInstructionsTemplate from "./hermes/templates/operator-instructions.v1.md" with { type: "text" };
 
 export type HermesMutationClass = "sessions" | "questions" | "reports";
@@ -32,10 +36,10 @@ export interface CoordinatorSetupSpec {
 	schemaVersion: 1;
 	coordinator: "hermes";
 	serverKey: string;
-	serverName: typeof HERMES_MCP_SERVER_NAME;
-	protocolVersion: typeof HERMES_MCP_PROTOCOL_VERSION;
+	serverName: typeof COORDINATOR_MCP_SERVER_NAME;
+	protocolVersion: typeof COORDINATOR_MCP_PROTOCOL_VERSION;
 	gjcCommand: string;
-	args: ["mcp-serve", "hermes"];
+	args: ["mcp-serve", "coordinator"];
 	roots: string[];
 	namespace: {
 		profile?: string;
@@ -83,7 +87,7 @@ class HermesSetupError extends Error {
 const MUTATION_CLASSES: HermesMutationClass[] = ["sessions", "questions", "reports"];
 const MANAGED_BY = "gjc";
 const SETUP_SCHEMA_VERSION = "1";
-const DEFAULT_SERVER_KEY = "gjc_hermes";
+const DEFAULT_SERVER_KEY = "gjc_coordinator";
 const DEFAULT_GJC_COMMAND = "gjc";
 const DEFAULT_TIMEOUT = 180;
 const DEFAULT_CONNECT_TIMEOUT = 60;
@@ -168,10 +172,10 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 		schemaVersion: 1,
 		coordinator: "hermes",
 		serverKey: optionalTrim(flags.serverKey) ?? DEFAULT_SERVER_KEY,
-		serverName: HERMES_MCP_SERVER_NAME,
-		protocolVersion: HERMES_MCP_PROTOCOL_VERSION,
+		serverName: COORDINATOR_MCP_SERVER_NAME,
+		protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION,
 		gjcCommand: optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND,
-		args: ["mcp-serve", "hermes"],
+		args: ["mcp-serve", "coordinator"],
 		roots,
 		namespace: {
 			...(optionalTrim(flags.profile) ? { profile: optionalTrim(flags.profile) } : {}),
@@ -226,17 +230,18 @@ export function computeHermesSetupSignature(spec: CoordinatorSetupSpec): string 
 
 export function renderHermesServerBlock(spec: CoordinatorSetupSpec): Record<string, unknown> {
 	const env: Record<string, string> = {
-		GJC_HERMES_MCP_WORKDIR_ROOTS: spec.roots.join(path.delimiter),
-		GJC_HERMES_MCP_SETUP_MANAGED_BY: MANAGED_BY,
-		GJC_HERMES_MCP_SETUP_SCHEMA_VERSION: SETUP_SCHEMA_VERSION,
-		GJC_HERMES_MCP_SETUP_SIGNATURE: computeHermesSetupSignature(spec),
+		GJC_COORDINATOR_MCP_WORKDIR_ROOTS: spec.roots.join(path.delimiter),
+		GJC_COORDINATOR_MCP_SETUP_MANAGED_BY: MANAGED_BY,
+		GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION: SETUP_SCHEMA_VERSION,
+		GJC_COORDINATOR_MCP_SETUP_SIGNATURE: computeHermesSetupSignature(spec),
 	};
-	if (spec.namespace.profile) env.GJC_HERMES_MCP_PROFILE = spec.namespace.profile;
-	if (spec.namespace.repo) env.GJC_HERMES_MCP_REPO = spec.namespace.repo;
-	if (spec.stateRoot) env.GJC_HERMES_MCP_STATE_ROOT = spec.stateRoot;
-	if (spec.mutationPolicy.classes.length > 0) env.GJC_HERMES_MCP_MUTATIONS = spec.mutationPolicy.classes.join(",");
-	if (spec.artifactByteCap !== undefined) env.GJC_HERMES_MCP_ARTIFACT_BYTE_CAP = String(spec.artifactByteCap);
-	if (spec.sessionCommand) env.GJC_HERMES_MCP_SESSION_COMMAND = spec.sessionCommand;
+	if (spec.namespace.profile) env.GJC_COORDINATOR_MCP_PROFILE = spec.namespace.profile;
+	if (spec.namespace.repo) env.GJC_COORDINATOR_MCP_REPO = spec.namespace.repo;
+	if (spec.stateRoot) env.GJC_COORDINATOR_MCP_STATE_ROOT = spec.stateRoot;
+	if (spec.mutationPolicy.classes.length > 0)
+		env.GJC_COORDINATOR_MCP_MUTATIONS = spec.mutationPolicy.classes.join(",");
+	if (spec.artifactByteCap !== undefined) env.GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP = String(spec.artifactByteCap);
+	if (spec.sessionCommand) env.GJC_COORDINATOR_MCP_SESSION_COMMAND = spec.sessionCommand;
 	return {
 		command: spec.gjcCommand,
 		args: spec.args,
@@ -254,7 +259,7 @@ function renderConfigYaml(spec: CoordinatorSetupSpec): string {
 function renderOperatorTemplate(spec: CoordinatorSetupSpec): string {
 	return operatorInstructionsTemplate
 		.replaceAll("{{SERVER_KEY}}", spec.serverKey)
-		.replaceAll("{{TOOL_PREFIX}}", "gjc_hermes")
+		.replaceAll("{{TOOL_PREFIX}}", "gjc_coordinator")
 		.replaceAll("{{TEMPLATE_VERSION}}", String(spec.operatorTemplateVersion));
 }
 
@@ -263,9 +268,9 @@ function serverBlockIsManaged(block: unknown): boolean {
 	const env = block.env;
 	return (
 		isRecord(env) &&
-		env.GJC_HERMES_MCP_SETUP_MANAGED_BY === MANAGED_BY &&
-		env.GJC_HERMES_MCP_SETUP_SCHEMA_VERSION === SETUP_SCHEMA_VERSION &&
-		typeof env.GJC_HERMES_MCP_SETUP_SIGNATURE === "string"
+		env.GJC_COORDINATOR_MCP_SETUP_MANAGED_BY === MANAGED_BY &&
+		env.GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION === SETUP_SCHEMA_VERSION &&
+		typeof env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === "string"
 	);
 }
 
@@ -351,8 +356,8 @@ async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promis
 }
 
 function runSmoke(spec: CoordinatorSetupSpec): HermesSetupResult["smoke"] {
-	const requiredTools = [...HERMES_MCP_TOOL_NAMES];
-	const missingTools = requiredTools.filter(tool => !HERMES_MCP_TOOL_NAMES.includes(tool));
+	const requiredTools = [...COORDINATOR_MCP_TOOL_NAMES];
+	const missingTools = requiredTools.filter(tool => !COORDINATOR_MCP_TOOL_NAMES.includes(tool));
 	return {
 		ok: missingTools.length === 0,
 		protocolVersion: spec.protocolVersion,
@@ -391,7 +396,7 @@ export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSet
 		previews,
 		warnings: spec.sessionCommand
 			? [
-					"Using explicit GJC_HERMES_MCP_SESSION_COMMAND exactly as supplied; provider/model validation is not performed.",
+					"Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND exactly as supplied; provider/model validation is not performed.",
 				]
 			: ["No session command supplied; spawned sessions use the default GJC command/model resolution."],
 		smoke,

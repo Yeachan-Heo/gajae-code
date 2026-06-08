@@ -1,5 +1,9 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../hermes/contract";
+import {
+	COORDINATOR_MCP_PROTOCOL_VERSION,
+	COORDINATOR_MCP_SERVER_NAME,
+	COORDINATOR_MCP_TOOL_NAMES,
+} from "../coordinator/contract";
 import { runHermesMcpStdio } from "../hermes-mcp/server";
 
 function writeJson(value: unknown): void {
@@ -7,7 +11,7 @@ function writeJson(value: unknown): void {
 }
 
 export function validateMcpServeSubcommandForTest(server: string | undefined): void {
-	if (server !== "hermes") throw new Error(`unknown_mcp_serve_subcommand:${server ?? ""}`);
+	if (server !== "coordinator") throw new Error(`unknown_mcp_serve_subcommand:${server ?? ""}`);
 }
 
 export default class McpServe extends Command {
@@ -15,7 +19,7 @@ export default class McpServe extends Command {
 	static strict = false;
 
 	static args = {
-		server: Args.string({ description: "MCP server to run (hermes)", required: false }),
+		server: Args.string({ description: "MCP server to run (coordinator)", required: false }),
 	};
 
 	static flags = {
@@ -41,9 +45,9 @@ export default class McpServe extends Command {
 		if (flags.check) {
 			const payload = {
 				ok: true,
-				server: { name: HERMES_MCP_SERVER_NAME, protocolVersion: HERMES_MCP_PROTOCOL_VERSION },
+				server: { name: COORDINATOR_MCP_SERVER_NAME, protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION },
 				readOnly: true,
-				tools: [...HERMES_MCP_TOOL_NAMES],
+				tools: [...COORDINATOR_MCP_TOOL_NAMES],
 			};
 			if (flags.json) writeJson(payload);
 			else

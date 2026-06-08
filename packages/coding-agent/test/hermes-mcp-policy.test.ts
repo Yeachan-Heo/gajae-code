@@ -12,7 +12,7 @@ import {
 const tempDirs: string[] = [];
 
 async function tempRoot(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-policy-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-policy-"));
 	tempDirs.push(dir);
 	return dir;
 }
@@ -32,13 +32,13 @@ describe("Hermes MCP safety policy", () => {
 	});
 
 	it("requires startup mutation opt-in and per-call allow_mutation", () => {
-		const config = buildHermesMcpConfig({ GJC_HERMES_MCP_MUTATIONS: "sessions,reports" });
+		const config = buildHermesMcpConfig({ GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports" });
 
 		expect(() => requireHermesMutation(config, "sessions", { allow_mutation: false })).toThrow(
-			"hermes_mutation_call_not_allowed",
+			"coordinator_mutation_call_not_allowed",
 		);
 		expect(() => requireHermesMutation(config, "questions", { allow_mutation: true })).toThrow(
-			"hermes_mutation_class_disabled:questions",
+			"coordinator_mutation_class_disabled:questions",
 		);
 		expect(() => requireHermesMutation(config, "sessions", { allow_mutation: true })).not.toThrow();
 	});
@@ -46,12 +46,12 @@ describe("Hermes MCP safety policy", () => {
 	it("rejects workdirs outside canonical allowlisted roots", async () => {
 		const root = await tempRoot();
 		const outside = await tempRoot();
-		const config = buildHermesMcpConfig({ GJC_HERMES_MCP_WORKDIR_ROOTS: root });
+		const config = buildHermesMcpConfig({ GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root });
 
 		await expect(assertHermesWorkdir(config, path.join(root, "child"))).resolves.toBe(path.join(root, "child"));
-		await expect(assertHermesWorkdir(config, outside)).rejects.toThrow("hermes_workdir_outside_allowed_roots");
+		await expect(assertHermesWorkdir(config, outside)).rejects.toThrow("coordinator_workdir_outside_allowed_roots");
 		await expect(assertHermesWorkdir(config, path.join(root, "..", path.basename(outside)))).rejects.toThrow(
-			"hermes_workdir_outside_allowed_roots",
+			"coordinator_workdir_outside_allowed_roots",
 		);
 	});
 
@@ -64,15 +64,15 @@ describe("Hermes MCP safety policy", () => {
 		await Bun.write(path.join(outside, "secret.txt"), "secret");
 		await fs.symlink(path.join(outside, "secret.txt"), escapedLink);
 		const config = buildHermesMcpConfig({
-			GJC_HERMES_MCP_WORKDIR_ROOTS: root,
-			GJC_HERMES_MCP_ARTIFACT_BYTE_CAP: "3",
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: "3",
 		});
 
 		const safe = await assertHermesArtifactPath(config, safeFile);
 		expect(safe.path).toBe(safeFile);
 		expect(safe.byteCap).toBe(3);
 		await expect(assertHermesArtifactPath(config, escapedLink)).rejects.toThrow(
-			"hermes_artifact_outside_allowed_roots",
+			"coordinator_artifact_outside_allowed_roots",
 		);
 	});
 });

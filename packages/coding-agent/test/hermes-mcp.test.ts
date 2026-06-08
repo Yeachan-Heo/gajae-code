@@ -2,16 +2,20 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import HermesCommand from "../src/commands/hermes";
+import CoordinatorCommand from "../src/commands/coordinator";
 import McpServeCommand from "../src/commands/mcp-serve";
-import { HERMES_MCP_PROTOCOL_VERSION, HERMES_MCP_SERVER_NAME, HERMES_MCP_TOOL_NAMES } from "../src/hermes/contract";
+import {
+	COORDINATOR_MCP_PROTOCOL_VERSION,
+	COORDINATOR_MCP_SERVER_NAME,
+	COORDINATOR_MCP_TOOL_NAMES,
+} from "../src/coordinator/contract";
 import { createHermesSafetyPolicy } from "../src/hermes-mcp/safety";
 import { createHermesMcpServer, handleHermesMcpRequest } from "../src/hermes-mcp/server";
 
 const ORIGINAL_STDOUT_WRITE = process.stdout.write.bind(process.stdout);
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-mcp-"));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-mcp-"));
 	try {
 		await run(root);
 	} finally {
@@ -41,7 +45,7 @@ async function runHermesCommand(argv: string[]): Promise<string> {
 		return true;
 	});
 	try {
-		const command = new HermesCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
+		const command = new CoordinatorCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
 		await command.run();
 		return output;
 	} finally {
@@ -53,14 +57,14 @@ afterEach(() => {
 	process.stdout.write = ORIGINAL_STDOUT_WRITE;
 });
 
-describe("gjc mcp-serve hermes", () => {
+describe("gjc mcp-serve coordinator", () => {
 	it("exposes a checkable Hermes MCP command and rejects unknown subcommands as JSON", async () => {
-		const ok = JSON.parse(await runCommand(["hermes", "--check", "--json"]));
+		const ok = JSON.parse(await runCommand(["coordinator", "--check", "--json"]));
 		expect(ok).toEqual({
 			ok: true,
-			server: { name: HERMES_MCP_SERVER_NAME, protocolVersion: HERMES_MCP_PROTOCOL_VERSION },
+			server: { name: COORDINATOR_MCP_SERVER_NAME, protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION },
 			readOnly: true,
-			tools: [...HERMES_MCP_TOOL_NAMES],
+			tools: [...COORDINATOR_MCP_TOOL_NAMES],
 		});
 
 		const rejected = JSON.parse(await runCommand(["bogus", "--json"]));
@@ -71,17 +75,17 @@ describe("gjc mcp-serve hermes", () => {
 		const ok = JSON.parse(await runHermesCommand(["--json"]));
 		expect(ok).toEqual({
 			ok: true,
-			server: { name: HERMES_MCP_SERVER_NAME, protocolVersion: HERMES_MCP_PROTOCOL_VERSION },
+			server: { name: COORDINATOR_MCP_SERVER_NAME, protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION },
 			readOnly: true,
-			tools: [...HERMES_MCP_TOOL_NAMES],
+			tools: [...COORDINATOR_MCP_TOOL_NAMES],
 		});
 
 		const tools = JSON.parse(await runHermesCommand(["tools", "--json"]));
-		expect(tools).toEqual({ ok: true, tools: [...HERMES_MCP_TOOL_NAMES] });
+		expect(tools).toEqual({ ok: true, tools: [...COORDINATOR_MCP_TOOL_NAMES] });
 	});
 
 	it("implements initialize, tools/list, and read-only mutating rejection", async () => {
-		const env = { ...process.env, GJC_HERMES_MCP_REPO: "repo-a" };
+		const env = { ...process.env, GJC_COORDINATOR_MCP_REPO: "repo-a" };
 		const initialize = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" }, { env });
 		expect(initialize).toEqual({
 			jsonrpc: "2.0",
@@ -89,12 +93,12 @@ describe("gjc mcp-serve hermes", () => {
 			result: {
 				protocolVersion: "2024-11-05",
 				capabilities: { tools: {}, prompts: {}, resources: {} },
-				serverInfo: { name: "gjc-hermes-mcp", version: expect.any(String) },
+				serverInfo: { name: "gjc-coordinator-mcp", version: expect.any(String) },
 			},
 		});
 
 		const listed = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
-		expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toContain("gjc_hermes_report_status");
+		expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toContain("gjc_coordinator_report_status");
 		const prompts = await handleHermesMcpRequest({ jsonrpc: "2.0", id: 20, method: "prompts/list" }, { env });
 		expect(prompts.result.prompts).toEqual([]);
 
@@ -106,12 +110,12 @@ describe("gjc mcp-serve hermes", () => {
 				jsonrpc: "2.0",
 				id: 3,
 				method: "tools/call",
-				params: { name: "gjc_hermes_start_session", arguments: { cwd: process.cwd(), allow_mutation: true } },
+				params: { name: "gjc_coordinator_start_session", arguments: { cwd: process.cwd(), allow_mutation: true } },
 			},
 			{ env },
 		);
 		const payload = JSON.parse(called.result.content[0].text);
-		expect(payload).toEqual({ ok: false, reason: "hermes_mutation_class_disabled:sessions" });
+		expect(payload).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
 	});
 
 	it("requires startup mutation class and per-call allow_mutation for mutating tools", async () => {
@@ -119,15 +123,15 @@ describe("gjc mcp-serve hermes", () => {
 			let created = false;
 			const env = {
 				...process.env,
-				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
-				GJC_HERMES_MCP_ENABLE_MUTATION_CLASSES: "session",
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES: "session",
 			};
 			const missingPerCall = await handleHermesMcpRequest(
 				{
 					jsonrpc: "2.0",
 					id: 1,
 					method: "tools/call",
-					params: { name: "gjc_hermes_start_session", arguments: { cwd: root } },
+					params: { name: "gjc_coordinator_start_session", arguments: { cwd: root } },
 				},
 				{
 					env,
@@ -139,7 +143,7 @@ describe("gjc mcp-serve hermes", () => {
 			);
 			expect(JSON.parse(missingPerCall.result.content[0].text)).toEqual({
 				ok: false,
-				reason: "hermes_mutation_call_not_allowed:sessions",
+				reason: "coordinator_mutation_call_not_allowed:sessions",
 			});
 
 			const allowed = await handleHermesMcpRequest(
@@ -147,7 +151,7 @@ describe("gjc mcp-serve hermes", () => {
 					jsonrpc: "2.0",
 					id: 2,
 					method: "tools/call",
-					params: { name: "gjc_hermes_start_session", arguments: { cwd: root, allow_mutation: true } },
+					params: { name: "gjc_coordinator_start_session", arguments: { cwd: root, allow_mutation: true } },
 				},
 				{
 					env,
@@ -176,12 +180,12 @@ describe("gjc mcp-serve hermes", () => {
 
 	it("canonicalizes workdir roots and rejects traversal plus symlink escapes", async () => {
 		await withTempRoot(async root => {
-			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hermes-outside-"));
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-outside-"));
 			try {
 				const link = path.join(root, "escape");
 				await fs.symlink(outside, link);
 				const policy = await createHermesSafetyPolicy({
-					env: { ...process.env, GJC_HERMES_MCP_WORKDIR_ROOTS: root },
+					env: { ...process.env, GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root },
 				});
 				expect(await policy.resolveWorkdir(path.join(root, "..", path.basename(root)))).toBe(root);
 				await expect(policy.resolveWorkdir(path.join(root, "..", path.basename(outside)))).rejects.toThrow(
@@ -201,18 +205,18 @@ describe("gjc mcp-serve hermes", () => {
 			const byteCap = 5;
 			const env = {
 				...process.env,
-				GJC_HERMES_MCP_WORKDIR_ROOTS: root,
-				GJC_HERMES_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
 			};
 			const server = await createHermesMcpServer({ env });
-			const read = await server.callTool("gjc_hermes_read_artifact", { path: artifact });
+			const read = await server.callTool("gjc_coordinator_read_artifact", { path: artifact });
 			expect(read.ok).toBe(true);
 			expect(read.path).toBe(artifact);
 			expect(read.bytes).toBeLessThanOrEqual(byteCap);
 			expect(read.truncated).toBe(true);
 			expect(Buffer.byteLength(String(read.text))).toBeLessThanOrEqual(byteCap);
 			await expect(
-				server.callTool("gjc_hermes_read_artifact", { path: path.join(os.tmpdir(), "missing.txt") }),
+				server.callTool("gjc_coordinator_read_artifact", { path: path.join(os.tmpdir(), "missing.txt") }),
 			).resolves.toEqual({
 				ok: false,
 				reason: "artifact_outside_allowed_roots",

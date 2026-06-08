@@ -3,7 +3,7 @@
 GJC exposes a native outward MCP bridge for Hermes-style coordinators:
 
 ```bash
-gjc mcp-serve hermes
+gjc mcp-serve coordinator
 ```
 
 The bridge is intentionally separate from GJC's client-side MCP runtime. It lets an external coordinator list sessions, start worktree/tmux-oriented sessions, queue bounded follow-up prompts, read status/tail/artifacts, handle structured questions, and write coordination reports without scraping terminal scrollback.
@@ -12,8 +12,8 @@ The bridge is intentionally separate from GJC's client-side MCP runtime. It lets
 
 Hermes integration is intentionally a core contract with multiple adapters, not an MCP-only product direction:
 
-- `packages/coding-agent/src/hermes/contract.ts` owns transport-neutral server metadata and tool names.
-- `gjc mcp-serve hermes` is the outward MCP adapter for Hermes-style agents.
+- `packages/coding-agent/src/coordinator/contract.ts` owns transport-neutral server metadata and tool names.
+- `gjc mcp-serve coordinator` is the outward MCP adapter for Hermes-style agents.
 - `gjc hermes` is the read-only CLI/debug adapter for humans and scripts that need to inspect the same contract without starting MCP transport.
 - `gjc setup hermes` is the setup adapter that renders coordinator config and operator guidance.
 
@@ -39,7 +39,7 @@ gjc setup hermes \
   --install
 ```
 
-The generated setup is model-agnostic. By default it does not render `GJC_HERMES_MCP_SESSION_COMMAND`, so spawned sessions use the user's normal GJC model/provider resolution. Users who need a specific local wrapper, dev checkout, or provider/model can opt in explicitly:
+The generated setup is model-agnostic. By default it does not render `GJC_COORDINATOR_MCP_SESSION_COMMAND`, so spawned sessions use the user's normal GJC model/provider resolution. Users who need a specific local wrapper, dev checkout, or provider/model can opt in explicitly:
 
 ```bash
 gjc setup hermes \
@@ -65,13 +65,13 @@ The bridge is read-only and fail-closed by default.
 Required root allowlist:
 
 ```bash
-export GJC_HERMES_MCP_WORKDIR_ROOTS="/path/to/repo:/path/to/worktrees"
+export GJC_COORDINATOR_MCP_WORKDIR_ROOTS="/path/to/repo:/path/to/worktrees"
 ```
 
 Mutating tools require both startup opt-in and per-call consent:
 
 ```bash
-export GJC_HERMES_MCP_MUTATIONS="sessions,questions,reports"
+export GJC_COORDINATOR_MCP_MUTATIONS="sessions,questions,reports"
 ```
 
 Every mutating MCP call must also include `allow_mutation: true`. Missing startup opt-in or missing per-call consent returns an error instead of falling back to shell or terminal relay.
@@ -79,22 +79,22 @@ Every mutating MCP call must also include `allow_mutation: true`. Missing startu
 Real tmux/GJC actuation is enabled by setting a GJC-compatible session command:
 
 ```bash
-export GJC_HERMES_MCP_SESSION_COMMAND="/path/to/gjc"
+export GJC_COORDINATOR_MCP_SESSION_COMMAND="/path/to/gjc"
 ```
 
-When set, `gjc_hermes_start_session` launches a detached tmux session, `gjc_hermes_send_prompt` creates a durable turn and sends input to that pane, and `gjc_hermes_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_hermes_report_status`.
+When set, `gjc_coordinator_start_session` launches a detached tmux session, `gjc_coordinator_send_prompt` creates a durable turn and sends input to that pane, and `gjc_coordinator_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_coordinator_report_status`.
 
-Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_HERMES_MCP_ARTIFACT_BYTE_CAP`.
+Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`.
 
-`gjc setup hermes` renders `GJC_HERMES_MCP_WORKDIR_ROOTS` with the host platform path delimiter (`:` on POSIX, `;` on Windows). Manual configs should prefer the same encoding.
+`gjc setup hermes` renders `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` with the host platform path delimiter (`:` on POSIX, `;` on Windows). Manual configs should prefer the same encoding.
 
 ## Optional namespace
 
 Use namespace variables to prevent cross-profile or cross-repo enumeration:
 
 ```bash
-export GJC_HERMES_MCP_PROFILE="meeseeks2"
-export GJC_HERMES_MCP_REPO="gajae-code"
+export GJC_COORDINATOR_MCP_PROFILE="meeseeks2"
+export GJC_COORDINATOR_MCP_REPO="gajae-code"
 ```
 
 Missing namespace never widens into global session enumeration.
@@ -103,40 +103,40 @@ Missing namespace never widens into global session enumeration.
 
 Read tools:
 
-- `gjc_hermes_list_sessions`
-- `gjc_hermes_read_status`
-- `gjc_hermes_read_tail`
-- `gjc_hermes_list_questions`
-- `gjc_hermes_list_artifacts`
-- `gjc_hermes_read_artifact`
-- `gjc_hermes_read_coordination_status`
-- `gjc_hermes_read_turn`
-- `gjc_hermes_await_turn`
+- `gjc_coordinator_list_sessions`
+- `gjc_coordinator_read_status`
+- `gjc_coordinator_read_tail`
+- `gjc_coordinator_list_questions`
+- `gjc_coordinator_list_artifacts`
+- `gjc_coordinator_read_artifact`
+- `gjc_coordinator_read_coordination_status`
+- `gjc_coordinator_read_turn`
+- `gjc_coordinator_await_turn`
 
 Mutating tools:
 
-- `gjc_hermes_start_session`
-- `gjc_hermes_send_prompt`
-- `gjc_hermes_submit_question_answer`
-- `gjc_hermes_report_status`
+- `gjc_coordinator_start_session`
+- `gjc_coordinator_send_prompt`
+- `gjc_coordinator_submit_question_answer`
+- `gjc_coordinator_report_status`
 
 ## Turn orchestration flow
 
 Hermes coordinators should treat turns, not terminal scrollback, as the unit of work:
 
-1. Call `gjc_hermes_start_session` with `allow_mutation: true`.
-2. Call `gjc_hermes_send_prompt` with `allow_mutation: true`.
+1. Call `gjc_coordinator_start_session` with `allow_mutation: true`.
+2. Call `gjc_coordinator_send_prompt` with `allow_mutation: true`.
 3. Store the returned `turn_id`.
-4. Poll `gjc_hermes_read_turn`, or call bounded `gjc_hermes_await_turn`, until the turn is terminal.
-5. If `gjc_hermes_list_questions` shows a question for that turn, answer with `gjc_hermes_submit_question_answer`.
-6. Use `gjc_hermes_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
+4. Poll `gjc_coordinator_read_turn`, or call bounded `gjc_coordinator_await_turn`, until the turn is terminal.
+5. If `gjc_coordinator_list_questions` shows a question for that turn, answer with `gjc_coordinator_submit_question_answer`.
+6. Use `gjc_coordinator_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
 
-`gjc_hermes_send_prompt` preserves the legacy `queued` and `delivered` fields and adds turn fields:
+`gjc_coordinator_send_prompt` preserves the legacy `queued` and `delivered` fields and adds turn fields:
 
 ```json
 {
   "ok": true,
-  "session_id": "gjc-hermes-demo",
+  "session_id": "gjc-coordinator-demo",
   "turn_id": "turn-00000000-0000-0000-0000-000000000000",
   "active_turn_id": "turn-00000000-0000-0000-0000-000000000000",
   "status": "active",
@@ -147,7 +147,7 @@ Hermes coordinators should treat turns, not terminal scrollback, as the unit of 
 
 A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable but are not delivered immediately. Force supersedes the previous active turn and audits that state in the turn journal.
 
-`gjc_hermes_read_turn` returns the authoritative durable turn plus advisory pane status:
+`gjc_coordinator_read_turn` returns the authoritative durable turn plus advisory pane status:
 
 ```json
 {
@@ -155,7 +155,7 @@ A session may have only one active turn by default. A second prompt is rejected 
   "turn": {
     "schema_version": 1,
     "turn_id": "turn-00000000-0000-0000-0000-000000000000",
-    "session_id": "gjc-hermes-demo",
+    "session_id": "gjc-coordinator-demo",
     "status": "completed",
     "final_response": {
       "text": "Done",
@@ -180,14 +180,14 @@ External `session_id`, `turn_id`, and `question_id` values are validated before 
 ```json
 {
   "mcp_servers": {
-    "gjc_hermes": {
+    "gjc_coordinator": {
       "command": "gjc",
-      "args": ["mcp-serve", "hermes"],
+      "args": ["mcp-serve", "coordinator"],
       "env": {
-        "GJC_HERMES_MCP_WORKDIR_ROOTS": "/home/doyun/src/gajae-code",
-        "GJC_HERMES_MCP_PROFILE": "meeseeks2",
-        "GJC_HERMES_MCP_REPO": "gajae-code",
-        "GJC_HERMES_MCP_SESSION_COMMAND": "/home/doyun/.local/bin/gjc-dev-meeseeks2"
+        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "/home/doyun/src/gajae-code",
+        "GJC_COORDINATOR_MCP_PROFILE": "meeseeks2",
+        "GJC_COORDINATOR_MCP_REPO": "gajae-code",
+        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "/home/doyun/.local/bin/gjc-dev-meeseeks2"
       },
       "enabled": true
     }
@@ -198,7 +198,7 @@ External `session_id`, `turn_id`, and `question_id` values are validated before 
 ## Smoke check
 
 ```bash
-gjc mcp-serve hermes --check --json
+gjc mcp-serve coordinator --check --json
 ```
 
-Expected result includes `ok: true`, server name `gjc-hermes-mcp`, and the GJC-named tool list.
+Expected result includes `ok: true`, server name `gjc-coordinator-mcp`, and the GJC-named tool list.

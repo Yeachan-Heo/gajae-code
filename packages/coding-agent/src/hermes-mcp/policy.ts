@@ -65,17 +65,22 @@ function cleanScope(value: string | undefined): string | null {
 }
 
 export function buildHermesMcpConfig(env: NodeJS.ProcessEnv = process.env): HermesMcpConfig {
-	const stateRoot = env.GJC_HERMES_MCP_STATE_ROOT?.trim() || path.join(process.cwd(), ".gjc", "state", "hermes-mcp");
+	const stateRoot =
+		env.GJC_COORDINATOR_MCP_STATE_ROOT?.trim() || path.join(process.cwd(), ".gjc", "state", "coordinator-mcp");
 	return {
-		allowedRoots: parseList(env.GJC_HERMES_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
-		mutationClasses: parseMutationClasses(env.GJC_HERMES_MCP_MUTATIONS ?? env.GJC_HERMES_MCP_ENABLE_MUTATION_CLASSES),
-		artifactByteCap: parseByteCap(env.GJC_HERMES_MCP_ARTIFACT_BYTE_CAP ?? env.GJC_HERMES_MCP_ARTIFACT_MAX_BYTES),
+		allowedRoots: parseList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
+		mutationClasses: parseMutationClasses(
+			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,
+		),
+		artifactByteCap: parseByteCap(
+			env.GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP ?? env.GJC_COORDINATOR_MCP_ARTIFACT_MAX_BYTES,
+		),
 		namespace: {
-			profile: cleanScope(env.GJC_HERMES_MCP_PROFILE),
-			repo: cleanScope(env.GJC_HERMES_MCP_REPO),
+			profile: cleanScope(env.GJC_COORDINATOR_MCP_PROFILE),
+			repo: cleanScope(env.GJC_COORDINATOR_MCP_REPO),
 		},
 		stateRoot: path.resolve(stateRoot),
-		sessionCommand: env.GJC_HERMES_MCP_SESSION_COMMAND?.trim() || null,
+		sessionCommand: env.GJC_COORDINATOR_MCP_SESSION_COMMAND?.trim() || null,
 	};
 }
 
@@ -100,13 +105,13 @@ async function canonicalAllowedRoots(config: HermesMcpConfig): Promise<string[]>
 }
 
 export async function assertHermesWorkdir(config: HermesMcpConfig, cwd: unknown): Promise<string> {
-	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("hermes_workdir_required");
-	if (config.allowedRoots.length === 0) throw new Error("hermes_workdir_roots_required");
+	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
 	const requested = path.resolve(cwd);
 	const canonicalRequested = await realpathIfExists(requested);
 	const roots = await canonicalAllowedRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
-		throw new Error(`hermes_workdir_outside_allowed_roots:${requested}`);
+		throw new Error(`coordinator_workdir_outside_allowed_roots:${requested}`);
 	}
 	return requested;
 }
@@ -116,13 +121,13 @@ export async function assertHermesArtifactPath(
 	artifactPath: unknown,
 ): Promise<{ path: string; byteCap: number }> {
 	if (typeof artifactPath !== "string" || artifactPath.trim().length === 0)
-		throw new Error("hermes_artifact_path_required");
-	if (config.allowedRoots.length === 0) throw new Error("hermes_artifact_roots_required");
+		throw new Error("coordinator_artifact_path_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
 	const requested = path.resolve(artifactPath);
 	const canonicalRequested = await realpathIfExists(requested);
 	const roots = await canonicalAllowedRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
-		throw new Error(`hermes_artifact_outside_allowed_roots:${requested}`);
+		throw new Error(`coordinator_artifact_outside_allowed_roots:${requested}`);
 	}
 	return { path: requested, byteCap: config.artifactByteCap };
 }
@@ -132,8 +137,9 @@ export function requireHermesMutation(
 	mutationClass: HermesMutationClass,
 	request: HermesMutationRequest,
 ): void {
-	if (!config.mutationClasses.has(mutationClass)) throw new Error(`hermes_mutation_class_disabled:${mutationClass}`);
-	if (request.allow_mutation !== true) throw new Error(`hermes_mutation_call_not_allowed:${mutationClass}`);
+	if (!config.mutationClasses.has(mutationClass))
+		throw new Error(`coordinator_mutation_class_disabled:${mutationClass}`);
+	if (request.allow_mutation !== true) throw new Error(`coordinator_mutation_call_not_allowed:${mutationClass}`);
 }
 
 export function hermesNamespacePath(config: HermesMcpConfig): string {

@@ -18,7 +18,7 @@ Do not report completion to the user until the GJC turn is terminal. Do not infe
 
 ## Model and provider policy
 
-The Hermes bridge does not choose a model/provider. When no session command is configured, GJC uses its normal local model/provider resolution. If the operator config supplies `GJC_HERMES_MCP_SESSION_COMMAND`, preserve it as explicit user intent.
+The Hermes bridge does not choose a model/provider. When no session command is configured, GJC uses its normal local model/provider resolution. If the operator config supplies `GJC_COORDINATOR_MCP_SESSION_COMMAND`, preserve it as explicit user intent.
 
 Provider-specific commands are examples only, never product defaults.
 

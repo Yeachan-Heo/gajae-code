@@ -48,7 +48,7 @@ function toSafetyConfig(config: HermesMcpConfig): HermesSafetyConfig {
 function toFailure(error: unknown): HermesFailure {
 	const message = error instanceof Error ? error.message : String(error);
 	const [rawReason, detail] = message.split(":", 2);
-	const reason = rawReason.replace(/^hermes_/, "");
+	const reason = rawReason.replace(/^coordinator_/, "");
 	return detail === undefined ? { ok: false, reason } : { ok: false, reason, detail };
 }
 
