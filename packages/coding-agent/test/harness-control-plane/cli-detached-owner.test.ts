@@ -11,6 +11,17 @@ const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"
 const SID = "d";
 const FAKE_RPC = path.join(import.meta.dir, "fixtures", "fake-rpc.ts");
 
+function gitInit(dir: string): void {
+	const run = (args: string[]): void => {
+		const r = Bun.spawnSync(["git", ...args], { cwd: dir, stdout: "ignore", stderr: "ignore" });
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
+	};
+	run(["init"]);
+	run(["config", "user.email", "test@example.com"]);
+	run(["config", "user.name", "Test"]);
+	run(["commit", "--allow-empty", "-m", "init"]);
+}
+
 let root: string;
 let workspace: string;
 let tmuxCommand: string;
@@ -224,6 +235,32 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect(evidence.ownerRuntime).toBe("detached");
 		expect(evidence.ownerFallbackReason).toContain("tmux new-session failed");
 		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+
+		const ret = await runHarness(["retire", "--session", SID]);
+		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+	}, 60_000);
+	it("recover bootstraps an owner for a started session whose owner was never spawned (#421)", async () => {
+		gitInit(workspace);
+		// start WITHOUT --detach persists a `started` session with no owner lease/endpoint.
+		const started = await runHarness([
+			"start",
+			"--input",
+			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
+		]);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		expect((started.json?.evidence as Record<string, unknown>).ownerRuntime).toBe("manual");
+
+		// recover must bootstrap a fresh owner instead of deadlocking on the missing prior endpoint.
+		const recovered = await runHarness(["recover", "--session", SID]);
+		expect(recovered.code).toBe(0);
+		const evidence = recovered.json?.evidence as Record<string, unknown>;
+		expect(evidence.bootstrappedOwner).toBe(true);
+		expect(evidence.restoredOwner).toBeUndefined();
+		expect(evidence.vanishReceiptId).toBeUndefined();
+		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
 
 		const ret = await runHarness(["retire", "--session", SID]);
 		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
