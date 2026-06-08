@@ -86,6 +86,16 @@ function parseRequestedTargets(): Set<string> | null {
 	);
 }
 
+function hostDefaultTargets(): BinaryTarget[] {
+	// A bare invocation (no --targets / RELEASE_TARGETS) is a single-host
+	// dogfood build, not a full release. Only the host's platform/arch can be
+	// built here because `embed:native` requires a matching prebuilt addon, and
+	// cross-arch addons are produced per-runner in CI. Default to the host
+	// target instead of every release target so we never demand native addons
+	// for architectures this machine cannot produce.
+	return targets.filter(target => target.platform === process.platform && target.arch === process.arch);
+}
+
 function shouldAdhocSignDarwinBinary(target: BinaryTarget): boolean {
 	return target.platform === "darwin" && process.platform === "darwin";
 }
@@ -182,7 +192,7 @@ async function main(): Promise<void> {
 	const requestedTargets = parseRequestedTargets();
 	const selectedTargets = requestedTargets
 		? targets.filter(target => requestedTargets.has(target.id))
-		: targets;
+		: hostDefaultTargets();
 
 	if (requestedTargets) {
 		const unknownTargets = [...requestedTargets].filter(
@@ -194,7 +204,13 @@ async function main(): Promise<void> {
 	}
 
 	if (selectedTargets.length === 0) {
-		throw new Error("No release targets selected.");
+		if (requestedTargets) {
+			throw new Error("No release targets selected.");
+		}
+		throw new Error(
+			`No release target matches this host (${process.platform}-${process.arch}). ` +
+				`Pass --targets <id> or set RELEASE_TARGETS to build a specific target.`,
+		);
 	}
 
 	await fs.mkdir(binariesDir, { recursive: true });
