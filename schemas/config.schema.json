@@ -575,6 +575,17 @@
 			},
 			"additionalProperties": false
 		},
+		"starReminder": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Show the interactive GitHub star reminder when gh is authenticated",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"collapseChangelog": {
 			"type": "boolean",
 			"description": "Show condensed changelog after updates",
