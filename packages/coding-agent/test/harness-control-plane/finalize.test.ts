@@ -153,6 +153,17 @@ describe("runFinalize (review-only verdict gate)", () => {
 		expect(await readReceiptIndex(root, SID, "review-failure")).toHaveLength(1);
 	});
 
+	it("records OWNER_CONFIRMATION_REQUIRED as a non-success human-action-required state", async () => {
+		const res = await runFinalize({ ...reviewBase(), verdict: "OWNER_CONFIRMATION_REQUIRED", checks: checks() });
+		expect(res.completed).toBe(false);
+		expect(res.verdict).toBe("OWNER_CONFIRMATION_REQUIRED");
+		expect(res.blockers).toEqual(["owner-confirmation-required"]);
+		// The verdict is still durably recorded even though it is not an autonomous success.
+		const verdicts = await readReceiptIndex(root, SID, "review-verdict");
+		expect(verdicts).toHaveLength(1);
+		expect(verdicts[0].valid).toBe(true);
+	});
+
 	it("never blocks review on validation-required-but-none-run", async () => {
 		const res = await runFinalize({
 			...reviewBase(),

@@ -591,7 +591,7 @@ describe("gjc harness CLI (foundation)", () => {
 		if (!state) throw new Error("missing seeded state");
 		state.lifecycle = "observing";
 		await writeSessionState(root, state);
-		// A live lease (fresh heartbeat, this test process pid) with recent RPC frames.
+		// A live lease (fresh heartbeat, this test process pid) — the heartbeat is the liveness signal.
 		const nowMs = Date.now();
 		const lease = {
 			ownerId: "owner-live",
@@ -621,11 +621,43 @@ describe("gjc harness CLI (foundation)", () => {
 		const monitored = runHarness(["monitor", "--session", sessionId]);
 		expect(monitored.code).toBe(0);
 		expect(monitored.json.evidence.ownerExit).toMatchObject({
-			reason: "owner-endpoint-observation-gap",
+			// Reason string is unchanged for backward-compatible consumers; the transient distinction
+			// is carried by the additive `terminal`/`transient` fields.
+			reason: "owner-endpoint-unreachable",
 			leaseStatus: "live",
 			terminal: false,
+			transient: true,
 		});
 		expect(monitored.json.evidence.ownerExit.lastRpcActivityAt).toBeTruthy();
+	});
+
+	it("monitor does not treat a terminal completion frame as owner liveness (no transient masking)", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		if (!state) throw new Error("missing seeded state");
+		state.lifecycle = "observing";
+		await writeSessionState(root, state);
+		// No lease (owner gone) plus a recent terminal completion frame.
+		await appendEvent(root, sessionId, {
+			eventId: "evt-rpc-completed",
+			cursor: 1,
+			createdAt: new Date().toISOString(),
+			severity: "info",
+			kind: "rpc_agent_completed",
+			state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { outcome: "completed", signal: "completed" },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-gone", leaseEpoch: 1 },
+		});
+
+		const monitored = runHarness(["monitor", "--session", sessionId]);
+		expect(monitored.code).toBe(0);
+		expect(monitored.json.evidence.ownerExit.terminal).toBe(true);
+		expect(monitored.json.evidence.ownerExit.transient).toBe(false);
+		// Completion frames are excluded from activity, so they cannot fabricate liveness.
+		expect(monitored.json.evidence.ownerExit.lastRpcActivityAt).toBeNull();
 	});
 
 	it("submit is blocked (accepted:false, owner-not-live) and never echoed-as-accepted", () => {

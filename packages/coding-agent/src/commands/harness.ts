@@ -54,9 +54,6 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
-/** RPC activity newer than this (relative to wall clock) marks an endpoint gap as transient, not terminal. */
-const RPC_ACTIVITY_RECENT_MS = 60_000;
-
 function parseInput(raw: string | undefined): Record<string, unknown> {
 	if (!raw?.trim()) return {};
 	const parsed = JSON.parse(raw) as unknown;
@@ -246,7 +243,9 @@ interface OwnerExitEvidence {
 	completedSeen: boolean;
 	/** True only when the owner is genuinely gone (lease missing or process dead). */
 	terminal: boolean;
-	/** ISO timestamp of the most recent RPC-derived owner event, if any. */
+	/** True when the owner process is provably alive (live lease + fresh heartbeat) but the endpoint did not route. */
+	transient: boolean;
+	/** ISO timestamp of the most recent non-terminal RPC-derived owner event, if any (observability only). */
 	lastRpcActivityAt: string | null;
 }
 
@@ -264,24 +263,28 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 		if (typeof signal === "string") lastSignal = signal;
 		if (event.kind === "prompt_accepted" || signal === "prompt-accepted") promptAcceptedSeen = true;
 		if (event.kind === "rpc_agent_completed" || signal === "completed") completedSeen = true;
-		if (event.kind === "rpc_activity" || event.kind.startsWith("rpc_")) lastRpcActivityAt = event.createdAt;
+		// Terminal completion/failure frames are NOT owner liveness — exclude them from activity.
+		if (event.kind.startsWith("rpc_") && event.kind !== "rpc_agent_completed" && event.kind !== "rpc_agent_failed") {
+			lastRpcActivityAt = event.createdAt;
+		}
 	}
-	// Recent RPC frames mean the owner is still driving the session even if the control endpoint
-	// did not answer this stateless call — a transient observation gap, not terminal owner loss.
-	const rpcActivityRecent =
-		lastRpcActivityAt !== null && Date.now() - Date.parse(lastRpcActivityAt) <= RPC_ACTIVITY_RECENT_MS;
+	// Owner liveness is the lease heartbeat, never RPC frames: a "live" lease means the owner process
+	// is alive and heartbeating within TTL, so a failed endpoint call is a transient observation gap.
+	// Real owner loss (missing/dead lease) stays terminal and keeps its original reason string so
+	// existing consumers that match on the reason continue to escalate.
 	const terminal = !lease || leaseStatus === "dead";
+	const transient = leaseStatus === "live";
 	let reason = "owner-not-live";
 	if (!lease) {
 		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-lease-missing";
 	} else if (leaseStatus === "dead") {
 		reason = promptAcceptedSeen && !completedSeen ? "owner-exited-after-prompt-acceptance" : "owner-process-dead";
 	} else if (leaseStatus === "expiredAlive") {
-		reason = rpcActivityRecent ? "owner-endpoint-observation-gap" : "owner-lease-expired";
+		reason = "owner-lease-expired";
 	} else if (leaseStatus === "epermAlive") {
 		reason = "owner-liveness-unknown-permission-denied";
 	} else {
-		reason = rpcActivityRecent ? "owner-endpoint-observation-gap" : "owner-endpoint-unreachable";
+		reason = "owner-endpoint-unreachable";
 	}
 	return {
 		reason,
@@ -296,6 +299,7 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 		promptAcceptedSeen,
 		completedSeen,
 		terminal,
+		transient,
 		lastRpcActivityAt,
 	};
 }
