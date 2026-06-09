@@ -234,6 +234,23 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 	});
 }
 
+// Catalog sources occasionally omit image input for Claude Opus 4.8 variants
+// (e.g. kilo/venice "-fast" entries) even though every Claude Opus model is
+// vision-capable. Correct those so capability advertising stays consistent
+// across providers. Runs after the dynamic merge so it survives regeneration.
+function applyClaudeOpusVisionCorrections(models: readonly Model[]): Model[] {
+	return models.map(model => {
+		const normalizedId = model.id.toLowerCase().replace(/\./g, "-");
+		if (!normalizedId.includes("claude-opus-4-8")) {
+			return model;
+		}
+		if (model.input.includes("image")) {
+			return model;
+		}
+		return { ...model, input: [...model.input, "image"] };
+	});
+}
+
 const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
 async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuthAccess | null> {
@@ -387,6 +404,7 @@ async function generateModels() {
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
+	allModels = applyClaudeOpusVisionCorrections(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
 
