@@ -388,6 +388,16 @@
 										]
 									}
 								},
+								"output": {
+									"type": "array",
+									"items": {
+										"type": "string",
+										"enum": [
+											"text",
+											"image"
+										]
+									}
+								},
 								"cost": {
 									"type": "object",
 									"properties": {
@@ -732,6 +742,16 @@
 									"additionalProperties": false
 								},
 								"input": {
+									"type": "array",
+									"items": {
+										"type": "string",
+										"enum": [
+											"text",
+											"image"
+										]
+									}
+								},
+								"output": {
 									"type": "array",
 									"items": {
 										"type": "string",
