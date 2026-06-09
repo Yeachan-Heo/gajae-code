@@ -1,9 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES } from "../../src/modes/shared/agent-wire/event-contract";
-import {
-	observeAgentSessionEvent,
-	observeRpcOutboundFrame,
-} from "../../src/modes/shared/agent-wire/event-observation";
+import { observeAgentSessionEvent, observeRpcOutboundFrame } from "../../src/modes/shared/agent-wire/event-observation";
 import { EVENT_FIXTURES } from "./fixtures";
 
 const SECRET_MARKERS = [
@@ -42,7 +39,10 @@ function assertBoundedAndRedacted(observation: unknown) {
 		expect(serialized).not.toContain(marker);
 	}
 
-	const evidence = ((observation as { evidence?: Record<string, unknown> } | null)?.evidence ?? {}) as Record<string, unknown>;
+	const evidence = ((observation as { evidence?: Record<string, unknown> } | null)?.evidence ?? {}) as Record<
+		string,
+		unknown
+	>;
 	for (const [key, value] of Object.entries(evidence)) {
 		if (key === "code" || key === "message") {
 			expect(typeof value === "string" ? value.length : 0).toBeLessThanOrEqual(200);

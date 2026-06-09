@@ -93,9 +93,10 @@ describe("agent-wire event observation", () => {
 			expect(observeRpcOutboundFrame({ type: "host_tool_call", id: "h1", toolName: "echo" })?.signal).toBe(
 				"tool-call",
 			);
-			expect(observeRpcOutboundFrame({ type: "host_uri_request", id: "u2", operation: "read", scheme: "db" })?.evidence.scheme).toBe(
-				"db",
-			);
+			expect(
+				observeRpcOutboundFrame({ type: "host_uri_request", id: "u2", operation: "read", scheme: "db" })?.evidence
+					.scheme,
+			).toBe("db");
 			const gate = observeRpcOutboundFrame({ type: "workflow_gate", gate_id: "g1", kind: "approval", stage: "pre" });
 			expect(gate?.semantic).toBe(true);
 			expect(gate?.evidence.gate_id).toBe("g1");

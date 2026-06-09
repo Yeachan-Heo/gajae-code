@@ -3,8 +3,9 @@
  * Fixtures intentionally embed sensitive-looking raw content (assistant text,
  * raw args, raw command output) so redaction can be asserted by tests.
  */
-import type { AgentSessionEvent } from "../../src/session/agent-session";
+
 import type { AgentWireEventType } from "../../src/modes/shared/agent-wire/event-contract";
+import type { AgentSessionEvent } from "../../src/session/agent-session";
 
 /** A raw secret marker that must NEVER appear in bounded owner evidence. */
 export const RAW_SECRET = "RAW_SECRET_MUST_NOT_LEAK";

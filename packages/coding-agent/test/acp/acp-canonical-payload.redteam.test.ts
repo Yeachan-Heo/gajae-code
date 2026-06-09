@@ -5,8 +5,8 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 } from "../../src/modes/acp/acp-event-mapper";
-import { toAgentWireEventPayload } from "../../src/modes/shared/agent-wire/event-envelope";
 import { AGENT_WIRE_EVENT_TYPES } from "../../src/modes/shared/agent-wire/event-contract";
+import { toAgentWireEventPayload } from "../../src/modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../../src/session/agent-session";
 import { EVENT_FIXTURES } from "../agent-wire/fixtures";
 
@@ -88,7 +88,11 @@ describe("ACP canonical payload red-team", () => {
 		for (const type of AGENT_WIRE_EVENT_TYPES) {
 			const fixture = EVENT_FIXTURES[type];
 			expect(
-				mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(fixture), SESSION_ID, makeParityOptions()),
+				mapAgentWireEventPayloadToAcpSessionUpdates(
+					toAgentWireEventPayload(fixture),
+					SESSION_ID,
+					makeParityOptions(),
+				),
 				type,
 			).toEqual(mapAgentSessionEventToAcpSessionUpdates(fixture, SESSION_ID, makeParityOptions()));
 		}
@@ -97,9 +101,10 @@ describe("ACP canonical payload red-team", () => {
 	it("returns no ACP notifications for every explicit whitelist event type", () => {
 		for (const type of WHITELISTED_EMPTY_EVENT_TYPES) {
 			expect(mapAgentSessionEventToAcpSessionUpdates(EVENT_FIXTURES[type], SESSION_ID), type).toEqual([]);
-			expect(mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(EVENT_FIXTURES[type]), SESSION_ID), type).toEqual(
-				[],
-			);
+			expect(
+				mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(EVENT_FIXTURES[type]), SESSION_ID),
+				type,
+			).toEqual([]);
 		}
 	});
 
@@ -117,7 +122,11 @@ describe("ACP canonical payload red-team", () => {
 			"tool_call_update",
 			"tool_call_update",
 		]);
-		expect(updates.map(notification => (notification.update as { toolCallId?: string }).toolCallId)).toEqual(["t1", "t1", "t1"]);
+		expect(updates.map(notification => (notification.update as { toolCallId?: string }).toolCallId)).toEqual([
+			"t1",
+			"t1",
+			"t1",
+		]);
 		expect((updates[1]!.update as { status?: string }).status).toBe("in_progress");
 		expect((updates[2]!.update as { status?: string }).status).toBe("completed");
 	});
