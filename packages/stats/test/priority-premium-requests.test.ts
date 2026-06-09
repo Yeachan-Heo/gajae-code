@@ -84,7 +84,7 @@ describe("priority service-tier premium-request backfill", () => {
 				{ type: "service_tier_change", id: "stc1", timestamp: new Date().toISOString(), serviceTier: "priority" },
 				assistantEntry({ id: "a1", provider: "openai" }),
 				assistantEntry({ id: "a2", provider: "openai-codex" }),
-				// Provider that doesn't honor service_tier — stays at zero.
+				// Direct Anthropic under priority tier counts as fast-mode premium.
 				assistantEntry({ id: "a3", provider: "anthropic" }),
 				{ type: "service_tier_change", id: "stc2", timestamp: new Date().toISOString(), serviceTier: null },
 				assistantEntry({ id: "a4", provider: "openai" }),
@@ -95,7 +95,7 @@ describe("priority service-tier premium-request backfill", () => {
 
 		const overall = await getOverallStats();
 		expect(overall.totalRequests).toBe(4);
-		expect(overall.totalPremiumRequests).toBe(2);
+		expect(overall.totalPremiumRequests).toBe(3);
 	});
 
 	it("preserves an existing non-zero premiumRequests value (Copilot multiplier) even under priority tier", async () => {
