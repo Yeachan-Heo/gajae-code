@@ -546,8 +546,24 @@ describe("ModelRegistry", () => {
 					modelProviderOrder: ["demo", "anthropic"],
 				},
 			});
+			// Both variants are vision-capable, so provider order is the deciding factor.
 			writeRawModelsJson({
-				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				demo: {
+					baseUrl: "https://demo.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					models: [
+						{
+							id: "anthropic/claude-sonnet-4.5",
+							name: "anthropic/claude-sonnet-4.5",
+							reasoning: false,
+							input: ["text", "image"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 100000,
+							maxTokens: 8000,
+						},
+					],
+				},
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
@@ -558,6 +574,30 @@ describe("ModelRegistry", () => {
 
 			expect(resolved?.provider).toBe("demo");
 			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
+		});
+
+		test("prefers vision-capable variant over configured provider order", async () => {
+			await Settings.init({
+				inMemory: true,
+				overrides: {
+					modelProviderOrder: ["demo", "anthropic"],
+				},
+			});
+			// demo's variant is text-only and ranked first by provider order, but the
+			// vision-capable bundled variant must win so an ambiguous id never resolves
+			// to a text-only namesake when a vision-capable variant is available.
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+			});
+
+			expect(resolved?.input.includes("image")).toBe(true);
+			expect(resolved?.provider).toBe("anthropic");
 		});
 	});
 

@@ -2325,6 +2325,14 @@ export class ModelRegistry {
 			fallback: 3,
 		};
 		return [...variants].sort((left, right) => {
+			// Prefer vision-capable variants over configured provider order so an
+			// ambiguous canonical id never resolves to a text-only namesake when a
+			// vision-capable variant of the same id is available.
+			const leftVision = left.model.input.includes("image") ? 0 : 1;
+			const rightVision = right.model.input.includes("image") ? 0 : 1;
+			if (leftVision !== rightVision) {
+				return leftVision - rightVision;
+			}
 			const leftProviderRank = providerRank.get(left.model.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
 			const rightProviderRank = providerRank.get(right.model.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
 			if (leftProviderRank !== rightProviderRank) {
