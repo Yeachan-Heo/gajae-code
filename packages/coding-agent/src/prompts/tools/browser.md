@@ -2,10 +2,11 @@ Drives a real Chromium tab with full puppeteer access via JS execution.
 
 <instruction>
 - For static web content (articles, docs, issues/PRs, JSON, PDFs, feeds), prefer the `read` tool with a URL — reader-mode text without spinning up a browser. Use this tool when you need JS execution, authentication, or interactive actions.
-- Three actions only:
+- Four actions:
   - `open` — acquire (or reuse) a named tab. `name` defaults to `"main"`. Optional `url` navigates after the tab is ready. Optional `viewport` sets dimensions. Optional `dialogs: "accept" | "dismiss"` auto-handles `alert`/`confirm`/`beforeunload` so navigation/clicks don't hang (default: leave dialogs unhandled — page hangs until caller wires `page.on('dialog', …)`).
   - `close` — release a tab by `name`, or every tab with `all: true`. For spawned-app browsers, set `kill: true` to terminate the process tree (default leaves it running).
   - `run` — execute JS against an existing tab. `code` is the body of an async function with `page`, `browser`, `tab`, `display`, `assert`, `wait` in scope. The function's return value is JSON-stringified into the tool result; multiple `display(value)` calls accumulate text/images.
+  - `act` — run a list of structured `actions` against an existing tab without writing JS (preferred for routine navigation/interaction). Each step is `{ verb, … }`; verbs: `navigate {url, wait_until?}`, `click {id|selector}`, `type {id|selector, text}`, `fill {selector, value}`, `select {selector, values}`, `press {key, selector?}`, `scroll {dx?, dy?}`, `back`, `wait {selector?|ms?}`, `observe {viewport_only?, include_all?}`, `extract {format?}`, `screenshot`. Address elements by the numeric `id` from a prior `observe` (preferred) or a selector. Steps run in order; the tool returns an array of per-step results (observations/extracted content included). Use `run` only when a verb does not cover what you need.
 - Tabs survive across `run` calls and across in-process subagents. Open once, reuse many times.
 - Browser kinds, selected by the `app` field on `open`:
   - default (no `app`) → headless Chromium with stealth patches.
@@ -32,7 +33,7 @@ Drives a real Chromium tab with full puppeteer access via JS execution.
 </instruction>
 
 <critical>
-- You MUST call `open` before `run`. `run` does not implicitly create a tab.
+- You MUST call `open` before `run` or `act`. Neither implicitly creates a tab.
 - You NEVER screenshot just to "see what's on the page" — `tab.observe()` returns structured data with element ids you can act on immediately.
 - After a `tab.goto()` or any navigation, prior element ids from `tab.observe()` are invalidated. Re-observe before referencing them.
 - `code` runs with full Node access. Treat it as your code, not sandboxed code.
