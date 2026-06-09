@@ -82,7 +82,7 @@ describe("issue #986 compaction auth fallback", () => {
 	}
 
 	it("falls back to an authenticated role model when the current provider returns auth_unavailable", async () => {
-		const { currentModel, fallbackModel } = await createSession({ fallbackModelRole: "smol" });
+		const { currentModel, fallbackModel } = await createSession({ fallbackModelRole: "default" });
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new Error(
