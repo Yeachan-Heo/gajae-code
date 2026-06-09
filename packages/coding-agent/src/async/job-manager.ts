@@ -6,6 +6,7 @@ const DELIVERY_RETRY_MAX_MS = 30_000;
 const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
+const MONITOR_TOMBSTONE_TTL_MS = 5 * 60_000;
 
 export interface AsyncJob {
 	id: string;
@@ -120,6 +121,27 @@ export interface AsyncJobDeliveryState {
 	pendingJobIds: string[];
 }
 
+export interface AsyncJobLifecycleCleanup {
+	onCancel?: (job: AsyncJob) => void;
+	onTerminal?: (job: AsyncJob) => void;
+	onEvict?: (job: AsyncJob) => void;
+	/**
+	 * Idempotent residual cleanup invoked by a post-eviction tombstone purge
+	 * (e.g. a late `job cancel` after the job left the registry). Kept distinct
+	 * from the at-most-once lifecycle phases so a tombstone purge never has to
+	 * re-invoke a phase hook. Must be safe to call repeatedly.
+	 */
+	onTombstonePurge?: (job: AsyncJob) => void;
+}
+
+export interface MonitorTombstone {
+	jobId: string;
+	ownerId?: string;
+	status: AsyncJob["status"];
+	expiresAt: number;
+	purge: () => unknown;
+}
+
 export interface AsyncJobRegisterOptions {
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
@@ -127,6 +149,7 @@ export interface AsyncJobRegisterOptions {
 	/** Structured metadata for tool-specific control surfaces. */
 	metadata?: AsyncJobMetadata;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
+	lifecycle?: AsyncJobLifecycleCleanup;
 }
 
 /**
@@ -214,6 +237,9 @@ export class AsyncJobManager {
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #outputState = new Map<string, AsyncJobOutputState>();
 	readonly #ownerCleanups = new Map<string, Set<() => void>>();
+	readonly #lifecycles = new Map<string, AsyncJobLifecycleCleanup>();
+	readonly #lifecyclePhases = new Map<string, Set<"cancel" | "terminal" | "evict">>();
+	readonly #monitorTombstones = new Map<string, MonitorTombstone>();
 	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
@@ -292,6 +318,7 @@ export class AsyncJobManager {
 			);
 		}
 
+		this.#expireMonitorTombstones();
 		const id = this.#resolveJobId(options?.id);
 		this.#suppressedDeliveries.delete(id);
 		const abortController = new AbortController();
@@ -308,6 +335,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			metadata: options?.metadata,
 		};
+		if (options?.lifecycle) this.#lifecycles.set(id, options.lifecycle);
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
 			if (!options?.onProgress) return;
@@ -325,8 +353,10 @@ export class AsyncJobManager {
 				const result = await run({ jobId: id, signal: abortController.signal, reportProgress });
 				const outcome: SubagentRunOutcome =
 					typeof result === "string" ? { kind: "completed", text: result } : result;
+
 				if (job.status === "cancelled") {
 					job.resultText = outcome.kind === "completed" ? outcome.text : outcome.note;
+					this.#runLifecycle(id, "terminal");
 					this.#scheduleEviction(id);
 					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
@@ -342,20 +372,24 @@ export class AsyncJobManager {
 					this.#drainResumeQueue();
 					return;
 				}
+
 				job.status = "completed";
 				job.resultText = outcome.text;
 				this.#enqueueDelivery(id, outcome.text);
+				this.#runLifecycle(id, "terminal");
 				this.#scheduleEviction(id);
 				this.#markRecordTerminal(id, "completed");
 				this.#drainResumeQueue();
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
+					this.#runLifecycle(id, "terminal");
 					this.#scheduleEviction(id);
 					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
 					return;
 				}
+				this.#runLifecycle(id, "terminal");
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				job.errorText = errorText;
@@ -381,6 +415,7 @@ export class AsyncJobManager {
 		if (!job) return false;
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status === "paused") {
+			this.#runLifecycle(id, "cancel");
 			// Paused jobs have no running promise to abort; transition directly.
 			// The session file is kept, so the record stays resumable by id.
 			job.status = "cancelled";
@@ -390,10 +425,74 @@ export class AsyncJobManager {
 			return true;
 		}
 		if (job.status !== "running") return false;
+		this.#runLifecycle(id, "cancel");
 		job.status = "cancelled";
 		job.abortController.abort();
-		this.#scheduleEviction(id);
 		return true;
+	}
+
+	#runLifecycle(jobId: string, phase: "cancel" | "terminal" | "evict"): void {
+		const fired = this.#lifecyclePhases.get(jobId) ?? new Set<"cancel" | "terminal" | "evict">();
+		if (fired.has(phase)) return;
+		fired.add(phase);
+		this.#lifecyclePhases.set(jobId, fired);
+		const lifecycle = this.#lifecycles.get(jobId);
+		const job = this.#jobs.get(jobId);
+		if (!lifecycle || !job) return;
+		try {
+			if (phase === "cancel") lifecycle.onCancel?.(job);
+			else if (phase === "terminal") lifecycle.onTerminal?.(job);
+			else lifecycle.onEvict?.(job);
+		} catch (error) {
+			logger.warn("Async job lifecycle cleanup failed", {
+				jobId,
+				phase,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#expireMonitorTombstones(): void {
+		const now = Date.now();
+		for (const [jobId, tombstone] of this.#monitorTombstones) {
+			if (tombstone.expiresAt <= now) this.#monitorTombstones.delete(jobId);
+		}
+	}
+
+	#recordMonitorTombstone(jobId: string): void {
+		const job = this.#jobs.get(jobId);
+		if (!job?.metadata?.monitor) return;
+		const lifecycle = this.#lifecycles.get(jobId);
+		this.#monitorTombstones.set(jobId, {
+			jobId,
+			ownerId: job.ownerId,
+			status: job.status,
+			expiresAt: Date.now() + MONITOR_TOMBSTONE_TTL_MS,
+			purge: () => (lifecycle?.onTombstonePurge ?? lifecycle?.onEvict)?.(job),
+		});
+	}
+
+	getMonitorTombstone(jobId: string, filter?: AsyncJobFilter): MonitorTombstone | undefined {
+		this.#expireMonitorTombstones();
+		const tombstone = this.#monitorTombstones.get(jobId);
+		if (!tombstone) return undefined;
+		if (filter?.ownerId && tombstone.ownerId !== filter.ownerId) return undefined;
+		return tombstone;
+	}
+
+	purgeMonitorTombstone(jobId: string, filter?: AsyncJobFilter): { found: boolean; status?: AsyncJob["status"] } {
+		const tombstone = this.getMonitorTombstone(jobId, filter);
+		if (!tombstone) return { found: false };
+		this.#monitorTombstones.delete(jobId);
+		try {
+			tombstone.purge();
+		} catch (error) {
+			logger.warn("Monitor tombstone purge failed", {
+				jobId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return { found: true, status: tombstone.status };
 	}
 
 	// ── Subagent control plane (pause / resume / steer support) ──────────
@@ -836,6 +935,7 @@ export class AsyncJobManager {
 	 */
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
+			this.#runLifecycle(job.id, "cancel");
 			job.status = "cancelled";
 			job.abortController.abort();
 			this.#scheduleEviction(job.id);
@@ -898,6 +998,17 @@ export class AsyncJobManager {
 		// manager. Errors in cleanup callbacks are logged but never escalated.
 		this.runOwnerCleanups();
 		this.cancelAll();
+		for (const tombstone of this.#monitorTombstones.values()) {
+			try {
+				tombstone.purge();
+			} catch (error) {
+				logger.warn("Monitor tombstone purge failed during dispose", {
+					jobId: tombstone.jobId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		this.#monitorTombstones.clear();
 		await this.waitForAll();
 		const drained = await this.drainDeliveries({ timeoutMs: options?.timeoutMs ?? 3_000 });
 		this.#clearEvictionTimers();
@@ -945,7 +1056,11 @@ export class AsyncJobManager {
 	#scheduleEviction(jobId: string): void {
 		this.#notifyChange();
 		if (this.#retentionMs <= 0) {
+			this.#recordMonitorTombstone(jobId);
+			this.#runLifecycle(jobId, "evict");
 			this.#jobs.delete(jobId);
+			this.#lifecycles.delete(jobId);
+			this.#lifecyclePhases.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
 			this.#watchedJobs.delete(jobId);
 			this.#outputState.delete(jobId);
@@ -957,7 +1072,11 @@ export class AsyncJobManager {
 		}
 		const timer = setTimeout(() => {
 			this.#evictionTimers.delete(jobId);
+			this.#recordMonitorTombstone(jobId);
+			this.#runLifecycle(jobId, "evict");
 			this.#jobs.delete(jobId);
+			this.#lifecycles.delete(jobId);
+			this.#lifecyclePhases.delete(jobId);
 			this.#suppressedDeliveries.delete(jobId);
 			this.#watchedJobs.delete(jobId);
 			this.#outputState.delete(jobId);

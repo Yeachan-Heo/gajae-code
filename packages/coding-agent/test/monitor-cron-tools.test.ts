@@ -39,6 +39,14 @@ function createSession(settings: Settings, options: SessionOptions = {}): ToolSe
 		sendCustomMessage: async (msg: { customType: string; content: string; details?: unknown }) => {
 			options.steered?.push({ customType: msg.customType, content: msg.content, details: msg.details });
 		},
+		purgeQueuedCustomMessages: () => ({
+			agentSteering: 0,
+			agentFollowUp: 0,
+			pendingNextTurn: 0,
+			displaySteering: 0,
+			displayFollowUp: 0,
+			totalExecutable: 0,
+		}),
 		allocateOutputArtifact: async () => ({}),
 	} as unknown as ToolSession;
 }
@@ -178,26 +186,63 @@ describe("MonitorTool", () => {
 		).rejects.toThrow(/Use the `read` tool instead/);
 	});
 
-	it("dispatches one task-notification steer per stdout line", async () => {
+	it("persistent monitor coalesces duplicate executable notifications", async () => {
 		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
 		const session = createSession(settings, { steered });
 		const tool = MonitorTool.createIf(session)!;
 		const result = expectText(
 			await tool.execute("call", {
-				command: "printf 'alpha\\nbeta\\n'",
+				command: "for i in $(seq 1 20); do printf 'same\\n'; done",
 				kind: "log",
 				description: "line test",
 				persistent: true,
 			}),
 		);
-		expect(result.text).toContain("Monitor started · task");
 		expect(result.text).toContain("persistent: true");
 		await manager.waitForAll();
-		expect(steered.map(entry => entry.customType)).toEqual(["task-notification", "task-notification"]);
-		expect(steered[0]?.content).toContain("alpha");
-		expect(steered[1]?.content).toContain("beta");
+		await Promise.resolve();
+
+		expect(steered.length).toBeLessThanOrEqual(3);
+		expect(steered.at(-1)?.content).toContain("same");
 		const slice = manager.readOutputSince(result.details.taskId, 0, { ownerId: "0-Test" });
-		expect(slice?.text).toContain("alpha\nbeta\n");
+		expect(slice?.text.match(/same\n/g)).toHaveLength(20);
+	});
+
+	it("persistent monitor preserves latest state when cap is full", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		await tool.execute("call", {
+			command:
+				"for i in $(seq 1 20); do printf '0 passed, 2 pending, 0 failed\\n'; done; printf '0 passed, 0 pending, 2 failed\\n'",
+			kind: "poll",
+			description: "state test",
+			persistent: true,
+		});
+		await manager.waitForAll();
+		await Promise.resolve();
+
+		expect(steered.some(entry => entry.content.includes("0 passed, 0 pending, 2 failed"))).toBe(true);
+		expect(steered.length).toBeLessThanOrEqual(3);
+	});
+
+	it("cancel closes monitor before abort trailing partial flush", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		const result = expectText(
+			await tool.execute("call", {
+				command: "printf 'partial-without-newline'; sleep 30",
+				kind: "poll",
+				description: "partial test",
+				persistent: true,
+			}),
+		);
+		manager.cancel(result.details.taskId, { ownerId: "0-Test" });
+		await manager.waitForAll();
+		await Promise.resolve();
+
+		expect(steered.some(entry => entry.content.includes("partial-without-newline"))).toBe(false);
 	});
 
 	it("auto-cancels non-persistent monitors after the first stdout-line notification", async () => {

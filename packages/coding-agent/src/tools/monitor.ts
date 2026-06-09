@@ -47,6 +47,7 @@ export interface MonitorToolDetails {
 }
 
 const MONITOR_LABEL_MAX = 120;
+const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
 
 function buildMonitorLabel(params: MonitorParams): string {
 	const base = `[monitor:${params.kind}] ${params.description}`;
@@ -89,36 +90,116 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		const ownerId = this.session.getAgentId?.() ?? undefined;
 		const bash = new BashTool(this.session);
 		let deliveredFirstLine = false;
+		const controller = { closed: false };
+		let currentJobId = "";
+		let sequence = 0;
+		let latestLine: string | undefined;
+		let coalescedCount = 0;
+		let flushScheduled = false;
+		// Count of notification *sends* (not live queue depth): once it exceeds the
+		// cap, each new send first purges older queued notifications for this task,
+		// keeping the queue bounded and latest-biased.
+		let pendingNotifications = 0;
+		const isMonitorMessage = (message: { customType?: string; details?: unknown }) =>
+			message.customType === "task-notification" &&
+			(message.details as { taskId?: string } | undefined)?.taskId === currentJobId;
+		const flushLatest = () => {
+			if (!persistent || latestLine === undefined) return;
+			const line = latestLine;
+			const count = coalescedCount;
+			latestLine = undefined;
+			coalescedCount = 0;
+			flushScheduled = false;
+			sendNotification(line, currentJobId, count);
+		};
+		const closeMonitor = (mode: "purge" | "flush") => {
+			// "flush" (natural process exit): deliver the newest pending line so the
+			// final state is never lost, then stop. "purge" (explicit cancel / registry
+			// eviction): drop the queued backlog. Non-persistent monitors keep their one
+			// notification, so they never purge.
+			if (mode === "flush") {
+				flushLatest();
+				controller.closed = true;
+				return;
+			}
+			controller.closed = true;
+			if (!persistent) return;
+			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
+		};
+		const sendNotification = (line: string, jobId: string, count: number) => {
+			if (controller.closed) return;
+			const notificationId = `${jobId}:${sequence}`;
+			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
+			const content = `<task-notification>\nMonitor task ${jobId} (${params.kind}: ${params.description}) emitted latest state:\n${line}${suffix}\n</task-notification>`;
+			const details = {
+				taskId: jobId,
+				kind: params.kind,
+				description: params.description,
+				monitor: true,
+				notificationId,
+				sequence,
+				coalescedCount: count,
+			};
+			pendingNotifications += 1;
+			if (pendingNotifications > MAX_PENDING_MONITOR_NOTIFICATIONS) {
+				this.session.purgeQueuedCustomMessages?.(
+					m =>
+						m.customType === "task-notification" &&
+						(m.details as { taskId?: string; notificationId?: string } | undefined)?.taskId === jobId &&
+						(m.details as { notificationId?: string } | undefined)?.notificationId !== notificationId,
+				);
+				pendingNotifications = MAX_PENDING_MONITOR_NOTIFICATIONS;
+			}
+			const sendPromise = this.session.sendCustomMessage?.(
+				{ customType: "task-notification", content, display: false, attribution: "agent", details },
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			if (sendPromise) {
+				void sendPromise.catch(error => {
+					logger.warn("Monitor task-notification delivery failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			} else {
+				this.session.steer?.({ customType: "task-notification", content, details });
+			}
+		};
+		const schedulePersistentNotification = (line: string) => {
+			latestLine = line;
+			sequence += 1;
+			coalescedCount += flushScheduled ? 1 : 0;
+			if (flushScheduled) return;
+			flushScheduled = true;
+			queueMicrotask(flushLatest);
+		};
 		const monitorJob = await bash.startMonitorJob(
 			{ command: params.command, timeout: params.timeout },
 			{
 				ownerId,
 				label,
 				ctx: context,
+				shouldAcceptRawLine: () => !controller.closed,
+				lifecycle: {
+					onCancel: () => closeMonitor("purge"),
+					onTerminal: () => closeMonitor("flush"),
+					onEvict: () => closeMonitor("purge"),
+					onTombstonePurge: () => closeMonitor("purge"),
+				},
 				onRawLine: (line, jobId) => {
+					if (controller.closed) return;
+					currentJobId = jobId;
 					if (!persistent && deliveredFirstLine) return;
 					deliveredFirstLine = true;
-					const content = `<task-notification>\nMonitor task ${jobId} (${params.kind}: ${params.description}) emitted:\n${line}\n</task-notification>`;
-					const details = { taskId: jobId, kind: params.kind, description: params.description };
-					const sendPromise = this.session.sendCustomMessage?.(
-						{ customType: "task-notification", content, display: false, attribution: "agent", details },
-						{ triggerTurn: true, deliverAs: "followUp" },
-					);
-					if (sendPromise) {
-						void sendPromise.catch(error => {
-							logger.warn("Monitor task-notification delivery failed", {
-								error: error instanceof Error ? error.message : String(error),
-							});
-						});
-					} else {
-						this.session.steer?.({ customType: "task-notification", content, details });
+					if (persistent) {
+						schedulePersistentNotification(line);
+						return;
 					}
-					if (!persistent) {
-						manager.cancel(jobId, ownerId ? { ownerId } : undefined);
-					}
+					sendNotification(line, jobId, 0);
+					manager.cancel(jobId, ownerId ? { ownerId } : undefined);
 				},
 			},
 		);
+		currentJobId = monitorJob.jobId;
 
 		const startedText = `Monitor started · task ${monitorJob.jobId} · persistent: ${persistent}`;
 

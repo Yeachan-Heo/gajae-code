@@ -943,6 +943,21 @@ export class Agent {
 		return this.#followUpQueue.pop();
 	}
 
+	/** Remove queued steering+follow-up messages matching `predicate`, preserving order of the rest. */
+	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): {
+		steering: number;
+		followUp: number;
+		total: number;
+	} {
+		const beforeSteering = this.#steeringQueue.length;
+		const beforeFollowUp = this.#followUpQueue.length;
+		this.#steeringQueue = this.#steeringQueue.filter(m => !predicate(m));
+		this.#followUpQueue = this.#followUpQueue.filter(m => !predicate(m));
+		const steering = beforeSteering - this.#steeringQueue.length;
+		const followUp = beforeFollowUp - this.#followUpQueue.length;
+		return { steering, followUp, total: steering + followUp };
+	}
+
 	clearMessages() {
 		this.#state.messages = [];
 	}

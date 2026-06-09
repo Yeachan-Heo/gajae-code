@@ -609,6 +609,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			label?: string;
 			ctx?: AgentToolContext;
 			onRawLine?: (line: string, jobId: string) => void;
+			shouldAcceptRawLine?: (jobId: string) => boolean;
+			lifecycle?: import("../async").AsyncJobLifecycleCleanup;
 		} = {},
 	): Promise<{ jobId: string; label: string; commandCwd: string }> {
 		const manager = AsyncJobManager.instance();
@@ -624,12 +626,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let cursorOffset = 0;
 		let lineBuffer = "";
 		const dispatchLines = (chunk: string) => {
+			if (opts.shouldAcceptRawLine?.(currentJobId) === false) return;
 			if (!onRawLine) return;
 			lineBuffer += chunk;
 			let newlineIndex = lineBuffer.indexOf("\n");
 			while (newlineIndex !== -1) {
 				const line = lineBuffer.slice(0, newlineIndex);
 				lineBuffer = lineBuffer.slice(newlineIndex + 1);
+				if (opts.shouldAcceptRawLine?.(currentJobId) === false) return;
 				try {
 					onRawLine(line, currentJobId);
 				} catch (error) {
@@ -642,6 +646,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 		const flushTrailingLine = () => {
 			if (!onRawLine) return;
+			if (opts.shouldAcceptRawLine?.(currentJobId) === false) return;
 			if (lineBuffer.length === 0) return;
 			const remainder = lineBuffer;
 			lineBuffer = "";
@@ -693,7 +698,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					throw error instanceof Error ? error : new Error(String(error));
 				}
 			},
-			{ ownerId, metadata: { monitor: true } },
+			{ ownerId, metadata: { monitor: true }, lifecycle: opts.lifecycle },
 		);
 		currentJobId = jobId;
 		return { jobId, label, commandCwd: prepared.commandCwd };
