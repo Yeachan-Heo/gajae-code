@@ -304,6 +304,7 @@ export class MCPManager {
 			config: MCPServerConfig;
 			tracked: TrackedPromise<ToolLoadResult>;
 			toolsPromise: Promise<ToolLoadResult>;
+			connectionAbort: AbortController;
 		};
 
 		const errors = new Map<string, string>();
@@ -424,7 +425,7 @@ export class MCPManager {
 			this.#pendingToolLoads.set(name, toolsPromise);
 
 			const tracked = trackPromise(toolsPromise);
-			connectionTasks.push({ name, config, tracked, toolsPromise });
+			connectionTasks.push({ name, config, tracked, toolsPromise, connectionAbort });
 
 			void toolsPromise
 				.then(async ({ connection, serverTools }) => {
@@ -475,7 +476,19 @@ export class MCPManager {
 
 				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
 				if (pendingWithoutCache.length > 0) {
-					await Promise.allSettled(pendingWithoutCache.map(task => task.tracked.promise));
+					for (const task of pendingWithoutCache) {
+						const message = `MCP server connection timed out during startup: ${task.name}`;
+						errors.set(task.name, message);
+						reportedErrors.add(task.name);
+						task.connectionAbort.abort(new Error(message));
+						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
+						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
+							this.#pendingToolLoads.delete(task.name);
+						this.#pendingConnectionControllers.delete(task.name);
+					}
+					// Do not await these promises here: a misbehaving stdio/MCP transport can ignore
+					// AbortSignal and keep startup blocked indefinitely. The background toolsPromise
+					// handler will clean up if it eventually settles.
 				}
 			}
 

@@ -91,6 +91,32 @@ describe("MCP lifecycle cleanup", () => {
 		expect(manager.getConnection("slow")).toBeUndefined();
 	});
 
+	it("connectServers fails fast when an uncached MCP startup ignores abort", async () => {
+		let capturedSignal: AbortSignal | undefined;
+		mock.module("../src/runtime-mcp/client", () => ({
+			...mcpClient,
+			connectToServer: (_name: string, _config: MCPServerConfig, options?: { signal?: AbortSignal }) => {
+				capturedSignal = options?.signal;
+				return new Promise<MCPServerConnection>(() => {});
+			},
+			listTools: async () => [],
+		}));
+		const { MCPManager: MockedManager } = await import("../src/runtime-mcp/manager");
+		const manager = new MockedManager(process.cwd());
+
+		const startedAt = Date.now();
+		const result = await manager.connectServers(
+			{ stuck: { type: "stdio", command: "stuck", timeout: 10_000 } },
+			{ stuck: { provider: "test", providerName: "Test", path: "test", level: "project" } },
+		);
+
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
+		expect(capturedSignal?.aborted).toBe(true);
+		expect(result.tools).toHaveLength(0);
+		expect(result.errors.get("stuck")).toBe("MCP server connection timed out during startup: stuck");
+		expect(manager.getConnectionStatus("stuck")).toBe("disconnected");
+	});
+
 	it("HttpTransport.close aborts and settles background SSE readers without reconnect", async () => {
 		const originalFetch = globalThis.fetch;
 		const stream = new ReadableStream<Uint8Array>({
