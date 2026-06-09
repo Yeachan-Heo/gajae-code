@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
@@ -21,6 +21,13 @@ import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-stat
 
 const tempRoots: string[] = [];
 
+let savedSessionId: string | undefined;
+
+beforeEach(() => {
+	savedSessionId = process.env.GJC_SESSION_ID;
+	delete process.env.GJC_SESSION_ID;
+});
+
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-runtime-"));
 	tempRoots.push(dir);
@@ -28,6 +35,8 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
+	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = savedSessionId;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
