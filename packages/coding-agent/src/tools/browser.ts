@@ -3,6 +3,7 @@ import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
@@ -24,8 +25,44 @@ const appSchema = z.object({
 	target: z.string().describe("substring to pick a window").optional(),
 });
 
+const actionStepSchema = z.object({
+	verb: z
+		.enum([
+			"navigate",
+			"click",
+			"type",
+			"fill",
+			"select",
+			"press",
+			"scroll",
+			"back",
+			"wait",
+			"observe",
+			"extract",
+			"screenshot",
+		])
+		.describe("structured action verb"),
+	id: z.number().describe("element id from a prior observe").optional(),
+	selector: z.string().describe("css/puppeteer selector").optional(),
+	text: z.string().describe("text to type").optional(),
+	value: z.string().describe("value for fill").optional(),
+	values: z.array(z.string()).describe("option value(s) for select").optional(),
+	url: z.string().describe("url for navigate").optional(),
+	key: z.string().describe("key for press, e.g. Enter").optional(),
+	dx: z.number().describe("horizontal scroll delta").optional(),
+	dy: z.number().describe("vertical scroll delta").optional(),
+	ms: z.number().describe("sleep ms for wait without selector").optional(),
+	format: z.enum(["markdown", "text", "html"]).describe("extract format").optional(),
+	wait_until: z
+		.enum(["load", "domcontentloaded", "networkidle0", "networkidle2"])
+		.describe("navigation wait condition for navigate")
+		.optional(),
+	viewport_only: z.boolean().describe("observe: only viewport elements").optional(),
+	include_all: z.boolean().describe("observe: include non-interactive elements").optional(),
+});
+
 const browserSchema = z.object({
-	action: z.enum(["open", "close", "run"] as const).describe("operation"),
+	action: z.enum(["open", "close", "run", "act"] as const).describe("operation"),
 	name: z.string().describe("tab id (default 'main')").optional(),
 	url: z.string().describe("url to open").optional(),
 	app: appSchema.optional(),
@@ -45,6 +82,7 @@ const browserSchema = z.object({
 		.describe("auto-handle dialogs")
 		.optional(),
 	code: z.string().describe("js body to run in tab").optional(),
+	actions: z.array(actionStepSchema).describe("structured action steps for action 'act'").optional(),
 	timeout: z.number().default(30).describe("timeout in seconds (default 30, max 300)").optional(),
 	all: z.boolean().describe("close every tab").optional(),
 	kill: z.boolean().describe("also kill spawned-app browsers").optional(),
@@ -126,6 +164,8 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 					return await this.#close(name, params, details, signal);
 				case "run":
 					return await this.#run(name, params, details, timeoutMs, signal);
+				case "act":
+					return await this.#act(name, params, details, timeoutMs, signal);
 				default:
 					throw new ToolError(`Unsupported action: ${(params as BrowserParams).action}`);
 			}
@@ -251,6 +291,56 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		}
 		if (!content.length) {
 			content.push({ type: "text", text: `Ran code on tab ${JSON.stringify(name)}` });
+		}
+		const textOnly = content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map(c => c.text)
+			.join("\n");
+		details.result = textOnly;
+		return toolResult(details).content(content).done();
+	}
+
+	async #act(
+		name: string,
+		params: BrowserParams,
+		details: BrowserToolDetails,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<BrowserToolDetails>> {
+		const steps = (params.actions ?? []) as BrowserActionStep[];
+		if (steps.length === 0) {
+			throw new ToolError("Missing required parameter 'actions' for action 'act'.");
+		}
+		const tab = getTab(name);
+		if (!tab) {
+			throw new ToolError(`No tab named ${JSON.stringify(name)}. Open it first with action 'open'.`);
+		}
+		details.browser = tab.browser.kind.kind;
+		details.url = tab.info.url;
+
+		// compileActionSteps validates each step and produces injection-safe code
+		// (steps embedded as parsed JSON) for the existing in-tab run worker.
+		let code: string;
+		try {
+			code = compileActionSteps(steps);
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+
+		const { displays, returnValue, screenshots } = await runInTab(name, {
+			code,
+			timeoutMs,
+			signal,
+			session: this.session,
+		});
+
+		if (screenshots.length) details.screenshots = screenshots;
+		const content = [...displays];
+		if (returnValue !== undefined) {
+			content.push({ type: "text", text: stringifyReturnValue(returnValue) });
+		}
+		if (!content.length) {
+			content.push({ type: "text", text: `Ran ${steps.length} action(s) on tab ${JSON.stringify(name)}` });
 		}
 		const textOnly = content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
