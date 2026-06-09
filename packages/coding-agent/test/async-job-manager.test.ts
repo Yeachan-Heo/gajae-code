@@ -374,4 +374,101 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
 	});
+	test("retention-zero eviction runs onEvict and records a monitor tombstone", async () => {
+		let evictCount = 0;
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const jobId = manager.register("bash", "monitor", async () => "done", {
+			ownerId: "0-Test",
+			metadata: { monitor: true },
+			lifecycle: {
+				onEvict: () => {
+					evictCount += 1;
+				},
+			},
+		});
+
+		await manager.waitForAll();
+
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(evictCount).toBe(1);
+		expect(manager.getMonitorTombstone(jobId, { ownerId: "0-Test" })?.jobId).toBe(jobId);
+		expect(manager.getMonitorTombstone(jobId, { ownerId: "other" })).toBeUndefined();
+	});
+
+	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {
+		let evictCount = 0;
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const jobId = manager.register("bash", "monitor", async () => "done", {
+			ownerId: "0-Test",
+			metadata: { monitor: true },
+			lifecycle: {
+				onEvict: () => {
+					evictCount += 1;
+				},
+			},
+		});
+
+		await manager.waitForAll();
+		expect(evictCount).toBe(1);
+		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: true, status: "completed" });
+		expect(evictCount).toBe(2);
+		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: false });
+		expect(evictCount).toBe(2);
+	});
+
+	test("tombstone purge uses the dedicated onTombstonePurge hook, not the evict phase", async () => {
+		let evictCount = 0;
+		let tombstonePurgeCount = 0;
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const jobId = manager.register("bash", "monitor", async () => "done", {
+			ownerId: "0-Test",
+			metadata: { monitor: true },
+			lifecycle: {
+				onEvict: () => {
+					evictCount += 1;
+				},
+				onTombstonePurge: () => {
+					tombstonePurgeCount += 1;
+				},
+			},
+		});
+
+		await manager.waitForAll();
+		expect(evictCount).toBe(1);
+		expect(tombstonePurgeCount).toBe(0);
+		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: true, status: "completed" });
+		// Tombstone purge runs the dedicated idempotent hook and does NOT re-run the evict phase.
+		expect(tombstonePurgeCount).toBe(1);
+		expect(evictCount).toBe(1);
+	});
+
+	test("lifecycle hooks fire at most once per phase", async () => {
+		const phases: string[] = [];
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const jobId = manager.register(
+			"bash",
+			"monitor",
+			async ({ signal }) => {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "cancelled";
+			},
+			{
+				metadata: { monitor: true },
+				lifecycle: {
+					onCancel: () => phases.push("cancel"),
+					onTerminal: () => phases.push("terminal"),
+					onEvict: () => phases.push("evict"),
+				},
+			},
+		);
+
+		expect(manager.cancel(jobId)).toBe(true);
+		expect(manager.cancel(jobId)).toBe(false);
+		await manager.waitForAll();
+		manager.purgeMonitorTombstone(jobId);
+
+		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
+		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
+		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+	});
 });

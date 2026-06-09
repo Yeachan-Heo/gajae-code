@@ -52,7 +52,7 @@ interface JobSnapshot {
 	errorText?: string;
 }
 
-type CancelStatus = "cancelled" | "not_found" | "already_completed";
+type CancelStatus = "cancelled" | "not_found" | "already_completed" | "already_cancelled";
 
 interface CancelOutcome {
 	id: string;
@@ -115,10 +115,20 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		for (const id of cancelIds) {
 			const existing = manager.getJob(id);
 			if (!existing || (ownerId && existing.ownerId !== ownerId)) {
-				cancelOutcomes.push({ id, status: "not_found", message: `Background job not found: ${id}` });
+				const tombstone = manager.purgeMonitorTombstone(id, ownerFilter);
+				cancelOutcomes.push(
+					tombstone.found
+						? {
+								id,
+								status: tombstone.status === "cancelled" ? "already_cancelled" : "already_completed",
+								message: `Monitor job ${id} already gone; purged queued notifications.`,
+							}
+						: { id, status: "not_found", message: `Background job not found: ${id}` },
+				);
 				continue;
 			}
 			if (existing.status !== "running") {
+				if (existing.metadata?.monitor) manager.purgeMonitorTombstone(id, ownerFilter);
 				cancelOutcomes.push({
 					id,
 					status: "already_completed",

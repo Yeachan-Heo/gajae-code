@@ -89,6 +89,15 @@ export interface ForkContextSeedMetadata {
 	skippedReasons: Record<string, number>;
 }
 
+export interface PurgeQueuedCustomMessagesResult {
+	agentSteering: number;
+	agentFollowUp: number;
+	pendingNextTurn: number;
+	displaySteering: number;
+	displayFollowUp: number;
+	totalExecutable: number;
+}
+
 export interface ForkContextSeed {
 	messages: Message[];
 	agentMessages: AgentMessage[];
@@ -5058,6 +5067,10 @@ export class AgentSession {
 		this.#queueHiddenNextTurnMessage(message, true);
 	}
 
+	queueDeferredMessageForTests(message: CustomMessage, triggerTurn = true): void {
+		this.#queueHiddenNextTurnMessage(message, triggerTurn);
+	}
+
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
@@ -5228,6 +5241,46 @@ export class AgentSession {
 			message.details,
 			message.attribution ?? "agent",
 		);
+	}
+
+	/** Remove undelivered queued custom messages matching `predicate` from executable queues and tagged display mirrors. */
+	purgeQueuedCustomMessages(predicate: (message: CustomMessage) => boolean): PurgeQueuedCustomMessagesResult {
+		const isMatch = (m: AgentMessage): boolean => m.role === "custom" && predicate(m as CustomMessage);
+		const removedTags = new Set<string>();
+		for (const m of [...this.agent.snapshotSteering(), ...this.agent.snapshotFollowUp()]) {
+			if (isMatch(m)) {
+				const tag = readPendingDisplayTag((m as CustomMessage).details);
+				if (tag) removedTags.add(tag);
+			}
+		}
+		const agentRemoved = this.agent.removeQueuedMessages(isMatch);
+		const beforeNext = this.#pendingNextTurnMessages.length;
+		for (const m of this.#pendingNextTurnMessages) {
+			if (predicate(m)) {
+				const tag = readPendingDisplayTag(m.details);
+				if (tag) removedTags.add(tag);
+			}
+		}
+		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(m => !predicate(m));
+		const pendingNextTurn = beforeNext - this.#pendingNextTurnMessages.length;
+		let displaySteering = 0;
+		let displayFollowUp = 0;
+		if (removedTags.size > 0) {
+			const beforeS = this.#steeringMessages.length;
+			this.#steeringMessages = this.#steeringMessages.filter(e => !(e.tag && removedTags.has(e.tag)));
+			displaySteering = beforeS - this.#steeringMessages.length;
+			const beforeF = this.#followUpMessages.length;
+			this.#followUpMessages = this.#followUpMessages.filter(e => !(e.tag && removedTags.has(e.tag)));
+			displayFollowUp = beforeF - this.#followUpMessages.length;
+		}
+		return {
+			agentSteering: agentRemoved.steering,
+			agentFollowUp: agentRemoved.followUp,
+			pendingNextTurn,
+			displaySteering,
+			displayFollowUp,
+			totalExecutable: agentRemoved.total + pendingNextTurn,
+		};
 	}
 
 	/**
