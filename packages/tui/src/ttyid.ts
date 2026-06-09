@@ -39,6 +39,13 @@ export function getTtyPath(): string | null {
  * Returns null if no terminal can be identified (e.g., piped input).
  */
 export function getTerminalId(): string | null {
+	// Inside tmux the stdin TTY path is unstable (it tracks the attached
+	// client, not the pane), which spawns duplicate sessions and breaks
+	// /resume. Prefer the stable per-pane TMUX_PANE identifier instead.
+	if (process.env.TMUX && process.env.TMUX_PANE) {
+		return `tmux-${process.env.TMUX_PANE}`;
+	}
+
 	// TTY device path — most reliable, unique per terminal tab
 	if (process.stdin.isTTY) {
 		try {
