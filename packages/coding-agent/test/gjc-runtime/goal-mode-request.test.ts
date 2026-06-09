@@ -4,6 +4,7 @@ import * as path from "node:path";
 import {
 	consumePendingGoalModeRequest,
 	GJC_SESSION_FILE_ENV,
+	GJC_SESSION_ID_ENV,
 	isUltragoalCreateGoalsInvocation,
 	readUltragoalGjcObjective,
 	writeCurrentSessionGoalModeState,
@@ -58,6 +59,50 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.objective).toBe("Complete ultragoal");
 		expect(request?.source).toBe("ultragoal");
 		expect(consumedAgain).toBeNull();
+	});
+
+	it("does not let a concurrent session consume another session's pending request", async () => {
+		const root = await tempDir();
+		await writePendingGoalModeRequest({
+			cwd: root,
+			objective: "Complete ultragoal",
+			goalsPath: "goals.json",
+			sessionId: "session-A",
+		});
+
+		// A different, independent session must not pick up session-A's request.
+		const leaked = await consumePendingGoalModeRequest(root, "session-B");
+		expect(leaked).toBeNull();
+
+		// The request is left intact for its rightful owner to consume.
+		const owned = await consumePendingGoalModeRequest(root, "session-A");
+		expect(owned?.objective).toBe("Complete ultragoal");
+		expect(owned?.sessionId).toBe("session-A");
+
+		// Once consumed by the owner it is gone for everyone.
+		expect(await consumePendingGoalModeRequest(root, "session-A")).toBeNull();
+	});
+
+	it("lets the owning session consume its own session-scoped request", async () => {
+		const root = await tempDir();
+		await writePendingGoalModeRequest({
+			cwd: root,
+			objective: "Complete ultragoal",
+			sessionId: "session-A",
+		});
+
+		const owned = await consumePendingGoalModeRequest(root, "session-A");
+		expect(owned?.sessionId).toBe("session-A");
+	});
+
+	it("keeps consuming legacy unscoped requests from any session", async () => {
+		const root = await tempDir();
+		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal" });
+
+		// No sessionId stamped (legacy/CLI-only producer) → consumable by any session.
+		const request = await consumePendingGoalModeRequest(root, "session-X");
+		expect(request?.objective).toBe("Complete ultragoal");
+		expect(request?.sessionId).toBeUndefined();
 	});
 
 	it("writes goal mode state into the current session file", async () => {
@@ -208,16 +253,21 @@ describe("GJC ultragoal goal mode request", () => {
 		);
 
 		const cliPath = path.resolve(import.meta.dir, "..", "..", "src", "cli.ts");
+
 		const result = Bun.spawnSync(["bun", cliPath, "ultragoal", "create-goals", "--brief", "Ship native goal"], {
 			cwd: root,
-			env: { ...process.env, [GJC_SESSION_FILE_ENV]: sessionFile },
+			env: { ...process.env, [GJC_SESSION_FILE_ENV]: sessionFile, [GJC_SESSION_ID_ENV]: "session-owner" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 
 		expect(result.exitCode, result.stderr.toString()).toBe(0);
-		const pending = await consumePendingGoalModeRequest(root);
+		// The pending request is stamped with the producing session and must not
+		// leak into a concurrent independent session sharing the same cwd.
+		expect(await consumePendingGoalModeRequest(root, "other-session")).toBeNull();
+		const pending = await consumePendingGoalModeRequest(root, "session-owner");
 		expect(pending?.objective).toContain(".gjc/ultragoal/goals.json");
+		expect(pending?.sessionId).toBe("session-owner");
 		const entries = (await loadEntriesFromFile(sessionFile)).filter(
 			(entry): entry is SessionEntry => entry.type !== "session",
 		);

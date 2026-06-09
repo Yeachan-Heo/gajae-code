@@ -4372,7 +4372,10 @@ export class AgentSession {
 
 	async #activatePendingGjcGoalModeRequest(): Promise<boolean> {
 		if (!this.settings.get("goal.enabled")) return false;
-		const pendingGoal = await consumePendingGoalModeRequest(this.sessionManager.getCwd());
+		const pendingGoal = await consumePendingGoalModeRequest(
+			this.sessionManager.getCwd(),
+			this.sessionManager.getSessionId(),
+		);
 		if (!pendingGoal) return false;
 		const currentState = this.getGoalModeState();
 		if (currentState?.goal && currentState.goal.status !== "complete" && currentState.goal.status !== "dropped") {

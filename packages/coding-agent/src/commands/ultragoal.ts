@@ -1,6 +1,7 @@
 import { Command } from "@gajae-code/utils/cli";
 import {
 	GJC_SESSION_FILE_ENV,
+	GJC_SESSION_ID_ENV,
 	isUltragoalCreateGoalsInvocation,
 	readUltragoalGjcObjective,
 	writeCurrentSessionGoalModeState,
@@ -28,6 +29,11 @@ export default class Ultragoal extends Command {
 			sessionFile: process.env[GJC_SESSION_FILE_ENV],
 			objective,
 		});
-		await writePendingGoalModeRequest({ cwd, objective, goalsPath });
+		await writePendingGoalModeRequest({
+			cwd,
+			objective,
+			goalsPath,
+			sessionId: process.env[GJC_SESSION_ID_ENV],
+		});
 	}
 }

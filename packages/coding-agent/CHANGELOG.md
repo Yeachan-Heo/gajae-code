@@ -8,6 +8,7 @@
 ### Fixed
 
 - Fixed a persistent `monitor` notification flood where a cancelled or evicted monitor kept delivering queued `task-notification` follow-ups (surviving process death, log deletion, and `job cancel` returning not-found). Monitors now purge their queued notifications on cancel/terminal/eviction, retain a short tombstone so post-eviction `job cancel` still purges, coalesce rapid duplicate output to the latest state, and close a cancel/trailing-flush race.
+- Fixed `ultragoal` execution leaking across concurrent independent GJC sessions. The runtime `goal-mode-request.json` is now stamped with the producing session's `GJC_SESSION_ID`, and the consumer only activates a request that belongs to the current session (another session's request is left intact instead of being consumed/deleted). Legacy unscoped requests remain consumable for single-session compatibility ([#457](https://github.com/Yeachan-Heo/gajae-code/issues/457)).
 
 ## [0.4.2] - 2026-06-09
 

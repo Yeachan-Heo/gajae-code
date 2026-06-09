@@ -25,6 +25,12 @@ export interface PendingGoalModeRequest {
 	objective: string;
 	createdAt: string;
 	goalsPath?: string;
+	/**
+	 * Session id that produced this request (from GJC_SESSION_ID). When present,
+	 * only the originating session may consume it, so concurrent sessions sharing
+	 * the same `.gjc` project state never auto-run each other's ultragoal.
+	 */
+	sessionId?: string;
 }
 
 export type CurrentSessionGoalModeWriteResult =
@@ -77,9 +83,11 @@ export async function writePendingGoalModeRequest(input: {
 	cwd: string;
 	objective: string;
 	goalsPath?: string;
+	sessionId?: string | null;
 }): Promise<PendingGoalModeRequest> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("goal objective is required");
+	const sessionId = input.sessionId?.trim();
 	const request: PendingGoalModeRequest = {
 		version: REQUEST_VERSION,
 		kind: "goal_mode_request",
@@ -87,6 +95,7 @@ export async function writePendingGoalModeRequest(input: {
 		objective,
 		createdAt: new Date().toISOString(),
 		goalsPath: input.goalsPath,
+		...(sessionId ? { sessionId } : {}),
 	};
 	const filePath = requestPath(input.cwd);
 	await writeJsonAtomic(filePath, request, {
@@ -162,7 +171,10 @@ export async function writeCurrentSessionGoalModeState(input: {
 	return { status: "updated", goal: state.goal, sessionFile };
 }
 
-export async function consumePendingGoalModeRequest(cwd: string): Promise<PendingGoalModeRequest | null> {
+export async function consumePendingGoalModeRequest(
+	cwd: string,
+	currentSessionId?: string | null,
+): Promise<PendingGoalModeRequest | null> {
 	const filePath = requestPath(cwd);
 	let raw: unknown;
 	try {
@@ -179,6 +191,14 @@ export async function consumePendingGoalModeRequest(cwd: string): Promise<Pendin
 		typeof candidate.objective !== "string" ||
 		candidate.objective.trim().length === 0
 	) {
+		return null;
+	}
+	// Session isolation: a request stamped with an owning session id may only be
+	// consumed by that same session. Leave another session's request untouched
+	// (do not delete it) so its rightful owner can still pick it up. Legacy/unscoped
+	// requests (no sessionId) remain consumable by any session in this cwd.
+	const ownerSessionId = typeof candidate.sessionId === "string" ? candidate.sessionId.trim() : "";
+	if (ownerSessionId && ownerSessionId !== (currentSessionId?.trim() ?? "")) {
 		return null;
 	}
 	await removeFileAudited(filePath, {
