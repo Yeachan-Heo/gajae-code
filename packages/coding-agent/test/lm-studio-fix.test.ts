@@ -54,4 +54,29 @@ describe("ModelRegistry LM Studio Fixes", () => {
 		expect(available.some(m => m.provider === "ollama")).toBe(true);
 		expect(available.some(m => m.provider === "lm-studio")).toBe(true);
 	});
+
+	test("forwards configured LM Studio auth during implicit discovery", async () => {
+		authStorage.setRuntimeApiKey("lm-studio", "test-lm-studio-key");
+
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url.includes(":1234/v1/models")) {
+				const headers = init?.headers as Headers | Record<string, string> | undefined;
+				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+				expect(authHeader).toBe("Bearer test-lm-studio-key");
+				return new Response(JSON.stringify({ data: [{ id: "authenticated-lm-studio-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		const model = registry.find("lm-studio", "authenticated-lm-studio-model");
+		expect(model?.provider).toBe("lm-studio");
+		expect(await registry.getApiKey(model!)).toBe("test-lm-studio-key");
+	});
 });
