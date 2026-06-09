@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,6 +26,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		tempHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-system-home-"));
 		originalHome = process.env.HOME;
 		process.env.HOME = tempHomeDir;
+		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
 	});
 
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
