@@ -74,13 +74,13 @@ function createStubInputControllerContext(opts: {
 		addToHistory: vi.fn(),
 	};
 	const enqueueCustomMessageDisplay = vi.fn((_text: string, _mode: "steer" | "followUp") => "sk-test-0");
-	const prompt = vi.fn(async (_text: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
 	// Annotate parameters so `mock.calls[N]` is typed as a tuple (not `[]`) and
 	// `message` carries required skill prompt details for assertion below.
 	const promptCustomMessage = vi.fn(
 		async (_message: { content: string; details: SkillPromptDetails }, _options?: unknown) => {},
 	);
 	const sendCustomMessage = vi.fn(async (_message: { content: string; details: SkillPromptDetails }) => {});
+	const prompt = vi.fn(async (_text: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
 	const showError = vi.fn();
@@ -270,7 +270,7 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 	});
 });
 
-describe("InputController busyPromptMode (queued prompts while busy)", () => {
+describe("InputController busyPromptMode + skill commands (issue #434)", () => {
 	let tempDir: TempDir;
 	let skillCommands: Map<string, Skill>;
 
@@ -295,35 +295,9 @@ describe("InputController busyPromptMode (queued prompts while busy)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("default (steer): free-text submit while streaming steers the active turn", async () => {
-		const { ctx, editor, prompt } = createStubInputControllerContext({
-			skillCommands,
-			isStreaming: true,
-		});
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-		editor.setText("keep going");
-		await editor.onSubmit?.("keep going");
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(prompt.mock.calls[0]?.[1]?.streamingBehavior).toBe("steer");
-	});
-
-	it("queue: free-text submit while streaming defers to the follow-up queue", async () => {
-		const { ctx, editor, prompt } = createStubInputControllerContext({
-			skillCommands,
-			isStreaming: true,
-			busyPromptMode: "queue",
-		});
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-		editor.setText("run this next");
-		await editor.onSubmit?.("run this next");
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(prompt.mock.calls[0]?.[1]?.streamingBehavior).toBe("followUp");
-	});
-
+	// Skill-command-specific routing. Free-text Enter routing and the Ctrl+Enter
+	// keybinding are covered in input-controller-busy-prompt-mode.test.ts; the
+	// E1 case above already covers the default (steer) skill path.
 	it("queue: Enter on a skill command while streaming queues it as followUp", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay } = createStubInputControllerContext({
 			skillCommands,
@@ -336,21 +310,6 @@ describe("InputController busyPromptMode (queued prompts while busy)", () => {
 		await editor.onSubmit?.("/skill:test-skill go");
 
 		expect(enqueueCustomMessageDisplay).toHaveBeenCalledWith("/skill:test-skill go", "followUp");
-	});
-
-	it("queue: Ctrl+Enter still routes to followUp (keybinding stays distinct)", async () => {
-		const { ctx, editor, prompt } = createStubInputControllerContext({
-			skillCommands,
-			isStreaming: true,
-			busyPromptMode: "queue",
-		});
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-		editor.setText("queued via keybinding");
-		await controller.handleFollowUp();
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(prompt.mock.calls[0]?.[1]?.streamingBehavior).toBe("followUp");
 	});
 });
 
