@@ -2,9 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import type { Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools";
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { imageGenTool, setPreferredImageProvider } from "@gajae-code/coding-agent/tools/image-gen";
+import {
+	getImageGenToolsWithRegistry,
+	imageGenTool,
+	setPreferredImageProvider,
+} from "@gajae-code/coding-agent/tools/image-gen";
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
@@ -190,5 +195,236 @@ describe("imageGenTool", () => {
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(requestUrl).toBe("https://api.openai.com/v1/responses");
+	});
+});
+
+const ANTIGRAVITY_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+
+function antigravitySseResponse(): Response {
+	const chunk = {
+		response: {
+			candidates: [
+				{
+					content: {
+						role: "model",
+						parts: [{ inlineData: { mimeType: "image/png", data: Buffer.from("fake-png").toString("base64") } }],
+					},
+				},
+			],
+		},
+	};
+	return new Response(`data: ${JSON.stringify(chunk)}\n\n`, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+const ANTIGRAVITY_MODEL = {
+	api: "google-gemini-cli",
+	provider: "google-antigravity",
+	id: "gemini-3-pro-image",
+	name: "Gemini 3 Pro Image (Antigravity)",
+	baseUrl: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+} as Model;
+
+function makeAntigravityCtx(modelRegistry: Partial<ModelRegistry>): CustomToolContext {
+	return {
+		sessionManager: {
+			getCwd: () => "/tmp",
+			getSessionId: () => "test-session",
+		} as unknown as ReadonlySessionManager,
+		modelRegistry: modelRegistry as unknown as ModelRegistry,
+		model: ANTIGRAVITY_MODEL,
+		isIdle: () => true,
+		hasQueuedMessages: () => false,
+		abort: () => {},
+	};
+}
+
+describe("providers.image settings schema", () => {
+	it("accepts antigravity and does not include openai-codex", () => {
+		const values = SETTINGS_SCHEMA["providers.image"].values as readonly string[];
+		expect(values).toContain("antigravity");
+		expect(values).not.toContain("openai-codex");
+	});
+});
+
+describe("imageGenTool antigravity provider", () => {
+	it("uses structured getOAuthAccess metadata (access token + projectId) for the request", async () => {
+		setPreferredImageProvider("antigravity");
+		let requestUrl: string | undefined;
+		let authorization: string | undefined;
+		let requestBody: { project?: string } | undefined;
+
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			authorization = new Headers(init?.headers).get("authorization") ?? undefined;
+			requestBody = JSON.parse(String(init?.body));
+			return antigravitySseResponse();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const ctx = makeAntigravityCtx({
+			authStorage: {
+				getOAuthAccess: async () => ({ accessToken: "oauth-token", projectId: "project-1" }),
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () => {
+				throw new Error("getApiKeyForProvider should not be called when OAuth metadata is present");
+			},
+		});
+
+		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(requestUrl).toBe(ANTIGRAVITY_URL);
+		expect(authorization).toBe("Bearer oauth-token");
+		expect(requestBody?.project).toBe("project-1");
+		expect(result.details?.provider).toBe("antigravity");
+		expect(result.details?.imageCount).toBe(1);
+	});
+
+	it("falls back to JSON-parsed getApiKeyForProvider credentials when OAuth access is absent", async () => {
+		setPreferredImageProvider("antigravity");
+		let authorization: string | undefined;
+		let requestBody: { project?: string } | undefined;
+
+		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			authorization = new Headers(init?.headers).get("authorization") ?? undefined;
+			requestBody = JSON.parse(String(init?.body));
+			return antigravitySseResponse();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const ctx = makeAntigravityCtx({
+			authStorage: {
+				getOAuthAccess: async () => undefined,
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () => JSON.stringify({ token: "json-token", projectId: "project-json" }),
+		});
+
+		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(authorization).toBe("Bearer json-token");
+		expect(requestBody?.project).toBe("project-json");
+	});
+
+	it("does not register for malformed JSON credentials without a token field", async () => {
+		setPreferredImageProvider("antigravity");
+
+		const modelRegistry = {
+			authStorage: {
+				getOAuthAccess: async () => undefined,
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () => JSON.stringify({ projectId: "project-without-token" }),
+		} as unknown as ModelRegistry;
+
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		expect(tools).toHaveLength(0);
+	});
+
+	it("does not register for empty or whitespace antigravity credentials", async () => {
+		setPreferredImageProvider("antigravity");
+
+		for (const credential of ["", "   \n\t  "]) {
+			const modelRegistry = {
+				authStorage: {
+					getOAuthAccess: async () => undefined,
+				} as unknown as ModelRegistry["authStorage"],
+				getApiKeyForProvider: async () => credential,
+			} as unknown as ModelRegistry;
+
+			const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+			expect(tools).toHaveLength(0);
+		}
+	});
+
+	it("accepts JSON credentials with accessToken and honors projectId", async () => {
+		setPreferredImageProvider("antigravity");
+		let authorization: string | undefined;
+		let requestBody: { project?: string } | undefined;
+
+		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			authorization = new Headers(init?.headers).get("authorization") ?? undefined;
+			requestBody = JSON.parse(String(init?.body));
+			return antigravitySseResponse();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const ctx = makeAntigravityCtx({
+			authStorage: {
+				getOAuthAccess: async () => undefined,
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () =>
+				JSON.stringify({ accessToken: "access-token-json", projectId: "project-access" }),
+		});
+
+		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(authorization).toBe("Bearer access-token-json");
+		expect(requestBody?.project).toBe("project-access");
+		expect(result.details?.provider).toBe("antigravity");
+	});
+
+	it("registers OAuth access without projectId but fails loudly before fetch", async () => {
+		setPreferredImageProvider("antigravity");
+		let fetchCalled = false;
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalled = true;
+			return antigravitySseResponse();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const modelRegistry = {
+			authStorage: {
+				getOAuthAccess: async () => ({ accessToken: "oauth-token-without-project" }),
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () => {
+				throw new Error("getApiKeyForProvider should not be called when OAuth access token is present");
+			},
+		} as unknown as ModelRegistry;
+
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		expect(tools).toHaveLength(1);
+
+		const ctx = makeAntigravityCtx(modelRegistry);
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
+			/projectId.*google-antigravity|google-antigravity.*projectId/s,
+		);
+		await expect(imageGenTool.execute("call-2", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(/login/);
+		expect(fetchCalled).toBe(false);
+	});
+
+	it("registers the tool for a raw-token-only credential but fails loudly without a projectId", async () => {
+		setPreferredImageProvider("antigravity");
+		let fetchCalled = false;
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalled = true;
+			return antigravitySseResponse();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const modelRegistry = {
+			authStorage: {
+				getOAuthAccess: async () => undefined,
+			} as unknown as ModelRegistry["authStorage"],
+			getApiKeyForProvider: async () => "raw-token",
+		} as unknown as ModelRegistry;
+
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		expect(tools).toHaveLength(1);
+
+		const ctx = makeAntigravityCtx(modelRegistry);
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
+			/projectId.*google-antigravity|google-antigravity.*projectId/s,
+		);
+		await expect(imageGenTool.execute("call-2", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(/login/);
+		expect(fetchCalled).toBe(false);
 	});
 });

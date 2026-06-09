@@ -401,23 +401,39 @@ export function setPreferredImageProvider(provider: ImageProvider | "auto"): voi
 
 interface ParsedAntigravityCredentials {
 	accessToken: string;
-	projectId: string;
+	projectId?: string;
 }
 
 function parseAntigravityCredentials(raw: string): ParsedAntigravityCredentials | null {
 	try {
-		const parsed = JSON.parse(raw) as { token?: string; projectId?: string };
-		if (parsed.token && parsed.projectId) {
-			return { accessToken: parsed.token, projectId: parsed.projectId };
+		const parsed = JSON.parse(raw) as { token?: string; accessToken?: string; projectId?: string };
+		const token = parsed.token ?? parsed.accessToken;
+		if (typeof token === "string" && token.trim().length > 0) {
+			return { accessToken: token.trim(), projectId: parsed.projectId };
 		}
+		// Parsed as JSON but no usable token field.
+		return null;
 	} catch {
-		// Invalid JSON
+		// Not JSON: treat the value as a raw bearer token.
 	}
-	return null;
+	const rawToken = raw.trim();
+	return rawToken.length > 0 ? { accessToken: rawToken } : null;
 }
 
-async function findAntigravityCredentials(modelRegistry: ModelRegistry): Promise<ImageApiKey | null> {
-	const apiKey = await modelRegistry.getApiKeyForProvider("google-antigravity");
+async function findAntigravityCredentials(
+	modelRegistry: ModelRegistry,
+	sessionId?: string,
+): Promise<ImageApiKey | null> {
+	const oauthAccess = await modelRegistry.authStorage.getOAuthAccess("google-antigravity", sessionId);
+	if (oauthAccess?.accessToken) {
+		return {
+			provider: "antigravity",
+			apiKey: oauthAccess.accessToken,
+			projectId: oauthAccess.projectId,
+		};
+	}
+
+	const apiKey = await modelRegistry.getApiKeyForProvider("google-antigravity", sessionId);
 	if (!apiKey) return null;
 
 	const parsed = parseAntigravityCredentials(apiKey);
@@ -457,7 +473,7 @@ async function findImageApiKey(
 		if (openAI) return openAI;
 		// Fall through to auto-detect if preferred provider key not found.
 	} else if (preferredImageProvider === "antigravity" && modelRegistry) {
-		const antigravity = await findAntigravityCredentials(modelRegistry);
+		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
 		if (antigravity) return antigravity;
 		// Fall through to auto-detect if preferred provider key not found.
 	} else if (preferredImageProvider === "gemini") {
@@ -477,7 +493,7 @@ async function findImageApiKey(
 	if (openAI) return openAI;
 
 	if (modelRegistry) {
-		const antigravity = await findAntigravityCredentials(modelRegistry);
+		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
 		if (antigravity) return antigravity;
 	}
 
@@ -995,7 +1011,9 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			if (provider === "antigravity") {
 				if (!apiKey.projectId) {
-					throw new Error("Missing projectId in antigravity credentials");
+					throw new Error(
+						"Antigravity image generation requires a projectId, but the stored google-antigravity credential only contains an access token. Run the google-antigravity login flow again so the projectId is stored, then retry.",
+					);
 				}
 
 				const prompt = assemblePrompt(params);

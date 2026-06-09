@@ -1845,7 +1845,8 @@
 						"auto",
 						"openai",
 						"gemini",
-						"openrouter"
+						"openrouter",
+						"antigravity"
 					],
 					"description": "Provider for image generation tool",
 					"default": "auto"
