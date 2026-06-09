@@ -9,6 +9,7 @@ export {
 	loadExtensionFromFactory,
 	loadExtensions,
 } from "./loader";
+export * from "./prefix-command-bridge";
 export * from "./runner";
 // Type guards
 export * from "./types";
