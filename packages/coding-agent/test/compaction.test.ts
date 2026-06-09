@@ -9,6 +9,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveThresholdTokens,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction/compaction";
 import * as ai from "@gajae-code/ai";
@@ -284,6 +285,37 @@ describe("shouldCompact", () => {
 		};
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
+	});
+
+	it("reserves the model's max output budget so input cannot fill the whole window", () => {
+		// GPT-5.5-like: 400K total window, 128K reserved max output.
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+		};
+
+		// Safe input budget = 400K - max(15%*400K=60K, 16384, 128K) = 400K - 128K = 272K.
+		expect(resolveThresholdTokens(400_000, settings, 128_000)).toBe(272_000);
+		expect(shouldCompact(271_999, 400_000, settings, 128_000)).toBe(false);
+		expect(shouldCompact(272_001, 400_000, settings, 128_000)).toBe(true);
+
+		// Separation guard: the same 300K input must NOT pack against the total window
+		// when output is reserved (would be allowed if budget == total context).
+		expect(shouldCompact(300_000, 400_000, settings, 128_000)).toBe(true);
+		expect(shouldCompact(300_000, 400_000, settings, 0)).toBe(false);
+	});
+
+	it("ignores max output reservation when it is below the percentage/floor reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+		};
+
+		// 8K max output is smaller than the 15% floor (15K) -> threshold unchanged at 85K.
+		expect(resolveThresholdTokens(100_000, settings, 8_000)).toBe(85_000);
+		expect(resolveThresholdTokens(100_000, settings, 0)).toBe(85_000);
 	});
 });
 

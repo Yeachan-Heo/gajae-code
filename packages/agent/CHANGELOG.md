@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Separated a model's total context window from its safe input/prompt-packing budget in the compaction threshold. `effectiveReserveTokens`, `resolveThresholdTokens`, and `shouldCompact` now accept an optional `maxOutputTokens` and reserve at least that completion budget, so a large-output model (e.g. 400K context / 128K max output) caps input near 272K instead of 340K and cannot overflow the total window with reserved output ([#442](https://github.com/Yeachan-Heo/gajae-code/issues/442)).
+
 ## [0.4.0] - 2026-06-06
 
 ### Changed
