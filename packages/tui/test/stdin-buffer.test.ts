@@ -327,4 +327,113 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual([]);
 		});
 	});
+
+	describe("UTF-8 multi-byte decoding (issue #454)", () => {
+		let emittedPaste: string[];
+
+		beforeEach(() => {
+			buffer = new StdinBuffer({ timeout: 10 });
+			emittedSequences = [];
+			buffer.on("data", (sequence: string) => {
+				emittedSequences.push(sequence);
+			});
+			emittedPaste = [];
+			buffer.on("paste", (data: string) => {
+				emittedPaste.push(data);
+			});
+		});
+
+		it("reassembles a Korean syllable split across Buffer chunks", () => {
+			const source = "화면 기록";
+			const bytes = Buffer.from(source, "utf8");
+			// Split inside the first 3-byte syllable (after 2 of 3 bytes).
+			processInput(bytes.subarray(0, 2));
+			expect(emittedSequences).toEqual([]); // decoder holds the partial prefix
+
+			processInput(bytes.subarray(2));
+			expect(emittedSequences.join("")).toBe(source);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("reassembles a bracketed Korean paste split mid-syllable and mid-marker", () => {
+			const content = "화면 기록";
+			const full = Buffer.from(`\x1b[200~${content}\x1b[201~`, "utf8");
+			// Split inside the Korean content and again inside the end marker.
+			const markerStart = Buffer.byteLength("\x1b[200~", "utf8");
+			processInput(full.subarray(0, markerStart + 2)); // mid first syllable
+			processInput(full.subarray(markerStart + 2, full.length - 3)); // mid end marker
+			processInput(full.subarray(full.length - 3));
+
+			expect(emittedPaste).toEqual([content]);
+			expect(emittedPaste.join("")).not.toContain("\uFFFD");
+			expect(emittedSequences).toEqual([]); // no data events during paste
+		});
+
+		it("reassembles a large multi-line Korean paste chunked at awkward byte offsets", () => {
+			const content = Array.from({ length: 40 }, (_, i) => `src/화면/기록-${i}.ts`).join("\n");
+			const full = Buffer.from(`\x1b[200~${content}\x1b[201~`, "utf8");
+			// Feed in fixed 5-byte chunks so most boundaries split a multi-byte char.
+			for (let i = 0; i < full.length; i += 5) {
+				processInput(full.subarray(i, i + 5));
+			}
+			expect(emittedPaste).toEqual([content]);
+			expect(emittedPaste.join("")).not.toContain("\uFFFD");
+		});
+
+		it("reassembles mixed ASCII, Korean, and emoji split inside multi-byte chars", () => {
+			const source = "a화b\u{1f389}c";
+			const bytes = Buffer.from(source, "utf8");
+			// Split inside the 3-byte Korean syllable and inside the 4-byte emoji.
+			const koreanStart = 1; // after "a"
+			const emojiStart = koreanStart + 3 + 1; // after Korean + "b"
+			processInput(bytes.subarray(0, koreanStart + 2));
+			processInput(bytes.subarray(koreanStart + 2, emojiStart + 2));
+			processInput(bytes.subarray(emojiStart + 2));
+
+			expect(emittedSequences.join("")).toBe(source);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("does not emit or corrupt a trailing incomplete sequence on flush", () => {
+			const bytes = Buffer.from("화", "utf8");
+			processInput(bytes.subarray(0, 2));
+			expect(emittedSequences).toEqual([]);
+
+			// Normal flush must not finalize the decoder: held bytes stay held.
+			expect(buffer.flush()).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+
+			// The completing bytes (remainder grouped with following text, as a
+			// real terminal delivers them) still produce the full character.
+			processInput(Buffer.concat([bytes.subarray(2), Buffer.from("x", "utf8")]));
+			expect(emittedSequences.join("")).toBe("화x");
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("resets decoder state on clear() so a stale prefix cannot complete", () => {
+			const bytes = Buffer.from("화", "utf8");
+			processInput(bytes.subarray(0, 2));
+			buffer.clear();
+
+			processInput(bytes.subarray(2));
+			expect(emittedSequences.join("")).not.toBe("화");
+		});
+
+		it("resets decoder state on destroy() so a stale prefix cannot complete", () => {
+			const bytes = Buffer.from("화", "utf8");
+			processInput(bytes.subarray(0, 2));
+			buffer.destroy();
+
+			processInput(bytes.subarray(2));
+			expect(emittedSequences.join("")).not.toBe("화");
+		});
+
+		it("preserves legacy single-high-byte meta conversion (ESC + byte-128)", () => {
+			// An isolated high byte is read as Alt/meta, not fed to the UTF-8
+			// decoder. 0xE1 (225) -> ESC + char(97) = ESC + "a".
+			processInput(Buffer.from([0xe1]));
+			expect(emittedSequences).toEqual(["\x1ba"]);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+	});
 });

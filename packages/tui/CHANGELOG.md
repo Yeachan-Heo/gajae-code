@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Korean (and other multi-byte UTF-8) paste mojibake in terminal input: `StdinBuffer` is now the single raw-stdin decoding boundary using a persistent `StringDecoder`, so multi-byte characters split across stdin read boundaries are reassembled instead of producing U+FFFD. `ProcessTerminal` no longer relies on `process.stdin.setEncoding("utf8")` and forwards raw Buffers; the legacy single-high-byte meta conversion is preserved. (#454)
+
 ## [0.4.0] - 2026-06-06
 
 ### Changed

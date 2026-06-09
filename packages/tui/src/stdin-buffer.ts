@@ -17,6 +17,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 import { EventEmitter } from "events";
+import { StringDecoder } from "node:string_decoder";
 
 const ESC = "\x1b";
 const BRACKETED_PASTE_START = "\x1b[200~";
@@ -246,6 +247,13 @@ export type StdinBufferEventMap = {
 /**
  * Buffers stdin input and emits complete sequences via the 'data' event.
  * Handles partial escape sequences that arrive across multiple chunks.
+ *
+ * StdinBuffer is the single raw-stdin decoding boundary: raw terminal bytes
+ * enter via `process()` and decoded string events leave via the 'data' and
+ * 'paste' events. UTF-8 is decoded exactly once here (using a persistent
+ * StringDecoder) so multi-byte characters split across chunk boundaries are
+ * reassembled rather than corrupted into U+FFFD. All downstream parsing
+ * (escape sequences, bracketed paste, Kitty/CSI, OSC/DA1) operates on strings.
  */
 export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#buffer: string = "";
@@ -254,6 +262,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#pasteMode: boolean = false;
 	#pasteBuffer: string = "";
 	#pendingKittyPrintableCodepoint: number | undefined;
+	// Persistent UTF-8 decoder. Holds an incomplete trailing multi-byte
+	// sequence between chunks so split reads (e.g. a 3-byte Korean syllable
+	// split across two stdin events) reassemble correctly instead of emitting
+	// U+FFFD. Reset on clear()/destroy(); never finalized on normal flush.
+	#decoder = new StringDecoder("utf8");
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -267,22 +280,38 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#timeout = undefined;
 		}
 
-		// Handle high-byte conversion (for compatibility with parseKeypress)
-		// If buffer has single byte > 127, convert to ESC + (byte - 128)
+		// Decode raw bytes into a string. Buffers come from raw stdin; strings
+		// come from tests or non-terminal callers and are already decoded.
 		let str: string;
+		let decodedFromBuffer = false;
 		if (Buffer.isBuffer(data)) {
+			// Legacy 8-bit meta: an isolated high byte (0x80-0xFF) is treated
+			// as ESC + (byte - 128) for Alt/meta compatibility, BEFORE UTF-8
+			// decoding. This is the one documented exception to UTF-8 boundary
+			// decoding — a lone high byte that is also a valid UTF-8 lead byte
+			// is still read as meta — so such a byte is never fed to the decoder.
 			if (data.length === 1 && data[0]! > 127) {
 				const byte = data[0]! - 128;
 				str = `\x1b${String.fromCharCode(byte)}`;
 			} else {
-				str = data.toString();
+				// Decode through the persistent StringDecoder so a multi-byte
+				// sequence split across chunks (e.g. a 3-byte Korean syllable)
+				// is reassembled instead of emitting U+FFFD.
+				str = this.#decoder.write(data);
+				decodedFromBuffer = true;
 			}
 		} else {
 			str = data;
 		}
 
 		if (str.length === 0 && this.#buffer.length === 0) {
-			this.#emitDataSequence("");
+			// A Buffer that decoded to nothing means the decoder is holding an
+			// incomplete UTF-8 prefix; emit nothing and wait for the completing
+			// bytes. Preserve the historical empty 'data' event for explicit
+			// empty-string input only.
+			if (!decodedFromBuffer) {
+				this.#emitDataSequence("");
+			}
 			return;
 		}
 
@@ -398,6 +427,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteMode = false;
 		this.#pasteBuffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
+		// Drop any incomplete multi-byte sequence the decoder is holding so a
+		// stale partial prefix cannot combine with future input. destroy()
+		// resets the decoder by calling clear().
+		this.#decoder = new StringDecoder("utf8");
 	}
 
 	getBuffer(): string {
