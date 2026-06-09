@@ -99,6 +99,7 @@ function createContext(): {
 	});
 
 	ctx = {
+		settings: { get: () => undefined } as unknown as InteractiveModeContext["settings"],
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender } as unknown as InteractiveModeContext["ui"],
 		loadingAnimation: undefined,
