@@ -1803,15 +1803,18 @@ describe("ModelRegistry", () => {
 	describe("runtime discovery", () => {
 		test("auto-discovers ollama models without provider config", async () => {
 			using _hook = mockOllamaDiscovery(["phi4-mini"]);
-
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh();
-			const ollamaModels = getModelsForProvider(registry, "ollama");
-			expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
-			expect(registry.getAvailable().some(m => m.provider === "ollama" && m.id === "phi4-mini")).toBe(true);
-			expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
+			const _restoreOllamaKey = unsetEnvForTest("OLLAMA_API_KEY");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
+				const ollamaModels = getModelsForProvider(registry, "ollama");
+				expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
+				expect(registry.getAvailable().some(m => m.provider === "ollama" && m.id === "phi4-mini")).toBe(true);
+				expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
+			} finally {
+				_restoreOllamaKey();
+			}
 		});
-
 		test("discovers ollama-cloud through built-in descriptor flow without regressing local implicit ollama", async () => {
 			authStorage.setRuntimeApiKey("ollama-cloud", "cloud-test-key");
 
@@ -1875,6 +1878,8 @@ describe("ModelRegistry", () => {
 			).toBe(true);
 		});
 		test("discovers ollama models at runtime and treats auth:none providers as available", async () => {
+			const _restoreOllamaKey = unsetEnvForTest("OLLAMA_API_KEY");
+			try {
 			writeRawModelsJson({
 				ollama: {
 					baseUrl: "http://127.0.0.1:11434/v1",
@@ -1913,6 +1918,9 @@ describe("ModelRegistry", () => {
 			const available = registry.getAvailable().filter(m => m.provider === "ollama");
 			expect(available.length).toBe(2);
 			expect(await registry.getApiKey(available[0])).toBe(kNoAuth);
+			} finally {
+				_restoreOllamaKey();
+			}
 		});
 
 		test("normalizes cached ollama completions rows to responses on load", () => {
