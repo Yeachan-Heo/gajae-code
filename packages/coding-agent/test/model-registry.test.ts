@@ -3,11 +3,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
-import { kNoAuth, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
+
+describe("model roles", () => {
+	test("only the default role remains after legacy role cleanup", () => {
+		expect(MODEL_ROLE_IDS).toEqual(["default"]);
+	});
+});
 
 describe("ModelRegistry", () => {
 	let tempDir: string;

@@ -62,7 +62,7 @@ export function isAuthenticated(apiKey: string | undefined | null): apiKey is st
 	return Boolean(apiKey) && apiKey !== kNoAuth;
 }
 
-export type ModelRole = "default" | "smol" | "slow" | "vision" | "plan" | "designer" | "commit" | "task";
+export type ModelRole = "default";
 
 export interface ModelRoleInfo {
 	tag?: string;
@@ -72,16 +72,9 @@ export interface ModelRoleInfo {
 
 export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 	default: { tag: "DEFAULT", name: "Default", color: "success" },
-	smol: { tag: "SMOL", name: "Fast", color: "warning" },
-	slow: { tag: "SLOW", name: "Thinking", color: "accent" },
-	vision: { tag: "VISION", name: "Vision", color: "error" },
-	plan: { tag: "PLAN", name: "Architect", color: "muted" },
-	designer: { tag: "DESIGNER", name: "Designer", color: "muted" },
-	commit: { tag: "COMMIT", name: "Commit", color: "dim" },
-	task: { tag: "TASK", name: "Subtask", color: "muted" },
 };
 
-export const MODEL_ROLE_IDS: ModelRole[] = ["default", "smol", "slow", "vision", "plan", "designer", "commit", "task"];
+export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 
 export type GjcModelAssignmentTargetId = "default" | "executor" | "architect" | "planner" | "critic";
 

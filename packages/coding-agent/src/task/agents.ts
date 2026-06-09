@@ -59,7 +59,7 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 			name: "task",
 			description: "General-purpose subagent with full capabilities for delegated multi-step tasks",
 			spawns: "*",
-			model: "pi/task",
+			model: "pi/default",
 			thinkingLevel: Effort.Medium,
 			hide: true,
 		},

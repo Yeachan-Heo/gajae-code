@@ -1,5 +1,5 @@
 /**
- * Generate commit messages from diffs using a smol, fast model.
+ * Generate commit messages from diffs using the default model.
  * Follows the same pattern as title-generator.ts.
  */
 import type { ThinkingLevel } from "@gajae-code/agent-core";
@@ -9,7 +9,6 @@ import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
-import MODEL_PRIO from "../priority.json" with { type: "json" };
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
 import { toReasoningEffort } from "../thinking";
 
@@ -36,7 +35,7 @@ function filterDiffNoise(diff: string): string {
 	return filtered.join("\n");
 }
 
-function getSmolModelCandidates(
+function getModelCandidates(
 	registry: ModelRegistry,
 	settings: Settings,
 ): Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> {
@@ -51,18 +50,12 @@ function getSmolModelCandidates(
 	};
 
 	const matchPreferences = { usageOrder: settings.getStorage()?.getModelUsageOrder() };
-	const configuredSmol = resolveModelRoleValue(settings.getModelRole("smol"), availableModels, {
+	const configured = resolveModelRoleValue(settings.getModelRole("default"), availableModels, {
 		settings,
 		matchPreferences,
 		modelRegistry: registry,
 	});
-	addCandidate(configuredSmol.model, configuredSmol.thinkingLevel);
-
-	for (const pattern of MODEL_PRIO.smol) {
-		const needle = pattern.toLowerCase();
-		addCandidate(availableModels.find(m => m.id.toLowerCase() === needle));
-		addCandidate(availableModels.find(m => m.id.toLowerCase().includes(needle)));
-	}
+	addCandidate(configured.model, configured.thinkingLevel);
 
 	for (const model of availableModels) {
 		addCandidate(model);
@@ -81,9 +74,9 @@ export async function generateCommitMessage(
 	settings: Settings,
 	sessionId?: string,
 ): Promise<string | null> {
-	const candidates = getSmolModelCandidates(registry, settings);
+	const candidates = getModelCandidates(registry, settings);
 	if (candidates.length === 0) {
-		logger.debug("commit-msg-generator: no smol model found");
+		logger.debug("commit-msg-generator: no model found");
 		return null;
 	}
 

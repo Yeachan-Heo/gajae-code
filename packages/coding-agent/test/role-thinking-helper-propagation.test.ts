@@ -30,11 +30,10 @@ afterEach(() => {
 });
 
 describe("role thinking helper propagation", () => {
-	it("passes smol-role thinking to commit message generation", async () => {
+	it("passes default-role thinking to commit message generation", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const settings = createSettings({
-			default: `${model.provider}/${model.id}:high`,
-			smol: "pi/default:minimal",
+			default: `${model.provider}/${model.id}:minimal`,
 		});
 		const registry = {
 			getAvailable: () => [model],
@@ -53,11 +52,10 @@ describe("role thinking helper propagation", () => {
 		});
 	});
 
-	it("disables reasoning for title generation even when smol role has thinking", async () => {
+	it("disables reasoning for title generation even when the default role has thinking", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const settings = createSettings({
-			default: `${model.provider}/${model.id}:high`,
-			smol: "pi/default:low",
+			default: `${model.provider}/${model.id}:low`,
 		});
 		const registry = {
 			getAvailable: () => [model],

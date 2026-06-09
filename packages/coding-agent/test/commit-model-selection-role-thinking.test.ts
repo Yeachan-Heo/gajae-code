@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Effort, getBundledModel } from "@gajae-code/ai";
-import { resolvePrimaryModel, resolveSmolModel } from "../src/commit/model-selection";
+import { resolvePrimaryModel, resolveSecondaryCommitModel } from "../src/commit/model-selection";
 
 function getModelOrThrow(id: string) {
 	const model = getBundledModel("anthropic", id);
@@ -26,26 +26,23 @@ function createSettings(modelRoles: Record<string, string>) {
 	} as never;
 }
 
-describe("commit role thinking selection", () => {
-	it("returns explicit thinking for commit and smol roles, including alias overrides", async () => {
+describe("commit model selection", () => {
+	it("uses the default role (with explicit thinking) for primary and secondary commit models", async () => {
 		const defaultModel = getModelOrThrow("claude-sonnet-4-5");
-		const commitModel = getModelOrThrow("claude-opus-4-5");
 		const settings = createSettings({
-			default: `${defaultModel.provider}/${defaultModel.id}:high`,
-			commit: `${commitModel.provider}/${commitModel.id}:low`,
-			smol: "pi/default:minimal",
+			default: `${defaultModel.provider}/${defaultModel.id}:low`,
 		});
 		const registry = {
-			getAvailable: () => [defaultModel, commitModel],
+			getAvailable: () => [defaultModel],
 			getApiKey: async () => "test-key",
 		};
 
 		const primary = await resolvePrimaryModel(undefined, settings, registry);
-		expect(primary.model.id).toBe(commitModel.id);
+		expect(primary.model.id).toBe(defaultModel.id);
 		expect(primary.thinkingLevel).toBe(Effort.Low);
 
-		const smol = await resolveSmolModel(settings, registry, commitModel, "fallback-key");
-		expect(smol.model.id).toBe(defaultModel.id);
-		expect(smol.thinkingLevel).toBe(Effort.Minimal);
+		const secondary = await resolveSecondaryCommitModel(settings, registry, defaultModel, "fallback-key");
+		expect(secondary.model.id).toBe(defaultModel.id);
+		expect(secondary.thinkingLevel).toBe(Effort.Low);
 	});
 });
