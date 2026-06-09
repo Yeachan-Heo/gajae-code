@@ -51,6 +51,13 @@ type PastePendingClearReason = "timeout" | "queue-limit";
  */
 export class CustomEditor extends Editor {
 	onEscape?: () => void;
+	/**
+	 * Optional high-priority interrupt consumer. Invoked when the interrupt key
+	 * is pressed, before `onEscape`. Returning `true` consumes the keystroke.
+	 * Used so a transient UI (e.g. the btw panel) stays dismissable even while
+	 * another controller has temporarily installed its own `onEscape` handler.
+	 */
+	onInterruptPriority?: () => boolean;
 	shouldBypassAutocompleteOnEscape?: () => boolean;
 	onClear?: () => void;
 	onExit?: () => void;
@@ -285,10 +292,19 @@ export class CustomEditor extends Editor {
 
 		// Intercept configured interrupt shortcut.
 		// Default behavior keeps autocomplete dismissal, but parent can prioritize global interrupt handling.
-		if (this.#matchesAction(data, "app.interrupt") && this.onEscape) {
+		if (this.#matchesAction(data, "app.interrupt")) {
 			if (!this.isShowingAutocomplete() || this.shouldBypassAutocompleteOnEscape?.()) {
-				this.onEscape();
-				return;
+				// A priority interrupt consumer (e.g. an open btw panel) must win over any
+				// transient onEscape handler other controllers install (auto-compaction,
+				// auto-retry, manual compaction, etc.) so dismissal stays wired regardless
+				// of which handler currently owns onEscape.
+				if (this.onInterruptPriority?.()) {
+					return;
+				}
+				if (this.onEscape) {
+					this.onEscape();
+					return;
+				}
 			}
 		}
 
