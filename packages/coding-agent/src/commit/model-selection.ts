@@ -1,14 +1,7 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
-import { MODEL_ROLE_IDS } from "../config/model-registry";
-import {
-	type ModelLookupRegistry,
-	parseModelPattern,
-	resolveModelRoleValue,
-	resolveRoleSelection,
-} from "../config/model-resolver";
+import { type ModelLookupRegistry, resolveModelRoleValue, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
-import MODEL_PRIO from "../priority.json" with { type: "json" };
 
 export interface ResolvedCommitModel {
 	model: Model<Api>;
@@ -29,7 +22,7 @@ export async function resolvePrimaryModel(
 	const matchPreferences = { usageOrder: settings.getStorage()?.getModelUsageOrder() };
 	const resolved = override
 		? resolveModelRoleValue(override, available, { settings, matchPreferences, modelRegistry })
-		: resolveRoleSelection(["commit", "smol", ...MODEL_ROLE_IDS], settings, available, modelRegistry);
+		: resolveRoleSelection(["default"], settings, available, modelRegistry);
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("No model available for commit generation");
@@ -41,25 +34,17 @@ export async function resolvePrimaryModel(
 	return { model, apiKey, thinkingLevel: resolved?.thinkingLevel };
 }
 
-export async function resolveSmolModel(
+export async function resolveSecondaryCommitModel(
 	settings: Settings,
 	modelRegistry: CommitModelRegistry,
 	fallbackModel: Model<Api>,
 	fallbackApiKey: string,
 ): Promise<ResolvedCommitModel> {
 	const available = modelRegistry.getAvailable();
-	const resolvedSmol = resolveRoleSelection(["smol"], settings, available, modelRegistry);
-	if (resolvedSmol?.model) {
-		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);
-		if (apiKey) return { model: resolvedSmol.model, apiKey, thinkingLevel: resolvedSmol.thinkingLevel };
-	}
-
-	const matchPreferences = { usageOrder: settings.getStorage()?.getModelUsageOrder() };
-	for (const pattern of MODEL_PRIO.smol) {
-		const candidate = parseModelPattern(pattern, available, matchPreferences, { modelRegistry }).model;
-		if (!candidate) continue;
-		const apiKey = await modelRegistry.getApiKey(candidate);
-		if (apiKey) return { model: candidate, apiKey };
+	const resolved = resolveRoleSelection(["default"], settings, available, modelRegistry);
+	if (resolved?.model) {
+		const apiKey = await modelRegistry.getApiKey(resolved.model);
+		if (apiKey) return { model: resolved.model, apiKey, thinkingLevel: resolved.thinkingLevel };
 	}
 
 	return { model: fallbackModel, apiKey: fallbackApiKey };

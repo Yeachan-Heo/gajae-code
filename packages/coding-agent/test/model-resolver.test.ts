@@ -440,10 +440,10 @@ describe("parseModelPattern", () => {
 describe("resolveModelRoleValue", () => {
 	test("resolves pi/<role>:<thinking> by expanding role alias before parsing thinking", () => {
 		const settings = {
-			getModelRole: (role: string) => (role === "smol" ? "openrouter/qwen/qwen3-coder:exacto" : undefined),
+			getModelRole: (role: string) => (role === "default" ? "openrouter/qwen/qwen3-coder:exacto" : undefined),
 		} as NonNullable<Parameters<typeof resolveModelRoleValue>[2]>["settings"];
 
-		const result = resolveModelRoleValue("pi/smol:high", allModels, { settings });
+		const result = resolveModelRoleValue("pi/default:high", allModels, { settings });
 
 		expect(result.model?.provider).toBe("openrouter");
 		expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
@@ -489,13 +489,13 @@ describe("resolveModelRoleValue", () => {
 	});
 });
 describe("resolveAgentModelPatterns", () => {
-	test("falls back to the active session model when pi/task is unset", () => {
+	test("falls back to the active session model when the agent inherits via pi/default", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
 		});
 
 		const result = resolveAgentModelPatterns({
-			agentModel: "pi/task",
+			agentModel: "pi/default",
 			settings,
 			activeModelPattern: "openai/gpt-4o",
 		});
@@ -503,59 +503,18 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result).toEqual(["openai/gpt-4o"]);
 	});
 
-	test("uses the configured task role before falling back to the session model", () => {
+	test("uses an explicit provider/model agent override instead of inheriting", () => {
 		const settings = Settings.isolated({
-			modelRoles: {
-				default: "openai/gpt-4o",
-				task: "anthropic/claude-sonnet-4-5:high",
-			},
+			modelRoles: { default: "openai/gpt-4o" },
 		});
 
 		const result = resolveAgentModelPatterns({
-			agentModel: "pi/task",
+			agentModel: "anthropic/claude-sonnet-4-5:high",
 			settings,
 			activeModelPattern: "openai/gpt-4o",
 		});
 
 		expect(result).toEqual(["anthropic/claude-sonnet-4-5:high"]);
-	});
-
-	test("expands pi/designer to priority defaults", () => {
-		const settings = Settings.isolated({
-			modelRoles: {
-				default: "anthropic/claude-sonnet-4-5",
-			},
-		});
-
-		const result = resolveAgentModelPatterns({
-			agentModel: "pi/designer",
-			settings,
-		});
-
-		expect(result).toEqual([
-			"google-gemini-cli/gemini-3.1-pro",
-			"google-gemini-cli/gemini-3-pro",
-			"gemini-3.1-pro",
-			"gemini-3-1-pro",
-			"gemini-3-pro",
-			"gemini-3",
-		]);
-	});
-
-	test("prefers configured designer role override over priority defaults", () => {
-		const settings = Settings.isolated({
-			modelRoles: {
-				default: "anthropic/claude-sonnet-4-5",
-				designer: "openai/gpt-4o",
-			},
-		});
-
-		const result = resolveAgentModelPatterns({
-			agentModel: "pi/designer",
-			settings,
-		});
-
-		expect(result).toEqual(["openai/gpt-4o"]);
 	});
 });
 
@@ -939,14 +898,14 @@ describe("OpenAI Codex default resolution", () => {
 });
 
 describe("expandRoleAlias", () => {
-	test("expands pi/vision to configured vision role", () => {
+	test("expands pi/default to the configured default role", () => {
 		const settings = Settings.isolated();
-		settings.setModelRole("vision", "openai/gpt-4o");
+		settings.setModelRole("default", "openai/gpt-4o");
 
-		expect(expandRoleAlias("pi/vision", settings)).toBe("openai/gpt-4o");
+		expect(expandRoleAlias("pi/default", settings)).toBe("openai/gpt-4o");
 	});
 
-	test("keeps pi/vision alias when vision role is unset", () => {
+	test("keeps an unknown role alias unchanged", () => {
 		const settings = Settings.isolated();
 		settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
 

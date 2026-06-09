@@ -12,7 +12,7 @@ function getModelOrThrow(id: string): Model<Api> {
 function createSettings(model: Model<Api>) {
 	return {
 		getModelRole(role: string) {
-			return role === "smol" ? `${model.provider}/${model.id}` : undefined;
+			return role === "default" ? `${model.provider}/${model.id}` : undefined;
 		},
 		getStorage() {
 			return undefined;

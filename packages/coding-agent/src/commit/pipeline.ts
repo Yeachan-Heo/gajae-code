@@ -18,7 +18,7 @@ import {
 import { runChangelogFlow } from "./changelog";
 import { runMapReduceAnalysis, shouldUseMapReduce } from "./map-reduce";
 import { formatCommitMessage } from "./message";
-import { resolvePrimaryModel, resolveSmolModel } from "./model-selection";
+import { resolvePrimaryModel, resolveSecondaryCommitModel } from "./model-selection";
 import summaryRetryPrompt from "./prompts/summary-retry.md" with { type: "text" };
 import typesDescriptionPrompt from "./prompts/types-description.md" with { type: "text" };
 import type { CommitCommandArgs, ConventionalAnalysis } from "./types";
@@ -56,7 +56,7 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 		model: smolModel,
 		apiKey: smolApiKey,
 		thinkingLevel: smolThinkingLevel,
-	} = await resolveSmolModel(settings, modelRegistry, primaryModel, primaryApiKey);
+	} = await resolveSecondaryCommitModel(settings, modelRegistry, primaryModel, primaryApiKey);
 
 	let stagedFiles = await git.diff.changedFiles(cwd, { cached: true });
 	if (stagedFiles.length === 0) {

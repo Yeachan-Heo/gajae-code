@@ -15,7 +15,6 @@ import {
 import { fuzzyMatch } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
-import MODEL_PRIO from "../priority.json" with { type: "json" };
 import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
 import { isAuthenticated, kNoAuth, MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
 import type { Settings } from "./settings";
@@ -529,7 +528,7 @@ function normalizeModelPatternList(value: string | string[] | undefined): string
 }
 
 function isSessionInheritedAgentPattern(value: string): boolean {
-	return value === DEFAULT_MODEL_ROLE || value === `${PREFIX_MODEL_ROLE}${DEFAULT_MODEL_ROLE}` || value === "pi/task";
+	return value === DEFAULT_MODEL_ROLE || value === `${PREFIX_MODEL_ROLE}${DEFAULT_MODEL_ROLE}`;
 }
 
 function resolveConfiguredRolePattern(value: string, settings?: Settings): string[] | undefined {
@@ -544,8 +543,7 @@ function resolveConfiguredRolePattern(value: string, settings?: Settings): strin
 	if (!role) return [normalized];
 
 	const configured = settings?.getModelRole(role)?.trim();
-	const roleDefaults = normalizeModelPatternList(MODEL_PRIO[role as keyof typeof MODEL_PRIO]);
-	const resolved = configured ? normalizeModelPatternList(configured) : roleDefaults;
+	const resolved = configured ? normalizeModelPatternList(configured) : undefined;
 	if (!resolved || resolved.length === 0) {
 		return undefined;
 	}
@@ -554,7 +552,7 @@ function resolveConfiguredRolePattern(value: string, settings?: Settings): strin
 }
 
 /**
- * Expand a role alias like "pi/smol" to the configured model string.
+ * Expand a role alias like "pi/default" to the configured model string.
  */
 export function expandRoleAlias(value: string, settings?: Settings): string {
 	const normalized = value.trim();
@@ -591,9 +589,8 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 	const configuredAgentPatterns = resolveConfiguredModelPatterns(agentModel, settings);
 	const singleAgentPattern = normalizedAgentPatterns.length === 1 ? normalizedAgentPatterns[0] : undefined;
 	const agentInheritsSessionModel = singleAgentPattern ? isSessionInheritedAgentPattern(singleAgentPattern) : false;
-	if (configuredAgentPatterns.length > 0) {
-		if (!agentInheritsSessionModel) return configuredAgentPatterns;
-		if (singleAgentPattern === "pi/task") return configuredAgentPatterns;
+	if (configuredAgentPatterns.length > 0 && !agentInheritsSessionModel) {
+		return configuredAgentPatterns;
 	}
 
 	const fallback =
@@ -1333,80 +1330,4 @@ export async function restoreModelFromSession(
 
 	// No models available
 	return { model: undefined, fallbackMessage: undefined };
-}
-
-/**
- * Find a smol/fast model using the priority chain.
- * Tries exact matches first, then fuzzy matches.
- *
- * @param modelRegistry The model registry to search
- * @param savedModel Optional saved model string from settings (provider/modelId)
- * @returns The best available smol model, or undefined if none found
- */
-export async function findSmolModel(
-	modelRegistry: ModelLookupRegistry,
-	savedModel?: string,
-): Promise<Model<Api> | undefined> {
-	const availableModels = modelRegistry.getAvailable();
-	if (availableModels.length === 0) return undefined;
-
-	// 1. Try saved model from settings
-	if (savedModel) {
-		const match = resolveModelFromString(savedModel, availableModels, undefined, modelRegistry);
-		if (match) return match;
-	}
-
-	// 2. Try priority chain
-	for (const pattern of MODEL_PRIO.smol) {
-		// Try exact match with provider prefix
-		const providerMatch = availableModels.find(m => `${m.provider}/${m.id}`.toLowerCase() === pattern);
-		if (providerMatch) return providerMatch;
-
-		// Try exact match first
-		const exactMatch = parseModelPattern(pattern, availableModels, undefined, { modelRegistry }).model;
-		if (exactMatch) return exactMatch;
-
-		// Try fuzzy match (substring)
-		const fuzzyMatch = availableModels.find(m => m.id.toLowerCase().includes(pattern));
-		if (fuzzyMatch) return fuzzyMatch;
-	}
-
-	// 3. Fallback to first available (same as default)
-	return availableModels[0];
-}
-
-/**
- * Find a slow/comprehensive model using the priority chain.
- * Prioritizes reasoning and OpenAI code backend models for thorough analysis.
- *
- * @param modelRegistry The model registry to search
- * @param savedModel Optional saved model string from settings (provider/modelId)
- * @returns The best available slow model, or undefined if none found
- */
-export async function findSlowModel(
-	modelRegistry: ModelLookupRegistry,
-	savedModel?: string,
-): Promise<Model<Api> | undefined> {
-	const availableModels = modelRegistry.getAvailable();
-	if (availableModels.length === 0) return undefined;
-
-	// 1. Try saved model from settings
-	if (savedModel) {
-		const match = resolveModelFromString(savedModel, availableModels, undefined, modelRegistry);
-		if (match) return match;
-	}
-
-	// 2. Try priority chain
-	for (const pattern of MODEL_PRIO.slow) {
-		// Try exact match first
-		const exactMatch = parseModelPattern(pattern, availableModels, undefined, { modelRegistry }).model;
-		if (exactMatch) return exactMatch;
-
-		// Try fuzzy match (substring)
-		const fuzzyMatch = availableModels.find(m => m.id.toLowerCase().includes(pattern.toLowerCase()));
-		if (fuzzyMatch) return fuzzyMatch;
-	}
-
-	// 3. Fallback to first available (same as default)
-	return availableModels[0];
 }

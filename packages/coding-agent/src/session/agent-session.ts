@@ -5757,7 +5757,7 @@ export class AgentSession {
 	/**
 	 * Cycle through configured role models in a fixed order.
 	 * Skips missing roles.
-	 * @param roleOrder - Order of roles to cycle through (e.g., ["slow", "default", "smol"])
+	 * @param roleOrder - Order of roles to cycle through (e.g., ["default"])
 	 * @param options - Optional settings: `temporary` to not persist to settings
 	 */
 	async cycleRoleModels(
@@ -7139,7 +7139,7 @@ export class AgentSession {
 		}
 		return new Error(
 			`Compaction requires usable credentials for ${currentModel.provider}/${currentModel.id}. ` +
-				`Configure ${currentModel.provider} credentials or assign an authenticated fallback role such as modelRoles.smol.`,
+				`Configure ${currentModel.provider} credentials or assign an authenticated fallback via modelRoles.default.`,
 		);
 	}
 
