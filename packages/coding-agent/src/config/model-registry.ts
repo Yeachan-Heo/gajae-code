@@ -688,6 +688,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.reasoning !== undefined) result.reasoning = override.reasoning;
 	if (override.thinking !== undefined) result.thinking = override.thinking as ThinkingConfig;
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
+	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
@@ -718,6 +719,7 @@ interface CustomModelDefinitionLike {
 	reasoning?: boolean;
 	thinking?: ThinkingConfig;
 	input?: ("text" | "image")[];
+	output?: ("text" | "image")[];
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
 	maxTokens?: number;
@@ -743,6 +745,7 @@ type CustomModelOverlay = {
 	reasoning?: boolean;
 	thinking?: ThinkingConfig;
 	input?: ("text" | "image")[];
+	output?: ("text" | "image")[];
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
 	maxTokens?: number;
@@ -818,6 +821,7 @@ function buildCustomModelOverlay(
 		reasoning: modelDef.reasoning,
 		thinking: modelDef.thinking as ThinkingConfig | undefined,
 		input: modelDef.input as ("text" | "image")[] | undefined,
+		output: modelDef.output as ("text" | "image")[] | undefined,
 		cost: modelDef.cost,
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
@@ -910,6 +914,7 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		reference?.cost ??
 		(options.useDefaults ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : undefined);
 	const input = resolvedModel.input ?? reference?.input ?? (options.useDefaults ? ["text"] : undefined);
+	const output = resolvedModel.output ?? reference?.output;
 	return enrichModelThinking({
 		id: resolvedModel.id,
 		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
@@ -919,6 +924,7 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		reasoning: resolvedModel.reasoning ?? reference?.reasoning ?? (options.useDefaults ? false : undefined),
 		thinking: resolvedModel.thinking ?? reference?.thinking,
 		input: input as ("text" | "image")[],
+		output: output as ("text" | "image")[] | undefined,
 		cost,
 		contextWindow:
 			resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : undefined),
@@ -1213,6 +1219,7 @@ export class ModelRegistry {
 					reasoning: customModel.reasoning ?? existingModel.reasoning,
 					thinking: customModel.thinking ?? existingModel.thinking,
 					input: customModel.input ?? existingModel.input,
+					output: customModel.output ?? existingModel.output,
 					cost: customModel.cost ?? existingModel.cost,
 					contextWindow: customModel.contextWindow ?? existingModel.contextWindow,
 					maxTokens: customModel.maxTokens ?? existingModel.maxTokens,
