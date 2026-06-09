@@ -289,11 +289,12 @@ export class InputController {
 				text = slashResult;
 			}
 
-			// Handle skill commands (/skill:name [args]). Enter ⇒ steer (matches the
-			// free-text Enter semantics applied a few lines below at the streaming
-			// branch). Ctrl+Enter routes through `handleFollowUp` and dispatches the
-			// same helper with `"followUp"`.
-			if (await this.#invokeSkillCommand(text, "steer")) {
+			// Handle skill commands (/skill:name [args]). While streaming, Enter
+			// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
+			// runs after it completes (matches the free-text Enter semantics applied
+			// a few lines below at the streaming branch). Ctrl+Enter always routes
+			// through `handleFollowUp` and dispatches the same helper with `"followUp"`.
+			if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior())) {
 				return;
 			}
 
@@ -344,7 +345,9 @@ export class InputController {
 				return;
 			}
 
-			// If streaming, use prompt() with steer behavior
+			// If streaming, use prompt() with the busy-prompt behavior the user
+			// selected: "steer" interrupts the active turn, "queue" defers the
+			// prompt to run after the active turn completes (in submission order).
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.ctx.session.isStreaming) {
 				this.ctx.editor.addToHistory(text);
@@ -355,9 +358,10 @@ export class InputController {
 				// (a user-role `message_start` event) leaves any draft the user has
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
+				const streamingBehavior = this.#busyStreamingBehavior();
 				await this.ctx.withLocalSubmission(
 					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+					() => this.ctx.session.prompt(text, { streamingBehavior, images }),
 					{ imageCount: images?.length ?? 0 },
 				);
 				this.ctx.updatePendingMessagesDisplay();
@@ -448,6 +452,17 @@ export class InputController {
 		} else {
 			this.ctx.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
 		}
+	}
+
+	/**
+	 * Resolve how a prompt submitted while the agent is busy should be delivered.
+	 * Driven by the `busyPromptMode` setting and kept distinct from the
+	 * follow-up keybinding: "steer" interrupts the active turn, "queue" defers
+	 * the prompt to the follow-up queue so it runs after the active turn
+	 * completes (in submission order). Only consulted while streaming.
+	 */
+	#busyStreamingBehavior(): "steer" | "followUp" {
+		return this.ctx.settings.get("busyPromptMode") === "queue" ? "followUp" : "steer";
 	}
 
 	/**
