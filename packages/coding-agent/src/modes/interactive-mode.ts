@@ -1156,7 +1156,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#updateGoalModeStatus();
 			return;
 		}
-		const pendingGoal = goalEnabled ? await consumePendingGoalModeRequest(this.sessionManager.getCwd()) : null;
+		const pendingGoal = goalEnabled
+			? await consumePendingGoalModeRequest(this.sessionManager.getCwd(), this.sessionManager.getSessionId())
+			: null;
 		if (pendingGoal) {
 			await this.#enterGoalMode({ objective: pendingGoal.objective, silent: true });
 			this.#scheduleGoalContinuation();
