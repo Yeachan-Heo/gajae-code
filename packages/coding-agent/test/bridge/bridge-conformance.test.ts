@@ -105,7 +105,7 @@ describe("bridge protocol conformance", () => {
 		const chunk = await reader.read();
 		await reader.cancel();
 		const text = new TextDecoder().decode(chunk.value);
-		expect(text).toContain('"protocol_version":1');
+		expect(text).toContain('"protocol_version":2');
 		expect(text).toContain('"session_id":"sess-1"');
 		expect(text).toContain('"seq":7');
 	});
@@ -146,7 +146,7 @@ async function observeHandshake(): Promise<{ accepted_capabilities: string[]; fr
 			method: "POST",
 			headers: { Authorization: "Bearer secret" },
 			body: JSON.stringify({
-				protocol_version_range: { min: 1, max: 1 },
+				protocol_version_range: { min: 1, max: 2 },
 				capabilities: CANDIDATE_CAPABILITIES,
 				requested_scopes: [...BRIDGE_COMMAND_SCOPES],
 			}),

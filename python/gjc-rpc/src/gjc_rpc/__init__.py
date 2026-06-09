@@ -30,6 +30,7 @@ from .host_uris import (
 )
 from .protocol import (
     AgentEndEvent,
+    AgentStartEvent,
     AgentMessage,
     AssistantMessage,
     AssistantMessageEvent,
@@ -62,6 +63,8 @@ from .protocol import (
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
+    RpcEventFrame,
+    RpcEventPayload,
     RpcNotification,
     SessionState,
     SessionStats,
@@ -99,6 +102,7 @@ from .protocol import (
 __all__ = [
     "AgentEventListener",
     "AgentEndEvent",
+    "AgentStartEvent",
     "AgentMessage",
     "AssistantMessage",
     "AssistantMessageEvent",
@@ -154,6 +158,8 @@ __all__ = [
     "RpcConcurrencyError",
     "RpcError",
     "RpcNotification",
+    "RpcEventFrame",
+    "RpcEventPayload",
     "RpcProcessExitError",
     "RpcProtocolError",
     "RpcTimeoutError",

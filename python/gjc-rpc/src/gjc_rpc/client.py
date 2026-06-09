@@ -72,6 +72,7 @@ from .protocol import (
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_workflow_gate_event,
     parse_session_state,
     parse_session_stats,
     parse_thinking_level_cycle_result,
@@ -81,6 +82,16 @@ from .protocol import (
 AgentEventListener = Callable[[RpcAgentEvent], None]
 NotificationListener = Callable[[RpcNotification], None]
 UiRequestListener = Callable[[ExtensionUiRequest], None]
+def _effective_event_type(payload: JsonObject) -> object:
+    if payload.get("type") == "event":
+        frame_payload = payload.get("payload")
+        if isinstance(frame_payload, dict):
+            inner_event = frame_payload.get("event")
+            if isinstance(inner_event, dict):
+                return inner_event.get("type")
+    return payload.get("type")
+
+
 WorkflowGateListener = Callable[[WorkflowGate], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
@@ -1013,7 +1024,7 @@ class RpcClient:
                     raise async_errors[0]
 
                 event_payloads = self._events.snapshot_from(start_index)
-                if any(payload.get("type") == "agent_end" for payload in event_payloads):
+                if any(_effective_event_type(payload) == "agent_end" for payload in event_payloads):
                     events = tuple(cast(RpcAgentEvent, parse_notification(payload)) for payload in event_payloads)
                     return events
 
@@ -1444,6 +1455,7 @@ class RpcClient:
 
 
                 if isinstance(notification, WorkflowGate):
+                    self._workflow_gates.put(parse_workflow_gate_event(payload))
                     self._dispatch_listeners(
                         "workflow_gate",
                         listener_notification.type,

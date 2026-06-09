@@ -1,19 +1,23 @@
 /**
- * Serialize `AgentSessionEvent`s into versioned bridge wire frames.
+ * Serialize `AgentSessionEvent`s into versioned agent-wire frames.
  *
  * The mapping is intentionally exhaustive: `agentSessionEventType` switches over
  * every variant of the event union and calls `assertNever` in the default arm,
  * so a newly added event variant fails to compile until it is handled here.
+ *
+ * The canonical sequencer + frame builders live here; the historical `Bridge*`
+ * names are retained as thin aliases for callers that have not yet migrated.
  */
 import { randomUUID } from "node:crypto";
 import type { AgentSessionEvent } from "../../../session/agent-session";
 import {
-	type AgentSessionEventType,
-	BRIDGE_PROTOCOL_VERSION,
-	type BridgeEventFrame,
-	type BridgeFrameEnvelope,
-	type BridgeFrameType,
-} from "./protocol";
+	AGENT_WIRE_PROTOCOL_VERSION,
+	type AgentWireEventFrame,
+	type AgentWireEventPayload,
+	type AgentWireEventType,
+	type AgentWireFrameEnvelope,
+	type AgentWireFrameType,
+} from "./event-contract";
 
 function assertNever(value: never): never {
 	throw new Error(`Unhandled AgentSessionEvent variant: ${JSON.stringify(value)}`);
@@ -24,7 +28,7 @@ function assertNever(value: never): never {
  *
  * Exhaustive over the union; adding a variant without a case is a type error.
  */
-export function agentSessionEventType(event: AgentSessionEvent): AgentSessionEventType {
+export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventType {
 	switch (event.type) {
 		case "agent_start":
 		case "agent_end":
@@ -59,7 +63,7 @@ export function agentSessionEventType(event: AgentSessionEvent): AgentSessionEve
  * Per-session monotonic frame builder. One instance per active session; `seq`
  * starts at 1 and increments per frame so clients can order and resume.
  */
-export class BridgeFrameSequencer {
+export class AgentWireFrameSequencer {
 	readonly #sessionId: string;
 	#seq = 0;
 
@@ -78,14 +82,14 @@ export class BridgeFrameSequencer {
 	}
 
 	/** Build the next envelope of the given type with a fresh seq + frame id. */
-	next<TType extends BridgeFrameType, TPayload>(
+	next<TType extends AgentWireFrameType, TPayload>(
 		type: TType,
 		payload: TPayload,
 		correlationId?: string,
-	): BridgeFrameEnvelope<TType, TPayload> {
+	): AgentWireFrameEnvelope<TType, TPayload> {
 		this.#seq += 1;
-		const frame: BridgeFrameEnvelope<TType, TPayload> = {
-			protocol_version: BRIDGE_PROTOCOL_VERSION,
+		const frame: AgentWireFrameEnvelope<TType, TPayload> = {
+			protocol_version: AGENT_WIRE_PROTOCOL_VERSION,
 			session_id: this.#sessionId,
 			seq: this.#seq,
 			frame_id: randomUUID(),
@@ -99,13 +103,28 @@ export class BridgeFrameSequencer {
 	}
 }
 
-/** Serialize a single `AgentSessionEvent` into an `event` wire frame. */
-export function toBridgeEventFrame(event: AgentSessionEvent, sequencer: BridgeFrameSequencer): BridgeEventFrame {
+/** Back-compat alias for {@link AgentWireFrameSequencer}. */
+export const BridgeFrameSequencer = AgentWireFrameSequencer;
+export type BridgeFrameSequencer = AgentWireFrameSequencer;
+
+/** Serialize a single `AgentSessionEvent` into a canonical `event` wire frame. */
+export function toAgentWireEventFrame(
+	event: AgentSessionEvent,
+	sequencer: AgentWireFrameSequencer,
+): AgentWireEventFrame {
 	return sequencer.next("event", {
 		event_type: agentSessionEventType(event),
 		event,
 	});
 }
+
+/** Build the rich event payload (renderer-facing) for an `AgentSessionEvent`. */
+export function toAgentWireEventPayload(event: AgentSessionEvent): AgentWireEventPayload {
+	return { event_type: agentSessionEventType(event), event };
+}
+
+/** Back-compat alias for {@link toAgentWireEventFrame}. */
+export const toBridgeEventFrame = toAgentWireEventFrame;
 
 /**
  * Serialize a `workflow_gate` event into a sequenced wire frame (#321). The
@@ -115,7 +134,7 @@ export function toBridgeEventFrame(event: AgentSessionEvent, sequencer: BridgeFr
  */
 export function toBridgeWorkflowGateFrame(
 	gate: import("../../rpc/rpc-types").RpcWorkflowGate,
-	sequencer: BridgeFrameSequencer,
+	sequencer: AgentWireFrameSequencer,
 ): import("./protocol").BridgeWorkflowGateFrame {
 	return sequencer.next("workflow_gate", gate, gate.gate_id);
 }

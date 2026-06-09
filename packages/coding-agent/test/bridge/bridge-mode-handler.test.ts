@@ -40,7 +40,7 @@ describe("bridge mode fetch handler", () => {
 			new Request("https://bridge.test/v1/handshake", {
 				method: "POST",
 				body: JSON.stringify({
-					protocol_version_range: { min: 1, max: 1 },
+					protocol_version_range: { min: 1, max: 2 },
 					capabilities: ["events"],
 					requested_scopes: ["prompt"],
 				}),
@@ -85,7 +85,7 @@ describe("bridge mode fetch handler", () => {
 				method: "POST",
 				headers: { Authorization: "Bearer secret" },
 				body: JSON.stringify({
-					protocol_version_range: { min: 1, max: 1 },
+					protocol_version_range: { min: 1, max: 2 },
 					capabilities: ["events", "prompt", "host_tools"],
 					requested_scopes: ["prompt"],
 				}),
@@ -188,7 +188,7 @@ describe("bridge mode fetch handler", () => {
 				method: "POST",
 				headers: { Authorization: "Bearer secret" },
 				body: JSON.stringify({
-					protocol_version_range: { min: 1, max: 1 },
+					protocol_version_range: { min: 1, max: 2 },
 					capabilities: ["events", "prompt", "ui.editor", "host_tools", "host_uri"],
 					requested_scopes: ["prompt", "bash"],
 				}),

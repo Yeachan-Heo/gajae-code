@@ -45,7 +45,7 @@ function serverArgs() {
 describe("bridge handshake advertises workflow_gate (#321)", () => {
 	it("accepts the workflow_gate capability + frame type without claiming inactive unattended", () => {
 		const request: BridgeHandshakeRequest = {
-			protocol_version_range: { min: 1, max: 1 },
+			protocol_version_range: { min: 1, max: 2 },
 			capabilities: ["events", "workflow_gate"],
 			requested_scopes: ["prompt"],
 			unattended: decl,
@@ -59,7 +59,7 @@ describe("bridge handshake advertises workflow_gate (#321)", () => {
 
 	it("does not echo the declaration when workflow_gate is not accepted", () => {
 		const request: BridgeHandshakeRequest = {
-			protocol_version_range: { min: 1, max: 1 },
+			protocol_version_range: { min: 1, max: 2 },
 			capabilities: ["events"],
 			requested_scopes: ["prompt"],
 			unattended: decl,
@@ -82,7 +82,7 @@ describe("bridge handshake advertises workflow_gate (#321)", () => {
 		// A handshake request carrying a malformed declaration is rejected by the type guard.
 		expect(
 			isBridgeHandshakeRequest({
-				protocol_version_range: { min: 1, max: 1 },
+				protocol_version_range: { min: 1, max: 2 },
 				capabilities: ["workflow_gate"],
 				requested_scopes: ["prompt"],
 				unattended: { actor: "x" },
@@ -125,7 +125,7 @@ describe("handshake handler advertises workflow_gate over the wire", () => {
 				method: "POST",
 				headers: { Authorization: "Bearer secret" },
 				body: JSON.stringify({
-					protocol_version_range: { min: 1, max: 1 },
+					protocol_version_range: { min: 1, max: 2 },
 					capabilities: ["events", "workflow_gate"],
 					requested_scopes: ["prompt"],
 				}),

@@ -16,7 +16,7 @@ const declaration = {
 
 function request(unattended = declaration): BridgeHandshakeRequest {
 	return {
-		protocol_version_range: { min: 1, max: 1 },
+		protocol_version_range: { min: 1, max: 2 },
 		capabilities: ["events", "workflow_gate"],
 		requested_scopes: ["prompt", "control"],
 		...(unattended ? { unattended } : {}),

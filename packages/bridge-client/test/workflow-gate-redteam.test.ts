@@ -16,7 +16,7 @@ const gate: WorkflowGate = {
 
 function frame(type: string, payload: unknown): BridgeFrame {
 	return {
-		protocol_version: 1,
+		protocol_version: 2,
 		session_id: "sess-1",
 		seq: 1,
 		frame_id: `${type}-1`,

@@ -9,6 +9,7 @@ import type {
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo-write";
+import type { AgentWireEventPayload } from "../shared/agent-wire/event-contract";
 
 interface MessageProgress {
 	textEmitted: boolean;
@@ -145,6 +146,14 @@ export function mapToolKind(toolName: string): ToolKind {
 	}
 }
 
+export function mapAgentWireEventPayloadToAcpSessionUpdates(
+	payload: AgentWireEventPayload,
+	sessionId: string,
+	options: AcpEventMapperOptions = {},
+): SessionNotification[] {
+	return mapAgentSessionEventToAcpSessionUpdates(payload.event, sessionId, options);
+}
+
 export function mapAgentSessionEventToAcpSessionUpdates(
 	event: AgentSessionEvent,
 	sessionId: string,
@@ -221,9 +230,32 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "todo_auto_clear":
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries: [] })];
-		default:
+		// These event types are intentionally not represented as ACP session updates.
+		case "agent_start":
+		case "agent_end":
+		case "turn_start":
+		case "turn_end":
+		case "message_start":
+		case "auto_compaction_start":
+		case "auto_compaction_end":
+		case "auto_retry_start":
+		case "auto_retry_end":
+		case "retry_fallback_applied":
+		case "retry_fallback_succeeded":
+		case "ttsr_triggered":
+		case "irc_message":
+		case "notice":
+		case "thinking_level_changed":
+		case "goal_updated":
 			return [];
+		default:
+			return assertNeverAcp(event);
 	}
+}
+
+function assertNeverAcp(event: never): SessionNotification[] {
+	void (event as AgentSessionEvent);
+	return [];
 }
 
 function mapAssistantMessageUpdate(

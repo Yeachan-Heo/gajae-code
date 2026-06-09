@@ -832,6 +832,21 @@ class ExtensionError:
 
 
 @dataclass(slots=True, frozen=True)
+class RpcEventPayload:
+    event_type: str
+    event: JsonObject
+
+
+@dataclass(slots=True, frozen=True)
+class RpcEventFrame:
+    protocol_version: int
+    session_id: str
+    seq: int
+    frame_id: str
+    payload: RpcEventPayload
+
+
+@dataclass(slots=True, frozen=True)
 class AgentStartEvent:
     type: Literal["agent_start"] = "agent_start"
 
@@ -1373,16 +1388,8 @@ def parse_workflow_gate(payload: JsonObject) -> WorkflowGate:
     )
 
 
-def parse_notification(payload: JsonObject) -> RpcNotification:
+def _parse_session_event(payload: JsonObject) -> RpcNotification:
     event_type = payload.get("type")
-    if event_type == "ready":
-        return ReadyEvent()
-    if event_type == "extension_ui_request":
-        return parse_extension_ui_request(payload)
-    if event_type == "workflow_gate":
-        return parse_workflow_gate(payload)
-    if event_type == "extension_error":
-        return parse_extension_error(payload)
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
@@ -1511,4 +1518,24 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
     if event_type == "todo_auto_clear":
         return TodoAutoClearEvent()
+    return UnknownNotification(payload=_clone_json_object(payload, field="session_event"))
+
+
+def parse_notification(payload: JsonObject) -> RpcNotification:
+    event_type = payload.get("type")
+    if event_type == "event":
+        frame_payload = payload.get("payload")
+        if isinstance(frame_payload, dict):
+            inner_event = frame_payload.get("event")
+            if isinstance(inner_event, dict):
+                return _parse_session_event(_clone_json_object(inner_event, field="event.payload.event"))
+        return UnknownNotification(payload=_clone_json_object(payload, field="notification"))
+    if event_type == "ready":
+        return ReadyEvent()
+    if event_type == "extension_ui_request":
+        return parse_extension_ui_request(payload)
+    if event_type == "workflow_gate":
+        return parse_workflow_gate(payload)
+    if event_type == "extension_error":
+        return parse_extension_error(payload)
     return UnknownNotification(payload=_clone_json_object(payload, field="notification"))

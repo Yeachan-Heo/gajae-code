@@ -21,6 +21,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
+import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../shared/agent-wire/event-envelope";
 import { rpcError as error } from "../shared/agent-wire/responses";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
 import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
@@ -471,9 +472,11 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	// Output all agent events as canonical agent-wire `event` frames (docs/rpc.md):
+	// { type:"event", protocol_version, session_id, seq, frame_id, payload:{ event_type, event } }.
+	const eventSequencer = new AgentWireFrameSequencer(session.sessionId);
 	session.subscribe(event => {
-		output(event);
+		output(toAgentWireEventFrame(event, eventSequencer));
 	});
 
 	// Handle a single command through the shared agent-wire dispatcher so RPC

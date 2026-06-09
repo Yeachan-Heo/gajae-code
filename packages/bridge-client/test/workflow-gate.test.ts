@@ -33,7 +33,7 @@ const gate: WorkflowGate = {
 describe("bridge-client workflow_gate helpers (#322)", () => {
 	it("isWorkflowGateFrame narrows workflow_gate frames", () => {
 		const frame: BridgeFrame = {
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "s",
 			seq: 1,
 			frame_id: "f",
@@ -41,7 +41,7 @@ describe("bridge-client workflow_gate helpers (#322)", () => {
 			payload: gate,
 		};
 		const other: BridgeFrame = {
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "s",
 			seq: 2,
 			frame_id: "g",
@@ -77,7 +77,7 @@ describe("bridge-client workflow_gate helpers (#322)", () => {
 		const captured: Array<{ url: string; body: string | null; headers: Record<string, string> }> = [];
 		const client = fakeClient(captured);
 		await client.handshake({
-			protocol_version_range: { min: 1, max: 1 },
+			protocol_version_range: { min: 1, max: 2 },
 			capabilities: ["events", "workflow_gate"],
 			requested_scopes: ["prompt"],
 			unattended: {
