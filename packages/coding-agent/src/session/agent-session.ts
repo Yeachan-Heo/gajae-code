@@ -6503,7 +6503,7 @@ export class AgentSession {
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings)) {
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, this.model?.maxTokens ?? 0)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {

@@ -203,22 +203,44 @@ export function getLastAssistantUsage(entries: SessionEntry[]): Usage | undefine
 }
 
 /**
- * Effective reserve: at least 15% of context window or the configured floor, whichever is larger.
+ * Effective reserve: the largest of 15% of the context window, the configured floor,
+ * and the model's reserved completion budget (`maxOutputTokens`).
+ *
+ * Reserving `maxOutputTokens` keeps the safe input/prompt-packing budget below the
+ * *total* context window for models whose completion reservation exceeds the 15%
+ * floor (e.g. a 400K-context model with 128K max output reserves 128K, not 60K, so
+ * input is capped near 272K instead of 340K).
  */
-export function effectiveReserveTokens(contextWindow: number, settings: CompactionSettings): number {
-	return Math.max(Math.floor(contextWindow * 0.15), settings.reserveTokens);
+export function effectiveReserveTokens(
+	contextWindow: number,
+	settings: CompactionSettings,
+	maxOutputTokens = 0,
+): number {
+	return Math.max(Math.floor(contextWindow * 0.15), settings.reserveTokens, Math.max(0, maxOutputTokens));
 }
 
 /**
  * Check if compaction should trigger based on context usage.
+ *
+ * `maxOutputTokens` is the model's reserved completion budget; it is excluded from
+ * the safe input budget so prompt + reserved output cannot exceed the total window.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	maxOutputTokens = 0,
+): boolean {
 	if (!settings.enabled || settings.strategy === "off" || contextWindow <= 0) return false;
-	const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
+	const thresholdTokens = resolveThresholdTokens(contextWindow, settings, maxOutputTokens);
 	return contextTokens > thresholdTokens;
 }
 
-export function resolveThresholdTokens(contextWindow: number, settings: CompactionSettings): number {
+export function resolveThresholdTokens(
+	contextWindow: number,
+	settings: CompactionSettings,
+	maxOutputTokens = 0,
+): number {
 	// Fixed token limit takes priority over percentage
 	const thresholdTokens = settings.thresholdTokens;
 	if (typeof thresholdTokens === "number" && Number.isFinite(thresholdTokens) && thresholdTokens > 0) {
@@ -229,7 +251,7 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 	// Percentage-based threshold
 	const thresholdPercent = settings.thresholdPercent;
 	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
-		return contextWindow - effectiveReserveTokens(contextWindow, settings);
+		return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
 	}
 	const clampedThresholdPercent = Math.min(99, Math.max(1, thresholdPercent));
 	return Math.floor(contextWindow * (clampedThresholdPercent / 100));
