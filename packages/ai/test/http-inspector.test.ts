@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../src/utils/http-inspector";
+import {
+	finalizeErrorMessage,
+	formatModelUnavailableGuidance,
+	isModelUnavailableError,
+	type RawHttpRequestDump,
+} from "../src/utils/http-inspector";
 
 let previousAgentDir: string | undefined;
 let previousPiConfigDir: string | undefined;
@@ -99,5 +104,64 @@ describe("HTTP 400 request dump sanitization", () => {
 		expect(saved).not.toContain("synthetic-key");
 		expect(saved).toContain("visible text");
 		expect(saved).toContain("[redacted]");
+	});
+});
+
+describe("HTTP 400 error message safety (issue #438)", () => {
+	function unavailableModelDump(): RawHttpRequestDump {
+		return {
+			provider: "openai",
+			api: "openai-responses",
+			model: "codex-mini-latest",
+			method: "POST",
+			url: "https://api.openai.com/v1/responses",
+			body: { model: "codex-mini-latest" },
+		};
+	}
+
+	it("does not encourage pasting the saved raw request log publicly", async () => {
+		await useTempAgentDir();
+		const error = new Error("400 The requested model 'codex-mini-latest' does not exist.");
+		(error as { status?: number }).status = 400;
+
+		const message = await finalizeErrorMessage(error, unavailableModelDump());
+
+		expect(message).toContain("raw-http-request=");
+		expect(message).toMatch(/do not paste/i);
+		expect(message).toMatch(/public channels/i);
+	});
+
+	it("surfaces model/provider selection guidance for unavailable-model 400s", async () => {
+		await useTempAgentDir();
+		const error = new Error("400 The requested model 'codex-mini-latest' does not exist.");
+		(error as { status?: number }).status = 400;
+
+		const message = await finalizeErrorMessage(error, unavailableModelDump());
+
+		expect(message).toContain("not available");
+		expect(message).toContain("gjc --list-models");
+		expect(message).toContain("gjc setup provider");
+		expect(message).toContain("codex-mini-latest");
+	});
+
+	it("detects unavailable-model errors only for 400 responses", () => {
+		const notFound = new Error("The requested model 'codex-mini-latest' does not exist.");
+		(notFound as { status?: number }).status = 400;
+		expect(isModelUnavailableError(notFound.message, notFound)).toBe(true);
+
+		const serverError = new Error("The requested model 'codex-mini-latest' does not exist.");
+		(serverError as { status?: number }).status = 500;
+		expect(isModelUnavailableError(serverError.message, serverError)).toBe(false);
+
+		const rateLimited = new Error("429 rate limit exceeded");
+		(rateLimited as { status?: number }).status = 400;
+		expect(isModelUnavailableError(rateLimited.message, rateLimited)).toBe(false);
+	});
+
+	it("omits model/provider names from guidance when the dump is absent", () => {
+		const guidance = formatModelUnavailableGuidance(undefined);
+		expect(guidance).toContain("not available");
+		expect(guidance).toContain("gjc --list-models");
+		expect(guidance).not.toContain("''");
 	});
 });

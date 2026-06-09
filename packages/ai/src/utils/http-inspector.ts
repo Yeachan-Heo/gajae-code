@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { extractHttpStatusFromError, getLogsDir } from "@gajae-code/utils";
+import { APP_NAME, extractHttpStatusFromError, getLogsDir } from "@gajae-code/utils";
 import { isCopilotTransientModelError } from "./retry.js";
 import { formatErrorMessageWithRetryAfter } from "./retry-after.js";
 
@@ -26,6 +26,46 @@ type ErrorWithStatus = {
 
 const SENSITIVE_HEADERS = ["authorization", "x-api-key", "api-key", "cookie", "set-cookie", "proxy-authorization"];
 
+/**
+ * Privacy note appended next to a saved raw HTTP request dump. The dump is
+ * sanitized (secrets/thinking redacted) but can still contain prompt content
+ * and request metadata, so we explicitly discourage pasting it into public
+ * channels (issue #438).
+ */
+const RAW_HTTP_REQUEST_PRIVACY_NOTE =
+	"note: this local file is for your own debugging and may contain prompt content or request metadata — review it before sharing and do not paste its contents into public channels (issues, Discord, etc.).";
+
+/**
+ * Patterns that indicate the configured model is unavailable on the provider
+ * (e.g. OpenAI's "The requested model '...' does not exist."). Used to surface
+ * actionable model/provider guidance instead of only a raw 400 + log path.
+ */
+const MODEL_UNAVAILABLE_PATTERNS: readonly RegExp[] = [
+	/\bmodel\b[^\n]*\bdoes not exist\b/i,
+	/\bdoes not exist\b[^\n]*\bmodel\b/i,
+	/\bmodel\b[^\n]*\b(not found|unavailable|not supported|no access|does not have access)\b/i,
+	/\b(unknown|unsupported|invalid)\s+model\b/i,
+];
+
+/** Whether `message` (from a 400 response) signals an unavailable/unknown model. */
+export function isModelUnavailableError(message: string, error: unknown): boolean {
+	if (extractHttpStatusFromError(error) !== 400) return false;
+	return MODEL_UNAVAILABLE_PATTERNS.some(pattern => pattern.test(message));
+}
+
+/** Actionable guidance for selecting an available model/provider. */
+export function formatModelUnavailableGuidance(dump: RawHttpRequestDump | undefined): string {
+	const modelPart = dump?.model ? ` '${dump.model}'` : "";
+	const providerPart = dump?.provider ? ` on provider '${dump.provider}'` : "";
+	return [
+		`The configured model${modelPart}${providerPart} is not available on this account/provider.`,
+		"Pick an available model before retrying:",
+		`  • List available models:  ${APP_NAME} --list-models`,
+		`  • Run with a model:        ${APP_NAME} --model <model>`,
+		`  • Configure a provider:    ${APP_NAME} setup provider`,
+	].join("\n");
+}
+
 export async function appendRawHttpRequestDumpFor400(
 	message: string,
 	error: unknown,
@@ -41,7 +81,7 @@ export async function appendRawHttpRequestDumpFor400(
 
 	try {
 		await Bun.write(filePath, `${JSON.stringify(sanitizedDump, null, 2)}\n`);
-		return `${message}\nraw-http-request=${filePath}`;
+		return `${message}\nraw-http-request=${filePath}\n${RAW_HTTP_REQUEST_PRIVACY_NOTE}`;
 	} catch (writeError) {
 		const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
 		return `${message}\nraw-http-request-save-failed=${writeMessage}`;
@@ -61,6 +101,9 @@ export async function finalizeErrorMessage(
 		} else if (!message.includes(capturedMessage)) {
 			message = `${message}\n${capturedMessage}`;
 		}
+	}
+	if (isModelUnavailableError(message, error)) {
+		message = `${message}\n\n${formatModelUnavailableGuidance(rawRequestDump)}`;
 	}
 	return appendRawHttpRequestDumpFor400(message, error, rawRequestDump);
 }
