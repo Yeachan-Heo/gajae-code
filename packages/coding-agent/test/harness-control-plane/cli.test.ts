@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -19,7 +20,7 @@ let cliEnv: HarnessCliEnv;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-cli-root-"));
-	workspace = await mkdtemp(path.join(tmpdir(), "harness-cli-ws-"));
+	workspace = realpathSync(await mkdtemp(path.join(tmpdir(), "harness-cli-ws-")));
 	cliEnv = createHarnessCliEnv(repoRoot);
 });
 
