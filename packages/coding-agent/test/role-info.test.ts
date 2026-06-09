@@ -12,14 +12,12 @@ describe("getRoleInfo", () => {
 			tag: "DEFAULT",
 		});
 		expect(getRoleInfo("smol", settings)).toEqual({
-			name: "Fast",
-			color: "warning",
-			tag: "SMOL",
+			name: "smol",
+			color: "muted",
 		});
 		expect(getRoleInfo("slow", settings)).toEqual({
-			name: "Thinking",
-			color: "accent",
-			tag: "SLOW",
+			name: "slow",
+			color: "muted",
 		});
 	});
 
@@ -53,14 +51,14 @@ describe("getRoleInfo", () => {
 	test("configured metadata overrides built-in role info while keeping built-in defaults", () => {
 		const settings = Settings.isolated({
 			modelTags: {
-				smol: { name: "My Smol", color: "success" },
+				default: { name: "My Default", color: "error" },
 			},
 		});
 
-		expect(getRoleInfo("smol", settings)).toEqual({
-			tag: "SMOL",
-			name: "My Smol",
-			color: "success",
+		expect(getRoleInfo("default", settings)).toEqual({
+			tag: "DEFAULT",
+			name: "My Default",
+			color: "error",
 		});
 	});
 });

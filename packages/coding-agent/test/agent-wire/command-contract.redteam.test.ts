@@ -1,6 +1,6 @@
+import { describe, expect, it } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
-import { describe, expect, it } from "bun:test";
 import {
 	dispatchRpcCommand,
 	isRpcCommandType,
@@ -67,7 +67,8 @@ describe("agent-wire command contract red-team", () => {
 		const harnessFiles = sourceFiles(HARNESS_CONTROL_PLANE_DIR);
 		expect(harnessFiles).toContain(join(HARNESS_CONTROL_PLANE_DIR, "owner.ts"));
 
-		const importPattern = /from\s+["'](?:\.\/frame-mapper|.*harness-control-plane\/frame-mapper)["']|import\s*\(["'](?:\.\/frame-mapper|.*harness-control-plane\/frame-mapper)["']\)/;
+		const importPattern =
+			/from\s+["'](?:\.\/frame-mapper|.*harness-control-plane\/frame-mapper)["']|import\s*\(["'](?:\.\/frame-mapper|.*harness-control-plane\/frame-mapper)["']\)/;
 		const offenders = sourceFiles(SRC_ROOT)
 			.filter(path => importPattern.test(readFileSync(path, "utf8")))
 			.map(repoRelative);

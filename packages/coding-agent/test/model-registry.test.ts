@@ -1880,44 +1880,44 @@ describe("ModelRegistry", () => {
 		test("discovers ollama models at runtime and treats auth:none providers as available", async () => {
 			const _restoreOllamaKey = unsetEnvForTest("OLLAMA_API_KEY");
 			try {
-			writeRawModelsJson({
-				ollama: {
-					baseUrl: "http://127.0.0.1:11434/v1",
-					api: "openai-completions",
-					auth: "none",
-					discovery: { type: "ollama" },
-				},
-			});
+				writeRawModelsJson({
+					ollama: {
+						baseUrl: "http://127.0.0.1:11434/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "ollama" },
+					},
+				});
 
-			using _hook = hookFetch(input => {
-				const url = String(input);
-				if (url === "http://127.0.0.1:11434/api/tags") {
-					return new Response(
-						JSON.stringify({
-							models: [{ name: "qwen2.5-coder:7b" }, { model: "llama3.2:3b", name: "llama3.2:3b" }],
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
-				}
-				if (url === "http://127.0.0.1:11434/api/show") {
-					return new Response(JSON.stringify({ capabilities: ["completion"] }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-				throw new Error(`Unexpected URL: ${url}`);
-			});
+				using _hook = hookFetch(input => {
+					const url = String(input);
+					if (url === "http://127.0.0.1:11434/api/tags") {
+						return new Response(
+							JSON.stringify({
+								models: [{ name: "qwen2.5-coder:7b" }, { model: "llama3.2:3b", name: "llama3.2:3b" }],
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } },
+						);
+					}
+					if (url === "http://127.0.0.1:11434/api/show") {
+						return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					throw new Error(`Unexpected URL: ${url}`);
+				});
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh();
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
 
-			const ollamaModels = getModelsForProvider(registry, "ollama");
-			expect(ollamaModels.some(m => m.id === "qwen2.5-coder:7b")).toBe(true);
-			expect(ollamaModels.some(m => m.id === "llama3.2:3b")).toBe(true);
+				const ollamaModels = getModelsForProvider(registry, "ollama");
+				expect(ollamaModels.some(m => m.id === "qwen2.5-coder:7b")).toBe(true);
+				expect(ollamaModels.some(m => m.id === "llama3.2:3b")).toBe(true);
 
-			const available = registry.getAvailable().filter(m => m.provider === "ollama");
-			expect(available.length).toBe(2);
-			expect(await registry.getApiKey(available[0])).toBe(kNoAuth);
+				const available = registry.getAvailable().filter(m => m.provider === "ollama");
+				expect(available.length).toBe(2);
+				expect(await registry.getApiKey(available[0])).toBe(kNoAuth);
 			} finally {
 				_restoreOllamaKey();
 			}

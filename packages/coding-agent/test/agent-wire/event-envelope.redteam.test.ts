@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES, AGENT_WIRE_PROTOCOL_VERSION } from "../../src/modes/shared/agent-wire/event-contract";
 import {
-	agentSessionEventType,
 	AgentWireFrameSequencer,
+	agentSessionEventType,
 	BridgeFrameSequencer,
 	toAgentWireEventFrame,
 	toBridgeEventFrame,
