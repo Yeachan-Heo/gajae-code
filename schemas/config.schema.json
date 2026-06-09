@@ -527,6 +527,15 @@
 			"description": "When steering messages interrupt tool execution",
 			"default": "immediate"
 		},
+		"busyPromptMode": {
+			"type": "string",
+			"enum": [
+				"steer",
+				"queue"
+			],
+			"description": "What a submitted prompt does while the agent is busy: steer (interrupt the active turn) or queue (run after the active turn completes)",
+			"default": "steer"
+		},
 		"doubleEscapeAction": {
 			"type": "string",
 			"enum": [

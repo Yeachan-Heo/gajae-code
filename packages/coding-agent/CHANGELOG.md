@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `busyPromptMode` setting (`steer` | `queue`, default `steer`) so a prompt submitted while the agent is busy can either steer the active turn or be queued to run after it completes, keeping steering and queued-next-turn semantics distinct. Ctrl+Enter still always queues as a follow-up (#434).
 ### Fixed
 
 - Fixed a persistent `monitor` notification flood where a cancelled or evicted monitor kept delivering queued `task-notification` follow-ups (surviving process death, log deletion, and `job cancel` returning not-found). Monitors now purge their queued notifications on cancel/terminal/eviction, retain a short tombstone so post-eviction `job cancel` still purges, coalesce rapid duplicate output to the latest state, and close a cancel/trailing-flush race.
