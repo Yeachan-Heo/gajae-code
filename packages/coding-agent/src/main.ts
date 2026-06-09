@@ -53,6 +53,11 @@ import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 
+async function printOfflineHelp(): Promise<void> {
+	const { printHelp } = await import("./cli/help");
+	printHelp();
+}
+
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	if (!settings.get("startup.checkUpdate")) {
 		return;
@@ -715,13 +720,21 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
+	const parsedArgs = parsed;
+	if (parsedArgs.help) {
+		await printOfflineHelp();
+		return;
+	}
+	if (parsedArgs.version) {
+		process.stdout.write(`${VERSION}\n`);
+		return;
+	}
+
 	logger.startTiming();
 
 	// Initialize theme early with defaults (CLI commands need symbols)
 	// Will be re-initialized with user preferences later
 	await logger.time("initTheme:initial", initTheme);
-
-	const parsedArgs = parsed;
 	await logger.time("maybeAutoChdir", maybeAutoChdir, parsedArgs);
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
@@ -729,12 +742,6 @@ export async function runRootCommand(
 	// Create AuthStorage and ModelRegistry upfront
 	const authStorage = await logger.time("discoverModels", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = new ModelRegistry(authStorage);
-
-	if (parsedArgs.version) {
-		process.stdout.write(`${VERSION}\n`);
-		process.exit(0);
-	}
-
 	if (parsedArgs.listModels !== undefined) {
 		await modelRegistry.refresh("online");
 		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;

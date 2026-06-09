@@ -19,6 +19,7 @@ procmgr.scrubProcessEnv();
  * lightweight CLI runner from pi-utils.
  */
 import { type CliConfig, type CommandEntry, run } from "@gajae-code/utils/cli";
+import { printHelp } from "./cli/help";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -107,15 +108,16 @@ export async function runCli(argv: string[]): Promise<void> {
 		await runSmokeTest();
 		return;
 	}
-	// --help and --version are handled by run() directly, don't rewrite those.
+	// Keep root help fully local/offline: do not load command modules, settings,
+	// model registries, or provider code before help can guide first-run users.
+	if (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+		printHelp();
+		return;
+	}
+	// --version is handled by run() directly, don't rewrite it.
 	// Everything else that isn't a known subcommand routes to "launch".
 	const first = argv[0];
-	const runArgv =
-		first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
-			? argv
-			: isSubcommand(first)
-				? argv
-				: ["launch", ...argv];
+	const runArgv = first === "--version" || first === "-v" ? argv : isSubcommand(first) ? argv : ["launch", ...argv];
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 

@@ -44,6 +44,12 @@ describe("CLI help load order", () => {
 		await fs.mkdir(home, { recursive: true });
 		await fs.mkdir(xdg, { recursive: true });
 		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			["modelRoles:", "  default: openai/codex-mini-latest", "modelProfile:", "  default: codex-standard", ""].join(
+				"\n",
+			),
+		);
 
 		const proc = Bun.spawn([process.execPath, cliEntry, "--help"], {
 			cwd: repoRoot,
@@ -55,17 +61,23 @@ describe("CLI help load order", () => {
 				XDG_CONFIG_HOME: xdg,
 				XDG_DATA_HOME: xdg,
 				PI_CODING_AGENT_DIR: agentDir,
+				GJC_CODING_AGENT_DIR: agentDir,
+				OPENAI_API_KEY: "sk-unavailable-model-sentinel",
 				PI_NO_TITLE: "1",
 				NO_COLOR: "1",
 			},
 		});
 
-		const [, , exitCode] = await Promise.all([
+		const [stdout, stderr, exitCode] = await Promise.all([
 			readStream(proc.stdout as ReadableStream<Uint8Array>),
 			readStream(proc.stderr as ReadableStream<Uint8Array>),
 			proc.exited,
 		]);
 
 		expect(exitCode).toBe(0);
+		expect(stdout).toContain("Useful Commands:");
+		expect(stdout).toContain("gjc --help");
+		expect(stderr).not.toContain("codex-mini-latest");
+		expect(stderr).not.toContain("raw-http-request");
 	}, 15_000);
 });

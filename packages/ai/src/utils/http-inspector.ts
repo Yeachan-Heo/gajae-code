@@ -41,10 +41,10 @@ export async function appendRawHttpRequestDumpFor400(
 
 	try {
 		await Bun.write(filePath, `${JSON.stringify(sanitizedDump, null, 2)}\n`);
-		return `${message}\nraw-http-request=${filePath}`;
+		return `${message}\nHTTP 400 request diagnostics were saved locally at ${filePath}. Review the file before sharing it; do not paste raw request logs publicly.`;
 	} catch (writeError) {
 		const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
-		return `${message}\nraw-http-request-save-failed=${writeMessage}`;
+		return `${message}\nHTTP 400 request diagnostics could not be saved locally: ${writeMessage}`;
 	}
 }
 
@@ -62,6 +62,7 @@ export async function finalizeErrorMessage(
 			message = `${message}\n${capturedMessage}`;
 		}
 	}
+	message = appendUnavailableModelGuidance(message, error, rawRequestDump, capturedErrorResponse);
 	return appendRawHttpRequestDumpFor400(message, error, rawRequestDump);
 }
 
@@ -96,6 +97,65 @@ export function rewriteCopilotError(errorMessage: string, error: unknown, provid
 		return `GitHub Copilot rejected this model (HTTP 400 model_not_supported) after retries. This is a known intermittent rollout gap for preview models on OAuth clients other than VS Code. Try again in a few seconds, switch to a GA model (gpt-5-mini, gpt-5.2), or run this model from VS Code.`;
 	}
 	return errorMessage;
+}
+
+function appendUnavailableModelGuidance(
+	message: string,
+	error: unknown,
+	dump: RawHttpRequestDump | undefined,
+	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
+): string {
+	if (extractHttpStatusFromError(error) !== 400 || !isUnavailableModelError(message, error, capturedErrorResponse)) {
+		return message;
+	}
+	if (message.includes("gjc --list-models") || message.includes("gjc setup provider")) {
+		return message;
+	}
+
+	const selectedModel = dump?.model ? ` "${dump.model}"` : "";
+	const selectedProvider = dump?.provider ? ` on provider "${dump.provider}"` : "";
+	return [
+		message,
+		`The configured model${selectedModel}${selectedProvider} appears unavailable for this account or endpoint. Run gjc --list-models to see configured models, start with an explicit available model via gjc --model <provider/model>, or run gjc setup provider to configure a provider before retrying.`,
+	].join("\n");
+}
+
+function isUnavailableModelError(
+	message: string,
+	error: unknown,
+	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
+): boolean {
+	const combined = [
+		message,
+		formatCapturedHttpError(capturedErrorResponse),
+		errorCode(error),
+		capturedErrorCode(capturedErrorResponse),
+	]
+		.filter((part): part is string => typeof part === "string" && part.length > 0)
+		.join("\n");
+	return (
+		/\bmodel(?:s)?[_ -]?(?:not[_ -]?(?:found|supported)|unsupported)\b/i.test(combined) ||
+		/\brequested model\b[\s\S]{0,120}\b(?:does not exist|not available|not supported|unavailable|access)\b/i.test(
+			combined,
+		) ||
+		/\b(?:does not exist|not available|not supported|unavailable)\b[\s\S]{0,120}\bmodel\b/i.test(combined)
+	);
+}
+
+function errorCode(error: unknown): string | undefined {
+	if (!isObject(error)) return undefined;
+	const direct = getStringProperty(error, "code");
+	if (direct) return direct;
+	const nested = getObjectProperty(error, "error");
+	return nested ? getStringProperty(nested, "code") : undefined;
+}
+
+function capturedErrorCode(captured: CapturedHttpErrorResponse | undefined): string | undefined {
+	if (!captured) return undefined;
+	const payload = parseCapturedErrorPayload(captured);
+	if (!payload) return undefined;
+	const nested = getObjectProperty(payload, "error");
+	return (nested ? getStringProperty(nested, "code") : undefined) ?? getStringProperty(payload, "code");
 }
 
 function sanitizeDump(dump: RawHttpRequestDump): RawHttpRequestDump {

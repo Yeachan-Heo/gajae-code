@@ -89,7 +89,7 @@ describe("HTTP 400 request dump sanitization", () => {
 		(error as { status?: number }).status = 400;
 
 		const message = await finalizeErrorMessage(error, dump);
-		const match = /raw-http-request=(.+)$/m.exec(message);
+		const match = /HTTP 400 request diagnostics were saved locally at (.+?)\. Review/m.exec(message);
 		expect(match?.[1]).toBeDefined();
 		const saved = await fs.readFile(match?.[1] ?? "", "utf-8");
 
@@ -99,5 +99,30 @@ describe("HTTP 400 request dump sanitization", () => {
 		expect(saved).not.toContain("synthetic-key");
 		expect(saved).toContain("visible text");
 		expect(saved).toContain("[redacted]");
+	});
+
+	it("adds unavailable-model setup guidance without raw request paste hints", async () => {
+		await useTempAgentDir();
+		const dump: RawHttpRequestDump = {
+			provider: "openai",
+			api: "openai-responses",
+			model: "codex-mini-latest",
+			method: "POST",
+			url: "https://api.openai.com/v1/responses",
+			body: { model: "codex-mini-latest" },
+		};
+		const error = new Error("400 The requested model 'codex-mini-latest' does not exist.");
+		(error as { status?: number; code?: string }).status = 400;
+		(error as { status?: number; code?: string }).code = "model_not_found";
+
+		const message = await finalizeErrorMessage(error, dump);
+
+		expect(message).toContain("gjc --list-models");
+		expect(message).toContain("gjc --model <provider/model>");
+		expect(message).toContain("gjc setup provider");
+		expect(message).toContain("do not paste raw request logs publicly");
+		expect(message).toContain("codex-mini-latest");
+		expect(message).not.toContain("raw-http-request=");
+		expect(message).not.toContain("http-400-requests/*.json");
 	});
 });
