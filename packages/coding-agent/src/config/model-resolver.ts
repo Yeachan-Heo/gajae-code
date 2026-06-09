@@ -246,6 +246,15 @@ function pickPreferredModel(candidates: Model<Api>[], context: ModelPreferenceCo
 			return (aProviderUsage ?? Number.POSITIVE_INFINITY) - (bProviderUsage ?? Number.POSITIVE_INFINITY);
 		}
 
+		// Prefer vision-capable variants over configured provider/registration order
+		// so an ambiguous id never resolves to a text-only namesake when a
+		// vision-capable variant of the same id is available.
+		const aVision = a.input.includes("image") ? 0 : 1;
+		const bVision = b.input.includes("image") ? 0 : 1;
+		if (aVision !== bVision) {
+			return aVision - bVision;
+		}
+
 		const aDeprioritized = context.deprioritizedProviders.has(a.provider);
 		const bDeprioritized = context.deprioritizedProviders.has(b.provider);
 		if (aDeprioritized !== bDeprioritized) {
