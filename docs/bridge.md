@@ -102,7 +102,7 @@ and requested scopes. Version mismatch returns `status: "rejected"`,
 In the default fail-closed configuration, a successful authenticated
 handshake returns:
 
-- `protocol_version` — the server protocol version (`BRIDGE_PROTOCOL_VERSION`, `1`).
+- `protocol_version` — the server protocol version (`BRIDGE_PROTOCOL_VERSION`, `2`).
 - `session_id` — the single session id this bridge serves.
 - `accepted_capabilities` — empty.
 - `accepted_scopes` — empty.

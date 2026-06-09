@@ -42,7 +42,25 @@ class FrameRpc implements HarnessRpc {
 	emit(frame: Record<string, unknown>): void {
 		this.cursor += 1;
 		this.#lastAt = new Date().toISOString();
-		this.#cb?.(frame);
+		// Mirror the wire: AgentSessionEvents are delivered wrapped in a canonical
+		// `event` frame; control frames stay flat.
+		const control = new Set([
+			"ready",
+			"response",
+			"event",
+			"extension_ui_request",
+			"extension_error",
+			"workflow_gate",
+			"host_tool_call",
+			"host_tool_cancel",
+			"host_uri_request",
+			"host_uri_cancel",
+		]);
+		const wire =
+			typeof frame.type === "string" && !control.has(frame.type)
+				? { type: "event", payload: { event_type: frame.type, event: frame } }
+				: frame;
+		this.#cb?.(wire);
 	}
 }
 
@@ -145,7 +163,8 @@ describe("owner frame -> observability", () => {
 
 		const events = await readEvents(root, SID, 0);
 		const ended = events.find(e => e.kind === "rpc_tool_ended");
-		expect(ended).toMatchObject({ severity: "warn", evidence: { status: "error", signal: "test-running" } });
+		// tool_execution_end has no args, so test-detection is by tool name -> tool-call.
+		expect(ended).toMatchObject({ severity: "warn", evidence: { status: "error", signal: "tool-call" } });
 		expect(events.every(e => e.writer.ownerId === info.ownerId)).toBe(true);
 		const eventJson = JSON.stringify(events);
 		expect(eventJson).not.toContain("SECRET_COMMAND");

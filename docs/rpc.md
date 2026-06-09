@@ -33,13 +33,13 @@ Behavior notes:
 
 Each frame is a single JSON object followed by `\n`.
 
-There is no envelope beyond the object shape itself.
+Agent session events are wrapped in canonical `event` frames. Ready, response, workflow gate, extension UI/error, host tool, and host URI frames remain flat.
 
 ### Outbound frame categories (stdout)
 
 1. Ready frame (`{ type: "ready" }`)
 2. `RpcResponse` (`{ type: "response", ... }`)
-3. `AgentSessionEvent` objects (`agent_start`, `message_update`, etc.)
+3. Canonical event frames wrapping `AgentSessionEvent` objects (`{ type: "event", ... }`)
 4. `RpcWorkflowGateEvent` (`{ type: "workflow_gate", ... }`)
 5. `RpcExtensionUIRequest` (`{ type: "extension_ui_request", ... }`)
 6. Host tool requests/cancellations (`host_tool_call`, `host_tool_cancel`)
@@ -287,9 +287,25 @@ previous set — schemes missing from the new list are unregistered.
 
 ## Event Stream Schema
 
-RPC mode forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
+RPC mode forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)` as canonical `event` frames:
 
-Common event types:
+```json
+{
+  "type": "event",
+  "protocol_version": 2,
+  "session_id": "...",
+  "seq": 1,
+  "frame_id": "...",
+  "payload": {
+    "event_type": "agent_start",
+    "event": { "type": "agent_start" }
+  }
+}
+```
+
+`seq` is monotonic per session starting at `1`. `payload.event_type` duplicates the inner event `type` for routing, and `payload.event` contains the original `AgentSessionEvent` fields.
+
+Common inner event types:
 
 - `agent_start`, `agent_end`
 - `turn_start`, `turn_end`
@@ -301,7 +317,11 @@ Common event types:
 - `todo_reminder`
 - `todo_auto_clear`
 
-Extension runner errors are emitted separately as:
+Non-event stdout categories remain flat: `ready`, `response`, `workflow_gate`, `extension_ui_request`, `extension_error`, `host_tool_call`, `host_tool_cancel`, `host_uri_request`, and `host_uri_cancel`.
+
+`message_update` includes streaming deltas in the inner event's `assistantMessageEvent` (text/thinking/toolcall deltas).
+
+Extension runner errors are emitted separately as flat frames:
 
 ```json
 {
@@ -311,8 +331,6 @@ Extension runner errors are emitted separately as:
   "error": "..."
 }
 ```
-
-`message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
 
 ## Prompt/Queue Concurrency and Ordering
 

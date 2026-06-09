@@ -150,6 +150,18 @@ function isRpcWorkflowGate(value: unknown): value is RpcWorkflowGate {
 	);
 }
 
+/**
+ * Unwrap a canonical agent-wire `event` frame `{ type:"event", payload:{ event_type, event } }`
+ * to its inner `AgentSessionEvent`. Returns null for any frame that is not a
+ * canonical event frame (session events are only delivered wrapped).
+ */
+function unwrapAgentWireEventFrame(value: unknown): unknown {
+	if (isRecord(value) && value.type === "event" && isRecord(value.payload)) {
+		return value.payload.event;
+	}
+	return null;
+}
+
 function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): AgentToolResult<TDetails> {
 	if (typeof result === "string") {
 		return {
@@ -763,11 +775,12 @@ export class RpcClient {
 			return;
 		}
 
-		if (!isAgentEvent(data)) return;
+		// Canonical agent-wire event frame: { type:"event", payload:{ event_type, event } }.
+		const event = unwrapAgentWireEventFrame(data);
+		if (!isAgentEvent(event)) return;
 
-		// Otherwise it's an event
 		for (const listener of this.#eventListeners) {
-			listener(data);
+			listener(event);
 		}
 	}
 

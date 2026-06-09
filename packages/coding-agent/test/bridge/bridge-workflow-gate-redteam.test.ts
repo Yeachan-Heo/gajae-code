@@ -27,7 +27,7 @@ const decl = {
 
 function request(overrides: Partial<BridgeHandshakeRequest> = {}): BridgeHandshakeRequest {
 	return {
-		protocol_version_range: { min: 1, max: 1 },
+		protocol_version_range: { min: 1, max: 2 },
 		capabilities: ["events", "workflow_gate"],
 		requested_scopes: ["prompt"],
 		...overrides,
@@ -118,7 +118,7 @@ describe("workflow_gate red-team negotiation", () => {
 
 	it("still rejects incompatible protocol versions", () => {
 		const res = negotiateBridgeHandshake(
-			request({ protocol_version_range: { min: 2, max: 2 }, unattended: decl }),
+			request({ protocol_version_range: { min: 3, max: 3 }, unattended: decl }),
 			server(),
 		) as BridgeHandshakeRejected;
 		expect(res.status).toBe("rejected");

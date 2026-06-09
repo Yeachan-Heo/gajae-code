@@ -5,7 +5,7 @@ describe("reference bridge consumer", () => {
 	it("renders event, permission, and response frames as semantic HTML", () => {
 		const consumer = new ReferenceBridgeConsumer();
 		consumer.consume({
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "sess-1",
 			seq: 1,
 			frame_id: "frame-1",
@@ -13,7 +13,7 @@ describe("reference bridge consumer", () => {
 			payload: { event_type: "message_update", event: { type: "message_update" } },
 		});
 		consumer.consume({
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "sess-1",
 			seq: 2,
 			frame_id: "frame-2",
@@ -22,7 +22,7 @@ describe("reference bridge consumer", () => {
 			payload: { kind: "permission", toolCall: { toolName: "bash" } },
 		});
 		consumer.consume({
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "sess-1",
 			seq: 3,
 			frame_id: "frame-3",
@@ -38,7 +38,7 @@ describe("reference bridge consumer", () => {
 
 	it("escapes payload summaries", () => {
 		const rendered = renderBridgeFrame({
-			protocol_version: 1,
+			protocol_version: 2,
 			session_id: "sess-1",
 			seq: 1,
 			frame_id: "frame-1",

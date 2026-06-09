@@ -14,10 +14,10 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { observeRpcOutboundFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
 import { ControlServer, type EndpointRequest } from "./control-endpoint";
 import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
-import { mapRpcFrame } from "./frame-mapper";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
 import {
@@ -174,7 +174,7 @@ export class RuntimeOwner {
 
 	/** Map an RPC frame and route it: semantic/signal-bearing -> serial emit; high-frequency progress -> coalesce. */
 	#handleFrame(frame: Record<string, unknown>): void {
-		const mapped = mapRpcFrame(frame);
+		const mapped = observeRpcOutboundFrame(frame);
 		if (!mapped) return;
 		if (mapped.semantic || (mapped.signal && !mapped.coalesceKey)) {
 			this.#framePump = this.#framePump
@@ -199,7 +199,7 @@ export class RuntimeOwner {
 		await this.#emit("info", "rpc_activity", { coalescedFrames });
 	}
 
-	async #emitMapped(mapped: NonNullable<ReturnType<typeof mapRpcFrame>>): Promise<void> {
+	async #emitMapped(mapped: NonNullable<ReturnType<typeof observeRpcOutboundFrame>>): Promise<void> {
 		await this.#emit(
 			mapped.severity,
 			mapped.kind,

@@ -174,7 +174,13 @@ export class GajaeCodeRpc implements HarnessRpc {
 		// Any other frame is a session/agent event: advance the cursor.
 		this.#cursor += 1;
 		this.#lastFrameAt = new Date().toISOString();
-		if (type === "agent_start") {
+		// Session events arrive as canonical `event` frames: the agent event type
+		// lives in `payload.event_type`. Non-event frames keep their flat `type`.
+		const effectiveType =
+			type === "event" && frame.payload && typeof frame.payload === "object"
+				? (frame.payload as { event_type?: unknown }).event_type
+				: type;
+		if (effectiveType === "agent_start") {
 			const cursor = this.#cursor;
 			this.#agentStartCursors.push(cursor);
 			this.#waiters = this.#waiters.filter(w => {

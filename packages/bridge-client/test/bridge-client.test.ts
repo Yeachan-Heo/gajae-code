@@ -20,7 +20,7 @@ describe("BridgeClient", () => {
 		});
 
 		const response = await client.handshake({
-			protocol_version_range: { min: 1, max: 1 },
+			protocol_version_range: { min: 1, max: 2 },
 			capabilities: ["events", "prompt"],
 			requested_scopes: ["prompt"],
 		});
@@ -115,7 +115,7 @@ describe("BridgeClient", () => {
 						start(controller) {
 							controller.enqueue(
 								new TextEncoder().encode(
-									'data: {"protocol_version":1,"session_id":"sess-1","seq":1,"frame_id":"frame-1","type":"event","payload":{"event_type":"agent_start"}}\r\n\r\n',
+									'data: {"protocol_version":2,"session_id":"sess-1","seq":1,"frame_id":"frame-1","type":"event","payload":{"event_type":"agent_start"}}\r\n\r\n',
 								),
 							);
 							controller.close();

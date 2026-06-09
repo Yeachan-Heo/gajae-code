@@ -4,11 +4,16 @@ import unittest
 
 from gjc_rpc import (
     AgentEndEvent,
+    AgentStartEvent,
+    AutoCompactionStartEvent,
     ExtensionUiRequest,
     SessionState,
+    ToolExecutionStartEvent,
+    UnknownNotification,
     WorkflowGate,
     WorkflowGateEvent,
     TodoReminderEvent,
+    TurnStartEvent,
     assistant_text,
     assistant_text_with_thinking,
     parse_notification,
@@ -16,6 +21,7 @@ from gjc_rpc import (
     parse_workflow_gate,
     parse_workflow_gate_event,
 )
+
 
 
 class ProtocolParsingTests(unittest.TestCase):
@@ -90,35 +96,185 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.system_prompt, ("You are useful.",))
         self.assertEqual(state.dump_tools[0].name, "read")
 
-    def test_parse_agent_end_notification(self) -> None:
+    def test_parse_wrapped_agent_start_notification(self) -> None:
         notification = parse_notification(
             {
-                "type": "agent_end",
-                "messages": [
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 1,
+                "frame_id": "f",
+                "payload": {"event_type": "agent_start", "event": {"type": "agent_start"}},
+            }
+        )
+
+        self.assertIsInstance(notification, AgentStartEvent)
+
+    def test_parse_wrapped_tool_execution_start_notification(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 1,
+                "frame_id": "f",
+                "payload": {
+                    "event_type": "tool_execution_start",
+                    "event": {
+                        "type": "tool_execution_start",
+                        "toolCallId": "tool-1",
+                        "toolName": "read",
+                        "args": {"path": "README.md"},
+                    },
+                },
+            }
+        )
+
+        self.assertIsInstance(notification, ToolExecutionStartEvent)
+        self.assertEqual(notification.tool_call_id, "tool-1")
+        self.assertEqual(notification.tool_name, "read")
+
+    def test_parse_wrapped_event_notifications_for_multiple_event_types(self) -> None:
+        cases = [
+            ("agent_start", {"type": "agent_start"}, AgentStartEvent),
+            ("turn_start", {"type": "turn_start"}, TurnStartEvent),
+            (
+                "auto_compaction_start",
+                {"type": "auto_compaction_start", "reason": "threshold", "action": "context-full"},
+                AutoCompactionStartEvent,
+            ),
+            (
+                "tool_execution_start",
+                {"type": "tool_execution_start", "toolCallId": "tool-2", "toolName": "bash", "args": {}},
+                ToolExecutionStartEvent,
+            ),
+        ]
+
+        for index, (event_type, event, expected_type) in enumerate(cases, start=1):
+            with self.subTest(event_type=event_type):
+                notification = parse_notification(
                     {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "hello"}],
-                        "api": "anthropic-messages",
-                        "provider": "anthropic",
-                        "model": "claude-sonnet-4-5",
-                        "usage": {
-                            "input": 1,
-                            "output": 1,
-                            "cacheRead": 0,
-                            "cacheWrite": 0,
-                            "totalTokens": 2,
-                            "cost": {
-                                "input": 0.0,
-                                "output": 0.0,
-                                "cacheRead": 0.0,
-                                "cacheWrite": 0.0,
-                                "total": 0.0,
-                            },
-                        },
-                        "stopReason": "stop",
-                        "timestamp": 1,
+                        "type": "event",
+                        "protocol_version": 2,
+                        "session_id": "s",
+                        "seq": index,
+                        "frame_id": f"f-{index}",
+                        "payload": {"event_type": event_type, "event": event},
                     }
-                ],
+                )
+
+                self.assertIsInstance(notification, expected_type)
+
+    def test_parse_wrapped_unknown_inner_event_type_as_unknown(self) -> None:
+        payload = {
+            "type": "event",
+            "protocol_version": 2,
+            "session_id": "s",
+            "seq": 3,
+            "frame_id": "f-unknown",
+            "payload": {"event_type": "future_event", "event": {"type": "future_event", "extra": True}},
+        }
+        notification = parse_notification(payload)
+
+        self.assertIsInstance(notification, UnknownNotification)
+        self.assertEqual(notification.payload, {"type": "future_event", "extra": True})
+
+    def test_parse_wrapped_event_missing_payload_event_as_unknown(self) -> None:
+        for payload in (
+            {"type": "event", "protocol_version": 2, "session_id": "s", "seq": 4, "frame_id": "f-missing"},
+            {
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 5,
+                "frame_id": "f-empty",
+                "payload": {},
+            },
+        ):
+            with self.subTest(payload=payload):
+                notification = parse_notification(payload)
+
+                self.assertIsInstance(notification, UnknownNotification)
+                self.assertEqual(notification.payload, payload)
+
+    def test_parse_flat_non_event_workflow_gate_notification(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "workflow_gate",
+                "gate_id": "gate-flat",
+                "stage": "ultragoal:signoff",
+                "kind": "execution",
+                "schema": {"type": "object"},
+                "schema_hash": "hash-flat",
+                "context": {"skill": "ultragoal"},
+                "created_at": "2026-06-09T00:00:00.000Z",
+                "options": [{"value": "approve", "label": "Approve"}],
+            }
+        )
+
+        self.assertIsInstance(notification, WorkflowGate)
+        self.assertEqual(notification.gate_id, "gate-flat")
+        self.assertEqual(notification.kind, "execution")
+
+    def test_parse_malformed_wrapped_event_notification_as_unknown(self) -> None:
+        payload = {
+            "type": "event",
+            "protocol_version": 2,
+            "session_id": "s",
+            "seq": 1,
+            "frame_id": "f",
+            "payload": {"event_type": "agent_start"},
+        }
+        notification = parse_notification(payload)
+
+        self.assertIsInstance(notification, UnknownNotification)
+        self.assertEqual(notification.payload, payload)
+
+    def test_parse_flat_agent_event_notification_as_unknown(self) -> None:
+        payload = {"type": "agent_start"}
+        notification = parse_notification(payload)
+
+        self.assertIsInstance(notification, UnknownNotification)
+        self.assertEqual(notification.payload, payload)
+    def test_parse_wrapped_agent_end_notification(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 6,
+                "frame_id": "f-agent-end",
+                "payload": {
+                    "event_type": "agent_end",
+                    "event": {
+                        "type": "agent_end",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "hello"}],
+                                "api": "anthropic-messages",
+                                "provider": "anthropic",
+                                "model": "claude-sonnet-4-5",
+                                "usage": {
+                                    "input": 1,
+                                    "output": 1,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 2,
+                                    "cost": {
+                                        "input": 0.0,
+                                        "output": 0.0,
+                                        "cacheRead": 0.0,
+                                        "cacheWrite": 0.0,
+                                        "total": 0.0,
+                                    },
+                                },
+                                "stopReason": "stop",
+                                "timestamp": 1,
+                            }
+                        ],
+                    },
+                },
             }
         )
 
@@ -188,19 +344,29 @@ class ProtocolParsingTests(unittest.TestCase):
     def test_workflow_gate_parsers_are_distinct(self) -> None:
         self.assertIsNot(parse_workflow_gate_event, parse_workflow_gate)
 
-    def test_parse_todo_reminder_notification(self) -> None:
+    def test_parse_wrapped_todo_reminder_notification(self) -> None:
         notification = parse_notification(
             {
-                "type": "todo_reminder",
-                "attempt": 1,
-                "maxAttempts": 3,
-                "todos": [
-                    {
-                        "id": "task-1",
-                        "content": "Map tools",
-                        "status": "pending",
-                    }
-                ],
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 7,
+                "frame_id": "f-todo-reminder",
+                "payload": {
+                    "event_type": "todo_reminder",
+                    "event": {
+                        "type": "todo_reminder",
+                        "attempt": 1,
+                        "maxAttempts": 3,
+                        "todos": [
+                            {
+                                "id": "task-1",
+                                "content": "Map tools",
+                                "status": "pending",
+                            }
+                        ],
+                    },
+                },
             }
         )
 
@@ -287,34 +453,83 @@ class ProtocolParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_notification(
                 {
-                    "type": "message_update",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "hello"}],
-                        "api": "anthropic-messages",
-                        "provider": "anthropic",
-                        "model": "claude-sonnet-4-5",
-                        "usage": {
-                            "input": 1,
-                            "output": 1,
-                            "cacheRead": 0,
-                            "cacheWrite": 0,
-                            "totalTokens": 2,
-                            "cost": {
-                                "input": 0.0,
-                                "output": 0.0,
-                                "cacheRead": 0.0,
-                                "cacheWrite": 0.0,
-                                "total": 0.0,
+                    "type": "event",
+                    "protocol_version": 2,
+                    "session_id": "s",
+                    "seq": 8,
+                    "frame_id": "f-message-update",
+                    "payload": {
+                        "event_type": "message_update",
+                        "event": {
+                            "type": "message_update",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "hello"}],
+                                "api": "anthropic-messages",
+                                "provider": "anthropic",
+                                "model": "claude-sonnet-4-5",
+                                "usage": {
+                                    "input": 1,
+                                    "output": 1,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 2,
+                                    "cost": {
+                                        "input": 0.0,
+                                        "output": 0.0,
+                                        "cacheRead": 0.0,
+                                        "cacheWrite": 0.0,
+                                        "total": 0.0,
+                                    },
+                                },
+                                "stopReason": "stop",
+                                "timestamp": 1,
+                            },
+                            "assistantMessageEvent": {
+                                "type": "done",
+                                "reason": "error",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [{"type": "text", "text": "hello"}],
+                                    "api": "anthropic-messages",
+                                    "provider": "anthropic",
+                                    "model": "claude-sonnet-4-5",
+                                    "usage": {
+                                        "input": 1,
+                                        "output": 1,
+                                        "cacheRead": 0,
+                                        "cacheWrite": 0,
+                                        "totalTokens": 2,
+                                        "cost": {
+                                            "input": 0.0,
+                                            "output": 0.0,
+                                            "cacheRead": 0.0,
+                                            "cacheWrite": 0.0,
+                                            "total": 0.0,
+                                        },
+                                    },
+                                    "stopReason": "stop",
+                                    "timestamp": 1,
+                                },
                             },
                         },
-                        "stopReason": "stop",
-                        "timestamp": 1,
                     },
-                    "assistantMessageEvent": {
-                        "type": "done",
-                        "reason": "error",
-                        "message": {
+                }
+            )
+
+    def test_parse_notification_deep_clones_nested_messages(self) -> None:
+        payload = {
+            "type": "event",
+            "protocol_version": 2,
+            "session_id": "s",
+            "seq": 9,
+            "frame_id": "f-agent-end-clone",
+            "payload": {
+                "event_type": "agent_end",
+                "event": {
+                    "type": "agent_end",
+                    "messages": [
+                        {
                             "role": "assistant",
                             "content": [{"type": "text", "text": "hello"}],
                             "api": "anthropic-messages",
@@ -336,43 +551,14 @@ class ProtocolParsingTests(unittest.TestCase):
                             },
                             "stopReason": "stop",
                             "timestamp": 1,
-                        },
-                    },
-                }
-            )
-
-    def test_parse_notification_deep_clones_nested_messages(self) -> None:
-        payload = {
-            "type": "agent_end",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "hello"}],
-                    "api": "anthropic-messages",
-                    "provider": "anthropic",
-                    "model": "claude-sonnet-4-5",
-                    "usage": {
-                        "input": 1,
-                        "output": 1,
-                        "cacheRead": 0,
-                        "cacheWrite": 0,
-                        "totalTokens": 2,
-                        "cost": {
-                            "input": 0.0,
-                            "output": 0.0,
-                            "cacheRead": 0.0,
-                            "cacheWrite": 0.0,
-                            "total": 0.0,
-                        },
-                    },
-                    "stopReason": "stop",
-                    "timestamp": 1,
-                }
-            ],
+                        }
+                    ],
+                },
+            },
         }
 
         notification = parse_notification(payload)
-        payload["messages"][0]["content"][0]["text"] = "mutated"
+        payload["payload"]["event"]["messages"][0]["content"][0]["text"] = "mutated"
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(notification.messages[0]["content"][0]["text"], "hello")

@@ -62,6 +62,25 @@ FAKE_SERVER = textwrap.dedent(
             "timestamp": 1,
         }
 
+    event_seq = 0
+
+    def emit_event(event):
+        global event_seq
+        event_seq += 1
+        print(
+            json.dumps(
+                {
+                    "type": "event",
+                    "protocol_version": 2,
+                    "session_id": "fake-session",
+                    "seq": event_seq,
+                    "frame_id": f"frame-{event_seq}",
+                    "payload": {"event_type": event.get("type"), "event": event},
+                }
+            ),
+            flush=True,
+        )
+
     registered_host_tools = []
 
     def current_state():
@@ -84,117 +103,96 @@ FAKE_SERVER = textwrap.dedent(
 
     def emit_prompt_turn(text: str, delay: float = 0.0, include_extra_events: bool = False):
         global last_assistant_text, messages
-        print(json.dumps({"type": "agent_start"}), flush=True)
-        print(json.dumps({"type": "turn_start"}), flush=True)
+        emit_event({"type": "agent_start"})
+        emit_event({"type": "turn_start"})
         partial = assistant_message("")
-        print(json.dumps({"type": "message_start", "message": partial}), flush=True)
-        print(
-            json.dumps(
-                {
-                    "type": "message_update",
-                    "message": partial,
-                    "assistantMessageEvent": {
-                        "type": "text_delta",
-                        "contentIndex": 0,
-                        "delta": text,
-                        "partial": partial,
-                    },
-                }
-            ),
-            flush=True,
+        emit_event({"type": "message_start", "message": partial})
+        emit_event(
+            {
+                "type": "message_update",
+                "message": partial,
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": text,
+                    "partial": partial,
+                },
+            }
         )
 
         if delay:
             time.sleep(delay)
 
         if include_extra_events:
-            print(
-                json.dumps(
-                    {
-                        "type": "tool_execution_start",
-                        "toolCallId": "tool-1",
-                        "toolName": "read",
-                        "args": {"path": "README.md"},
-                        "intent": "Inspect docs",
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "tool-1",
+                    "toolName": "read",
+                    "args": {"path": "README.md"},
+                    "intent": "Inspect docs",
+                }
             )
-            print(
-                json.dumps(
-                    {
-                        "type": "tool_execution_update",
-                        "toolCallId": "tool-1",
-                        "toolName": "read",
-                        "args": {"path": "README.md"},
-                        "partialResult": {"bytes": 12},
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "tool_execution_update",
+                    "toolCallId": "tool-1",
+                    "toolName": "read",
+                    "args": {"path": "README.md"},
+                    "partialResult": {"bytes": 12},
+                }
             )
-            print(
-                json.dumps(
-                    {
-                        "type": "tool_execution_end",
-                        "toolCallId": "tool-1",
-                        "toolName": "read",
-                        "result": {"text": "docs"},
-                        "isError": False,
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "tool-1",
+                    "toolName": "read",
+                    "result": {"text": "docs"},
+                    "isError": False,
+                }
             )
-            print(json.dumps({"type": "auto_compaction_start", "reason": "threshold", "action": "context-full"}), flush=True)
-            print(
-                json.dumps(
-                    {
-                        "type": "auto_compaction_end",
-                        "action": "context-full",
-                        "result": {
-                            "summary": "trimmed",
-                            "shortSummary": "trimmed",
-                            "firstKeptEntryId": "entry-1",
-                            "tokensBefore": 123,
-                        },
-                        "aborted": False,
-                        "willRetry": False,
-                    }
-                ),
-                flush=True,
+            emit_event({"type": "auto_compaction_start", "reason": "threshold", "action": "context-full"})
+            emit_event(
+                {
+                    "type": "auto_compaction_end",
+                    "action": "context-full",
+                    "result": {
+                        "summary": "trimmed",
+                        "shortSummary": "trimmed",
+                        "firstKeptEntryId": "entry-1",
+                        "tokensBefore": 123,
+                    },
+                    "aborted": False,
+                    "willRetry": False,
+                }
             )
-            print(
-                json.dumps(
-                    {
-                        "type": "auto_retry_start",
-                        "attempt": 1,
-                        "maxAttempts": 3,
-                        "delayMs": 25,
-                        "errorMessage": "retrying",
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "auto_retry_start",
+                    "attempt": 1,
+                    "maxAttempts": 3,
+                    "delayMs": 25,
+                    "errorMessage": "retrying",
+                }
             )
-            print(json.dumps({"type": "auto_retry_end", "success": True, "attempt": 1}), flush=True)
-            print(json.dumps({"type": "retry_fallback_applied", "from": "a", "to": "b", "role": "primary"}), flush=True)
-            print(json.dumps({"type": "retry_fallback_succeeded", "model": "b", "role": "primary"}), flush=True)
-            print(json.dumps({"type": "ttsr_triggered", "rules": [{"id": "rule-1"}]}), flush=True)
-            print(
-                json.dumps(
-                    {
-                        "type": "todo_reminder",
-                        "attempt": 1,
-                        "maxAttempts": 2,
-                        "todos": [{"id": "task-1", "content": "Map tools", "status": "pending"}],
-                    }
-                ),
-                flush=True,
+            emit_event({"type": "auto_retry_end", "success": True, "attempt": 1})
+            emit_event({"type": "retry_fallback_applied", "from": "a", "to": "b", "role": "primary"})
+            emit_event({"type": "retry_fallback_succeeded", "model": "b", "role": "primary"})
+            emit_event({"type": "ttsr_triggered", "rules": [{"id": "rule-1"}]})
+            emit_event(
+                {
+                    "type": "todo_reminder",
+                    "attempt": 1,
+                    "maxAttempts": 2,
+                    "todos": [{"id": "task-1", "content": "Map tools", "status": "pending"}],
+                }
             )
-            print(json.dumps({"type": "todo_auto_clear"}), flush=True)
+            emit_event({"type": "todo_auto_clear"})
 
         assistant = assistant_message(text)
-        print(json.dumps({"type": "message_end", "message": assistant}), flush=True)
-        print(json.dumps({"type": "turn_end", "message": assistant, "toolResults": []}), flush=True)
-        print(json.dumps({"type": "agent_end", "messages": [assistant]}), flush=True)
+        emit_event({"type": "message_end", "message": assistant})
+        emit_event({"type": "turn_end", "message": assistant, "toolResults": []})
+        emit_event({"type": "agent_end", "messages": [assistant]})
         last_assistant_text = text
         messages = [assistant]
 
@@ -365,22 +363,22 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, command_type, {})
             message = command["message"]
             if message == "needs ui":
-                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-1", "stage": "input", "kind": "question", "schema": {"type": "string"}, "context": {"method": "input", "title": "Need input"}}), flush=True)
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-1", "stage": "input", "kind": "question", "schema": {"type": "string"}, "schema_hash": "hash-ui-1", "created_at": "2026-06-09T00:00:00.000Z", "context": {"method": "input", "title": "Need input"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
                 continue
             if message == "needs confirm":
-                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-2", "stage": "confirm", "kind": "approval", "schema": {"type": "boolean"}, "context": {"method": "confirm", "title": "Confirm", "message": "Continue?"}}), flush=True)
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-2", "stage": "confirm", "kind": "approval", "schema": {"type": "boolean"}, "schema_hash": "hash-ui-2", "created_at": "2026-06-09T00:00:00.000Z", "context": {"method": "confirm", "title": "Confirm", "message": "Continue?"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
                 continue
             if message == "needs select":
-                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-select", "stage": "select", "kind": "question", "schema": {"type": "string", "enum": ["alpha", "beta"]}, "options": ["alpha", "beta"], "context": {"method": "select", "title": "Pick"}}), flush=True)
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-select", "stage": "select", "kind": "question", "schema": {"type": "string", "enum": ["alpha", "beta"]}, "schema_hash": "hash-ui-select", "created_at": "2026-06-09T00:00:00.000Z", "options": ["alpha", "beta"], "context": {"method": "select", "title": "Pick"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-select", "method": "select", "title": "Pick", "options": ["alpha", "beta"]}), flush=True)
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
                 continue
             if message == "needs host tool":
-                print(json.dumps({"type": "agent_start"}), flush=True)
+                emit_event({"type": "agent_start"})
                 print(
                     json.dumps(
                         {
@@ -399,32 +397,26 @@ FAKE_SERVER = textwrap.dedent(
                 print(json.dumps({"type": "unknown_future_event", "value": 1}), flush=True)
             emit_prompt_turn("pong", delay=0.3 if message == "slow" else 0.0, include_extra_events=message == "all events")
         elif command_type == "host_tool_update":
-            print(
-                json.dumps(
-                    {
-                        "type": "tool_execution_update",
-                        "toolCallId": "toolu_host_1",
-                        "toolName": "echo_host",
-                        "args": {"message": "hello"},
-                        "partialResult": command["partialResult"],
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "tool_execution_update",
+                    "toolCallId": "toolu_host_1",
+                    "toolName": "echo_host",
+                    "args": {"message": "hello"},
+                    "partialResult": command["partialResult"],
+                }
             )
         elif command_type == "host_tool_result":
-            print(
-                json.dumps(
-                    {
-                        "type": "tool_execution_end",
-                        "toolCallId": "toolu_host_1",
-                        "toolName": "echo_host",
-                        "result": command["result"],
-                        "isError": command.get("isError", False),
-                    }
-                ),
-                flush=True,
+            emit_event(
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "toolu_host_1",
+                    "toolName": "echo_host",
+                    "result": command["result"],
+                    "isError": command.get("isError", False),
+                }
             )
-            print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+            emit_event({"type": "agent_end", "messages": []})
         else:
             respond(request_id, command_type, success=False, error=f"unsupported: {command_type}")
     """

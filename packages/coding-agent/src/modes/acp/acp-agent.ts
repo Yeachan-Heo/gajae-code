@@ -72,10 +72,11 @@ import {
 } from "../../session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { parseThinkingLevel } from "../../thinking";
+import { toAgentWireEventPayload } from "../shared/agent-wire/event-envelope";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	buildToolCallStartUpdate,
-	mapAgentSessionEventToAcpSessionUpdates,
+	mapAgentWireEventPayloadToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -1128,12 +1129,16 @@ export class AcpAgent implements Agent {
 		}
 
 		this.#prepareLiveAssistantMessage(record, event);
-		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
-			getMessageId: message => this.#getLiveMessageId(record, message),
-			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
-			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
-			cwd: record.session.sessionManager.getCwd(),
-		})) {
+		for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(
+			toAgentWireEventPayload(event),
+			record.session.sessionId,
+			{
+				getMessageId: message => this.#getLiveMessageId(record, message),
+				getMessageProgress: message => this.#getLiveMessageProgress(record, message),
+				getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
+				cwd: record.session.sessionManager.getCwd(),
+			},
+		)) {
 			await this.#connection.sessionUpdate(notification);
 		}
 		if (event.type === "tool_execution_end") {
@@ -1887,14 +1892,17 @@ export class AcpAgent implements Agent {
 				errorMessage: message.errorMessage,
 			},
 		};
-		const notifications = mapAgentSessionEventToAcpSessionUpdates(endEvent, sessionId, {
+		const notifications = mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(endEvent), sessionId, {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
 		});
 		if (options.includeStart === false) {
 			return notifications;
 		}
-		return [...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, { cwd }), ...notifications];
+		return [
+			...mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(startEvent), sessionId, { cwd }),
+			...notifications,
+		];
 	}
 
 	#buildReplayToolArgs(details: unknown): { path?: string } {

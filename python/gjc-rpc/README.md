@@ -257,6 +257,21 @@ visible = assistant_text(message)
 full = assistant_text_with_thinking(message)
 ```
 
+## Event Frames
+
+AgentSession events are delivered on stdout as canonical `event` frames:
+
+```json
+{ "type": "event", "protocol_version": 2, "session_id": "…", "seq": 1, "frame_id": "…",
+  "payload": { "event_type": "tool_execution_start", "event": { "type": "tool_execution_start", … } } }
+```
+
+`seq` is monotonic per session (starting at 1). The client unwraps these
+automatically: typed listeners (`on_agent_start`, `on_tool_execution_start`,
+`on_message_update`, …) and the generic event hook receive the **inner** event,
+not the envelope. Non-event frames (`ready`, `response`, `workflow_gate`,
+`extension_ui_request`, `extension_error`, host tool/URI requests) stay flat.
+
 ## Protocol Reference
 
 The canonical wire protocol still lives in the repo at

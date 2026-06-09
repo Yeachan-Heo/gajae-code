@@ -9,8 +9,10 @@ import { AcpAgent } from "../src/modes/acp/acp-agent";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
+	mapAgentWireEventPayloadToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "../src/modes/acp/acp-event-mapper";
+import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
@@ -129,6 +131,40 @@ describe("ACP event mapper", () => {
 		expect(thoughtUpdates[0] ? getChunkMessageId(thoughtUpdates[0]) : undefined).toBe(
 			"a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a",
 		);
+	});
+
+	it("maps canonical wire payloads the same as direct events", () => {
+		const assistantMessage = makeAssistantMessage("wire chunk");
+		const messageEvent = {
+			type: "message_update",
+			message: assistantMessage,
+			assistantMessageEvent: { type: "text_delta", delta: "wire chunk" },
+		} as AgentSessionEvent;
+		const toolStartEvent = {
+			type: "tool_execution_start",
+			toolCallId: "toolu_wire_1",
+			toolName: "bash",
+			args: { command: "bun test" },
+		} as AgentSessionEvent;
+
+		expect(mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(toolStartEvent), "session-1")).toEqual(
+			mapAgentSessionEventToAcpSessionUpdates(toolStartEvent, "session-1"),
+		);
+		expect(mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(messageEvent), "session-1")).toEqual(
+			mapAgentSessionEventToAcpSessionUpdates(messageEvent, "session-1"),
+		);
+	});
+
+	it("returns no ACP updates for whitelisted unrepresented events", () => {
+		expect(
+			mapAgentSessionEventToAcpSessionUpdates({ type: "agent_start" } as AgentSessionEvent, "session-1"),
+		).toEqual([]);
+		expect(
+			mapAgentSessionEventToAcpSessionUpdates(
+				{ type: "notice", level: "info", message: "visible elsewhere" } as AgentSessionEvent,
+				"session-1",
+			),
+		).toEqual([]);
 	});
 
 	it("emits final assistant text when no text deltas were observed", () => {

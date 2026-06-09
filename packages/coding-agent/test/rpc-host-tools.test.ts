@@ -147,7 +147,7 @@ function handle(frame) {
 			return;
 		}
 		write({ id: frame.id, type: "response", command: "workflow_gate_response", success: true, data: { gate_id: frame.gate_id, status: "accepted", answer_hash: "mock-answer-hash" } });
-		write({ type: "agent_end", messages: [] });
+		write({ type: "event", payload: { event_type: "agent_end", event: { type: "agent_end", messages: [] } } });
 	}
 }
 `,
@@ -215,7 +215,7 @@ function handle(frame) {
 	}
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
-		write({ type: "agent_start" });
+		write({ type: "event", payload: { event_type: "agent_start", event: { type: "agent_start" } } });
 		write({
 			type: "host_tool_call",
 			id: "host-call-1",
@@ -226,24 +226,24 @@ function handle(frame) {
 		return;
 	}
 	if (frame.type === "host_tool_update") {
-		write({
+		write({ type: "event", payload: { event_type: "tool_execution_update", event: {
 			type: "tool_execution_update",
 			toolCallId: "toolu_host_1",
 			toolName: "echo_host",
 			args: { message: "hello" },
 			partialResult: frame.partialResult,
-		});
+		} } });
 		return;
 	}
 	if (frame.type === "host_tool_result") {
-		write({
+		write({ type: "event", payload: { event_type: "tool_execution_end", event: {
 			type: "tool_execution_end",
 			toolCallId: "toolu_host_1",
 			toolName: "echo_host",
 			result: frame.result,
 			isError: frame.isError === true,
-		});
-		write({ type: "agent_end", messages: [] });
+		} } });
+		write({ type: "event", payload: { event_type: "agent_end", event: { type: "agent_end", messages: [] } } });
 	}
 }
 `,

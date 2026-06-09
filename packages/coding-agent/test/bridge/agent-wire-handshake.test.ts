@@ -22,7 +22,7 @@ describe("agent-wire bridge handshake", () => {
 	it("accepts compatible clients and reports unsupported capabilities explicitly", () => {
 		const response = negotiateBridgeHandshake(
 			{
-				protocol_version_range: { min: 1, max: 1 },
+				protocol_version_range: { min: 1, max: 2 },
 				capabilities: ["events", "prompt", "ui.editor", "ui.declarative"],
 				requested_scopes: ["prompt", "bash", "message:read"],
 			},
@@ -41,7 +41,7 @@ describe("agent-wire bridge handshake", () => {
 	it("rejects incompatible major versions", () => {
 		const response = negotiateBridgeHandshake(
 			{
-				protocol_version_range: { min: 2, max: 3 },
+				protocol_version_range: { min: 3, max: 4 },
 				capabilities: ["events"],
 				requested_scopes: ["prompt"],
 			},

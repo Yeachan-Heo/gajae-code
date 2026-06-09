@@ -8,6 +8,8 @@
  * v1 implements the gajae-code adapter only. omx/codex/remote/auth are deferred seams.
  */
 
+import type { AgentWireObservedSignal } from "../modes/shared/agent-wire/event-contract";
+
 /** Harnesses the control plane can operate. v1 implements `gajae-code` only. */
 export type Harness = "gajae-code" | "codex" | "omx";
 
@@ -147,17 +149,12 @@ export interface SessionState {
 	updatedAt: string;
 }
 
-/** Bounded observed-signal vocabulary surfaced by `observe` (the owner only ever emits these). */
-export type ObservedSignal =
-	| "SessionStart"
-	| "prompt-accepted"
-	| "tool-call"
-	| "test-running"
-	| "commit-created"
-	| "completed"
-	| "error"
-	| "streaming"
-	| "idle";
+/**
+ * Bounded observed-signal vocabulary surfaced by `observe` (the owner only ever
+ * emits these). Aliased to the canonical agent-wire signal vocabulary so there
+ * is a single source of truth shared with the observation core.
+ */
+export type ObservedSignal = AgentWireObservedSignal;
 
 export const OBSERVED_SIGNALS: readonly ObservedSignal[] = [
 	"SessionStart",
