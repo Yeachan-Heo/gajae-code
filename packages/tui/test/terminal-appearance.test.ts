@@ -330,3 +330,75 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		terminal.stop();
 	});
 });
+
+describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {
+	beforeEach(() => {
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdin, "setRawMode", { value: vi.fn(), configurable: true });
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);
+		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
+		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
+		restoreProperty(process, "platform", processPlatformDescriptor);
+		restoreEnv("WSL_INTEROP", originalWslInterop);
+		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
+	});
+
+	function setupTerminal() {
+		const received: string[] = [];
+		vi.spyOn(process, "kill").mockReturnValue(true);
+		vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const setEncodingSpy = vi.spyOn(process.stdin, "setEncoding").mockImplementation(() => process.stdin);
+		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		const terminal = new ProcessTerminal();
+		terminal.start(
+			data => received.push(data),
+			() => {},
+		);
+
+		return { terminal, received, setEncodingSpy };
+	}
+
+	it("does not call setEncoding('utf8') on start", () => {
+		const { terminal, setEncodingSpy } = setupTerminal();
+		expect(setEncodingSpy).not.toHaveBeenCalled();
+		terminal.stop();
+	});
+
+	it("delivers a Korean bracketed paste split mid-syllable from raw Buffers unchanged", () => {
+		const { terminal, received } = setupTerminal();
+
+		const content = "화면 기록";
+		const full = Buffer.from(`\x1b[200~${content}\x1b[201~`, "utf8");
+		const markerStart = Buffer.byteLength("\x1b[200~", "utf8");
+		// Split inside the first Korean syllable and inside the end marker.
+		process.stdin.emit("data", full.subarray(0, markerStart + 2));
+		process.stdin.emit("data", full.subarray(markerStart + 2, full.length - 3));
+		process.stdin.emit("data", full.subarray(full.length - 3));
+
+		// Terminal re-wraps decoded paste content in bracketed markers.
+		expect(received).toContain(`\x1b[200~${content}\x1b[201~`);
+		expect(received.join("")).not.toContain("\uFFFD");
+
+		terminal.stop();
+	});
+
+	it("decodes Buffer-emitted OSC 11 + DA1 protocol responses without leaking to input", () => {
+		const { terminal, received } = setupTerminal();
+
+		process.stdin.emit("data", Buffer.from("\x1b]11;rgb:0000/0000/0000\x07", "utf8"));
+		process.stdin.emit("data", Buffer.from("\x1b[?1;2c", "utf8"));
+
+		expect(terminal.appearance).toBe("dark");
+		expect(received).toEqual([]);
+
+		terminal.stop();
+	});
+});

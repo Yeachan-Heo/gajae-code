@@ -123,7 +123,7 @@ export class ProcessTerminal implements Terminal {
 	#modifyOtherKeysActive = false;
 	#modifyOtherKeysTimeout?: Timer;
 	#stdinBuffer?: StdinBuffer;
-	#stdinDataHandler?: (data: string) => void;
+	#stdinDataHandler?: (data: string | Buffer) => void;
 	#dead = false;
 	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
 	#detachLogPath = $env.PI_TUI_TERMINAL_DETACH_LOG || "";
@@ -165,7 +165,11 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(true);
 		}
-		process.stdin.setEncoding("utf8");
+		// Do NOT setEncoding("utf8"): raw stdin chunks may split a multi-byte
+		// UTF-8 character across reads, and Bun's raw-TTY string decoding does
+		// not reliably reassemble them (issue #454 — Korean paste mojibake).
+		// StdinBuffer is the single decoding boundary and decodes Buffers via a
+		// persistent StringDecoder, so we forward raw Buffers untouched.
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
@@ -420,7 +424,7 @@ export class ProcessTerminal implements Terminal {
 		});
 
 		// Handler that pipes stdin data through the buffer
-		this.#stdinDataHandler = (data: string) => {
+		this.#stdinDataHandler = (data: string | Buffer) => {
 			this.#stdinBuffer!.process(data);
 		};
 	}
