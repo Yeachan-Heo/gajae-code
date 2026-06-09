@@ -270,6 +270,50 @@ describe("ModelRegistry", () => {
 			expect(openaiModel?.cacheRetention).toBe("long");
 		});
 
+		test("propagates declared image output capability for custom models", () => {
+			writeRawModelsJson({
+				layofflabs: {
+					baseUrl: "https://api.layofflabs.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "gpt-5.5",
+							input: ["text", "image"],
+							output: ["text", "image"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 400000,
+							maxTokens: 128000,
+						},
+						{
+							id: "gpt-5.5-text",
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 400000,
+							maxTokens: 128000,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("layofflabs", "gpt-5.5")?.output).toEqual(["text", "image"]);
+			expect(registry.find("layofflabs", "gpt-5.5-text")?.output).toBeUndefined();
+		});
+
+		test("modelOverrides can set image output capability", () => {
+			writeRawModelsJson({
+				openai: {
+					modelOverrides: {
+						"gpt-5-mini": { output: ["text", "image"] },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("openai", "gpt-5-mini")?.output).toEqual(["text", "image"]);
+		});
+
 		test("modelOverrides cacheRetention wins over provider cacheRetention", () => {
 			writeRawModelsJson({
 				openai: {

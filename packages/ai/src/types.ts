@@ -854,6 +854,14 @@ export interface Model<TApi extends Api = any> {
 	baseUrl: string;
 	reasoning: boolean;
 	input: ("text" | "image")[];
+	/**
+	 * Output modalities the model can produce. Defaults to text-only when
+	 * unset. A model that lists `"image"` advertises image-generation support
+	 * (e.g. an OpenAI-compatible `gpt-image` model behind a proxy), which the
+	 * `generate_image` tool uses to route requests without first-party
+	 * provider/id heuristics.
+	 */
+	output?: ("text" | "image")[];
 	cost: {
 		input: number; // $/million tokens
 		output: number; // $/million tokens

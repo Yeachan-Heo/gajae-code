@@ -605,12 +605,21 @@ function collectInlineImages(parts: GeminiPart[]): InlineImageData[] {
 	return images;
 }
 
-function isOpenAIHostedImageModel(model: Model | undefined): model is Model {
+export function isOpenAIHostedImageModel(model: Model | undefined): model is Model {
 	if (!model) return false;
-	if (model.provider !== "openai" && model.provider !== "openai-codex") return false;
+	// The hosted image_generation tool is only available over the Responses API.
 	if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") return false;
-	const modelId = model.id.toLowerCase();
-	return modelId.startsWith("gpt-") || modelId === "o3" || modelId.startsWith("o3-");
+	// Declarative capability: any provider (e.g. an OpenAI-compatible proxy
+	// fronting gpt-image) whose model advertises image output can drive
+	// generate_image, routed to the model's own baseUrl with registry auth.
+	if (model.output?.includes("image")) return true;
+	// First-party heuristic: OpenAI/OpenAI code GPT and o3 models generate
+	// images inline through the hosted tool without a declared output modality.
+	if (model.provider === "openai" || model.provider === "openai-codex") {
+		const modelId = model.id.toLowerCase();
+		return modelId.startsWith("gpt-") || modelId === "o3" || modelId.startsWith("o3-");
+	}
+	return false;
 }
 
 function getOpenAIHostedImageProvider(model: Model): ImageProvider {
