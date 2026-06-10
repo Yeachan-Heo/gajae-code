@@ -217,6 +217,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "paste-image",
+		aliases: ["attach-image"],
+		description: "Attach image from system clipboard",
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleImagePaste();
+			return commandConsumed();
+		},
+	},
+	{
 		name: "theme",
 		description: "Open theme selector",
 		handleTui: (_command, runtime) => {

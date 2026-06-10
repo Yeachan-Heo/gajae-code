@@ -27,6 +27,14 @@ const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const CLIPBOARD_TEMP_IMAGE_FILE_PATTERN = /^clipboard-\d{4}-\d{2}-\d{2}-\d{6}-[A-Za-z0-9]+\.(?:png|jpe?g|gif|webp)$/i;
 const MACOS_CLIPBOARD_TEMP_DIR_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T$/;
 
+const PASTE_IMAGE_COMMAND_PATTERN = /(?:^|\s)\/(?:paste-image|attach-image)\s*$/;
+
+function stripTrailingPasteImageCommand(text: string): string | undefined {
+	const match = text.match(PASTE_IMAGE_COMMAND_PATTERN);
+	if (!match || match.index === undefined) return undefined;
+	return text.slice(0, match.index).trimEnd();
+}
+
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
@@ -250,6 +258,12 @@ export class InputController {
 			}
 
 			if (!text) return;
+			const pasteImagePrefix = stripTrailingPasteImageCommand(text);
+			if (pasteImagePrefix !== undefined) {
+				this.ctx.editor.setText(pasteImagePrefix ? `${pasteImagePrefix} ` : "");
+				await this.handleImagePaste();
+				return;
+			}
 
 			// Continue shortcuts: "." or "c" sends empty message (agent continues, no visible message)
 			if (text === "." || text === "c") {

@@ -6,7 +6,7 @@ import blueCrabTheme from "../src/modes/theme/defaults/blue-crab.json" with { ty
 import redClawTheme from "../src/modes/theme/defaults/red-claw.json" with { type: "json" };
 import * as themeModule from "../src/modes/theme/theme";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
-import { lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
 describe("GJC red-claw redesign defaults", () => {
 	afterEach(() => {
@@ -81,6 +81,37 @@ describe("GJC red-claw redesign defaults", () => {
 		expect(command?.handleTui).toBeDefined();
 		expect(command?.handle).toBeUndefined();
 		expect(ACP_BUILTIN_SLASH_COMMANDS.map(item => item.name)).not.toContain("theme");
+	});
+
+	it("exposes /paste-image only for TUI clipboard image attachment", () => {
+		const command = lookupBuiltinSlashCommand("paste-image");
+		const alias = lookupBuiltinSlashCommand("attach-image");
+
+		expect(command?.handleTui).toBeDefined();
+		expect(command?.handle).toBeUndefined();
+		expect(alias).toBe(command);
+		expect(ACP_BUILTIN_SLASH_COMMANDS.map(item => item.name)).not.toContain("paste-image");
+		expect(ACP_BUILTIN_SLASH_COMMANDS.map(item => item.name)).not.toContain("attach-image");
+	});
+
+	it("dispatches /paste-image and /attach-image through the TUI image paste handler", async () => {
+		const setText = vi.fn();
+		const handleImagePaste = vi.fn(async () => true);
+		const runtime = {
+			ctx: {
+				editor: { setText },
+				handleImagePaste,
+			},
+			handleBackgroundCommand: vi.fn(),
+		} as unknown as Parameters<typeof executeBuiltinSlashCommand>[1];
+
+		expect(await executeBuiltinSlashCommand("/paste-image", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/attach-image", runtime)).toBe(true);
+
+		expect(setText).toHaveBeenCalledTimes(2);
+		expect(setText).toHaveBeenNthCalledWith(1, "");
+		expect(setText).toHaveBeenNthCalledWith(2, "");
+		expect(handleImagePaste).toHaveBeenCalledTimes(2);
 	});
 
 	it("keeps public status presets on the GJC identity", () => {

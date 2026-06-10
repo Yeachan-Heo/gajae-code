@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Added a TUI-only `/paste-image` slash command, with `/attach-image` as an alias, so terminal clipboard image attachment remains reachable when the terminal intercepts normal paste handling.
+
 ## [0.4.3] - 2026-06-10
 
 ### Added

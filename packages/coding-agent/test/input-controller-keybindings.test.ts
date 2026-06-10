@@ -278,6 +278,57 @@ describe("InputController pasted clipboard image paths", () => {
 	});
 });
 
+describe("InputController paste-image submit fallback", () => {
+	it("consumes exact /paste-image without prompting the agent", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		const pasteSpy = vi.spyOn(controller, "handleImagePaste").mockResolvedValue(true);
+
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("/paste-image");
+
+		expect(pasteSpy).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("consumes exact /attach-image without prompting the agent", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		const pasteSpy = vi.spyOn(controller, "handleImagePaste").mockResolvedValue(true);
+
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("/attach-image");
+
+		expect(pasteSpy).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("preserves existing placeholders when appending another /paste-image", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		const pasteSpy = vi.spyOn(controller, "handleImagePaste").mockImplementation(async () => {
+			ctx.pendingImages.push({
+				type: "image",
+				data: `image-${ctx.pendingImages.length + 1}`,
+				mimeType: "image/png",
+			});
+			editor.insertText(`[image ${ctx.pendingImages.length}] `);
+			return true;
+		});
+
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("/paste-image");
+		await editor.onSubmit?.(`${editor.getText()}/paste-image`);
+
+		expect(pasteSpy).toHaveBeenCalledTimes(2);
+		expect(editor.getText()).toBe("[image 1] [image 2] ");
+		expect(ctx.pendingImages).toHaveLength(2);
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+});
+
 describe("InputController shell mode cues", () => {
 	it("marks leading bang input as shell mode without rewriting editor text", async () => {
 		const { InputController, ctx, editor } = await createContext();
