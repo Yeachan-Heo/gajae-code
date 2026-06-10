@@ -4,6 +4,7 @@
  */
 import {
 	Container,
+	Editor,
 	Markdown,
 	matchesKey,
 	padding,
@@ -16,8 +17,13 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
-import { getMarkdownTheme, theme } from "../../modes/theme/theme";
-import { matchesAppExternalEditor, matchesSelectCancel } from "../../modes/utils/keybinding-matchers";
+import { getEditorTheme, getMarkdownTheme, theme } from "../../modes/theme/theme";
+import {
+	matchesAppExternalEditor,
+	matchesAppInterrupt,
+	matchesSelectCancel,
+} from "../../modes/utils/keybinding-matchers";
+import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -56,6 +62,17 @@ export interface HookSelectorOptions {
 	 */
 	wrapFocused?: boolean;
 	scrollTitleRows?: number;
+	/**
+	 * Inline free-text entry for the option with this label (e.g. the ask
+	 * tool's "Other (type your own)"). Selecting it keeps the title and option
+	 * list on screen and opens a prompt-style editor below the list instead of
+	 * replacing the whole selector. Enter submits via `onSubmit`; Escape
+	 * returns to option selection.
+	 */
+	customInput?: {
+		optionLabel: string;
+		onSubmit: (text: string) => void;
+	};
 }
 
 class OutlinedList extends Container {
@@ -297,6 +314,12 @@ export class HookSelectorComponent extends Container {
 	#wrapFocused: boolean;
 	#outline: boolean;
 	#scrollTitleRows: number | undefined;
+	#customInput: { optionLabel: string; onSubmit: (text: string) => void } | undefined;
+	#inputArea: Container;
+	#inlineEditor: Editor | undefined;
+	#helpTextComponent: Text;
+	#baseHelpText: string;
+	#tui: TUI | undefined;
 	constructor(
 		title: string,
 		options: string[],
@@ -317,6 +340,8 @@ export class HookSelectorComponent extends Container {
 		this.#onExternalEditorCallback = opts?.onExternalEditor;
 		this.#wrapFocused = opts?.wrapFocused === true;
 		this.#outline = opts?.outline === true;
+		this.#customInput = opts?.customInput;
+		this.#tui = opts?.tui;
 
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
@@ -364,9 +389,12 @@ export class HookSelectorComponent extends Container {
 			this.#listContainer = new Container();
 			this.addChild(this.#listContainer);
 		}
+		this.#inputArea = new Container();
+		this.addChild(this.#inputArea);
 		this.addChild(new Spacer(1));
-		const controlsHint = opts?.helpText ?? "up/down navigate  enter select  esc cancel";
-		this.addChild(new Text(theme.fg("dim", controlsHint), 1, 0));
+		this.#baseHelpText = opts?.helpText ?? "up/down navigate  enter select  esc cancel";
+		this.#helpTextComponent = new Text(theme.fg("dim", this.#baseHelpText), 1, 0);
+		this.addChild(this.#helpTextComponent);
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 
@@ -432,6 +460,10 @@ export class HookSelectorComponent extends Container {
 			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
 			return;
 		}
+		if (this.#inlineEditor) {
+			this.#handleInputModeKey(keyData, this.#inlineEditor);
+			return;
+		}
 		if (matchesKey(keyData, "up") || keyData === "k") {
 			this.#selectedIndex = Math.max(0, this.#selectedIndex - 1);
 			this.#updateList();
@@ -440,7 +472,12 @@ export class HookSelectorComponent extends Container {
 			this.#updateList();
 		} else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selected = this.#options[this.#selectedIndex];
-			if (selected) this.#onSelectCallback(selected);
+			if (!selected) return;
+			if (this.#customInput && selected === this.#customInput.optionLabel) {
+				this.#enterInputMode();
+				return;
+			}
+			this.#onSelectCallback(selected);
 		} else if (matchesKey(keyData, "left")) {
 			this.#onLeftCallback?.();
 		} else if (matchesKey(keyData, "right")) {
@@ -449,6 +486,73 @@ export class HookSelectorComponent extends Container {
 			this.#onExternalEditorCallback();
 		} else if (matchesSelectCancel(keyData)) {
 			this.#onCancelCallback();
+		}
+	}
+
+	/** Keys while the inline custom-input editor is open below the option list. */
+	#handleInputModeKey(keyData: string, editor: Editor): void {
+		// Escape backs out to option selection instead of cancelling the dialog,
+		// so a stray Esc never throws away the question context.
+		if (matchesKey(keyData, "escape") || matchesAppInterrupt(keyData)) {
+			this.#exitInputMode();
+			return;
+		}
+		if (matchesAppExternalEditor(keyData)) {
+			void this.#openExternalEditor(editor);
+			return;
+		}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
+			this.#customInput?.onSubmit(editor.getText());
+			return;
+		}
+		editor.handleInput(keyData);
+	}
+
+	#enterInputMode(): void {
+		if (this.#inlineEditor) return;
+		// Stop the auto-select countdown for good: the user is actively typing,
+		// matching the old behavior where the separate editor had no timeout.
+		if (this.#countdown) {
+			this.#countdown.dispose();
+			this.#countdown = undefined;
+			this.#titleComponent.setText(this.#baseTitle);
+		}
+		const editor = new Editor(getEditorTheme());
+		editor.setBorderVisible(false);
+		editor.setPromptGutter("> ");
+		editor.disableSubmit = true;
+		this.#inlineEditor = editor;
+		this.#inputArea.addChild(new Spacer(1));
+		this.#inputArea.addChild(editor);
+		const scrollHint = this.#scrollTitleRows === undefined ? "" : "  wheel/PgUp/PgDn scroll question";
+		this.#helpTextComponent.setText(
+			theme.fg("dim", `enter submit  esc back to options  ctrl+g external editor${scrollHint}`),
+		);
+		this.invalidate();
+	}
+
+	#exitInputMode(): void {
+		if (!this.#inlineEditor) return;
+		this.#inlineEditor = undefined;
+		this.#inputArea.clear();
+		this.#helpTextComponent.setText(theme.fg("dim", this.#baseHelpText));
+		this.invalidate();
+	}
+
+	async #openExternalEditor(editor: Editor): Promise<void> {
+		const editorCmd = getEditorCommand();
+		if (!editorCmd || !this.#tui) return;
+
+		const currentText = editor.getExpandedText();
+		try {
+			this.#tui.stop();
+			const result = await openInEditor(editorCmd, currentText);
+			if (result !== null) {
+				editor.setText(result);
+			}
+		} finally {
+			this.#tui.start();
+			this.#tui.requestRender(true);
 		}
 	}
 

@@ -29,6 +29,7 @@ const HOOK_SELECTOR_MOUSE_REPORTING_ENABLE = "\x1b[?1006h\x1b[?1000h";
 const HOOK_SELECTOR_MOUSE_REPORTING_DISABLE = "\x1b[?1000l\x1b[?1006l";
 const HOOK_SELECTOR_CHROME_ROWS = 7;
 const HOOK_SELECTOR_OUTLINE_ROWS = 2;
+const HOOK_SELECTOR_INLINE_INPUT_ROWS = 2;
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -601,8 +602,11 @@ export class ExtensionUiController {
 		const maxVisible =
 			requestedTitleRows === undefined ? baseMaxVisible : Math.min(15, Math.max(3, scrollOptionRows + 1));
 		const listChromeRows = dialogOptions?.outline === true ? HOOK_SELECTOR_OUTLINE_ROWS : 0;
+		// Reserve rows for the inline custom-input editor so opening it doesn't
+		// push the scrollable title past the viewport into terminal scrollback.
+		const inlineInputRows = dialogOptions?.customInput ? HOOK_SELECTOR_INLINE_INPUT_ROWS : 0;
 		const availableTitleRows =
-			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - HOOK_SELECTOR_CHROME_ROWS;
+			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - inlineInputRows - HOOK_SELECTOR_CHROME_ROWS;
 		const scrollTitleRows =
 			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
 		if (scrollTitleRows !== undefined) {
@@ -645,6 +649,17 @@ export class ExtensionUiController {
 				wrapFocused: dialogOptions?.wrapFocused,
 				scrollTitleRows,
 				maxVisible,
+				customInput: dialogOptions?.customInput
+					? {
+							optionLabel: dialogOptions.customInput.optionLabel,
+							onSubmit: text => {
+								const optionLabel = dialogOptions.customInput?.optionLabel;
+								this.hideHookSelector();
+								dialogOptions.customInput?.onSubmit(text);
+								finish(optionLabel);
+							},
+						}
+					: undefined,
 			},
 		);
 		this.ctx.editorContainer.clear();

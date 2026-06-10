@@ -122,6 +122,19 @@ export interface ExtensionUIDialogOptions {
 	 * select-only rendering hint; non-TUI bridges drop it and do not serialize it.
 	 */
 	scrollTitleRows?: number;
+	/**
+	 * For interactive TUI select dialogs, handle the option with `optionLabel`
+	 * inline: selecting it keeps the title and option list on screen and opens
+	 * a free-text input below the list. Submitting calls `onSubmit` with the
+	 * typed text and resolves the select with `optionLabel`; Escape returns to
+	 * option selection. Non-TUI bridges (RPC, ACP) drop it; callers must keep
+	 * a fallback path for selects that resolve `optionLabel` without invoking
+	 * `onSubmit`.
+	 */
+	customInput?: {
+		optionLabel: string;
+		onSubmit: (text: string) => void;
+	};
 }
 
 /** Raw terminal input listener for extensions. */

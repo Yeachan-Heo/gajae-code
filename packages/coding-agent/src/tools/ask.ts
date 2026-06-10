@@ -175,6 +175,7 @@ interface UIContext {
 			onLeft?: () => void;
 			onRight?: () => void;
 			helpText?: string;
+			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
 		},
 	): Promise<string | undefined>;
 	editor(
@@ -194,6 +195,7 @@ async function askSingleQuestion(
 ): Promise<SelectionResult> {
 	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
 	const doneLabel = getDoneOptionLabel();
+	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	let selectedOptions = [...(initialSelection?.selectedOptions ?? [])];
 	let customInput = initialSelection?.customInput;
 	let timedOut = false;
@@ -202,11 +204,20 @@ async function askSingleQuestion(
 		prompt: string,
 		optionsToShow: string[],
 		initialIndex?: number,
-	): Promise<{ choice: string | undefined; timedOut: boolean; navigation?: "back" | "forward" }> => {
+	): Promise<{
+		choice: string | undefined;
+		timedOut: boolean;
+		navigation?: "back" | "forward";
+		inlineInput?: string;
+	}> => {
 		let timeoutTriggered = false;
 		const onTimeout = () => {
 			timeoutTriggered = true;
 		};
+		// Inline custom input: the TUI selector keeps the question and option
+		// list on screen and collects the "Other" text below the list, instead
+		// of swapping to a separate editor screen that hides the question.
+		let inlineInput: string | undefined;
 		let navigationAction: "back" | "forward" | undefined;
 		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
@@ -222,6 +233,12 @@ async function askSingleQuestion(
 			scrollTitleRows,
 			onTimeout,
 			helpText,
+			customInput: {
+				optionLabel: otherOptionLabel,
+				onSubmit: (text: string) => {
+					inlineInput = text;
+				},
+			},
 			onLeft: navigation?.allowBack
 				? () => {
 						navigationAction = "back";
@@ -240,16 +257,17 @@ async function askSingleQuestion(
 		if (!timeoutTriggered && choice === undefined && typeof timeout === "number") {
 			timeoutTriggered = Date.now() - startMs >= timeout;
 		}
-		return { choice, timedOut: timeoutTriggered, navigation: navigationAction };
+		return { choice, timedOut: timeoutTriggered, navigation: navigationAction, inlineInput };
 	};
 
+	// Fallback for UI contexts that don't support inline custom input (they
+	// resolve the "Other" label without invoking customInput.onSubmit).
 	const promptForCustomInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
 		const showCustomInput = () => ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
 	};
-	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
 	if (multi) {
@@ -278,6 +296,7 @@ async function askSingleQuestion(
 				choice,
 				timedOut: selectTimedOut,
 				navigation: arrowNavigation,
+				inlineInput,
 			} = await selectOption(`${prefix}${promptWithProgress}`, opts, cursorIndex);
 
 			if (arrowNavigation) {
@@ -297,11 +316,11 @@ async function askSingleQuestion(
 					timedOut = true;
 					break;
 				}
-				const customResult = await promptForCustomInput();
-				if (customResult.input === undefined) {
+				const input = inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input;
+				if (input === undefined) {
 					break;
 				}
-				customInput = customResult.input;
+				customInput = input;
 				break;
 			}
 
@@ -353,6 +372,7 @@ async function askSingleQuestion(
 			choice,
 			timedOut: selectTimedOut,
 			navigation: arrowNavigation,
+			inlineInput,
 		} = await selectOption(promptWithProgress, optionsWithNavigation, initialIndex);
 		timedOut = selectTimedOut;
 
@@ -365,12 +385,12 @@ async function askSingleQuestion(
 			}
 		} else if (choice === otherOptionLabel) {
 			if (!selectTimedOut) {
-				const customResult = await promptForCustomInput();
-				if (customResult.input !== undefined) {
-					customInput = customResult.input;
+				const input = inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input;
+				if (input !== undefined) {
+					customInput = input;
 					selectedOptions = [];
 				}
-				// If editor was dismissed (undefined), keep prior selectedOptions/customInput intact
+				// If input was dismissed (undefined), keep prior selectedOptions/customInput intact
 			}
 		} else {
 			selectedOptions = [stripRecommendedSuffix(choice)];

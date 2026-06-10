@@ -32,6 +32,7 @@ function createContext(args: {
 			onLeft?: () => void;
 			onRight?: () => void;
 			helpText?: string;
+			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
 		},
 	) => Promise<string | undefined>;
 	editor?: (
@@ -417,6 +418,69 @@ describe("AskTool custom input", () => {
 		expect(result.details?.customInput).toBe(multilineText);
 		expect(result.details?.selectedOptions).toEqual([]);
 		expect(editor).toHaveBeenCalledTimes(1);
+		expect(abort).not.toHaveBeenCalled();
+	});
+
+	it("uses inline selector input for Other without opening the editor screen", async () => {
+		const tool = new AskTool(createSession());
+		const abort = vi.fn();
+		const editor = vi.fn(async () => "editor text");
+		const questions = [
+			{
+				id: "details",
+				question: "Share details",
+				options: [{ label: "yes" }, { label: "no" }],
+			},
+		];
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				// Simulate the TUI selector collecting the text inline below the
+				// option list, then resolving with the Other label.
+				expect(dialogOptions?.customInput?.optionLabel).toBe("Other (type your own)");
+				dialogOptions?.customInput?.onSubmit("inline answer");
+				return "Other (type your own)";
+			},
+			editor,
+			abort,
+		});
+
+		const result = await tool.execute("call-inline-single", { questions }, undefined, undefined, context);
+		expect(result.details?.customInput).toBe("inline answer");
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(editor).not.toHaveBeenCalled();
+		expect(abort).not.toHaveBeenCalled();
+	});
+
+	it("uses inline selector input for Other in multi-select questions", async () => {
+		const tool = new AskTool(createSession());
+		const abort = vi.fn();
+		const editor = vi.fn(async () => "editor text");
+		const questions = [
+			{
+				id: "details",
+				question: "Share details",
+				options: [{ label: "yes" }, { label: "no" }],
+				multi: true,
+			},
+		];
+		let call = 0;
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				call++;
+				if (call === 1) {
+					return options.find(option => option.includes("yes"));
+				}
+				dialogOptions?.customInput?.onSubmit("inline multi answer");
+				return "Other (type your own)";
+			},
+			editor,
+			abort,
+		});
+
+		const result = await tool.execute("call-inline-multi", { questions }, undefined, undefined, context);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
+		expect(result.details?.customInput).toBe("inline multi answer");
+		expect(editor).not.toHaveBeenCalled();
 		expect(abort).not.toHaveBeenCalled();
 	});
 
