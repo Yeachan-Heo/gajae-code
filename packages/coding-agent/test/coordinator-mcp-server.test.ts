@@ -224,8 +224,6 @@ describe("Coordinator MCP server protocol", () => {
 			services: {
 				startSession: async input => ({
 					sessionId: "gjc-demo",
-					tmuxSession: "gjc-demo",
-					tmuxTarget: "missing-target",
 					cwd: input.cwd,
 					createdAt: "2026-06-07T00:00:00.000Z",
 				}),
@@ -291,7 +289,7 @@ describe("Coordinator MCP server protocol", () => {
 		const advisoryStatus = read.advisory_status as { live: boolean | null };
 		expect(readTurn.schema_version).toBe(1);
 		expect(readTurn.status).toBe("completed");
-		expect(advisoryStatus.live).toBe(false);
+		expect(advisoryStatus.live).toBe(null);
 
 		const afterTerminal = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "gjc-demo",
@@ -419,5 +417,104 @@ describe("Coordinator MCP server protocol", () => {
 		expect(awaited.reason).toBe("timeout");
 		const awaitedTurn = awaited.turn as { status: string };
 		expect(awaitedTurn.status).toBe("queued");
+	});
+
+	it("wakes await_turn from durable turn changes without waiting for the fallback interval", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-watch");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "queued",
+			queue: true,
+			allow_mutation: true,
+		});
+
+		const started = Date.now();
+		const timer = setTimeout(() => {
+			void server.callTool("gjc_coordinator_report_status", {
+				session_id: "gjc-demo",
+				turn_id: queued.turn_id,
+				status: "completed",
+				summary: "Done",
+				allow_mutation: true,
+			});
+		}, 25);
+		try {
+			const awaited = await server.callTool("gjc_coordinator_await_turn", {
+				session_id: "gjc-demo",
+				turn_id: queued.turn_id,
+				timeout_ms: 1000,
+				poll_interval_ms: 750,
+			});
+
+			expect(awaited.ok).toBe(true);
+			expect((awaited.turn as { status: string }).status).toBe("completed");
+			expect(Date.now() - started).toBeLessThan(500);
+		} finally {
+			clearTimeout(timer);
+		}
+	});
+
+	it("terminalizes active turns quickly when the recorded tmux session is gone", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-stale");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					tmuxSession: "definitely-missing-gjc-demo",
+					tmuxTarget: "definitely-missing-gjc-demo:0.0",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "first",
+			allow_mutation: true,
+		});
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "gjc-demo",
+			turn_id: first.turn_id,
+		});
+
+		expect((read.turn as { status: string }).status).toBe("failed");
+		expect((read.turn as { error: { code: string } }).error.code).toBe("session_unavailable");
+		expect((read.session_state as { state: string }).state).toBe("stale");
+
+		const second = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "second",
+			allow_mutation: true,
+		});
+		expect(second.ok).toBe(true);
+		expect(second.reason).toBeUndefined();
 	});
 });

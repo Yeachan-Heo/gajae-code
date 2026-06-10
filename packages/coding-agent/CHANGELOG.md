@@ -5,9 +5,11 @@
 ### Changed
 
 - Added conservative `timeout-minutes` values to all CI workflow jobs to prevent indefinite hangs.
+- Made coordinator MCP turn waiting state-backed by durable turn/session files, with runtime session sidecar updates for running/completed/error states and Meeseeks guidance that avoids fixed sleep/capture-pane loops.
 
 ### Fixed
 
+- Failed stale coordinator turns quickly when their recorded tmux session is gone, clearing active-turn state instead of burning await timeouts.
 - Improved the grep limit-reached message to show the current limit value and suggest using `--limit` for more results.
 - Fixed a `gjc harness` recovery deadlock where a session created by `start` without `--detach` (persisted as `started` with no owner lease/endpoint) could never get a live owner: `recover` refused to spawn one because no prior endpoint existed, while `start` reported `session-already-exists`. `recover` now bootstraps a fresh owner for a never-started session (no lease, no endpoint, no owner-run evidence) without writing a misleading `vanish` receipt, reported via `bootstrappedOwner: true`. Bootstrap is independent of the vanish classifier's `ownerRequired` verdict (nothing has vanished), so a session started in a non-git workspace (git delta `unknown`) is recovered too, while a deleted worktree is still refused (#421).
 
