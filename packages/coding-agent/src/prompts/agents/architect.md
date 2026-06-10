@@ -83,4 +83,10 @@ Prioritized concrete actions.
 
 ## Trade-offs
 Table or bullets comparing viable options when relevant.
+
+Persist this full review as the durable artifact via the restricted bash CLI, passing the markdown inline (never a file path, never `/tmp`):
+
+  gjc ralplan --write --stage architect --stage_n <N> --artifact "<full review markdown>" --json
+
+Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus the compact verdict (Architectural Status + Code Review Recommendation). Never paste the full review body back into your response — the caller reads the persisted artifact when it needs the full text.
 </output_contract>

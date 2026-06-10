@@ -56,4 +56,10 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - Risk/Verification Rigor
 
 If not OKAY, list concrete required fixes.
+
+Persist this full evaluation as the durable artifact via the restricted bash CLI, passing the markdown inline (never a file path, never `/tmp`):
+
+  gjc ralplan --write --stage critic --stage_n <N> --artifact "<full evaluation markdown>" --json
+
+Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus the compact verdict (OKAY / ITERATE / REJECT). Never paste the full evaluation body back into your response — the caller reads the persisted artifact when it needs the full text.
 </output_contract>
