@@ -1,5 +1,5 @@
 import { logger } from "@gajae-code/utils";
-import type { AgentSource } from "../task/types";
+import type { AgentProgress, AgentSource } from "../task/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -248,6 +248,7 @@ export class AsyncJobManager {
 	#disposed = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
+	readonly #subagentProgress = new Map<string, AgentProgress>();
 	readonly #resumeQueue: ResumeQueueEntry[] = [];
 	#resumeSeq = 0;
 	#resumeRunner?: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
@@ -531,6 +532,38 @@ export class AsyncJobManager {
 		this.#liveHandles.delete(subagentId);
 	}
 
+	/**
+	 * Retain the latest live `AgentProgress` for a subagent (deep-cloned so later
+	 * mutation of the live object cannot corrupt retained state). Read by the
+	 * `subagent` await panel; cleared on terminal/cancel/purge/dispose.
+	 *
+	 * Ignored for ids without a canonical `SubagentRecord` (e.g. foreground/inline
+	 * task runs that share the executor path) so the map only holds detached
+	 * subagent progress and never accumulates untracked foreground task state.
+	 */
+	recordSubagentProgress(subagentId: string, progress: AgentProgress): void {
+		if (!this.#subagentRecords.has(subagentId)) return;
+		this.#subagentProgress.set(subagentId, structuredClone(progress));
+	}
+
+	getSubagentProgress(subagentId: string): AgentProgress | undefined {
+		return this.#subagentProgress.get(subagentId);
+	}
+
+	/**
+	 * True only when a live, in-session progress producer exists for this id: a
+	 * canonical registered record with a live handle or an in-memory running job.
+	 * False for `SubagentTool` backward-compat job synthesis and resumed-from-disk
+	 * records, which have no live producer to stream from.
+	 */
+	hasLiveSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
+		const rec = this.getSubagentRecord(subagentId, filter);
+		if (!rec) return false;
+		if (this.#liveHandles.has(rec.subagentId)) return true;
+		const job = rec.currentJobId ? this.#jobs.get(rec.currentJobId) : undefined;
+		return job?.status === "running";
+	}
+
 	/** Install the TaskTool-owned resume runner. Returns the new job id, or undefined on failure. */
 	setResumeRunner(
 		runner: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined,
@@ -561,6 +594,7 @@ export class AsyncJobManager {
 		if (rec) {
 			rec.status = "paused";
 			this.#liveHandles.delete(rec.subagentId);
+			this.#subagentProgress.delete(rec.subagentId);
 		}
 	}
 
@@ -569,6 +603,7 @@ export class AsyncJobManager {
 		if (!rec) return;
 		rec.status = status;
 		this.#liveHandles.delete(rec.subagentId);
+		this.#subagentProgress.delete(rec.subagentId);
 	}
 
 	/** Request a graceful safe-boundary pause of a running subagent. */
@@ -626,6 +661,9 @@ export class AsyncJobManager {
 		message?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		const prevJobId = rec.currentJobId;
+		// Clear any retained progress from the previous run so a resumed subagent
+		// never renders the prior run's tool/output as live before it emits again.
+		this.#subagentProgress.delete(rec.subagentId);
 		const newJobId = this.#resumeRunner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
 		if (!newJobId) return { ok: false, reason: "resume_failed" };
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
@@ -663,6 +701,7 @@ export class AsyncJobManager {
 			}
 			rec.status = "cancelled";
 			this.#liveHandles.delete(rec.subagentId);
+			this.#subagentProgress.delete(rec.subagentId);
 			this.#drainResumeQueue();
 			return true;
 		}
@@ -671,6 +710,7 @@ export class AsyncJobManager {
 			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
 			rec.status = "cancelled";
 			rec.queued = undefined;
+			this.#subagentProgress.delete(rec.subagentId);
 			return true;
 		}
 		return false;
@@ -685,6 +725,7 @@ export class AsyncJobManager {
 				this.#liveHandles.delete(sid);
 				this.#resumeDescriptors.delete(sid);
 				this.#subagentRecords.delete(sid);
+				this.#subagentProgress.delete(sid);
 			}
 		}
 	}
@@ -1021,6 +1062,7 @@ export class AsyncJobManager {
 		this.#ownerCleanups.clear();
 		this.#subagentRecords.clear();
 		this.#liveHandles.clear();
+		this.#subagentProgress.clear();
 		this.#resumeDescriptors.clear();
 		this.#resumeQueue.length = 0;
 		this.#notifyChange();

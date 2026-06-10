@@ -691,6 +691,20 @@ function renderAgentProgress(
 }
 
 /**
+ * Public wrapper to render a single subagent's live `AgentProgress` for the
+ * `subagent` await panel. Reuses the internal task-progress renderer so the
+ * await panel stays at parity with the inline task panel.
+ */
+export function renderSubagentLiveProgress(
+	progress: AgentProgress,
+	expanded: boolean,
+	theme: Theme,
+	spinnerFrame?: number,
+): string[] {
+	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame);
+}
+
+/**
  * Render review result with combined verdict + findings in tree structure.
  */
 function renderReviewResult(

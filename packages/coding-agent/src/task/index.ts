@@ -1324,6 +1324,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
+							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
@@ -1384,6 +1385,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
+							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,

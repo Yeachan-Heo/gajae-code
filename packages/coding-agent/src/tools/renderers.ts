@@ -29,6 +29,7 @@ import { resolveToolRenderer } from "./resolve";
 import { searchToolRenderer } from "./search";
 import { searchToolBm25Renderer } from "./search-tool-bm25";
 import { sshToolRenderer } from "./ssh";
+import { subagentToolRenderer } from "./subagent-render";
 import { todoWriteToolRenderer } from "./todo-write";
 import { writeToolRenderer } from "./write";
 
@@ -66,6 +67,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	resolve: resolveToolRenderer as ToolRenderer,
 	search_tool_bm25: searchToolBm25Renderer as ToolRenderer,
 	ssh: sshToolRenderer as ToolRenderer,
+	subagent: subagentToolRenderer as ToolRenderer,
 	task: taskToolRenderer as ToolRenderer,
 	todo_write: todoWriteToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,

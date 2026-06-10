@@ -4,7 +4,7 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
-import type { AgentSource } from "../task/types";
+import type { AgentProgress, AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
@@ -63,6 +63,10 @@ export interface SubagentSnapshot {
 	outputRef?: string;
 	truncated?: boolean;
 	guidance?: string;
+	/** Live streaming progress for the awaited subagent (await panel only; UI detail). */
+	progress?: AgentProgress;
+	/** True when a live in-session progress producer exists for this subagent. */
+	liveProgressAvailable?: boolean;
 }
 
 export interface SubagentToolDetails {
@@ -322,10 +326,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		manager.watchJobs(watchedJobIds);
 		const progressTimer = onUpdate
 			? setInterval(() => {
-					onUpdate(this.#progressResult(manager, records));
+					onUpdate(this.#progressResult(manager, records, true));
 				}, 500)
 			: undefined;
-		onUpdate?.(this.#progressResult(manager, records));
+		onUpdate?.(this.#progressResult(manager, records, true));
 
 		let timedOut = false;
 		try {
@@ -355,6 +359,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			notFoundIds,
 			timedOut,
 			verbosity: params.verbosity ?? "receipt",
+			attachLiveProgress: true,
 		});
 	}
 
@@ -450,17 +455,29 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		return ids.filter(id => !this.#findVisibleRecord(manager, id, ownerFilter));
 	}
 
-	#progressResult(manager: AsyncJobManager, records: SubagentRecord[]): AgentToolResult<SubagentToolDetails> {
+	#progressResult(
+		manager: AsyncJobManager,
+		records: SubagentRecord[],
+		attachLiveProgress = false,
+	): AgentToolResult<SubagentToolDetails> {
 		return {
 			content: [{ type: "text", text: "" }],
-			details: { subagents: this.#recordSnapshots(manager, records, false, "receipt", new Set()) },
+			details: {
+				subagents: this.#recordSnapshots(manager, records, false, "receipt", new Set(), attachLiveProgress),
+			},
 		};
 	}
 
 	async #buildRecordResult(
 		manager: AsyncJobManager,
 		records: SubagentRecord[],
-		options: { title: string; notFoundIds?: string[]; timedOut?: boolean; verbosity?: SubagentParams["verbosity"] },
+		options: {
+			title: string;
+			notFoundIds?: string[];
+			timedOut?: boolean;
+			verbosity?: SubagentParams["verbosity"];
+			attachLiveProgress?: boolean;
+		},
 	): Promise<AgentToolResult<SubagentToolDetails>> {
 		const verifiedOutputIds = await this.#verifiedOutputIds(records);
 		const snapshots = this.#recordSnapshots(
@@ -469,6 +486,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			options.timedOut,
 			options.verbosity ?? "receipt",
 			verifiedOutputIds,
+			options.attachLiveProgress ?? false,
 		);
 		for (const id of options.notFoundIds ?? []) {
 			snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
@@ -513,8 +531,28 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		timedOut = false,
 		verbosity: SubagentParams["verbosity"] = "receipt",
 		verifiedOutputIds: ReadonlySet<string>,
+		attachLiveProgress = false,
 	): SubagentSnapshot[] {
-		return records.map(record => this.#recordSnapshot(manager, record, timedOut, verbosity, verifiedOutputIds));
+		return records.map(record =>
+			this.#recordSnapshot(manager, record, timedOut, verbosity, verifiedOutputIds, attachLiveProgress),
+		);
+	}
+
+	#liveProgressFields(
+		manager: AsyncJobManager,
+		record: SubagentRecord,
+		attachLiveProgress: boolean,
+	): Pick<SubagentSnapshot, "progress" | "liveProgressAvailable"> {
+		if (!attachLiveProgress) return {};
+		const liveProgressAvailable = manager.hasLiveSubagent(record.subagentId);
+		// Only surface progress when a live producer exists; stale/retained progress
+		// for a record with no live producer must degrade to a static snapshot (AC5).
+		if (!liveProgressAvailable) return { liveProgressAvailable: false };
+		const progress = manager.getSubagentProgress(record.subagentId);
+		return {
+			liveProgressAvailable: true,
+			...(progress ? { progress } : {}),
+		};
 	}
 
 	#recordSnapshot(
@@ -523,7 +561,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		timedOut = false,
 		verbosity: SubagentParams["verbosity"] = "receipt",
 		verifiedOutputIds: ReadonlySet<string>,
+		attachLiveProgress = false,
 	): SubagentSnapshot {
+		const liveFields = this.#liveProgressFields(manager, record, attachLiveProgress);
 		const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
 		if (job) {
 			return {
@@ -531,6 +571,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				id: record.subagentId,
 				jobId: record.currentJobId ?? job.id,
 				status: record.status,
+				...liveFields,
 			};
 		}
 		return {
@@ -542,6 +583,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			agentSource: "bundled",
 			durationMs: 0,
 			...(verifiedOutputIds.has(record.subagentId) ? { outputRef: `agent://${record.subagentId}` } : {}),
+			...liveFields,
 		};
 	}
 
