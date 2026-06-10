@@ -72,7 +72,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// In text mode, output final response
 	if (mode === "text") {
 		const state = session.state;
-		const lastMessage = state.messages[state.messages.length - 1];
+		const lastMessage = state.messages.findLast(message => message.role === "assistant");
 
 		if (lastMessage?.role === "assistant") {
 			const assistantMsg = lastMessage as AssistantMessage;

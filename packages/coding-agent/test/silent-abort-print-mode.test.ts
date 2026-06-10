@@ -6,7 +6,7 @@
  * (and exit with code 1). This test verifies the guard skips silent-abort.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai";
 import type { AgentSession } from "../src/session/agent-session";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
 
@@ -32,7 +32,7 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 }
 
 /** Minimal mock of AgentSession for print-mode text output path */
-function createMockSession(messages: AssistantMessage[]): AgentSession {
+function createMockSession(messages: Message[]): AgentSession {
 	return {
 		state: { messages },
 		sessionManager: {
@@ -104,5 +104,51 @@ describe("Print-mode silent-abort regression", () => {
 		expect(stderrText).toContain("Rate limit exceeded");
 		// process.exit(1) SHOULD have been called
 		expect(exitSpy).toHaveBeenCalledWith(1);
+	});
+});
+
+function makeToolResultMessage(): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: "call_1",
+		toolName: "read",
+		content: [{ type: "text", text: "file contents" }],
+		isError: false,
+		timestamp: Date.now(),
+	} as ToolResultMessage;
+}
+
+describe("Print-mode last-assistant output regression (#484)", () => {
+	let stdoutOutput: string[];
+
+	beforeEach(() => {
+		stdoutOutput = [];
+		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			const chunk = args[0];
+			if (typeof chunk === "string" && chunk.length > 0) stdoutOutput.push(chunk);
+			const last = args[args.length - 1];
+			if (typeof last === "function") last();
+			return true;
+		});
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("prints last assistant text even when a toolResult trails it", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+
+		const assistantMsg = makeAssistantMessage({
+			content: [{ type: "text", text: "@gajae-code/coding-agent" }],
+		});
+		// Cursor native tool execution can append a toolResult after the assistant reply.
+		const session = createMockSession([assistantMsg, makeToolResultMessage()]);
+		await runPrintMode(session, { mode: "text" });
+
+		const stdoutText = stdoutOutput.join("");
+		expect(stdoutText).toContain("@gajae-code/coding-agent");
 	});
 });

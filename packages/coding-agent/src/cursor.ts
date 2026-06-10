@@ -161,7 +161,20 @@ function formatMcpToolErrorMessage(toolName: string, availableTools: string[]): 
 }
 
 export class CursorExecHandlers implements ICursorExecHandlers {
-	constructor(private options: CursorExecBridgeOptions) {}
+	constructor(private options: CursorExecBridgeOptions) {
+		// Bind every native handler so methods stay instance-safe when invoked
+		// detached/unbound by the Cursor provider (e.g. `const read = handlers.read`).
+		// Without this, `this.#optionsForCall()` throws "undefined is not an object".
+		this.read = this.read.bind(this);
+		this.ls = this.ls.bind(this);
+		this.grep = this.grep.bind(this);
+		this.write = this.write.bind(this);
+		this.delete = this.delete.bind(this);
+		this.shell = this.shell.bind(this);
+		this.shellStream = this.shellStream.bind(this);
+		this.diagnostics = this.diagnostics.bind(this);
+		this.mcp = this.mcp.bind(this);
+	}
 
 	#optionsForCall(): CursorExecBridgeOptions {
 		return {
