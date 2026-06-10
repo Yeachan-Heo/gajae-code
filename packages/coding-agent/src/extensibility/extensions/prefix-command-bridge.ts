@@ -4,6 +4,7 @@ import type { ExtensionContext, InputEvent, InputEventResult } from "./types";
 
 export const OOO_BRIDGE_RECURSION_ENV = "_OUROBOROS_GJC_BRIDGE_DEPTH";
 export const OOO_BRIDGE_CONTINUE_EXIT_CODE = 78;
+export const OOO_BRIDGE_TIMEOUT_ENV = "OUROBOROS_GJC_BRIDGE_TIMEOUT_MS";
 
 export interface ExactPrefixCommandBridgeOptions {
 	/** Bare command prefix to intercept, without trailing whitespace. */
@@ -28,14 +29,27 @@ export interface ExactPrefixCommandBridgeOptions {
 }
 
 function isExactPrefixMatch(text: string, prefix: string): boolean {
-	return text === prefix || text.startsWith(`${prefix} `);
+	return text === prefix || text.startsWith(`${prefix} `) || text.startsWith(`${prefix}\t`);
 }
+
+function parseTimeoutEnv(envName: string): number | undefined {
+	const value = process.env[envName];
+	if (value === undefined || value.trim() === "") return undefined;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function isDispatchSource(event: InputEvent): boolean {
+	return event.source === undefined || event.source === "interactive";
+}
+
+const activeDispatches = new WeakSet<InputEvent>();
 
 function hasActiveRecursionGuard(envName: string): boolean {
 	const value = process.env[envName];
 	if (value === undefined || value === "") return false;
 	const depth = Number(value);
-	return Number.isFinite(depth) ? depth > 0 : true;
+	return Number.isFinite(depth) ? depth > 1 : true;
 }
 
 function nextRecursionDepth(envName: string): string {
@@ -57,18 +71,21 @@ export function createExactPrefixCommandBridge(options: ExactPrefixCommandBridge
 	const recursionEnv = options.recursionEnv ?? OOO_BRIDGE_RECURSION_ENV;
 	const continueExitCode = options.continueExitCode ?? OOO_BRIDGE_CONTINUE_EXIT_CODE;
 	const args = options.args ?? [];
+	const timeout = options.timeout ?? parseTimeoutEnv(OOO_BRIDGE_TIMEOUT_ENV);
 	const dispatch =
 		options.dispatch ??
 		((command, commandArgs, ctx, execOptions) => execCommand(command, commandArgs, ctx.cwd, execOptions));
 
 	return async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
 		if (!isExactPrefixMatch(event.text, options.prefix)) return {};
-		if (event.source === "extension" || hasActiveRecursionGuard(recursionEnv)) return {};
+		if (!isDispatchSource(event) || hasActiveRecursionGuard(recursionEnv)) return {};
+		if (activeDispatches.has(event)) return {};
 
 		const previousDepth = process.env[recursionEnv];
+		activeDispatches.add(event);
 		process.env[recursionEnv] = nextRecursionDepth(recursionEnv);
 		try {
-			const result = await dispatch(options.command, [...args, event.text], ctx, { timeout: options.timeout });
+			const result = await dispatch(options.command, [...args, event.text], ctx, { timeout });
 			if (result.code === 0) return { handled: true };
 			if (result.code === continueExitCode) return {};
 
@@ -80,9 +97,19 @@ export function createExactPrefixCommandBridge(options: ExactPrefixCommandBridge
 				prefix: options.prefix,
 				error: output,
 			});
-			ctx.ui.notify(output, "error");
+			ctx.ui?.notify(output, "error");
+			return { handled: true };
+		} catch (err) {
+			const output = err instanceof Error ? err.message : String(err);
+			logger.error("Exact-prefix command bridge dispatch failed", {
+				command: options.command,
+				prefix: options.prefix,
+				error: output,
+			});
+			ctx.ui?.notify(output, "error");
 			return { handled: true };
 		} finally {
+			activeDispatches.delete(event);
 			if (previousDepth === undefined) {
 				delete process.env[recursionEnv];
 			} else {
