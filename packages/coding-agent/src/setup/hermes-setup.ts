@@ -24,6 +24,8 @@ export interface HermesSetupFlags {
 	repo?: string;
 	profile?: string;
 	sessionCommand?: string;
+	noWorktree?: boolean;
+	worktreeName?: string;
 	stateRoot?: string;
 	mutation?: string[];
 	artifactByteCap?: string;
@@ -47,6 +49,11 @@ export interface CoordinatorSetupSpec {
 		repo?: string;
 	};
 	sessionCommand?: string;
+	sessionCommandSource: "default" | "explicit";
+	worktree: {
+		enabled: boolean;
+		name?: string;
+	};
 	stateRoot?: string;
 	mutationPolicy: {
 		classes: HermesMutationClass[];
@@ -157,6 +164,39 @@ function parseByteCap(value: string | undefined): number | undefined {
 	return parsed;
 }
 
+function normalizeWorktreeName(value: string | undefined): string | undefined {
+	const trimmed = optionalTrim(value);
+	if (!trimmed) return undefined;
+	if (trimmed.startsWith("-") || !/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(trimmed)) {
+		throw new HermesSetupError(`Invalid Hermes worktree name: ${trimmed}`, 2);
+	}
+	return trimmed;
+}
+
+function resolveHermesWorktree(flags: HermesSetupFlags): CoordinatorSetupSpec["worktree"] {
+	if (flags.noWorktree && flags.worktreeName) {
+		throw new HermesSetupError("Use either --no-worktree or --worktree-name, not both.", 2);
+	}
+	const name = normalizeWorktreeName(flags.worktreeName);
+	return flags.noWorktree ? { enabled: false } : { enabled: true, ...(name ? { name } : {}) };
+}
+
+function resolveHermesSessionCommand(gjcCommand: string, flags: HermesSetupFlags): string {
+	const explicit = optionalTrim(flags.sessionCommand);
+	if (explicit) {
+		if (flags.noWorktree || flags.worktreeName) {
+			throw new HermesSetupError(
+				"Use either --session-command or Hermes worktree flags; explicit session commands are preserved exactly.",
+				2,
+			);
+		}
+		return explicit;
+	}
+	const worktree = resolveHermesWorktree(flags);
+	if (!worktree.enabled) return gjcCommand;
+	return worktree.name ? `${gjcCommand} --worktree ${worktree.name}` : `${gjcCommand} --worktree`;
+}
+
 function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["installTarget"] {
 	if (flags.target && flags.profileDir) {
 		throw new HermesSetupError("Use exactly one of --target or --profile-dir for Hermes setup install targets.", 2);
@@ -169,20 +209,24 @@ function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["
 
 export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupSpec {
 	const roots = normalizeRoots(flags.root);
+	const gjcCommand = optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND;
+	const sessionCommand = resolveHermesSessionCommand(gjcCommand, flags);
 	return {
 		schemaVersion: 1,
 		coordinator: "hermes",
 		serverKey: optionalTrim(flags.serverKey) ?? DEFAULT_SERVER_KEY,
 		serverName: COORDINATOR_MCP_SERVER_NAME,
 		protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION,
-		gjcCommand: optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND,
+		gjcCommand,
 		args: ["mcp-serve", "coordinator"],
 		roots,
 		namespace: {
 			...(optionalTrim(flags.profile) ? { profile: optionalTrim(flags.profile) } : {}),
 			...(optionalTrim(flags.repo) ? { repo: optionalTrim(flags.repo) } : {}),
 		},
-		...(optionalTrim(flags.sessionCommand) ? { sessionCommand: flags.sessionCommand } : {}),
+		worktree: resolveHermesWorktree(flags),
+		sessionCommandSource: optionalTrim(flags.sessionCommand) ? "explicit" : "default",
+		sessionCommand,
 		...(optionalTrim(flags.stateRoot) ? { stateRoot: path.resolve(flags.stateRoot!) } : {}),
 		mutationPolicy: {
 			classes: parseMutationClasses(flags.mutation),
@@ -214,6 +258,8 @@ function signaturePayload(spec: CoordinatorSetupSpec): Record<string, unknown> {
 		contractDocVersion: spec.contractDocVersion,
 		coordinator: spec.coordinator,
 		mutationClasses: spec.mutationPolicy.classes,
+		worktree: spec.worktree,
+		sessionCommandSource: spec.sessionCommandSource,
 		namespace: spec.namespace,
 		operatorTemplateVersion: spec.operatorTemplateVersion,
 		roots: spec.roots,
@@ -360,7 +406,9 @@ async function runSmoke(spec: CoordinatorSetupSpec): Promise<HermesSetupResult["
 	const requiredTools = [...COORDINATOR_MCP_TOOL_NAMES];
 	const server = createCoordinatorMcpServer({ env: {} });
 	const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
-	const advertised = new Set((listed.result?.tools ?? []).map((tool: { name: string }) => tool.name));
+	const listedResult = isRecord(listed.result) ? listed.result : {};
+	const tools = Array.isArray(listedResult.tools) ? listedResult.tools : [];
+	const advertised = new Set(tools.map(tool => (isRecord(tool) ? String(tool.name) : "")));
 	const missingTools = requiredTools.filter(tool => !advertised.has(tool));
 	return {
 		ok: missingTools.length === 0,
@@ -398,11 +446,18 @@ export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSet
 		mode,
 		files_written,
 		previews,
-		warnings: spec.sessionCommand
-			? [
-					"Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND exactly as supplied; provider/model validation is not performed.",
-				]
-			: ["No session command supplied; spawned sessions use the default GJC command/model resolution."],
+		warnings:
+			spec.sessionCommandSource === "explicit"
+				? [
+						"Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND exactly as supplied; provider/model/worktree validation is not performed.",
+					]
+				: spec.worktree.enabled
+					? [
+							`GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to '${spec.sessionCommand}' so GJC owns worktree creation and resume identity.`,
+						]
+					: [
+							"GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to the configured gjc command with worktree isolation disabled by user request.",
+						],
 		smoke,
 	};
 }

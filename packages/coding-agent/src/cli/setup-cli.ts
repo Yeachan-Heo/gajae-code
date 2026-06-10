@@ -48,6 +48,8 @@ export interface SetupCommandArgs {
 		repo?: string;
 		profile?: string;
 		sessionCommand?: string;
+		noWorktree?: boolean;
+		worktreeName?: string;
 		stateRoot?: string;
 		mutation?: string[];
 		artifactByteCap?: string;
@@ -119,6 +121,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.profile = args[++i];
 		} else if (arg === "--session-command") {
 			flags.sessionCommand = args[++i];
+		} else if (arg === "--no-worktree") {
+			flags.noWorktree = true;
+		} else if (arg === "--worktree-name") {
+			flags.worktreeName = args[++i];
 		} else if (arg === "--state-root") {
 			flags.stateRoot = args[++i];
 		} else if (arg === "--mutation") {
@@ -493,7 +499,8 @@ ${chalk.bold("Provider example:")}
 ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
   ${APP_NAME} setup hermes --root /path/to/repo --profile my-bot --repo gajae-code --profile-dir /path/to/hermes/profile --install
-  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --model <provider/model>"
+  ${APP_NAME} setup hermes --root /path/to/repo --worktree-name hermes-gajae-code
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom --model <provider/model>"
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -511,7 +518,9 @@ ${chalk.bold("Options:")}
   --root            Allowed Hermes MCP workdir/artifact root (repeatable)
   --profile         Hermes MCP profile namespace
   --repo            Hermes MCP repo namespace
-  --session-command Explicit GJC session command; omitted by default
+  --session-command Explicit GJC session command; disables generated worktree flags
+  --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
+  --worktree-name   Named GJC --worktree branch for Hermes sessions
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
   --target          Hermes config file target for config-only install
   --profile-dir     Hermes profile directory for full setup install
@@ -522,7 +531,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup defaults --check Check bundled GJC default workflow skills are installed
   ${APP_NAME} setup hooks            Install native Codex skill-state hooks
   ${APP_NAME} setup hooks --check    Check native Codex skill-state hooks
-  ${APP_NAME} setup hermes           Render a model-agnostic Hermes MCP setup preview
+  ${APP_NAME} setup hermes --root /path/to/repo Render a model-agnostic Hermes MCP setup preview
   ${APP_NAME} setup python           Install Python execution dependencies
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available

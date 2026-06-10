@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
@@ -9,10 +8,6 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
-import {
-	GJC_COORDINATOR_SESSION_ID_ENV,
-	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
-} from "../gjc-runtime/session-state-sidecar";
 import {
 	assertCoordinatorArtifactPath,
 	assertCoordinatorWorkdir,
@@ -35,7 +30,7 @@ interface JsonRpcRequest {
 interface JsonRpcResponse {
 	jsonrpc: "2.0";
 	id: string | number | null;
-	result?: any;
+	result?: unknown;
 	error?: { code: number; message: string; data?: unknown };
 }
 
@@ -83,16 +78,7 @@ interface TurnRecord {
 		delivered: boolean;
 		queued: boolean;
 		target: string | null;
-		tmux_keys_sent?: boolean;
-		prompt_acknowledged?: boolean;
-		state?: "queued" | "tmux_keys_sent" | "acknowledged" | "unavailable";
-		attempts: Array<{
-			delivered: boolean;
-			created_at: string;
-			reason: string | null;
-			channel?: "tmux_keys" | "runtime_ack";
-			tmux_keys_sent?: boolean;
-		}>;
+		attempts: Array<{ delivered: boolean; created_at: string; reason: string | null }>;
 	};
 	question_ids: string[];
 	final_response: {
@@ -111,33 +97,15 @@ interface TurnRecord {
 	completed_at: string | null;
 }
 
-type CoordinatorSessionStateValue =
-	| "booting"
-	| "ready_for_input"
-	| "running"
-	| "needs_user_input"
-	| "completed"
-	| "errored"
-	| "stale"
-	| "unknown";
-
-interface CoordinatorSessionState {
-	schema_version: 1;
-	session_id: string;
-	state: CoordinatorSessionStateValue;
-	ready_for_input: boolean;
-	current_turn_id: string | null;
-	last_turn_id: string | null;
-	updated_at: string;
-	source: "coordinator" | "agent_session_event";
-	live: boolean | null;
-	reason: string | null;
-}
-
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_EXTERNAL_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
 
 function textResult(
 	payload: unknown,
@@ -293,7 +261,7 @@ function toolSchema(name: CoordinatorToolName): {
 	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
 }
 
-function normalizeSession(session: any): Record<string, unknown> {
+function normalizeSession(session: Record<string, unknown>): Record<string, unknown> {
 	return {
 		session_id: session.sessionId ?? session.session_id ?? session.name ?? "unknown",
 		...(session.tmuxSession ? { tmux_session: session.tmuxSession } : {}),
@@ -307,7 +275,7 @@ async function ensureDir(dir: string): Promise<void> {
 	await fs.mkdir(dir, { recursive: true });
 }
 
-async function readJsonFile(file: string): Promise<any | null> {
+async function readJsonFile(file: string): Promise<unknown | null> {
 	try {
 		return JSON.parse(await fs.readFile(file, "utf8"));
 	} catch {
@@ -320,7 +288,7 @@ async function writeJsonFile(file: string, value: unknown): Promise<void> {
 	await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function listJsonFiles(dir: string): Promise<any[]> {
+async function listJsonFiles(dir: string): Promise<unknown[]> {
 	try {
 		const entries = await fs.readdir(dir);
 		const values = await Promise.all(
@@ -358,10 +326,6 @@ function questionFile(namespaceDir: string, questionId: string): string {
 	return path.join(namespaceDir, "questions", `${safeExternalId("question", questionId)}.json`);
 }
 
-function sessionStateFile(namespaceDir: string, sessionId: string): string {
-	return path.join(namespaceDir, "session-states", `${safeExternalId("session", sessionId)}.json`);
-}
-
 async function readTurnRecord(namespaceDir: string, turnId: unknown): Promise<TurnRecord | null> {
 	return (await readJsonFile(turnFile(namespaceDir, safeTurnId(turnId)))) as TurnRecord | null;
 }
@@ -392,120 +356,6 @@ async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 	if (active?.turn_id === turn.turn_id) await fs.rm(activeTurnFile(namespaceDir, turn.session_id), { force: true });
 }
 
-async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
-	return (await readJsonFile(sessionStateFile(namespaceDir, sessionId))) as CoordinatorSessionState | null;
-}
-
-async function writeSessionState(
-	namespaceDir: string,
-	sessionId: string,
-	state: CoordinatorSessionStateValue,
-	options: {
-		currentTurnId?: string | null;
-		lastTurnId?: string | null;
-		live?: boolean | null;
-		reason?: string | null;
-		source?: CoordinatorSessionState["source"];
-	} = {},
-): Promise<CoordinatorSessionState> {
-	const previous = await readSessionState(namespaceDir, sessionId);
-	const payload: CoordinatorSessionState = {
-		schema_version: 1,
-		session_id: sessionId,
-		state,
-		ready_for_input: state === "ready_for_input" || state === "completed",
-		current_turn_id: options.currentTurnId ?? (state === "running" ? (previous?.current_turn_id ?? null) : null),
-		last_turn_id: options.lastTurnId ?? previous?.last_turn_id ?? null,
-		updated_at: new Date().toISOString(),
-		source: options.source ?? "coordinator",
-		live: options.live ?? previous?.live ?? null,
-		reason: options.reason ?? null,
-	};
-	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
-	return payload;
-}
-
-function hasTmuxIdentity(session: Record<string, unknown>): boolean {
-	return (
-		(typeof session.tmux_session === "string" && session.tmux_session.length > 0) ||
-		(typeof session.tmuxSession === "string" && session.tmuxSession.length > 0)
-	);
-}
-
-async function markTurnFailedForUnavailableSession(
-	namespaceDir: string,
-	turn: TurnRecord,
-	reason: string,
-): Promise<TurnRecord> {
-	const timestamp = new Date().toISOString();
-	const failed: TurnRecord = {
-		...turn,
-		status: "failed",
-		final_response: {
-			text: `Coordinator session unavailable: ${reason}`,
-			format: "markdown",
-			source: "coordinator_liveness",
-			artifact_path: null,
-			truncated: false,
-		},
-		error: { code: "session_unavailable", message: reason, recoverable: true },
-		liveness: { checked_at: timestamp, live: false, reason },
-		updated_at: timestamp,
-		completed_at: timestamp,
-	};
-	await writeTurnRecord(namespaceDir, failed);
-	await clearActiveTurn(namespaceDir, failed);
-	await writeSessionState(namespaceDir, failed.session_id, "stale", {
-		lastTurnId: failed.turn_id,
-		live: false,
-		reason,
-	});
-	return failed;
-}
-
-async function markTurnTerminalFromSessionState(
-	namespaceDir: string,
-	turn: TurnRecord,
-	sessionState: CoordinatorSessionState,
-): Promise<TurnRecord> {
-	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
-	const timestamp = new Date().toISOString();
-	const resolved: TurnRecord = {
-		...turn,
-		status: terminalStatus,
-		delivery: {
-			...turn.delivery,
-			prompt_acknowledged: true,
-			state: "acknowledged",
-		},
-		final_response: {
-			text: null,
-			format: "markdown",
-			source: "runtime_state",
-			artifact_path: null,
-			truncated: false,
-		},
-		error:
-			terminalStatus === "failed"
-				? { code: "runtime_errored", message: sessionState.reason ?? "runtime_errored", recoverable: true }
-				: null,
-		updated_at: timestamp,
-		completed_at: timestamp,
-	};
-	await writeTurnRecord(namespaceDir, resolved);
-	await clearActiveTurn(namespaceDir, resolved);
-	await writeSessionState(namespaceDir, resolved.session_id, sessionState.state, {
-		lastTurnId: resolved.turn_id,
-		live: sessionState.live,
-		reason: sessionState.reason,
-	});
-	return resolved;
-}
-
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 function makeTurnRecord(
 	config: CoordinatorMcpConfig,
 	sessionId: string,
@@ -520,15 +370,7 @@ function makeTurnRecord(
 		namespace: config.namespace,
 		status,
 		prompt: { text: prompt, created_at: timestamp, source: "mcp" },
-		delivery: {
-			delivered: false,
-			queued: true,
-			target: null,
-			tmux_keys_sent: false,
-			prompt_acknowledged: false,
-			state: "queued",
-			attempts: [],
-		},
+		delivery: { delivered: false, queued: true, target: null, attempts: [] },
 		question_ids: [],
 		final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
 		evidence: [],
@@ -585,17 +427,9 @@ function boundedLineCount(value: unknown): number {
 async function startTmuxSession(
 	config: CoordinatorMcpConfig,
 	input: SessionStartInput,
-	namespaceDir: string,
-): Promise<Record<string, unknown> | null> {
-	if (!config.sessionCommand) return null;
+): Promise<Record<string, unknown>> {
+	if (!config.sessionCommand) throw new Error("coordinator_session_command_required");
 	const sessionName = `gjc-coordinator-${randomUUID().slice(0, 8)}`;
-	const runtimeStateFile = sessionStateFile(namespaceDir, sessionName);
-	const sessionCommand = [
-		"exec env",
-		`${GJC_COORDINATOR_SESSION_STATE_FILE_ENV}=${shellQuote(runtimeStateFile)}`,
-		`${GJC_COORDINATOR_SESSION_ID_ENV}=${shellQuote(sessionName)}`,
-		config.sessionCommand,
-	].join(" ");
 	const started = await runCommand([
 		"tmux",
 		"new-session",
@@ -607,13 +441,10 @@ async function startTmuxSession(
 		sessionName,
 		"-c",
 		input.cwd,
-		sessionCommand,
+		config.sessionCommand,
 	]);
 	if (started.exitCode !== 0) throw new Error(`coordinator_tmux_start_failed:${started.stderr || started.stdout}`);
 	const [tmuxTarget, paneId] = started.stdout.trim().split(/\s+/, 2);
-	const initialPromptTmuxKeysSent = input.prompt
-		? await sendTmuxPromptKeys(tmuxTarget || sessionName, input.prompt)
-		: false;
 	return {
 		sessionId: sessionName,
 		tmuxSession: sessionName,
@@ -622,8 +453,6 @@ async function startTmuxSession(
 		cwd: input.cwd,
 		createdAt: new Date().toISOString(),
 		sessionCommand: config.sessionCommand,
-		runtimeStateFile,
-		initialPromptTmuxKeysSent,
 	};
 }
 
@@ -639,6 +468,32 @@ async function sendTmuxPrompt(session: Record<string, unknown>, prompt: string):
 	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
 	if (typeof target !== "string" || target.length === 0) return false;
 	return await sendTmuxPromptKeys(target, prompt);
+}
+
+async function deliverTurn(
+	namespaceDir: string,
+	session: Record<string, unknown>,
+	turn: TurnRecord,
+): Promise<TurnRecord> {
+	const delivered = await sendTmuxPrompt(session, turn.prompt.text);
+	const timestamp = new Date().toISOString();
+	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
+	const deliveredTurn: TurnRecord = {
+		...turn,
+		status: "active",
+		delivery: {
+			delivered,
+			queued: !delivered,
+			target: typeof target === "string" ? target : null,
+			attempts: [{ delivered, created_at: timestamp, reason: delivered ? null : "tmux_delivery_unavailable" }],
+		},
+		liveness: { checked_at: timestamp, live: await hasTmuxSession(session), reason: null },
+		started_at: turn.started_at ?? timestamp,
+		updated_at: timestamp,
+	};
+	await writeTurnRecord(namespaceDir, deliveredTurn);
+	await writeActiveTurn(namespaceDir, deliveredTurn);
+	return deliveredTurn;
 }
 
 async function hasTmuxSession(session: Record<string, unknown>): Promise<boolean | null> {
@@ -681,39 +536,6 @@ async function inspectTmuxSession(session: Record<string, unknown>, lines = 80):
 		...summarizePaneTail(tail),
 		tail_preview: tail.slice(-20),
 	};
-}
-
-function waitForTurnStateChange(namespaceDir: string, turn: TurnRecord, timeoutMs: number): Promise<void> {
-	const deferred = Promise.withResolvers<void>();
-	const watchers: nodeFs.FSWatcher[] = [];
-	const watchedFiles = new Map<string, Set<string>>([
-		[turnsDir(namespaceDir), new Set([`${turn.turn_id}.json`])],
-		[path.join(namespaceDir, "active-turns"), new Set([`${turn.session_id}.json`])],
-		[path.join(namespaceDir, "session-states"), new Set([`${turn.session_id}.json`])],
-	]);
-	let settled = false;
-	const finish = () => {
-		if (settled) return;
-		settled = true;
-		for (const watcher of watchers) watcher.close();
-		clearTimeout(timer);
-		deferred.resolve();
-	};
-	const timer = setTimeout(finish, Math.max(timeoutMs, 0));
-	timer.unref?.();
-
-	for (const [dir, filenames] of watchedFiles) {
-		try {
-			const watcher = nodeFs.watch(dir, (_eventType, filename) => {
-				if (typeof filename === "string" && filenames.has(filename)) finish();
-			});
-			watchers.push(watcher);
-		} catch {
-			// Directory may not exist yet; the timeout remains a bounded fallback.
-		}
-	}
-
-	return deferred.promise;
 }
 
 function decodeUtf8WithinByteCap(bytes: Buffer, byteCap: number): string {
@@ -772,6 +594,40 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
+	async function listQuestions(args: Record<string, unknown>): Promise<unknown[]> {
+		const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
+		const status = typeof args.status === "string" && args.status.length > 0 ? args.status : null;
+		return (await listJsonFiles(path.join(namespaceDir, "questions"))).filter(question => {
+			const record = asRecord(question);
+			if (!record) return false;
+			if (sessionId && record.session_id !== sessionId) return false;
+			if (status && record.status !== status) return false;
+			return true;
+		});
+	}
+
+	async function validateEvidencePaths(value: unknown): Promise<Array<{ path: string }>> {
+		if (value == null) return [];
+		if (!Array.isArray(value)) throw new Error("coordinator_evidence_paths_must_be_array");
+		const evidence: Array<{ path: string }> = [];
+		for (const item of value) {
+			const resolved = await assertCoordinatorArtifactPath(config, item);
+			evidence.push({ path: resolved.path });
+		}
+		return evidence;
+	}
+
+	async function promoteNextQueuedTurn(sessionId: string): Promise<TurnRecord | null> {
+		const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+		if (!session) return null;
+		const queuedTurns = (await listJsonFiles(turnsDir(namespaceDir)))
+			.map(turn => asRecord(turn) as TurnRecord | null)
+			.filter((turn): turn is TurnRecord => turn?.session_id === sessionId && turn.status === "queued")
+			.sort((left, right) => left.created_at.localeCompare(right.created_at));
+		const nextTurn = queuedTurns[0];
+		return nextTurn ? await deliverTurn(namespaceDir, session, nextTurn) : null;
+	}
+
 
 	async function readTurnPayload(
 		turnId: unknown,
@@ -783,45 +639,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
 			return { ok: false, reason: "turn_session_mismatch" };
 		}
-		const session = await readJsonFile(sessionFile(turn.session_id));
-		let resolvedTurn = turn;
-		let advisoryStatus: Record<string, unknown> = { live: false };
-		let sessionState = await readSessionState(namespaceDir, turn.session_id);
-		if (
-			sessionState &&
-			ACTIVE_TURN_STATUSES.has(turn.status) &&
-			sessionState.current_turn_id === turn.turn_id &&
-			(sessionState.state === "completed" || sessionState.state === "errored")
-		) {
-			resolvedTurn = await markTurnTerminalFromSessionState(namespaceDir, turn, sessionState);
-			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		} else if (
-			sessionState &&
-			ACTIVE_TURN_STATUSES.has(turn.status) &&
-			sessionState.current_turn_id === turn.turn_id &&
-			sessionState.state === "stale" &&
-			sessionState.reason === "tmux_delivery_unavailable" &&
-			turn.delivery.state === "unavailable" &&
-			session &&
-			hasTmuxIdentity(session)
-		) {
-			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "tmux_delivery_unavailable");
-			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		} else if (!session && ACTIVE_TURN_STATUSES.has(turn.status)) {
-			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "session_record_missing");
-			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		} else if (session) {
-			advisoryStatus = await inspectTmuxSession(session, boundedLineCount(lines));
-			if (ACTIVE_TURN_STATUSES.has(turn.status) && hasTmuxIdentity(session) && advisoryStatus.live === false) {
-				resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "tmux_session_missing");
-				sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-			}
-		}
+		const session = asRecord(await readJsonFile(sessionFile(turn.session_id)));
 		return {
 			ok: true,
-			turn: resolvedTurn,
-			advisory_status: advisoryStatus,
-			session_state: sessionState,
+			turn,
+			advisory_status: session ? await inspectTmuxSession(session, boundedLineCount(lines)) : { live: false },
 		};
 	}
 
@@ -831,57 +653,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_read_status") {
 				const sessionId = args.session_id;
 				if (sessionId) {
-					const session = await readJsonFile(sessionFile(sessionId));
-					return {
-						ok: true,
-						session,
-						status: session ? await inspectTmuxSession(session) : { live: false },
-						session_state: await readSessionState(namespaceDir, safeExternalId("session", sessionId)),
-					};
+					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+					return { ok: true, session, status: session ? await inspectTmuxSession(session) : { live: false } };
 				}
 				const sessions = await listSessions();
 				const statuses = await Promise.all(
-					sessions.map(async session => {
-						if (typeof session !== "object" || session === null) return { session, status: { live: null } };
-						const normalized = session as Record<string, unknown>;
-						const listedSessionId =
-							typeof normalized.session_id === "string"
-								? normalized.session_id
-								: normalizeSession(normalized).session_id;
-						return {
-							session,
-							status: await inspectTmuxSession(normalized, 40),
-							session_state: await readSessionState(namespaceDir, listedSessionId as string),
-						};
-					}),
+					sessions.map(async session =>
+						typeof session === "object" && session !== null
+							? { session, status: await inspectTmuxSession(session as Record<string, unknown>, 40) }
+							: { session, status: { live: null } },
+					),
 				);
 				return { ok: true, sessions, statuses };
 			}
 			if (name === "gjc_coordinator_read_tail") {
-				const session = await readJsonFile(sessionFile(args.session_id));
+				const session = asRecord(await readJsonFile(sessionFile(args.session_id)));
 				return { ok: true, lines: session ? await captureTmuxTail(session, boundedLineCount(args.lines)) : [] };
 			}
-			if (name === "gjc_coordinator_list_questions") {
-				const questions = await listJsonFiles(path.join(namespaceDir, "questions"));
-				const sessionId = typeof args.session_id === "string" ? safeExternalId("session", args.session_id) : null;
-				if (sessionId) {
-					const openQuestion = questions.find(
-						question =>
-							question &&
-							typeof question === "object" &&
-							(question as { session_id?: unknown }).session_id === sessionId &&
-							(question as { status?: unknown }).status === "open",
-					) as { turn_id?: unknown } | undefined;
-					if (openQuestion) {
-						await writeSessionState(namespaceDir, sessionId, "needs_user_input", {
-							currentTurnId: typeof openQuestion.turn_id === "string" ? openQuestion.turn_id : null,
-							live: null,
-							reason: "open_question",
-						});
-					}
-				}
-				return { ok: true, questions };
-			}
+			if (name === "gjc_coordinator_list_questions")
+				return { ok: true, questions: await listQuestions(args) };
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
@@ -898,84 +688,47 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				const started = services.startSession
 					? await services.startSession(input)
-					: await startTmuxSession(config, input, namespaceDir);
-				const session = normalizeSession(
-					started ?? { sessionId: `gjc-coordinator-${Date.now()}`, cwd, createdAt: new Date().toISOString() },
-				);
+					: await startTmuxSession(config, input);
+				const startedRecord = asRecord(started);
+				if (!startedRecord) throw new Error("coordinator_session_command_required");
+				const session = normalizeSession(startedRecord);
 				await writeJsonFile(sessionFile(session.session_id), session);
-				const live = hasTmuxIdentity(session) ? await hasTmuxSession(session) : null;
-				let turn: TurnRecord | null = null;
-				let sessionState = await writeSessionState(
-					namespaceDir,
-					session.session_id as string,
-					input.prompt ? "running" : "ready_for_input",
-					{ live, reason: null },
-				);
-				if (input.prompt) {
-					const tmuxKeysSent = session.initialPromptTmuxKeysSent === true;
-					turn = makeTurnRecord(config, session.session_id as string, input.prompt, "active");
-					const timestamp = new Date().toISOString();
-					turn.delivery = {
-						delivered: false,
-						queued: !tmuxKeysSent,
-						target:
-							typeof session.tmux_target === "string"
-								? session.tmux_target
-								: typeof session.tmuxTarget === "string"
-									? session.tmuxTarget
-									: null,
-						tmux_keys_sent: tmuxKeysSent,
-						prompt_acknowledged: false,
-						state: tmuxKeysSent ? "tmux_keys_sent" : "unavailable",
-						attempts: [
-							{
-								delivered: false,
-								tmux_keys_sent: tmuxKeysSent,
-								channel: "tmux_keys",
-								created_at: timestamp,
-								reason: tmuxKeysSent ? "awaiting_runtime_ack" : "tmux_delivery_unavailable",
-							},
-						],
-					};
-					turn.liveness = { checked_at: timestamp, live, reason: live === false ? "tmux_session_missing" : null };
-					turn.updated_at = timestamp;
-					await writeTurnRecord(namespaceDir, turn);
-					await writeActiveTurn(namespaceDir, turn);
-					await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), {
-						session_id: turn.session_id,
+				if (typeof args.prompt === "string" && args.prompt.length > 0) {
+					const turn = await deliverTurn(
+						namespaceDir,
+						session,
+						makeTurnRecord(config, String(session.session_id), args.prompt, "active"),
+					);
+					const prompt = {
+						session_id: session.session_id,
 						turn_id: turn.turn_id,
-						prompt: input.prompt,
+						prompt: args.prompt,
 						queued: turn.delivery.queued,
 						delivered: turn.delivery.delivered,
-						tmux_keys_sent: turn.delivery.tmux_keys_sent ?? false,
-						prompt_acknowledged: turn.delivery.prompt_acknowledged ?? false,
 						created_at: turn.created_at,
-					});
-					sessionState = await writeSessionState(
-						namespaceDir,
-						turn.session_id,
-						tmuxKeysSent ? "running" : "stale",
-						{
-							currentTurnId: turn.turn_id,
-							live,
-							reason: tmuxKeysSent ? null : "tmux_delivery_unavailable",
-						},
-					);
+					};
+					await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), prompt);
+					return {
+						ok: true,
+						session,
+						turn_id: turn.turn_id,
+						active_turn_id: turn.turn_id,
+						status: turn.status,
+						queued: turn.delivery.queued,
+						delivered: turn.delivery.delivered,
+						delivery: turn.delivery,
+					};
 				}
-				return { ok: true, session, session_state: sessionState, ...(turn ? { turn, turn_id: turn.turn_id } : {}) };
+				return { ok: true, session };
 			}
 			if (name === "gjc_coordinator_send_prompt") {
 				requireCoordinatorMutation(config, "sessions", args);
 				const sessionId = safeExternalId("session", args.session_id);
-				const session = await readJsonFile(sessionFile(sessionId));
+				const session = asRecord(await readJsonFile(sessionFile(sessionId)));
 				if (!session) return { ok: false, reason: "unknown_session", session_id: sessionId };
 				if (typeof args.prompt !== "string" || args.prompt.length === 0)
 					return { ok: false, reason: "prompt_required" };
-				let activeTurn = await readActiveTurn(namespaceDir, sessionId);
-				if (activeTurn && hasTmuxIdentity(session) && (await hasTmuxSession(session)) === false) {
-					activeTurn = await markTurnFailedForUnavailableSession(namespaceDir, activeTurn, "tmux_session_missing");
-					activeTurn = null;
-				}
+				const activeTurn = await readActiveTurn(namespaceDir, sessionId);
 				if (activeTurn && args.force !== true && args.queue !== true) {
 					return {
 						ok: false,
@@ -997,61 +750,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				}
 				const shouldQueue = args.queue === true && args.force !== true;
 				const turn = makeTurnRecord(config, sessionId, args.prompt, shouldQueue ? "queued" : "active");
-				if (!shouldQueue) {
-					const tmuxKeysSent = await sendTmuxPrompt(session, args.prompt);
-					const timestamp = new Date().toISOString();
-					const live = hasTmuxIdentity(session) ? await hasTmuxSession(session) : null;
-					turn.delivery = {
-						delivered: false,
-						queued: !tmuxKeysSent,
-						target: typeof session.tmux_target === "string" ? session.tmux_target : null,
-						tmux_keys_sent: tmuxKeysSent,
-						prompt_acknowledged: false,
-						state: tmuxKeysSent ? "tmux_keys_sent" : "unavailable",
-						attempts: [
-							{
-								delivered: false,
-								tmux_keys_sent: tmuxKeysSent,
-								channel: "tmux_keys",
-								created_at: timestamp,
-								reason: tmuxKeysSent ? "awaiting_runtime_ack" : "tmux_delivery_unavailable",
-							},
-						],
-					};
-					turn.liveness = { checked_at: timestamp, live, reason: live === false ? "tmux_session_missing" : null };
-					turn.updated_at = timestamp;
-					await writeActiveTurn(namespaceDir, turn);
-					await writeSessionState(namespaceDir, sessionId, tmuxKeysSent ? "running" : "stale", {
-						currentTurnId: turn.turn_id,
-						live,
-						reason: tmuxKeysSent ? null : "tmux_delivery_unavailable",
-					});
-				}
-				await writeTurnRecord(namespaceDir, turn);
-				const queued = {
+				const recordedTurn = shouldQueue ? turn : await deliverTurn(namespaceDir, session, turn);
+				if (shouldQueue) await writeTurnRecord(namespaceDir, recordedTurn);
+				const prompt = {
 					session_id: sessionId,
-					turn_id: turn.turn_id,
+					turn_id: recordedTurn.turn_id,
 					prompt: args.prompt,
-					queued: turn.delivery.queued,
-					delivered: turn.delivery.delivered,
-					tmux_keys_sent: turn.delivery.tmux_keys_sent ?? false,
-					prompt_acknowledged: turn.delivery.prompt_acknowledged ?? false,
-					created_at: turn.created_at,
+					queued: recordedTurn.delivery.queued,
+					delivered: recordedTurn.delivery.delivered,
+					created_at: recordedTurn.created_at,
 				};
-				await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), queued);
+				await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), prompt);
 				return {
 					ok: true,
 					session_id: sessionId,
-					turn_id: turn.turn_id,
-					active_turn_id: shouldQueue ? activeTurn?.turn_id : turn.turn_id,
-					status: turn.status,
-					queued: turn.delivery.queued,
-					delivered: turn.delivery.delivered,
-					delivery: turn.delivery,
-					prompt: queued,
-					tmux_keys_sent: turn.delivery.tmux_keys_sent ?? false,
-					prompt_acknowledged: turn.delivery.prompt_acknowledged ?? false,
-					session_state: await readSessionState(namespaceDir, sessionId),
+					turn_id: recordedTurn.turn_id,
+					active_turn_id: shouldQueue ? activeTurn?.turn_id : recordedTurn.turn_id,
+					status: recordedTurn.status,
+					queued: recordedTurn.delivery.queued,
+					delivered: recordedTurn.delivery.delivered,
+					delivery: recordedTurn.delivery,
+					prompt,
 				};
 			}
 			if (name === "gjc_coordinator_read_turn") {
@@ -1067,22 +786,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status) &&
 					Date.now() < deadline
 				) {
-					const remainingMs = deadline - Date.now();
-					await waitForTurnStateChange(
-						namespaceDir,
-						payload.turn as TurnRecord,
-						Math.min(pollIntervalMs, remainingMs),
-					);
+					await Bun.sleep(pollIntervalMs);
 					payload = await readTurnPayload(args.turn_id, args.session_id, args.lines);
 				}
 				if (payload.ok === true && !TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status)) {
-					return {
-						ok: false,
-						reason: "timeout",
-						turn: payload.turn,
-						advisory_status: payload.advisory_status,
-						session_state: payload.session_state,
-					};
+					return { ok: false, reason: "timeout", turn: payload.turn, advisory_status: payload.advisory_status };
 				}
 				return payload;
 			}
@@ -1090,7 +798,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				requireCoordinatorMutation(config, "questions", args);
 				const questionId = safeExternalId("question", args.question_id);
 				const questionPath = questionFile(namespaceDir, questionId);
-				const question = await readJsonFile(questionPath);
+				const question = asRecord(await readJsonFile(questionPath));
 				if (!question) return { ok: false, reason: "unknown_question" };
 				if (args.session_id != null && question.session_id !== safeExternalId("session", args.session_id)) {
 					return { ok: false, reason: "question_session_mismatch" };
@@ -1118,12 +826,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 						await writeTurnRecord(namespaceDir, turn);
 						await writeActiveTurn(namespaceDir, turn);
-						await writeSessionState(namespaceDir, turn.session_id, "running", {
-							currentTurnId: turn.turn_id,
-							live: null,
-							reason: null,
-						});
-						const session = await readJsonFile(sessionFile(turn.session_id));
+						const session = asRecord(await readJsonFile(sessionFile(turn.session_id)));
 						if (session && typeof args.answer === "string") await sendTmuxPrompt(session, args.answer);
 					}
 				}
@@ -1131,21 +834,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_report_status") {
 				requireCoordinatorMutation(config, "reports", args);
+				const evidence = await validateEvidencePaths(args.evidence_paths);
+				const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
 				const report = {
-					session_id: args.session_id,
+					session_id: sessionId,
 					turn_id: args.turn_id,
 					status: args.status,
 					summary: args.summary,
 					blocker: args.blocker,
 					pr_url: args.pr_url,
-					evidence_paths: args.evidence_paths ?? [],
+					evidence_paths: evidence.map(item => item.path),
 					created_at: new Date().toISOString(),
 				};
 				let turn: TurnRecord | null = null;
+				let promotedTurn: TurnRecord | null = null;
 				if (args.turn_id != null) {
 					turn = await readTurnRecord(namespaceDir, args.turn_id);
 					if (!turn) return { ok: false, reason: "unknown_turn" };
-					if (args.session_id != null && turn.session_id !== safeExternalId("session", args.session_id)) {
+					if (sessionId != null && turn.session_id !== sessionId) {
 						return { ok: false, reason: "turn_session_mismatch" };
 					}
 					const terminalStatus = asTerminalTurnStatus(args.status);
@@ -1154,11 +860,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						turn = {
 							...turn,
 							status: terminalStatus,
-							delivery: {
-								...turn.delivery,
-								prompt_acknowledged: true,
-								state: "acknowledged",
-							},
 							final_response: {
 								text:
 									typeof args.summary === "string"
@@ -1171,9 +872,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								artifact_path: null,
 								truncated: false,
 							},
-							evidence: Array.isArray(args.evidence_paths)
-								? args.evidence_paths.map(evidencePath => ({ path: evidencePath }))
-								: [],
+							evidence,
 							error:
 								terminalStatus === "failed"
 									? {
@@ -1188,24 +887,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 						await writeTurnRecord(namespaceDir, turn);
 						await clearActiveTurn(namespaceDir, turn);
-						await writeSessionState(
-							namespaceDir,
-							turn.session_id,
-							terminalStatus === "failed" ? "errored" : "completed",
-							{
-								lastTurnId: turn.turn_id,
-								live: null,
-								reason: terminalStatus === "failed" ? "reported_failure" : null,
-							},
-						);
+						promotedTurn = await promoteNextQueuedTurn(turn.session_id);
 					}
 				}
 				await writeJsonFile(path.join(namespaceDir, "reports", `${Date.now()}.json`), report);
-				return {
-					ok: true,
-					report,
-					...(turn ? { turn, session_state: await readSessionState(namespaceDir, turn.session_id) } : {}),
-				};
+				return { ok: true, report, ...(turn ? { turn } : {}), ...(promotedTurn ? { promoted_turn: promotedTurn } : {}) };
 			}
 			return { ok: false, reason: "unknown_tool", tool: name };
 		} catch (error) {
@@ -1254,7 +940,7 @@ function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; te
 export async function handleCoordinatorMcpRequest(
 	request: JsonRpcRequest,
 	options: LegacyHandlerOptions = {},
-): Promise<any> {
+): Promise<JsonRpcResponse> {
 	if (request.method === "initialize") {
 		return {
 			jsonrpc: "2.0",

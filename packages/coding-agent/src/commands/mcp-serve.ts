@@ -11,7 +11,7 @@ function writeJson(value: unknown): void {
 }
 
 export function validateMcpServeSubcommandForTest(server: string | undefined): void {
-	if (server !== "coordinator") throw new Error(`unknown_mcp_serve_subcommand:${server ?? ""}`);
+	if (server !== "coordinator" && server !== "hermes") throw new Error(`unknown_mcp_serve_subcommand:${server ?? ""}`);
 }
 
 export default class McpServe extends Command {
@@ -19,7 +19,7 @@ export default class McpServe extends Command {
 	static strict = false;
 
 	static args = {
-		server: Args.string({ description: "MCP server to run (coordinator)", required: false }),
+		server: Args.string({ description: "MCP server to run (coordinator or hermes alias)", required: false }),
 	};
 
 	static flags = {
@@ -39,6 +39,7 @@ export default class McpServe extends Command {
 			} else {
 				process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
 			}
+			process.exitCode = 1;
 			return;
 		}
 

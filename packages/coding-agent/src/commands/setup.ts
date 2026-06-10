@@ -28,6 +28,8 @@ export default class Setup extends Command {
 		repo: Flags.string({ description: "Hermes MCP repo namespace" }),
 		profile: Flags.string({ description: "Hermes MCP profile namespace" }),
 		"session-command": Flags.string({ description: "Explicit GJC session command for Hermes to launch" }),
+		"no-worktree": Flags.boolean({ description: "Disable default GJC --worktree isolation for Hermes sessions" }),
+		"worktree-name": Flags.string({ description: "Named GJC --worktree branch for Hermes sessions" }),
 		"state-root": Flags.string({ description: "Hermes MCP coordination state root" }),
 		mutation: Flags.string({
 			description: "Hermes MCP mutation classes: sessions,questions,reports,all",
@@ -68,6 +70,8 @@ export default class Setup extends Command {
 				repo: flags.repo,
 				profile: flags.profile,
 				sessionCommand: flags["session-command"],
+				noWorktree: flags["no-worktree"],
+				worktreeName: flags["worktree-name"],
 				stateRoot: flags["state-root"],
 				mutation: flags.mutation,
 				artifactByteCap: flags["artifact-byte-cap"],

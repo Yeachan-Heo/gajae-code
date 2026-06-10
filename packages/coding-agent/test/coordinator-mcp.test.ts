@@ -55,6 +55,7 @@ async function runHermesCommand(argv: string[]): Promise<string> {
 
 afterEach(() => {
 	process.stdout.write = ORIGINAL_STDOUT_WRITE;
+	process.exitCode = 0;
 });
 
 describe("gjc mcp-serve coordinator", () => {
@@ -69,6 +70,9 @@ describe("gjc mcp-serve coordinator", () => {
 
 		const rejected = JSON.parse(await runCommand(["bogus", "--json"]));
 		expect(rejected).toEqual({ ok: false, reason: "unknown_mcp_serve_subcommand", subcommand: "bogus" });
+		expect(process.exitCode).toBe(1);
+		process.exitCode = 0;
+
 	});
 
 	it("exposes the same Hermes contract through the read-only CLI adapter", async () => {

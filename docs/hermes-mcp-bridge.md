@@ -6,6 +6,8 @@ GJC exposes a native outward MCP bridge for Hermes-style coordinators:
 gjc mcp-serve coordinator
 ```
 
+`gjc mcp-serve hermes` is accepted as a compatibility alias for the same coordinator bridge.
+
 The bridge is intentionally separate from GJC's client-side MCP runtime. It lets an external coordinator list sessions, start worktree/tmux-oriented sessions, queue bounded follow-up prompts, read status/tail/artifacts, handle structured questions, and write coordination reports without scraping terminal scrollback.
 
 ## Core contract and adapters
@@ -39,12 +41,18 @@ gjc setup hermes \
   --install
 ```
 
-The generated setup is model-agnostic. By default it does not render `GJC_COORDINATOR_MCP_SESSION_COMMAND`, so spawned sessions use the user's normal GJC model/provider resolution. Users who need a specific local wrapper, dev checkout, or provider/model can opt in explicitly:
+The generated setup is model-agnostic and worktree-isolated. By default it renders `GJC_COORDINATOR_MCP_SESSION_COMMAND` as `gjc --worktree`, so spawned sessions launch inside a GJC-managed sibling worktree while GJC still records the original repo as the project identity for tmux/session resume. Users who need a stable named branch can set `--worktree-name`; users who need a specific local wrapper, dev checkout, or provider/model can opt in explicitly:
 
 ```bash
 gjc setup hermes \
   --root /path/to/repo \
-  --session-command "gjc --model <provider/model>"
+  --worktree-name hermes-gajae-code
+```
+
+```bash
+gjc setup hermes \
+  --root /path/to/repo \
+  --session-command "gjc --worktree hermes-custom --model <provider/model>"
 ```
 
 Provider/model examples are examples only; GJC does not hard-code GPT, Anthropic, or any other provider as the Hermes bridge default.
@@ -76,13 +84,15 @@ export GJC_COORDINATOR_MCP_MUTATIONS="sessions,questions,reports"
 
 Every mutating MCP call must also include `allow_mutation: true`. Missing startup opt-in or missing per-call consent returns an error instead of falling back to shell or terminal relay.
 
-Real tmux/GJC actuation is enabled by setting a GJC-compatible session command:
+Real tmux/GJC actuation uses the configured GJC-compatible session command. `gjc setup hermes` writes this as `gjc --worktree` by default so GJC owns worktree creation and resume identity:
 
 ```bash
-export GJC_COORDINATOR_MCP_SESSION_COMMAND="/path/to/gjc"
+export GJC_COORDINATOR_MCP_SESSION_COMMAND="gjc --worktree"
 ```
 
-When set, `gjc_coordinator_start_session` launches a detached tmux session, `gjc_coordinator_send_prompt` creates a durable turn and sends input to that pane, and `gjc_coordinator_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_coordinator_report_status`.
+With that command configured, `gjc_coordinator_start_session` launches a detached tmux session, `gjc_coordinator_send_prompt` creates a durable turn and sends input to that pane, and `gjc_coordinator_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_coordinator_report_status`.
+
+For resume safety, prefer the generated GJC-native worktree command over creating a git worktree in Hermes itself. GJC's launch path records the original repo as the project identity while running in the worktree, so session listing/resume can still group the session under the source project. If Hermes creates and later deletes an unmanaged worktree, a saved session may still exist but its cwd can be gone.
 
 Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`.
 
@@ -145,7 +155,7 @@ Hermes coordinators should treat turns, not terminal scrollback, as the unit of 
 }
 ```
 
-A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable but are not delivered immediately. Force supersedes the previous active turn and audits that state in the turn journal.
+A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable and the next queued turn is promoted when the active turn reaches a terminal `gjc_coordinator_report_status`. Force supersedes the previous active turn and audits that state in the turn journal.
 
 `gjc_coordinator_read_turn` returns the authoritative durable turn plus advisory pane status:
 

@@ -151,6 +151,8 @@ describe("setup CLI parsing", () => {
 					"gajae-code",
 					"--session-command",
 					"gjc --model openai/gpt-5.5",
+					"--worktree-name",
+					"hermes-gajae-code",
 					"--mutation",
 					"sessions,reports",
 					"--json",
@@ -162,13 +164,14 @@ describe("setup CLI parsing", () => {
 					profile: "bot",
 					repo: "gajae-code",
 					sessionCommand: "gjc --model openai/gpt-5.5",
+					worktreeName: "hermes-gajae-code",
 					mutation: ["sessions,reports"],
 					json: true,
 				},
 			});
 		});
 
-		it("renders Hermes setup without a product-default model", async () => {
+		it("renders Hermes setup with a model-agnostic usable GJC session command", async () => {
 			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
@@ -185,7 +188,8 @@ describe("setup CLI parsing", () => {
 			const configPreview = parsed.previews.find(preview => preview.path.endsWith(".yaml"))?.content ?? "";
 			expect(configPreview).not.toContain("openai/gpt-5.5");
 			expect(configPreview).not.toContain("--model");
-			expect(configPreview).not.toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND");
+			expect(configPreview).toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND: gjc --worktree");
+			expect(output).toContain("owns worktree creation and resume identity");
 		});
 
 		it("preserves explicit Hermes session commands exactly", async () => {
@@ -238,7 +242,39 @@ describe("setup CLI parsing", () => {
 			expect(parsed.mcp_servers.other?.command).toBe("other");
 			expect(parsed.mcp_servers.gjc_coordinator?.command).toBe("gjc");
 			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_MUTATIONS).toBe("sessions,questions");
-			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_SESSION_COMMAND).toBeUndefined();
+			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_SESSION_COMMAND).toBe("gjc --worktree");
+		});
+
+		it("renders named Hermes worktree commands and allows explicit opt-out", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const named = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					root: [tempRoot],
+					worktreeName: "hermes-gajae-code",
+				},
+			});
+
+			const namedOutput = named.mock.calls.map(call => String(call[0])).join("");
+			expect(namedOutput).toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND: gjc --worktree hermes-gajae-code");
+			named.mockRestore();
+			const noWorktree = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+			await runSetupCommand({
+				component: "hermes",
+				flags: {
+					json: true,
+					root: [tempRoot],
+					noWorktree: true,
+				},
+			});
+
+			const noWorktreeOutput = noWorktree.mock.calls.map(call => String(call[0])).join("");
+			expect(noWorktreeOutput).toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND: gjc");
+			expect(noWorktreeOutput).not.toContain("GJC_COORDINATOR_MCP_SESSION_COMMAND: gjc --worktree");
 		});
 
 		it("rejects unmanaged Hermes server conflicts unless forced", async () => {
