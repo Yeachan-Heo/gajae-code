@@ -140,6 +140,17 @@ function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitW
 	return { path: path.resolve(worktreePath), head, branchRef, detached: !branchRef };
 }
 
+function resolveCanonicalRepoRoot(cwd: string): string {
+	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	const commonDir = tryRunGit(repoRoot, ["rev-parse", "--git-common-dir"]);
+	if (!commonDir) return repoRoot;
+	const resolvedCommonDir = path.resolve(repoRoot, commonDir);
+	if (path.basename(resolvedCommonDir) !== ".git") return repoRoot;
+	const ownerRoot = path.dirname(resolvedCommonDir);
+	if (tryRunGit(ownerRoot, ["rev-parse", "--is-inside-work-tree"]) !== "true") return repoRoot;
+	return ownerRoot;
+}
+
 function isWorktreeDirty(worktreePath: string): boolean {
 	return runGit(worktreePath, ["status", "--porcelain"]).length > 0;
 }
@@ -187,7 +198,7 @@ export function planLaunchWorktree(
 	mode: GjcLaunchWorktreeMode,
 ): GjcLaunchWorktreePlan | { enabled: false } {
 	if (!mode.enabled) return { enabled: false };
-	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	const repoRoot = resolveCanonicalRepoRoot(cwd);
 	const baseRef = runGit(repoRoot, ["rev-parse", "HEAD"]);
 	const branchName = mode.detached ? null : mode.name;
 	if (branchName) validateBranchName(repoRoot, branchName);

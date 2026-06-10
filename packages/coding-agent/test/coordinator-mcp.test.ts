@@ -72,7 +72,6 @@ describe("gjc mcp-serve coordinator", () => {
 		expect(rejected).toEqual({ ok: false, reason: "unknown_mcp_serve_subcommand", subcommand: "bogus" });
 		expect(process.exitCode).toBe(1);
 		process.exitCode = 0;
-
 	});
 
 	it("exposes the same Hermes contract through the read-only CLI adapter", async () => {
@@ -169,7 +168,8 @@ describe("gjc mcp-serve coordinator", () => {
 				},
 			);
 			expect(created).toBe(true);
-			expect(JSON.parse(allowed.result.content[0].text)).toEqual({
+			const allowedPayload = JSON.parse(allowed.result.content[0].text);
+			expect(allowedPayload).toMatchObject({
 				ok: true,
 				session: {
 					session_id: "x",
@@ -180,6 +180,11 @@ describe("gjc mcp-serve coordinator", () => {
 					bindings: "root",
 					created_at: "now",
 					createdAt: "now",
+				},
+				session_state: {
+					session_id: "x",
+					state: "ready_for_input",
+					ready_for_input: true,
 				},
 			});
 		});

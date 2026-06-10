@@ -126,10 +126,13 @@ Read tools:
 Mutating tools:
 
 - `gjc_coordinator_start_session`
+- `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
 
+
+`gjc_coordinator_register_session` registers an existing visible tmux-backed GJC pane as the coordinator-authoritative session. Use it when an operator has already launched a visible Warp/tmux lane and Hermes must send prompts to that same pane instead of creating a hidden `gjc-coordinator-*` session. The tool validates the workdir allowlist, safe session/target tokens, and tmux target liveness before writing session state.
 ## Turn orchestration flow
 
 Hermes coordinators should treat turns, not terminal scrollback, as the unit of work:

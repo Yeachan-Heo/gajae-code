@@ -115,6 +115,25 @@ describe("default launch worktrees", () => {
 		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
 	});
 
+	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {
+		const repo = await createRepo("gjc-launch-nested-source-worktree-");
+		const first = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(first.worktree.enabled && first.worktree.created).toBe(true);
+
+		const second = prepareLaunchWorktree(first.cwd, ["--worktree", "feature/nested"]);
+		const expectedPath = path.join(
+			path.dirname(repo),
+			`${path.basename(repo)}.gajae-code-worktrees`,
+			testSlug("feature/nested"),
+		);
+
+		expect(second.worktree.enabled && second.worktree.repoRoot).toBe(repo);
+		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
+		expect(
+			second.cwd.includes(`.gajae-code-worktrees${path.sep}${path.basename(first.cwd)}.gajae-code-worktrees`),
+		).toBe(false);
+	});
+
 	it("updates a clean reused detached launch worktree when source HEAD advances", async () => {
 		const repo = await createRepo("gjc-launch-advance-worktree-");
 		const first = prepareLaunchWorktree(repo, ["--worktree"]);

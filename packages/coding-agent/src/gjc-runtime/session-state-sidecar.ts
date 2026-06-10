@@ -30,6 +30,33 @@ function lastAssistant(messages: unknown[] | undefined): AssistantMessage | unde
 	return undefined;
 }
 
+function assistantText(assistant: AssistantMessage | undefined): string | null {
+	if (!assistant) return null;
+	const text = assistant.content
+		.filter(part => part.type === "text")
+		.map(part => part.text)
+		.join("\n")
+		.trim();
+	return text.length > 0 ? text : null;
+}
+
+function finalResponseForEvent(event: RuntimeStateEvent): {
+	text: string | null;
+	format: "markdown";
+	source: "agent_end";
+	artifact_path: null;
+	truncated: false;
+} | null {
+	if (event.type !== "agent_end") return null;
+	return {
+		text: assistantText(lastAssistant(event.messages)),
+		format: "markdown",
+		source: "agent_end",
+		artifact_path: null,
+		truncated: false,
+	};
+}
+
 function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	if (event.type === "agent_start" || event.type === "turn_start") return "running";
 	if (event.type === "agent_end") {
@@ -55,6 +82,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	} catch {
 		previous = {};
 	}
+	const finalResponse = finalResponseForEvent(event);
 	const payload = {
 		schema_version: 1,
 		session_id: process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId,
@@ -69,6 +97,16 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 		event: event.type,
 		cwd: context.cwd,
 		session_file: context.sessionFile ?? null,
+		...(finalResponse ? { final_response: finalResponse } : {}),
+		...(state === "errored"
+			? {
+					error: {
+						code: "agent_error",
+						message: lastAssistant(event.messages)?.errorMessage ?? "agent_error",
+						recoverable: true,
+					},
+				}
+			: {}),
 	};
 	try {
 		await fs.mkdir(path.dirname(stateFile), { recursive: true });
