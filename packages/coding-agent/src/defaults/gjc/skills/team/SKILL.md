@@ -47,6 +47,40 @@ gjc team 3:executor "analyze feature X and report flaws"
 gjc team "debug flaky integration tests"
 gjc team "ship end-to-end fix with verification"
 ```
+Whiplash strategy example:
+
+```bash
+gjc team --whiplash "fix the approved plan and prove failure paths"
+```
+
+### Whiplash mode
+
+Whiplash is a **Team execution strategy**, not a fifth workflow skill and not a new public role-agent roster. Use `gjc team --whiplash "<task>"` when the user explicitly asks for Whiplash-style same-task reasoning collision.
+
+Protocol:
+
+1. Launch exactly three `executor` workers for the MVP.
+2. Give all three workers the same canonical task, same conditions, and same acceptance criteria; store the same canonical task hash on each Whiplash task.
+3. The only intentional worker difference is runtime reasoning effort:
+   - `worker-1` low lane launches with `--thinking low`.
+   - `worker-2` medium lane launches with `--thinking medium`.
+   - `worker-3` high lane launches with `--thinking high`.
+4. Do not assign different roles, personas, subjects, or complementary subtasks before review.
+5. Workers report effective model/thinking effort with `gjc team api report-whiplash-effort`; unsupported, capped, mismatched, or unknown effort activates degraded mode.
+6. Reviewer/leader waits for all current-round Whiplash tasks to reach terminal status before `write-whiplash-review`.
+7. Round 1 cannot accept. It must force reject with comparative critique and non-empty `proof_required`.
+8. `lead_worker` is a benchmark only; it is never the sole executor or an acceptance bypass.
+9. Retry rounds preserve the same canonical task hash and requested `--thinking` lane mapping; strategy rotation, non-convergence, recurrence, `prevention_note`, and degraded-mode rationale must be explicit.
+
+Useful Team API operations:
+
+```bash
+gjc team api read-whiplash-state --input '{"team_name":"<team>"}' --json
+gjc team api report-whiplash-effort --input '{"team_name":"<team>","worker_id":"worker-1","effective_thinking_effort":"low","effective_model_id":"provider/model","effort_evidence":"session resolved requested effort"}' --json
+gjc team api write-whiplash-review --input '{"team_name":"<team>","decision":"force_reject","comparative_critique":"...","proof_required":["failure path evidence"]}' --json
+gjc team api advance-whiplash-round --input '{"team_name":"<team>","retry_strategy":"structural-change","rationale":"round 1 proof gaps"}' --json
+```
+
 
 ### Team-first launch contract
 

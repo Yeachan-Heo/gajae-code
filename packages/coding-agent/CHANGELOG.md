@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `gjc team --whiplash` strategy for same-task low/medium/high reasoning lanes with forced first-round review rejection.
+
 ## [0.2.0] - 2026-05-28
 
 ### Added

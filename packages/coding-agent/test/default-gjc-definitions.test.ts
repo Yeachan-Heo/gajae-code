@@ -201,6 +201,31 @@ Project executor override body.
 		}
 	});
 
+	it("documents Whiplash as Team strategy without expanding public surfaces", async () => {
+		const definitions = getDefaultGjcDefinitions();
+		const definitionNames = definitions.map(definition => String(definition.name));
+		expect(definitionNames.sort()).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
+		expect(definitionNames.some(name => name === "whiplash" || name === "whiplash-loop")).toBe(false);
+		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS).toEqual(["default", "executor", "architect", "planner", "critic"]);
+
+		const team = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "team", "SKILL.md"),
+		).text();
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		expect(team).toContain("gjc team --whiplash");
+		expect(team).toContain("not a fifth workflow skill");
+		expect(team).toContain("--thinking low");
+		expect(team).toContain("--thinking medium");
+		expect(team).toContain("--thinking high");
+		expect(team).toContain("Round 1 cannot accept");
+		expect(ultragoal).toContain("Whiplash Team strategy");
+		expect(ultragoal).toContain("not a fifth workflow skill");
+		expect(ultragoal).toContain("checkpoint authority");
+	});
+
 	it("keeps bundled deep-interview skill on GJC-native workflow vocabulary", () => {
 		const deepInterview = getDefaultGjcDefinitions().find(definition => definition.name === "deep-interview");
 		expect(deepInterview).toBeDefined();

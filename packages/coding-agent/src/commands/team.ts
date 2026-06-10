@@ -77,10 +77,12 @@ export default class Team extends Command {
 	static flags = {
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: false }),
 		"dry-run": Flags.boolean({ description: "Create team state without starting tmux panes", default: false }),
+		whiplash: Flags.boolean({ description: "Start Team in Whiplash strategy mode", default: false }),
 	};
 
 	static examples = [
 		'gjc team 3:executor "Implement the approved plan"',
+		'gjc team --whiplash "Implement the approved plan"',
 		"gjc team status <team-name> --json",
 		'gjc team api claim-task --input \'{"team_name":"demo","worker_id":"worker-1"}\' --json',
 		"gjc team shutdown <team-name>",
@@ -118,6 +120,12 @@ export default class Team extends Command {
 				`state: ${snapshot.state_dir}`,
 				`tasks: ${snapshot.task_total} (${formatTaskCounts(snapshot.task_counts)})`,
 				`workers: ${snapshot.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")}`,
+				`strategy: ${snapshot.strategy}`,
+				...(snapshot.whiplash
+					? [
+							`whiplash: round=${snapshot.whiplash.round} status=${snapshot.whiplash.status} lanes=${snapshot.whiplash.lanes.map(lane => `${lane.worker_id}:${lane.requested_thinking_effort}/${lane.effort_status}`).join(" ")}`,
+						]
+					: []),
 				...formatIntegrationSummary(snapshot),
 			]);
 			return;
@@ -145,6 +153,7 @@ export default class Team extends Command {
 					"create-task read-task list-tasks update-task claim-task transition-task-status release-task-claim",
 					"read-config read-manifest read-worker-status read-worker-heartbeat update-worker-heartbeat write-worker-inbox write-worker-identity",
 					"append-event read-events await-event write-shutdown-request read-shutdown-ack read-monitor-snapshot write-monitor-snapshot read-task-approval write-task-approval",
+					"read-whiplash-state report-whiplash-effort write-whiplash-review advance-whiplash-round",
 				]);
 				return;
 			}
@@ -163,7 +172,7 @@ export default class Team extends Command {
 		}
 
 		const startArgs = action === "start" ? rest : this.argv;
-		const options = parseTeamLaunchArgs(startArgs);
+		const options = parseTeamLaunchArgs(flags.whiplash ? ["--whiplash", ...startArgs] : startArgs);
 		const snapshot = await startGjcTeam({ ...options, dryRun });
 		await syncTeamHud(snapshot);
 		if (json) {
@@ -176,6 +185,7 @@ export default class Team extends Command {
 			`tmux: ${snapshot.tmux_session}`,
 			`state: ${snapshot.state_dir}`,
 			`workers: ${snapshot.workers.length}`,
+			`strategy: ${snapshot.strategy}`,
 		]);
 	}
 }

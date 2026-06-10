@@ -134,6 +134,16 @@ gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evid
 
 Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
 
+Whiplash Team strategy is allowed when the approved Ultragoal story benefits from same-task heterogeneous-reasoning collision rather than normal role-split parallelism. Launch it explicitly with `gjc team --whiplash "<story task>"`. Whiplash remains Team-owned execution state, not a new Ultragoal mode, not a fifth workflow skill, and not a new public role-agent roster.
+
+When consuming Whiplash evidence:
+
+- verify all three lanes used the same canonical task hash and the runtime launch args `--thinking low`, `--thinking medium`, and `--thinking high`;
+- require `read-whiplash-state` / review evidence showing round 1 forced reject, all-worker terminal barrier, comparative critique, and non-empty `proof_required`;
+- treat unsupported, capped, mismatched, or unknown effective effort as degraded evidence that must be explicitly justified before checkpointing;
+- treat `lead_worker` as benchmark evidence only, never as proof that one worker alone completed the story;
+- cite Team Whiplash review/evidence in the Ultragoal quality gate, while keeping `gjc ultragoal checkpoint` authority with the Ultragoal leader only.
+
 ## Mandatory completion cleanup and review gate
 
 An ultragoal story cannot be checkpointed `complete` until the active agent has run the quality gate:

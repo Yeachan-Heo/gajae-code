@@ -8,6 +8,97 @@ import { applyGjcTmuxProfile } from "./launch-tmux";
 export type GjcTeamPhase = "starting" | "running" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
 export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "failed" | "draining" | "unknown";
+export type GjcTeamStrategy = "standard" | "whiplash";
+export type GjcWhiplashReasoningTier = "low" | "medium" | "high";
+export type GjcWhiplashRequestedEffort = GjcWhiplashReasoningTier;
+export type GjcWhiplashEffectiveEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type GjcWhiplashEffortStatus = "pending" | "honored" | "capped" | "mismatched" | "unsupported" | "unknown";
+export type GjcWhiplashStatus = "collecting" | "retrying" | "accepted" | "non_converged" | "degraded";
+export type GjcWhiplashReviewDecision = "force_reject" | "retry" | "accept" | "non_converged";
+
+export interface GjcWhiplashCanonicalBrief {
+	task: string;
+	shared_conditions: string[];
+	shared_acceptance_criteria: string[];
+	hash: string;
+}
+
+export interface GjcWhiplashEffortMismatch {
+	worker_id: string;
+	requested: GjcWhiplashRequestedEffort;
+	effective?: GjcWhiplashEffectiveEffort;
+	status: GjcWhiplashEffortStatus;
+	reason: string;
+}
+
+export interface GjcWhiplashDegradedMode {
+	active: boolean;
+	missing_tiers: GjcWhiplashReasoningTier[];
+	missing_workers: string[];
+	effort_mismatches: GjcWhiplashEffortMismatch[];
+	recovery_attempted: string;
+	acceptance_impact: string;
+}
+
+export interface GjcWhiplashLane {
+	worker_id: string;
+	reasoning_tier: GjcWhiplashReasoningTier;
+	agent_type: "executor";
+	canonical_hash: string;
+	launch_args: ["--thinking", GjcWhiplashRequestedEffort];
+	requested_thinking_effort: GjcWhiplashRequestedEffort;
+	effective_thinking_effort?: GjcWhiplashEffectiveEffort;
+	effective_model_id?: string;
+	effort_status: GjcWhiplashEffortStatus;
+	effort_evidence?: string;
+	lead_worker_benchmark: boolean;
+}
+
+export interface GjcWhiplashProofRequirement {
+	id: string;
+	claim: string;
+	required_evidence: string;
+	status: "open" | "satisfied" | "waived";
+	satisfied_by?: string;
+	waiver_rationale?: string;
+}
+
+export interface GjcWhiplashReview {
+	round: number;
+	decision: GjcWhiplashReviewDecision;
+	reviewer: string;
+	worker_results: Record<string, { task_id: string; status: GjcTeamTaskStatus; evidence?: string }>;
+	comparative_critique: string;
+	proof_required: GjcWhiplashProofRequirement[];
+	lead_worker_id?: string;
+	lead_worker_benchmark_note: string;
+	retry_strategy?: string;
+	non_convergence_note?: string;
+	prevention_note?: string;
+	degraded_mode?: GjcWhiplashDegradedMode;
+	round_consumed: boolean;
+	created_at: string;
+}
+
+export interface GjcWhiplashRetryStrategyEntry {
+	round: number;
+	strategy: string;
+	rationale: string;
+	created_at: string;
+}
+
+export interface GjcWhiplashState {
+	strategy: "whiplash";
+	status: GjcWhiplashStatus;
+	round: number;
+	canonical: GjcWhiplashCanonicalBrief;
+	lanes: GjcWhiplashLane[];
+	reviews: GjcWhiplashReview[];
+	retry_strategy_history: GjcWhiplashRetryStrategyEntry[];
+	degraded_mode: GjcWhiplashDegradedMode;
+	lead_worker_id?: string;
+	updated_at: string;
+}
 
 export const GJC_TEAM_DEFAULT_WORKERS = 3;
 export const GJC_TEAM_MAX_WORKERS = 20;
@@ -40,6 +131,7 @@ export interface GjcTeamWorker {
 	worktree_created?: boolean;
 	worktree_base_ref?: string;
 	team_state_root?: string;
+	whiplash_lane?: GjcWhiplashLane;
 }
 
 export interface GjcTeamTaskClaim {
@@ -61,6 +153,7 @@ export interface GjcTeamTask {
 	error?: string;
 	blocked_by?: string[];
 	depends_on?: string[];
+	metadata?: Record<string, unknown>;
 	version: number;
 	claim?: GjcTeamTaskClaim;
 	created_at: string;
@@ -78,6 +171,7 @@ export interface GjcTeamConfig {
 	display_name: string;
 	requested_name: string;
 	task: string;
+	strategy: GjcTeamStrategy;
 	agent_type: string;
 	worker_count: number;
 	max_workers: number;
@@ -93,6 +187,7 @@ export interface GjcTeamConfig {
 	leader_cwd: string;
 	team_state_root: string;
 	workers: GjcTeamWorker[];
+	whiplash?: GjcWhiplashState;
 	created_at: string;
 	updated_at: string;
 }
@@ -133,6 +228,8 @@ export interface GjcTeamSnapshot {
 	task_counts: Record<GjcTeamTaskStatus, number>;
 	workers: GjcTeamWorker[];
 	integration_by_worker?: Record<string, GjcTeamWorkerIntegrationState>;
+	strategy: GjcTeamStrategy;
+	whiplash?: GjcWhiplashState;
 	updated_at: string;
 }
 
@@ -145,6 +242,7 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	strategy?: GjcTeamStrategy;
 }
 
 export interface GjcTeamApiClaimResult {
@@ -343,6 +441,10 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-monitor-snapshot",
 	"read-task-approval",
 	"write-task-approval",
+	"read-whiplash-state",
+	"report-whiplash-effort",
+	"write-whiplash-review",
+	"advance-whiplash-round",
 ] as const;
 
 function now(): string {
@@ -367,6 +469,125 @@ function sanitizeName(value: string): string {
 function shortHash(value: string): string {
 	return Bun.hash(value).toString(16).slice(0, 8).padStart(8, "0");
 }
+const WHIPLASH_TIERS: readonly GjcWhiplashReasoningTier[] = ["low", "medium", "high"];
+const WHIPLASH_EFFECT_ORDER: readonly GjcWhiplashEffectiveEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+
+function emptyWhiplashDegradedMode(): GjcWhiplashDegradedMode {
+	return {
+		active: false,
+		missing_tiers: [],
+		missing_workers: [],
+		effort_mismatches: [],
+		recovery_attempted: "",
+		acceptance_impact: "",
+	};
+}
+
+function createWhiplashCanonicalBrief(task: string): GjcWhiplashCanonicalBrief {
+	const sharedConditions = [
+		"All lanes receive the same task, same conditions, and same acceptance criteria.",
+		"Reasoning tier is the only intentional lane difference; do not split roles or personas.",
+	];
+	const sharedAcceptanceCriteria = [
+		"Worker commands differ by per-lane --thinking launch args.",
+		"Round 1 cannot accept and must produce comparative critique plus proof_required.",
+		"Whiplash completion requires all-worker terminal barrier and accepted review state.",
+	];
+	return {
+		task,
+		shared_conditions: sharedConditions,
+		shared_acceptance_criteria: sharedAcceptanceCriteria,
+		hash: shortHash([task, ...sharedConditions, ...sharedAcceptanceCriteria].join("\n---\n")),
+	};
+}
+
+function createWhiplashLane(worker: GjcTeamWorker, canonical: GjcWhiplashCanonicalBrief): GjcWhiplashLane {
+	const tier = WHIPLASH_TIERS[worker.index - 1];
+	if (!tier) throw new Error(`invalid_whiplash_worker_index:${worker.index}`);
+	return {
+		worker_id: worker.id,
+		reasoning_tier: tier,
+		agent_type: "executor",
+		canonical_hash: canonical.hash,
+		launch_args: ["--thinking", tier],
+		requested_thinking_effort: tier,
+		effort_status: "pending",
+		lead_worker_benchmark: false,
+	};
+}
+
+function attachWhiplashLanes(workers: GjcTeamWorker[], canonical: GjcWhiplashCanonicalBrief): GjcTeamWorker[] {
+	return workers.map(worker => ({ ...worker, whiplash_lane: createWhiplashLane(worker, canonical) }));
+}
+
+function createWhiplashState(task: string, workers: GjcTeamWorker[]): GjcWhiplashState {
+	const canonical = createWhiplashCanonicalBrief(task);
+	return {
+		strategy: "whiplash",
+		status: "collecting",
+		round: 1,
+		canonical,
+		lanes: attachWhiplashLanes(workers, canonical).map(worker => worker.whiplash_lane!),
+		reviews: [],
+		retry_strategy_history: [],
+		degraded_mode: emptyWhiplashDegradedMode(),
+		updated_at: now(),
+	};
+}
+
+function isWhiplashEffectiveEffort(value: string): value is GjcWhiplashEffectiveEffort {
+	return WHIPLASH_EFFECT_ORDER.includes(value as GjcWhiplashEffectiveEffort);
+}
+
+function resolveEffortStatus(
+	requested: GjcWhiplashRequestedEffort,
+	effective: GjcWhiplashEffectiveEffort | undefined,
+	explicit?: GjcWhiplashEffortStatus,
+): GjcWhiplashEffortStatus {
+	if (explicit) return explicit;
+	if (!effective) return "unknown";
+	if (effective === requested) return "honored";
+	return WHIPLASH_EFFECT_ORDER.indexOf(effective) < WHIPLASH_EFFECT_ORDER.indexOf(requested) ? "capped" : "mismatched";
+}
+
+function refreshWhiplashDegradedMode(state: GjcWhiplashState): GjcWhiplashDegradedMode {
+	const mismatches = state.lanes
+		.filter(lane => lane.effort_status !== "honored")
+		.map(lane => ({
+			worker_id: lane.worker_id,
+			requested: lane.requested_thinking_effort,
+			effective: lane.effective_thinking_effort,
+			status: lane.effort_status,
+			reason: `requested ${lane.requested_thinking_effort}, effective ${lane.effective_thinking_effort ?? "unknown"}`,
+		}));
+	if (mismatches.length === 0) return emptyWhiplashDegradedMode();
+	return {
+		active: true,
+		missing_tiers: [],
+		missing_workers: [],
+		effort_mismatches: mismatches,
+		recovery_attempted: "Worker reported effective effort through Team whiplash effort state.",
+		acceptance_impact:
+			"Whiplash acceptance is blocked unless review explicitly justifies degraded reasoning evidence.",
+	};
+}
+
+async function readWhiplashState(dir: string): Promise<GjcWhiplashState | undefined> {
+	return (await readJsonFile<GjcWhiplashState>(whiplashStatePath(dir))) ?? undefined;
+}
+
+async function writeWhiplashState(dir: string, state: GjcWhiplashState): Promise<GjcWhiplashState> {
+	const updated = { ...state, updated_at: now() };
+	await writeJsonFile(whiplashStatePath(dir), updated);
+	return updated;
+}
+
+function ensureWhiplashLaunch(options: GjcTeamStartOptions): void {
+	if ((options.strategy ?? "standard") !== "whiplash") return;
+	if (options.workerCount !== 3) throw new Error("whiplash_requires_exactly_three_workers");
+	if (options.agentType !== "executor") throw new Error("whiplash_requires_executor_agent_type");
+}
+
 function makeTeamName(task: string, env: NodeJS.ProcessEnv): string {
 	const basis = [task, env.GJC_SESSION_ID, env.CODEX_SESSION_ID, env.TMUX_PANE, env.TMUX, now()]
 		.filter(Boolean)
@@ -391,6 +612,13 @@ function workerDir(dir: string, worker: string): string {
 }
 function workerIntegrationDedupePath(dir: string, worker: string): string {
 	return path.join(workerDir(dir, worker), "posttooluse-dedupe.json");
+}
+function whiplashStatePath(dir: string): string {
+	return path.join(dir, "whiplash.json");
+}
+
+function whiplashReviewPath(dir: string, round: number): string {
+	return path.join(dir, "whiplash-reviews", `round-${round}.json`);
 }
 
 export function resolveGjcTeamStateRoot(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
@@ -439,6 +667,7 @@ async function readConfig(dir: string): Promise<GjcTeamConfig> {
 		tmux_target: config.tmux_target ?? config.tmux_session ?? tmuxSessionName,
 		leader_cwd: config.leader_cwd ?? config.leader.cwd,
 		team_state_root: config.team_state_root ?? config.state_root,
+		strategy: config.strategy ?? "standard",
 		worker_cli_plan: config.worker_cli_plan ?? Array.from({ length: config.worker_count }, () => "gjc"),
 	};
 }
@@ -669,6 +898,25 @@ export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.Process
 	if (entrypoint && path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
 	return "gjc";
 }
+function buildWhiplashPromptLines(config: GjcTeamConfig, worker: GjcTeamWorker): string[] {
+	const lane = worker.whiplash_lane;
+	const whiplash = config.whiplash;
+	if (!lane || !whiplash) return [];
+	return [
+		"Whiplash mode: solve the same canonical task as the other lanes; do not split roles or personas.",
+		`Reasoning tier: ${lane.reasoning_tier}. Requested launch effort: ${lane.requested_thinking_effort}.`,
+		`Canonical task hash: ${whiplash.canonical.hash}.`,
+		`Canonical task: ${whiplash.canonical.task}`,
+		`Shared conditions: ${whiplash.canonical.shared_conditions.join(" | ")}`,
+		`Shared acceptance criteria: ${whiplash.canonical.shared_acceptance_criteria.join(" | ")}`,
+		"Report effective model/thinking effort with gjc team api report-whiplash-effort before terminal task transition when possible.",
+	];
+}
+
+function buildWorkerLaunchArgs(worker: GjcTeamWorker): string {
+	return worker.whiplash_lane?.launch_args.map(shellQuote).join(" ") ?? "";
+}
+
 function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): string {
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
@@ -678,6 +926,7 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`Team state root: ${config.state_root}.`,
 		workspace,
 		`Task: ${config.task}`,
+		...buildWhiplashPromptLines(config, worker),
 		`Use gjc team api claim-task/transition-task-status with this worker id, record evidence, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
@@ -690,17 +939,28 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`GJC_TEAM_DISPLAY_NAME=${shellQuote(config.display_name)}`,
 		...(worker.worktree_path ? [`GJC_TEAM_WORKTREE_PATH=${shellQuote(worker.worktree_path)}`] : []),
 	];
-	return `${env.join(" ")} ${config.worker_command} ${shellQuote(prompt)}`;
+	const launchArgs = buildWorkerLaunchArgs(worker);
+	return `${env.join(" ")} ${config.worker_command}${launchArgs ? ` ${launchArgs}` : ""} ${shellQuote(prompt)}`;
 }
-function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[] {
+function buildInitialTasks(task: string, workers: GjcTeamWorker[], whiplash?: GjcWhiplashState): GjcTeamTask[] {
 	return workers.map(worker => ({
 		id: `task-${worker.index}`,
 		subject: `Execute team brief (${worker.id})`,
-		description: task,
+		description: whiplash?.canonical.task ?? task,
 		title: `Execute team brief (${worker.id})`,
-		objective: task,
+		objective: whiplash?.canonical.task ?? task,
 		status: "pending",
 		owner: worker.id,
+		metadata: worker.whiplash_lane
+			? {
+					strategy: "whiplash",
+					round: whiplash?.round ?? 1,
+					canonical_hash: worker.whiplash_lane.canonical_hash,
+					reasoning_tier: worker.whiplash_lane.reasoning_tier,
+					requested_thinking_effort: worker.whiplash_lane.requested_thinking_effort,
+					launch_args: worker.whiplash_lane.launch_args,
+				}
+			: undefined,
 		version: 1,
 		created_at: now(),
 		updated_at: now(),
@@ -1409,7 +1669,7 @@ async function integrateGjcWorkerCommits(
 }
 
 async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promise<void> {
-	for (const folder of ["tasks", "claims", "mailbox", "dispatch", "approvals", "workers"])
+	for (const folder of ["tasks", "claims", "mailbox", "dispatch", "approvals", "workers", "whiplash-reviews"])
 		await fs.mkdir(path.join(dir, folder), { recursive: true });
 	for (const worker of workers) {
 		await fs.mkdir(workerDir(dir, worker.id), { recursive: true });
@@ -1430,6 +1690,8 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const env = options.env ?? process.env;
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
+	ensureWhiplashLaunch(options);
+	const strategy = options.strategy ?? "standard";
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
 	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
 	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
@@ -1441,7 +1703,9 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const tmuxContext = options.dryRun
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
 		: readCurrentTmuxLeaderContext(tmuxCommand, env);
-	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
+	const baseWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
+	const whiplash = strategy === "whiplash" ? createWhiplashState(options.task, baseWorkers) : undefined;
+	const initialWorkers = whiplash ? attachWhiplashLanes(baseWorkers, whiplash.canonical) : baseWorkers;
 	const workers: GjcTeamWorker[] = [];
 	try {
 		for (const worker of initialWorkers)
@@ -1450,11 +1714,13 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		await rollbackCreatedWorktrees(workers);
 		throw error;
 	}
+	const whiplashState = whiplash ? { ...whiplash, lanes: workers.map(worker => worker.whiplash_lane!) } : undefined;
 	const config: GjcTeamConfig = {
 		team_name: teamName,
 		display_name: displayName,
 		requested_name: options.teamName ?? displayName,
 		task: options.task,
+		strategy,
 		agent_type: options.agentType,
 		worker_count: options.workerCount,
 		max_workers: GJC_TEAM_MAX_WORKERS,
@@ -1470,11 +1736,13 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		leader_cwd: cwd,
 		team_state_root: stateRoot,
 		workers,
+		whiplash: whiplashState,
 		created_at: createdAt,
 		updated_at: createdAt,
 	};
 	await initializeStateDirs(dir, config.workers);
 	await writeJsonFile(path.join(dir, "config.json"), config);
+	if (config.whiplash) await writeWhiplashState(dir, config.whiplash);
 	await writeJsonFile(path.join(dir, "manifest.v2.json"), {
 		version: 2,
 		team_name: config.team_name,
@@ -1485,19 +1753,26 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		tmux_target: config.tmux_target,
 		worker_command: config.worker_command,
 		worker_cli_plan: config.worker_cli_plan,
+		strategy: config.strategy,
 		tmux_command: config.tmux_command,
 		leader: config.leader,
 		workers: config.workers,
 		workspace_mode: config.workspace_mode,
+		whiplash: config.whiplash,
 		created_at: createdAt,
 		updated_at: createdAt,
 	});
 	await writePhase(dir, "starting");
-	for (const task of buildInitialTasks(options.task, config.workers)) await writeTask(dir, task);
+	for (const task of buildInitialTasks(options.task, config.workers, config.whiplash)) await writeTask(dir, task);
 	await appendEvent(dir, {
 		type: "team_started",
 		message: "Started native gjc team runtime",
-		data: { worker_count: options.workerCount, agent_type: options.agentType, workspace_mode: config.workspace_mode },
+		data: {
+			worker_count: options.workerCount,
+			agent_type: options.agentType,
+			workspace_mode: config.workspace_mode,
+			strategy: config.strategy,
+		},
 	});
 	await appendTelemetry(dir, {
 		type: "team_runtime",
@@ -1507,6 +1782,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 			worker_command: config.worker_command,
 			worker_cli_plan: workerCliPlan,
 			workspace_mode: config.workspace_mode,
+			strategy: config.strategy,
 		},
 	});
 	let tmuxWorkers: GjcTeamWorker[];
@@ -1526,8 +1802,10 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		...config,
 		workers: tmuxWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: now() })),
 		updated_at: now(),
+		whiplash: config.whiplash,
 	};
 	await writeJsonFile(path.join(dir, "config.json"), runningConfig);
+	if (runningConfig.whiplash) await writeWhiplashState(dir, runningConfig.whiplash);
 	await writePhase(dir, "running");
 	return readGjcTeamSnapshot(teamName, cwd, env);
 }
@@ -1550,6 +1828,7 @@ export async function readGjcTeamSnapshot(
 	};
 	for (const task of tasks) taskCounts[task.status] += 1;
 	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
+	const whiplash = await readWhiplashState(dir);
 	return {
 		team_name: config.team_name,
 		display_name: config.display_name,
@@ -1562,6 +1841,8 @@ export async function readGjcTeamSnapshot(
 		task_counts: taskCounts,
 		workers: config.workers,
 		integration_by_worker: monitor?.integration_by_worker,
+		strategy: config.strategy,
+		whiplash,
 		updated_at: config.updated_at,
 	};
 }
@@ -1705,10 +1986,18 @@ export async function shutdownGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const tasks = await readTasks(dir);
-	const shutdownPhase: GjcTeamPhase =
-		tasks.length === 0 || tasks.every(task => task.status === "completed")
+	const whiplash = await readWhiplashState(dir);
+	const tasksComplete = tasks.length === 0 || tasks.every(task => task.status === "completed");
+	const tasksFailed = tasks.some(task => task.status === "failed" || task.status === "blocked");
+	const shutdownPhase: GjcTeamPhase = whiplash
+		? whiplash.status === "accepted" && tasksComplete
 			? "complete"
-			: tasks.some(task => task.status === "failed" || task.status === "blocked")
+			: whiplash.status === "non_converged" || tasksFailed
+				? "failed"
+				: "cancelled"
+		: tasksComplete
+			? "complete"
+			: tasksFailed
 				? "failed"
 				: "cancelled";
 	killWorkerPanes(config);
@@ -2129,6 +2418,234 @@ export async function readGjcTaskApproval(
 		path.join(await findTeamDir(teamName, cwd, env), "approvals", `${taskId}.json`),
 	);
 }
+function isGjcWhiplashEffortStatus(value: string): value is GjcWhiplashEffortStatus {
+	return ["pending", "honored", "capped", "mismatched", "unsupported", "unknown"].includes(value);
+}
+
+function parseWhiplashProofRequirements(value: unknown): GjcWhiplashProofRequirement[] {
+	if (!Array.isArray(value)) return [];
+	return value.map((entry, index) => {
+		if (typeof entry === "string")
+			return {
+				id: `proof-${index + 1}`,
+				claim: entry,
+				required_evidence: entry,
+				status: "open" as const,
+			};
+		const obj = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+		return {
+			id: String(obj.id ?? `proof-${index + 1}`),
+			claim: String(obj.claim ?? obj.required_evidence ?? obj.evidence ?? ""),
+			required_evidence: String(obj.required_evidence ?? obj.evidence ?? obj.claim ?? ""),
+			status: ["open", "satisfied", "waived"].includes(String(obj.status))
+				? (String(obj.status) as GjcWhiplashProofRequirement["status"])
+				: "open",
+			satisfied_by: typeof obj.satisfied_by === "string" ? obj.satisfied_by : undefined,
+			waiver_rationale: typeof obj.waiver_rationale === "string" ? obj.waiver_rationale : undefined,
+		};
+	});
+}
+
+function isTerminalTaskStatus(status: GjcTeamTaskStatus): boolean {
+	return status === "completed" || status === "failed" || status === "blocked";
+}
+
+function currentWhiplashRoundTasks(tasks: GjcTeamTask[], round: number): GjcTeamTask[] {
+	return tasks.filter(task => task.metadata?.strategy === "whiplash" && task.metadata.round === round);
+}
+
+export async function readGjcWhiplashState(
+	teamName: string,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcWhiplashState> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	const state = await readWhiplashState(dir);
+	if (!state) throw new Error(`whiplash_state_not_found:${teamName}`);
+	return state;
+}
+
+export async function reportGjcWhiplashEffort(
+	teamName: string,
+	workerId: string,
+	input: Record<string, unknown>,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcWhiplashState> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	const state = await readGjcWhiplashState(teamName, cwd, env);
+	const lane = state.lanes.find(candidate => candidate.worker_id === workerId);
+	if (!lane) throw new Error(`whiplash_lane_not_found:${workerId}`);
+	const effectiveRaw =
+		typeof input.effective_thinking_effort === "string" ? input.effective_thinking_effort : undefined;
+	const effective = effectiveRaw && isWhiplashEffectiveEffort(effectiveRaw) ? effectiveRaw : undefined;
+	const explicitRaw = typeof input.effort_status === "string" ? input.effort_status : undefined;
+	const explicit = explicitRaw && isGjcWhiplashEffortStatus(explicitRaw) ? explicitRaw : undefined;
+	const updatedLane: GjcWhiplashLane = {
+		...lane,
+		effective_thinking_effort: effective,
+		effective_model_id:
+			typeof input.effective_model_id === "string" ? input.effective_model_id : lane.effective_model_id,
+		effort_status: resolveEffortStatus(lane.requested_thinking_effort, effective, explicit),
+		effort_evidence: typeof input.effort_evidence === "string" ? input.effort_evidence : lane.effort_evidence,
+	};
+	const updated: GjcWhiplashState = {
+		...state,
+		lanes: state.lanes.map(candidate => (candidate.worker_id === workerId ? updatedLane : candidate)),
+	};
+	updated.degraded_mode = refreshWhiplashDegradedMode(updated);
+	updated.status = updated.degraded_mode.active && updated.status === "accepted" ? "degraded" : updated.status;
+	const written = await writeWhiplashState(dir, updated);
+	const config = await readConfig(dir);
+	await writeJsonFile(path.join(dir, "config.json"), {
+		...config,
+		workers: config.workers.map(worker =>
+			worker.id === workerId ? { ...worker, whiplash_lane: updatedLane, last_heartbeat: now() } : worker,
+		),
+		whiplash: written,
+		updated_at: now(),
+	});
+	await appendEvent(dir, {
+		type: "whiplash_effort_reported",
+		worker: workerId,
+		message: `Whiplash effort ${updatedLane.effort_status}`,
+		data: {
+			worker_id: workerId,
+			requested: updatedLane.requested_thinking_effort,
+			effective,
+			status: updatedLane.effort_status,
+		},
+	});
+	return written;
+}
+
+export async function writeGjcWhiplashReview(
+	teamName: string,
+	input: Record<string, unknown>,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcWhiplashReview> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	const state = await readGjcWhiplashState(teamName, cwd, env);
+	const tasks = await readTasks(dir);
+	const roundTasks = currentWhiplashRoundTasks(tasks, state.round);
+	const openTasks = roundTasks.filter(task => !isTerminalTaskStatus(task.status));
+	if (roundTasks.length !== state.lanes.length || openTasks.length > 0)
+		throw new Error(`whiplash_review_premature:${teamName}:round-${state.round}`);
+	const rawDecision = String(input.decision ?? "");
+	if (!["force_reject", "retry", "accept", "non_converged"].includes(rawDecision))
+		throw new Error(`invalid_whiplash_review_decision:${rawDecision}`);
+	const decision = rawDecision as GjcWhiplashReviewDecision;
+	if (state.round === 1 && decision === "accept") throw new Error("whiplash_round1_accept_forbidden");
+	const comparativeCritique = String(input.comparative_critique ?? input.comparativeCritique ?? "").trim();
+	const proofRequired = parseWhiplashProofRequirements(input.proof_required ?? input.proofRequired);
+	if (!comparativeCritique) throw new Error("whiplash_review_requires_comparative_critique");
+	if (proofRequired.length === 0) throw new Error("whiplash_review_requires_proof_required");
+	const preventionNote = String(input.prevention_note ?? input.preventionNote ?? "").trim();
+	if (input.recurrence && !preventionNote) throw new Error("whiplash_recurrence_requires_prevention_note");
+	const effectiveDegradedMode = refreshWhiplashDegradedMode(state);
+	if (
+		decision === "accept" &&
+		effectiveDegradedMode.active &&
+		!String(input.degraded_acceptance_rationale ?? "").trim()
+	)
+		throw new Error("whiplash_accept_requires_degraded_rationale");
+	const review: GjcWhiplashReview = {
+		round: state.round,
+		decision,
+		reviewer: String(input.reviewer ?? "leader-fixed"),
+		worker_results: Object.fromEntries(
+			roundTasks.map(task => [task.owner ?? task.assignee ?? task.id, { task_id: task.id, status: task.status }]),
+		),
+		comparative_critique: comparativeCritique,
+		proof_required: proofRequired,
+		lead_worker_id: typeof input.lead_worker_id === "string" ? input.lead_worker_id : undefined,
+		lead_worker_benchmark_note: String(
+			input.lead_worker_benchmark_note ?? input.leadWorkerBenchmarkNote ?? "benchmark only",
+		),
+		retry_strategy: typeof input.retry_strategy === "string" ? input.retry_strategy : undefined,
+		non_convergence_note: typeof input.non_convergence_note === "string" ? input.non_convergence_note : undefined,
+		prevention_note: preventionNote,
+		degraded_mode: effectiveDegradedMode.active ? effectiveDegradedMode : undefined,
+		round_consumed: true,
+		created_at: now(),
+	};
+	await writeJsonFile(whiplashReviewPath(dir, state.round), review);
+	const updated: GjcWhiplashState = {
+		...state,
+		status: decision === "accept" ? "accepted" : decision === "non_converged" ? "non_converged" : "retrying",
+		reviews: [...state.reviews.filter(existing => existing.round !== state.round), review],
+		lead_worker_id: review.lead_worker_id ?? state.lead_worker_id,
+		degraded_mode: effectiveDegradedMode,
+	};
+	const written = await writeWhiplashState(dir, updated);
+	const config = await readConfig(dir);
+	await writeJsonFile(path.join(dir, "config.json"), { ...config, whiplash: written, updated_at: now() });
+	await appendEvent(dir, {
+		type: "whiplash_review_written",
+		worker: review.reviewer,
+		message: `Whiplash review ${decision} for round ${review.round}`,
+		data: { round: review.round, decision },
+	});
+	return review;
+}
+
+export async function advanceGjcWhiplashRound(
+	teamName: string,
+	input: Record<string, unknown>,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<GjcWhiplashState> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	const state = await readGjcWhiplashState(teamName, cwd, env);
+	if (state.status !== "retrying") throw new Error(`whiplash_round_not_retrying:${state.status}`);
+	const nextRound = state.round + 1;
+	if (nextRound > 5) throw new Error("whiplash_max_rounds_exceeded");
+	const strategy = String(input.retry_strategy ?? input.strategy ?? `round-${nextRound}-retry`);
+	const rationale = String(input.rationale ?? "Retry after comparative Whiplash review.");
+	const tasks = await readTasks(dir);
+	let nextIndex = tasks.length + 1;
+	for (const lane of state.lanes) {
+		await writeTask(dir, {
+			id: `task-${nextIndex++}`,
+			subject: `Whiplash round ${nextRound} (${lane.worker_id})`,
+			description: state.canonical.task,
+			title: `Whiplash round ${nextRound} (${lane.worker_id})`,
+			objective: state.canonical.task,
+			status: "pending",
+			owner: lane.worker_id,
+			metadata: {
+				strategy: "whiplash",
+				round: nextRound,
+				canonical_hash: lane.canonical_hash,
+				reasoning_tier: lane.reasoning_tier,
+				requested_thinking_effort: lane.requested_thinking_effort,
+				launch_args: lane.launch_args,
+				retry_strategy: strategy,
+			},
+			version: 1,
+			created_at: now(),
+			updated_at: now(),
+		});
+	}
+	const written = await writeWhiplashState(dir, {
+		...state,
+		status: "collecting",
+		round: nextRound,
+		retry_strategy_history: [
+			...state.retry_strategy_history,
+			{ round: nextRound, strategy, rationale, created_at: now() },
+		],
+	});
+	const config = await readConfig(dir);
+	await writeJsonFile(path.join(dir, "config.json"), { ...config, whiplash: written, updated_at: now() });
+	await appendEvent(dir, {
+		type: "whiplash_round_advanced",
+		message: `Advanced Whiplash to round ${nextRound}`,
+		data: { round: nextRound, retry_strategy: strategy },
+	});
+	return written;
+}
 export async function writeGjcShutdownRequest(
 	teamName: string,
 	worker: string,
@@ -2267,6 +2784,14 @@ export async function executeGjcTeamApiOperation(
 			return await readConfig(await findTeamDir(teamName, cwd, env));
 		case "read-manifest":
 			return readJsonFile(path.join(await findTeamDir(teamName, cwd, env), "manifest.v2.json"));
+		case "read-whiplash-state":
+			return { whiplash: await readGjcWhiplashState(teamName, cwd, env) };
+		case "report-whiplash-effort":
+			return { whiplash: await reportGjcWhiplashEffort(teamName, worker, input, cwd, env) };
+		case "write-whiplash-review":
+			return { review: await writeGjcWhiplashReview(teamName, input, cwd, env) };
+		case "advance-whiplash-round":
+			return { whiplash: await advanceGjcWhiplashRound(teamName, input, cwd, env) };
 		case "read-worker-status":
 			return readGjcWorkerStatus(teamName, worker, cwd, env);
 		case "read-worker-heartbeat":
@@ -2327,7 +2852,8 @@ export async function executeGjcTeamApiOperation(
 
 export function parseTeamLaunchArgs(argv: string[]): GjcTeamStartOptions {
 	const parsedWorktree = parseWorktreeMode(argv);
-	const positionals = parsedWorktree.remainingArgs.filter(arg => !arg.startsWith("--"));
+	const strategy: GjcTeamStrategy = parsedWorktree.remainingArgs.includes("--whiplash") ? "whiplash" : "standard";
+	const positionals = parsedWorktree.remainingArgs.filter(arg => arg !== "--whiplash" && !arg.startsWith("--"));
 	const dryRun = argv.includes("--dry-run");
 	let workerCount = GJC_TEAM_DEFAULT_WORKERS;
 	let agentType = "executor";
@@ -2343,7 +2869,7 @@ export function parseTeamLaunchArgs(argv: string[]): GjcTeamStartOptions {
 	} else if (countOnly) {
 		workerCount = Number.parseInt(countOnly[1] ?? "", 10);
 		taskStartIndex = 1;
-	} else if (roleOnly && positionals.length > 1) {
+	} else if (strategy !== "whiplash" && roleOnly && positionals.length > 1) {
 		agentType = roleOnly[1] ?? "executor";
 		taskStartIndex = 1;
 	}
@@ -2351,5 +2877,14 @@ export function parseTeamLaunchArgs(argv: string[]): GjcTeamStartOptions {
 	if (!task) throw new Error("missing_team_task");
 	if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
-	return { workerCount, agentType, task, dryRun, worktreeMode: resolveDefaultWorktreeMode(parsedWorktree.mode) };
+	if (strategy === "whiplash" && workerCount !== 3) throw new Error("whiplash_requires_exactly_three_workers");
+	if (strategy === "whiplash" && agentType !== "executor") throw new Error("whiplash_requires_executor_agent_type");
+	return {
+		workerCount,
+		agentType,
+		task,
+		dryRun,
+		worktreeMode: resolveDefaultWorktreeMode(parsedWorktree.mode),
+		strategy,
+	};
 }

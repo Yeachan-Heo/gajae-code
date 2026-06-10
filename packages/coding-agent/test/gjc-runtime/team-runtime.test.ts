@@ -266,6 +266,168 @@ describe("native gjc team runtime", () => {
 		expect(separatedShort.task).toBe("ship it");
 	});
 
+	it("parses whiplash mode as exactly three executor lanes", () => {
+		const parsed = parseTeamLaunchArgs(["--whiplash", "prove", "the", "fix"]);
+		expect(parsed.strategy).toBe("whiplash");
+		expect(parsed.workerCount).toBe(3);
+		expect(parsed.agentType).toBe("executor");
+		expect(parsed.task).toBe("prove the fix");
+		expect(() => parseTeamLaunchArgs(["--whiplash", "2:executor", "prove"])).toThrow(
+			"whiplash_requires_exactly_three_workers",
+		);
+		expect(() => parseTeamLaunchArgs(["--whiplash", "3:critic", "prove"])).toThrow(
+			"whiplash_requires_executor_agent_type",
+		);
+	});
+
+	it("starts whiplash workers with per-lane thinking launch args and shared canonical hash", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 3,
+			agentType: "executor",
+			task: "Same task collision",
+			teamName: "whiplash-team",
+			strategy: "whiplash",
+			cwd: cleanupRoot,
+			env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "gjc-worker", GJC_TEAM_TMUX_COMMAND: fakeTmux },
+		});
+
+		expect(snapshot.strategy).toBe("whiplash");
+		expect(snapshot.whiplash?.lanes.map(lane => lane.requested_thinking_effort)).toEqual(["low", "medium", "high"]);
+		const hashes = new Set(snapshot.whiplash?.lanes.map(lane => lane.canonical_hash));
+		expect(hashes.size).toBe(1);
+		const config = await readTeamConfig(snapshot.state_dir);
+		const manifest = await Bun.file(path.join(snapshot.state_dir, "manifest.v2.json")).json();
+		expect(config.strategy).toBe("whiplash");
+		expect(manifest.strategy).toBe("whiplash");
+		expect(config.workers.map(worker => worker.whiplash_lane?.launch_args)).toEqual([
+			["--thinking", "low"],
+			["--thinking", "medium"],
+			["--thinking", "high"],
+		]);
+		const tasks = await executeGjcTeamApiOperation("list-tasks", { team_name: "whiplash-team" }, cleanupRoot, {
+			PATH: process.env.PATH ?? "",
+		});
+		expect(JSON.stringify(tasks)).toContain('"canonical_hash"');
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("gjc-worker '--thinking' 'low'");
+		expect(tmuxLog).toContain("gjc-worker '--thinking' 'medium'");
+		expect(tmuxLog).toContain("gjc-worker '--thinking' 'high'");
+	});
+
+	it("enforces whiplash effort reporting, round-one reject, and retry round creation", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 3,
+			agentType: "executor",
+			task: "Review barrier",
+			teamName: "whiplash-api-team",
+			strategy: "whiplash",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+
+		await expect(
+			executeGjcTeamApiOperation(
+				"write-whiplash-review",
+				{
+					team_name: "whiplash-api-team",
+					decision: "force_reject",
+					comparative_critique: "not all workers are terminal",
+					proof_required: ["failure path"],
+				},
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("whiplash_review_premature");
+
+		for (const [worker, effort] of [
+			["worker-1", "low"],
+			["worker-2", "medium"],
+			["worker-3", "high"],
+		] as const) {
+			await executeGjcTeamApiOperation(
+				"report-whiplash-effort",
+				{
+					team_name: "whiplash-api-team",
+					worker_id: worker,
+					effective_thinking_effort: effort,
+					effective_model_id: `provider/${effort}`,
+					effort_evidence: "test report",
+				},
+				cleanupRoot,
+				{ PATH: "" },
+			);
+			const claim = await claimGjcTeamTask("whiplash-api-team", worker, cleanupRoot, { PATH: "" });
+			expect(claim.ok).toBe(true);
+			await transitionGjcTeamTask(
+				"whiplash-api-team",
+				claim.task?.id ?? "",
+				"completed",
+				cleanupRoot,
+				{ PATH: "" },
+				claim.claim_token,
+			);
+		}
+
+		const mismatchedEffort = await executeGjcTeamApiOperation(
+			"report-whiplash-effort",
+			{
+				team_name: "whiplash-api-team",
+				worker_id: "worker-1",
+				effective_thinking_effort: "medium",
+				effective_model_id: "provider/medium",
+				effort_evidence: "provider resolved above requested low effort",
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		expect(JSON.stringify(mismatchedEffort)).toContain('"effort_status":"mismatched"');
+		expect(JSON.stringify(mismatchedEffort)).toContain('"active":true');
+
+		await expect(
+			executeGjcTeamApiOperation(
+				"write-whiplash-review",
+				{
+					team_name: "whiplash-api-team",
+					decision: "accept",
+					comparative_critique: "round one cannot accept",
+					proof_required: ["failure path"],
+				},
+				cleanupRoot,
+				{ PATH: "" },
+			),
+		).rejects.toThrow("whiplash_round1_accept_forbidden");
+
+		const review = await executeGjcTeamApiOperation(
+			"write-whiplash-review",
+			{
+				team_name: "whiplash-api-team",
+				decision: "force_reject",
+				comparative_critique: "compare low medium high",
+				proof_required: ["failure path"],
+				lead_worker_id: "worker-3",
+				lead_worker_benchmark_note: "worker-3 is a benchmark only",
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		expect(JSON.stringify(review)).toContain('"decision":"force_reject"');
+		const advanced = await executeGjcTeamApiOperation(
+			"advance-whiplash-round",
+			{ team_name: "whiplash-api-team", retry_strategy: "structural-change", rationale: "proof gap" },
+			cleanupRoot,
+			{ PATH: "" },
+		);
+		expect(JSON.stringify(advanced)).toContain('"round":2');
+		const tasks = await executeGjcTeamApiOperation("list-tasks", { team_name: "whiplash-api-team" }, cleanupRoot, {
+			PATH: "",
+		});
+		expect(JSON.stringify(tasks)).toContain('"round":2');
+	});
+
 	it("creates worker worktrees by default for the tmux launch path", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
