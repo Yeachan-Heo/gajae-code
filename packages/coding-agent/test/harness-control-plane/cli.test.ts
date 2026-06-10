@@ -121,6 +121,45 @@ async function appendSignal(sessionId: string, cursor: number, signal: string): 
 	});
 }
 
+const DEAD_PID = 2_147_483_646;
+
+/**
+ * Seed a session whose owner started (emitted `owner_started`, so it reported live) but whose
+ * process is now dead, with no prompt ever accepted: the issue #485 "owner died before first
+ * prompt" scenario. Writes a dead-pid lease plus the `owner_started` event deterministically.
+ */
+async function seedOwnerDiedBeforeFirstPrompt(sessionId: string): Promise<void> {
+	const state = await readSessionState(root, sessionId);
+	if (!state) throw new Error("missing seeded state");
+	state.lifecycle = "started";
+	state.updatedAt = "2026-06-03T00:00:00.000Z";
+	await writeSessionState(root, state);
+	const lease = {
+		ownerId: "owner-dead",
+		sessionId,
+		pid: DEAD_PID,
+		leaseTokenHash: "0".repeat(64),
+		endpoint: { kind: "unix-socket" as const, path: "/tmp/dead-owner.sock" },
+		eventsPath: sessionPaths(root, sessionId).events,
+		heartbeatAt: "2026-06-03T00:00:01.000Z",
+		expiresAt: new Date(Date.now() + 30_000).toISOString(),
+		leaseEpoch: 1,
+		writer: { ownerId: "owner-dead", leaseEpoch: 1 },
+	};
+	await writeFile(sessionPaths(root, sessionId).lease, `${JSON.stringify(lease, null, 2)}\n`, "utf8");
+	await appendEvent(root, sessionId, {
+		eventId: "evt-owner-started",
+		cursor: 1,
+		createdAt: "2026-06-03T00:00:01.000Z",
+		severity: "info",
+		kind: "owner_started",
+		state: { sessionId, lifecycle: "started", harness: "gajae-code", ownerLive: true, blockers: [] },
+		evidence: { ownerId: "owner-dead", leaseEpoch: 1 },
+		nextAllowedActions: [],
+		writer: { ownerId: "owner-dead", leaseEpoch: 1 },
+	});
+}
+
 describe("gjc harness CLI (foundation)", () => {
 	it("test CLI env cleanup removes overlapping created links and preserves pre-existing links", async () => {
 		const fakeRepo = await mkdtemp(path.join(tmpdir(), "harness-cli-env-repo-"));
@@ -702,5 +741,92 @@ describe("gjc harness CLI (foundation)", () => {
 		expect(res.json.ok).toBe(false);
 		expect(res.json.evidence.pending).toBe(true);
 		expect(res.json.evidence.verb).toBe("validate");
+	});
+
+	it("submit surfaces owner death before first prompt as an actionable startup blocker (#485)", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		await seedOwnerDiedBeforeFirstPrompt(sessionId);
+
+		const res = runHarness(["submit", "--session", sessionId, "--input", JSON.stringify({ prompt: "go" })]);
+
+		expect(res.code).toBe(1);
+		assertContract(res.json);
+		expect(res.json.ok).toBe(false);
+		expect(res.json.evidence.accepted).toBe(false);
+		expect(res.json.evidence.submitted).toBe(false);
+		// Not the misleading bare gate: an explicit, distinct startup-death reason.
+		expect(res.json.evidence.reason).toBe("owner-died-before-first-prompt");
+		expect(res.json.evidence.guidance).toContain("recover");
+		expect(res.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-died-before-first-prompt",
+			leaseStatus: "dead",
+			pid: DEAD_PID,
+			lastEventKind: "owner_started",
+			promptAcceptedSeen: false,
+			completedSeen: false,
+			terminal: true,
+			startupBlocker: true,
+		});
+		// The session is persisted as an actionable blocked state, not left as a healthy "started".
+		expect(res.json.state.lifecycle).toBe("blocked");
+		expect(res.json.state.blockers).toContain("owner-died-before-first-prompt");
+		const persisted = await readSessionState(root, sessionId);
+		expect(persisted?.lifecycle).toBe("blocked");
+		expect(persisted?.blockers).toContain("owner-died-before-first-prompt");
+	});
+
+	it("observe surfaces owner death before first prompt with preserved exit evidence (#485)", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		await seedOwnerDiedBeforeFirstPrompt(sessionId);
+
+		const res = runHarness(["observe", "--session", sessionId]);
+
+		expect(res.code).toBe(0);
+		assertContract(res.json);
+		expect(res.json.state.ownerLive).toBe(false);
+		expect(res.json.state.lifecycle).toBe("blocked");
+		expect(res.json.state.blockers).toContain("owner-died-before-first-prompt");
+		expect(res.json.evidence.startupBlocked).toBe(true);
+		expect(res.json.evidence.blockerReason).toBe("owner-died-before-first-prompt");
+		expect(res.json.evidence.guidance).toContain("recover");
+		expect(res.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-died-before-first-prompt",
+			leaseStatus: "dead",
+			pid: DEAD_PID,
+			startupBlocker: true,
+		});
+	});
+
+	it("does not classify owner death after prompt acceptance as a startup blocker (boundary, #485)", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		await seedOwnerDiedBeforeFirstPrompt(sessionId);
+		// A prompt was accepted before the owner died -> post-acceptance exit, not a startup blocker.
+		await appendEvent(root, sessionId, {
+			eventId: "evt-prompt-accepted",
+			cursor: 2,
+			createdAt: "2026-06-03T00:00:02.000Z",
+			severity: "info",
+			kind: "prompt_accepted",
+			state: { sessionId, lifecycle: "observing", harness: "gajae-code", ownerLive: true, blockers: [] },
+			evidence: { reason: "protocol-ack-single-flight", agentStartCursor: 2 },
+			nextAllowedActions: [],
+			writer: { ownerId: "owner-dead", leaseEpoch: 1 },
+		});
+
+		const res = runHarness(["submit", "--session", sessionId, "--input", JSON.stringify({ prompt: "go" })]);
+
+		expect(res.code).toBe(1);
+		expect(res.json.evidence.reason).toBe("owner-not-live");
+		expect(res.json.evidence.ownerExit).toMatchObject({
+			reason: "owner-exited-after-prompt-acceptance",
+			startupBlocker: false,
+			promptAcceptedSeen: true,
+		});
 	});
 });
