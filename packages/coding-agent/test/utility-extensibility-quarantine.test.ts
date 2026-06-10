@@ -35,7 +35,6 @@ describe("GJC utility extensibility quarantine", () => {
 			"plan",
 			"share",
 			"browser",
-			"copy",
 			"todo",
 			"changelog",
 			"branch",
@@ -49,6 +48,7 @@ describe("GJC utility extensibility quarantine", () => {
 		}
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
+		expect(registry).toContain(`name: "copy"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);
 		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});

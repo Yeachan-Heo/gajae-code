@@ -436,6 +436,21 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "copy",
+		description: "Copy last agent message to clipboard",
+		subcommands: [
+			{ name: "last", description: "Copy last agent message (default)" },
+			{ name: "code", description: "Copy last code block from last agent message" },
+			{ name: "all", description: "Copy all code blocks from last agent message" },
+			{ name: "cmd", description: "Copy last bash/eval command" },
+		],
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			runtime.ctx.handleCopyCommand(command.args.trim().toLowerCase() || undefined);
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "session",
 		description: "Session management commands",
 		acpDescription: "Show session information",
