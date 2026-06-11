@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as ai from "@gajae-code/ai";
 import { type Api, getBundledModel, type Model } from "@gajae-code/ai";
-import { generateSessionTitle } from "../src/utils/title-generator";
+import { formatSessionTerminalTitle, generateSessionTitle } from "../src/utils/title-generator";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -101,5 +101,27 @@ describe("title generator", () => {
 
 		expect(title).toBe("Budget Title");
 		expect(maxTokens).toBeGreaterThanOrEqual(1024);
+	});
+});
+
+describe("formatSessionTerminalTitle", () => {
+	it("returns GJC when no session name or cwd is provided", () => {
+		expect(formatSessionTerminalTitle(undefined)).toBe("GJC");
+	});
+
+	it("prefixes the session name with GJC", () => {
+		expect(formatSessionTerminalTitle("My Session")).toBe("GJC: My Session");
+	});
+
+	it("falls back to the cwd basename when no session name is provided", () => {
+		expect(formatSessionTerminalTitle(undefined, "/home/user/gajae")).toBe("GJC: gajae");
+	});
+
+	it("strips control characters from the session name", () => {
+		expect(formatSessionTerminalTitle("ab\u0001\u001bc")).toBe("GJC: abc");
+	});
+
+	it("falls back to GJC when the sanitized session name is empty", () => {
+		expect(formatSessionTerminalTitle("\u0001\u001b")).toBe("GJC");
 	});
 });
