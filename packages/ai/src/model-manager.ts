@@ -134,7 +134,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cache.staticFingerprint === staticFingerprint &&
 		cache.staticFingerprint.length > 0
 	) {
-		return { models: passModelList<TApi>(cache.models), stale: false };
+		const cachedModels = passModelList<TApi>(cache.models);
+		if (!hasStaticTransportDrift(staticModels, cachedModels)) {
+			return { models: cachedModels, stale: false };
+		}
+		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
+		writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
+		return { models: repairedModels, stale: false };
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -225,6 +231,20 @@ function shouldFetchRemoteSources(
 	}
 	if (!hasAuthoritativeCache) {
 		return cacheAgeMs >= NON_AUTHORITATIVE_RETRY_MS;
+	}
+	return false;
+}
+
+function hasStaticTransportDrift<TApi extends Api>(
+	staticModels: readonly Model<TApi>[],
+	cachedModels: readonly Model<TApi>[],
+): boolean {
+	if (staticModels.length === 0 || cachedModels.length === 0) return false;
+	const cachedById = new Map(cachedModels.map(model => [model.id, model]));
+	for (const staticModel of staticModels) {
+		const cachedModel = cachedById.get(staticModel.id);
+		if (!cachedModel) continue;
+		if (cachedModel.api !== staticModel.api) return true;
 	}
 	return false;
 }

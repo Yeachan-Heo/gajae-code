@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import { getBundledModels } from "../src/models";
 import type { Api, Model } from "../src/types";
@@ -71,6 +72,52 @@ describe("opencode-go qwen3.7-max keeps anthropic-messages transport (issue #489
 		expect(qwen).toBeDefined();
 		expect(qwen?.api).toBe("anthropic-messages");
 		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go");
+	});
+
+	test("fresh authoritative cache with stale transport is repaired before fast-path return", async () => {
+		const staticModels: Model<Api>[] = [
+			{
+				id: "qwen3.7-max",
+				name: "Qwen3.7 Max",
+				api: "anthropic-messages",
+				provider: "opencode-go",
+				baseUrl: "https://opencode.ai/zen/go",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 2.5, output: 7.5, cacheRead: 0.5, cacheWrite: 3.125 },
+				contextWindow: 1000000,
+				maxTokens: 65536,
+			},
+		];
+		const poisonedCache: Model<Api>[] = [
+			{
+				...staticModels[0],
+				api: "openai-completions",
+				baseUrl: "https://opencode.ai/zen/go/v1",
+			},
+		];
+		const now = () => 1_800_000_000_000;
+		const staticFingerprint = Bun.hash(JSON.stringify(staticModels)).toString(36);
+		writeModelCache("opencode-go", now(), poisonedCache, true, staticFingerprint, cacheDbPath);
+
+		const { models, stale } = await resolveProviderModels<Api>(
+			{
+				providerId: "opencode-go",
+				staticModels,
+				cacheDbPath,
+				now,
+				fetchDynamicModels: async () => {
+					throw new Error("fast path should not fetch");
+				},
+			},
+			"online-if-uncached",
+		);
+
+		const qwen = models.find(m => m.id === "qwen3.7-max");
+		expect(stale).toBe(false);
+		expect(qwen?.api).toBe("anthropic-messages");
+		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go");
+		expect(qwen?.contextWindow).toBe(1000000);
 	});
 
 	test("dynamic discovery still enriches matching-transport models", async () => {
