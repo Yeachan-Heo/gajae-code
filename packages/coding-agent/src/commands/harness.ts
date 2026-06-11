@@ -10,7 +10,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
@@ -508,6 +508,7 @@ export default class Harness extends Command {
 
 	static flags = {
 		input: Flags.string({ description: "JSON object input for the verb", default: "" }),
+		"prompt-file": Flags.string({ description: "Read submit prompt text from a file (submit verb only)" }),
 		session: Flags.string({ char: "s", description: "Session id (re-grab a session)" }),
 		cursor: Flags.string({ description: "Event cursor for events --follow (exclusive)", default: "0" }),
 		follow: Flags.boolean({ description: "Tail the owner-written event log", default: false }),
@@ -527,6 +528,14 @@ export default class Harness extends Command {
 		let root = resolveHarnessRoot();
 		try {
 			const input = parseInput(flags.input);
+			const promptFile = flags["prompt-file"];
+			if (promptFile !== undefined) {
+				if (verb !== "submit") throw new Error("prompt_file_only_supported_for_submit");
+				if (typeof input.prompt === "string" && input.prompt.length > 0) {
+					throw new Error("prompt_file_conflicts_with_input_prompt");
+				}
+				input.prompt = readFileSync(promptFile, "utf8");
+			}
 			const sessionId = flags.session ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
 			const expectedWorkspace = typeof input.workspace === "string" ? resolveInputWorkspace(input) : undefined;
 			if (verb !== "start" && sessionId) {
