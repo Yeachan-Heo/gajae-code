@@ -3621,10 +3621,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#initializeSchema(): void {
+		// Apply busy_timeout FIRST: `PRAGMA journal_mode=WAL` needs a brief
+		// exclusive lock, and without an active busy_timeout a concurrent writer
+		// makes it fail immediately with SQLITE_BUSY (deterministic on Windows,
+		// where file locks are mandatory).
+		this.#db.run("PRAGMA busy_timeout=5000");
 		this.#db.run(`
 			PRAGMA journal_mode=WAL;
 			PRAGMA synchronous=NORMAL;
-			PRAGMA busy_timeout=5000;
 			CREATE TABLE IF NOT EXISTS auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
