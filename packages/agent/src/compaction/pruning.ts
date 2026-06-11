@@ -73,31 +73,39 @@ function toolCallPath(call: ToolCall): string | undefined {
 }
 
 /**
- * `*** Add|Update|Delete File: <path>` and `*** Move to: <path>` headers in
- * an apply_patch envelope. Move destinations count as touched paths: a rename
- * onto a file invalidates earlier reads of that destination.
+ * `*** Add|Update|Delete File: <path>` headers open a hunk; `*** Move to:
+ * <path>` attaches a rename destination to the current hunk. Move
+ * destinations count as touched paths: a rename onto a file invalidates
+ * earlier reads of that destination.
  */
-const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/gm;
+const APPLY_PATCH_HEADER = /^\*\*\* (?:((?:Add|Update|Delete) File)|(Move to)): (.+)$/gm;
 
 /**
- * Paths touched by an edit-class tool call. Most edit tools carry a single
- * path argument; apply_patch envelopes carry an `input` string with
- * `*** <Op> File:` / `*** Move to:` headers instead. The envelope shape can
+ * Paths touched by an edit-class tool call, grouped per hunk so a failed
+ * hunk can be excluded wholesale (its rename destination included). Most
+ * edit tools carry a single path argument; apply_patch envelopes carry an
+ * `input` string with per-file headers instead. The envelope shape can
  * arrive under the custom `apply_patch` tool OR the regular `edit` tool
  * (providers without custom-tool support fall back to the JSON function), so
  * any edit-class call with a string `input` is parsed for headers.
  */
-function editToolPaths(call: ToolCall): string[] {
+function editToolPathGroups(call: ToolCall): string[][] {
 	const path = toolCallPath(call);
-	if (path !== undefined) return [path];
+	if (path !== undefined) return [[path]];
 	const input = call.arguments.input;
 	if (typeof input !== "string") return [];
-	const paths: string[] = [];
-	for (const match of input.matchAll(APPLY_PATCH_FILE_HEADER)) {
-		const headerPath = match[1]?.trim();
-		if (headerPath) paths.push(headerPath);
+	const groups: string[][] = [];
+	for (const match of input.matchAll(APPLY_PATCH_HEADER)) {
+		const headerPath = match[3]?.trim();
+		if (!headerPath) continue;
+		const isMoveTo = match[2] !== undefined;
+		if (isMoveTo && groups.length > 0) {
+			groups[groups.length - 1].push(headerPath);
+		} else {
+			groups.push([headerPath]);
+		}
 	}
-	return paths;
+	return groups;
 }
 
 /**
@@ -188,6 +196,17 @@ function failedEditPaths(message: ToolResultMessage): Set<string> {
 	return failed;
 }
 
+/**
+ * Concrete file path a `read` result actually came from, when the tool
+ * reported one (`details.resolvedPath`). Suffix resolution can map a bare
+ * filename argument onto a different concrete path.
+ */
+function readResolvedPath(message: ToolResultMessage): string | undefined {
+	const details = message.details as { resolvedPath?: unknown } | undefined;
+	const resolved = details?.resolvedPath;
+	return typeof resolved === "string" && resolved.length > 0 ? resolved : undefined;
+}
+
 interface StalenessIndex {
 	/** Entry indices of toolResults superseded by a later same-target result or a later edit. */
 	staleResultIndices: Set<number>;
@@ -211,7 +230,7 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 	}
 
 	const lastResultIndexByKey = new Map<string, number>();
-	const resultMeta = new Map<number, { key?: string; call: ToolCall }>();
+	const resultMeta = new Map<number, { key?: string; call: ToolCall; message: ToolResultMessage }>();
 	const lastEditIndexByPath = new Map<string, number>();
 
 	for (let i = 0; i < entries.length; i++) {
@@ -233,14 +252,18 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		if (message.isError) continue;
 
 		const key = toolTargetKey(call);
-		resultMeta.set(i, { key, call });
+		resultMeta.set(i, { key, call, message });
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
 			// Per-file edit results record failures in details.perFileResults;
-			// failed files were not mutated and must not stale reads.
+			// a failed hunk mutated nothing, so exclude its whole path group
+			// (rename destination included) from touched paths.
 			const failed = failedEditPaths(message);
-			for (const editPath of editToolPaths(call)) {
-				if (!failed.has(editPath)) lastEditIndexByPath.set(editPath, i);
+			for (const group of editToolPathGroups(call)) {
+				if (group.some(groupPath => failed.has(groupPath))) continue;
+				for (const editPath of group) {
+					lastEditIndexByPath.set(editPath, i);
+				}
 			}
 		}
 	}
@@ -255,11 +278,20 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 			}
 		}
 		if (meta.call.name === "read") {
-			const path = toolCallPath(meta.call);
-			if (path !== undefined) {
-				// Selector-qualified reads (src/foo.ts:50-100) still read the file.
-				const editIndex = lastEditIndexByPath.get(readBasePath(path));
-				if (editIndex !== undefined && editIndex > index) staleResultIndices.add(index);
+			// Check both the call argument (selectors stripped) and the resolved
+			// path from result details: suffix resolution can map a bare filename
+			// onto a different concrete path, and edits may use either form.
+			const lookupPaths = new Set<string>();
+			const argPath = toolCallPath(meta.call);
+			if (argPath !== undefined) lookupPaths.add(readBasePath(argPath));
+			const resolved = readResolvedPath(meta.message);
+			if (resolved !== undefined) lookupPaths.add(resolved);
+			for (const lookupPath of lookupPaths) {
+				const editIndex = lastEditIndexByPath.get(lookupPath);
+				if (editIndex !== undefined && editIndex > index) {
+					staleResultIndices.add(index);
+					break;
+				}
 			}
 		}
 	}

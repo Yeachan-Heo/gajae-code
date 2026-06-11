@@ -312,14 +312,9 @@ describe("staleness supersession ordering", () => {
 	it("a same-path edit that partly succeeds still invalidates its reads", () => {
 		const entries: SessionEntry[] = [];
 		const read = pair(entries, "c1", "read", { path: "src/multi.ts" });
-		const envelope = [
-			"*** Begin Patch",
-			"*** Update File: src/multi.ts",
-			"@@",
-			"-a",
-			"+b",
-			"*** End Patch",
-		].join("\n");
+		const envelope = ["*** Begin Patch", "*** Update File: src/multi.ts", "@@", "-a", "+b", "*** End Patch"].join(
+			"\n",
+		);
 		entries.push(assistantCallEntry("c2", "apply_patch", { input: envelope }));
 		const patchResult = toolResultEntry("c2", "apply_patch", 100);
 		// apply_patch emits multiple entries for the same path: an earlier
@@ -334,6 +329,52 @@ describe("staleness supersession ordering", () => {
 		entries.push(patchResult);
 		const ids = prunedIds(entries, EAGER);
 		expect(ids).toContain(read.id);
+	});
+
+	it("a failed rename hunk does not stale reads of its Move to destination", () => {
+		const entries: SessionEntry[] = [];
+		const readDest = pair(entries, "c1", "read", { path: "src/dest.ts" });
+		const readOk = pair(entries, "c2", "read", { path: "src/ok.ts" });
+		const envelope = [
+			"*** Begin Patch",
+			"*** Update File: src/ok.ts",
+			"@@",
+			"-a",
+			"+b",
+			"*** Update File: src/source.ts",
+			"*** Move to: src/dest.ts",
+			"@@",
+			"-x",
+			"+y",
+			"*** End Patch",
+		].join("\n");
+		entries.push(assistantCallEntry("c3", "apply_patch", { input: envelope }));
+		const patchResult = toolResultEntry("c3", "apply_patch", 100);
+		(patchResult.message as ToolResultMessage & { details?: unknown }).details = {
+			perFileResults: [
+				{ path: "src/ok.ts", isError: false },
+				{ path: "src/source.ts", isError: true, errorText: "hash mismatch" },
+			],
+		};
+		entries.push(patchResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(readOk.id);
+		expect(ids).not.toContain(readDest.id);
+	});
+
+	it("a suffix-resolved read is invalidated via its resolvedPath details", () => {
+		const entries: SessionEntry[] = [];
+		// Read called with a bare filename; tool resolved it to src/foo.ts.
+		entries.push(assistantCallEntry("c1", "read", { path: "foo.ts" }));
+		const suffixRead = toolResultEntry("c1", "read", 8000);
+		(suffixRead.message as ToolResultMessage & { details?: unknown }).details = {
+			resolvedPath: "src/foo.ts",
+			suffixResolution: { from: "foo.ts", to: "src/foo.ts" },
+		};
+		entries.push(suffixRead);
+		pair(entries, "c2", "edit", { path: "src/foo.ts" }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(suffixRead.id);
 	});
 
 	it("an errored later result does not supersede the earlier success", () => {
