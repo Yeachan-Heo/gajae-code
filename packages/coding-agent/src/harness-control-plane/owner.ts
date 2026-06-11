@@ -504,13 +504,21 @@ export class RuntimeOwner {
 		const workspace = state.handle.workspace;
 		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(workspace);
 		const reviewOnly = state.handle.mode === "review";
+		const inputVerdict = reviewOnly ? (typeof input.verdict === "string" ? input.verdict : null) : undefined;
+		// Review-only finalize with no explicit verdict pulls the final assistant text from the live
+		// RPC owner so the verdict can be extracted deterministically instead of demanded from the operator.
+		let assistantText: string | null = null;
+		if (reviewOnly && inputVerdict == null && this.#opts.rpc.getLastAssistantText) {
+			assistantText = await this.#opts.rpc.getLastAssistantText().catch(() => null);
+		}
 		const fin = await runFinalize({
 			root: this.#opts.root,
 			sessionId: this.#opts.sessionId,
 			workspace,
 			branch: state.handle.branch ?? "",
 			reviewOnly,
-			verdict: reviewOnly ? (typeof input.verdict === "string" ? input.verdict : null) : undefined,
+			verdict: inputVerdict,
+			assistantText: reviewOnly ? assistantText : undefined,
 			prTarget: reviewOnly ? state.handle.issueOrPr : undefined,
 			requireTests: input.requireTests !== false,
 			requireCommit: input.requireCommit !== false,

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "../../src/harness-control-plane/finalize";
 import { readReceiptIndex } from "../../src/harness-control-plane/storage";
+import type { ReviewFailureEvidence, ReviewVerdictEvidence } from "../../src/harness-control-plane/receipts";
 
 let root: string;
 const SID = "f";
@@ -173,5 +174,116 @@ describe("runFinalize (review-only verdict gate)", () => {
 		});
 		expect(res.completed).toBe(true);
 		expect(res.blockers).not.toContain("validation-required-but-none-run");
+	});
+});
+
+describe("runFinalize (review-only verdict from assistant text)", () => {
+	const reviewBase = () => ({
+		root,
+		sessionId: SID,
+		workspace: "/ws",
+		branch: "gajae-code-pr-414-review",
+		reviewOnly: true as const,
+		prTarget: "PR-414",
+	});
+
+	async function readEvidence<E>(family: "review-verdict" | "review-failure"): Promise<E> {
+		const idx = await readReceiptIndex(root, SID, family);
+		expect(idx).toHaveLength(1);
+		const env = JSON.parse(await readFile(idx[0].path, "utf8")) as { evidence: E };
+		return env.evidence;
+	}
+
+	it("extracts a verdict from final assistant text when no explicit verdict is supplied", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: null,
+			assistantText: "Reviewed the diff. Found blocking issues.\nVerdict: REQUEST_CHANGES",
+			checks: checks(),
+		});
+		expect(res.completed).toBe(true);
+		expect(res.verdict).toBe("REQUEST_CHANGES");
+		expect(res.blockers).toEqual([]);
+		const evidence = await readEvidence<ReviewVerdictEvidence>("review-verdict");
+		expect(evidence.verdict).toBe("REQUEST_CHANGES");
+		expect(evidence.verdictSource).toBe("assistant");
+		expect(typeof evidence.assistantDigest).toBe("string");
+		expect((evidence.assistantDigest as string).length).toBe(64);
+	});
+
+	it("aliases MERGE_READY to APPROVE_MERGE_READY", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: null,
+			assistantText: "Looks good to me. MERGE_READY",
+			checks: checks(),
+		});
+		expect(res.verdict).toBe("APPROVE_MERGE_READY");
+		expect(res.completed).toBe(true);
+	});
+
+	it("uses the final (last) verdict when the assistant text mentions several", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: null,
+			assistantText: "Initially I leaned APPROVE_MERGE_READY but on reflection: REQUEST_CHANGES",
+			checks: checks(),
+		});
+		expect(res.verdict).toBe("REQUEST_CHANGES");
+	});
+
+	it("fails deterministically with bounded/digest evidence when assistant text lacks a verdict", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: null,
+			assistantText: "I looked at the change but I am not sure what to recommend yet.",
+			checks: checks(),
+		});
+		expect(res.completed).toBe(false);
+		expect(res.verdict).toBeNull();
+		expect(res.blockers).toEqual(["review-verdict-missing"]);
+		const evidence = await readEvidence<ReviewFailureEvidence>("review-failure");
+		expect(evidence.reason).toBe("review-verdict-missing");
+		expect(typeof evidence.assistantDigest).toBe("string");
+		expect((evidence.assistantDigest as string).length).toBe(64);
+		expect(evidence.assistantSummary).toContain("not sure what to recommend");
+	});
+
+	it("bounds an oversized assistant summary in the failure receipt", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: null,
+			assistantText: "x".repeat(5000),
+			checks: checks(),
+		});
+		expect(res.completed).toBe(false);
+		const evidence = await readEvidence<ReviewFailureEvidence>("review-failure");
+		expect((evidence.assistantSummary as string).length).toBeLessThanOrEqual(281);
+	});
+
+	it("explicit input.verdict wins over assistant extraction", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: "APPROVE_MERGE_READY",
+			assistantText: "Verdict: REQUEST_CHANGES",
+			checks: checks(),
+		});
+		expect(res.completed).toBe(true);
+		expect(res.verdict).toBe("APPROVE_MERGE_READY");
+		const evidence = await readEvidence<ReviewVerdictEvidence>("review-verdict");
+		expect(evidence.verdictSource).toBe("input");
+		expect(evidence.assistantDigest ?? null).toBeNull();
+	});
+
+	it("treats a non-null invalid explicit verdict as invalid (no extraction fallback)", async () => {
+		const res = await runFinalize({
+			...reviewBase(),
+			verdict: "LGTM",
+			assistantText: "Verdict: REQUEST_CHANGES",
+			checks: checks(),
+		});
+		expect(res.completed).toBe(false);
+		expect(res.blockers).toEqual(["review-verdict-invalid"]);
+		expect(res.verdict).toBeNull();
 	});
 });

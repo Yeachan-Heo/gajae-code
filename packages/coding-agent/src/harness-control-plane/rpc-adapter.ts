@@ -36,6 +36,8 @@ export interface HarnessRpc {
 	isLive?(): boolean;
 	/** ISO timestamp of the last observed event frame, or null. */
 	lastFrameAt?(): string | null;
+	/** Final assistant text from the live session (for review-verdict extraction); null when unavailable. */
+	getLastAssistantText?(): Promise<string | null>;
 }
 
 export interface AcceptanceResult {
@@ -238,6 +240,12 @@ export class GajaeCodeRpc implements HarnessRpc {
 			steeringQueueDepth: typeof data.queuedMessageCount === "number" ? data.queuedMessageCount : 0,
 			followupQueueDepth: 0,
 		};
+	}
+
+	async getLastAssistantText(): Promise<string | null> {
+		const res = await this.#send({ type: "get_last_assistant_text" });
+		const data = (res.data ?? {}) as Record<string, unknown>;
+		return typeof data.text === "string" ? data.text : null;
 	}
 
 	async sendPrompt(prompt: string): Promise<{ commandId: string; ack: boolean }> {

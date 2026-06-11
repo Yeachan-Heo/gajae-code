@@ -156,6 +156,10 @@ export interface ReviewVerdictEvidence {
 	finalizedAt: string;
 	/** Bounded summary code/reference for the verdict; never raw assistant text. */
 	summaryRef: string | null;
+	/** Where the verdict came from: explicit operator input or extracted from final assistant text. */
+	verdictSource?: "input" | "assistant";
+	/** sha256 of the assistant text the verdict was extracted from, when sourced from the agent. */
+	assistantDigest?: string | null;
 }
 
 export interface ReviewFailureEvidence {
@@ -165,6 +169,10 @@ export interface ReviewFailureEvidence {
 	failedAt: string;
 	/** Routing hint for the operator/fallback path. */
 	fallback: string;
+	/** sha256 of the assistant text examined for a verdict, when one was available. */
+	assistantDigest?: string | null;
+	/** Bounded, whitespace-collapsed assistant summary (never an unbounded transcript dump). */
+	assistantSummary?: string | null;
 }
 
 function validateFamily(receipt: ReceiptEnvelope<unknown>): string[] {
