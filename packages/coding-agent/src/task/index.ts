@@ -580,6 +580,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								runMode: message ? "message" : "resume",
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+								suppressRoiReconciliation: true,
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -677,6 +678,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								frozenForkSeeds,
 								{
 									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
+									suppressRoiReconciliation: true,
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -876,6 +878,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			runMode?: "initial" | "resume" | "message";
 			resumeMessage?: string;
 			sessionFiles?: ReadonlyMap<string, string | null>;
+			/**
+			 * Set for per-child async runs: the spawnPlan is carried for gate
+			 * consistency, but batch-level ROI reconciliation must not be computed
+			 * against a single child's receipts.
+			 */
+			suppressRoiReconciliation?: boolean;
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
@@ -1714,7 +1722,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const receipts = results.map(buildTaskReceipt);
 			const roiSummary = buildTaskRoiSummary(receipts);
-			const roiReconciliation = reconcileSpawnRoi(params.spawnPlan, receipts);
+			const roiReconciliation = executionOverrides?.suppressRoiReconciliation
+				? undefined
+				: reconcileSpawnRoi(params.spawnPlan, receipts);
 			const summaries = receipts.map(r => {
 				const status = r.status === "merge_failed" ? "merge failed" : r.status;
 				return {
