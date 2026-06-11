@@ -309,6 +309,33 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(readFailed.id);
 	});
 
+	it("a same-path edit that partly succeeds still invalidates its reads", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/multi.ts" });
+		const envelope = [
+			"*** Begin Patch",
+			"*** Update File: src/multi.ts",
+			"@@",
+			"-a",
+			"+b",
+			"*** End Patch",
+		].join("\n");
+		entries.push(assistantCallEntry("c2", "apply_patch", { input: envelope }));
+		const patchResult = toolResultEntry("c2", "apply_patch", 100);
+		// apply_patch emits multiple entries for the same path: an earlier
+		// same-path hunk succeeds while a later same-path hunk fails. The file
+		// still mutated, so reads of it must be invalidated.
+		(patchResult.message as ToolResultMessage & { details?: unknown }).details = {
+			perFileResults: [
+				{ path: "src/multi.ts", isError: false },
+				{ path: "src/multi.ts", isError: true, errorText: "hash mismatch" },
+			],
+		};
+		entries.push(patchResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(read.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });

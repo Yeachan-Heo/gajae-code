@@ -160,19 +160,31 @@ function resultDetailFiles(message: ToolResultMessage): string[] {
 }
 
 /**
- * Paths that FAILED in a per-file edit result (`details.perFileResults`).
- * Multi-file apply_patch catches per-file failures and still returns a
- * non-error result; failed files were not mutated and must not stale reads.
+ * Paths that FAILED in a per-file edit result (`details.perFileResults`) and
+ * were NOT mutated by any same-path entry. Multi-file apply_patch catches
+ * per-file failures and still returns a non-error result; a purely-failed
+ * path was not mutated and must not stale reads. But apply_patch can emit
+ * multiple entries for the same path (e.g. several hunks): if any same-path
+ * entry succeeded the file still mutated, so it must NOT be suppressed.
+ * Conservative: only an entry explicitly marked `isError === true` counts as
+ * a failure; anything else (including ambiguous/malformed entries) counts as
+ * a success and keeps the path out of the suppression set.
  */
 function failedEditPaths(message: ToolResultMessage): Set<string> {
 	const details = message.details as { perFileResults?: unknown } | undefined;
 	const perFile = details?.perFileResults;
 	if (!Array.isArray(perFile)) return new Set();
 	const failed = new Set<string>();
+	const succeeded = new Set<string>();
 	for (const item of perFile) {
 		const entry = item as { path?: unknown; isError?: unknown };
-		if (entry?.isError === true && typeof entry.path === "string") failed.add(entry.path);
+		if (typeof entry?.path !== "string") continue;
+		if (entry.isError === true) failed.add(entry.path);
+		else succeeded.add(entry.path);
 	}
+	// A path mutated if any same-path entry succeeded, even when another
+	// same-path entry failed; drop those from the suppression set.
+	for (const path of succeeded) failed.delete(path);
 	return failed;
 }
 
