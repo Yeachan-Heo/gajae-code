@@ -292,9 +292,21 @@ function fingerprintStatic<TApi extends Api>(models: readonly Model<TApi>[]): st
 
 function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamicModel: Model<TApi>): Model<TApi> {
 	const supportsImage = existingModel.input.includes("image") || dynamicModel.input.includes("image");
+	// The static catalog is authoritative for transport: `api` (and its
+	// api-specific `baseUrl`). Dynamic discovery enumerates ids via a single
+	// hardcoded api (e.g. fetchOpenAICompatibleModels always tags
+	// `openai-completions`), so spreading it blindly would clobber catalog
+	// entries that route through a different format — e.g. opencode-go
+	// qwen3.7-max is `anthropic-messages` but would be downgraded to
+	// `openai-completions` and 401 with `not supported for format oa-compat`
+	// (issue #489). Keep the existing api, and only take the dynamic baseUrl
+	// when the api matches (same transport, same URL shape).
+	const baseUrl = existingModel.api === dynamicModel.api ? dynamicModel.baseUrl : existingModel.baseUrl;
 	return enrichModelThinking({
 		...existingModel,
 		...dynamicModel,
+		api: existingModel.api,
+		baseUrl,
 		name: preferDiscoveryName(dynamicModel.name, existingModel.name, dynamicModel.id),
 		reasoning: existingModel.reasoning || dynamicModel.reasoning,
 		input: supportsImage ? ["text", "image"] : ["text"],
