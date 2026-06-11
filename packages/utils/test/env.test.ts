@@ -127,6 +127,131 @@ assertEqual($env.GJC_ENV_TEST_FALLBACK_ONLY, "fallback-after-import", "fallback 
 	});
 });
 
+describe("$credentialEnv", () => {
+	it("does not read provider credentials from the current project's .env overlay", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(dir, ".env"), "ANTHROPIC_API_KEY=project-key\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+
+function assertEqual(actual: string | undefined, expected: string | undefined, label: string): void {
+	if (actual !== expected) {
+		throw new Error(\`\${label}: expected \${expected}, got \${actual}\`);
+	}
+}
+
+assertEqual($env.ANTHROPIC_API_KEY, "project-key", "project dotenv remains available through $env");
+assertEqual($credentialEnv("ANTHROPIC_API_KEY"), undefined, "provider credential excludes project dotenv");
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+			},
+			dir,
+		);
+	});
+
+	it("still resolves explicitly inherited provider credentials", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-inherited-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(dir, ".env"), "ANTHROPIC_API_KEY=project-key\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+if ($credentialEnv("ANTHROPIC_API_KEY") !== "inherited-key") {
+	throw new Error("inherited provider credential was not resolved");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				ANTHROPIC_API_KEY: "inherited-key",
+			},
+			dir,
+		);
+	});
+
+	it("uses the secure project-dotenv rule when inherited and project values are indistinguishable", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-ambiguous-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(dir, ".env"), "ANTHROPIC_API_KEY=same-key\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+
+if ($env.ANTHROPIC_API_KEY !== "same-key") {
+	throw new Error("project dotenv should remain available through $env");
+}
+if ($credentialEnv("ANTHROPIC_API_KEY") !== undefined) {
+	throw new Error("ambiguous inherited/project dotenv match should not be used as provider credential");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				ANTHROPIC_API_KEY: "same-key",
+			},
+			dir,
+		);
+	});
+});
+
+describe("$pickCredentialEnv", () => {
+	it("returns the first available credential key while excluding project dotenv", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-pick-credential-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(
+			path.join(dir, ".env"),
+			[
+				"FIRST_PROVIDER_KEY=project-first",
+				"SECOND_PROVIDER_KEY=project-second",
+				"THIRD_PROVIDER_KEY=project-third",
+			].join("\n"),
+		);
+		fs.writeFileSync(
+			path.join(agentDir, ".env"),
+			"SECOND_PROVIDER_KEY=agent-second\nTHIRD_PROVIDER_KEY=agent-third\n",
+		);
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $env, $pickCredentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+if ($env.FIRST_PROVIDER_KEY !== "project-first") {
+	throw new Error("project dotenv should remain available through $env");
+}
+const value = $pickCredentialEnv("FIRST_PROVIDER_KEY", "SECOND_PROVIDER_KEY", "THIRD_PROVIDER_KEY");
+if (value !== "agent-second") {
+	throw new Error(\`expected first non-project credential env value, got \${value}\`);
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+			},
+			dir,
+		);
+	});
+});
+
 describe("filterProcessEnv", () => {
 	it("drops entries that cannot be passed to process spawn env", () => {
 		expect(
