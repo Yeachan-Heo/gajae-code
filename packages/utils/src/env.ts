@@ -145,6 +145,19 @@ export function $inheritedEnv(name: string): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
+	if (!isSafeEnvName(name)) return undefined;
+	const value = file[name];
+	if (value === undefined || !isSafeEnvValue(value)) return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function isProjectEnvValue(name: string, value: string): boolean {
+	const projectValue = resolveFileEnvValue(projectEnv, name);
+	return projectValue !== undefined && projectValue === value;
+}
+
 // Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
 const homeShellEnv = {
 	...parseShellEnvFile(path.join(os.homedir(), ".zshenv")),
@@ -179,6 +192,9 @@ for (const file of [projectEnv, agentEnv, piEnv, homeEnv, homeShellEnv]) {
  * All users should import this env module (import { $env } from "@gajae-code/utils")
  * before using environment variables. This ensures that .env files have been loaded and
  * overrides (project, home) have been applied, so $env always reflects the correct values.
+ *
+ * Provider credential resolution must not use this merged view because it includes the
+ * caller's cwd/.env. Use $credentialEnv/$pickCredentialEnv for model authentication.
  */
 export const $env: Record<string, string> = Bun.env as Record<string, string>;
 
@@ -193,6 +209,34 @@ export function $pickenv(...keys: string[]): string | undefined {
 		if (value) {
 			return value;
 		}
+	}
+	return undefined;
+}
+
+/**
+ * Resolve credential-bearing environment variables without consulting the caller's project .env.
+ *
+ * GJC loads cwd/.env into $env for project-aware tools, but model-provider authentication should
+ * only use values explicitly inherited from the launching shell or GJC/user-owned config files.
+ */
+export function $credentialEnv(name: string): string | undefined {
+	const inherited = $inheritedEnv(name);
+	if (inherited !== undefined && !isProjectEnvValue(name, inherited)) return inherited;
+	return (
+		resolveFileEnvValue(agentEnv, name) ??
+		resolveFileEnvValue(piEnv, name) ??
+		resolveFileEnvValue(homeEnv, name) ??
+		resolveFileEnvValue(homeShellEnv, name)
+	);
+}
+
+/**
+ * Resolve the first credential env value from the given keys, excluding cwd/.env overlays.
+ */
+export function $pickCredentialEnv(...keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = $credentialEnv(key);
+		if (value) return value;
 	}
 	return undefined;
 }
