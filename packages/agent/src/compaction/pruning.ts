@@ -72,19 +72,26 @@ function toolCallPath(call: ToolCall): string | undefined {
 	return typeof path === "string" && path.length > 0 ? path : undefined;
 }
 
-/** `*** Add|Update|Delete File: <path>` headers in an apply_patch envelope. */
-const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm;
+/**
+ * `*** Add|Update|Delete File: <path>` and `*** Move to: <path>` headers in
+ * an apply_patch envelope. Move destinations count as touched paths: a rename
+ * onto a file invalidates earlier reads of that destination.
+ */
+const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/gm;
 
 /**
  * Paths touched by an edit-class tool call. Most edit tools carry a single
- * path argument; the OpenAI custom `apply_patch` envelope carries an `input`
- * string with one or more `*** <Op> File:` headers instead.
+ * path argument; apply_patch envelopes carry an `input` string with
+ * `*** <Op> File:` / `*** Move to:` headers instead. The envelope shape can
+ * arrive under the custom `apply_patch` tool OR the regular `edit` tool
+ * (providers without custom-tool support fall back to the JSON function), so
+ * any edit-class call with a string `input` is parsed for headers.
  */
 function editToolPaths(call: ToolCall): string[] {
 	const path = toolCallPath(call);
 	if (path !== undefined) return [path];
 	const input = call.arguments.input;
-	if (call.name !== "apply_patch" || typeof input !== "string") return [];
+	if (typeof input !== "string") return [];
 	const paths: string[] = [];
 	for (const match of input.matchAll(APPLY_PATCH_FILE_HEADER)) {
 		const headerPath = match[1]?.trim();
@@ -94,10 +101,27 @@ function editToolPaths(call: ToolCall): string[] {
 }
 
 /**
+ * Trailing read selectors (`:50`, `:50-200`, `:50+150`, `:5-16,960-973`,
+ * `:raw`, `:conflicts`), possibly stacked (`:2-4:raw`). Stripped to resolve
+ * the underlying file for edit invalidation.
+ */
+const READ_SELECTOR_SUFFIX = /:(?:raw|conflicts|\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/;
+
+/** Base file path of a read target with any line/mode selectors stripped. */
+function readBasePath(path: string): string {
+	let base = path;
+	while (READ_SELECTOR_SUFFIX.test(base)) {
+		base = base.replace(READ_SELECTOR_SUFFIX, "");
+	}
+	return base;
+}
+
+/**
  * Stable identity for "the same logical lookup": same tool re-targeting the
  * same subject. A later result with the same key supersedes earlier ones.
  * Keys are canonical JSON tuples so user-controlled text (patterns, paths)
- * can never collide via delimiter ambiguity.
+ * can never collide via delimiter ambiguity. Search keys include pagination
+ * (`skip`): later pages complement page 1, they do not replace it.
  */
 function toolTargetKey(call: ToolCall): string | undefined {
 	const path = toolCallPath(call);
@@ -106,7 +130,8 @@ function toolTargetKey(call: ToolCall): string | undefined {
 	if (typeof pattern === "string" && pattern.length > 0) {
 		const paths = call.arguments.paths;
 		const pathList = Array.isArray(paths) ? paths.filter((p): p is string => typeof p === "string") : [];
-		return JSON.stringify([call.name, "pattern", pattern, pathList]);
+		const skip = typeof call.arguments.skip === "number" ? call.arguments.skip : 0;
+		return JSON.stringify([call.name, "pattern", pattern, pathList, skip]);
 	}
 	return undefined;
 }
@@ -164,7 +189,8 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		if (meta.call.name === "read") {
 			const path = toolCallPath(meta.call);
 			if (path !== undefined) {
-				const editIndex = lastEditIndexByPath.get(path);
+				// Selector-qualified reads (src/foo.ts:50-100) still read the file.
+				const editIndex = lastEditIndexByPath.get(readBasePath(path));
 				if (editIndex !== undefined && editIndex > index) staleResultIndices.add(index);
 			}
 		}

@@ -159,6 +159,56 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(readC.id);
 	});
 
+	it("an apply_patch-shaped envelope sent through the edit tool also supersedes reads", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		const envelope = ["*** Begin Patch", "*** Update File: src/a.ts", "@@", "-old", "+new", "*** End Patch"].join(
+			"\n",
+		);
+		pair(entries, "c2", "edit", { input: envelope }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(read.id);
+	});
+
+	it("a Move to: rename destination invalidates earlier reads of that destination", () => {
+		const entries: SessionEntry[] = [];
+		const readDest = pair(entries, "c1", "read", { path: "src/dest.ts" });
+		const envelope = [
+			"*** Begin Patch",
+			"*** Update File: src/source.ts",
+			"*** Move to: src/dest.ts",
+			"@@",
+			"-old",
+			"+new",
+			"*** End Patch",
+		].join("\n");
+		pair(entries, "c2", "apply_patch", { input: envelope }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(readDest.id);
+	});
+
+	it("a later edit invalidates selector-qualified reads of the same file", () => {
+		const entries: SessionEntry[] = [];
+		const rangeRead = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
+		const rawRead = pair(entries, "c2", "read", { path: "src/a.ts:2-4:raw" });
+		const otherFile = pair(entries, "c3", "read", { path: "src/b.ts:50-100" });
+		pair(entries, "c4", "edit", { path: "src/a.ts" }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(rangeRead.id);
+		expect(ids).toContain(rawRead.id);
+		expect(ids).not.toContain(otherFile.id);
+	});
+
+	it("search pagination pages do not supersede each other", () => {
+		const entries: SessionEntry[] = [];
+		const pageOne = pair(entries, "c1", "search", { pattern: "foo", paths: ["src"] });
+		const pageTwo = pair(entries, "c2", "search", { pattern: "foo", paths: ["src"], skip: 20 });
+		const config: PruneConfig = { ...EAGER, protectTokens: 1_000_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).not.toContain(pageOne.id);
+		expect(ids).not.toContain(pageTwo.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });
