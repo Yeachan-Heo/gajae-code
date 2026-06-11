@@ -252,6 +252,63 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(read.id);
 	});
 
+	it("a resolve apply with nested sourceResultDetails invalidates touched files", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		entries.push(assistantCallEntry("c2", "resolve", { action: "apply", reason: "Apply." }));
+		const resolveResult = toolResultEntry("c2", "resolve", 100);
+		(resolveResult.message as ToolResultMessage & { details?: unknown }).details = {
+			label: "AST Edit",
+			sourceResultDetails: { applied: true, files: ["src/a.ts"] },
+		};
+		entries.push(resolveResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(read.id);
+	});
+
+	it("a partially applied (errored) AST resolve still invalidates the applied files", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		entries.push(assistantCallEntry("c2", "resolve", { action: "apply", reason: "Apply." }));
+		const staleApply = toolResultEntry("c2", "resolve", 100, true);
+		(staleApply.message as ToolResultMessage & { details?: unknown }).details = {
+			sourceResultDetails: { applied: true, files: ["src/a.ts"] },
+		};
+		entries.push(staleApply);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(read.id);
+	});
+
+	it("failed files in a multi-file edit result do not stale their reads", () => {
+		const entries: SessionEntry[] = [];
+		const readOk = pair(entries, "c1", "read", { path: "src/ok.ts" });
+		const readFailed = pair(entries, "c2", "read", { path: "src/failed.ts" });
+		const envelope = [
+			"*** Begin Patch",
+			"*** Update File: src/ok.ts",
+			"@@",
+			"-a",
+			"+b",
+			"*** Update File: src/failed.ts",
+			"@@",
+			"-x",
+			"+y",
+			"*** End Patch",
+		].join("\n");
+		entries.push(assistantCallEntry("c3", "apply_patch", { input: envelope }));
+		const patchResult = toolResultEntry("c3", "apply_patch", 100);
+		(patchResult.message as ToolResultMessage & { details?: unknown }).details = {
+			perFileResults: [
+				{ path: "src/ok.ts", isError: false },
+				{ path: "src/failed.ts", isError: true, errorText: "hash mismatch" },
+			],
+		};
+		entries.push(patchResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(readOk.id);
+		expect(ids).not.toContain(readFailed.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });

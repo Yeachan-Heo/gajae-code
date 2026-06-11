@@ -142,13 +142,38 @@ function toolTargetKey(call: ToolCall): string | undefined {
 /**
  * Files actually mutated according to a tool result's details. Used for
  * AST-edit-shaped results (`ast_edit` direct-apply and the hidden `resolve`
- * apply step), which report `{ applied: true, files: [...] }`. Conservative:
+ * apply step), which report `{ applied: true, files: [...] }` — the resolve
+ * tool nests that payload under `details.sourceResultDetails`. Conservative:
  * returns nothing unless the details explicitly mark the change as applied.
+ * Checked even on `isError` results: a stale-preview apply reports an error
+ * while still having mutated the listed files.
  */
 function resultDetailFiles(message: ToolResultMessage): string[] {
-	const details = message.details as { applied?: unknown; files?: unknown } | undefined;
-	if (details?.applied !== true || !Array.isArray(details.files)) return [];
-	return details.files.filter((file): file is string => typeof file === "string" && file.length > 0);
+	const raw = message.details as { applied?: unknown; files?: unknown; sourceResultDetails?: unknown } | undefined;
+	const candidates = [raw, raw?.sourceResultDetails as { applied?: unknown; files?: unknown } | undefined];
+	for (const details of candidates) {
+		if (details?.applied === true && Array.isArray(details.files)) {
+			return details.files.filter((file): file is string => typeof file === "string" && file.length > 0);
+		}
+	}
+	return [];
+}
+
+/**
+ * Paths that FAILED in a per-file edit result (`details.perFileResults`).
+ * Multi-file apply_patch catches per-file failures and still returns a
+ * non-error result; failed files were not mutated and must not stale reads.
+ */
+function failedEditPaths(message: ToolResultMessage): Set<string> {
+	const details = message.details as { perFileResults?: unknown } | undefined;
+	const perFile = details?.perFileResults;
+	if (!Array.isArray(perFile)) return new Set();
+	const failed = new Set<string>();
+	for (const item of perFile) {
+		const entry = item as { path?: unknown; isError?: unknown };
+		if (entry?.isError === true && typeof entry.path === "string") failed.add(entry.path);
+	}
+	return failed;
 }
 
 interface StalenessIndex {
@@ -179,23 +204,31 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 
 	for (let i = 0; i < entries.length; i++) {
 		const message = getToolResultMessage(entries[i]);
-		if (!message || message.isError) continue;
+		if (!message) continue;
 		const call = callsById.get(message.toolCallId);
 		if (!call) continue;
+
+		// AST edits mutate files when previews are applied via the hidden
+		// `resolve` tool; the call args carry globs, not concrete paths. Both
+		// tools report actually-touched files in result details. Collected
+		// BEFORE the error gate: a stale-preview apply reports an error while
+		// still having mutated the listed files.
+		if (call.name === "resolve" || call.name === "ast_edit") {
+			for (const editPath of resultDetailFiles(message)) {
+				lastEditIndexByPath.set(editPath, i);
+			}
+		}
+		if (message.isError) continue;
+
 		const key = toolTargetKey(call);
 		resultMeta.set(i, { key, call });
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
+			// Per-file edit results record failures in details.perFileResults;
+			// failed files were not mutated and must not stale reads.
+			const failed = failedEditPaths(message);
 			for (const editPath of editToolPaths(call)) {
-				lastEditIndexByPath.set(editPath, i);
-			}
-		}
-		// AST edits mutate files when previews are applied via the hidden
-		// `resolve` tool; the call args carry globs, not concrete paths. Both
-		// tools report the actually-touched files in result details.
-		if (call.name === "resolve" || call.name === "ast_edit") {
-			for (const editPath of resultDetailFiles(message)) {
-				lastEditIndexByPath.set(editPath, i);
+				if (!failed.has(editPath)) lastEditIndexByPath.set(editPath, i);
 			}
 		}
 	}
