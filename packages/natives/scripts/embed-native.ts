@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type BuildSidecar, type CandidateAddon, verifyDefaultLanguageSet } from "./embed-guard";
 
 const reset = process.argv.includes("--reset");
 const outputPath = path.join(import.meta.dir, "../native/embedded-addon.js");
@@ -34,9 +35,14 @@ if (reset) {
 	process.exit(0);
 }
 
-interface CandidateAddon {
-	variant: "modern" | "baseline" | "default";
-	filename: string;
+async function readBuildSidecar(candidatePath: string): Promise<BuildSidecar | null> {
+	const sidecarPath = `${candidatePath}.build.json`;
+	try {
+		return (await Bun.file(sidecarPath).json()) as BuildSidecar;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw err;
+	}
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -51,6 +57,7 @@ async function fileExists(filePath: string): Promise<boolean> {
 const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
 const targetArch = Bun.env.TARGET_ARCH || process.arch;
 const platformTag = `${targetPlatform}-${targetArch}`;
+const hostPlatformTag = `${process.platform}-${process.arch}`;
 const candidates: CandidateAddon[] =
 	targetArch === "x64"
 		? [
@@ -63,6 +70,13 @@ const available: CandidateAddon[] = [];
 for (const candidate of candidates) {
 	const candidatePath = path.join(nativeDir, candidate.filename);
 	if (await fileExists(candidatePath)) {
+		await verifyDefaultLanguageSet(candidate, candidatePath, {
+			platformTag,
+			hostPlatformTag,
+			readBuildSidecar,
+			loadNativeAddon: candidatePath => require(candidatePath) as { nativeBuildInfo?: () => { languageSet?: string } },
+			warn: message => console.warn(message),
+		});
 		available.push(candidate);
 	}
 }

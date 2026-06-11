@@ -14,6 +14,7 @@ const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
 const targetArch = Bun.env.TARGET_ARCH || process.arch;
 const configuredVariantRaw = Bun.env.TARGET_VARIANT;
 const isCrossCompile = Boolean(crossTarget) || targetPlatform !== process.platform || targetArch !== process.arch;
+const languageSet = Bun.env.PI_NATIVE_FULL_LANGS === "1" ? "full" : "default";
 
 type X64Variant = "modern" | "baseline";
 
@@ -170,6 +171,7 @@ const napiArgs = [
 ];
 
 if (crossTarget) napiArgs.push("--target", crossTarget);
+if (languageSet === "full") napiArgs.push("--", "--features", "full-langs");
 
 const canonicalAddonFilename = `pi_natives.${targetPlatform}-${targetArch}${variantSuffix}.node`;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
@@ -205,6 +207,11 @@ try {
 	}
 
 	await installGeneratedBindings(buildOutputDir);
+
+	await Bun.write(
+		`${canonicalAddonPath}.build.json`,
+		`${JSON.stringify({ languageSet, builtAt: new Date().toISOString() }, null, 2)}\n`,
+	);
 
 	await generateEnumExports();
 

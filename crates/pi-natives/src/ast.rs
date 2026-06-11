@@ -555,6 +555,9 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 		let strictness = resolve_strictness(strictness);
 		let include_meta = include_meta.unwrap_or(false);
 		let lang_str = lang.as_deref().map(str::trim).filter(|v| !v.is_empty());
+		if let Some(lang) = lang_str {
+			resolve_supported_lang(lang)?;
+		}
 		let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), &ct)?
 			.into_iter()
 			.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
@@ -712,6 +715,9 @@ pub fn ast_edit(options: AstReplaceOptions<'_>) -> task::Promise<AstReplaceResul
 		let fail_on_parse_error = fail_on_parse_error.unwrap_or(false);
 
 		let lang_str = lang.as_deref().map(str::trim).filter(|v| !v.is_empty());
+		if let Some(lang) = lang_str {
+			resolve_supported_lang(lang)?;
+		}
 		let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), &ct)?
 			.into_iter()
 			.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
@@ -973,12 +979,20 @@ mod tests {
 		assert_eq!(resolve_supported_lang("ts").ok(), Some(SupportLang::TypeScript));
 		assert_eq!(resolve_supported_lang("jsx").ok(), Some(SupportLang::JavaScript));
 		assert_eq!(resolve_supported_lang("rs").ok(), Some(SupportLang::Rust));
-		assert_eq!(resolve_supported_lang("kotlin").ok(), Some(SupportLang::Kotlin));
+		#[cfg(feature = "full-langs")]
+		{
+			assert_eq!(resolve_supported_lang("kotlin").ok(), Some(SupportLang::Kotlin));
+			assert_eq!(resolve_supported_lang("tla").ok(), Some(SupportLang::Tlaplus));
+			assert_eq!(resolve_supported_lang("pluscal").ok(), Some(SupportLang::Tlaplus));
+		}
+		#[cfg(not(feature = "full-langs"))]
+		{
+			let err = resolve_supported_lang("kotlin").expect_err("kotlin should require full-langs");
+			assert!(err.to_string().contains("full-langs"));
+		}
 		assert_eq!(resolve_supported_lang("bash").ok(), Some(SupportLang::Bash));
 		assert_eq!(resolve_supported_lang("c").ok(), Some(SupportLang::C));
 		assert_eq!(resolve_supported_lang("cpp").ok(), Some(SupportLang::Cpp));
-		assert_eq!(resolve_supported_lang("tla").ok(), Some(SupportLang::Tlaplus));
-		assert_eq!(resolve_supported_lang("pluscal").ok(), Some(SupportLang::Tlaplus));
 		assert!(resolve_supported_lang("brainfuck").is_err());
 	}
 

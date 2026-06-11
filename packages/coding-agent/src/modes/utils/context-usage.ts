@@ -1,8 +1,12 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionSettings } from "@gajae-code/agent-core/compaction";
-import { effectiveReserveTokens, estimateTokens, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
+import {
+	effectiveReserveTokens,
+	estimateMessageTokensHeuristic,
+	estimateTextTokensHeuristic,
+	resolveThresholdTokens,
+} from "@gajae-code/agent-core/compaction";
 import type { Model } from "@gajae-code/ai";
-import { countTokens } from "@gajae-code/natives";
 import { formatNumber } from "@gajae-code/utils";
 import type { Skill } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
@@ -46,7 +50,7 @@ export function estimateSkillsTokens(skills: readonly Skill[]): number {
 		// concatenated form, so encode each piece separately and sum.
 		fragments.push(skill.name, skill.description);
 	}
-	return countTokens(fragments);
+	return estimateTextTokensHeuristic(fragments);
 }
 
 export function estimateToolSchemaTokens(
@@ -61,7 +65,7 @@ export function estimateToolSchemaTokens(
 			// Schema may contain functions or cycles; ignore.
 		}
 	}
-	return countTokens(fragments);
+	return estimateTextTokensHeuristic(fragments);
 }
 
 /**
@@ -100,8 +104,8 @@ function computeNonMessageBreakdown(session: AgentSession): {
 	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? []);
 	const systemPromptParts = session.systemPrompt ?? [];
 	const rulesTokens = estimateRulesTokens(systemPromptParts);
-	const systemContextTokens = countTokens(systemPromptParts.slice(1));
-	const systemPromptTokens = Math.max(0, countTokens(systemPromptParts[0] ?? "") - skillsTokens - rulesTokens);
+	const systemContextTokens = estimateTextTokensHeuristic(systemPromptParts.slice(1));
+	const systemPromptTokens = Math.max(0, estimateTextTokensHeuristic(systemPromptParts[0] ?? "") - skillsTokens - rulesTokens);
 	return { rulesTokens, skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
 }
 
@@ -112,7 +116,7 @@ function estimateRulesTokens(systemPromptParts: readonly string[]): number {
 			fragments.push(match[0]);
 		}
 	}
-	return fragments.length === 0 ? 0 : countTokens(fragments);
+	return fragments.length === 0 ? 0 : estimateTextTokensHeuristic(fragments);
 }
 
 function splitLastUserTurn(messages: readonly AgentMessage[]): {
@@ -130,7 +134,7 @@ function splitLastUserTurn(messages: readonly AgentMessage[]): {
 	let regularMessagesTokens = 0;
 	let lastUserTurnTokens = 0;
 	for (let i = 0; i < messages.length; i++) {
-		const tokens = estimateTokens(messages[i]);
+		const tokens = estimateMessageTokensHeuristic(messages[i]);
 		if (i === lastUserIndex) {
 			lastUserTurnTokens = tokens;
 		} else {

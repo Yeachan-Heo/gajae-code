@@ -59,7 +59,8 @@
 	"exports": {
 		".": {
 			"types": "./native/index.d.ts",
-			"import": "./native/index.js"
+			"import": "./native/index.js",
+			"default": "./native/index.js"
 		}
 	}
 }

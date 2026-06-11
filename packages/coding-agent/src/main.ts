@@ -33,9 +33,9 @@ import { getDefault, type SettingPath, Settings, settings } from "./config/setti
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
-import { InteractiveMode, runAcpMode, runBridgeMode, runPrintMode, runRpcMode } from "./modes";
-import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
+import type { InteractiveMode, InteractiveModeOptions } from "./modes/interactive-mode";
 import type { SubmittedUserInput } from "./modes/types";
+import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { MCPManager } from "./runtime-mcp";
 import {
 	type CreateAgentSessionOptions,
@@ -304,6 +304,7 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 ): Promise<void> {
+	const { InteractiveMode } = await import("./modes/interactive-mode");
 	const mode = new InteractiveMode(
 		session,
 		version,
@@ -706,7 +707,7 @@ async function buildSessionOptions(
 interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
-	runAcpMode?: typeof runAcpMode;
+	runAcpMode?: (createSession: AcpSessionFactory) => Promise<void>;
 	settings?: Settings;
 }
 
@@ -927,7 +928,7 @@ export async function runRootCommand(
 			rawArgs,
 			createSession,
 		});
-		await (deps.runAcpMode ?? runAcpMode)(createAcpSession);
+		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)(createAcpSession);
 	} else {
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } =
 			await createSession(sessionOptions);
@@ -973,8 +974,10 @@ export async function runRootCommand(
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
+			const { runRpcMode } = await import("./modes/rpc/rpc-mode");
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined);
 		} else if (mode === "bridge") {
+			const { runBridgeMode } = await import("./modes/bridge/bridge-mode");
 			await runBridgeMode(session, setToolUIContext);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
@@ -1014,6 +1017,7 @@ export async function runRootCommand(
 				initialImages,
 			);
 		} else {
+			const { runPrintMode } = await import("./modes/print-mode");
 			await runPrintMode(session, {
 				mode,
 				messages: parsedArgs.messages,

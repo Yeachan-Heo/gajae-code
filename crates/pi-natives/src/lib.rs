@@ -23,6 +23,7 @@
 
 pub mod appearance;
 pub mod ast;
+pub mod build_info;
 pub mod clipboard;
 pub mod crash;
 pub mod edit_fuzzy;

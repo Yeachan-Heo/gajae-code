@@ -11,6 +11,7 @@ packages/*/dist-firefox/
 target/
 *.tsbuildinfo
 *.node
+*.node.build.json
 *.b64.js
 
 # Environment

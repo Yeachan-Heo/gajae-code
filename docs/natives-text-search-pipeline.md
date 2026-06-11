@@ -234,7 +234,7 @@ Text functions generally return deterministic transformed output; errors are lim
 
 - `input` may be a single string or an array of strings.
 - Arrays return one aggregate count and are encoded in parallel in Rust.
-- Default encoding is `O200kBase`; `Cl100kBase` is also available.
+- Default encoding is `O200kBase`; `Cl100kBase` remains available as a compatibility alias routing to `o200k_base` in default builds.
 - The implementation uses ordinary tokenization, not special-token handling.
 
 ## Pure utility vs filesystem-dependent flows

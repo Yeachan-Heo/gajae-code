@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { estimateTokens } from "@gajae-code/agent-core/compaction";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { formatCount, getProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
@@ -50,7 +50,7 @@ export interface StatusLineSettings {
 
 /**
  * Symbol-keyed sidecar tagged onto each `AgentMessage` to memoize its
- * `estimateTokens` result. Keyed by message identity (the object itself);
+ * `estimateMessageTokensHeuristic` result. Keyed by message identity (the object itself);
  * a cheap content fingerprint detects in-place mutations (post-hoc error
  * attachment, retry-truncated branch rebuild, etc.) and forces recompute.
  *
@@ -64,11 +64,11 @@ interface TaggedMessage {
 }
 
 /**
- * Cheap structural fingerprint mirroring `estimateTokens`'s content walk.
+ * Cheap structural fingerprint mirroring `estimateMessageTokensHeuristic`'s content walk.
  * O(blocks) — only reads string `.length` and primitives, never copies or
  * serializes content. Any in-place mutation that alters total tokenized
  * content also alters one of the byte-length sums or block counts captured
- * here, forcing the cached `estimateTokens` value to be recomputed.
+ * here, forcing the cached heuristic token value to be recomputed.
  */
 function messageFingerprint(msg: AgentMessage): string {
 	const role = (msg as { role?: string }).role ?? "";
@@ -136,7 +136,7 @@ function tokensForMessage(msg: AgentMessage): number {
 	const tagged = msg as TaggedMessage;
 	const cached = tagged[kTokenCache];
 	if (cached && cached.fingerprint === fp) return cached.tokens;
-	const tokens = estimateTokens(msg);
+	const tokens = estimateMessageTokensHeuristic(msg);
 	tagged[kTokenCache] = { fingerprint: fp, tokens };
 	return tokens;
 }
@@ -560,7 +560,7 @@ export class StatusLineComponent implements Component {
 		let messagesTokens = 0;
 		const lastIdx = messages.length - 1;
 		for (let i = 0; i < messages.length; i++) {
-			messagesTokens += i === lastIdx ? estimateTokens(messages[i]) : tokensForMessage(messages[i]);
+			messagesTokens += i === lastIdx ? estimateMessageTokensHeuristic(messages[i]) : tokensForMessage(messages[i]);
 		}
 
 		const usedTokens = this.#nonMessageTokensCache + messagesTokens;

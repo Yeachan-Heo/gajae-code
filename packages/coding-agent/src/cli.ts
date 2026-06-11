@@ -1,24 +1,14 @@
 #!/usr/bin/env bun
-import { installH2Fetch } from "@gajae-code/ai";
-import { APP_NAME, MIN_BUN_VERSION, procmgr, VERSION } from "@gajae-code/utils";
+import { APP_NAME, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 
-// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
-// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
-// can't toggle from JS, so we patch globalThis.fetch to pass
-// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
-// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
-installH2Fetch();
 
-// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
-// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
-// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
-procmgr.scrubProcessEnv();
+
 
 /**
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
-import { type CliConfig, type CommandEntry, run } from "@gajae-code/utils/cli";
+import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -28,6 +18,9 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 }
 
 process.title = APP_NAME;
+const rootHelpFlags = ["--help", "-h", "help", ""];
+const versionFlags = ["--version", "-v"];
+
 
 const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
@@ -54,12 +47,94 @@ const commands: CommandEntry[] = [
 
 async function showHelp(config: CliConfig): Promise<void> {
 	const { renderRootHelp } = await import("@gajae-code/utils/cli");
-	const { getExtraHelpText } = await import("./cli/args");
+	const { getExtraHelpText } = await import("./cli/fast-help");
 	renderRootHelp(config);
 	const extra = getExtraHelpText();
 	if (extra.trim().length > 0) {
 		process.stdout.write(`\n${extra}\n`);
 	}
+}
+
+async function installRuntimeGlobals(): Promise<void> {
+	const [{ installH2Fetch }, { procmgr }] = await Promise.all([import("@gajae-code/ai"), import("@gajae-code/utils")]);
+	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
+	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
+	// can't toggle from JS, so we patch globalThis.fetch to pass
+	// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
+	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
+	installH2Fetch();
+
+	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
+	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
+	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
+	procmgr.scrubProcessEnv();
+}
+
+async function loadLaunchCommand() {
+	return import("./commands/launch").then(m => m.default);
+}
+
+
+class RootHelpCommand extends Command {
+	static description = "Red-claw AI coding assistant";
+	static hidden = true;
+	static args = {
+		messages: Args.string({
+			description: "Messages to send (prefix files with @)",
+			required: false,
+			multiple: true,
+		}),
+	};
+	static flags = {
+		model: Flags.string({ description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")' }),
+		smol: Flags.string({ description: "Smol/fast model for lightweight tasks (or GJC_SMOL_MODEL env)" }),
+		slow: Flags.string({ description: "Slow/reasoning model for thorough analysis (or GJC_SLOW_MODEL env)" }),
+		plan: Flags.string({ description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)" }),
+		mpreset: Flags.string({ description: "Model profile preset to activate for this session" }),
+		default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
+		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
+		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
+		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
+		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
+		mode: Flags.string({ description: "Output mode: text (default), json, rpc, acp, rpc-ui, or bridge", options: ["text", "json", "rpc", "acp", "rpc-ui", "bridge"] }),
+		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
+		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
+		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
+		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
+		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
+		models: Flags.string({ description: "Comma-separated model patterns for Ctrl+P cycling" }),
+		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
+		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
+		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
+		tmux: Flags.boolean({ description: "Launch interactive startup inside tmux" }),
+		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),
+		thinking: Flags.string({ description: "Set thinking level: ultra, high, medium, low", options: ["ultra", "high", "medium", "low"] }),
+		hook: Flags.string({ description: "Load a hook/extension file (can be used multiple times)", multiple: true }),
+		extension: Flags.string({ char: "e", description: "Load an extension file (can be used multiple times)", multiple: true }),
+		"no-extensions": Flags.boolean({ description: "Disable extension discovery (explicit -e paths still work)" }),
+		"no-skills": Flags.boolean({ description: "Disable skills discovery and loading" }),
+		skills: Flags.string({ description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)" }),
+		"no-rules": Flags.boolean({ description: "Disable rules discovery and loading" }),
+		export: Flags.string({ description: "Export session file to HTML and exit" }),
+		"list-models": Flags.string({ description: "List available models (with optional fuzzy search)" }),
+		"no-title": Flags.boolean({ description: "Disable title auto-generation" }),
+	};
+	static examples = [
+		`# Interactive mode\n  ${APP_NAME}`,
+		`# Interactive mode with initial prompt\n  ${APP_NAME} "List all .ts files in src/"`,
+		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
+		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
+		`# Continue previous session\n  ${APP_NAME} --continue "What did we discuss?"`,
+		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
+		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
+		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-standard`,
+		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencode-go-pro --default`,
+		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
+	];
+	static strict = false;
+	async run(): Promise<void> {}
 }
 
 /**
@@ -109,6 +184,21 @@ export async function runCli(argv: string[]): Promise<void> {
 		await runSmokeTest();
 		return;
 	}
+	if (rootHelpFlags.includes(argv[0] ?? "")) {
+		const { renderRootHelp } = await import("@gajae-code/utils/cli");
+		const { getExtraHelpText } = await import("./cli/fast-help");
+		renderRootHelp({ bin: APP_NAME, version: VERSION, commands: new Map([["launch", RootHelpCommand]]) });
+		const extra = getExtraHelpText();
+		if (extra.trim().length > 0) {
+			process.stdout.write(`\n${extra}\n`);
+		}
+		return;
+	}
+	if (versionFlags.includes(argv[0] ?? "")) {
+		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
+		return;
+	}
+	await installRuntimeGlobals();
 	// --help and --version are handled by run() directly, don't rewrite those.
 	// Everything else that isn't a known subcommand routes to "launch".
 	const first = argv[0];

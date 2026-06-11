@@ -344,6 +344,11 @@ export interface BashFixupResult {
   stripped: Array<string>
 }
 
+export interface BuildInfo {
+  version: string
+  languageSet: string
+}
+
 /** Clipboard image payload encoded as PNG bytes. */
 export interface ClipboardImage {
   /** PNG-encoded image bytes. */
@@ -381,7 +386,8 @@ export declare function copyToClipboard(text: string): void
  *
  * Uses ordinary encoding (no special-token handling), which is the right
  * choice for measuring user/model content rather than wire-protocol tokens.
- * Defaults to `o200k_base`; pass `Cl100kBase` for older `OpenAI` models.
+ * Always counts with `o200k_base` in default builds (`Cl100kBase` is a
+ * compatibility alias). Exact for o200k only.
  */
 export declare function countTokens(input: string | Array<string>, encoding?: Encoding | undefined | null): number
 
@@ -422,7 +428,11 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 export declare enum Encoding {
   /** GPT-4o / o1 / GPT-5 (default). */
   O200kBase = 'O200kBase',
-  /** GPT-3.5 / GPT-4 / older. */
+  /**
+   * Compatibility alias: routes to `o200k_base` in default builds. The
+   * cl100k BPE table is not embedded; callers needing true cl100k counts
+   * must use an external tokenizer.
+   */
   Cl100kBase = 'Cl100kBase'
 }
 
@@ -1103,6 +1113,8 @@ export interface MinimizerResult {
   /** Byte length of the minimized text the consumer received. */
   outputBytes: number
 }
+
+export declare function nativeBuildInfo(): BuildInfo
 
 /** Parsed Kitty keyboard protocol sequence result for a Kitty input sequence. */
 export interface ParsedKittyResult {

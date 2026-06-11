@@ -41,6 +41,7 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateMessageTokensHeuristic,
 	estimateTokens,
 	generateBranchSummary,
 	generateHandoff,
@@ -9527,7 +9528,7 @@ export class AgentSession {
 			// No usage data - estimate all messages
 			let estimated = 0;
 			for (const message of messages) {
-				estimated += estimateTokens(message);
+				estimated += estimateMessageTokensHeuristic(message);
 			}
 			return {
 				tokens: estimated,
@@ -9537,7 +9538,7 @@ export class AgentSession {
 		const usageTokens = calculatePromptTokens(lastUsage);
 		let trailingTokens = 0;
 		for (let i = lastUsageIndex + 1; i < messages.length; i++) {
-			trailingTokens += estimateTokens(messages[i]);
+			trailingTokens += estimateMessageTokensHeuristic(messages[i]);
 		}
 
 		return {

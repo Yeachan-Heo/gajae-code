@@ -235,6 +235,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
 	if (!selectedEmbeddedFile) return null;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
+	if (fs.existsSync(targetPath)) return targetPath;
 
 	try {
 		fs.mkdirSync(ctx.versionedDir, { recursive: true });

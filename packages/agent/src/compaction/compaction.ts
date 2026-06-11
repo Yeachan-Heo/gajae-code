@@ -13,7 +13,6 @@ import {
 	type Model,
 	type Usage,
 } from "@gajae-code/ai";
-import { countTokens } from "@gajae-code/natives";
 import { logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
@@ -268,18 +267,95 @@ export function resolveThresholdTokens(
 const IMAGE_TOKEN_ESTIMATE = 1200;
 
 /**
- * Estimate token count for a message using cl100k_base via the native
- * tokenizer. This is not Anthropic's first-party tokenizer (Anthropic doesn't
- * publish one) but is within ~5–10% across English/code text.
+ * Lazily-required native `countTokens`. `@gajae-code/natives` dlopens a ~39MB
+ * addon; importing it at module scope would put that cost on every cold path
+ * that touches compaction exports (status line, print mode, context report).
+ * Deferring the require to the first context-changing call keeps the trivial
+ * `-p` / display paths native-free.
  */
-export function estimateTokens(message: AgentMessage): number {
+let cachedNativeCountTokens: ((input: string | string[], encoding?: unknown) => number) | null = null;
+
+function nativeCountTokens(fragments: string[]): number {
+	if (!cachedNativeCountTokens) {
+		const { createRequire } = require("node:module") as typeof import("node:module");
+		const requireFromHere = createRequire(import.meta.url);
+		const natives = requireFromHere("@gajae-code/natives") as {
+			countTokens: (input: string | string[], encoding?: unknown) => number;
+		};
+		cachedNativeCountTokens = natives.countTokens;
+	}
+	return cachedNativeCountTokens(fragments);
+}
+
+/**
+ * Estimate token count for a message using the native o200k tokenizer.
+ * Exact for o200k only; an approximation for Anthropic/other model families
+ * (Anthropic doesn't publish a tokenizer) within ~5–10% on English/code text.
+ *
+ * This materializes the native BPE table (~50MB RSS) on first call. Use it
+ * only for context-changing decisions (compaction trigger/cut points, pruning
+ * budgets, branch summarization, fork-context seeding, context-limit
+ * enforcement). For display-only totals use
+ * {@link estimateMessageTokensHeuristic}.
+ */
+export function countMessageTokensNativeO200k(message: AgentMessage): number {
+	const { fragments, extra } = collectMessageFragments(message);
+	if (fragments.length === 0) return extra;
+	return extra + nativeCountTokens(fragments);
+}
+
+/**
+ * Backwards-compatible alias for {@link countMessageTokensNativeO200k}.
+ * Existing callers treat this as the canonical message-token estimator for
+ * context-changing decisions.
+ */
+export const estimateTokens = countMessageTokensNativeO200k;
+
+/**
+ * Average bytes per token for the cheap heuristic. ~4 bytes/token is the
+ * conventional approximation for English/code text under modern BPE
+ * vocabularies; it intentionally errs slightly low-precision in exchange for
+ * never touching the native tokenizer (and its ~50MB BPE table).
+ */
+const HEURISTIC_BYTES_PER_TOKEN = 4;
+
+/**
+ * Cheap, native-free token estimate for a message. Suitable ONLY for
+ * display/init surfaces (status line, /context report, HUD totals) — never
+ * for context-changing decisions, which must use
+ * {@link countMessageTokensNativeO200k}.
+ */
+export function estimateMessageTokensHeuristic(message: AgentMessage): number {
+	const { fragments, extra } = collectMessageFragments(message);
+	let bytes = 0;
+	for (const fragment of fragments) {
+		bytes += fragment.length;
+	}
+	return extra + Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+}
+
+/**
+ * Cheap, native-free token estimate for plain string fragments. Display-only
+ * counterpart of the native `countTokens(fragments)` aggregate.
+ */
+export function estimateTextTokensHeuristic(fragments: string | readonly string[]): number {
+	if (typeof fragments === "string") return Math.ceil(fragments.length / HEURISTIC_BYTES_PER_TOKEN);
+	let bytes = 0;
+	for (const fragment of fragments) {
+		bytes += fragment.length;
+	}
+	return Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+}
+
+/** Shared content walk for both the native and heuristic estimators. */
+function collectMessageFragments(message: AgentMessage): { fragments: string[]; extra: number } {
 	const fragments: string[] = [];
 	let extra = 0;
 	if ((message as { role?: string }).role === "bashExecution") {
 		const bash = message as { command?: unknown; output?: unknown };
 		if (typeof bash.command === "string") fragments.push(bash.command);
 		if (typeof bash.output === "string") fragments.push(bash.output);
-		return fragments.length === 0 ? 0 : countTokens(fragments);
+		return { fragments, extra };
 	}
 
 	switch (message.role) {
@@ -331,11 +407,10 @@ export function estimateTokens(message: AgentMessage): number {
 			break;
 		}
 		default:
-			return 0;
+			break;
 	}
 
-	if (fragments.length === 0) return extra;
-	return extra + countTokens(fragments);
+	return { fragments, extra };
 }
 
 function estimateEntriesTokens(entries: SessionEntry[], startIndex: number, endIndex: number): number {
