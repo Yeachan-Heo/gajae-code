@@ -203,4 +203,80 @@ describe("receipt ingest red-team", () => {
 		expect(result.transitions).toEqual([]);
 		expect(result.finalLifecycle).toBe("finalizing");
 	});
+
+	it("a terminal review verdict completes a finalizing review session", () => {
+		const verdict = buildReceipt({
+			receiptId: "rv-approve",
+			sessionId: "s",
+			family: "review-verdict",
+			source: "test",
+			subject,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			evidence: {
+				verdict: "APPROVE_MERGE_READY",
+				prTarget: "https://example.test/pr/1",
+				finalizedAt: "2026-01-01T00:00:00.000Z",
+				summaryRef: null,
+			},
+		});
+
+		const result = ingestReceipts(state("finalizing"), [verdict]);
+
+		expect(result.accepted).toEqual([verdict]);
+		expect(result.transitions).toEqual([{ from: "finalizing", to: "completed", receiptId: "rv-approve" }]);
+		expect(result.finalLifecycle).toBe("completed");
+	});
+
+	it("OWNER_CONFIRMATION_REQUIRED verdicts are accepted but do not complete", () => {
+		const verdict = buildReceipt({
+			receiptId: "rv-owner",
+			sessionId: "s",
+			family: "review-verdict",
+			source: "test",
+			subject,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			evidence: {
+				verdict: "OWNER_CONFIRMATION_REQUIRED",
+				prTarget: null,
+				finalizedAt: "2026-01-01T00:00:00.000Z",
+				summaryRef: null,
+			},
+		});
+
+		const result = ingestReceipts(state("finalizing"), [verdict]);
+
+		expect(result.accepted).toEqual([verdict]);
+		expect(result.transitions).toEqual([]);
+		expect(result.finalLifecycle).toBe("finalizing");
+	});
+
+	it("rejects completion receipts whose evidence finalLifecycle disagrees", () => {
+		const contradictory = buildReceipt<CompletionEvidence>({
+			receiptId: "c-contradiction",
+			sessionId: "s",
+			family: "completion",
+			source: "test",
+			subject,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			evidence: {
+				finalCommit: "abc",
+				branch: "feat/x",
+				prUrl: "https://example.test/pr/1",
+				issueArtifact: null,
+				requiredValidationReceiptIds: ["v-1"],
+				finalLifecycle: "finalizing",
+				finalizedAt: "2026-01-01T00:00:00.000Z",
+				blockers: [],
+			},
+		});
+
+		const result = ingestReceipts(state("finalizing"), [contradictory]);
+
+		expect(result.accepted).toEqual([]);
+		expect(result.rejected).toEqual([
+			{ receipt: contradictory, reasons: ["evidence-lifecycle-mismatch:finalizing"] },
+		]);
+		expect(result.transitions).toEqual([]);
+		expect(result.finalLifecycle).toBe("finalizing");
+	});
 });

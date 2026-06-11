@@ -1,4 +1,4 @@
-import type { ReceiptEnvelope } from "./receipts";
+import type { CompletionEvidence, ReceiptEnvelope, ReviewVerdictEvidence } from "./receipts";
 import { validateReceipt } from "./receipts";
 import { canTransition } from "./state-machine";
 import type { HarnessLifecycle, ReceiptFamily, SessionState } from "./types";
@@ -7,7 +7,32 @@ export const RECEIPT_DIGEST_MAX_CHARS = 280;
 
 export const RECEIPT_FAMILY_LIFECYCLE_TARGETS: Partial<Record<ReceiptFamily, HarnessLifecycle>> = {
 	completion: "completed",
+	// Review-only sessions terminate on a valid review verdict rather than a
+	// completion receipt; the finalizer treats valid verdicts as terminal.
+	"review-verdict": "completed",
 };
+
+/**
+ * Family-specific evidence consistency: the lifecycle target must agree with
+ * what the evidence itself claims. Hash validity alone is not enough — a
+ * semantically contradictory receipt must not drive the lifecycle.
+ */
+function evidenceContradiction(receipt: ReceiptEnvelope<unknown>, target: HarnessLifecycle): string | undefined {
+	if (receipt.family === "completion") {
+		const evidence = receipt.evidence as CompletionEvidence;
+		if (evidence.finalLifecycle !== target) {
+			return `evidence-lifecycle-mismatch:${evidence.finalLifecycle}`;
+		}
+	}
+	if (receipt.family === "review-verdict") {
+		const evidence = receipt.evidence as ReviewVerdictEvidence;
+		// Owner confirmation is not a terminal success verdict.
+		if (evidence.verdict === "OWNER_CONFIRMATION_REQUIRED") {
+			return "review-verdict-not-terminal";
+		}
+	}
+	return undefined;
+}
 
 export interface ReceiptIngestResult {
 	accepted: ReceiptEnvelope<unknown>[];
@@ -50,6 +75,19 @@ export function ingestReceipts(
 
 		const target = RECEIPT_FAMILY_LIFECYCLE_TARGETS[receipt.family];
 		if (target) {
+			// Non-terminal review verdicts (OWNER_CONFIRMATION_REQUIRED) are
+			// valid receipts but do not complete the session: accept, no move.
+			if (receipt.family === "review-verdict" && evidenceContradiction(receipt, target) !== undefined) {
+				accepted.push(receipt);
+				continue;
+			}
+			// Other contradictions (e.g. completion evidence whose
+			// finalLifecycle disagrees with the target) reject fail-closed.
+			const contradiction = evidenceContradiction(receipt, target);
+			if (contradiction !== undefined) {
+				rejected.push({ receipt, reasons: [contradiction] });
+				continue;
+			}
 			if (!canTransition(lifecycle, target)) {
 				rejected.push({ receipt, reasons: [`illegal-transition:${lifecycle}->${target}`] });
 				continue;
