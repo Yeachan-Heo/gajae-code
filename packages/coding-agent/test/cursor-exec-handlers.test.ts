@@ -71,3 +71,54 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		}
 	});
 });
+
+describe("CursorExecHandlers grep empty pattern guard (#501)", () => {
+	function makeRecordingHandlers(searchCalls: Array<Record<string, unknown>>): CursorExecHandlers {
+		const searchTool = {
+			name: "search",
+			label: "search",
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				searchCalls.push(args);
+				return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const tools = new Map<string, AgentTool>([["search", searchTool]]);
+		return new CursorExecHandlers({ cwd: process.cwd(), tools } as never);
+	}
+
+	it("empty pattern does not call search and returns an actionable error", async () => {
+		const searchCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeRecordingHandlers(searchCalls);
+		const result = await handlers.grep(create(GrepArgsSchema, { pattern: "", path: "/tmp", toolCallId: "g" }));
+		expect(searchCalls.length).toBe(0);
+		expect(result.role).toBe("toolResult");
+		expect(result.isError).toBe(true);
+		expect(result.toolName).toBe("search");
+		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("");
+		expect(text).toContain("must not be empty");
+	});
+
+	it("whitespace-only pattern does not call search and returns an actionable error", async () => {
+		const searchCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeRecordingHandlers(searchCalls);
+		const result = await handlers.grep(create(GrepArgsSchema, { pattern: "   ", path: "/tmp", toolCallId: "g" }));
+		expect(searchCalls.length).toBe(0);
+		expect(result.isError).toBe(true);
+	});
+
+	it("non-empty pattern calls search with the same searchPath behavior", async () => {
+		const searchCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeRecordingHandlers(searchCalls);
+		const result = await handlers.grep(create(GrepArgsSchema, { pattern: "foo", path: "/tmp", toolCallId: "g" }));
+		expect(searchCalls.length).toBe(1);
+		expect(searchCalls[0]).toMatchObject({ pattern: "foo", paths: ["/tmp"] });
+		expect(result.isError).toBeFalsy();
+	});
+
+	it("preserves glob/path behavior for non-empty patterns", async () => {
+		const searchCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeRecordingHandlers(searchCalls);
+		await handlers.grep(create(GrepArgsSchema, { pattern: "foo", path: "/tmp", glob: "*.ts", toolCallId: "g" }));
+		expect(searchCalls[0]).toMatchObject({ paths: ["/tmp/*.ts"] });
+	});
+});

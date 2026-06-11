@@ -198,6 +198,12 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 	async grep(args: Parameters<NonNullable<ICursorExecHandlers["grep"]>>[0]) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
+		if (args.pattern.trim() === "") {
+			const result = buildToolErrorResult(
+				"Cursor grep request rejected: pattern must not be empty. Provide a non-empty search pattern.",
+			);
+			return createToolResultMessage(toolCallId, "search", result, true);
+		}
 		const searchPath = args.glob ? `${args.path || "."}/${args.glob}` : args.path || ".";
 		const toolResultMessage = await executeTool(this.#optionsForCall(), "search", toolCallId, {
 			pattern: args.pattern,
