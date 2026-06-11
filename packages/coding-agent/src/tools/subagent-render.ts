@@ -73,7 +73,11 @@ function renderSubagentSnapshot(
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
 	}
 
-	if (snapshot.progress) {
+	// Defense in depth: the producer only attaches `progress` when a live
+	// producer exists (subagent.ts #liveProgressFields), but the renderer
+	// also honors an explicit `liveProgressAvailable: false` so stale retained
+	// progress can never resurrect a live panel (AC5).
+	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
 		// Live streaming panel (full task-panel parity), indented under the header.
 		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, spinnerFrame)) {
 			lines.push(`  ${pl}`);
@@ -142,6 +146,11 @@ export const subagentToolRenderer = {
 				);
 
 				const lines: string[] = [header];
+				// Discoverability: the inline panel is a bounded preview; the session
+				// observer (ctrl+s) streams the full per-subagent message history.
+				if (runningCount > 0) {
+					lines.push(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`);
+				}
 				for (const snapshot of subagents) {
 					lines.push(...renderSubagentSnapshot(snapshot, expanded, theme, options.spinnerFrame));
 				}

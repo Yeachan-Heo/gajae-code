@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a dim `(ctrl+s to observe sessions)` discoverability hint under the `subagent` await panel header while any awaited subagent is still running, pointing to the full session observer overlay; the hint shows in both collapsed and expanded states and disappears once no subagent is running.
+
 ### Fixed
 
 - Preserved provider abort root causes in the final TUI abort label, kept replay rendering idempotent, and added a `PI_STREAM_IDLE_TIMEOUT_MS` remediation hint when stream idle watchdogs fire.
