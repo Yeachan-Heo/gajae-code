@@ -4,6 +4,7 @@ import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
+import type { SpawnRoiReconciliation } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import type { SpawnPlanReceipt } from "./spawn-gate";
 import type { NestedRepoPatch } from "./worktree";
@@ -337,6 +338,11 @@ export interface SingleResult {
 	outputMeta?: { lineCount: number; charCount: number; byteSize?: number; sha256?: string };
 	/** Fork-context seed accounting for this subagent, when inherited parent context was cloned. */
 	forkContext?: { mode: ForkContextMode; clonedTokens: number };
+	/**
+	 * Advisory fork-context mode recommendation for this task (logged only;
+	 * never changes the actual mode selection).
+	 */
+	forkContextAdvisory?: { recommendedMode: ForkContextMode; reasons: string[] };
 }
 
 /** Tool details for TUI rendering */
@@ -356,6 +362,7 @@ export interface TaskToolDetails {
 		/** Advisory ids for terminal children that spent tokens without detectable output/review/changes. */
 		lowRoiChildIds: string[];
 	};
+	roiReconciliation?: SpawnRoiReconciliation;
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

@@ -46,6 +46,7 @@ export interface TaskResultReceipt {
 	};
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
+	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
 	roi?: TaskRoi;
 }
 
@@ -234,6 +235,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		review: buildReview(raw),
 		extractedToolCounts,
 		forkContext: raw.forkContext,
+		forkContextAdvisory: raw.forkContextAdvisory,
 		roi: buildTaskRoi(raw),
 	};
 }

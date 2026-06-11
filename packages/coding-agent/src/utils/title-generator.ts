@@ -12,7 +12,7 @@ import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
-const DEFAULT_TERMINAL_TITLE = "π";
+const DEFAULT_TERMINAL_TITLE = "GJC";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 const MAX_INPUT_CHARS = 2000;
