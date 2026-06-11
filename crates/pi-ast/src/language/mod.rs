@@ -607,19 +607,15 @@ impl SupportLang {
 
 	pub fn from_alias(value: &str) -> Option<Self> {
 		let lowered = value.trim().to_ascii_lowercase();
-		CORE_LANG_ALIASES
-			.get(lowered.as_str())
-			.copied()
-			.or_else(|| {
-				#[cfg(feature = "full-langs")]
-				{
-					LONG_TAIL_LANG_ALIASES.get(lowered.as_str()).copied()
-				}
-				#[cfg(not(feature = "full-langs"))]
-				{
-					None
-				}
-			})
+		let core = CORE_LANG_ALIASES.get(lowered.as_str()).copied();
+		#[cfg(feature = "full-langs")]
+		{
+			core.or_else(|| LONG_TAIL_LANG_ALIASES.get(lowered.as_str()).copied())
+		}
+		#[cfg(not(feature = "full-langs"))]
+		{
+			core
+		}
 	}
 
 	pub fn from_path(path: &Path) -> Option<Self> {
