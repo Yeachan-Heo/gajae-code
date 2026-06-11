@@ -95,7 +95,8 @@ export type ReceiptFamily =
 	| "validation"
 	| "completion"
 	| "review-verdict"
-	| "review-failure";
+	| "review-failure"
+	| "phase-rollup";
 
 /** The CLI verbs / primitives exposed by `gjc harness <verb>`. */
 export type HarnessVerb =

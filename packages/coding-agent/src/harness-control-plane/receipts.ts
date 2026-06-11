@@ -46,7 +46,7 @@ export interface ReceiptEnvelope<E = Record<string, unknown>> {
 export const RECEIPT_SCHEMA_VERSION = 1 as const;
 
 /** Deterministic stringify with sorted keys (stable hash basis). */
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const obj = value as Record<string, unknown>;
@@ -189,9 +189,109 @@ function validateFamily(receipt: ReceiptEnvelope<unknown>): string[] {
 			return validateReviewVerdict(receipt.evidence as ReviewVerdictEvidence);
 		case "review-failure":
 			return validateReviewFailure(receipt.evidence as ReviewFailureEvidence);
+		case "phase-rollup":
+			return validatePhaseRollup(receipt.evidence as PhaseRollupEvidence);
 		default:
 			return [`unknown-family:${receipt.family}`];
 	}
+}
+
+// ---- Phase rollup (receipt-of-receipts) ----------------------------------------
+
+/** Pointer back to one superseded child task receipt. */
+export interface PhaseRollupChildPointer {
+	id: string;
+	status: "completed" | "failed" | "aborted" | "merge_failed" | "paused";
+	/** Artifact URI holding the child's full output, when available. */
+	outputUri: string | null;
+	/** Content hash of the child's output artifact, when available. */
+	outputSha256: string | null;
+	/** Hash of the child receipt itself (canonical JSON), for staleness checks. */
+	receiptSha256: string;
+}
+
+export interface PhaseRollupEvidence {
+	/** Harness lifecycle boundary this rollup was emitted at. */
+	phase: string;
+	children: PhaseRollupChildPointer[];
+	aggregate: {
+		childCount: number;
+		completed: number;
+		failed: number;
+		totalTokens: number;
+		totalCostTotal: number | null;
+		totalClonedTokens: number | null;
+		lowRoiChildIds: string[];
+	};
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+const PHASE_ROLLUP_CHILD_STATUSES = new Set(["completed", "failed", "aborted", "merge_failed", "paused"]);
+
+export function validatePhaseRollup(e: PhaseRollupEvidence): string[] {
+	const reasons: string[] = [];
+	if (!e || typeof e.phase !== "string" || e.phase.length === 0) return ["phase-rollup-missing-phase"];
+	if (!Array.isArray(e.children) || e.children.length === 0) {
+		reasons.push("phase-rollup-empty-children");
+		return reasons;
+	}
+	const seenIds = new Set<string>();
+	let completedFromChildren = 0;
+	let failedFromChildren = 0;
+	for (const child of e.children) {
+		if (!child || typeof child.id !== "string" || child.id.length === 0) {
+			reasons.push("phase-rollup-child-missing-id");
+			continue;
+		}
+		if (seenIds.has(child.id)) reasons.push(`phase-rollup-duplicate-child-id:${child.id}`);
+		seenIds.add(child.id);
+		if (!PHASE_ROLLUP_CHILD_STATUSES.has(child.status)) {
+			reasons.push(`phase-rollup-child-bad-status:${child.id}`);
+		}
+		if (child.status === "completed") completedFromChildren++;
+		if (child.status === "failed" || child.status === "merge_failed") failedFromChildren++;
+		if (typeof child.receiptSha256 !== "string" || !SHA256_HEX.test(child.receiptSha256)) {
+			reasons.push(`phase-rollup-child-bad-receipt-hash:${child.id}`);
+		}
+		if (child.outputUri !== null && (typeof child.outputUri !== "string" || child.outputUri.length === 0)) {
+			reasons.push(`phase-rollup-child-bad-output-uri:${child.id}`);
+		}
+		if (child.outputSha256 !== null && !SHA256_HEX.test(child.outputSha256)) {
+			reasons.push(`phase-rollup-child-bad-output-hash:${child.id}`);
+		}
+		if (child.outputSha256 !== null && child.outputUri === null) {
+			reasons.push(`phase-rollup-child-orphan-output-hash:${child.id}`);
+		}
+	}
+	const aggregate = e.aggregate;
+	if (!aggregate || typeof aggregate.childCount !== "number") {
+		reasons.push("phase-rollup-missing-aggregate");
+		return reasons;
+	}
+	if (aggregate.childCount !== e.children.length) reasons.push("phase-rollup-child-count-mismatch");
+	if (aggregate.completed !== completedFromChildren) reasons.push("phase-rollup-aggregate-completed-mismatch");
+	if (aggregate.failed !== failedFromChildren) reasons.push("phase-rollup-aggregate-failed-mismatch");
+	for (const field of ["totalTokens", "completed", "failed"] as const) {
+		const value = aggregate[field];
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+			reasons.push(`phase-rollup-aggregate-bad-${field}`);
+		}
+	}
+	for (const field of ["totalCostTotal", "totalClonedTokens"] as const) {
+		const value = aggregate[field];
+		if (value !== null && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+			reasons.push(`phase-rollup-aggregate-bad-${field}`);
+		}
+	}
+	if (!Array.isArray(aggregate.lowRoiChildIds)) {
+		reasons.push("phase-rollup-aggregate-bad-lowRoiChildIds");
+	} else {
+		for (const id of aggregate.lowRoiChildIds) {
+			if (!seenIds.has(id)) reasons.push(`phase-rollup-aggregate-unknown-low-roi-id:${id}`);
+		}
+	}
+	return reasons;
 }
 
 function validateVanish(e: VanishEvidence): string[] {
