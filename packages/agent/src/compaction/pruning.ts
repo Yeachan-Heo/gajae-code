@@ -72,6 +72,27 @@ function toolCallPath(call: ToolCall): string | undefined {
 	return typeof path === "string" && path.length > 0 ? path : undefined;
 }
 
+/** `*** Add|Update|Delete File: <path>` headers in an apply_patch envelope. */
+const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm;
+
+/**
+ * Paths touched by an edit-class tool call. Most edit tools carry a single
+ * path argument; the OpenAI custom `apply_patch` envelope carries an `input`
+ * string with one or more `*** <Op> File:` headers instead.
+ */
+function editToolPaths(call: ToolCall): string[] {
+	const path = toolCallPath(call);
+	if (path !== undefined) return [path];
+	const input = call.arguments.input;
+	if (call.name !== "apply_patch" || typeof input !== "string") return [];
+	const paths: string[] = [];
+	for (const match of input.matchAll(APPLY_PATCH_FILE_HEADER)) {
+		const headerPath = match[1]?.trim();
+		if (headerPath) paths.push(headerPath);
+	}
+	return paths;
+}
+
 /**
  * Stable identity for "the same logical lookup": same tool re-targeting the
  * same subject. A later result with the same key supersedes earlier ones.
@@ -125,8 +146,9 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		resultMeta.set(i, { key, call });
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
-			const path = toolCallPath(call);
-			if (path !== undefined) lastEditIndexByPath.set(path, i);
+			for (const editPath of editToolPaths(call)) {
+				lastEditIndexByPath.set(editPath, i);
+			}
 		}
 	}
 

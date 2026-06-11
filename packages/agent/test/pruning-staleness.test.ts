@@ -138,6 +138,27 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(read.id);
 	});
 
+	it("an apply_patch envelope edit supersedes earlier reads of every patched file", () => {
+		const entries: SessionEntry[] = [];
+		const readA = pair(entries, "c1", "read", { path: "src/a.ts" });
+		const readB = pair(entries, "c2", "read", { path: "src/b.ts" });
+		const readC = pair(entries, "c3", "read", { path: "src/c.ts" });
+		const envelope = [
+			"*** Begin Patch",
+			"*** Update File: src/a.ts",
+			"@@",
+			"-old",
+			"+new",
+			"*** Delete File: src/b.ts",
+			"*** End Patch",
+		].join("\n");
+		pair(entries, "c4", "apply_patch", { input: envelope }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(readA.id);
+		expect(ids).toContain(readB.id);
+		expect(ids).not.toContain(readC.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });
