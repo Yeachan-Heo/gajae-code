@@ -25,7 +25,12 @@ function childPointer(receipt: TaskResultReceipt): PhaseRollupChildPointer {
 		status: receipt.status,
 		outputUri: receipt.outputRef?.uri ?? null,
 		outputSha256: receipt.outputRef?.sha256 ?? null,
-		receiptSha256: sha256Hex(canonicalJson(receipt)),
+		// Normalize through JSON first: in-memory task receipts carry optional
+		// fields with value `undefined`, which canonicalJson would hash as
+		// `null` while persisted/parsed receipts omit those keys entirely.
+		// JSON round-tripping drops undefined-valued keys so the hash is
+		// identical for in-memory and rehydrated copies of the same receipt.
+		receiptSha256: sha256Hex(canonicalJson(JSON.parse(JSON.stringify(receipt)))),
 	};
 }
 

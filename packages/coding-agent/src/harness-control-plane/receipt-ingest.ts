@@ -33,6 +33,13 @@ export function ingestReceipts(
 			continue;
 		}
 
+		// Fail closed on cross-session receipts: a self-consistent receipt from
+		// another session must never drive this session's lifecycle.
+		if (receipt.sessionId !== state.sessionId) {
+			rejected.push({ receipt, reasons: [`session-mismatch:${receipt.sessionId}`] });
+			continue;
+		}
+
 		const target = RECEIPT_FAMILY_LIFECYCLE_TARGETS[receipt.family];
 		if (target) {
 			if (!canTransition(lifecycle, target)) {

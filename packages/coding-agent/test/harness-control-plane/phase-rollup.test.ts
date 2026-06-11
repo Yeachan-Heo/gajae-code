@@ -70,6 +70,14 @@ describe("phase-rollup: builder", () => {
 		expect(rollup(children).sha256).toBe(rollup(children).sha256);
 	});
 
+	it("hashes children identically whether optional fields are undefined or absent (JSON round-trip)", () => {
+		const inMemory = childReceipt({ assignment: undefined, description: undefined });
+		const rehydrated = JSON.parse(JSON.stringify(inMemory)) as typeof inMemory;
+		const a = rollup([inMemory]).evidence.children[0]?.receiptSha256;
+		const b = rollup([rehydrated]).evidence.children[0]?.receiptSha256;
+		expect(a).toBe(b);
+	});
+
 	it("aggregates ROI: lowRoi ids, cost, cloned tokens; nulls when absent", () => {
 		const low = childReceipt({
 			id: "2-Low",
