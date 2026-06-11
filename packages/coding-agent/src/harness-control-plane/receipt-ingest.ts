@@ -33,6 +33,14 @@ export function ingestReceipts(
 			continue;
 		}
 
+		// Fail closed on receipts the envelope itself marks invalid: the hash
+		// can be self-consistent while the issuer recorded the receipt as not
+		// proving its claim.
+		if (receipt.valid !== true) {
+			rejected.push({ receipt, reasons: ["receipt-marked-invalid"] });
+			continue;
+		}
+
 		// Fail closed on cross-session receipts: a self-consistent receipt from
 		// another session must never drive this session's lifecycle.
 		if (receipt.sessionId !== state.sessionId) {

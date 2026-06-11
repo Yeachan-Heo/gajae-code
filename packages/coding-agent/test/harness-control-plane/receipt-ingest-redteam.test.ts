@@ -174,4 +174,33 @@ describe("receipt ingest red-team", () => {
 		expect(result.transitions).toEqual([]);
 		expect(result.finalLifecycle).toBe("finalizing");
 	});
+
+	it("rejects hash-consistent receipts whose envelope marks them invalid", () => {
+		const markedInvalid = buildReceipt<CompletionEvidence>({
+			receiptId: "c-invalid",
+			sessionId: "s",
+			family: "completion",
+			source: "test",
+			subject,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			valid: false,
+			evidence: {
+				finalCommit: "abc",
+				branch: "feat/x",
+				prUrl: "https://example.test/pr/1",
+				issueArtifact: null,
+				requiredValidationReceiptIds: ["v-1"],
+				finalLifecycle: "completed",
+				finalizedAt: "2026-01-01T00:00:00.000Z",
+				blockers: [],
+			},
+		});
+
+		const result = ingestReceipts(state("finalizing"), [markedInvalid]);
+
+		expect(result.accepted).toEqual([]);
+		expect(result.rejected).toEqual([{ receipt: markedInvalid, reasons: ["receipt-marked-invalid"] }]);
+		expect(result.transitions).toEqual([]);
+		expect(result.finalLifecycle).toBe("finalizing");
+	});
 });
