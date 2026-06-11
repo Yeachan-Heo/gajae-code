@@ -36,6 +36,7 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"bench:context": "bun run bench/context-optimization.bench.ts",
 		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
 		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
 		"fix": "biome check --write --unsafe . && bun run format-prompts && bun run generate-docs-index",
