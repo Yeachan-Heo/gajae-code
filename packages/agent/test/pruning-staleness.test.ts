@@ -209,6 +209,18 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(pageTwo.id);
 	});
 
+	it("searches with different result-shaping flags do not supersede each other", () => {
+		const entries: SessionEntry[] = [];
+		const caseSensitive = pair(entries, "c1", "search", { pattern: "foo", paths: ["src"] });
+		const caseInsensitive = pair(entries, "c2", "search", { pattern: "foo", paths: ["src"], i: true });
+		const noGitignore = pair(entries, "c3", "search", { pattern: "foo", paths: ["src"], gitignore: false });
+		const config: PruneConfig = { ...EAGER, protectTokens: 1_000_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).not.toContain(caseSensitive.id);
+		expect(ids).not.toContain(caseInsensitive.id);
+		expect(ids).not.toContain(noGitignore.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });

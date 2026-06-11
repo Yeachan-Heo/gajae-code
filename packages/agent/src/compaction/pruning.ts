@@ -121,7 +121,8 @@ function readBasePath(path: string): string {
  * same subject. A later result with the same key supersedes earlier ones.
  * Keys are canonical JSON tuples so user-controlled text (patterns, paths)
  * can never collide via delimiter ambiguity. Search keys include pagination
- * (`skip`): later pages complement page 1, they do not replace it.
+ * (`skip`) and result-shaping flags (`i`, `gitignore`): a later page or a
+ * differently-shaped search complements earlier output, it does not replace it.
  */
 function toolTargetKey(call: ToolCall): string | undefined {
 	const path = toolCallPath(call);
@@ -131,7 +132,9 @@ function toolTargetKey(call: ToolCall): string | undefined {
 		const paths = call.arguments.paths;
 		const pathList = Array.isArray(paths) ? paths.filter((p): p is string => typeof p === "string") : [];
 		const skip = typeof call.arguments.skip === "number" ? call.arguments.skip : 0;
-		return JSON.stringify([call.name, "pattern", pattern, pathList, skip]);
+		const caseInsensitive = call.arguments.i === true;
+		const gitignore = call.arguments.gitignore !== false;
+		return JSON.stringify([call.name, "pattern", pattern, pathList, skip, caseInsensitive, gitignore]);
 	}
 	return undefined;
 }
