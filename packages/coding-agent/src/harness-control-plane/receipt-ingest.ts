@@ -118,7 +118,9 @@ function buildReceiptIngestDigest(
 ): string {
 	let digest = `ingested ${total} receipts: ${acceptedCount} accepted, ${rejected.length} rejected; lifecycle ${initialLifecycle}->${finalLifecycle}`;
 	if (rejected.length > 0) {
-		const rejectedSummary = rejected.map(item => `${item.receipt.receiptId}(${item.reasons.join("|")})`).join(",");
+		const rejectedSummary = rejected
+			.map(item => `${item.receipt?.receiptId ?? "<malformed>"}(${item.reasons.join("|")})`)
+			.join(",");
 		digest += `; rejected: ${rejectedSummary}`;
 	}
 	return digest.slice(0, RECEIPT_DIGEST_MAX_CHARS);

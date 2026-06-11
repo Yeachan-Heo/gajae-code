@@ -96,9 +96,50 @@ export interface ValidationOutcome {
 	reasons: string[];
 }
 
+/** Reusable non-empty string guard for structural envelope checks. */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Validate the structural envelope fields independently of the hash. A receipt
+ * can be hash-self-consistent while carrying empty/missing identity fields (an
+ * attacker controls the bytes the hash is computed over), so these checks must
+ * run BEFORE any lifecycle transition is allowed. Fail-closed.
+ */
+function validateStructure(receipt: ReceiptEnvelope<unknown>): string[] {
+	const reasons: string[] = [];
+	if (!isNonEmptyString(receipt.receiptId)) reasons.push("envelope-missing-receiptId");
+	if (!isNonEmptyString(receipt.sessionId)) reasons.push("envelope-missing-sessionId");
+	if (!isNonEmptyString(receipt.source)) reasons.push("envelope-missing-source");
+	if (!isNonEmptyString(receipt.createdAt)) reasons.push("envelope-missing-createdAt");
+	// Family vocabulary itself is enforced by `validateFamily`; here we only
+	// require a non-empty family token so the envelope is well-formed.
+	if (!isNonEmptyString(receipt.family)) reasons.push("envelope-missing-family");
+	if (typeof receipt.valid !== "boolean") reasons.push("envelope-bad-valid");
+	if (typeof receipt.sha256 !== "string") reasons.push("envelope-missing-sha256");
+	const subject = receipt.subject as ReceiptSubject | undefined;
+	if (!subject || typeof subject !== "object" || Array.isArray(subject) || !isNonEmptyString(subject.workspace)) {
+		reasons.push("envelope-bad-subject");
+	}
+	if (receipt.evidence === null || typeof receipt.evidence !== "object" || Array.isArray(receipt.evidence)) {
+		reasons.push("envelope-bad-evidence");
+	}
+	if (!receipt.artifactHashes || typeof receipt.artifactHashes !== "object" || Array.isArray(receipt.artifactHashes)) {
+		reasons.push("envelope-bad-artifactHashes");
+	}
+	return reasons;
+}
+
 /** Recompute the hash and run structural family checks. Fail-closed. */
 export function validateReceipt(receipt: ReceiptEnvelope<unknown>): ValidationOutcome {
+	// Fail closed on malformed/non-object envelopes (null, undefined, arrays,
+	// primitives) instead of throwing while destructuring below.
+	if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) {
+		return { valid: false, reasons: ["malformed-envelope"] };
+	}
 	const reasons: string[] = [];
+	reasons.push(...validateStructure(receipt));
 	const { sha256, ...rest } = receipt;
 	if (sha256Hex(hashBasis(rest)) !== sha256) reasons.push("hash-mismatch");
 	if (receipt.schemaVersion !== RECEIPT_SCHEMA_VERSION) reasons.push("schema-version-mismatch");
@@ -208,6 +249,16 @@ export interface PhaseRollupChildPointer {
 	outputSha256: string | null;
 	/** Hash of the child receipt itself (canonical JSON), for staleness checks. */
 	receiptSha256: string;
+	/**
+	 * Per-child ROI accounting carried into the rollup so the aggregate totals
+	 * below are recomputable/verifiable from child evidence (not self-reported).
+	 * `tokens` is the child's effective token count; cost/cloned are null when
+	 * the child reported no such accounting.
+	 */
+	tokens: number;
+	costTotal: number | null;
+	clonedTokens: number | null;
+	lowRoi: boolean;
 }
 
 export interface PhaseRollupEvidence {
@@ -229,6 +280,22 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 const PHASE_ROLLUP_CHILD_STATUSES = new Set(["completed", "failed", "aborted", "merge_failed", "paused"]);
 
+/** Reconcile two recomputed-vs-reported numeric totals (null == "not reported"). */
+function numbersReconcile(actual: number | null, expected: number | null): boolean {
+	if (actual === null || expected === null) return actual === expected;
+	return Math.abs(actual - expected) <= 1e-9;
+}
+
+/** True when two id lists describe the same set (order-independent). */
+function sameIdSet(actual: readonly string[], expected: readonly string[]): boolean {
+	if (actual.length !== expected.length) return false;
+	const expectedSet = new Set(expected);
+	for (const id of actual) {
+		if (!expectedSet.has(id)) return false;
+	}
+	return new Set(actual).size === expectedSet.size;
+}
+
 export function validatePhaseRollup(e: PhaseRollupEvidence): string[] {
 	const reasons: string[] = [];
 	if (!e || typeof e.phase !== "string" || e.phase.length === 0) return ["phase-rollup-missing-phase"];
@@ -239,6 +306,12 @@ export function validatePhaseRollup(e: PhaseRollupEvidence): string[] {
 	const seenIds = new Set<string>();
 	let completedFromChildren = 0;
 	let failedFromChildren = 0;
+	let tokensFromChildren = 0;
+	let costFromChildren = 0;
+	let clonedFromChildren = 0;
+	let anyCost = false;
+	let anyCloned = false;
+	const lowRoiFromChildren: string[] = [];
 	for (const child of e.children) {
 		if (!child || typeof child.id !== "string" || child.id.length === 0) {
 			reasons.push("phase-rollup-child-missing-id");
@@ -260,8 +333,42 @@ export function validatePhaseRollup(e: PhaseRollupEvidence): string[] {
 		if (child.outputSha256 !== null && !SHA256_HEX.test(child.outputSha256)) {
 			reasons.push(`phase-rollup-child-bad-output-hash:${child.id}`);
 		}
+		// Receipt-of-receipts integrity requires BOTH an output URI and its
+		// content hash. Reject either one-sided pairing fail-closed: a hash
+		// without a URI is unanchored, and a URI without a hash is unverifiable.
 		if (child.outputSha256 !== null && child.outputUri === null) {
 			reasons.push(`phase-rollup-child-orphan-output-hash:${child.id}`);
+		}
+		if (child.outputUri !== null && child.outputSha256 === null) {
+			reasons.push(`phase-rollup-child-orphan-output-uri:${child.id}`);
+		}
+		// Per-child ROI accounting must be well-formed before it can be summed
+		// for the recomputed aggregate reconciliation below.
+		if (typeof child.tokens !== "number" || !Number.isFinite(child.tokens) || child.tokens < 0) {
+			reasons.push(`phase-rollup-child-bad-tokens:${child.id}`);
+		} else {
+			tokensFromChildren += child.tokens;
+		}
+		if (child.costTotal !== null) {
+			if (typeof child.costTotal !== "number" || !Number.isFinite(child.costTotal) || child.costTotal < 0) {
+				reasons.push(`phase-rollup-child-bad-cost:${child.id}`);
+			} else {
+				anyCost = true;
+				costFromChildren += child.costTotal;
+			}
+		}
+		if (child.clonedTokens !== null) {
+			if (typeof child.clonedTokens !== "number" || !Number.isFinite(child.clonedTokens) || child.clonedTokens < 0) {
+				reasons.push(`phase-rollup-child-bad-cloned-tokens:${child.id}`);
+			} else {
+				anyCloned = true;
+				clonedFromChildren += child.clonedTokens;
+			}
+		}
+		if (typeof child.lowRoi !== "boolean") {
+			reasons.push(`phase-rollup-child-bad-low-roi:${child.id}`);
+		} else if (child.lowRoi) {
+			lowRoiFromChildren.push(child.id);
 		}
 	}
 	const aggregate = e.aggregate;
@@ -284,12 +391,22 @@ export function validatePhaseRollup(e: PhaseRollupEvidence): string[] {
 			reasons.push(`phase-rollup-aggregate-bad-${field}`);
 		}
 	}
+	// Recompute the ROI aggregates from child evidence and fail closed on any
+	// self-reported total that does not reconcile. `null` is the canonical
+	// "no child reported this metric" value, mirroring the builder.
+	if (aggregate.totalTokens !== tokensFromChildren) {
+		reasons.push("phase-rollup-aggregate-tokens-mismatch");
+	}
+	if (!numbersReconcile(aggregate.totalCostTotal, anyCost ? costFromChildren : null)) {
+		reasons.push("phase-rollup-aggregate-cost-mismatch");
+	}
+	if (!numbersReconcile(aggregate.totalClonedTokens, anyCloned ? clonedFromChildren : null)) {
+		reasons.push("phase-rollup-aggregate-cloned-tokens-mismatch");
+	}
 	if (!Array.isArray(aggregate.lowRoiChildIds)) {
 		reasons.push("phase-rollup-aggregate-bad-lowRoiChildIds");
-	} else {
-		for (const id of aggregate.lowRoiChildIds) {
-			if (!seenIds.has(id)) reasons.push(`phase-rollup-aggregate-unknown-low-roi-id:${id}`);
-		}
+	} else if (!sameIdSet(aggregate.lowRoiChildIds, lowRoiFromChildren)) {
+		reasons.push("phase-rollup-aggregate-low-roi-mismatch");
 	}
 	return reasons;
 }
@@ -338,6 +455,9 @@ function validateCompletion(e: CompletionEvidence): string[] {
 		reasons.push("completion-missing-validation-receipts");
 	}
 	if (Array.isArray(e.blockers) && e.blockers.length > 0) reasons.push("completion-has-blockers");
+	// NOTE: evidence.finalLifecycle vs the lifecycle target is reconciled
+	// fail-closed at the ingest layer (`evidenceContradiction` ->
+	// `evidence-lifecycle-mismatch`), where the actual transition is gated.
 	return reasons;
 }
 

@@ -169,4 +169,101 @@ describe("phase-rollup red-team", () => {
 		expect(outcome.valid).toBe(false);
 		expect(outcome.reasons).toContain("phase-rollup-aggregate-failed-mismatch");
 	});
+	it("rejects a one-sided outputUri without its content hash (unverifiable pointer)", () => {
+		const good = rollup([childReceipt()]).evidence.children[0]!;
+		const r = rawRollup({
+			phase: "implementation",
+			children: [{ ...good, id: "uri-only", outputUri: "agent://uri-only", outputSha256: null }],
+			aggregate: {
+				childCount: 1,
+				completed: 1,
+				failed: 0,
+				totalTokens: 5000,
+				totalCostTotal: 0.01,
+				totalClonedTokens: null,
+				lowRoiChildIds: [],
+			},
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("phase-rollup-child-orphan-output-uri:uri-only");
+	});
+
+	it("rejects a one-sided outputSha256 without its anchoring uri (unanchored hash)", () => {
+		const good = rollup([childReceipt()]).evidence.children[0]!;
+		const r = rawRollup({
+			phase: "implementation",
+			children: [{ ...good, id: "hash-only", outputUri: null, outputSha256: sha256Hex("output") }],
+			aggregate: {
+				childCount: 1,
+				completed: 1,
+				failed: 0,
+				totalTokens: 5000,
+				totalCostTotal: 0.01,
+				totalClonedTokens: null,
+				lowRoiChildIds: [],
+			},
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("phase-rollup-child-orphan-output-hash:hash-only");
+	});
+
+	it("rejects a self-reported totalTokens that does not match summed child evidence", () => {
+		const good = rollup([childReceipt()]).evidence.children[0]!;
+		const r = rawRollup({
+			phase: "implementation",
+			children: [good],
+			aggregate: {
+				childCount: 1,
+				completed: 1,
+				failed: 0,
+				totalTokens: 9999,
+				totalCostTotal: 0.01,
+				totalClonedTokens: null,
+				lowRoiChildIds: [],
+			},
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("phase-rollup-aggregate-tokens-mismatch");
+	});
+
+	it("rejects a self-reported totalCostTotal that does not reconcile with child cost", () => {
+		const good = rollup([childReceipt()]).evidence.children[0]!;
+		const r = rawRollup({
+			phase: "implementation",
+			children: [good],
+			aggregate: {
+				childCount: 1,
+				completed: 1,
+				failed: 0,
+				totalTokens: 5000,
+				totalCostTotal: 0.02,
+				totalClonedTokens: null,
+				lowRoiChildIds: [],
+			},
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("phase-rollup-aggregate-cost-mismatch");
+	});
+
+	it("builds a valid rollup for all-zero reported cost/cloned children (builder and validator agree)", () => {
+		const zeroChild = childReceipt({
+			id: "zero-roi",
+			roi: {
+				tokens: 5000,
+				costTotal: 0,
+				clonedTokens: 0,
+				producedChanges: true,
+				materialContribution: true,
+				lowRoi: false,
+			},
+		});
+		const r = rollup([zeroChild]);
+		expect(r.evidence.aggregate.totalCostTotal).toBe(0);
+		expect(r.evidence.aggregate.totalClonedTokens).toBe(0);
+		expect(validateReceipt(r).valid).toBe(true);
+	});
 });

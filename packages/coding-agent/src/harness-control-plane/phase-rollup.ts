@@ -20,17 +20,30 @@ import {
 } from "./receipts";
 
 function childPointer(receipt: TaskResultReceipt): PhaseRollupChildPointer {
+	const ref = receipt.outputRef;
+	// Receipt-of-receipts integrity requires BOTH a pointer URI and its content
+	// hash. A URI without a verifiable hash cannot be integrity-checked, so we
+	// drop the (one-sided) pointer entirely rather than emit an unverifiable ref
+	// that the fail-closed validator would reject.
+	const hasVerifiableRef = Boolean(ref?.uri) && Boolean(ref?.sha256);
 	return {
 		id: receipt.id,
 		status: receipt.status,
-		outputUri: receipt.outputRef?.uri ?? null,
-		outputSha256: receipt.outputRef?.sha256 ?? null,
+		outputUri: hasVerifiableRef ? (ref?.uri ?? null) : null,
+		outputSha256: hasVerifiableRef ? (ref?.sha256 ?? null) : null,
 		// Normalize through JSON first: in-memory task receipts carry optional
 		// fields with value `undefined`, which canonicalJson would hash as
 		// `null` while persisted/parsed receipts omit those keys entirely.
 		// JSON round-tripping drops undefined-valued keys so the hash is
 		// identical for in-memory and rehydrated copies of the same receipt.
 		receiptSha256: sha256Hex(canonicalJson(JSON.parse(JSON.stringify(receipt)))),
+		// Per-child ROI accounting so the rollup aggregate is recomputable from
+		// child evidence (see validatePhaseRollup). `tokens` falls back to the
+		// receipt's raw token count when no ROI proxy is present.
+		tokens: receipt.roi?.tokens ?? receipt.tokens,
+		costTotal: receipt.roi?.costTotal ?? null,
+		clonedTokens: receipt.roi?.clonedTokens ?? null,
+		lowRoi: receipt.roi?.lowRoi ?? false,
 	};
 }
 
@@ -46,8 +59,18 @@ export interface BuildPhaseRollupInput {
 }
 
 export function buildPhaseRollupReceipt(input: BuildPhaseRollupInput): ReceiptEnvelope<PhaseRollupEvidence> {
-	const totalCostTotal = input.children.reduce((total, child) => total + (child.roi?.costTotal ?? 0), 0);
-	const totalClonedTokens = input.children.reduce((total, child) => total + (child.roi?.clonedTokens ?? 0), 0);
+	// `null` means "no child reported this metric" — the canonical value the
+	// fail-closed validator reconciles against. Decide presence from whether a
+	// child carried the field at all (not from a >0 sum), so a legitimate
+	// all-zero total reconciles instead of collapsing to null and mismatching.
+	const anyCost = input.children.some(child => (child.roi?.costTotal ?? null) !== null);
+	const anyCloned = input.children.some(child => (child.roi?.clonedTokens ?? null) !== null);
+	const totalCostTotal = anyCost
+		? input.children.reduce((total, child) => total + (child.roi?.costTotal ?? 0), 0)
+		: null;
+	const totalClonedTokens = anyCloned
+		? input.children.reduce((total, child) => total + (child.roi?.clonedTokens ?? 0), 0)
+		: null;
 	const evidence: PhaseRollupEvidence = {
 		phase: input.phase,
 		children: input.children.map(childPointer),
@@ -56,8 +79,8 @@ export function buildPhaseRollupReceipt(input: BuildPhaseRollupInput): ReceiptEn
 			completed: input.children.filter(child => child.status === "completed").length,
 			failed: input.children.filter(child => child.status === "failed" || child.status === "merge_failed").length,
 			totalTokens: input.children.reduce((total, child) => total + (child.roi?.tokens ?? child.tokens), 0),
-			totalCostTotal: totalCostTotal > 0 ? totalCostTotal : null,
-			totalClonedTokens: totalClonedTokens > 0 ? totalClonedTokens : null,
+			totalCostTotal,
+			totalClonedTokens,
 			lowRoiChildIds: input.children.filter(child => child.roi?.lowRoi).map(child => child.id),
 		},
 	};
