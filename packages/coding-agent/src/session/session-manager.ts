@@ -3126,6 +3126,26 @@ export class SessionManager {
 	}
 
 	/**
+	 * Write mutated message entries back into the canonical entry store by id.
+	 *
+	 * `getBranch()` materializes resident-blob entries into copies, so in-place
+	 * mutation of returned entries (e.g. pruning tool outputs) does not affect
+	 * the canonical store. This applies such mutations for real.
+	 */
+	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
+		for (const updated of entries) {
+			const canonical = this.#byId.get(updated.id);
+			if (canonical?.type !== "message") continue;
+			const residentEntry = prepareEntryForResidentSync(
+				{ ...canonical, message: updated.message },
+				this.#residentBlobStore,
+			) as SessionMessageEntry;
+			canonical.message = residentEntry.message;
+		}
+		this.#needsFullRewriteOnNextPersist = true;
+	}
+
+	/**
 	 * Rewrite the session file after in-place entry updates.
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */

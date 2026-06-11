@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Made tool-output pruning staleness-aware: results superseded by a later same-target result (re-read file, re-run search) or invalidated by a later successful edit/write are pruned before merely-old ones, including inside the recency protect window. New optional `PruneConfig.staleOverridableTools` (default `["read"]`) waives protected-tool immunity for superseded results while the most recent result per target stays protected. Target identity uses collision-proof canonical JSON tuple keys.
+- `PruneResult` now returns `prunedEntries` so callers whose entry source materializes copies (e.g. blob-externalized session entries) can write mutations back into their canonical store.
+
 ## [0.4.4] - 2026-06-10
 
 - Version aligned with the 0.4.4 monorepo release; no functional changes in this package.

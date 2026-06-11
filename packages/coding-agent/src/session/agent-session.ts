@@ -6063,6 +6063,9 @@ export class AgentSession {
 			return undefined;
 		}
 
+		// getBranch() returns materialized copies for blob-externalized entries, so
+		// the pruning mutations must be written back into the canonical store.
+		this.sessionManager.applyEntryMessageUpdates(result.prunedEntries);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
@@ -6507,12 +6510,18 @@ export class AgentSession {
 		// Case 2: Threshold - turn succeeded but context is getting large
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return;
-		const pruneResult = await this.#pruneToolOutputs();
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
+		const maxOutputTokens = this.model?.maxTokens ?? 0;
+		// Cache-epoch invariant: pruning rewrites already-sent toolResult history,
+		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
+		// sanctioned maintenance boundary, i.e. when the un-pruned context already
+		// crosses the compaction threshold. Pruning may then avert full compaction.
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
+		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, this.model?.maxTokens ?? 0)) {
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {

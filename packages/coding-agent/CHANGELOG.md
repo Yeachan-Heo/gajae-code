@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Tool-output pruning no longer rewrites already-sent provider-facing history mid prompt-cache epoch: `#checkCompaction` now invokes pruning only when un-pruned context already crosses the compaction threshold (a sanctioned maintenance boundary), preserving the prefix-stability invariant. Also fixed a latent no-op where pruning mutated materialized branch copies and never persisted; `SessionManager.applyEntryMessageUpdates` now writes pruned messages back into the canonical store.
+
 - Preserved provider abort root causes in the final TUI abort label, kept replay rendering idempotent, and added a `PI_STREAM_IDLE_TIMEOUT_MS` remediation hint when stream idle watchdogs fire.
 
 ## [0.4.4] - 2026-06-10

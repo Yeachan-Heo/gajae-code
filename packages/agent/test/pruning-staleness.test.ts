@@ -1,0 +1,215 @@
+import { describe, expect, it } from "bun:test";
+import type { ToolResultMessage } from "@gajae-code/ai";
+import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
+import { DEFAULT_PRUNE_CONFIG, type PruneConfig, pruneToolOutputs } from "../src/compaction/pruning";
+
+/**
+ * Staleness-aware pruning: superseded tool results (same target read/searched
+ * again later, or a covered file edited later) are pruned before merely-old
+ * ones, and superseded `read` results lose their protected-tool immunity while
+ * the most recent read per file stays protected.
+ */
+
+let idCounter = 0;
+
+function assistantCallEntry(callId: string, toolName: string, args: Record<string, unknown>): SessionEntry {
+	idCounter++;
+	return {
+		type: "message",
+		id: `a-${idCounter}`,
+		parentId: null,
+		timestamp: new Date(idCounter).toISOString(),
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: callId, name: toolName, arguments: args }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "m",
+			stopReason: "toolUse",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: idCounter,
+		},
+	} as SessionEntry;
+}
+
+function toolResultEntry(callId: string, toolName: string, sizeChars = 8000, isError = false): SessionMessageEntry {
+	idCounter++;
+	return {
+		type: "message",
+		id: `r-${idCounter}`,
+		parentId: null,
+		timestamp: new Date(idCounter).toISOString(),
+		message: {
+			role: "toolResult",
+			toolCallId: callId,
+			toolName,
+			content: [{ type: "text", text: `result-${callId} ${"x ".repeat(Math.floor(sizeChars / 2))}` }],
+			isError,
+			timestamp: idCounter,
+		} as ToolResultMessage,
+	} as SessionMessageEntry;
+}
+
+/** A call+result pair appended as two entries. */
+function pair(
+	entries: SessionEntry[],
+	callId: string,
+	toolName: string,
+	args: Record<string, unknown>,
+	sizeChars = 8000,
+	isError = false,
+): SessionMessageEntry {
+	entries.push(assistantCallEntry(callId, toolName, args));
+	const result = toolResultEntry(callId, toolName, sizeChars, isError);
+	entries.push(result);
+	return result;
+}
+
+const EAGER: PruneConfig = {
+	protectTokens: 0,
+	minimumSavings: 0,
+	protectedTools: ["skill", "read"],
+	staleOverridableTools: ["read"],
+};
+
+function prunedIds(entries: SessionEntry[], config: PruneConfig): string[] {
+	const result = pruneToolOutputs(entries, config);
+	return result.prunedEntries.map(entry => entry.id).sort();
+}
+
+describe("staleness supersession ordering", () => {
+	it("a later read of the same file supersedes the earlier read (earlier prunable, latest protected)", () => {
+		const entries: SessionEntry[] = [];
+		const oldRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		const newRead = pair(entries, "c2", "read", { path: "src/a.ts" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(oldRead.id);
+		expect(ids).not.toContain(newRead.id);
+	});
+
+	it("a later identical search supersedes the earlier one; different patterns are independent", () => {
+		const entries: SessionEntry[] = [];
+		const oldSearch = pair(entries, "c1", "search", { pattern: "foo", paths: ["src"] });
+		const otherSearch = pair(entries, "c2", "search", { pattern: "bar", paths: ["src"] });
+		const newSearch = pair(entries, "c3", "search", { pattern: "foo", paths: ["src"] });
+		// Use a config protecting nothing but with a window so only stale items are pruned.
+		const config: PruneConfig = { ...EAGER, protectTokens: 1_000_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).toContain(oldSearch.id);
+		expect(ids).not.toContain(otherSearch.id);
+		expect(ids).not.toContain(newSearch.id);
+	});
+
+	it("delimiter-looking patterns/paths never collide (canonical tuple keys)", () => {
+		const entries: SessionEntry[] = [];
+		// Historic collision shapes under naive `${name}:${pattern}@${paths.join(",")}` keys:
+		const a = pair(entries, "c1", "search", { pattern: "foo@a", paths: ["b"] });
+		const b = pair(entries, "c2", "search", { pattern: "foo", paths: ["a@b"] });
+		const c = pair(entries, "c3", "search", { pattern: "x", paths: ["a,b"] });
+		const d = pair(entries, "c4", "search", { pattern: "x", paths: ["a", "b"] });
+		const config: PruneConfig = { ...EAGER, protectTokens: 1_000_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).not.toContain(a.id);
+		expect(ids).not.toContain(b.id);
+		expect(ids).not.toContain(c.id);
+		expect(ids).not.toContain(d.id);
+	});
+
+	it("a later edit to a file supersedes an earlier read of that file", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		pair(entries, "c2", "edit", { path: "src/a.ts" }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(read.id);
+	});
+
+	it("an edit to a different file does not stale the read", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		pair(entries, "c2", "edit", { path: "src/b.ts" }, 100);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(read.id);
+	});
+
+	it("an errored later result does not supersede the earlier success", () => {
+		const entries: SessionEntry[] = [];
+		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		pair(entries, "c2", "read", { path: "src/a.ts" }, 100, true);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(okRead.id);
+	});
+});
+
+describe("protect-window interaction", () => {
+	it("stale results inside the protect window are still prunable; fresh ones are not", () => {
+		const entries: SessionEntry[] = [];
+		const staleRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		const freshBash = pair(entries, "c2", "bash", { command: "ls" });
+		const newRead = pair(entries, "c3", "read", { path: "src/a.ts" });
+		// Window large enough that everything is "recent".
+		const config: PruneConfig = { ...EAGER, protectTokens: 1_000_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).toContain(staleRead.id);
+		expect(ids).not.toContain(freshBash.id);
+		expect(ids).not.toContain(newRead.id);
+	});
+
+	it("non-stale results keep classic window semantics (old beyond window prunable)", () => {
+		const entries: SessionEntry[] = [];
+		const oldBash = pair(entries, "c1", "bash", { command: "a" }, 60_000);
+		const newBash = pair(entries, "c2", "bash", { command: "b" }, 60_000);
+		// Window covers only the newest result (~15k tokens each).
+		const config: PruneConfig = { ...EAGER, protectTokens: 20_000 };
+		const ids = prunedIds(entries, config);
+		expect(ids).toContain(oldBash.id);
+		expect(ids).not.toContain(newBash.id);
+	});
+
+	it("minimumSavings hysteresis still gates staleness pruning", () => {
+		const entries: SessionEntry[] = [];
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 400);
+		pair(entries, "c2", "read", { path: "src/a.ts" }, 400);
+		const config: PruneConfig = { ...EAGER, minimumSavings: 50_000 };
+		const result = pruneToolOutputs(entries, config);
+		expect(result.prunedCount).toBe(0);
+		expect(result.prunedEntries).toEqual([]);
+	});
+});
+
+describe("protected tools", () => {
+	it("the most recent read per file is never pruned even with zero protect window", () => {
+		const entries: SessionEntry[] = [];
+		const reads = ["a", "b", "c"].map(name => pair(entries, `c-${name}`, "read", { path: `src/${name}.ts` }));
+		const ids = prunedIds(entries, EAGER);
+		for (const read of reads) expect(ids).not.toContain(read.id);
+	});
+
+	it("non-overridable protected tools (skill) stay protected even when superseded", () => {
+		const entries: SessionEntry[] = [];
+		const oldSkill = pair(entries, "c1", "skill", { path: "skills/x.md" });
+		pair(entries, "c2", "skill", { path: "skills/x.md" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(oldSkill.id);
+	});
+
+	it("default config keeps read in protectedTools and staleOverridableTools", () => {
+		expect(DEFAULT_PRUNE_CONFIG.protectedTools).toContain("read");
+		expect(DEFAULT_PRUNE_CONFIG.staleOverridableTools).toContain("read");
+	});
+
+	it("config without staleOverridableTools behaves like classic protection", () => {
+		const entries: SessionEntry[] = [];
+		const oldRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		pair(entries, "c2", "read", { path: "src/a.ts" });
+		const config: PruneConfig = { protectTokens: 0, minimumSavings: 0, protectedTools: ["read"] };
+		const ids = prunedIds(entries, config);
+		expect(ids).not.toContain(oldRead.id);
+	});
+});
