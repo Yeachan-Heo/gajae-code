@@ -399,7 +399,6 @@ pub enum SupportLang {
 	Zig,
 }
 
-
 #[cfg(not(feature = "full-langs"))]
 const ALL_LANGS_DEFAULT: [SupportLang; 19] = [
 	SupportLang::TypeScript,
@@ -1181,7 +1180,8 @@ pub const KNOWN_LONG_TAIL_ALIASES: &[&str] = &[
 	"xslt",
 	"svg",
 	"plist",
-	"zig",];
+	"zig",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1195,30 +1195,27 @@ mod tests {
 	fn all_langs_matches_locked_registry() {
 		let langs = SupportLang::all_langs();
 		#[cfg(not(feature = "full-langs"))]
-		assert_eq!(
-			langs,
-			&[
-				SupportLang::TypeScript,
-				SupportLang::Tsx,
-				SupportLang::JavaScript,
-				SupportLang::Python,
-				SupportLang::Rust,
-				SupportLang::Go,
-				SupportLang::Java,
-				SupportLang::C,
-				SupportLang::Cpp,
-				SupportLang::CSharp,
-				SupportLang::Ruby,
-				SupportLang::Php,
-				SupportLang::Bash,
-				SupportLang::Json,
-				SupportLang::Yaml,
-				SupportLang::Toml,
-				SupportLang::Markdown,
-				SupportLang::Html,
-				SupportLang::Css,
-			],
-		);
+		assert_eq!(langs, &[
+			SupportLang::TypeScript,
+			SupportLang::Tsx,
+			SupportLang::JavaScript,
+			SupportLang::Python,
+			SupportLang::Rust,
+			SupportLang::Go,
+			SupportLang::Java,
+			SupportLang::C,
+			SupportLang::Cpp,
+			SupportLang::CSharp,
+			SupportLang::Ruby,
+			SupportLang::Php,
+			SupportLang::Bash,
+			SupportLang::Json,
+			SupportLang::Yaml,
+			SupportLang::Toml,
+			SupportLang::Markdown,
+			SupportLang::Html,
+			SupportLang::Css,
+		],);
 
 		#[cfg(feature = "full-langs")]
 		{
@@ -1242,7 +1239,9 @@ mod tests {
 		let html = SupportLang::Html;
 		let ast = html.ast_grep("<html><script>const x=1</script></html>");
 		let injections = html.extract_injections(ast.root());
-		let ranges = injections.get("js").expect("script should inject JavaScript");
+		let ranges = injections
+			.get("js")
+			.expect("script should inject JavaScript");
 		let range = ranges.first().expect("script should expose raw text range");
 		assert_eq!(&ast.root().text().as_ref()[range.start_byte..range.end_byte], "const x=1");
 
@@ -1250,4 +1249,3 @@ mod tests {
 		assert!(ast.root().find(matcher).is_some());
 	}
 }
-

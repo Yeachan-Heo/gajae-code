@@ -73,7 +73,9 @@ pub fn resolve_supported_lang(value: &str) -> Result<SupportLang> {
 		let lowered = value.trim().to_ascii_lowercase();
 		if KNOWN_LONG_TAIL_ALIASES.contains(&lowered.as_str()) {
 			anyhow!(
-				"language \"{lowered}\" is not included in the default build; rebuild from source with --features full-langs (PI_NATIVE_FULL_LANGS=1 bun --cwd=packages/natives run build)"
+				"language \"{lowered}\" is not included in the default build; rebuild from source \
+				 with --features full-langs (PI_NATIVE_FULL_LANGS=1 bun --cwd=packages/natives run \
+				 build)"
 			)
 		} else {
 			anyhow!("Unsupported language '{value}'. Supported: {}", supported_lang_list())
