@@ -139,6 +139,18 @@ function toolTargetKey(call: ToolCall): string | undefined {
 	return undefined;
 }
 
+/**
+ * Files actually mutated according to a tool result's details. Used for
+ * AST-edit-shaped results (`ast_edit` direct-apply and the hidden `resolve`
+ * apply step), which report `{ applied: true, files: [...] }`. Conservative:
+ * returns nothing unless the details explicitly mark the change as applied.
+ */
+function resultDetailFiles(message: ToolResultMessage): string[] {
+	const details = message.details as { applied?: unknown; files?: unknown } | undefined;
+	if (details?.applied !== true || !Array.isArray(details.files)) return [];
+	return details.files.filter((file): file is string => typeof file === "string" && file.length > 0);
+}
+
 interface StalenessIndex {
 	/** Entry indices of toolResults superseded by a later same-target result or a later edit. */
 	staleResultIndices: Set<number>;
@@ -175,6 +187,14 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
 			for (const editPath of editToolPaths(call)) {
+				lastEditIndexByPath.set(editPath, i);
+			}
+		}
+		// AST edits mutate files when previews are applied via the hidden
+		// `resolve` tool; the call args carry globs, not concrete paths. Both
+		// tools report the actually-touched files in result details.
+		if (call.name === "resolve" || call.name === "ast_edit") {
+			for (const editPath of resultDetailFiles(message)) {
 				lastEditIndexByPath.set(editPath, i);
 			}
 		}

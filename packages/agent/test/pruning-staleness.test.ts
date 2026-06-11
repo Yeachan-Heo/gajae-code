@@ -221,6 +221,37 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(noGitignore.id);
 	});
 
+	it("an applied ast_edit/resolve result invalidates earlier reads of touched files", () => {
+		const entries: SessionEntry[] = [];
+		const readA = pair(entries, "c1", "read", { path: "src/a.ts" });
+		const readB = pair(entries, "c2", "read", { path: "src/b.ts" });
+		// Applied AST edit (direct or via the hidden resolve tool) reports touched files in details.
+		entries.push(assistantCallEntry("c3", "resolve", { action: "apply", reason: "Apply." }));
+		const resolveResult = toolResultEntry("c3", "resolve", 100);
+		(resolveResult.message as ToolResultMessage & { details?: unknown }).details = {
+			applied: true,
+			files: ["src/a.ts"],
+		};
+		entries.push(resolveResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(readA.id);
+		expect(ids).not.toContain(readB.id);
+	});
+
+	it("a dry-run (not applied) ast_edit preview does not invalidate reads", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "c1", "read", { path: "src/a.ts" });
+		entries.push(assistantCallEntry("c2", "ast_edit", { paths: ["src/**/*.ts"] }));
+		const previewResult = toolResultEntry("c2", "ast_edit", 100);
+		(previewResult.message as ToolResultMessage & { details?: unknown }).details = {
+			applied: false,
+			files: ["src/a.ts"],
+		};
+		entries.push(previewResult);
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(read.id);
+	});
+
 	it("an errored later result does not supersede the earlier success", () => {
 		const entries: SessionEntry[] = [];
 		const okRead = pair(entries, "c1", "read", { path: "src/a.ts" });
