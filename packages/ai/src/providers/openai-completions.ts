@@ -61,6 +61,7 @@ import { adaptSchemaForStrict, NO_STRICT, toolWireSchema } from "../utils/schema
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -1430,6 +1431,11 @@ export function convertMessages(
 	};
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	// Composer-harness models need anchor/edit discipline pinned ahead of the
+	// host prompt (see composer-discipline.ts for the observed failure modes).
+	if (systemPrompts.length > 0 && isComposerHarnessModel(model.id)) {
+		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
+	}
 	if (systemPrompts.length > 0) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
 		const role = useDeveloperRole ? "developer" : "system";
