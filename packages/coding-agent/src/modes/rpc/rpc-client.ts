@@ -12,6 +12,7 @@ import type { SessionStats } from "../../session/agent-session";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
+	RpcGetStateInclude,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -442,8 +443,8 @@ export class RpcClient {
 	/**
 	 * Get current session state.
 	 */
-	async getState(): Promise<RpcSessionState> {
-		const response = await this.#send({ type: "get_state" });
+	async getState(include?: RpcGetStateInclude[]): Promise<RpcSessionState> {
+		const response = await this.#send(include ? { type: "get_state", include } : { type: "get_state" });
 		return this.#getData(response);
 	}
 

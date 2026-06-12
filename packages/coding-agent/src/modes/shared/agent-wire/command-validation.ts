@@ -28,6 +28,15 @@ function stringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string");
 }
 
+const GET_STATE_INCLUDES = new Set(["tools", "dumpTools", "systemPrompt"]);
+
+function optionalGetStateInclude(value: unknown): boolean {
+	return (
+		value === undefined ||
+		(Array.isArray(value) && value.every(item => typeof item === "string" && GET_STATE_INCLUDES.has(item)))
+	);
+}
+
 function todoPhase(value: unknown): boolean {
 	if (!isRecord(value) || typeof value.name !== "string" || !Array.isArray(value.tasks)) return false;
 	return value.tasks.every(
@@ -96,7 +105,9 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 		case "follow_up":
 			return stringField(value, "message") && optionalArray(value.images);
 		case "abort":
+			return true;
 		case "get_state":
+			return optionalGetStateInclude(value.include);
 		case "cycle_model":
 		case "get_available_models":
 		case "cycle_thinking_level":

@@ -82,7 +82,7 @@ Important edge behavior from runtime:
 
 ### State
 
-- `{ id?, type: "get_state" }`
+- `{ id?, type: "get_state", include?: ("tools" | "dumpTools" | "systemPrompt")[] }` (`dumpTools` is accepted as an alias for the older response field name.)
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
@@ -143,6 +143,8 @@ All command results use `RpcResponse`:
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
 
+
+By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.
 ### `get_state` payload
 
 ```json
@@ -173,14 +175,17 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
       ]
     }
   ],
-  "systemPrompt": "...",
-  "dumpTools": [
-    {
-      "name": "read",
-      "description": "Read files and URLs",
-      "parameters": {}
-    }
-  ]
+  "contextUsage": {
+    "tokens": 0,
+    "contextWindow": 200000,
+    "percent": 0
+  }
+  // Optional with include: ["systemPrompt"]:
+  // "systemPrompt": ["..."],
+  // Optional with include: ["tools"] (or ["dumpTools"]):
+  // "dumpTools": [
+  //   { "name": "read", "description": "Read files and URLs", "parameters": {} }
+  // ]
 }
 ```
 
