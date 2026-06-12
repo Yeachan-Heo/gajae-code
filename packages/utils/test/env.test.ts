@@ -93,6 +93,29 @@ describe("parseShellEnvFile", () => {
 			OPENAI_API_KEY: "shell-key",
 		});
 	});
+
+	it("ignores assignments inside shell function bodies", () => {
+		const filePath = writeTempEnv(
+			[
+				"export TOP_LEVEL_TOKEN=keep-me",
+				"configure_session() {",
+				"  export FUNCTION_TOKEN=ignore-me",
+				"  INNER_SETTING=ignore-me",
+				"  nested() {",
+				"    export NESTED_SECRET=ignore-me",
+				"  }",
+				"}",
+				"AFTER_FUNCTION=also-keep",
+				"inline_function() { export INLINE_SECRET=ignore-me; }",
+			].join("\n"),
+			".zshrc",
+		);
+
+		expect(parseShellEnvFile(filePath)).toEqual({
+			TOP_LEVEL_TOKEN: "keep-me",
+			AFTER_FUNCTION: "also-keep",
+		});
+	});
 });
 
 describe("$inheritedEnv", () => {

@@ -70,9 +70,24 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	try {
 		const content = fs.readFileSync(filePath, "utf-8");
+		let functionBlockDepth = 0;
 		for (const line of content.split("\n")) {
 			const trimmed = line.trim();
 			if (!trimmed || trimmed.startsWith("#")) continue;
+
+			if (functionBlockDepth > 0) {
+				functionBlockDepth += (line.match(/{/g) ?? []).length;
+				functionBlockDepth -= (line.match(/}/g) ?? []).length;
+				functionBlockDepth = Math.max(0, functionBlockDepth);
+				continue;
+			}
+
+			if (/^(?:function\s+)?[A-Za-z_][A-Za-z0-9_-]*\s*(?:\(\))?\s*\{/.test(trimmed)) {
+				functionBlockDepth += (line.match(/{/g) ?? []).length;
+				functionBlockDepth -= (line.match(/}/g) ?? []).length;
+				functionBlockDepth = Math.max(0, functionBlockDepth);
+				continue;
+			}
 
 			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
 			if (!match) continue;
