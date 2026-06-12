@@ -63,8 +63,17 @@ case "$1" in
 }
     ;;
   show-options)
+    profile_file=${JSON.stringify(path.join(root, "tmux-profile-tag"))}
     if [ "${options.gjcProfile === false ? "0" : "1"}" = "1" ]; then echo "1"; exit 0; fi
+    if [ -f "$profile_file" ]; then echo "1"; exit 0; fi
     exit 1
+    ;;
+  set-option)
+    profile_file=${JSON.stringify(path.join(root, "tmux-profile-tag"))}
+    for arg in "$@"; do
+      if [ "$arg" = "@gjc-profile" ]; then echo "1" > "$profile_file"; fi
+    done
+    exit 0
     ;;
   split-window)
     ${options.failSplit ? "echo split failed >&2; exit 1" : ""}
@@ -624,6 +633,56 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("show-options -qv -t =test-session @gjc-profile");
 		expect(tmuxLog).not.toContain("split-window");
 		expect(tmuxLog).not.toContain("set-option -t test-session:0");
+	});
+
+	it("self-heals a missing @gjc-profile tag when the leader pane was launched by gjc --tmux", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { gjcProfile: false });
+
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Recover managed leader",
+			teamName: "self-heal-team",
+			cwd: cleanupRoot,
+			dryRun: false,
+			env: {
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				GJC_TMUX_LAUNCHED: "1",
+			},
+		});
+
+		expect(snapshot.team_name).toBe("self-heal-team");
+		expect(snapshot.tmux_target).toBe("test-session:0");
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("set-option -t =test-session @gjc-profile 1");
+		expect(tmuxLog).toContain("split-window");
+	});
+
+	it("keeps rejecting untagged sessions when GJC_TMUX_LAUNCHED is not set even with TMUX present", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { gjcProfile: false });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Do not hijack foreign tmux",
+				teamName: "foreign-team",
+				cwd: cleanupRoot,
+				env: {
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+					TMUX: "/tmp/tmux-501/default,1,0",
+				},
+			}),
+		).rejects.toThrow(/unmanaged_tmux_session:test-session/);
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).not.toContain("set-option");
 	});
 
 	it("cleans partial worker worktrees without killing the leader session when pane startup fails", async () => {

@@ -5,7 +5,7 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 
-import { applyGjcTmuxProfile } from "./launch-tmux";
+import { applyGjcTmuxProfile, GJC_TMUX_LAUNCHED_ENV } from "./launch-tmux";
 import {
 	AlreadyExistsError,
 	appendJsonl as appendJsonlAudited,
@@ -1643,6 +1643,17 @@ function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): stri
 	return result.stdout.toString().trim();
 }
 
+function retagGjcLaunchedTmuxSession(tmuxCommand: string, sessionName: string): boolean {
+	const result = Bun.spawnSync(
+		[tmuxCommand, "set-option", "-t", `=${sessionName}`, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	return result.exitCode === 0;
+}
+
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	const paneTarget = env.TMUX_PANE?.trim();
 	const args = paneTarget
@@ -1654,12 +1665,21 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
-	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
-		throw new Error(
-			buildTeamTmuxLeaderRequirementMessage(
-				`unmanaged_tmux_session:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`,
-			),
-		);
+	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
+		// Self-heal: a pane launched through `gjc --tmux` exports
+		// GJC_TMUX_LAUNCHED=1, but the session can lose (or never receive) the
+		// @gjc-profile user-option tag when startup attach fails mid-way or the
+		// registry write races. That stranded-but-genuinely-GJC leader pane
+		// previously hard-failed as unmanaged_tmux_session; re-tag it instead.
+		const launchedByGjc = env[GJC_TMUX_LAUNCHED_ENV] === "1";
+		const retagged = launchedByGjc && retagGjcLaunchedTmuxSession(tmuxCommand, sessionName);
+		if (!retagged || readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
+			throw new Error(
+				buildTeamTmuxLeaderRequirementMessage(
+					`unmanaged_tmux_session:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`,
+				),
+			);
+	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
 export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
