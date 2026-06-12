@@ -453,6 +453,25 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).not.toContain("kill-session");
 	});
 
+	it("resolves the team tmux leader from GJC_TMUX_COMMAND, not only GJC_TEAM_TMUX_COMMAND", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Resolve tmux command from the general override",
+			teamName: "tmux-command-override-team",
+			cwd: cleanupRoot,
+			env: { PATH: process.env.PATH ?? "", GJC_TEAM_WORKER_COMMAND: "true", GJC_TMUX_COMMAND: fakeTmux },
+		});
+
+		const config = await Bun.file(path.join(snapshot.state_dir, "config.json")).json();
+		expect(config.tmux_command).toBe(fakeTmux);
+		expect(config.tmux_target).toBe("test-session:0");
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+	});
+
 	it("starts multiple runtime workers before tmux state mutation", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);

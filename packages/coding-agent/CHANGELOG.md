@@ -7,6 +7,9 @@
 - Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).
 
 - Aligned the `codex-standard` and `codex-pro` model profiles on the `openai-codex/gpt-5.5` baseline so they no longer default to stale mixed model generations (`gpt-5.4`, `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.3-codex-spark`); the profiles now differentiate purely by per-role reasoning effort (#532).
+### Fixed
+
+- Tightened the Windows/psmux tmux provider boundary: `gjc team` now honors `GJC_TMUX_COMMAND` (not just `GJC_TEAM_TMUX_COMMAND`) so the team leader resolves the same multiplexer as `gjc session`/`gjc --tmux`; and when a multiplexer lists a session that lacks GJC's `@gjc-profile` ownership tag, `gjc session status` now returns `gjc_tmux_session_untagged` with a `detail` hint and `gjc team` reports the same cause, instead of a bare `gjc_tmux_session_not_found` / `unmanaged_tmux_session`. Documented that alternative multiplexers such as psmux on Windows are not fully supported because they do not round-trip tmux user options (#531).
 
 ## [0.4.5] - 2026-06-12
 

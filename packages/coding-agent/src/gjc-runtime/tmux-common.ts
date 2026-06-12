@@ -32,6 +32,21 @@ export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): str
 	return env[GJC_TMUX_COMMAND_ENV]?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
 }
 
+export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
+
+export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
+	return (
+		`the active multiplexer "${tmuxCommand}" lists this session but did not return GJC's ${GJC_TMUX_PROFILE_OPTION} ownership tag; ` +
+		"GJC-managed sessions and `gjc team` require a tmux provider that round-trips tmux user options. " +
+		"Alternative multiplexers such as psmux on Windows do not persist user options yet, so the Windows-native psmux path is not fully supported; " +
+		"use real tmux for GJC-managed session and team flows."
+	);
+}
+
+export function buildGjcTmuxUntaggedSessionError(sessionName: string, tmuxCommand: string): string {
+	return `${GJC_TMUX_UNTAGGED_REASON}:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`;
+}
+
 export function sanitizeTmuxToken(value: string): string {
 	return (
 		value

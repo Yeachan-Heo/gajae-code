@@ -17,7 +17,12 @@ import {
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
-import { GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE } from "./tmux-common";
+import {
+	buildGjcTmuxUntaggedSessionHint,
+	GJC_TMUX_PROFILE_OPTION,
+	GJC_TMUX_PROFILE_VALUE,
+	resolveGjcTmuxCommand,
+} from "./tmux-common";
 
 export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
 export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
@@ -1622,9 +1627,6 @@ async function ensureWorkerWorktree(
 	};
 }
 
-export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): string {
-	return env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
-}
 function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
 	const suffix = detail?.trim() ? `:${detail.trim()}` : "";
 	return `gjc_team_requires_tmux_leader: run \`gjc --tmux\` first, then run \`gjc team ...\` inside that tmux-backed leader session, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
@@ -1653,7 +1655,11 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
 	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
-		throw new Error(buildTeamTmuxLeaderRequirementMessage(`unmanaged_tmux_session:${sessionName}`));
+		throw new Error(
+			buildTeamTmuxLeaderRequirementMessage(
+				`unmanaged_tmux_session:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`,
+			),
+		);
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
 export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
