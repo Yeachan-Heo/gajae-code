@@ -2400,6 +2400,22 @@ export class SessionManager {
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
 			const materializedEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
+			const restoreResidentStateAfterFailure = (): void => {
+				this.#fileEntries = materializedEntries;
+				this.#resetResidentTextBlobStore();
+				this.#reexternalizeFileEntriesForResidentStore();
+				this.#bumpAllRevisions();
+			};
+			const restoreResidentStateAndThrow = (error: unknown): never => {
+				try {
+					restoreResidentStateAfterFailure();
+				} catch (restoreErr) {
+					throw new Error(
+						`Failed to restore live session resident state after move failure: ${toError(restoreErr).message}; original error: ${toError(error).message}`,
+					);
+				}
+				throw error;
+			};
 			this.#disposeResidentTextBlobStore();
 
 			try {
@@ -2423,8 +2439,10 @@ export class SessionManager {
 					try {
 						await fs.promises.rename(newArtifactDir, oldArtifactDir);
 					} catch (rollbackErr) {
-						throw new Error(
-							`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+						restoreResidentStateAndThrow(
+							new Error(
+								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+							),
 						);
 					}
 				}
@@ -2432,12 +2450,14 @@ export class SessionManager {
 					try {
 						await fs.promises.rename(newSessionFile, oldSessionFile);
 					} catch (rollbackErr) {
-						throw new Error(
-							`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+						restoreResidentStateAndThrow(
+							new Error(
+								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+							),
 						);
 					}
 				}
-				throw err;
+				restoreResidentStateAndThrow(err);
 			}
 			this.#sessionFile = newSessionFile;
 			this.#fileEntries = materializedEntries;

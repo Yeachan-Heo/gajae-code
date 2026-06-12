@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-age
 const tempDirs: string[] = [];
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
+	vi.restoreAllMocks();
 });
 
 function tempRoot(prefix = "gjc-resident-life-"): string {
@@ -66,7 +67,7 @@ async function makeLargeSession(
 	text: string,
 ): Promise<{ sm: SessionManager; root: string; sessionFile: string; artifactsDir: string; cacheDir: string }> {
 	const root = tempRoot();
-	const sm = SessionManager.create(root, path.join(root, "sessions"));
+	const sm = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
 	sm.appendMessage({ role: "user", content: "start", timestamp: Date.now() });
 	sm.appendMessage(assistant(text));
 	await sm.ensureOnDisk();
@@ -157,6 +158,49 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(await readPersistedJsonl(movedFile)).not.toContain("blob:sha256:");
 		const movedCacheDirs = fs.readdirSync(movedCacheRoot).filter(name => name.startsWith(sm.getSessionId()));
 		expect(movedCacheDirs).toHaveLength(1);
+		await sm.close();
+	});
+
+	it("keeps live resident text readable when moveTo session-file rename fails", async () => {
+		const sentinel = `failed session rename ${"r".repeat(2048)}`;
+		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
+		const newRoot = tempRoot("gjc-resident-failed-move-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === sessionFile) throw new Error("simulated session rename failure");
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated session rename failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
+		await sm.rewriteEntries();
+		expect(await readPersistedJsonl(sessionFile)).toContain(sentinel.slice(0, 100));
+		await sm.close();
+	});
+
+	it("keeps live resident text readable when moveTo artifact rename fails after session rollback", async () => {
+		const sentinel = `failed artifact rename ${"a".repeat(2048)}`;
+		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
+		const oldArtifactDir = sessionFile.slice(0, -6);
+		const newRoot = tempRoot("gjc-resident-failed-artifact-move-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === oldArtifactDir) throw new Error("simulated artifact rename failure");
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated artifact rename failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
+		await sm.rewriteEntries();
+		expect(await readPersistedJsonl(sessionFile)).toContain(sentinel.slice(0, 100));
 		await sm.close();
 	});
 
