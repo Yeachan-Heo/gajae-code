@@ -28,8 +28,7 @@ import {
 	type VanishEvidence,
 	validateReceipt,
 } from "./receipts";
-import type { HarnessRpc } from "./rpc-adapter";
-import { singleFlightAccept } from "./rpc-adapter";
+import { type HarnessRpc, type RpcStateSnapshot, singleFlightAccept } from "./rpc-adapter";
 import {
 	acquireLease,
 	canWriteEvents,
@@ -39,7 +38,7 @@ import {
 	releaseLease,
 	type SessionLease,
 } from "./session-lease";
-import { buildStateView, nextAllowedActions } from "./state-machine";
+import { buildStateView, nextAllowedActions, submitUnavailableReason } from "./state-machine";
 import {
 	appendEvent,
 	controlSocketPath,
@@ -200,11 +199,6 @@ export class RuntimeOwner {
 	}
 
 	async #emitMapped(mapped: NonNullable<ReturnType<typeof observeRpcOutboundFrame>>): Promise<void> {
-		await this.#emit(
-			mapped.severity,
-			mapped.kind,
-			mapped.signal ? { ...mapped.evidence, signal: mapped.signal } : mapped.evidence,
-		);
 		if (mapped.kind === "rpc_agent_completed") {
 			const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 			if (
@@ -218,6 +212,11 @@ export class RuntimeOwner {
 				await writeSessionState(this.#opts.root, state);
 			}
 		}
+		await this.#emit(
+			mapped.severity,
+			mapped.kind,
+			mapped.signal ? { ...mapped.evidence, signal: mapped.signal } : mapped.evidence,
+		);
 	}
 
 	#aggregateSignals(events: EventEnvelope[]): string[] {
@@ -231,6 +230,20 @@ export class RuntimeOwner {
 			if (e.kind === "prompt_accepted") add("prompt-accepted");
 		}
 		return out;
+	}
+
+	#eventSubmitGateReason(kind: string, evidence: Record<string, unknown>): string | null {
+		const reason = typeof evidence.reason === "string" ? evidence.reason : null;
+		const signal = typeof evidence.signal === "string" ? evidence.signal : null;
+		const rpcActive =
+			kind === "prompt_accepted" ||
+			reason === "pre-state-not-idle" ||
+			kind.startsWith("rpc_") ||
+			signal === "prompt-accepted" ||
+			signal === "streaming" ||
+			signal === "tool-call" ||
+			signal === "test-running";
+		return rpcActive ? "rpc-not-idle" : null;
 	}
 
 	async #emit(severity: Severity, kind: string, evidence: Record<string, unknown>): Promise<void> {
@@ -247,6 +260,7 @@ export class RuntimeOwner {
 					ownerLive: true,
 					blockers: [],
 				};
+		const submitGateReason = this.#eventSubmitGateReason(kind, evidence);
 		const envelope: EventEnvelope = {
 			eventId: randomUUID(),
 			cursor: ++this.#cursor,
@@ -255,19 +269,33 @@ export class RuntimeOwner {
 			kind,
 			state: view,
 			evidence,
-			nextAllowedActions: nextAllowedActions(view.lifecycle, true),
+			nextAllowedActions: nextAllowedActions(view.lifecycle, true, { submitUnavailableReason: submitGateReason }),
 			writer: { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch },
 		};
 		await appendEvent(this.#opts.root, this.#opts.sessionId, envelope);
 	}
 
-	#response(state: SessionState, evidence: Record<string, unknown>, ok = true): PrimitiveResponse {
+	#response(
+		state: SessionState,
+		evidence: Record<string, unknown>,
+		ok = true,
+		submitGateReason: string | null = null,
+	): PrimitiveResponse {
 		return {
 			ok,
 			state: buildStateView(state, true),
 			evidence,
-			nextAllowedActions: nextAllowedActions(state.lifecycle, true),
+			nextAllowedActions: nextAllowedActions(state.lifecycle, true, { submitUnavailableReason: submitGateReason }),
 		};
+	}
+
+	#submitGateReason(state: SessionState, rpcState: RpcStateSnapshot | null): string | null {
+		const rpcReason = rpcState
+			? rpcState.isStreaming || rpcState.steeringQueueDepth > 0 || rpcState.followupQueueDepth > 0
+				? "rpc-not-idle"
+				: null
+			: "rpc-not-live";
+		return submitUnavailableReason(state.lifecycle, true, rpcReason);
 	}
 
 	async #handle(req: EndpointRequest): Promise<unknown> {
@@ -297,8 +325,10 @@ export class RuntimeOwner {
 		const state = await this.#loadState();
 		const workspace = state.handle.workspace;
 		let streaming = false;
+		let rpcState: RpcStateSnapshot | null = null;
 		try {
-			streaming = (await this.#opts.rpc.getState()).isStreaming;
+			rpcState = await this.#opts.rpc.getState();
+			streaming = rpcState.isStreaming;
 		} catch {
 			streaming = false;
 		}
@@ -328,12 +358,7 @@ export class RuntimeOwner {
 				gitDelta = "unknown";
 			}
 		}
-		const rpcLive = this.#opts.rpc.isLive
-			? this.#opts.rpc.isLive()
-			: await this.#opts.rpc
-					.getState()
-					.then(() => true)
-					.catch(() => false);
+		const rpcLive = this.#opts.rpc.isLive ? this.#opts.rpc.isLive() : rpcState !== null;
 		const rpcLastFrameAt = this.#opts.rpc.lastFrameAt ? this.#opts.rpc.lastFrameAt() : null;
 		// Sticky semantic signals come from the persisted owner event log -> survive polling gaps.
 		const recent = (await readEvents(this.#opts.root, this.#opts.sessionId, 0)).slice(-200);
@@ -343,6 +368,7 @@ export class RuntimeOwner {
 			(t): t is string => typeof t === "string",
 		);
 		const lastActivityAt = stamps.length > 0 ? (stamps.sort().at(-1) ?? state.updatedAt) : state.updatedAt;
+		const submitGateReason = this.#submitGateReason(state, rpcState);
 		return {
 			lifecycle: state.lifecycle,
 			ownerLive: true,
@@ -354,6 +380,8 @@ export class RuntimeOwner {
 			risk: deleted ? "deleted-worktree" : "normal",
 			rpcLive,
 			rpcLastFrameAt,
+			readyForSubmit: submitGateReason === null,
+			submitUnavailableReason: submitGateReason,
 		};
 	}
 
@@ -543,10 +571,21 @@ export class RuntimeOwner {
 		const prompt = typeof input.prompt === "string" ? input.prompt : "";
 		const state = await this.#loadState();
 		if (!prompt) {
-			return this.#response(state, { accepted: false, reason: "empty-prompt" }, false);
+			return this.#response(
+				state,
+				{ accepted: false, submitted: false, reason: "empty-prompt" },
+				false,
+				"empty-prompt",
+			);
 		}
-		if (state.lifecycle === "blocked") {
-			return this.#response(state, { accepted: false, reason: "lifecycle-blocked" }, false);
+		const lifecycleGate = submitUnavailableReason(state.lifecycle, true);
+		if (lifecycleGate) {
+			return this.#response(
+				state,
+				{ accepted: false, submitted: false, reason: lifecycleGate },
+				false,
+				lifecycleGate,
+			);
 		}
 		const result = await singleFlightAccept(this.#opts.rpc, prompt, this.#opts.acceptanceTimeoutMs);
 		if (result.accepted) {
@@ -560,11 +599,12 @@ export class RuntimeOwner {
 		} else {
 			await this.#emit("warn", "prompt_not_accepted", { reason: result.reason });
 		}
+		const submitGateReason = result.accepted ? null : result.reason === "pre-state-not-idle" ? "rpc-not-idle" : null;
 		return this.#response(
 			state,
 			{
 				accepted: result.accepted,
-				submitted: true,
+				submitted: result.commandId !== null,
 				reason: result.reason,
 				commandId: result.commandId,
 				preSubmitCursor: result.preSubmitCursor,
@@ -572,12 +612,16 @@ export class RuntimeOwner {
 				acceptanceEvidence: result.preSubmitState,
 			},
 			result.accepted,
+			submitGateReason,
 		);
 	}
 
 	async #observe(): Promise<PrimitiveResponse> {
 		const state = await this.#loadState();
-		return this.#response(state, { observation: await this.#observeGit(), ownerRouted: true });
+		const observation = await this.#observeGit();
+		const submitGateReason =
+			typeof observation.submitUnavailableReason === "string" ? observation.submitUnavailableReason : null;
+		return this.#response(state, { observation, ownerRouted: true }, true, submitGateReason);
 	}
 
 	async #retire(): Promise<PrimitiveResponse> {

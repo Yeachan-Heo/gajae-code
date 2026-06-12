@@ -175,4 +175,41 @@ describe("gjc harness CLI -> live owner routing", () => {
 		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
 		expect((res.json?.evidence as Record<string, unknown>).ownerRouted).toBeUndefined();
 	}, 10_000);
+
+	it("does not accept or advertise submit when the owner endpoint degrades", async () => {
+		await owner?.stop();
+		owner = null;
+		const socketPath = controlSocketPath(root, SID);
+		hungServer = net.createServer(socket => {
+			socket.end("not-json\n");
+		});
+		await new Promise<void>((resolve, reject) => {
+			hungServer?.once("error", reject);
+			hungServer?.listen(socketPath, () => {
+				hungServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+		await acquireLease(root, SID, {
+			ownerId: "bad-frame-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: socketPath },
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+
+		const res = await runHarness(["submit", "--session", SID, "--input", JSON.stringify({ prompt: "do it" })]);
+
+		expect(res.code).toBe(1);
+		expect(res.json?.ok).toBe(false);
+		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).accepted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).submitted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).reason).toBe("owner-not-live");
+		expect(res.json?.nextAllowedActions).toContainEqual({
+			verb: "submit",
+			available: false,
+			reason: "owner-not-live",
+		});
+	}, 10_000);
 });

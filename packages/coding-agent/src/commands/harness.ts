@@ -20,7 +20,7 @@ import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
-import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
+import { buildResponse, buildStateView, submitUnavailableReason } from "../harness-control-plane/state-machine";
 import {
 	canonicalWorkspacePath,
 	generateSessionId,
@@ -978,8 +978,21 @@ export default class Harness extends Command {
 
 	async #submit(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
 		const sessionId = requireSessionId(input, flagSession);
-		if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
 		let state = await loadState(root, sessionId);
+		const noOwnerGate = submitUnavailableReason(state.lifecycle, false);
+		if (!noOwnerGate || noOwnerGate === "owner-not-live") {
+			if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
+			state = await loadState(root, sessionId);
+		}
+		const blockedByOwnerLiveness = state.blockers.some(
+			blocker => isOwnerLivenessBlocker(blocker) || blocker === OWNER_STARTUP_BLOCKER,
+		);
+		const lifecycleGate = submitUnavailableReason(state.lifecycle, false);
+		if (lifecycleGate && lifecycleGate !== "owner-not-live" && !blockedByOwnerLiveness) {
+			writeJson(buildResponse(state, false, { accepted: false, submitted: false, reason: lifecycleGate }, false));
+			process.exitCode = 1;
+			return;
+		}
 		// No live owner: submission is blocked (never echoed-as-accepted). Surface owner exit
 		// evidence + explicit recovery guidance so the caller is not left with a bare gate.
 		const ownerExit = await buildOwnerExitEvidence(root, state);

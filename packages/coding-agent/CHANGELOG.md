@@ -14,6 +14,8 @@
 - Hardened RPC stdio lifecycle behavior: `gjc --mode rpc` now reports malformed JSONL frames as parse-error responses without killing the session, flushes durable session state before exiting on EOF/shutdown, and has red-team coverage for attached persistence, reload, malformed-frame recovery, and concurrent child-session isolation.
 ### Fixed
 
+- Hardened the harness RPC submit/router contract so `submit` is no longer advertised or accepted during finalizing/non-idle lifecycle windows, non-idle RPC state reports `submitted:false` with a retryable gate, and degraded owner endpoints fall back to `owner-not-live` without false acceptance (#544).
+
 - Ran estimated context maintenance before sending a new prompt, including tool-output pruning and threshold compaction, so large tool results appended after the last assistant turn cannot push the next model request over the context window.
 - `gjc team` now self-heals a missing `@gjc-profile` ownership tag when the current leader pane was genuinely launched by `gjc --tmux` (detected via `GJC_TMUX_LAUNCHED=1`): the session is re-tagged with `set-option` and startup proceeds, instead of hard-failing with `unmanaged_tmux_session` after a mid-startup attach failure or registry race stripped the tag. Sessions without the GJC launch marker are still rejected unchanged, so foreign tmux sessions cannot be hijacked.
 
