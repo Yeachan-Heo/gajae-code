@@ -93,10 +93,10 @@ describe("model profile activation", () => {
 			profileName: "codex-standard",
 		});
 		expect(codexStandard.agentModelOverrides).toEqual({
-			executor: "openai-codex/gpt-5.4:low",
-			architect: "openai-codex/gpt-5.4:xhigh",
-			planner: "openai-codex/gpt-5.4:medium",
-			critic: "openai-codex/gpt-5.4:high",
+			executor: "openai-codex/gpt-5.5:low",
+			architect: "openai-codex/gpt-5.5:xhigh",
+			planner: "openai-codex/gpt-5.5:medium",
+			critic: "openai-codex/gpt-5.5:high",
 		});
 
 		const codexPro = await prepareModelProfileActivation({
@@ -105,9 +105,10 @@ describe("model profile activation", () => {
 			settings: Settings.isolated(),
 			profileName: "codex-pro",
 		});
-		expect(codexPro.agentModelOverrides.architect).toBe("openai-codex/gpt-5.1-codex-max:high");
+		expect(codexPro.agentModelOverrides.executor).toBe("openai-codex/gpt-5.5:high");
+		expect(codexPro.agentModelOverrides.architect).toBe("openai-codex/gpt-5.5:xhigh");
 		expect(codexPro.agentModelOverrides.planner).toBe("openai-codex/gpt-5.5:high");
-		expect(codexPro.agentModelOverrides.critic).toBe("openai-codex/gpt-5.3-codex-spark:high");
+		expect(codexPro.agentModelOverrides.critic).toBe("openai-codex/gpt-5.5:high");
 	});
 
 	test("session-only changes active model and applies runtime overrides without persisted sets", async () => {

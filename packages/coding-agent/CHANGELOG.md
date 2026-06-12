@@ -6,6 +6,8 @@
 
 - Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).
 
+- Aligned the `codex-standard` and `codex-pro` model profiles on the `openai-codex/gpt-5.5` baseline so they no longer default to stale mixed model generations (`gpt-5.4`, `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.3-codex-spark`); the profiles now differentiate purely by per-role reasoning effort (#532).
+
 ## [0.4.5] - 2026-06-12
 
 ### Added

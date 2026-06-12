@@ -196,7 +196,7 @@ Built-in profiles are grouped by provider mix and tier:
 - `codex-{eco,standard,pro}`
 - `opencode-go-codex-{eco,standard,pro}`
 
-The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. User-defined profiles override built-ins by exact profile name.
+The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. The `codex-standard` and `codex-pro` profiles share the current `openai-codex/gpt-5.5` model baseline and differ only by per-role reasoning effort rather than by model generation. User-defined profiles override built-ins by exact profile name.
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
 

@@ -104,20 +104,42 @@ describe("built-in model profile catalog", () => {
 		for (const role of roles) {
 			const parsed = parseModelString(profile.modelMapping[role] ?? "");
 			expect(parsed?.provider).toBe("openai-codex");
-			expect(parsed?.id).toBe("gpt-5.4");
+			expect(parsed?.id).toBe("gpt-5.5");
 			expect(parsed?.thinkingLevel).toBe(expected[role]);
 		}
 	});
 
-	test("codex-pro default is GPT-5.5 xhigh", () => {
+	test("codex-pro mapping uses the GPT-5.5 baseline with raised effort", () => {
 		const profile = builtIn("codex-pro");
-		const parsed = parseModelString(profile.modelMapping.default ?? "");
+		const expected: Record<Role, ThinkingLevel> = {
+			default: ThinkingLevel.XHigh,
+			executor: ThinkingLevel.High,
+			architect: ThinkingLevel.XHigh,
+			planner: ThinkingLevel.High,
+			critic: ThinkingLevel.High,
+		};
+		for (const role of roles) {
+			const parsed = parseModelString(profile.modelMapping[role] ?? "");
+			expect(parsed?.provider).toBe("openai-codex");
+			expect(parsed?.id).toBe("gpt-5.5");
+			expect(parsed?.thinkingLevel).toBe(expected[role]);
+		}
+	});
 
-		expect(parsed?.provider).toBe("openai-codex");
-		expect(parsed?.id).toBe("gpt-5.5");
-		expect(parsed?.thinkingLevel).toBeUndefined();
-		const model = getBundledModel("openai-codex", "gpt-5.5");
-		expect(model?.thinking?.defaultLevel).toBe(ThinkingLevel.XHigh);
+	test("codex profiles share the GPT-5.5 baseline and differ only by effort", () => {
+		const standard = builtIn("codex-standard");
+		const pro = builtIn("codex-pro");
+		for (const role of roles) {
+			expect(parseModelString(standard.modelMapping[role] ?? "")?.id).toBe("gpt-5.5");
+			expect(parseModelString(pro.modelMapping[role] ?? "")?.id).toBe("gpt-5.5");
+			expect(effortOf(pro.modelMapping[role] ?? "")).toBeGreaterThanOrEqual(
+				effortOf(standard.modelMapping[role] ?? ""),
+			);
+		}
+		const strictlyHigher = roles.some(
+			role => effortOf(pro.modelMapping[role] ?? "") > effortOf(standard.modelMapping[role] ?? ""),
+		);
+		expect(strictlyHigher).toBe(true);
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {
