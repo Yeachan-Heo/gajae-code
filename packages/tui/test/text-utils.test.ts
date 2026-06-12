@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { extractSegments, sliceWithWidth, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
+import {
+	extractSegments,
+	sliceWithWidth,
+	truncateToWidth,
+	visibleWidth,
+	visibleWidthExceeds,
+} from "@gajae-code/tui/utils";
 
 describe("text utils", () => {
 	it("computes visible width for ANSI and tabs", () => {
@@ -32,5 +38,22 @@ describe("text utils", () => {
 		expect(result.before).toContain("hel");
 		expect(result.after.startsWith("\x1b[31m")).toBe(true);
 		expect(result.afterWidth).toBeGreaterThan(0);
+	});
+
+	it("checks ASCII/ANSI overflow without counting escape bytes", () => {
+		expect(visibleWidthExceeds("abc\x1b[0m", 3)).toBe(false);
+		expect(visibleWidthExceeds("abc\x1b[0m", 2)).toBe(true);
+		expect(visibleWidthExceeds("hi\t", 5)).toBe(false);
+		expect(visibleWidthExceeds("hi\t", 4)).toBe(true);
+		expect(visibleWidthExceeds("", -1)).toBe(true);
+		expect(visibleWidthExceeds("x", Number.NaN)).toBe(false);
+	});
+
+	it("checks OSC hyperlinks and wide text overflow exactly", () => {
+		const link = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		expect(visibleWidthExceeds(link, 4)).toBe(false);
+		expect(visibleWidthExceeds(link, 3)).toBe(true);
+		expect(visibleWidthExceeds("ㅁ", 2)).toBe(false);
+		expect(visibleWidthExceeds("ㅁ", 1)).toBe(true);
 	});
 });

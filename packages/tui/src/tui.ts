@@ -17,6 +17,7 @@ import {
 	sliceWithWidth,
 	truncateToWidth,
 	visibleWidth,
+	visibleWidthExceeds,
 } from "./utils";
 
 const SEGMENT_RESET = "\x1b[0m";
@@ -984,8 +985,9 @@ export class TUI extends Container {
 				if (idx >= 0 && idx < result.length) {
 					// Defensive: truncate overlay line to declared width before compositing
 					// (components should already respect width, but this ensures it)
-					const truncatedOverlayLine =
-						visibleWidth(overlayLines[i]) > w ? sliceByColumn(overlayLines[i], 0, w, true) : overlayLines[i];
+					const truncatedOverlayLine = visibleWidthExceeds(overlayLines[i], w)
+						? sliceByColumn(overlayLines[i], 0, w, true)
+						: overlayLines[i];
 					result[idx] = this.#compositeLineAt(result[idx], truncatedOverlayLine, col, w, termWidth);
 					modifiedLines.add(idx);
 				}
@@ -997,8 +999,7 @@ export class TUI extends Container {
 		// guarantee this, but we verify here to prevent crashes from any edge cases
 		// Only check lines that were actually modified (optimization)
 		for (const idx of modifiedLines) {
-			const lineWidth = visibleWidth(result[idx]);
-			if (lineWidth > termWidth) {
+			if (visibleWidthExceeds(result[idx], termWidth)) {
 				result[idx] = sliceByColumn(result[idx], 0, termWidth, true);
 			}
 		}
@@ -1049,8 +1050,7 @@ export class TUI extends Container {
 		// - Complex ANSI/OSC sequences (hyperlinks, colors)
 		// - Wide characters at segment boundaries
 		// - Edge cases in segment extraction
-		const resultWidth = visibleWidth(result);
-		if (resultWidth <= totalWidth) {
+		if (!visibleWidthExceeds(result, totalWidth)) {
 			return result;
 		}
 		// Truncate with strict=true to ensure we don't exceed totalWidth
@@ -1107,7 +1107,7 @@ export class TUI extends Container {
 	#truncateLinesToWidth(lines: string[], width: number): string[] {
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (TERMINAL.isImageLine(line) || visibleWidth(line) <= width) continue;
+			if (TERMINAL.isImageLine(line) || !visibleWidthExceeds(line, width)) continue;
 			const truncated = truncateToWidth(line, width, Ellipsis.Omit);
 			lines[i] = truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
 		}
@@ -1199,7 +1199,7 @@ export class TUI extends Container {
 				if (lineIndex >= newLines.length) continue;
 				const line = newLines[lineIndex];
 				const isImage = TERMINAL.isImageLine(line);
-				if (!isImage && visibleWidth(line) > width) {
+				if (!isImage && visibleWidthExceeds(line, width)) {
 					let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
 					truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
 					buffer += truncatedLine;
@@ -1413,7 +1413,7 @@ export class TUI extends Container {
 			const line = newLines[i];
 			let truncatedLine = line;
 			const isImage = TERMINAL.isImageLine(line);
-			if (!isImage && visibleWidth(line) > width) {
+			if (!isImage && visibleWidthExceeds(line, width)) {
 				if (debugRedraw) {
 					const debugData = [
 						`[TUI Truncate] ${new Date().toISOString()}`,

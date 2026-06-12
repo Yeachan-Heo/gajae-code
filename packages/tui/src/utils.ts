@@ -142,6 +142,113 @@ export function visibleWidth(str: string): number {
 	return recordTextHelper("text.visibleWidth", () => visibleWidthRaw(str));
 }
 
+function skipAnsiSequence(str: string, escIndex: number): number | undefined {
+	const next = str.charCodeAt(escIndex + 1);
+	if (Number.isNaN(next)) return escIndex + 1;
+
+	// CSI: ESC [ ... final-byte
+	if (next === 0x5b) {
+		for (let i = escIndex + 2; i < str.length; i++) {
+			const code = str.charCodeAt(i);
+			if (code >= 0x40 && code <= 0x7e) return i + 1;
+		}
+		return undefined;
+	}
+
+	// OSC / DCS / APC / PM strings terminate with BEL or ST (ESC \\).
+	if (next === 0x5d || next === 0x50 || next === 0x5e || next === 0x5f) {
+		for (let i = escIndex + 2; i < str.length; i++) {
+			const code = str.charCodeAt(i);
+			if (code === 0x07) return i + 1;
+			if (code === 0x1b && str.charCodeAt(i + 1) === 0x5c) return i + 2;
+		}
+		return undefined;
+	}
+
+	// Other ESC forms are fixed-width control sequences for our purposes.
+	return Math.min(str.length, escIndex + 2);
+}
+
+interface VisibleWidthExceedsCacheEntry {
+	limit: number;
+	tabWidth: number;
+	result: boolean;
+}
+
+const VISIBLE_WIDTH_EXCEEDS_CACHE_LIMIT = 4096;
+const VISIBLE_WIDTH_EXCEEDS_MAX_CACHEABLE_LENGTH = 2048;
+const visibleWidthExceedsCache = new Map<string, VisibleWidthExceedsCacheEntry>();
+
+function rememberVisibleWidthExceeds(str: string, entry: VisibleWidthExceedsCacheEntry): void {
+	if (str.length > VISIBLE_WIDTH_EXCEEDS_MAX_CACHEABLE_LENGTH) return;
+	if (visibleWidthExceedsCache.size >= VISIBLE_WIDTH_EXCEEDS_CACHE_LIMIT) {
+		const firstKey = visibleWidthExceedsCache.keys().next().value;
+		if (firstKey === undefined) {
+			visibleWidthExceedsCache.clear();
+		} else {
+			visibleWidthExceedsCache.delete(firstKey);
+		}
+	}
+	visibleWidthExceedsCache.set(str, entry);
+}
+
+function computeVisibleWidthExceedsRaw(str: string, limit: number, tabWidth: number): boolean {
+	let width = 0;
+
+	for (let i = 0; i < str.length; ) {
+		const code = str.charCodeAt(i);
+		if (code === 0x1b) {
+			const next = skipAnsiSequence(str, i);
+			if (next === undefined) return visibleWidthRaw(str) > limit;
+			i = next;
+			continue;
+		}
+		if (code === 0x09) {
+			width += tabWidth;
+		} else if (code >= 0x20 && code <= 0x7e) {
+			width += 1;
+		} else if (code < 0x20) {
+			i += 1;
+			continue;
+		} else {
+			return visibleWidthRaw(str) > limit;
+		}
+
+		if (width > limit) return true;
+		i += 1;
+	}
+
+	return false;
+}
+
+function visibleWidthExceedsRaw(str: string, maxWidth: number): boolean {
+	if (Number.isNaN(maxWidth)) return false;
+	if (maxWidth === Number.POSITIVE_INFINITY) return false;
+	if (maxWidth === Number.NEGATIVE_INFINITY) return true;
+	if (!str) return 0 > maxWidth;
+	const limit = Math.floor(maxWidth);
+	const tabWidth = getDefaultTabWidth();
+	const cached = visibleWidthExceedsCache.get(str);
+	if (cached && cached.limit === limit && cached.tabWidth === tabWidth) {
+		return cached.result;
+	}
+
+	const result = computeVisibleWidthExceedsRaw(str, limit, tabWidth);
+	rememberVisibleWidthExceeds(str, { limit, tabWidth, result });
+	return result;
+}
+
+/**
+ * Cheap overflow predicate for renderer guard paths.
+ *
+ * ASCII/ANSI terminal lines are answered without allocating or crossing the
+ * native boundary; complex Unicode falls back to exact visible-width logic.
+ */
+export function visibleWidthExceeds(str: string, maxWidth: number): boolean {
+	if (!renderMetrics.enabled) return visibleWidthExceedsRaw(str, maxWidth);
+	return recordTextHelper("text.visibleWidthExceeds", () => visibleWidthExceedsRaw(str, maxWidth));
+}
+
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
 
