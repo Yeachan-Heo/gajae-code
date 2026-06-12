@@ -76,7 +76,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	});
 
-	it("does not load project MCP config unless MCP is explicitly enabled", async () => {
+	it("does not load project MCP config unless project MCP config is enabled", async () => {
 		fs.writeFileSync(
 			path.join(tempDir, ".mcp.json"),
 			JSON.stringify({
@@ -104,9 +104,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			toolNames: ["read"],
 		});
 
-		expect(mcpManager).toBeUndefined();
-		expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-		expect(session.getActiveToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+		expect(mcpManager).toBeDefined();
+		expect(session.getAllToolNames()).not.toContain("mcp__local_local");
+		expect(session.getActiveToolNames()).not.toContain("mcp__local_local");
 	});
 
 	it("does not advertise MCP discovery when search_tool_bm25 is not active", async () => {

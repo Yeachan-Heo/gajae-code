@@ -78,7 +78,7 @@ import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-e
 import { resolveMemoryBackend } from "./memory-backend";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
-import { MCPManager } from "./runtime-mcp";
+import { discoverAndLoadMCPTools, MCPManager } from "./runtime-mcp";
 import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
@@ -275,7 +275,7 @@ export interface CreateAgentSessionOptions {
 	/** File-based slash commands. Default: discovered from commands/ directories */
 	slashCommands?: FileSlashCommand[];
 
-	/** @deprecated MCP runtime discovery is quarantined and ignored. */
+	/** Enable runtime MCP discovery for top-level sessions. Default: true. */
 	enableMCP?: boolean;
 	/** Existing MCP manager to reuse (skips discovery, propagates to toolSession). */
 	mcpManager?: MCPManager;
@@ -1266,15 +1266,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
-		// MCP runtime discovery is quarantined for the GJC surface. Keep an
-		// explicitly supplied manager only for legacy in-process callers that own
-		// lifecycle themselves; never discover project/user MCP configs here.
-		const mcpManager: MCPManager | undefined = options.mcpManager;
+		// Load runtime MCP tools for top-level sessions unless explicitly disabled.
+		// ACP clients and subagents pass enableMCP: false because they either own
+		// their MCP lifecycle or intentionally avoid inheriting host integrations.
+		let mcpManager: MCPManager | undefined = options.mcpManager;
 		const customTools: CustomTool[] = [];
-		// Only top-level sessions own the global MCPManager. Subagents already
-		// receive the parent's manager via `options.mcpManager`, and reassigning
-		// the singleton to the same value is a no-op \u2014 keep the gate explicit
-		// to mirror the AsyncJobManager ownership rule.
+		if (!mcpManager && options.enableMCP !== false && !options.parentTaskPrefix) {
+			const mcpLoadResult = await logger.time("discoverAndLoadMCPTools", () =>
+				discoverAndLoadMCPTools(cwd, {
+					authStorage,
+					enableProjectConfig: settings.get("mcp.enableProjectConfig"),
+					filterBrowser: options.toolNames?.includes("browser") ?? false,
+				}),
+			);
+			mcpManager = mcpLoadResult.manager;
+			customTools.push(...mcpLoadResult.tools.map(loaded => loaded.tool));
+			for (const error of mcpLoadResult.errors) {
+				logger.warn("MCP tool load failed", error);
+			}
+		}
 		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
 
 		// Add image tools when the active model or configured image providers can generate images.
@@ -1632,8 +1642,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
-		// Effective discovery mode only covers built-in tools; MCP tool discovery
-		// is quarantined from the GJC public surface.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
 		const effectiveDiscoveryMode: "off" | "all" = toolsDiscoveryModeSetting === "all" ? "all" : "off";
 		const mcpDiscoveryEnabled = false;
