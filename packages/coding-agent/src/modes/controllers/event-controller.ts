@@ -261,6 +261,7 @@ export class EventController {
 			this.ctx.ui.requestRender();
 		} else if (event.message.role === "assistant") {
 			this.#lastThinkingCount = 0;
+			this.#segmentStartIndex = 0;
 			this.#resetReadGroup();
 			this.ctx.streamingComponent = new AssistantMessageComponent(undefined, this.ctx.hideThinkingBlock, () =>
 				this.ctx.ui.requestRender(),
@@ -308,10 +309,46 @@ export class EventController {
 		}
 	}
 
+	/**
+	 * First content-block index of the current assistant segment. Thinking/
+	 * text arriving after a toolCall starts a new segment component appended
+	 * below the tool rows, preserving the reasoning→tool→reasoning timeline.
+	 */
+	#segmentStartIndex = 0;
+
+	/** Render the current segment's slice of the streaming assistant message. */
+	#segmentSlice(message: AssistantMessage): AssistantMessage {
+		if (this.#segmentStartIndex === 0) return message;
+		return { ...message, content: message.content.slice(this.#segmentStartIndex) };
+	}
+
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			// Visible thinking/text after the latest toolCall → cut a new
+			// segment so it renders below the tool rows instead of merging into
+			// the original block above them.
+			const content = event.message.content;
+			let lastToolIndex = -1;
+			for (let i = content.length - 1; i >= 0; i--) {
+				if (content[i].type === "toolCall") {
+					lastToolIndex = i;
+					break;
+				}
+			}
+			if (lastToolIndex >= this.#segmentStartIndex) {
+				const hasPostToolContent = content
+					.slice(lastToolIndex + 1)
+					.some(c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
+				if (hasPostToolContent) {
+					this.#segmentStartIndex = lastToolIndex + 1;
+					this.ctx.streamingComponent = new AssistantMessageComponent(undefined, this.ctx.hideThinkingBlock, () =>
+						this.ctx.ui.requestRender(),
+					);
+					this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
+				}
+			}
+			this.ctx.streamingComponent.updateContent(this.#segmentSlice(this.ctx.streamingMessage));
 
 			const thinkingCount = this.ctx.streamingMessage.content.filter(
 				content => content.type === "thinking" && content.thinking.trim(),
@@ -431,9 +468,9 @@ export class EventController {
 				// display only — does NOT mutate the persisted message's stopReason
 				// (the marker on errorMessage drives replay-side suppression).
 				const msgWithoutAbort = { ...this.ctx.streamingMessage, stopReason: "stop" as const };
-				this.ctx.streamingComponent.updateContent(msgWithoutAbort);
+				this.ctx.streamingComponent.updateContent(this.#segmentSlice(msgWithoutAbort));
 			} else {
-				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+				this.ctx.streamingComponent.updateContent(this.#segmentSlice(this.ctx.streamingMessage));
 			}
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {

@@ -308,12 +308,30 @@ export class UiHelpers {
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
-				this.ctx.addMessageToChat(message);
-				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
-				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
-				if (assistantComponent) {
-					assistantComponent.setUsageInfo(message.usage);
-				}
+				// Render the message in segments split at toolCall boundaries so
+				// reasoning that followed a tool call appears below that tool's row,
+				// matching arrival order: [segment, tools, segment, …].
+				const contentBlocks = message.content;
+				let assistantComponent: AssistantMessageComponent | undefined;
+				let segmentStart = 0;
+				const flushSegment = (end: number): void => {
+					const slice = contentBlocks.slice(segmentStart, end);
+					segmentStart = end;
+					const visible = slice.some(
+						c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
+					);
+					if (!visible) return;
+					// Only the final segment keeps the error/abort footer.
+					const segmentMessage =
+						end < contentBlocks.length
+							? { ...message, content: slice, stopReason: "stop" as const, errorMessage: undefined }
+							: { ...message, content: slice };
+					this.ctx.addMessageToChat(segmentMessage);
+					const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
+					if (lastChild instanceof AssistantMessageComponent) {
+						assistantComponent = lastChild;
+					}
+				};
 				readGroup = null;
 				const isAbortedSilently = message.stopReason === "aborted" && isSilentAbort(message.errorMessage);
 				const hasErrorStop =
@@ -327,11 +345,14 @@ export class UiHelpers {
 						: message.errorMessage || "Error"
 					: null;
 
-				// Render tool call components
-				for (const content of message.content) {
+				// Render tool call components, flushing the preceding assistant
+				// segment before each so block order matches arrival order.
+				for (let blockIndex = 0; blockIndex < contentBlocks.length; blockIndex++) {
+					const content = contentBlocks[blockIndex];
 					if (content.type !== "toolCall") {
 						continue;
 					}
+					flushSegment(blockIndex);
 
 					if (
 						content.name === "read" &&
@@ -398,6 +419,8 @@ export class UiHelpers {
 						this.ctx.pendingTools.set(content.id, component);
 					}
 				}
+				flushSegment(contentBlocks.length);
+				assistantComponent?.setUsageInfo(message.usage);
 			} else if (message.role === "toolResult") {
 				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
 				const isReadGroupResult =
