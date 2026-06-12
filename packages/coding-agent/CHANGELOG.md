@@ -10,6 +10,7 @@
 - Added an advisory spawn-ROI reconciliation module (`reconcileSpawnRoi`): compares the spawn-plan `maxInlineTokens` promise against each child receipt's actual inline-token proxy and surfaces a deterministic `SpawnRoiReconciliation` (per-child overage, lowRoi ids, advisory flags) as optional `TaskToolDetails.roiReconciliation`; advisory-only, never changes task success semantics.
 - Added a deterministic fork-context mode advisory (`adviseForkContextMode`): recommends `none`/`receipt`/`last-turn` from assignment-text dependence signals with parent-capped per-mode cloned-token estimates, never overrides an explicit caller mode, and is surfaced receipt-visible-only as `TaskResultReceipt.forkContextAdvisory` (no change to actual mode selection).
 
+- Added native `gjc ultragoal steer --kind` support for documented steering mutations beyond `add_subgoal`, including split, reorder, wording revision, ledger annotation, and blocked-goal supersession contracts with structured audit expectations.
 ### Fixed
 - Kept the unified `goal` tool registered and active by default whenever `goal.enabled` is true, including explicit tool subsets and `gjc ultragoal create-goals` arming flows.
 
