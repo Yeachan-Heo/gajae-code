@@ -161,6 +161,26 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.close();
 	});
 
+	it("restoreState re-owns resident text before resetting the resident store", async () => {
+		const sentinel = `restore resident ${"b".repeat(2048)}`;
+		const { sm, sessionFile } = await makeLargeSession(sentinel);
+		const snapshot = sm.captureState();
+
+		sm.restoreState(snapshot);
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
+		const restoredHtml = path.join(tempRoot(), "restore.html");
+		await exportSessionToHtml(sm, undefined, { outputPath: restoredHtml });
+		expect(await Bun.file(restoredHtml).text()).not.toContain("blob:sha256:");
+
+		await sm.rewriteEntries();
+		const rewritten = await readPersistedJsonl(sessionFile);
+		expect(rewritten).toContain(sentinel.slice(0, 100));
+		expect(rewritten).not.toContain("__gjcResidentBlob");
+		expect(rewritten).not.toContain("blob:sha256:");
+		await sm.close();
+	});
+
 	it("keeps live resident text readable when moveTo session-file rename fails", async () => {
 		const sentinel = `failed session rename ${"r".repeat(2048)}`;
 		const { sm, root, sessionFile } = await makeLargeSession(sentinel);

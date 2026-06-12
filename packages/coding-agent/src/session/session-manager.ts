@@ -2054,6 +2054,7 @@ interface SessionManagerStateSnapshot {
 	flushed: boolean;
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
+	materializedFileEntries: FileEntry[];
 }
 
 export class SessionManager {
@@ -2208,6 +2209,7 @@ export class SessionManager {
 	}
 
 	captureState(): SessionManagerStateSnapshot {
+		const materializedFileEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
 		return {
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
@@ -2218,17 +2220,21 @@ export class SessionManager {
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
 			// so rollback does not need structured cloning of extension/custom details.
 			fileEntries: [...this.#fileEntries],
+			// Rollback snapshots must own resident data before another session reset disposes
+			// the ephemeral store backing the resident sentinels above.
+			materializedFileEntries,
 		};
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		const restoredFileEntries = [...snapshot.materializedFileEntries];
 		this.#sessionId = snapshot.sessionId;
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#flushed = snapshot.flushed;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
-		this.#fileEntries = [...snapshot.fileEntries];
+		this.#fileEntries = restoredFileEntries;
 		this.#persistWriter = undefined;
 		this.#persistWriterPath = undefined;
 		this.#persistChain = Promise.resolve();
@@ -2237,8 +2243,8 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
-		this.#buildIndex();
 		this.#resetResidentTextBlobStore();
+		this.#reexternalizeFileEntriesForResidentStore();
 		this.#bumpAllRevisions();
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
