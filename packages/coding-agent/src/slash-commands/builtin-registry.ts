@@ -21,6 +21,17 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
+
+/**
+ * 083.4: parse a /effort argument, accepting Codex ReasoningEffort vocabulary
+ * (none/minimal) as aliases for jwc thinking levels (off/min).
+ */
+function parseEffortArg(raw: string): ThinkingLevel | undefined {
+	const normalized = raw === "none" ? "off" : raw === "minimal" ? "min" : raw;
+	const level = parseThinkingLevel(normalized);
+	// "inherit" is a model-selector concept, not a session effort.
+	return level === "inherit" ? undefined : level;
+}
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
@@ -324,6 +335,67 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showModelSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "effort",
+		description: "Set reasoning effort for the current session",
+		acpDescription: "Set reasoning effort",
+		acpInputHint: "[off|minimal|low|medium|high|xhigh|max]",
+		subcommands: [
+			{ name: "off", description: "No reasoning" },
+			{ name: "minimal", description: "Very brief reasoning (~1k tokens)" },
+			{ name: "low", description: "Light reasoning (~2k tokens)" },
+			{ name: "medium", description: "Moderate reasoning (~8k tokens)" },
+			{ name: "high", description: "Deep reasoning (~16k tokens)" },
+			{ name: "xhigh", description: "Maximum reasoning (~32k tokens)" },
+			{ name: "max", description: "Unrestricted reasoning" },
+			{ name: "status", description: "Show current reasoning effort" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const raw = command.args.trim().toLowerCase();
+			if (!raw || raw === "status") {
+				await runtime.output(
+					`Reasoning effort: ${runtime.session.thinkingLevel ?? "off"}. Options: off, minimal, low, medium, high, xhigh, max.`,
+				);
+				return commandConsumed();
+			}
+			const level = parseEffortArg(raw);
+			if (!level) {
+				await runtime.output(
+					`Unknown effort "${command.args.trim()}". Options: off, minimal, low, medium, high, xhigh, max.`,
+				);
+				return commandConsumed();
+			}
+			runtime.session.setThinkingLevel(level);
+			await runtime.output(`Reasoning effort set to ${runtime.session.thinkingLevel ?? "off"}.`);
+			return commandConsumed();
+		},
+		handleTui: (command, runtime) => {
+			const raw = command.args.trim().toLowerCase();
+			if (!raw) {
+				runtime.ctx.showEffortSelector();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (raw === "status") {
+				runtime.ctx.showStatus(
+					`Reasoning effort: ${runtime.ctx.session.thinkingLevel ?? "off"} (off|minimal|low|medium|high|xhigh|max)`,
+				);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			const level = parseEffortArg(raw);
+			if (!level) {
+				runtime.ctx.showError(`Unknown effort "${command.args.trim()}" (off|minimal|low|medium|high|xhigh|max)`);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.session.setThinkingLevel(level);
+			refreshStatusLine(runtime.ctx);
+			runtime.ctx.showStatus(`Reasoning effort set to ${runtime.ctx.session.thinkingLevel ?? "off"}.`);
 			runtime.ctx.editor.setText("");
 		},
 	},

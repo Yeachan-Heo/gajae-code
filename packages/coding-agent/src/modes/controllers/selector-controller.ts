@@ -1,8 +1,8 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
-import type { Component, OverlayHandle } from "@gajae-code/tui";
-import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
+import type { Component, OverlayHandle, SelectItem } from "@gajae-code/tui";
+import { Container, Input, Loader, SelectList, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
 import { activateModelProfile } from "../../config/model-profile-activation";
 import { settings } from "../../config/settings";
@@ -20,6 +20,7 @@ import {
 	getAvailableThemes,
 	getCurrentThemeName,
 	getDetectedThemeSettingsPath,
+	getSelectListTheme,
 	getSymbolTheme,
 	previewTheme,
 	restoreThemePreview,
@@ -28,6 +29,7 @@ import {
 	setTheme,
 	theme,
 } from "../../modes/theme/theme";
+import { DynamicBorder } from "../../modes/components/dynamic-border";
 import type { InteractiveModeContext } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -244,6 +246,42 @@ export class SelectorController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorTopBorder();
 		this.ctx.ui.requestRender();
+	}
+
+	/** 083.4: dropdown for /effort — pick a reasoning effort (thinking level). */
+	showEffortSelector(): void {
+		const levels: SelectItem[] = [
+			{ value: "off", label: "off", description: "No reasoning" },
+			{ value: "min", label: "minimal", description: "Very brief reasoning (~1k tokens)" },
+			{ value: "low", label: "low", description: "Light reasoning (~2k tokens)" },
+			{ value: "medium", label: "medium", description: "Moderate reasoning (~8k tokens)" },
+			{ value: "high", label: "high", description: "Deep reasoning (~16k tokens)" },
+			{ value: "xhigh", label: "xhigh", description: "Maximum reasoning (~32k tokens)" },
+			{ value: "max", label: "max", description: "Unrestricted reasoning" },
+		];
+		this.showSelector(done => {
+			const container = new Container();
+			container.addChild(new DynamicBorder());
+			container.addChild(new Text(theme.fg("accent", " Reasoning effort"), 1, 0));
+			const list = new SelectList(levels, 8, getSelectListTheme());
+			const current = this.ctx.session.thinkingLevel;
+			const currentIndex = levels.findIndex(item => item.value === current);
+			if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+			list.onSelect = item => {
+				done();
+				this.ctx.session.setThinkingLevel(item.value as ThinkingLevel);
+				this.ctx.statusLine.invalidate();
+				this.ctx.showStatus(`Reasoning effort set to ${this.ctx.session.thinkingLevel ?? "off"}.`);
+				this.ctx.ui.requestRender();
+			};
+			list.onCancel = () => {
+				done();
+				this.ctx.ui.requestRender();
+			};
+			container.addChild(list);
+			container.addChild(new DynamicBorder());
+			return { component: container, focus: list };
+		});
 	}
 
 	showThemeSelector(): void {
