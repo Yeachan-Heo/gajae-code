@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed compaction cut-point selection when the newest retained context ends in an uncuttable tool result, so automatic compaction can keep the latest assistant/tool-result pair instead of falling back to a no-op cut.
+
 ## [0.4.5] - 2026-06-12
 
 ### Changed
