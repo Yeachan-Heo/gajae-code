@@ -119,6 +119,10 @@ function normalizeReportFindings(value: unknown): ReportFindingDetails[] {
 	return findings;
 }
 
+function formatModelSubstitutionWarning(warning: { requested: string; effective: string }): string {
+	return `Requested model substituted: ${warning.requested} -> ${warning.effective}`;
+}
+
 function formatJsonScalar(value: unknown, _theme: Theme): string {
 	if (value === null) return "null";
 	if (typeof value === "string") {
@@ -566,6 +570,14 @@ function renderAgentProgress(
 	lines.push(statusLine);
 
 	lines.push(...renderTaskSection(progress.assignment ?? progress.task, continuePrefix, expanded, theme));
+	if (progress.modelSubstitutionWarning) {
+		lines.push(
+			`${continuePrefix}${theme.fg(
+				"warning",
+				truncateToWidth(replaceTabs(formatModelSubstitutionWarning(progress.modelSubstitutionWarning)), 90),
+			)}`,
+		);
+	}
 
 	// Current tool (if running) or most recent completed tool
 	if (progress.status === "running") {
@@ -862,8 +874,16 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 				}
 			}
 		}
-	} else {
+	} else if (!result.modelSubstitutionWarning) {
 		lines.push(...renderOutputSection(result.preview, continuePrefix, expanded, theme, 3, 12));
+	}
+	if (result.modelSubstitutionWarning) {
+		lines.push(
+			`${continuePrefix}${theme.fg(
+				"warning",
+				truncateToWidth(replaceTabs(formatModelSubstitutionWarning(result.modelSubstitutionWarning)), 90),
+			)}`,
+		);
 	}
 	if (result.roi?.lowRoi) {
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);

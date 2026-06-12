@@ -411,6 +411,151 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(cases[0].expectedThinkingLevel);
 		expect(createAgentSessionSpy.mock.calls[1]?.[0]?.thinkingLevel).toBe(cases[1].expectedThinkingLevel);
 	});
+	it("surfaces auth fallback model substitution and annotates session model_change", async () => {
+		vi.clearAllMocks();
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-auth-fallback",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const sessionModelChanges: Array<{
+			model: string;
+			role?: string;
+			metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
+		}> = [];
+		(
+			session as unknown as {
+				sessionManager: {
+					appendSessionInit: () => void;
+					appendModelChange: (
+						model: string,
+						role?: string,
+						metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+					) => string;
+				};
+			}
+		).sessionManager = {
+			appendSessionInit: () => {},
+			appendModelChange: (model, role, metadata) => {
+				sessionModelChanges.push({ model, role, metadata });
+				return "model-change-id";
+			},
+		};
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [
+				{ provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 272000 },
+				{ provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5", contextWindow: 400000 },
+			],
+			getApiKey: async (model: { id: string }) => (model.id === "gpt-5.5" ? "sk-test" : undefined),
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-auth-fallback-warning",
+			modelOverride: "openai-codex/gpt-5.3-codex:high",
+			parentActiveModelPattern: "openai-codex/gpt-5.5",
+			modelRegistry,
+		});
+
+		expect(result.modelSubstitutionWarning).toEqual({
+			requested: "openai-codex/gpt-5.3-codex",
+			effective: "openai-codex/gpt-5.5",
+			reason: "auth_unavailable",
+		});
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
+			reason: "auth_unavailable",
+			requestedModel: { provider: "openai-codex", id: "gpt-5.3-codex" },
+		});
+		expect(sessionModelChanges).toEqual([]);
+	});
+
+	it("surfaces server-side assistant model substitution evidence", async () => {
+		vi.clearAllMocks();
+		const sessionModelChanges: Array<{
+			model: string;
+			role?: string;
+			metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
+		}> = [];
+		const session = createMockSession(({ emit, state }) => {
+			const assistant: AssistantMessage = {
+				...createAssistantStopMessage("done"),
+				provider: "openai-codex",
+				model: "gpt-5.5",
+			};
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-server-substitution",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		(
+			session as unknown as {
+				sessionManager: {
+					appendSessionInit: () => void;
+					appendModelChange: (
+						model: string,
+						role?: string,
+						metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+					) => string;
+				};
+			}
+		).sessionManager = {
+			appendSessionInit: () => {},
+			appendModelChange: (model, role, metadata) => {
+				sessionModelChanges.push({ model, role, metadata });
+				return "model-change-id";
+			},
+		};
+		mockCreateAgentSession(session);
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [
+				{ provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 272000 },
+			],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-server-substitution-warning",
+			modelOverride: "openai-codex/gpt-5.3-codex:high",
+			modelRegistry,
+		});
+
+		expect(result.modelSubstitutionWarning).toEqual({
+			requested: "openai-codex/gpt-5.3-codex",
+			effective: "openai-codex/gpt-5.5",
+			reason: "assistant_model_mismatch",
+		});
+		expect(sessionModelChanges).toEqual([
+			{
+				model: "openai-codex/gpt-5.5",
+				role: undefined,
+				metadata: {
+					previousModel: "openai-codex/gpt-5.3-codex",
+					reason: "assistant_model_mismatch",
+					thinkingLevel: Effort.High,
+				},
+			},
+		]);
+	});
 	it("fails after 3 reminders when yield is never called for a structured task", async () => {
 		const prompts: string[] = [];
 		const session = createMockSession(({ text, promptIndex, emit, state }) => {

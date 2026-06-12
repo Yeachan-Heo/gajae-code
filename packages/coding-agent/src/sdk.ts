@@ -234,6 +234,8 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
+	/** Runtime substitution metadata for the initial model_change session event. */
+	modelSubstitution?: { requestedModel: Model; reason: string };
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: ScopedModelSelection[];
 
@@ -1912,7 +1914,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
 			if (model) {
-				sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				const substitution = options.modelSubstitution;
+				sessionManager.appendModelChange(
+					`${model.provider}/${model.id}`,
+					undefined,
+					substitution
+						? {
+								previousModel: `${substitution.requestedModel.provider}/${substitution.requestedModel.id}`,
+								reason: substitution.reason,
+								thinkingLevel: thinkingLevel ?? null,
+							}
+						: undefined,
+				);
 			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 			if (initialServiceTier) {

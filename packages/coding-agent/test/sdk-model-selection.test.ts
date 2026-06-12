@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModel } from "@gajae-code/ai";
+import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
@@ -146,6 +146,62 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		} finally {
 			getApiKeySpy.mockRestore();
 			authStorage.close();
+		}
+	});
+
+	test("persists model substitution metadata on new session model_change", async () => {
+		const effectiveModel: Model = {
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			thinking: { minLevel: Effort.Minimal, maxLevel: Effort.XHigh, mode: "effort" },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 8192,
+		};
+		const requestedModel: Model = {
+			...effectiveModel,
+			id: "gpt-5.3-codex",
+			name: "GPT-5.3 Codex",
+			contextWindow: 272000,
+		};
+		const sessionManager = SessionManager.inMemory(tempDir);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			model: effectiveModel,
+			thinkingLevel: Effort.High,
+			modelSubstitution: { requestedModel, reason: "auth_unavailable" },
+			sessionManager,
+			disableExtensionDiscovery: true,
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			toolNames: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			const modelChanges = sessionManager.getEntries().filter(entry => entry.type === "model_change");
+			expect(modelChanges).toHaveLength(1);
+			expect(modelChanges[0]).toMatchObject({
+				type: "model_change",
+				model: "openai-codex/gpt-5.5",
+				previousModel: "openai-codex/gpt-5.3-codex",
+				reason: "auth_unavailable",
+				thinkingLevel: Effort.High,
+			});
+		} finally {
+			await session.dispose();
 		}
 	});
 });

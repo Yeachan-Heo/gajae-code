@@ -107,6 +107,12 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
+	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */
+	previousModel?: string;
+	/** Machine-readable reason for runtime model substitution/fallback. */
+	reason?: string;
+	/** Effective thinking level when the change was recorded. */
+	thinkingLevel?: string | null;
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {
@@ -3244,7 +3250,11 @@ export class SessionManager {
 	 * @param model Model in "provider/modelId" format
 	 * @param role Optional role (default: "default")
 	 */
-	appendModelChange(model: string, role?: string): string {
+	appendModelChange(
+		model: string,
+		role?: string,
+		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(this.#byId),
@@ -3252,6 +3262,9 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			model,
 			role,
+			previousModel: metadata?.previousModel,
+			reason: metadata?.reason,
+			thinkingLevel: metadata?.thinkingLevel,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
