@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Stripped `OpenAI-Beta` in the `openai-proxy` request transform profile so OpenAI-compatible proxies do not receive SDK beta headers.
+
 ## [0.4.4] - 2026-06-10
 
 - Version aligned with the 0.4.4 monorepo release; no functional changes in this package.
