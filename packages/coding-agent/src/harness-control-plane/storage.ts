@@ -18,6 +18,8 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { appendReceiptToConfiguredSpool } from "./receipt-spool";
+import type { ReceiptEnvelope } from "./receipts";
 import type { EventEnvelope, ReceiptFamily, SessionState } from "./types";
 
 interface HarnessRootRegistryEntry {
@@ -227,6 +229,26 @@ async function readJson<T>(file: string): Promise<T | null> {
 		throw error;
 	}
 }
+function isReceiptEnvelope(value: unknown): value is ReceiptEnvelope<unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const envelope = value as Record<string, unknown>;
+	return (
+		typeof envelope.receiptId === "string" &&
+		typeof envelope.schemaVersion === "number" &&
+		typeof envelope.sessionId === "string" &&
+		typeof envelope.family === "string" &&
+		typeof envelope.valid === "boolean" &&
+		typeof envelope.createdAt === "string" &&
+		typeof envelope.source === "string" &&
+		envelope.subject !== null &&
+		typeof envelope.subject === "object" &&
+		envelope.evidence !== null &&
+		typeof envelope.evidence === "object" &&
+		envelope.artifactHashes !== null &&
+		typeof envelope.artifactHashes === "object" &&
+		typeof envelope.sha256 === "string"
+	);
+}
 
 export async function readSessionState(root: string, sessionId: string): Promise<SessionState | null> {
 	return readJson<SessionState>(sessionPaths(root, sessionId).state);
@@ -372,6 +394,7 @@ export async function writeReceiptImmutable(
 		path: file,
 	};
 	await fs.appendFile(paths.receiptsIndex, `${JSON.stringify(entry)}\n`, "utf8");
+	if (isReceiptEnvelope(value)) await appendReceiptToConfiguredSpool(value);
 	return entry;
 }
 

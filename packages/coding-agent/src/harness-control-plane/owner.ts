@@ -20,6 +20,7 @@ import { ControlServer, type EndpointRequest } from "./control-endpoint";
 import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
+import { RECEIPT_SPOOL_DIR_ENV, withReceiptSpoolDir } from "./receipt-spool";
 import {
 	buildReceipt,
 	type ReceiptSubject,
@@ -298,6 +299,12 @@ export class RuntimeOwner {
 		return submitUnavailableReason(state.lifecycle, true, rpcReason);
 	}
 
+	async #withReceiptSpoolFromInput<T>(input: Record<string, unknown>, fn: () => Promise<T>): Promise<T> {
+		const requested = input[RECEIPT_SPOOL_DIR_ENV];
+		if (typeof requested === "string" && requested.trim()) return withReceiptSpoolDir(requested, fn);
+		return fn();
+	}
+
 	async #handle(req: EndpointRequest): Promise<unknown> {
 		switch (req.verb) {
 			case "ping":
@@ -309,13 +316,13 @@ export class RuntimeOwner {
 			case "retire":
 				return this.#retire();
 			case "finalize":
-				return this.#finalize(req.input);
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#finalize(req.input));
 			case "recover":
-				return this.#recover();
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#recover());
 			case "validate":
-				return this.#validate();
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#validate());
 			case "operate":
-				return this.#operate(req.input);
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#operate(req.input));
 			default:
 				return { ok: false, error: `owner_unsupported_verb:${req.verb}` };
 		}

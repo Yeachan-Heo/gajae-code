@@ -5,6 +5,7 @@
 ### Added
 
 - Added first-class `minimax-standard`, `minimax-cn-standard`, `kimi-standard`, and `glm-standard` model profiles plus a grouped `/model` Presets browser so profile presets stay scannable as the catalog grows (#532).
+- Added a harness receipt JSONL spool exporter for gajae receipt-runtime interop: configured `gjc harness --receipt-spool-dir <dir>` / `GJC_RECEIPT_SPOOL_DIR` now appends persisted native `ReceiptEnvelope` records as `{cursor,envelope}` lines to `spool.jsonl`, with restart-safe 12-digit cursors and installed-package smoke coverage (#545).
 
 ### Changed
 
