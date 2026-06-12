@@ -40,6 +40,39 @@ bun install -g gajae-code
 
 The scoped package is also available as `@gajae-code/coding-agent`.
 
+### Windows (native install)
+
+On a clean Windows 11 machine, install Bun first, then install `gjc` with Bun's
+global installer:
+
+```powershell
+# 1. Install Bun
+powershell -c "irm bun.sh/install.ps1|iex"
+
+# 2. Restart the terminal so PATH and the Bun runtime refresh, then confirm Bun
+bun --version
+
+# 3. Install and verify gjc
+bun install -g gajae-code
+gjc --version
+gjc --smoke-test
+```
+
+`bun install -g` places the `gjc` launcher in `%USERPROFILE%\.bun\bin`. That
+directory must be on `PATH` for `gjc` to resolve as a command. Bun's installer
+adds it automatically, but the change only applies to terminals started after
+installation — restart PowerShell (or sign out/in) if `gjc` is "not recognized".
+
+Troubleshooting:
+
+- **`gjc` reports an old Bun runtime.** Re-run the Bun installer above, restart
+  the terminal, and confirm `bun --version` matches what `gjc --version`
+  expects. If an older Bun still wins, make sure `%USERPROFILE%\.bun\bin` is
+  first on `PATH` and remove any stale Bun installs shadowing it.
+- **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed
+  but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in
+  `echo $env:Path`, then restart the terminal.
+
 ## Quick start
 
 ```sh

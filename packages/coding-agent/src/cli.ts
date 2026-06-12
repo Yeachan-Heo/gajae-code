@@ -5,11 +5,15 @@
  * lightweight CLI runner from pi-utils.
  */
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
-import { APP_NAME, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
-		`error: Bun runtime must be >= ${MIN_BUN_VERSION} (found v${Bun.version}). Please upgrade: bun upgrade\n`,
+		formatBunRuntimeError({
+			currentVersion: Bun.version,
+			minVersion: MIN_BUN_VERSION,
+			execPath: process.execPath,
+		}),
 	);
 	process.exit(1);
 }
