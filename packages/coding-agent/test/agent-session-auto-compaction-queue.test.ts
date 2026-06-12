@@ -269,6 +269,52 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
 	});
 
+	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.strategy", "handoff");
+		session.settings.set("compaction.thresholdTokens", 1000);
+
+		const handoffSpy = vi.spyOn(session, "handoff").mockImplementation(async () => {
+			expect(streamCallCount).toBe(0);
+			return { document: "handoff document" };
+		});
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Ready for tool output" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 800,
+				output: 50,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 850,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const largeToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "tool-large-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(10_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		sessionManager.appendMessage(assistantMsg);
+		sessionManager.appendMessage(largeToolResult);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.prompt("next prompt after large read");
+
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(streamCallCount).toBe(1);
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
+	});
+
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 

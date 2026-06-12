@@ -6551,7 +6551,10 @@ export class AgentSession {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
-			await this.#runAutoCompaction("threshold", false, false, { continueAfterMaintenance: false });
+			await this.#runAutoCompaction("threshold", false, false, {
+				continueAfterMaintenance: false,
+				deferHandoffMaintenance: false,
+			});
 		}
 	}
 
@@ -7283,18 +7286,24 @@ export class AgentSession {
 		reason: "overflow" | "threshold" | "idle",
 		willRetry: boolean,
 		deferred = false,
-		options?: { continueAfterMaintenance?: boolean },
+		options?: { continueAfterMaintenance?: boolean; deferHandoffMaintenance?: boolean },
 	): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.strategy === "off") return;
 		if (reason !== "idle" && !compactionSettings.enabled) return;
 		const generation = this.#promptGeneration;
-		if (!deferred && reason !== "overflow" && reason !== "idle" && compactionSettings.strategy === "handoff") {
+		if (
+			options?.deferHandoffMaintenance !== false &&
+			!deferred &&
+			reason !== "overflow" &&
+			reason !== "idle" &&
+			compactionSettings.strategy === "handoff"
+		) {
 			this.#schedulePostPromptTask(
 				async signal => {
 					await Promise.resolve();
 					if (signal.aborted) return;
-					await this.#runAutoCompaction(reason, willRetry, true);
+					await this.#runAutoCompaction(reason, willRetry, true, options);
 				},
 				{ generation },
 			);
