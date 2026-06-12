@@ -8,6 +8,9 @@
 ### Changed
 
 - Optimization Suite v3 Lane 2 (context cost): compaction token estimates now use a shared per-entry cache (`estimateEntryTokens`) keyed by a boundary-lossless fingerprint of the exact estimator fragments, covering `estimateEntriesTokens`, the `findCutPoint` reverse walk, and pruning candidate scoring — repeated full-session estimate p95 −97%, token totals exactly equal to fresh estimates and never stale after prune mutation. Pruned bash/search/grep tool results now carry a one-line digest notice (exit code, match/file count, first error line; capped at 1.25× the generic notice cost) instead of a bare truncation notice, with savings computed from the exact notice string; reads and other tools keep the generic notice. `trimOpenAiCompactInput` is O(n) via per-item serialized lengths and a running character sum (5k-item trim −99.9%) and is now exported.
+### Changed
+
+- Optimization Suite v3 Lane 3 (serialization): `cloneJson` in the append-only context now uses a typed JSON-semantic recursive clone instead of a `JSON.parse(JSON.stringify())` round-trip (−36% median on clone-heavy paths), with exact JSON.stringify byte parity including the toJSON holder-key protocol (single get, no re-dispatch on replacement values), function/symbol dropping, sparse arrays, Dates, and prototype-bearing objects; the helper is now exported.
 
 ## [0.4.5] - 2026-06-12
 

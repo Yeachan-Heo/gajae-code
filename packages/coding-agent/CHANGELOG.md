@@ -10,6 +10,10 @@
 
 ### Changed
 
+- Optimization Suite v3 Lane 3 (serialization): session-switch message comparison now uses per-message cached source strings + xxHash64 as an accelerator (source-string compare remains the authority; collision fallback tested) — unchanged-session compares −95% median. The secret obfuscator precomputes a longest-first combined regex (single-pass replace, −70% median/−77% p95 on 100 secrets × 1MiB) with a conservative sequential fallback whenever secrets overlap each other or any replacement/placeholder contains a secret — output bytes are identical in all cases. Intra-line diff rendering gains byte-identical fast paths for identical lines and whitespace-token-aligned prefix/suffix spans (identical −67%, single-token −60%; long lines skip the scan). Mental-model LCS keeps legacy dense-DP tie-break semantics (a Hunt-Szymanski variant was rejected for changing rendered bytes). Provider-visible fork-context seeds use JSON-semantic cloning instead of structuredClone.
+
+### Changed
+
 - Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).
 
 - Aligned the `codex-standard` and `codex-pro` model profiles on the `openai-codex/gpt-5.5` baseline so they no longer default to stale mixed model generations (`gpt-5.4`, `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.3-codex-spark`); the profiles now differentiate purely by per-role reasoning effort (#532).

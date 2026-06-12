@@ -839,6 +839,8 @@ export type BeforeAgentStartInternalMessage = Pick<
 	"customType" | "content" | "display" | "details" | "attribution"
 >;
 
+type ProviderReplaySourceCacheEntry = { source: string; hash: bigint };
+
 /**
  * Internal (first-party, non-user-hook) contributor invoked at the active
  * before-agent-start point alongside the extension runner. Returns an optional
@@ -1056,6 +1058,7 @@ export class AgentSession {
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
+	#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
@@ -1419,7 +1422,7 @@ export class AgentSession {
 				recordSkip("unsupported-role");
 				return undefined;
 			}
-			const cloned = structuredClone(message) as Message;
+			const cloned = cloneJsonValueForForkSeed(message) as Message;
 			if ("providerPayload" in cloned) {
 				delete (cloned as { providerPayload?: unknown }).providerPayload;
 			}
@@ -1466,7 +1469,7 @@ export class AgentSession {
 		}
 		return {
 			messages,
-			agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+			agentMessages: messages.map(message => cloneJsonValueForForkSeed(message) as AgentMessage),
 			metadata: {
 				sourceSessionId: this.sessionId,
 				parentMessageCount: providerMessages.length,
@@ -7077,11 +7080,37 @@ export class AgentSession {
 		}
 	}
 
+	#getProviderReplaySource(message: AgentMessage): ProviderReplaySourceCacheEntry {
+		const cached = this.#providerReplaySourceCache.get(message);
+		if (cached) return cached;
+		const source = JSON.stringify(this.#normalizeSessionMessageForProviderReplay(message));
+		const hash = this.#hashProviderReplaySource(source);
+		const entry = { source, hash };
+		this.#providerReplaySourceCache.set(message, entry);
+		return entry;
+	}
+
+	#hashProviderReplaySource(source: string): bigint {
+		return Bun.hash.xxHash64(source);
+	}
+
 	#didSessionMessagesChange(previousMessages: AgentMessage[], nextMessages: AgentMessage[]): boolean {
-		return (
-			JSON.stringify(previousMessages.map(message => this.#normalizeSessionMessageForProviderReplay(message))) !==
-			JSON.stringify(nextMessages.map(message => this.#normalizeSessionMessageForProviderReplay(message)))
-		);
+		if (previousMessages.length !== nextMessages.length) return true;
+
+		const previousSources: ProviderReplaySourceCacheEntry[] = [];
+		const nextSources: ProviderReplaySourceCacheEntry[] = [];
+		for (let i = 0; i < previousMessages.length; i++) {
+			const previous = this.#getProviderReplaySource(previousMessages[i]!);
+			const next = this.#getProviderReplaySource(nextMessages[i]!);
+			if (previous.hash !== next.hash) return true;
+			previousSources.push(previous);
+			nextSources.push(next);
+		}
+
+		for (let i = 0; i < previousSources.length; i++) {
+			if (previousSources[i]!.source !== nextSources[i]!.source) return true;
+		}
+		return false;
 	}
 
 	#getModelKey(model: Model): string {
@@ -9808,4 +9837,8 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
 	}
+}
+
+function cloneJsonValueForForkSeed<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
 }

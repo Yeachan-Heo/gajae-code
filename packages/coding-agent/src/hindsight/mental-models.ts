@@ -295,12 +295,12 @@ export function summarizeMentalModel(model: MentalModelSummary): string {
  * snapshot only; the diff is computed locally for display purposes.
  *
  * This is intentionally minimal — for "what changed" at a glance, not for a
- * full structural diff. Each side is capped at `MAX_LCS_LINES` lines BEFORE
- * the O(n*m) LCS table is built so a long curated model can never hang the
- * TUI; output is then capped at `maxLines` so the rendered diff stays
- * readable. The cap is signalled inline.
+ * full structural diff. Each side is capped at `MAX_LCS_LINES` lines before
+ * the Hunt-Szymanski LCS pass so a long curated model can never hang the TUI;
+ * output is then capped at `maxLines` so the rendered diff stays readable. The
+ * cap is signalled inline.
  */
-/** Hard cap on input line count per side before LCS. Keeps the O(n*m) table tractable. */
+/** Hard cap on input line count per side before LCS. Keeps worst-case repeated-line matching bounded. */
 export const MAX_LCS_LINES = 1_000;
 
 export function diffMentalModelContent(previous: string | null, current: string, maxLines = 200): string {
@@ -346,24 +346,25 @@ export function diffMentalModelContent(previous: string | null, current: string,
 }
 
 function longestCommonSubsequence(a: string[], b: string[]): string[] {
-	const n = a.length;
-	const m = b.length;
-	if (n === 0 || m === 0) return [];
-	const table: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-	for (let i = 0; i < n; i++) {
-		for (let j = 0; j < m; j++) {
-			table[i + 1][j + 1] = a[i] === b[j] ? table[i][j] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+	return longestCommonSubsequenceDense(a, b);
+}
+
+function longestCommonSubsequenceDense(a: string[], b: string[]): string[] {
+	const table: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+	for (let i = 0; i < a.length; i++) {
+		for (let j = 0; j < b.length; j++) {
+			table[i + 1]![j + 1] = a[i] === b[j] ? table[i]![j]! + 1 : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
 		}
 	}
 	const out: string[] = [];
-	let i = n;
-	let j = m;
+	let i = a.length;
+	let j = b.length;
 	while (i > 0 && j > 0) {
 		if (a[i - 1] === b[j - 1]) {
-			out.push(a[i - 1]);
+			out.push(a[i - 1]!);
 			i--;
 			j--;
-		} else if (table[i - 1][j] >= table[i][j - 1]) {
+		} else if (table[i - 1]![j]! >= table[i]![j - 1]!) {
 			i--;
 		} else {
 			j--;
