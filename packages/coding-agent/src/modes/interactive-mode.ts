@@ -267,6 +267,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	pendingImages: ImageContent[] = [];
 	compactionQueuedMessages: CompactionQueuedMessage[] = [];
 	pendingTools = new Map<string, ToolExecutionHandle>();
+	lastToolComponent: ToolExecutionHandle | undefined = undefined;
 	pendingBashComponents: BashExecutionComponent[] = [];
 	bashComponent: BashExecutionComponent | undefined = undefined;
 	pendingPythonComponents: EvalExecutionComponent[] = [];
@@ -904,6 +905,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
+		this.lastToolComponent = undefined;
 		const context = this.session.buildDisplaySessionContext();
 		this.renderSessionContext(context);
 	}

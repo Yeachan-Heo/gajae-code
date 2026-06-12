@@ -10,6 +10,8 @@ import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { ToolExecutionComponent } from "../components/tool-execution";
+import { ToolTranscriptOverlayComponent } from "../components/tool-transcript-overlay";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
@@ -217,6 +219,12 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.jobs.open")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showJobsOverlay());
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.tools.focus")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.enterOrMoveToolFocus());
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.tools.transcript")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.showToolTranscript());
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -865,6 +873,117 @@ export class InputController {
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	// =========================================================================
+	// Tool focus mode (083.1 pattern B): ctrl+up enters / moves up, ↑↓ navigate,
+	// enter toggles the focused tool's expansion, esc or typing exits.
+	// =========================================================================
+
+	#toolFocus:
+		| {
+				tools: ToolExecutionComponent[];
+				index: number;
+				prevOnChange: ((text: string) => void) | undefined;
+				prevInterruptPriority: (() => boolean) | undefined;
+		  }
+		| undefined;
+
+	enterOrMoveToolFocus(): void {
+		if (this.#toolFocus) {
+			this.#moveToolFocus(-1);
+			return;
+		}
+		const tools = this.ctx.chatContainer.children.filter(
+			(child): child is ToolExecutionComponent => child instanceof ToolExecutionComponent,
+		);
+		if (tools.length === 0) {
+			this.ctx.showStatus("No tool blocks to focus");
+			return;
+		}
+		const editor = this.ctx.editor;
+		const prevOnChange = editor.onChange;
+		this.#toolFocus = {
+			tools,
+			index: tools.length - 1,
+			prevOnChange,
+			prevInterruptPriority: editor.onInterruptPriority,
+		};
+		// Esc exits focus mode before any other interrupt handling (btw-panel pattern).
+		editor.onInterruptPriority = () => {
+			this.#exitToolFocus();
+			return true;
+		};
+		// Typing drops focus so the prompt stays fluent.
+		editor.onChange = (text: string) => {
+			this.#exitToolFocus();
+			prevOnChange?.(text);
+		};
+		editor.setCustomKeyHandler("up", () => this.#moveToolFocus(-1));
+		editor.setCustomKeyHandler("down", () => this.#moveToolFocus(1));
+		editor.setCustomKeyHandler("enter", () => this.#toggleFocusedTool());
+		tools[this.#toolFocus.index].setFocused(true);
+		this.ctx.showStatus("tool focus: ↑↓ move · enter open/close · esc exit");
+		this.ctx.ui.requestRender();
+	}
+
+	#exitToolFocus(): void {
+		const focus = this.#toolFocus;
+		if (!focus) return;
+		this.#toolFocus = undefined;
+		focus.tools[focus.index]?.setFocused(false);
+		const editor = this.ctx.editor;
+		editor.removeCustomKeyHandler("up");
+		editor.removeCustomKeyHandler("down");
+		editor.removeCustomKeyHandler("enter");
+		editor.onChange = focus.prevOnChange;
+		editor.onInterruptPriority = focus.prevInterruptPriority;
+		this.ctx.ui.requestRender();
+	}
+
+	#moveToolFocus(delta: number): void {
+		const focus = this.#toolFocus;
+		if (!focus) return;
+		const next = focus.index + delta;
+		if (next < 0 || next >= focus.tools.length) return;
+		focus.tools[focus.index].setFocused(false);
+		focus.index = next;
+		focus.tools[next].setFocused(true);
+		this.ctx.ui.requestRender();
+	}
+
+	#toggleFocusedTool(): void {
+		const focus = this.#toolFocus;
+		if (!focus) return;
+		const tool = focus.tools[focus.index];
+		tool.setExpanded(!tool.expanded);
+		this.ctx.ui.requestRender();
+	}
+
+	/** 083.1 pattern A: full tool transcript in a scrollable overlay (alt+t). */
+	showToolTranscript(): void {
+		this.#exitToolFocus();
+		const tools = this.ctx.chatContainer.children.filter(
+			(child): child is ToolExecutionComponent => child instanceof ToolExecutionComponent,
+		);
+		if (tools.length === 0) {
+			this.ctx.showStatus("No tool blocks to show");
+			return;
+		}
+		const close = () => {
+			this.ctx.editorContainer.clear();
+			this.ctx.editorContainer.addChild(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.requestRender();
+		};
+		const overlay = new ToolTranscriptOverlayComponent(tools, {
+			close,
+			requestRender: () => this.ctx.ui.requestRender(),
+		});
+		this.ctx.editorContainer.clear();
+		this.ctx.editorContainer.addChild(overlay);
+		this.ctx.ui.setFocus(overlay.getFocus());
+		this.ctx.ui.requestRender();
 	}
 
 	toggleToolOutputExpansion(): void {

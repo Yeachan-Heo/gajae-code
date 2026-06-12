@@ -124,6 +124,7 @@ export interface ToolExecutionHandle {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	setMinimized?(minimized: boolean): void;
 }
 
 /**
@@ -164,6 +165,10 @@ export class ToolExecutionComponent extends Container {
 	#spinnerInterval?: NodeJS.Timeout;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
+	// One-line summary mode (083.1) — set when a newer tool starts
+	#minimized = false;
+	// Focus marker for the tool-focus mode (083.1 pattern B)
+	#focused = false;
 	#renderState: {
 		spinnerFrame?: number;
 		expanded: boolean;
@@ -395,6 +400,70 @@ export class ToolExecutionComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		this.#expanded = expanded;
 		this.#updateDisplay();
+	}
+
+	/**
+	 * Collapse this tool to a one-line summary (083.1). Set when a newer tool
+	 * starts so only the active/latest tool shows its preview. Expansion
+	 * (individual or global ctrl+o) overrides minimization at render time, so
+	 * a minimized tool can always be re-opened.
+	 */
+	setMinimized(minimized: boolean): void {
+		this.#minimized = minimized;
+	}
+
+	get minimized(): boolean {
+		return this.#minimized;
+	}
+
+	/** Focus marker for tool-focus mode (083.1 pattern B). Render-only — no layout change. */
+	setFocused(focused: boolean): void {
+		this.#focused = focused;
+	}
+
+	/** Individual expand state (read by tool-focus mode for toggling). */
+	get expanded(): boolean {
+		return this.#expanded;
+	}
+
+	/**
+	 * Replace the leading separator blank line with an accent focus marker.
+	 * Same line count, so toggling focus never reflows the chat.
+	 */
+	#applyFocusMarker(lines: string[]): string[] {
+		if (!this.#focused || lines.length === 0 || lines[0] !== "") return lines;
+		return [theme.fg("accent", " ❯"), ...lines.slice(1)];
+	}
+
+	override render(width: number): string[] {
+		if (this.#minimized && !this.#expanded) {
+			// Children still render (cheap — they cache); we need their height for
+			// the hidden-line hint and the spacer/content split.
+			const full = super.render(width);
+			const hiddenLines = Math.max(0, full.length - 2);
+			const icon = this.#isPartial ? "pending" : this.#result?.isError ? "error" : "success";
+			let description: string | undefined;
+			if (this.#result?.isError) {
+				description = this.#getTextOutput().split("\n")[0]?.trim() || undefined;
+			} else {
+				const argsObject =
+					this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;
+				description = argsObject ? formatArgsInline(argsObject, 60) || undefined : undefined;
+			}
+			const line = renderStatusLine(
+				{
+					icon,
+					spinnerFrame: this.#spinnerFrame,
+					title: this.#toolLabel,
+					description,
+					meta: hiddenLines > 0 ? [`… +${hiddenLines} lines`] : undefined,
+				},
+				theme,
+			);
+			// Keep the leading blank line (block separation, 083.2) + pad like Box paddingX=1.
+			return this.#applyFocusMarker(["", ` ${truncateToWidth(line, Math.max(1, width - 1))}`]);
+		}
+		return this.#applyFocusMarker(super.render(width));
 	}
 
 	setShowImages(show: boolean): void {

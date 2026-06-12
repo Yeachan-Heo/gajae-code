@@ -262,6 +262,10 @@ export class EventController {
 		} else if (event.message.role === "assistant") {
 			this.#lastThinkingCount = 0;
 			this.#resetReadGroup();
+			// 083.1: a new assistant message means the previous tool batch is done —
+			// collapse its last tool too (new tools in this message start a new chain).
+			this.ctx.lastToolComponent?.setMinimized?.(true);
+			this.ctx.lastToolComponent = undefined;
 			this.ctx.streamingComponent = new AssistantMessageComponent(undefined, this.ctx.hideThinkingBlock, () =>
 				this.ctx.ui.requestRender(),
 			);
@@ -370,6 +374,9 @@ export class EventController {
 						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
+					// 083.1: a new tool starting collapses the previous one to a one-line summary
+					this.ctx.lastToolComponent?.setMinimized?.(true);
+					this.ctx.lastToolComponent = component;
 					this.ctx.chatContainer.addChild(component);
 					this.ctx.pendingTools.set(content.id, component);
 				} else {
@@ -485,6 +492,9 @@ export class EventController {
 				event.toolCallId,
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
+			// 083.1: a new tool starting collapses the previous one to a one-line summary
+			this.ctx.lastToolComponent?.setMinimized?.(true);
+			this.ctx.lastToolComponent = component;
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
 			this.ctx.ui.requestRender();
@@ -613,6 +623,9 @@ export class EventController {
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
+		// 083.1: turn is over — no tool is active anymore, collapse the last one.
+		this.ctx.lastToolComponent?.setMinimized?.(true);
+		this.ctx.lastToolComponent = undefined;
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		this.sendCompletionNotification();

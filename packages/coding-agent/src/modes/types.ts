@@ -97,6 +97,8 @@ export interface InteractiveModeContext {
 	pendingImages: ImageContent[];
 	compactionQueuedMessages: CompactionQueuedMessage[];
 	pendingTools: Map<string, ToolExecutionHandle>;
+	/** Latest tool block in the chat — minimized when the next tool starts (083.1). */
+	lastToolComponent: ToolExecutionHandle | undefined;
 	pendingBashComponents: BashExecutionComponent[];
 	bashComponent: BashExecutionComponent | undefined;
 	pendingPythonComponents: EvalExecutionComponent[];

@@ -27,6 +27,8 @@ interface AppKeybindings {
 	"app.model.select": true;
 	"app.model.selectTemporary": true;
 	"app.tools.expand": true;
+	"app.tools.focus": true;
+	"app.tools.transcript": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.message.dequeue": true;
@@ -105,6 +107,14 @@ export const KEYBINDINGS = {
 	"app.tools.expand": {
 		defaultKeys: "ctrl+o",
 		description: "Expand tools",
+	},
+	"app.tools.focus": {
+		defaultKeys: "ctrl+up",
+		description: "Focus tool blocks (↑↓ move, enter toggle, esc exit)",
+	},
+	"app.tools.transcript": {
+		defaultKeys: "alt+t",
+		description: "Open full tool transcript overlay",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
