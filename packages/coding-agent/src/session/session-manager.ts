@@ -32,6 +32,7 @@ import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
 	BlobStore,
+	EphemeralBlobStore,
 	externalizeImageData,
 	externalizeImageDataSync,
 	externalizeImageDataUrl,
@@ -728,6 +729,17 @@ export function buildSessionContext(
 	};
 }
 
+function cloneSessionContext(context: SessionContext): SessionContext {
+	return {
+		...context,
+		messages: cloneJsonSemantic(context.messages),
+		models: { ...context.models },
+		injectedTtsrRules: [...context.injectedTtsrRules],
+		selectedMCPToolNames: [...context.selectedMCPToolNames],
+		modeData: cloneJsonSemantic(context.modeData),
+	};
+}
+
 /**
  * Compute the default session directory for a cwd.
  * Classifies cwd by canonical location so symlink/alias paths resolve to the
@@ -1176,13 +1188,20 @@ function shouldExternalizeResidentString(key: string | undefined): boolean {
 	return !key || !RESIDENT_EXTERNALIZE_STRING_EXCLUDED_KEYS.has(key);
 }
 
-function externalizeResidentValueSync(obj: unknown, blobStore: BlobStore, key?: string): unknown {
+interface ResidentBlobStores {
+	textStore: BlobStore;
+	imageStore: BlobStore;
+	sessionId?: string;
+	sessionFile?: string;
+}
+
+function externalizeResidentValueSync(obj: unknown, stores: ResidentBlobStores, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (typeof obj === "string") {
 		if (key === "image_url" && isImageDataUrl(obj) && obj.length >= BLOB_EXTERNALIZE_THRESHOLD)
-			return residentBlobSentinel("imageUrl", externalizeImageDataUrlSync(blobStore, obj));
+			return residentBlobSentinel("imageUrl", externalizeImageDataUrlSync(stores.imageStore, obj));
 		if (shouldExternalizeResidentString(key) && obj.length >= BLOB_EXTERNALIZE_THRESHOLD)
-			return residentBlobSentinel("text", blobStore.putSync(Buffer.from(obj, "utf8")).ref);
+			return residentBlobSentinel("text", stores.textStore.putSync(Buffer.from(obj, "utf8")).ref);
 		return obj;
 	}
 	if (Array.isArray(obj)) {
@@ -1199,11 +1218,11 @@ function externalizeResidentValueSync(obj: unknown, blobStore: BlobStore, key?: 
 				changed = true;
 				result[i] = {
 					...item,
-					data: residentBlobSentinel("imageData", externalizeImageDataSync(blobStore, item.data)),
+					data: residentBlobSentinel("imageData", externalizeImageDataSync(stores.imageStore, item.data)),
 				};
 				continue;
 			}
-			const newItem = externalizeResidentValueSync(item, blobStore, key);
+			const newItem = externalizeResidentValueSync(item, stores, key);
 			if (newItem !== item) changed = true;
 			result[i] = newItem;
 		}
@@ -1213,7 +1232,7 @@ function externalizeResidentValueSync(obj: unknown, blobStore: BlobStore, key?: 
 		let changed = false;
 		const entries: Array<readonly [string, unknown]> = [];
 		for (const [childKey, value] of Object.entries(obj)) {
-			const newValue = externalizeResidentValueSync(value, blobStore, childKey);
+			const newValue = externalizeResidentValueSync(value, stores, childKey);
 			if (newValue !== value) changed = true;
 			entries.push([childKey, newValue]);
 		}
@@ -1222,13 +1241,13 @@ function externalizeResidentValueSync(obj: unknown, blobStore: BlobStore, key?: 
 	return obj;
 }
 
-function prepareEntryForResidentSync(entry: FileEntry, blobStore: BlobStore): FileEntry {
-	return externalizeResidentValueSync(entry, blobStore) as FileEntry;
+function prepareEntryForResidentSync(entry: FileEntry, stores: ResidentBlobStores): FileEntry {
+	return externalizeResidentValueSync(entry, stores) as FileEntry;
 }
 
 function materializeResidentValueSync(
 	obj: unknown,
-	blobStore: BlobStore,
+	stores: ResidentBlobStores,
 	key?: string,
 	cache = new Map<string, string>(),
 ): unknown {
@@ -1240,17 +1259,17 @@ function materializeResidentValueSync(
 		if (cached !== undefined) return cached;
 		const resolved =
 			obj.kind === "imageUrl"
-				? resolveImageDataUrlSync(blobStore, obj.ref)
+				? resolveImageDataUrlSync(stores.imageStore, obj.ref)
 				: obj.kind === "imageData"
-					? resolveImageDataSync(blobStore, obj.ref)
-					: resolveTextBlobSync(blobStore, obj.ref);
+					? resolveImageDataSync(stores.imageStore, obj.ref)
+					: resolveTextBlobSync(stores.textStore, obj.ref, stores);
 		cache.set(cacheKey, resolved);
 		return resolved;
 	}
 	if (Array.isArray(obj)) {
 		let changed = false;
 		const result = obj.map(item => {
-			const newItem = materializeResidentValueSync(item, blobStore, key, cache);
+			const newItem = materializeResidentValueSync(item, stores, key, cache);
 			if (newItem !== item) changed = true;
 			return newItem;
 		});
@@ -1259,7 +1278,7 @@ function materializeResidentValueSync(
 	if (typeof obj === "object") {
 		let changed = false;
 		const entries = Object.entries(obj).map(([childKey, value]) => {
-			const newValue = materializeResidentValueSync(value, blobStore, childKey, cache);
+			const newValue = materializeResidentValueSync(value, stores, childKey, cache);
 			if (newValue !== value) changed = true;
 			return [childKey, newValue] as const;
 		});
@@ -1270,15 +1289,38 @@ function materializeResidentValueSync(
 
 function materializeResidentEntrySync<T extends FileEntry | SessionEntry>(
 	entry: T,
-	blobStore: BlobStore,
+	stores: ResidentBlobStores,
 	cache: Map<string, string>,
 ): T {
-	return materializeResidentValueSync(entry, blobStore, undefined, cache) as T;
+	return materializeResidentValueSync(entry, stores, undefined, cache) as T;
 }
 
-function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(entries: T[], blobStore: BlobStore): T[] {
+function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(
+	entries: T[],
+	stores: ResidentBlobStores,
+): T[] {
 	const cache = new Map<string, string>();
-	return entries.map(entry => materializeResidentEntrySync(entry, blobStore, cache));
+	return entries.map(entry => materializeResidentEntrySync(entry, stores, cache));
+}
+function cloneJsonSemantic<T>(value: T): T {
+	if (value === null || value === undefined || typeof value !== "object") return value;
+	if (Array.isArray(value)) return value.map(item => cloneJsonSemantic(item)) as T;
+	const cloned: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value)) cloned[key] = cloneJsonSemantic(child);
+	return cloned as T;
+}
+
+function cloneAgentMessage<T extends AgentMessage>(message: T): T {
+	return {
+		...message,
+		...("content" in message ? { content: cloneJsonSemantic(message.content) } : {}),
+		...("providerPayload" in message ? { providerPayload: cloneJsonSemantic(message.providerPayload) } : {}),
+	};
+}
+
+function cloneSessionEntry(entry: SessionEntry): SessionEntry {
+	if (entry.type !== "message") return { ...entry };
+	return { ...entry, message: cloneAgentMessage(entry.message) } as SessionEntry;
 }
 
 async function truncateForPersistence(obj: FileEntry, blobStore: BlobStore, key?: string): Promise<FileEntry>;
@@ -1711,6 +1753,7 @@ const SESSION_LIST_PREFIX_BYTES = 4096;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
 const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
+let residentCacheInstanceCounter = 0;
 
 async function readSessionListPrefix(file: string, storage: SessionStorage, buffer: Buffer): Promise<string> {
 	if (!(storage instanceof FileSessionStorage)) {
@@ -2049,7 +2092,21 @@ export class SessionManager {
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
 	readonly #blobStore: BlobStore;
-	readonly #residentBlobStore = new MemoryBlobStore();
+	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
+	readonly #residentImageBlobStore: BlobStore;
+	#entryRevision = 0;
+	#leafRevision = 0;
+	/** Export/header cache invalidation contract; consumers may arrive after the revision field. */
+	#headerExportRevision = 0;
+	/** Label-view cache invalidation contract; consumers may arrive after the revision field. */
+	#labelRevision = 0;
+	#replayMetadataRevision = 0;
+	#materializedEntriesRevision = -1;
+	#materializedEntriesCache: WeakRef<SessionEntry[]> | undefined;
+	#sessionContextCache: WeakRef<SessionContext> | undefined;
+	#sessionContextEntryRevision = -1;
+	#sessionContextLeafRevision = -1;
+	#sessionContextReplayMetadataRevision = -1;
 
 	private constructor(
 		private cwd: string,
@@ -2057,11 +2114,92 @@ export class SessionManager {
 		private readonly persist: boolean,
 		private readonly storage: SessionStorage,
 	) {
-		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentBlobStore;
+		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
+		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
 			this.storage.ensureDirSync(sessionDir);
 		}
 		// Note: call _initSession() or _initSessionFile() after construction
+	}
+
+	#residentBlobStores(): ResidentBlobStores {
+		return {
+			textStore: this.#residentTextBlobStore,
+			imageStore: this.#residentImageBlobStore,
+			sessionId: this.#sessionId || undefined,
+			sessionFile: this.#sessionFile,
+		};
+	}
+
+	#residentCacheDir(sessionFile: string): string {
+		const instance = ++residentCacheInstanceCounter;
+		return path.join(
+			sessionFile.slice(0, -6),
+			"resident-cache",
+			`${this.#sessionId || "pending"}-${process.pid}-${instance}`,
+		);
+	}
+
+	#reexternalizeFileEntriesForResidentStore(): void {
+		this.#fileEntries = this.#fileEntries.map(entry =>
+			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
+		);
+		this.#buildIndex();
+	}
+
+	#resetMaterializedCaches(): void {
+		this.#materializedEntriesRevision = -1;
+		this.#materializedEntriesCache = undefined;
+	}
+
+	#bumpEntryRevision(): void {
+		this.#entryRevision++;
+		this.#resetMaterializedCaches();
+	}
+
+	#bumpAllRevisions(): void {
+		this.#entryRevision++;
+		this.#leafRevision++;
+		this.#headerExportRevision++;
+		this.#labelRevision++;
+		this.#replayMetadataRevision++;
+		this.#resetMaterializedCaches();
+	}
+
+	/**
+	 * Snapshot of the five cache-invalidation revision domains (plan: Lane 1
+	 * revision contract). Tests assert the invalidation mapping through this;
+	 * future export/label-view caches key off their respective domains.
+	 */
+	revisionSnapshot(): {
+		entry: number;
+		leaf: number;
+		headerExport: number;
+		label: number;
+		replayMetadata: number;
+	} {
+		return {
+			entry: this.#entryRevision,
+			leaf: this.#leafRevision,
+			headerExport: this.#headerExportRevision,
+			label: this.#labelRevision,
+			replayMetadata: this.#replayMetadataRevision,
+		};
+	}
+
+	#disposeResidentTextBlobStore(): void {
+		if (this.#residentTextBlobStore instanceof EphemeralBlobStore) {
+			this.#residentTextBlobStore.dispose();
+		}
+		this.#residentTextBlobStore = new MemoryBlobStore();
+		this.#resetMaterializedCaches();
+	}
+
+	#resetResidentTextBlobStore(): void {
+		this.#disposeResidentTextBlobStore();
+		if (this.persist && this.#sessionFile && this.storage instanceof FileSessionStorage) {
+			this.#residentTextBlobStore = new EphemeralBlobStore(this.#residentCacheDir(this.#sessionFile));
+		}
 	}
 
 	/** Puts a binary blob into the blob store and returns the blob reference */
@@ -2100,6 +2238,8 @@ export class SessionManager {
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
 		this.#buildIndex();
+		this.#resetResidentTextBlobStore();
+		this.#bumpAllRevisions();
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		}
@@ -2113,6 +2253,7 @@ export class SessionManager {
 	/** Initialize with a new session (used by factory methods) */
 	#initNewSession(): void {
 		this.#newSessionSync();
+		this.#bumpAllRevisions();
 	}
 
 	/** Switch to a different session file (used for resume and branching) */
@@ -2131,22 +2272,26 @@ export class SessionManager {
 
 			this.#needsFullRewriteOnNextPersist = migrateToCurrentVersion(this.#fileEntries);
 			await resolveBlobRefsInEntries(this.#fileEntries, this.#blobStore);
+			this.#resetResidentTextBlobStore();
 
 			this.#fileEntries = this.#fileEntries.map(entry =>
-				prepareEntryForResidentSync(entry, this.#residentBlobStore),
+				prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 			);
 			this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 
 			this.#buildIndex();
+			this.#bumpAllRevisions();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
 		} else {
 			const explicitPath = this.#sessionFile;
 			this.#newSessionSync();
 			this.#sessionFile = explicitPath; // preserve explicit path from --session flag
+			this.#resetResidentTextBlobStore();
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.#bumpAllRevisions();
 			return;
 		}
 	}
@@ -2154,7 +2299,9 @@ export class SessionManager {
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		await this.#closePersistWriter();
-		return this.#newSessionSync(options);
+		const sessionFile = this.#newSessionSync(options);
+		this.#bumpAllRevisions();
+		return sessionFile;
 	}
 
 	/** Delete a session file and its artifacts. Drains the persist writer first to avoid EPERM on Windows. ENOENT is treated as success. */
@@ -2180,6 +2327,7 @@ export class SessionManager {
 
 		const oldSessionFile = this.#sessionFile;
 		const oldSessionId = this.#sessionId;
+		const materializedEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
 
 		// Close the current writer
 		await this.#closePersistWriter();
@@ -2209,8 +2357,11 @@ export class SessionManager {
 		this.#titleSource = newHeader.titleSource;
 
 		// Replace the header in fileEntries
-		const entries = this.#fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		const entries = materializedEntries.filter((e): e is SessionEntry => e.type !== "session");
 		this.#fileEntries = [newHeader, ...entries];
+		this.#resetResidentTextBlobStore();
+		this.#reexternalizeFileEntriesForResidentStore();
+		this.#bumpAllRevisions();
 
 		// Write the new session file
 		this.#flushed = false;
@@ -2248,6 +2399,8 @@ export class SessionManager {
 			hadSessionFile = this.storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
+			const materializedEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
+			this.#disposeResidentTextBlobStore();
 
 			try {
 				// Guard: session file may not exist yet (no assistant messages persisted)
@@ -2287,6 +2440,10 @@ export class SessionManager {
 				throw err;
 			}
 			this.#sessionFile = newSessionFile;
+			this.#fileEntries = materializedEntries;
+			this.#resetResidentTextBlobStore();
+			this.#reexternalizeFileEntriesForResidentStore();
+			this.#bumpAllRevisions();
 		}
 
 		// Update cwd and sessionDir after the move succeeds.
@@ -2297,6 +2454,7 @@ export class SessionManager {
 		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 		if (header) {
 			header.cwd = resolvedCwd;
+			this.#headerExportRevision++;
 		}
 
 		// Rewrite the session file at its new location with updated header.
@@ -2347,6 +2505,7 @@ export class SessionManager {
 			this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
 			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		}
+		this.#resetResidentTextBlobStore();
 		return this.#sessionFile;
 	}
 
@@ -2626,7 +2785,7 @@ export class SessionManager {
 		await this.#queuePersistTask(async () => {
 			await this.#closePersistWriterInternal();
 			const entries = await Promise.all(
-				materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStore).map(entry =>
+				materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
@@ -2640,7 +2799,7 @@ export class SessionManager {
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
 		this.#closePersistWriterInternalSync();
-		const entries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStore).map(entry =>
+		const entries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 			prepareEntryForPersistenceSync(entry, this.#blobStore),
 		);
 		this.#writeEntriesAtomicallySync(entries);
@@ -2677,11 +2836,13 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
-		if (!this.#persistWriter) return;
 		await this.#queuePersistTask(async () => {
-			await this.#closePersistWriterInternal();
-			this.#flushed = true;
+			if (this.#persistWriter) {
+				await this.#closePersistWriterInternal();
+				this.#flushed = true;
+			}
 		});
+		this.#disposeResidentTextBlobStore();
 		if (this.#persistError) throw this.#persistError;
 	}
 
@@ -2889,6 +3050,7 @@ export class SessionManager {
 			header.title = sanitized;
 			header.titleSource = source;
 		}
+		this.#headerExportRevision++;
 
 		// Update the session file header with the title (if already flushed)
 		const sessionFile = this.#sessionFile;
@@ -2945,7 +3107,7 @@ export class SessionManager {
 				this.#rewriteFile().catch(() => {});
 				return;
 			}
-			const materializedEntry = materializeResidentEntrySync(entry, this.#residentBlobStore, new Map());
+			const materializedEntry = materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map());
 			const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 			writer.writeSync(persistedEntry);
 		} catch (err) {
@@ -2955,10 +3117,13 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
-		const residentEntry = prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry;
+		const residentEntry = prepareEntryForResidentSync(entry, this.#residentBlobStores()) as SessionEntry;
 		this.#fileEntries.push(residentEntry);
 		this.#byId.set(residentEntry.id, residentEntry);
 		this.#leafId = residentEntry.id;
+		this.#bumpEntryRevision();
+		this.#leafRevision++;
+		if (entry.type === "label") this.#labelRevision++;
 		this._persist(residentEntry);
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			const usage = entry.message.usage;
@@ -3139,11 +3304,13 @@ export class SessionManager {
 			if (canonical?.type !== "message") continue;
 			const residentEntry = prepareEntryForResidentSync(
 				{ ...canonical, message: updated.message },
-				this.#residentBlobStore,
+				this.#residentBlobStores(),
 			) as SessionMessageEntry;
 			canonical.message = residentEntry.message;
 		}
 		this.#needsFullRewriteOnNextPersist = true;
+		this.#bumpEntryRevision();
+		this.#replayMetadataRevision++;
 	}
 
 	/**
@@ -3255,7 +3422,7 @@ export class SessionManager {
 	getLeafEntry(): SessionEntry | undefined {
 		if (!this.#leafId) return undefined;
 		const entry = this.#byId.get(this.#leafId);
-		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStore, new Map()) : undefined;
+		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
 
 	/**
@@ -3275,7 +3442,7 @@ export class SessionManager {
 
 	getEntry(id: string): SessionEntry | undefined {
 		const entry = this.#byId.get(id);
-		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStore, new Map()) : undefined;
+		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
 
 	/**
@@ -3286,7 +3453,7 @@ export class SessionManager {
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
-				children.push(materializeResidentEntrySync(entry, this.#residentBlobStore, cache));
+				children.push(materializeResidentEntrySync(entry, this.#residentBlobStores(), cache));
 			}
 		}
 		return children;
@@ -3336,7 +3503,7 @@ export class SessionManager {
 		const startId = fromId ?? this.#leafId;
 		let current = startId ? this.#byId.get(startId) : undefined;
 		while (current) {
-			path.push(materializeResidentEntrySync(current, this.#residentBlobStore, cache));
+			path.push(materializeResidentEntrySync(current, this.#residentBlobStores(), cache));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
@@ -3348,9 +3515,22 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.#leafId);
+		const cached = this.#sessionContextCache?.deref();
+		if (
+			cached &&
+			this.#sessionContextEntryRevision === this.#entryRevision &&
+			this.#sessionContextLeafRevision === this.#leafRevision &&
+			this.#sessionContextReplayMetadataRevision === this.#replayMetadataRevision
+		) {
+			return cloneSessionContext(cached);
+		}
+		const context = buildSessionContext(this.#getMaterializedEntriesInternal(), this.#leafId);
+		this.#sessionContextCache = new WeakRef(context);
+		this.#sessionContextEntryRevision = this.#entryRevision;
+		this.#sessionContextLeafRevision = this.#leafRevision;
+		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
+		return cloneSessionContext(context);
 	}
-
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
 		let didSanitize = false;
@@ -3366,6 +3546,10 @@ export class SessionManager {
 
 			entry.message = sanitizedMessage;
 			didSanitize = true;
+		}
+		if (didSanitize) {
+			this.#bumpEntryRevision();
+			this.#replayMetadataRevision++;
 		}
 
 		return didSanitize;
@@ -3384,11 +3568,22 @@ export class SessionManager {
 	 * The session is append-only: use appendXXX() to add entries, branch() to
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
+	#getMaterializedEntriesInternal(): SessionEntry[] {
+		if (this.#materializedEntriesRevision === this.#entryRevision) {
+			const cached = this.#materializedEntriesCache?.deref();
+			if (cached) return cached;
+		}
+		const resolvedTextBlobCache = new Map<string, string>();
+		const materializedEntries = this.#fileEntries
+			.filter((e): e is SessionEntry => e.type !== "session")
+			.map(entry => materializeResidentEntrySync(entry, this.#residentBlobStores(), resolvedTextBlobCache));
+		this.#materializedEntriesCache = new WeakRef(materializedEntries);
+		this.#materializedEntriesRevision = this.#entryRevision;
+		return materializedEntries;
+	}
+
 	getEntries(): SessionEntry[] {
-		return materializeResidentEntriesSync(
-			this.#fileEntries.filter((e): e is SessionEntry => e.type !== "session"),
-			this.#residentBlobStore,
-		);
+		return this.#getMaterializedEntriesInternal().map(entry => cloneSessionEntry(entry));
 	}
 
 	/**
@@ -3450,6 +3645,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.#leafId = branchFromId;
+		this.#leafRevision++;
 	}
 
 	/**
@@ -3459,6 +3655,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.#leafId = null;
+		this.#leafRevision++;
 	}
 
 	/**
@@ -3548,17 +3745,19 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 			this.storage.writeTextSync(newSessionFile, `${lines.join("\n")}\n`);
+			this.#sessionId = newSessionId;
+			this.#sessionFile = newSessionFile;
+			this.#resetResidentTextBlobStore();
 			this.#fileEntries = [
 				header,
 				...pathWithoutLabels.map(
-					entry => prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry,
+					entry => prepareEntryForResidentSync(entry, this.#residentBlobStores()) as SessionEntry,
 				),
 				...labelEntries,
 			];
-			this.#sessionId = newSessionId;
-			this.#sessionFile = newSessionFile;
 			this.#flushed = true;
 			this.#buildIndex();
+			this.#bumpAllRevisions();
 			return newSessionFile;
 		}
 
@@ -3577,13 +3776,17 @@ export class SessionManager {
 			labelEntries.push(labelEntry);
 			parentId = labelEntry.id;
 		}
+		this.#sessionId = newSessionId;
+		this.#resetResidentTextBlobStore();
 		this.#fileEntries = [
 			header,
-			...pathWithoutLabels.map(entry => prepareEntryForResidentSync(entry, this.#residentBlobStore) as SessionEntry),
+			...pathWithoutLabels.map(
+				entry => prepareEntryForResidentSync(entry, this.#residentBlobStores()) as SessionEntry,
+			),
 			...labelEntries,
 		];
-		this.#sessionId = newSessionId;
 		this.#buildIndex();
+		this.#bumpAllRevisions();
 		return undefined;
 	}
 
@@ -3625,18 +3828,25 @@ export class SessionManager {
 		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-		manager.#fileEntries = forkEntries.map(entry => prepareEntryForResidentSync(entry, manager.#residentBlobStore));
+		manager.#fileEntries = forkEntries;
 		const sourceHeader = manager.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 		const historyEntries = manager.#fileEntries.filter(entry => entry.type !== "session") as SessionEntry[];
 		manager.#newSessionSync({ parentSession: sourceHeader?.id });
+		manager.#resetResidentTextBlobStore();
 		const newHeader = manager.#fileEntries[0] as SessionHeader;
 		newHeader.title = sourceHeader?.title;
 		newHeader.titleSource = sourceHeader?.titleSource;
-		manager.#fileEntries = [newHeader, ...historyEntries];
+		manager.#fileEntries = [
+			newHeader,
+			...historyEntries.map(
+				entry => prepareEntryForResidentSync(entry, manager.#residentBlobStores()) as SessionEntry,
+			),
+		];
 		manager.#sessionName = newHeader.title;
 		manager.#titleSource = newHeader.titleSource;
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.#buildIndex();
+		manager.#bumpAllRevisions();
 		await manager.#rewriteFile();
 		return manager;
 	}

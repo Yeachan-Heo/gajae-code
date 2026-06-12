@@ -6,6 +6,7 @@
 
 - Added first-class `minimax-standard`, `minimax-cn-standard`, `kimi-standard`, and `glm-standard` model profiles plus a grouped `/model` Presets browser so profile presets stay scannable as the catalog grows (#532).
 - Added a harness receipt JSONL spool exporter for gajae receipt-runtime interop: configured `gjc harness --receipt-spool-dir <dir>` / `GJC_RECEIPT_SPOOL_DIR` now appends persisted native `ReceiptEnvelope` records as `{cursor,envelope}` lines to `spool.jsonl`, with restart-safe 12-digit cursors and installed-package smoke coverage (#545).
+- Optimization Suite v3 Lane 1 (RSS): large resident text in persisted sessions is now backed by an ephemeral session-scoped disk cache (`EphemeralBlobStore`) instead of being pinned in JS heap for the whole session lifetime; canonical JSONL persistence, reload, and export semantics are byte-identical (resident refs never persist). Missing resident text cache blobs now surface a typed `ResidentBlobMissingError` instead of silently leaking `blob:sha256:` refs into provider payloads, UI, or exports. `getEntries()`/`buildSessionContext()` are served from revision-keyed WeakRef caches below the public ownership boundary (callers still receive caller-owned copies). Fixture retained heap −82%, RSS −55%, warm `getEntries()` p95 −80% on 10k-entry sessions; one-shot `exportFromFile()` now closes its session manager.
 
 ### Changed
 
