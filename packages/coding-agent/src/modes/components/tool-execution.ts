@@ -197,9 +197,11 @@ export class ToolExecutionComponent extends Container {
 
 		this.addChild(new Spacer(1));
 
-		// Always create both - contentBox for custom tools/bash/tools with renderers, contentText for other built-ins
-		this.#contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.#contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// Always create both - contentBox for custom tools/bash/tools with renderers, contentText for other built-ins.
+		// Vertical padding is 0: block separation comes solely from the leading Spacer
+		// (1 blank line above each block), matching reference TUIs (083.2).
+		this.#contentBox = new Box(1, 0, (text: string) => theme.bg("toolPendingBg", text));
+		this.#contentText = new Text("", 1, 0, (text: string) => theme.bg("toolPendingBg", text));
 
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
@@ -514,7 +516,7 @@ export class ToolExecutionComponent extends Container {
 					const fileBgFn = fileResult.isError
 						? (text: string) => theme.bg("toolErrorBg", text)
 						: (text: string) => theme.bg("toolSuccessBg", text);
-					const fileBox = new Box(1, 1, fileBgFn);
+					const fileBox = new Box(1, 0, fileBgFn);
 					try {
 						const resultComponent = renderer.renderResult(
 							{ content: [], details: fileResult, isError: fileResult.isError },
@@ -540,7 +542,7 @@ export class ToolExecutionComponent extends Container {
 					const pendingSpacer = new Spacer(1);
 					this.#multiFileBoxes.push(pendingSpacer);
 					this.addChild(pendingSpacer);
-					const pendingBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+					const pendingBox = new Box(1, 0, (text: string) => theme.bg("toolPendingBg", text));
 					const pendingText = renderStatusLine(
 						{
 							icon: "pending",
