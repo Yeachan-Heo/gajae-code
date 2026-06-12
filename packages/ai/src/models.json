@@ -70520,6 +70520,33 @@
 				"maxLevel": "high"
 			}
 		},
+		"grok-composer-2.5-fast": {
+			"id": "grok-composer-2.5-fast",
+			"name": "Grok Composer 2.5 Fast",
+			"api": "openai-completions",
+			"provider": "xai",
+			"baseUrl": "https://api.x.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"compat": {
+				"supportsReasoningEffort": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"grok-vision-beta": {
 			"id": "grok-vision-beta",
 			"name": "Grok Vision Beta",
