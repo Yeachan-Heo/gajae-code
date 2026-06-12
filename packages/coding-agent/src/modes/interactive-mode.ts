@@ -2441,6 +2441,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showModelSelector(options);
 	}
 
+	showEffortSelector(): void {
+		this.#selectorController.showEffortSelector();
+	}
+
 	showProviderOnboarding(): void {
 		this.#selectorController.showProviderOnboarding();
 	}

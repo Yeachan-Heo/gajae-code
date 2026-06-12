@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ThinkingLevel } from "@gajae-code/agent-core";
+import type { ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { setProjectDir } from "@gajae-code/utils";
 import {
@@ -20,7 +21,7 @@ import {
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
-import { parseThinkingLevel } from "../thinking";
+import { getThinkingLevelMetadata, parseThinkingLevel } from "../thinking";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
@@ -201,6 +202,22 @@ function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.ui.requestRender();
 }
 
+/**
+ * Parse a /effort argument into a session thinking level. Accepts canonical
+ * levels plus the Codex-style aliases none→off and min→minimal. "inherit" is
+ * a model-selector concept, not a session effort, so it is rejected.
+ */
+function parseEffortArg(raw: string): ThinkingLevel | undefined {
+	const normalized = raw === "none" ? "off" : raw === "min" ? "minimal" : raw;
+	const level = parseThinkingLevel(normalized);
+	return level === "inherit" ? undefined : level;
+}
+
+/** Selectable /effort levels, derived from the canonical thinking vocabulary. */
+const EFFORT_LEVEL_VALUES: ReadonlyArray<ResolvedThinkingLevel> = ["off", ...THINKING_EFFORTS];
+
+const EFFORT_OPTIONS_HINT = EFFORT_LEVEL_VALUES.join("|");
+
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
 	runtime.ctx.editor.setText("");
 	void runtime.ctx.shutdown();
@@ -324,6 +341,64 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showModelSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "effort",
+		description: "Set reasoning effort for the current session",
+		acpDescription: "Set reasoning effort",
+		acpInputHint: `[${EFFORT_OPTIONS_HINT}]`,
+		subcommands: [
+			...EFFORT_LEVEL_VALUES.map(value => ({
+				name: value,
+				description: getThinkingLevelMetadata(value).description,
+			})),
+			{ name: "status", description: "Show current reasoning effort" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const raw = command.args.trim().toLowerCase();
+			if (!raw || raw === "status") {
+				await runtime.output(
+					`Reasoning effort: ${runtime.session.thinkingLevel ?? "off"}. Options: ${EFFORT_LEVEL_VALUES.join(", ")}.`,
+				);
+				return commandConsumed();
+			}
+			const level = parseEffortArg(raw);
+			if (!level) {
+				await runtime.output(
+					`Unknown effort "${command.args.trim()}". Options: ${EFFORT_LEVEL_VALUES.join(", ")}.`,
+				);
+				return commandConsumed();
+			}
+			runtime.session.setThinkingLevel(level);
+			await runtime.output(`Reasoning effort set to ${runtime.session.thinkingLevel ?? "off"}.`);
+			return commandConsumed();
+		},
+		handleTui: (command, runtime) => {
+			const raw = command.args.trim().toLowerCase();
+			if (!raw) {
+				runtime.ctx.showEffortSelector();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (raw === "status") {
+				runtime.ctx.showStatus(
+					`Reasoning effort: ${runtime.ctx.session.thinkingLevel ?? "off"} (${EFFORT_OPTIONS_HINT})`,
+				);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			const level = parseEffortArg(raw);
+			if (!level) {
+				runtime.ctx.showError(`Unknown effort "${command.args.trim()}" (${EFFORT_OPTIONS_HINT})`);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.session.setThinkingLevel(level);
+			refreshStatusLine(runtime.ctx);
+			runtime.ctx.showStatus(`Reasoning effort set to ${runtime.ctx.session.thinkingLevel ?? "off"}.`);
 			runtime.ctx.editor.setText("");
 		},
 	},

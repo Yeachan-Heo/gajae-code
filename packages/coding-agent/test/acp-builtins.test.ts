@@ -52,6 +52,7 @@ interface FakeAcpBuiltinSession {
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
 	getAvailableModels(): Array<{ provider: string; id: string; contextWindow?: number }>;
 	setModel(model: unknown): Promise<void>;
+	thinkingLevel: unknown;
 	setThinkingLevel(thinkingLevel: unknown): void;
 }
 
@@ -117,7 +118,10 @@ function createRuntime() {
 		getContextUsage: () => undefined,
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
 		async setModel(_model: unknown) {},
-		setThinkingLevel(_thinkingLevel: unknown) {},
+		thinkingLevel: undefined,
+		setThinkingLevel(thinkingLevel: unknown) {
+			this.thinkingLevel = thinkingLevel;
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
@@ -195,6 +199,50 @@ function createRuntime() {
 }
 
 describe("ACP builtin slash commands", () => {
+	it("effort: sets a canonical reasoning level", async () => {
+		const { output, runtime } = createRuntime();
+		const setThinkingLevelSpy = spyOn(runtime.session, "setThinkingLevel");
+
+		const result = await executeAcpBuiltinSlashCommand("/effort minimal", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setThinkingLevelSpy).toHaveBeenCalledWith("minimal");
+		expect(output).toEqual(["Reasoning effort set to minimal."]);
+	});
+
+	it("effort: normalizes the min and none aliases to canonical levels", async () => {
+		const { runtime } = createRuntime();
+		const setThinkingLevelSpy = spyOn(runtime.session, "setThinkingLevel");
+
+		await executeAcpBuiltinSlashCommand("/effort min", runtime);
+		expect(setThinkingLevelSpy).toHaveBeenLastCalledWith("minimal");
+
+		await executeAcpBuiltinSlashCommand("/effort none", runtime);
+		expect(setThinkingLevelSpy).toHaveBeenLastCalledWith("off");
+	});
+
+	it("effort: rejects inherit and unknown values without touching the session", async () => {
+		const { output, runtime } = createRuntime();
+		const setThinkingLevelSpy = spyOn(runtime.session, "setThinkingLevel");
+
+		await executeAcpBuiltinSlashCommand("/effort inherit", runtime);
+		await executeAcpBuiltinSlashCommand("/effort turbo", runtime);
+
+		expect(setThinkingLevelSpy).not.toHaveBeenCalled();
+		expect(output[0]).toContain('Unknown effort "inherit"');
+		expect(output[1]).toContain('Unknown effort "turbo"');
+	});
+
+	it("effort: bare and status report the current level", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.thinkingLevel = "high";
+
+		const result = await executeAcpBuiltinSlashCommand("/effort status", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toStartWith("Reasoning effort: high.");
+	});
+
 	it("consumes fast status without returning prompt text", async () => {
 		const { output, runtime } = createRuntime();
 

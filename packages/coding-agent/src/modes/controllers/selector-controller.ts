@@ -1,8 +1,9 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
-import type { Component, OverlayHandle } from "@gajae-code/tui";
-import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
+import type { Component, OverlayHandle, SelectItem } from "@gajae-code/tui";
+import { Container, Input, Loader, SelectList, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
 import { activateModelProfile } from "../../config/model-profile-activation";
 import { settings } from "../../config/settings";
@@ -16,10 +17,12 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
+import { DynamicBorder } from "../../modes/components/dynamic-border";
 import {
 	getAvailableThemes,
 	getCurrentThemeName,
 	getDetectedThemeSettingsPath,
+	getSelectListTheme,
 	getSymbolTheme,
 	previewTheme,
 	restoreThemePreview,
@@ -37,6 +40,7 @@ import {
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
+import { getThinkingLevelMetadata } from "../../thinking";
 import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -244,6 +248,41 @@ export class SelectorController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorTopBorder();
 		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Dropdown for bare /effort — pick a reasoning effort (thinking level).
+	 * Items derive from the canonical thinking vocabulary so the selector can
+	 * never drift from the levels the session actually accepts.
+	 */
+	showEffortSelector(): void {
+		const levels: SelectItem[] = [ThinkingLevel.Off, ...THINKING_EFFORTS].map(value => {
+			const metadata = getThinkingLevelMetadata(value);
+			return { value, label: metadata.label, description: metadata.description };
+		});
+		this.showSelector(done => {
+			const container = new Container();
+			container.addChild(new DynamicBorder());
+			container.addChild(new Text(theme.fg("accent", " Reasoning effort"), 1, 0));
+			const list = new SelectList(levels, levels.length + 1, getSelectListTheme());
+			const current = this.ctx.session.thinkingLevel;
+			const currentIndex = levels.findIndex(item => item.value === current);
+			if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+			list.onSelect = item => {
+				done();
+				this.ctx.session.setThinkingLevel(item.value as ThinkingLevel);
+				this.ctx.statusLine.invalidate();
+				this.ctx.showStatus(`Reasoning effort set to ${this.ctx.session.thinkingLevel ?? "off"}.`);
+				this.ctx.ui.requestRender();
+			};
+			list.onCancel = () => {
+				done();
+				this.ctx.ui.requestRender();
+			};
+			container.addChild(list);
+			container.addChild(new DynamicBorder());
+			return { component: container, focus: list };
+		});
 	}
 
 	showThemeSelector(): void {
