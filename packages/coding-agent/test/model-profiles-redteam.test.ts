@@ -154,10 +154,10 @@ describe("model profile red-team schema and catalog cases", () => {
 		expect(resolved.agentModelOverrides).toEqual({ executor: "provider/executor:high" });
 	});
 
-	test("mergeModelProfiles with undefined returns exactly the 9 builtins", () => {
+	test("mergeModelProfiles with undefined returns exactly the 13 builtins", () => {
 		const merged = mergeModelProfiles(undefined);
 
-		expect(merged.size).toBe(9);
+		expect(merged.size).toBe(13);
 		expect([...merged.values()]).toEqual([...BUILTIN_MODEL_PROFILES]);
 	});
 

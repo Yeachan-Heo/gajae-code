@@ -40,9 +40,9 @@ function effortOf(selector: string): number {
 }
 
 describe("built-in model profile catalog", () => {
-	test("contains exactly 9 builtins", () => {
-		expect(BUILTIN_MODEL_PROFILES).toHaveLength(9);
-		expect(new Set(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).size).toBe(9);
+	test("contains exactly 13 builtins", () => {
+		expect(BUILTIN_MODEL_PROFILES).toHaveLength(13);
+		expect(new Set(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).size).toBe(13);
 	});
 
 	test("required_providers are correct per family", () => {
@@ -53,6 +53,14 @@ describe("built-in model profile catalog", () => {
 				expect(profile.requiredProviders).toEqual(["opencode-go"]);
 			} else if (profile.name.startsWith("codex-")) {
 				expect(profile.requiredProviders).toEqual(["openai-codex"]);
+			} else if (profile.name === "minimax-standard") {
+				expect(profile.requiredProviders).toEqual(["minimax-code"]);
+			} else if (profile.name === "minimax-cn-standard") {
+				expect(profile.requiredProviders).toEqual(["minimax-code-cn"]);
+			} else if (profile.name === "kimi-standard") {
+				expect(profile.requiredProviders).toEqual(["kimi-code"]);
+			} else if (profile.name === "glm-standard") {
+				expect(profile.requiredProviders).toEqual(["zai"]);
 			} else {
 				throw new Error(`Unexpected built-in profile ${profile.name}`);
 			}
@@ -140,6 +148,65 @@ describe("built-in model profile catalog", () => {
 			role => effortOf(pro.modelMapping[role] ?? "") > effortOf(standard.modelMapping[role] ?? ""),
 		);
 		expect(strictlyHigher).toBe(true);
+	});
+
+	test("MiniMax, Kimi, and GLM presets map to first-class coding plan providers", () => {
+		const expected: Record<string, { provider: string; id: string; efforts: Record<Role, ThinkingLevel> }> = {
+			"minimax-standard": {
+				provider: "minimax-code",
+				id: "minimax-m3",
+				efforts: {
+					default: ThinkingLevel.Medium,
+					executor: ThinkingLevel.Low,
+					architect: ThinkingLevel.High,
+					planner: ThinkingLevel.Medium,
+					critic: ThinkingLevel.High,
+				},
+			},
+			"minimax-cn-standard": {
+				provider: "minimax-code-cn",
+				id: "minimax-m3",
+				efforts: {
+					default: ThinkingLevel.Medium,
+					executor: ThinkingLevel.Low,
+					architect: ThinkingLevel.High,
+					planner: ThinkingLevel.Medium,
+					critic: ThinkingLevel.High,
+				},
+			},
+			"kimi-standard": {
+				provider: "kimi-code",
+				id: "kimi-k2.5",
+				efforts: {
+					default: ThinkingLevel.Medium,
+					executor: ThinkingLevel.Low,
+					architect: ThinkingLevel.High,
+					planner: ThinkingLevel.Medium,
+					critic: ThinkingLevel.High,
+				},
+			},
+			"glm-standard": {
+				provider: "zai",
+				id: "glm-5.1",
+				efforts: {
+					default: ThinkingLevel.Medium,
+					executor: ThinkingLevel.Low,
+					architect: ThinkingLevel.High,
+					planner: ThinkingLevel.Medium,
+					critic: ThinkingLevel.High,
+				},
+			},
+		};
+
+		for (const [profileName, expectation] of Object.entries(expected)) {
+			const profile = builtIn(profileName);
+			for (const role of roles) {
+				const parsed = parseModelString(profile.modelMapping[role] ?? "");
+				expect(parsed?.provider).toBe(expectation.provider);
+				expect(parsed?.id).toBe(expectation.id);
+				expect(parsed?.thinkingLevel).toBe(expectation.efforts[role]);
+			}
+		}
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {

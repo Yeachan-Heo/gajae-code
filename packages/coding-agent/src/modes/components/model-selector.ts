@@ -81,6 +81,34 @@ interface ProfileItem {
 	profile: ModelProfileDefinition;
 }
 
+interface ProfileSurfaceItem {
+	kind: "profile-surface";
+	count: number;
+	groupCount: number;
+}
+
+interface ProfileGroup {
+	id: string;
+	label: string;
+	description: string;
+	profiles: ProfileItem[];
+}
+
+interface ProfileGroupDefinition {
+	id: string;
+	label: string;
+	description: string;
+	matches: (profile: ProfileItem) => boolean;
+}
+
+interface ProfileActionItem {
+	kind: "profile-action";
+	profile: ProfileItem;
+}
+
+type ProfileMenuState = { kind: "groups" } | { kind: "profiles"; group: ProfileGroup };
+type ActionMenuItem = ModelItem | CanonicalModelItem | ProfileActionItem;
+
 type ScopedModelItem = ScopedModelSelection;
 
 interface RoleAssignment {
@@ -150,6 +178,40 @@ const OPENAI_CODE_PROFILE_PRESET: ModelAssignmentPreset = {
 	},
 };
 
+const PROFILE_GROUP_DEFINITIONS: readonly ProfileGroupDefinition[] = [
+	{
+		id: "codex",
+		label: "Codex",
+		description: "OpenAI Codex profiles",
+		matches: profile => profile.name.startsWith("codex-"),
+	},
+	{
+		id: "opencode-go",
+		label: "OpenCode Go",
+		description: "OpenCode Go profiles",
+		matches: profile => profile.name.startsWith("opencode-go-") && !profile.name.includes("-codex-"),
+	},
+	{
+		id: "opencode-go-codex",
+		label: "OpenCode Go + Codex",
+		description: "OpenCode Go defaults with Codex review roles",
+		matches: profile => profile.name.startsWith("opencode-go-codex-"),
+	},
+	{
+		id: "coding-plans",
+		label: "Coding Plans",
+		description: "MiniMax, Kimi, and GLM/zAI profiles",
+		matches: profile =>
+			profile.name.startsWith("minimax-") || profile.name.startsWith("kimi-") || profile.name.startsWith("glm-"),
+	},
+];
+
+const CUSTOM_PROFILE_GROUP_DEFINITION: Omit<ProfileGroupDefinition, "matches"> = {
+	id: "custom",
+	label: "Custom",
+	description: "User-defined profiles",
+};
+
 function formatProviderTabLabel(providerId: string): string {
 	return providerId.replace(/[-_]+/g, " ").toUpperCase();
 }
@@ -161,7 +223,7 @@ function createProviderTab(providerId: string): ProviderTabState {
  * Component that renders a canonical model selector with provider tabs.
  * - Tab/Arrow Left/Right: Switch between provider tabs
  * - Arrow Up/Down: Navigate model list
- * - Enter: Open assignment actions for default plus GJC role-agent models
+ * - Enter: Open grouped profile picker or assignment actions for default plus GJC role-agent models
  * - Escape: Close selector
  */
 export class ModelSelectorComponent extends Container {
@@ -184,10 +246,13 @@ export class ModelSelectorComponent extends Container {
 	#tui: TUI;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
-	#pendingActionItem?: ModelItem | CanonicalModelItem;
+	#pendingActionItem?: ActionMenuItem;
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
+	#profileMenuState?: ProfileMenuState;
+	#selectedProfileGroupIndex: number = 0;
+	#selectedProfileIndex: number = 0;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -240,12 +305,11 @@ export class ModelSelectorComponent extends Container {
 		}
 		this.#searchInput.onSubmit = () => {
 			const selectedItem = this.#getSelectedItem();
-			if (selectedItem) {
-				if (selectedItem.kind === "profile") {
-					this.#beginProfileActionMenu(selectedItem);
-				} else {
-					this.#beginActionMenuOrSelect(selectedItem);
-				}
+			if (!selectedItem) return;
+			if (selectedItem.kind === "profile-surface") {
+				this.#openProfileMenu();
+			} else {
+				this.#beginActionMenuOrSelect(selectedItem);
 			}
 		};
 		this.addChild(this.#searchInput);
@@ -494,7 +558,10 @@ export class ModelSelectorComponent extends Container {
 		this.#canonicalModels = canonicalModels;
 		this.#filteredCanonicalModels = canonicalModels;
 		this.#profileItems = profileItems;
-		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, models.length - 1));
+		this.#selectedIndex = Math.min(
+			this.#selectedIndex,
+			Math.max(0, models.length + this.#getVisibleProfileSurface().length - 1),
+		);
 	}
 
 	#buildProviderTabs(): void {
@@ -619,8 +686,14 @@ export class ModelSelectorComponent extends Container {
 			this.#filteredModels = baseModels;
 			this.#filteredCanonicalModels = baseCanonicalModels;
 		}
+		this.#profileMenuState = undefined;
+		if (this.#pendingActionItem?.kind === "profile-action") {
+			this.#pendingActionItem = undefined;
+		}
 
-		const visibleCount = isCanonicalTab ? this.#filteredCanonicalModels.length : this.#filteredModels.length;
+		const profileSurfaceCount = this.#getVisibleProfileSurface().length;
+		const visibleCount =
+			profileSurfaceCount + (isCanonicalTab ? this.#filteredCanonicalModels.length : this.#filteredModels.length);
 		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, visibleCount - 1));
 		this.#updateList();
 	}
@@ -688,17 +761,65 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
-	#getVisibleProfiles(): ProfileItem[] {
-		return !this.#temporaryOnly && !this.#isCanonicalTab() && this.#getActiveTabId() === ALL_TAB
-			? this.#profileItems
-			: [];
+	#buildProfileGroups(): ProfileGroup[] {
+		const groups: ProfileGroup[] = [];
+		const groupedProfiles = new Set<ProfileItem>();
+		for (const definition of PROFILE_GROUP_DEFINITIONS) {
+			const profiles = this.#profileItems.filter(profile => definition.matches(profile));
+			if (profiles.length === 0) continue;
+			groups.push({
+				id: definition.id,
+				label: definition.label,
+				description: definition.description,
+				profiles,
+			});
+			for (const profile of profiles) groupedProfiles.add(profile);
+		}
+		const customProfiles = this.#profileItems.filter(profile => !groupedProfiles.has(profile));
+		if (customProfiles.length > 0) {
+			groups.push({
+				id: CUSTOM_PROFILE_GROUP_DEFINITION.id,
+				label: CUSTOM_PROFILE_GROUP_DEFINITION.label,
+				description: CUSTOM_PROFILE_GROUP_DEFINITION.description,
+				profiles: customProfiles,
+			});
+		}
+		return groups;
+	}
+
+	#getVisibleProfileSurface(): ProfileSurfaceItem[] {
+		if (
+			this.#temporaryOnly ||
+			this.#isCanonicalTab() ||
+			this.#getActiveTabId() !== ALL_TAB ||
+			this.#profileItems.length === 0
+		) {
+			return [];
+		}
+		return [
+			{ kind: "profile-surface", count: this.#profileItems.length, groupCount: this.#buildProfileGroups().length },
+		];
 	}
 
 	#updateList(): void {
 		this.#listContainer.clear();
+
+		if (this.#pendingActionItem?.kind === "profile-action") {
+			this.#listContainer.addChild(new Text(theme.fg("muted", "Presets"), 0, 0));
+			this.#listContainer.addChild(new Text(`  ${this.#pendingActionItem.profile.name}`, 0, 0));
+			this.#renderProfileActionMenu(this.#pendingActionItem.profile);
+			return;
+		}
+
+		if (this.#profileMenuState) {
+			this.#renderProfileMenu(this.#profileMenuState);
+			return;
+		}
+
 		const isCanonicalTab = this.#isCanonicalTab();
-		const visibleProfiles = this.#getVisibleProfiles();
-		const modelSelectedIndex = Math.max(0, this.#selectedIndex - visibleProfiles.length);
+		const visibleProfileSurface = this.#getVisibleProfileSurface();
+		const profileSurfaceCount = visibleProfileSurface.length;
+		const modelSelectedIndex = Math.max(0, this.#selectedIndex - profileSurfaceCount);
 		const visibleItems = isCanonicalTab ? this.#filteredCanonicalModels : this.#filteredModels;
 
 		const maxVisible = 10;
@@ -710,28 +831,25 @@ export class ModelSelectorComponent extends Container {
 
 		const showProvider = this.#getActiveTabId() === ALL_TAB;
 
-		if (visibleProfiles.length > 0) {
-			this.#listContainer.addChild(new Text(theme.fg("muted", "Profiles"), 0, 0));
-			for (let i = 0; i < visibleProfiles.length; i++) {
-				const profile = visibleProfiles[i];
-				if (!profile) continue;
-				const isSelected = i === this.#selectedIndex;
-				const prefix = isSelected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
-				const label = isSelected ? theme.fg("accent", profile.name) : profile.name;
-				this.#listContainer.addChild(new Text(`${prefix}${label}`, 0, 0));
-			}
+		if (visibleProfileSurface.length > 0) {
+			const surface = visibleProfileSurface[0];
+			const isSelected = this.#selectedIndex === 0;
+			const prefix = isSelected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			const label = isSelected ? theme.fg("accent", "Browse presets") : "Browse presets";
+			const details = theme.fg("dim", ` (${surface.count} profiles in ${surface.groupCount} groups)`);
+			this.#listContainer.addChild(new Text(theme.fg("muted", "Presets"), 0, 0));
+			this.#listContainer.addChild(new Text(`${prefix}${label}${details}`, 0, 0));
 			this.#listContainer.addChild(new Spacer(1));
 		}
-		// Show visible slice of filtered models
+
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = visibleItems[i];
 			if (!item) continue;
 			const canonicalItem = isCanonicalTab ? (item as CanonicalModelItem) : undefined;
 			const providerItem = isCanonicalTab ? undefined : (item as ModelItem);
 
-			const isSelected = i + visibleProfiles.length === this.#selectedIndex;
+			const isSelected = i + profileSurfaceCount === this.#selectedIndex;
 
-			// Build role badges (inverted: color as background, black text)
 			const roleBadgeTokens: string[] = [];
 			for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 				const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[role];
@@ -774,19 +892,17 @@ export class ModelSelectorComponent extends Container {
 			this.#listContainer.addChild(new Text(line, 0, 0));
 		}
 
-		// Add scroll indicator if needed
 		if (startIndex > 0 || endIndex < visibleItems.length) {
-			const scrollInfo = theme.fg("muted", `  (${this.#selectedIndex + 1}/${visibleItems.length})`);
+			const scrollInfo = theme.fg("muted", `  (${modelSelectedIndex + 1}/${visibleItems.length})`);
 			this.#listContainer.addChild(new Text(scrollInfo, 0, 0));
 		}
 
-		// Show error message or "no results" if empty
 		if (this.#errorMessage) {
 			const errorLines = String(this.#errorMessage).split("\n");
 			for (const line of errorLines) {
 				this.#listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
-		} else if (visibleItems.length === 0 && visibleProfiles.length === 0) {
+		} else if (visibleItems.length === 0 && profileSurfaceCount === 0) {
 			const statusMessage = this.#getProviderEmptyStateMessage();
 			this.#listContainer.addChild(
 				new Text(
@@ -795,11 +911,8 @@ export class ModelSelectorComponent extends Container {
 					0,
 				),
 			);
-		} else if (this.#selectedIndex < visibleProfiles.length) {
-			const selectedProfile = visibleProfiles[this.#selectedIndex];
-			if (selectedProfile && this.#pendingActionItem) {
-				this.#renderProfileActionMenu(selectedProfile);
-			}
+		} else if (this.#selectedIndex < profileSurfaceCount) {
+			this.#listContainer.addChild(new Text(theme.fg("muted", "  Enter to open grouped presets"), 0, 0));
 		} else {
 			const selected = visibleItems[modelSelectedIndex];
 			if (!selected) {
@@ -869,6 +982,121 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	#renderProfileMenu(state: ProfileMenuState): void {
+		this.#listContainer.addChild(new Text(theme.fg("muted", "Presets"), 0, 0));
+		if (state.kind === "groups") {
+			const groups = this.#buildProfileGroups();
+			for (let i = 0; i < groups.length; i++) {
+				const group = groups[i];
+				if (!group) continue;
+				const prefix = i === this.#selectedProfileGroupIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+				const label = i === this.#selectedProfileGroupIndex ? theme.fg("accent", group.label) : group.label;
+				const details = theme.fg("dim", ` (${group.profiles.length}) — ${group.description}`);
+				this.#listContainer.addChild(new Text(`${prefix}${label}${details}`, 0, 0));
+			}
+			this.#listContainer.addChild(new Spacer(1));
+			this.#listContainer.addChild(
+				new Text(theme.fg("muted", "  Enter to open a group; Esc to return to models"), 0, 0),
+			);
+			return;
+		}
+
+		this.#listContainer.addChild(
+			new Text(theme.fg("dim", `  ${state.group.label} — ${state.group.description}`), 0, 0),
+		);
+		this.#listContainer.addChild(new Spacer(1));
+		for (let i = 0; i < state.group.profiles.length; i++) {
+			const profile = state.group.profiles[i];
+			if (!profile) continue;
+			const prefix = i === this.#selectedProfileIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			const label = i === this.#selectedProfileIndex ? theme.fg("accent", profile.name) : profile.name;
+			this.#listContainer.addChild(new Text(`${prefix}${label}`, 0, 0));
+		}
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(
+			new Text(theme.fg("muted", "  Enter for actions; Esc to return to preset groups"), 0, 0),
+		);
+	}
+
+	#openProfileMenu(): void {
+		const groups = this.#buildProfileGroups();
+		if (groups.length === 0) return;
+		this.#profileMenuState = { kind: "groups" };
+		this.#selectedProfileGroupIndex = Math.min(this.#selectedProfileGroupIndex, groups.length - 1);
+		this.#selectedProfileIndex = 0;
+		this.#updateList();
+	}
+
+	#handleProfileMenuInput(keyData: string): void {
+		const state = this.#profileMenuState;
+		if (!state) return;
+		if (state.kind === "groups") {
+			const groups = this.#buildProfileGroups();
+			if (groups.length === 0) {
+				this.#profileMenuState = undefined;
+				this.#updateList();
+				return;
+			}
+			if (matchesKey(keyData, "up")) {
+				this.#selectedProfileGroupIndex =
+					this.#selectedProfileGroupIndex === 0 ? groups.length - 1 : this.#selectedProfileGroupIndex - 1;
+				this.#updateList();
+				return;
+			}
+			if (matchesKey(keyData, "down")) {
+				this.#selectedProfileGroupIndex = (this.#selectedProfileGroupIndex + 1) % groups.length;
+				this.#updateList();
+				return;
+			}
+			if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+				const group = groups[this.#selectedProfileGroupIndex];
+				if (!group) return;
+				this.#profileMenuState = { kind: "profiles", group };
+				this.#selectedProfileIndex = 0;
+				this.#updateList();
+				return;
+			}
+			if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+				this.#profileMenuState = undefined;
+				this.#updateList();
+			}
+			return;
+		}
+
+		const profiles = state.group.profiles;
+		if (profiles.length === 0) {
+			this.#profileMenuState = { kind: "groups" };
+			this.#selectedProfileIndex = 0;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "up")) {
+			this.#selectedProfileIndex =
+				this.#selectedProfileIndex === 0 ? profiles.length - 1 : this.#selectedProfileIndex - 1;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "down")) {
+			this.#selectedProfileIndex = (this.#selectedProfileIndex + 1) % profiles.length;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			const profile = profiles[this.#selectedProfileIndex];
+			if (!profile) return;
+			this.#profileMenuState = undefined;
+			this.#pendingActionItem = { kind: "profile-action", profile };
+			this.#selectedActionIndex = 0;
+			this.#updateList();
+			return;
+		}
+		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+			this.#profileMenuState = { kind: "groups" };
+			this.#selectedProfileIndex = 0;
+			this.#updateList();
+		}
+	}
+
 	#getCurrentRoleThinkingLevel(role: string): ThinkingLevel {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
 	}
@@ -876,10 +1104,10 @@ export class ModelSelectorComponent extends Container {
 		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (supportsOpenAICodexPreset(model) ? 1 : 0);
 	}
 
-	#getSelectedItem(): ModelItem | CanonicalModelItem | ProfileItem | undefined {
-		const visibleProfiles = this.#getVisibleProfiles();
-		if (this.#selectedIndex < visibleProfiles.length) return visibleProfiles[this.#selectedIndex];
-		const modelIndex = this.#selectedIndex - visibleProfiles.length;
+	#getSelectedItem(): ModelItem | CanonicalModelItem | ProfileSurfaceItem | undefined {
+		const visibleProfileSurface = this.#getVisibleProfileSurface();
+		if (this.#selectedIndex < visibleProfileSurface.length) return visibleProfileSurface[this.#selectedIndex];
+		const modelIndex = this.#selectedIndex - visibleProfileSurface.length;
 		return this.#isCanonicalTab() ? this.#filteredCanonicalModels[modelIndex] : this.#filteredModels[modelIndex];
 	}
 
@@ -892,6 +1120,10 @@ export class ModelSelectorComponent extends Container {
 			this.#handleActionMenuInput(keyData);
 			return;
 		}
+		if (this.#profileMenuState) {
+			this.#handleProfileMenuInput(keyData);
+			return;
+		}
 
 		// Tab bar navigation
 		if (this.#tabBar?.handleInput(keyData)) {
@@ -901,7 +1133,7 @@ export class ModelSelectorComponent extends Container {
 		// Up arrow - navigate list (wrap to bottom when at top)
 		if (matchesKey(keyData, "up")) {
 			const itemCount =
-				this.#getVisibleProfiles().length +
+				this.#getVisibleProfileSurface().length +
 				(this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length);
 			if (itemCount === 0) return;
 			this.#selectedIndex = this.#selectedIndex === 0 ? itemCount - 1 : this.#selectedIndex - 1;
@@ -912,7 +1144,7 @@ export class ModelSelectorComponent extends Container {
 		// Down arrow - navigate list (wrap to top when at bottom)
 		if (matchesKey(keyData, "down")) {
 			const itemCount =
-				this.#getVisibleProfiles().length +
+				this.#getVisibleProfileSurface().length +
 				(this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length);
 			if (itemCount === 0) return;
 			this.#selectedIndex = this.#selectedIndex === itemCount - 1 ? 0 : this.#selectedIndex + 1;
@@ -920,16 +1152,14 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
-		// Enter opens the persistent assignment menu. Temporary-only mode keeps the
-		// existing non-persistent quick-switch behavior.
+		// Enter opens the grouped preset picker or persistent assignment menu.
+		// Temporary-only mode keeps the existing non-persistent quick-switch behavior.
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selectedItem = this.#getSelectedItem();
-			if (selectedItem) {
-				if (selectedItem.kind === "profile") {
-					this.#beginProfileActionMenu(selectedItem);
-				} else {
-					this.#beginActionMenuOrSelect(selectedItem);
-				}
+			if (selectedItem?.kind === "profile-surface") {
+				this.#openProfileMenu();
+			} else if (selectedItem) {
+				this.#beginActionMenuOrSelect(selectedItem);
 			}
 			return;
 		}
@@ -943,11 +1173,6 @@ export class ModelSelectorComponent extends Container {
 		// Pass everything else to search input
 		this.#searchInput.handleInput(keyData);
 		this.#filterModels(this.#searchInput.getValue());
-	}
-	#beginProfileActionMenu(profile: ProfileItem): void {
-		this.#pendingActionItem = profile as unknown as ModelItem;
-		this.#selectedActionIndex = 0;
-		this.#updateList();
 	}
 
 	#beginActionMenuOrSelect(item: ModelItem | CanonicalModelItem): void {
@@ -963,7 +1188,7 @@ export class ModelSelectorComponent extends Container {
 	#handleActionMenuInput(keyData: string): void {
 		const item = this.#pendingActionItem;
 		if (!item) return;
-		const actionCount = (item as unknown as ProfileItem).kind === "profile" ? 2 : this.#getActionCount(item.model);
+		const actionCount = item.kind === "profile-action" ? 2 : this.#getActionCount(item.model);
 		if (matchesKey(keyData, "up")) {
 			this.#selectedActionIndex = this.#selectedActionIndex === 0 ? actionCount - 1 : this.#selectedActionIndex - 1;
 			this.#updateList();
@@ -976,11 +1201,10 @@ export class ModelSelectorComponent extends Container {
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			this.#pendingActionItem = undefined;
-			if ((item as unknown as ProfileItem).kind === "profile") {
-				const profile = item as unknown as ProfileItem;
+			if (item.kind === "profile-action") {
 				this.#onSelectCallback({
 					kind: "profile",
-					profileName: profile.name,
+					profileName: item.profile.name,
 					setDefault: this.#selectedActionIndex === 1,
 				});
 			} else {

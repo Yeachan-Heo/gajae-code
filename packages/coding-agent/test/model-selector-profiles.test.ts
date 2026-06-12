@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import { BUILTIN_MODEL_PROFILES, type ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -36,9 +36,12 @@ const profile: ModelProfileDefinition = {
 	modelMapping: { default: "provider-a/default:high", executor: "provider-a/alternate" },
 	source: "user",
 };
+const codingPlanProfiles = BUILTIN_MODEL_PROFILES.filter(profile =>
+	["minimax-standard", "minimax-cn-standard", "kimi-standard", "glm-standard"].includes(profile.name),
+);
 
-function createRegistry(options: { missingCredentials?: boolean } = {}) {
-	const profiles = new Map([[profile.name, profile]]);
+function createRegistry(options: { missingCredentials?: boolean; profiles?: ModelProfileDefinition[] } = {}) {
+	const profiles = new Map((options.profiles ?? [profile]).map(profile => [profile.name, profile]));
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
@@ -57,14 +60,14 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 
 function createSelector(
 	onSelect: (selection: ModelSelectorSelection) => void,
-	options: { temporaryOnly?: boolean } = {},
+	options: { temporaryOnly?: boolean; profiles?: ModelProfileDefinition[] } = {},
 ) {
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
 	return new ModelSelectorComponent(
 		ui,
 		undefined,
 		Settings.isolated(),
-		createRegistry() as never,
+		createRegistry({ profiles: options.profiles }) as never,
 		[],
 		onSelect,
 		() => {},
@@ -128,26 +131,78 @@ describe("model selector profiles", () => {
 		installTestTheme();
 	});
 
-	test("renders Profiles above model rows", async () => {
+	test("renders grouped Presets above model rows", async () => {
 		installTestTheme();
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered.indexOf("Profiles")).toBeGreaterThanOrEqual(0);
-		expect(rendered.indexOf("profile-a")).toBeGreaterThan(rendered.indexOf("Profiles"));
-		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("profile-a"));
+		expect(rendered.indexOf("Presets")).toBeGreaterThanOrEqual(0);
+		expect(rendered).toContain("Browse presets");
+		expect(rendered).toContain("Enter to open grouped presets");
+		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("Browse presets"));
+		expect(rendered).not.toContain("profile-a");
 	});
 
-	test("temporary-only mode hides Profiles", async () => {
+	test("opens profile actions through grouped preset picker", async () => {
+		installTestTheme();
+		let selected: ModelSelectorSelection | undefined;
+		const selector = createSelector(selection => {
+			selected = selection;
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Custom (1) — User-defined profiles");
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("profile-a");
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Action for profile: profile-a");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual({ kind: "profile", profileName: "profile-a", setDefault: false });
+	});
+
+	test("groups first-class coding plan presets under Coding Plans", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, { profiles: codingPlanProfiles });
+		await Bun.sleep(10);
+		installTestTheme();
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Browse presets");
+		expect(rendered).not.toContain("minimax-standard");
+		expect(rendered).not.toContain("minimax-cn-standard");
+		expect(rendered).not.toContain("kimi-standard");
+		expect(rendered).not.toContain("glm-standard");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Coding Plans (4) — MiniMax, Kimi, and GLM/zAI profiles");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("minimax-standard");
+		expect(rendered).toContain("minimax-cn-standard");
+		expect(rendered).toContain("kimi-standard");
+		expect(rendered).toContain("glm-standard");
+		expect(rendered).not.toContain("provider-a/default");
+	});
+
+	test("temporary-only mode hides Presets", async () => {
 		installTestTheme();
 		const selector = createSelector(() => {}, { temporaryOnly: true });
 		await Bun.sleep(10);
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered).not.toContain("Profiles");
+		expect(rendered).not.toContain("Presets");
+		expect(rendered).not.toContain("Browse presets");
 		expect(rendered).not.toContain("profile-a");
 	});
 

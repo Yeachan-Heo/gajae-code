@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added first-class `minimax-standard`, `minimax-cn-standard`, `kimi-standard`, and `glm-standard` model profiles plus a grouped `/model` Presets browser so profile presets stay scannable as the catalog grows (#532).
+
 ### Changed
 
 - Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).

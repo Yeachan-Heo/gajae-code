@@ -195,8 +195,10 @@ Built-in profiles are grouped by provider mix and tier:
 - `opencode-go-{eco,standard,pro}`
 - `codex-{eco,standard,pro}`
 - `opencode-go-codex-{eco,standard,pro}`
+- Coding-plan profiles: `minimax-standard`, `minimax-cn-standard`, `kimi-standard`, `glm-standard`
 
-The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. The `codex-standard` and `codex-pro` profiles share the current `openai-codex/gpt-5.5` model baseline and differ only by per-role reasoning effort rather than by model generation. User-defined profiles override built-ins by exact profile name.
+The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. The `codex-standard` and `codex-pro` profiles share the current `openai-codex/gpt-5.5` model baseline and differ only by per-role reasoning effort rather than by model generation. The MiniMax, Kimi, and GLM presets are single-provider `standard` profiles over the first-class coding-plan providers (`minimax-code`, `minimax-code-cn`, `kimi-code`, and `zai`). User-defined profiles override built-ins by exact profile name.
+
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
 
@@ -205,7 +207,7 @@ gjc --mpreset codex-standard
 gjc --mpreset opencode-go-pro --default
 ```
 
-The `/model` command shows a `Profiles` section above model selection. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers.
+The `/model` command shows a `Presets` section with a `Browse presets` row above model selection. The selector groups profile presets behind that row, then shows provider-mix groups such as Codex, OpenCode Go, Coding Plans, and Custom so profile growth does not flatten into the model list. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers.
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 

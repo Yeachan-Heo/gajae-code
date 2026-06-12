@@ -142,27 +142,30 @@ describe("model selector profile red-team", () => {
 		installTestTheme();
 	});
 
-	test("empty profile catalog omits Profiles section and does not crash", async () => {
+	test("empty profile catalog omits Presets section and does not crash", async () => {
 		const selector = createSelector(() => {}, { profiles: [] });
 		const rendered = await renderSelector(selector);
 
-		expect(rendered).not.toContain("Profiles");
+		expect(rendered).not.toContain("Presets");
 		expect(rendered).toContain("provider-a/default");
 	});
 
-	test("temporary-only mode hides Profiles even when profiles exist", async () => {
+	test("temporary-only mode hides Presets even when profiles exist", async () => {
 		const selector = createSelector(() => {}, { temporaryOnly: true });
 		const rendered = await renderSelector(selector);
 
-		expect(rendered).not.toContain("Profiles");
+		expect(rendered).not.toContain("Presets");
 		expect(rendered).not.toContain("profile-a");
 	});
 
-	test("user-overridden profile name appears once", async () => {
+	test("user-overridden profile name appears once inside grouped presets", async () => {
 		const builtinProfile: ModelProfileDefinition = { ...userProfile, source: "builtin" };
 		const overriddenProfile: ModelProfileDefinition = { ...userProfile, source: "user" };
 		const selector = createSelector(() => {}, { profiles: [builtinProfile, overriddenProfile] });
-		const rendered = await renderSelector(selector);
+		await renderSelector(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered.match(/profile-a/g) ?? []).toHaveLength(1);
 	});
@@ -175,11 +178,15 @@ describe("model selector profile red-team", () => {
 		await renderSelector(applySelector);
 		applySelector.handleInput("\n");
 		applySelector.handleInput("\n");
+		applySelector.handleInput("\n");
+		applySelector.handleInput("\n");
 
 		const defaultSelector = createSelector(selection => {
 			selections.push(selection);
 		});
 		await renderSelector(defaultSelector);
+		defaultSelector.handleInput("\n");
+		defaultSelector.handleInput("\n");
 		defaultSelector.handleInput("\n");
 		defaultSelector.handleInput("\x1b[B");
 		defaultSelector.handleInput("\n");
@@ -222,26 +229,30 @@ describe("model selector profile red-team", () => {
 		expect(setCalls).toEqual([]);
 	});
 
-	test("profile names with unusual characters render without breaking the list", async () => {
+	test("profile names with unusual characters render without breaking the grouped preset list", async () => {
 		const weirdProfile: ModelProfileDefinition = {
 			...userProfile,
 			name: "Team/Profile: β 🚀 [default] {x}|$",
 		};
 		const selector = createSelector(() => {}, { profiles: [weirdProfile] });
-		const rendered = await renderSelector(selector);
+		await renderSelector(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
-		expect(rendered).toContain("Profiles");
+		expect(rendered).toContain("Presets");
 		expect(rendered).toContain("Team/Profile: β 🚀 [default] {x}|$");
-		expect(rendered).toContain("provider-a/default");
+		expect(rendered).not.toContain("provider-a/default");
 	});
 
-	test("profiles render above flat model rows", async () => {
+	test("grouped presets render above flat model rows", async () => {
 		const selector = createSelector(() => {});
 		const rendered = await renderSelector(selector);
 
-		expect(rendered.indexOf("Profiles")).toBeGreaterThanOrEqual(0);
-		expect(rendered.indexOf("profile-a")).toBeGreaterThan(rendered.indexOf("Profiles"));
-		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("profile-a"));
-		expect(rendered.indexOf("provider-b/zzz-flat-model")).toBeGreaterThan(rendered.indexOf("profile-a"));
+		expect(rendered.indexOf("Presets")).toBeGreaterThanOrEqual(0);
+		expect(rendered.indexOf("Browse presets")).toBeGreaterThan(rendered.indexOf("Presets"));
+		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("Browse presets"));
+		expect(rendered.indexOf("provider-b/zzz-flat-model")).toBeGreaterThan(rendered.indexOf("Browse presets"));
+		expect(rendered).not.toContain("profile-a");
 	});
 });
