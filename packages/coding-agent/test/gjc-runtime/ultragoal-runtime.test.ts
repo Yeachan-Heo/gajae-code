@@ -586,6 +586,74 @@ describe("native GJC ultragoal runtime", () => {
 		expect(supersededGoal).toMatchObject({ status: "superseded", steering: { noReplacementRequired: true } });
 	});
 
+	it("rejects blocked supersession when it would remove the final required goal", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Complete the only story" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+
+		const stderr = await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence shows this blocked sub-goal is no longer required",
+				"--rationale",
+				"negative test verifies the final required goal cannot be superseded without replacement",
+			],
+			"mark_blocked_superseded",
+		);
+
+		expect(stderr).toContain("only remaining required goal");
+	});
+
+	it("allows blocked supersession when another required goal remains", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: ["@goal: First", "Complete first story.", "", "@goal: Second", "Complete second story."].join("\n"),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+
+		const supersede = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence shows this blocked sub-goal is no longer required",
+				"--rationale",
+				"remaining required goal covers the aggregate objective",
+				"--json",
+			],
+			root,
+		);
+		const plan = await readUltragoalPlan(root);
+
+		expect(supersede.status).toBe(0);
+		expect(plan?.goals.map(goal => [goal.id, goal.status])).toEqual([
+			["G001", "superseded"],
+			["G002", "pending"],
+		]);
+	});
+
 	it("audits known-kind steering rejections without mutating goals", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({

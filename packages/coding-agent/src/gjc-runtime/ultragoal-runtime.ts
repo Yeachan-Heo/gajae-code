@@ -1630,6 +1630,10 @@ async function markBlockedUltragoalSuperseded(input: {
 	});
 	const goal = findGoalOrThrow(input.plan, input.goalId, kind);
 	requireGoalStatus(goal, ["blocked", "review_blocked"], kind);
+	const remainingRequiredGoals = requiredUltragoalGoals(input.plan).filter(item => item.id !== goal.id);
+	if (remainingRequiredGoals.length === 0) {
+		throw new Error(`steer ${kind} cannot supersede ${goal.id} because it is the only remaining required goal`);
+	}
 	const now = new Date().toISOString();
 	goal.status = "superseded";
 	goal.evidence = evidence;
