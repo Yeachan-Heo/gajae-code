@@ -15,6 +15,7 @@
 - Set SQLite auth-store `busy_timeout` before enabling WAL so initialization is reliable under contention.
 - Resolved provider credentials from inherited or GJC-owned environment sources instead of trusting the caller project's `.env` overlays.
 - Rendered and executed Cursor-native tool calls without dropping provider-specific call details.
+- Stripped `OpenAI-Beta` in the `openai-proxy` request transform profile so OpenAI-compatible proxies do not receive SDK beta headers.
 
 ## [0.4.4] - 2026-06-10
 

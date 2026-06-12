@@ -63,7 +63,7 @@ describe("OpenAI-compatible request transforms", () => {
 			baseUrl: "https://proxy.example/v1",
 			id: "local-selector",
 			wireModelId: "upstream-wire-id",
-			headers: { "x-stainless-lang": "js", "x-keep": "yes" },
+			headers: { "x-stainless-lang": "js", "OpenAI-Beta": "responses=v1", "x-keep": "yes" },
 			requestTransform: {
 				profile: "openai-proxy",
 				setHeaders: { "x-custom": "configured", "x-remove": null },
@@ -87,6 +87,7 @@ describe("OpenAI-compatible request transforms", () => {
 		}
 
 		expect(capturedHeaders.get("x-stainless-lang")).toBeNull();
+		expect(capturedHeaders.get("openai-beta")).toBeNull();
 		expect(capturedHeaders.get("x-keep")).toBe("yes");
 		expect(capturedHeaders.get("x-custom")).toBe("configured");
 		expect(capturedHeaders.get("x-remove")).toBeNull();

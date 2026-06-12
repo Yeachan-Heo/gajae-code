@@ -274,7 +274,7 @@ Use provider-level `headers` for proxy-required headers. Keep the provider `api`
 
 When request shaping is needed:
 
-- `requestTransform.profile: openai-proxy` strips OpenAI SDK/Stainless telemetry headers at final fetch time and sets a generic GJC user agent.
+- `requestTransform.profile: openai-proxy` strips OpenAI SDK/Stainless telemetry and beta headers at final fetch time and sets a generic GJC user agent.
 - `stripHeaders` replaces the preset strip list when provided.
 - `setHeaders` is applied after stripping; use `null` to remove a header.
 - `extraBody` is shallow-merged into the JSON request body after provider compatibility fields; core transport keys such as `model`, `messages`/`input`, `stream`, `tools`, and `tool_choice` are protected and ignored.
