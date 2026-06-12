@@ -150,3 +150,39 @@ describe("CursorExecHandlers grep empty pattern guard (#501)", () => {
 		expect(searchCalls[0]).toMatchObject({ paths: ["/tmp/*.ts"] });
 	});
 });
+
+describe("CursorExecHandlers shell timeout unit conversion", () => {
+	function makeShellRecordingHandlers(bashCalls: Array<Record<string, unknown>>): CursorExecHandlers {
+		const bashTool = {
+			name: "bash",
+			label: "bash",
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				bashCalls.push(args);
+				return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const tools = new Map<string, AgentTool>([["bash", bashTool]]);
+		return new CursorExecHandlers({ cwd: process.cwd(), tools } as never);
+	}
+
+	it("converts wire milliseconds to bash seconds (block_until_ms: 30000 → 30s, not 30000s)", async () => {
+		const bashCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeShellRecordingHandlers(bashCalls);
+		await handlers.shell(create(ShellArgsSchema, { command: "echo hi", timeout: 30000, toolCallId: "s" }));
+		expect(bashCalls[0]).toMatchObject({ command: "echo hi", timeout: 30 });
+	});
+
+	it("omits the timeout when unset or zero", async () => {
+		const bashCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeShellRecordingHandlers(bashCalls);
+		await handlers.shell(create(ShellArgsSchema, { command: "echo hi", toolCallId: "s" }));
+		expect(bashCalls[0]?.["timeout"]).toBeUndefined();
+	});
+
+	it("rounds sub-second timeouts up to 1s instead of dropping them", async () => {
+		const bashCalls: Array<Record<string, unknown>> = [];
+		const handlers = makeShellRecordingHandlers(bashCalls);
+		await handlers.shell(create(ShellArgsSchema, { command: "echo hi", timeout: 500, toolCallId: "s" }));
+		expect(bashCalls[0]).toMatchObject({ timeout: 1 });
+	});
+});

@@ -51,7 +51,7 @@ async function saveBashOriginalArtifact(session: ToolSession, originalText: stri
 const bashSchemaBase = z.object({
 	command: z.string().describe("command to execute"),
 	env: z.record(z.string().regex(BASH_ENV_NAME_PATTERN), z.string()).optional().describe("extra env vars"),
-	timeout: z.number().default(300).describe("timeout in seconds").optional(),
+	timeout: z.number().default(300).describe("timeout in seconds, NOT milliseconds (30 = 30s)").optional(),
 	cwd: z.string().describe("working directory").optional(),
 	pty: z.boolean().describe("run in pty mode").optional(),
 });
