@@ -34,10 +34,17 @@ function recordPath(sessionId: string, agentDir?: string): string {
 	return path.join(rpcSessionsDir(agentDir), `${sessionId}.json`);
 }
 
-/** Write (or replace) the registry record for a session. */
+/**
+ * Write (or replace) the registry record for a session. The record is written to
+ * a same-directory temp file and atomically renamed into place so a concurrent
+ * reader never observes (and reaps) a partially-written record.
+ */
 export async function registerRpcSession(record: RpcSessionRecord, agentDir?: string): Promise<string> {
 	const file = recordPath(record.sessionId, agentDir);
-	await Bun.write(file, JSON.stringify(record));
+	// `.tmp` suffix keeps the staging file out of the `*.json` listing/reaping path.
+	const staging = `${file}.${process.pid}.tmp`;
+	await Bun.write(staging, JSON.stringify(record));
+	await fs.rename(staging, file);
 	return file;
 }
 
