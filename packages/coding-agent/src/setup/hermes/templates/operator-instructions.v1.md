@@ -9,11 +9,15 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled.
 2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
 3. Store the returned `turn_id`.
-4. Poll `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for that `turn_id` until the turn is terminal.
+4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `latest_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
    If a second task is needed while one turn is active, pass `queue: true`; the next queued turn is promoted after the active turn is reported terminal.
 5. If GJC asks a structured question, use `{{TOOL_PREFIX}}_list_questions` and answer with `{{TOOL_PREFIX}}_submit_question_answer`.
 6. Use `{{TOOL_PREFIX}}_report_status` for coordinator-visible status and final reports.
 7. Use `{{TOOL_PREFIX}}_read_tail` only as advisory debug output when structured turn state is insufficient.
+
+## Event watch
+
+`{{TOOL_PREFIX}}_watch_events` is a bounded long-poll read tool. Call it with `after_seq` set to the last stored sequence number, optional `session_id` or `event_types`, `timeout_ms` up to 30000, and `limit` up to 100. Store the returned `latest_seq` before the next wait. A timeout with no events is not failure; call again or use the turn/status read tools for a snapshot.
 
 Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
 

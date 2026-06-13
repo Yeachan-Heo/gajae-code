@@ -168,6 +168,50 @@ interface CoordinatorSessionState {
 	reason: string | null;
 }
 
+type CoordinatorEventKind =
+	| "session.registered"
+	| "session.started"
+	| "session.state_changed"
+	| "turn.queued"
+	| "turn.delivering"
+	| "turn.active"
+	| "turn.waiting_for_answer"
+	| "turn.completed"
+	| "turn.failed"
+	| "turn.cancelled"
+	| "turn.superseded"
+	| "question.opened"
+	| "question.answered"
+	| "report.written"
+	| "tmux.delivery_succeeded"
+	| "tmux.delivery_failed";
+
+interface CoordinatorEvent {
+	schema_version: 1;
+	seq: number;
+	id: string;
+	timestamp: string;
+	kind: CoordinatorEventKind;
+	session_id?: string;
+	turn_id?: string;
+	question_id?: string;
+	report_id?: string;
+	summary: string;
+	payload_ref?: string;
+	metadata?: Record<string, string | number | boolean | null>;
+}
+
+interface CoordinatorEventInput {
+	kind: CoordinatorEventKind;
+	sessionId?: string | null;
+	turnId?: string | null;
+	questionId?: string | null;
+	reportId?: string | null;
+	summary: string;
+	payloadRef?: string | null;
+	metadata?: Record<string, string | number | boolean | null>;
+}
+
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
@@ -351,6 +395,22 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_read_coordination_status") {
 		return { name, description: "Read coordinator coordination reports.", inputSchema: common };
 	}
+	if (name === "gjc_coordinator_watch_events") {
+		return {
+			name,
+			description: "Long-poll the durable coordinator event journal for new bounded event records.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					after_seq: { type: "number" },
+					session_id: sessionId,
+					event_types: { type: "array", items: { type: "string" } },
+					timeout_ms: { type: "number" },
+					limit: { type: "number" },
+				},
+			},
+		};
+	}
 	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
 }
 
@@ -457,6 +517,135 @@ function activeSessionStates(sessionStates: Array<Record<string, unknown>>): Arr
 	});
 }
 
+function eventsDir(namespaceDir: string): string {
+	return path.join(namespaceDir, "events");
+}
+
+function eventJournalFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "event-journal.jsonl");
+}
+
+function eventSequenceFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "latest-seq.json");
+}
+
+function boundSummary(value: string): string {
+	const normalized = value
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+}
+
+async function readLatestEventSeq(namespaceDir: string): Promise<number> {
+	const sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	const seq = sequence?.seq;
+	if (typeof seq === "number" && Number.isInteger(seq) && seq >= 0) return seq;
+	let latestSeq = 0;
+	for (const event of await readCoordinatorEvents(namespaceDir)) latestSeq = Math.max(latestSeq, event.seq);
+	return latestSeq;
+}
+
+async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEventInput): Promise<CoordinatorEvent> {
+	const latestSeq = await readLatestEventSeq(namespaceDir);
+	const seq = latestSeq + 1;
+	const timestamp = new Date().toISOString();
+	const event: CoordinatorEvent = {
+		schema_version: 1,
+		seq,
+		id: `event-${seq.toString().padStart(12, "0")}`,
+		timestamp,
+		kind: input.kind,
+		summary: boundSummary(input.summary),
+		...(input.sessionId ? { session_id: input.sessionId } : {}),
+		...(input.turnId ? { turn_id: input.turnId } : {}),
+		...(input.questionId ? { question_id: input.questionId } : {}),
+		...(input.reportId ? { report_id: input.reportId } : {}),
+		...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
+		...(input.metadata ? { metadata: input.metadata } : {}),
+	};
+	await ensureDir(eventsDir(namespaceDir));
+	await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
+	await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+	return event;
+}
+
+function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
+	try {
+		const event = JSON.parse(line) as CoordinatorEvent;
+		if (typeof event.seq !== "number" || typeof event.kind !== "string") return null;
+		return event;
+	} catch {
+		return null;
+	}
+}
+
+async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorEvent[]> {
+	try {
+		const content = await fs.readFile(eventJournalFile(namespaceDir), "utf8");
+		return content
+			.split("\n")
+			.map(line => line.trim())
+			.filter(Boolean)
+			.map(parseCoordinatorEvent)
+			.filter((event): event is CoordinatorEvent => event !== null)
+			.sort((left, right) => left.seq - right.seq);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+}
+
+function boundedEventLimit(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return 100;
+	return Math.min(parsed, 100);
+}
+
+function eventTypeFilter(value: unknown): Set<string> | null {
+	if (!Array.isArray(value)) return null;
+	const types = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+	return types.length > 0 ? new Set(types) : null;
+}
+
+function filterCoordinatorEvents(
+	events: CoordinatorEvent[],
+	args: Record<string, unknown>,
+	limit: number,
+): CoordinatorEvent[] {
+	const afterSeq =
+		typeof args.after_seq === "number" ? args.after_seq : Number.parseInt(String(args.after_seq ?? "0"), 10);
+	const safeAfterSeq = Number.isFinite(afterSeq) && afterSeq > 0 ? afterSeq : 0;
+	const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
+	const eventTypes = eventTypeFilter(args.event_types);
+	return events
+		.filter(event => event.seq > safeAfterSeq)
+		.filter(event => !sessionId || event.session_id === sessionId)
+		.filter(event => !eventTypes || eventTypes.has(event.kind))
+		.slice(0, limit);
+}
+
+function eventSummaries(
+	events: CoordinatorEvent[],
+): Array<
+	Pick<
+		CoordinatorEvent,
+		"seq" | "id" | "timestamp" | "kind" | "session_id" | "turn_id" | "question_id" | "report_id" | "summary"
+	>
+> {
+	return events.map(event => ({
+		seq: event.seq,
+		id: event.id,
+		timestamp: event.timestamp,
+		kind: event.kind,
+		...(event.session_id ? { session_id: event.session_id } : {}),
+		...(event.turn_id ? { turn_id: event.turn_id } : {}),
+		...(event.question_id ? { question_id: event.question_id } : {}),
+		...(event.report_id ? { report_id: event.report_id } : {}),
+		summary: event.summary,
+	}));
+}
+
 function safeExternalId(kind: "session" | "question", value: unknown): string {
 	if (typeof value !== "string" || !SAFE_EXTERNAL_ID_PATTERN.test(value)) throw new Error(`invalid_${kind}_id`);
 	return value;
@@ -513,8 +702,36 @@ async function readTurnRecord(namespaceDir: string, turnId: unknown): Promise<Tu
 	return (await readJsonFile(turnFile(namespaceDir, safeTurnId(turnId)))) as TurnRecord | null;
 }
 
+function turnEventKind(status: TurnStatus): CoordinatorEventKind | null {
+	if (status === "queued") return "turn.queued";
+	if (status === "delivering") return "turn.delivering";
+	if (status === "active") return "turn.active";
+	if (status === "waiting_for_answer") return "turn.waiting_for_answer";
+	if (status === "completed") return "turn.completed";
+	if (status === "failed") return "turn.failed";
+	if (status === "cancelled") return "turn.cancelled";
+	if (status === "superseded") return "turn.superseded";
+	return null;
+}
+
 async function writeTurnRecord(namespaceDir: string, turn: TurnRecord): Promise<void> {
+	const previous = (await readJsonFile(turnFile(namespaceDir, turn.turn_id))) as TurnRecord | null;
 	await writeJsonFile(turnFile(namespaceDir, turn.turn_id), turn);
+	const kind = previous?.status === turn.status ? null : turnEventKind(turn.status);
+	if (kind) {
+		await appendCoordinatorEvent(namespaceDir, {
+			kind,
+			sessionId: turn.session_id,
+			turnId: turn.turn_id,
+			summary: `Turn ${turn.turn_id} is ${turn.status}`,
+			payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, turn.turn_id)),
+			metadata: {
+				status: turn.status,
+				queued: turn.delivery.queued,
+				tmux_keys_sent: turn.delivery.tmux_keys_sent ?? null,
+			},
+		});
+	}
 }
 
 async function readActiveTurn(namespaceDir: string, sessionId: string): Promise<TurnRecord | null> {
@@ -569,6 +786,28 @@ async function writeSessionState(
 		reason: options.reason ?? null,
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
+	if (
+		!previous ||
+		previous.state !== payload.state ||
+		previous.current_turn_id !== payload.current_turn_id ||
+		previous.last_turn_id !== payload.last_turn_id ||
+		previous.live !== payload.live ||
+		previous.reason !== payload.reason
+	) {
+		await appendCoordinatorEvent(namespaceDir, {
+			kind: "session.state_changed",
+			sessionId,
+			turnId: payload.current_turn_id ?? payload.last_turn_id,
+			summary: `Session ${sessionId} state changed to ${payload.state}`,
+			payloadRef: path.relative(namespaceDir, sessionStateFile(namespaceDir, sessionId)),
+			metadata: {
+				state: payload.state,
+				ready_for_input: payload.ready_for_input,
+				live: payload.live,
+				reason: payload.reason,
+			},
+		});
+	}
 	return payload;
 }
 
@@ -944,6 +1183,31 @@ function waitForTurnStateChange(namespaceDir: string, turn: TurnRecord, timeoutM
 	return deferred.promise;
 }
 
+async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number): Promise<void> {
+	const deferred = Promise.withResolvers<void>();
+	const watchers: nodeFs.FSWatcher[] = [];
+	let settled = false;
+	const finish = () => {
+		if (settled) return;
+		settled = true;
+		for (const watcher of watchers) watcher.close();
+		clearTimeout(timer);
+		deferred.resolve();
+	};
+	const timer = setTimeout(finish, Math.max(timeoutMs, 0));
+	timer.unref?.();
+	await ensureDir(eventsDir(namespaceDir));
+	try {
+		const watcher = nodeFs.watch(eventsDir(namespaceDir), (_eventType, filename) => {
+			if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
+		});
+		watchers.push(watcher);
+	} catch {
+		// Directory may not exist yet; the timeout remains a bounded fallback.
+	}
+	return deferred.promise;
+}
+
 function decodeUtf8WithinByteCap(bytes: Buffer, byteCap: number): string {
 	const decoder = new TextDecoder("utf-8", { fatal: true });
 	for (let end = Math.min(bytes.length, byteCap); end >= 0; end--) {
@@ -1096,6 +1360,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				reason: tmuxKeysSent ? null : "tmux_delivery_unavailable",
 			});
 		}
+		await appendCoordinatorEvent(namespaceDir, {
+			kind: tmuxKeysSent ? "tmux.delivery_succeeded" : "tmux.delivery_failed",
+			sessionId: activeTurn.session_id,
+			turnId: activeTurn.turn_id,
+			summary: tmuxKeysSent
+				? `Tmux delivery succeeded for turn ${activeTurn.turn_id}`
+				: `Tmux delivery failed for turn ${activeTurn.turn_id}`,
+			payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, activeTurn.turn_id)),
+			metadata: { target: typeof target === "string" ? target : null, live },
+		});
 		return activeTurn;
 	}
 
@@ -1194,6 +1468,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					sessionFile(sessionId),
 					commandRunner,
 				);
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "session.registered",
+					sessionId,
+					summary: `Session ${sessionId} registered for coordinator control`,
+					payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
+					metadata: { source: optionalString(args.source) ?? "register_session", visible: args.visible !== false },
+				});
+
 				return {
 					ok: true,
 					session: registered.session,
@@ -1239,6 +1521,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir)));
 				const questions = jsonRecords(await listQuestions(args));
 				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports")));
+				const events = await readCoordinatorEvents(namespaceDir);
 				return {
 					ok: true,
 					schema_version: 1,
@@ -1261,6 +1544,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					questions,
 					reports,
 					events: buildCanonicalCoordinatorEvents({ sessionStates, turns, questions, reports }),
+					latest_event_seq: await readLatestEventSeq(namespaceDir),
+					recent_events: eventSummaries(events.slice(-10)),
+				};
+			}
+			if (name === "gjc_coordinator_watch_events") {
+				const limit = boundedEventLimit(args.limit);
+				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				let events = await readCoordinatorEvents(namespaceDir);
+				let matched = filterCoordinatorEvents(events, args, limit);
+				let timedOut = false;
+				if (matched.length === 0 && timeoutMs > 0) {
+					await waitForCoordinatorEvents(namespaceDir, timeoutMs);
+					events = await readCoordinatorEvents(namespaceDir);
+					matched = filterCoordinatorEvents(events, args, limit);
+					timedOut = matched.length === 0;
+				}
+				return {
+					ok: true,
+					events: matched,
+					latest_seq: await readLatestEventSeq(namespaceDir),
+					timed_out: timedOut,
+					transport: { mcp: "long_poll", push_subscriptions: false },
 				};
 			}
 			if (name === "gjc_coordinator_start_session") {
@@ -1279,6 +1584,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (!startedRecord) throw new Error("coordinator_session_command_required");
 				const session = normalizeSession(startedRecord);
 				await writeJsonFile(sessionFile(session.session_id), session);
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "session.started",
+					sessionId: String(session.session_id),
+					summary: `Session ${String(session.session_id)} started by coordinator`,
+					payloadRef: path.relative(namespaceDir, sessionFile(session.session_id)),
+					metadata: { prompted: typeof args.prompt === "string" && args.prompt.length > 0 },
+				});
 				const live = hasTmuxIdentity(session) ? await hasTmuxSession(session, commandRunner) : null;
 				let sessionState = await writeSessionState(namespaceDir, String(session.session_id), "ready_for_input", {
 					live,
@@ -1427,6 +1739,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					answered_at: new Date().toISOString(),
 				};
 				await writeJsonFile(questionPath, answered);
+				if (question.status === "open") {
+					await appendCoordinatorEvent(namespaceDir, {
+						kind: "question.opened",
+						sessionId: typeof question.session_id === "string" ? question.session_id : null,
+						turnId: typeof question.turn_id === "string" ? question.turn_id : null,
+						questionId,
+						summary: `Question ${questionId} opened`,
+						payloadRef: path.relative(namespaceDir, questionPath),
+					});
+				}
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "question.answered",
+					sessionId: typeof question.session_id === "string" ? question.session_id : null,
+					turnId: typeof question.turn_id === "string" ? question.turn_id : null,
+					questionId,
+					summary: `Question ${questionId} answered`,
+					payloadRef: path.relative(namespaceDir, questionPath),
+				});
+
 				let turn: TurnRecord | null = null;
 				if (answeredTurnId) {
 					turn = await readTurnRecord(namespaceDir, answeredTurnId);
@@ -1525,7 +1856,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						promotedTurn = await promoteNextQueuedTurn(turn.session_id);
 					}
 				}
-				await writeJsonFile(path.join(namespaceDir, "reports", `${Date.now()}.json`), report);
+				const reportId = `report-${Date.now()}`;
+				const reportPath = path.join(namespaceDir, "reports", `${reportId}.json`);
+				await writeJsonFile(reportPath, report);
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "report.written",
+					sessionId,
+					turnId: typeof args.turn_id === "string" ? args.turn_id : null,
+					reportId,
+					summary:
+						typeof args.summary === "string"
+							? args.summary
+							: `Report ${String(args.status ?? "unknown")} written`,
+					payloadRef: path.relative(namespaceDir, reportPath),
+					metadata: { status: typeof args.status === "string" ? args.status : null },
+				});
 				return {
 					ok: true,
 					report,

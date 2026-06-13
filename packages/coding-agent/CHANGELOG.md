@@ -64,6 +64,10 @@
 - Preserved dev/main release metadata and changelog consistency for the 0.4.5 lockstep release.
 
 - Added native `gjc ultragoal steer --kind` support for documented steering mutations beyond `add_subgoal`, including split, reorder, wording revision, ledger annotation, and blocked-goal supersession contracts with structured audit expectations.
+### Added
+
+- Added a durable coordinator event journal and `gjc_coordinator_watch_events` long-poll MCP tool so Hermes-style coordinators can react to session, turn, question, report, and tmux-delivery changes without fixed snapshot polling.
+
 ### Fixed
 
 - Kept the unified `goal` tool registered and active by default whenever `goal.enabled` is true, including explicit tool subsets and `gjc ultragoal create-goals` arming flows.
