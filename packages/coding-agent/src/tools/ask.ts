@@ -34,6 +34,8 @@ import {
 	renderDeepInterviewAskQuestion,
 } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { appendOrMergeDeepInterviewRound } from "../gjc-runtime/deep-interview-recorder";
+import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
 import { gateAnswerToResult, questionToGate } from "../modes/shared/agent-wire/deep-interview-gate";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
@@ -50,15 +52,25 @@ const OptionItem = z.object({
 	label: z.string().describe("display label"),
 });
 
+/** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
+const DeepInterviewMeta = z.object({
+	round_id: z.string().describe("stable optional round identity").optional(),
+	round: z.number().int().nonnegative().describe("round number"),
+	component: z.string().min(1).describe("targeted topology component"),
+	dimension: z.string().min(1).describe("targeted clarity dimension"),
+	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
+});
+
 const QuestionItem = z.object({
 	id: z.string().describe("question id"),
 	question: z.string().describe("question text"),
 	options: z.array(OptionItem).describe("available options"),
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
+	deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
 });
 
-const askSchema = z.object({
+export const askSchema = z.object({
 	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
 });
 
@@ -456,6 +468,45 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		TERMINAL.sendNotification("Waiting for input");
 	}
 
+	/**
+	 * Record a resolved deep-interview round when the question carries structured
+	 * metadata. The runtime owns durable record/merge semantics; this tool is only the
+	 * caller. Best-effort: a state-write hiccup must not break the user's answer flow.
+	 */
+	async #recordDeepInterviewRound(
+		q: AskParams["questions"][number],
+		selectedOptions: string[],
+		customInput: string | undefined,
+	): Promise<void> {
+		const meta = q.deepInterview;
+		if (!meta) return;
+		try {
+			const cwd = this.session.cwd;
+			const sessionId = this.session.getSessionId?.() ?? undefined;
+			const statePath = deepInterviewStatePath(cwd, sessionId);
+			await appendOrMergeDeepInterviewRound(
+				cwd,
+				statePath,
+				{
+					round: meta.round,
+					round_id: meta.round_id,
+					questionId: q.id,
+					questionText: q.question,
+					component: meta.component,
+					dimension: meta.dimension,
+					ambiguity: meta.ambiguity,
+					selectedOptions,
+					customInput,
+				},
+				{ sessionId },
+			);
+		} catch (error) {
+			console.warn(
+				`ask: deep-interview round recording failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: AskParams,
@@ -515,6 +566,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					options: q.options,
 					multi: q.multi,
 					recommended: q.recommended,
+					deepInterview: q.deepInterview,
 				};
 				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				const decoded = gateAnswerToResult(gateQuestion, answer);
@@ -582,6 +634,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
+			await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -643,6 +696,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 			};
+
+			await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 
 			if (navAction === "back") {
 				questionIndex = Math.max(0, questionIndex - 1);

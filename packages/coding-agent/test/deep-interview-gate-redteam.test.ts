@@ -10,6 +10,7 @@ import {
 	WorkflowGateBroker,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "@gajae-code/coding-agent/modes/shared/agent-wire/workflow-gate-schema";
+import { askSchema } from "@gajae-code/coding-agent/tools/ask";
 
 const singleQ: AskGateQuestion = {
 	id: "single-auth",
@@ -203,5 +204,58 @@ describe("deep-interview question gates red-team", () => {
 		const rejected = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["Password"] } });
 		expect(rejected.status).toBe("rejected");
 		expect(rejected.error?.schema_hash).toBe(gate.schema_hash);
+	});
+});
+
+describe("deep-interview structured metadata red-team", () => {
+	it("does not alter selection or free-text decoding when metadata is present", async () => {
+		const withMeta: AskGateQuestion = {
+			...singleQ,
+			deepInterview: { round: 1, component: "conflict-detection", dimension: "goal", ambiguity: 0.6 },
+		};
+		const selection = await resolveQuestion(withMeta, { selected: ["JWT"] });
+		expect(selection.resolution.status).toBe("accepted");
+		expect(gateAnswerToResult(withMeta, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
+
+		const free = await resolveQuestion(withMeta, { selected: [], other: true, custom: "Passkeys" });
+		expect(free.resolution.status).toBe("accepted");
+		expect(gateAnswerToResult(withMeta, { selected: [], other: true, custom: "Passkeys" }).customInput).toBe(
+			"Passkeys",
+		);
+	});
+
+	it("rejects invalid deepInterview metadata at the ask schema boundary", () => {
+		const base = { id: "q1", question: "Q?", options: [{ label: "A" }] };
+		// ambiguity out of range
+		expect(
+			askSchema.safeParse({
+				questions: [{ ...base, deepInterview: { round: 1, component: "c", dimension: "goal", ambiguity: 1.5 } }],
+			}).success,
+		).toBe(false);
+		// missing required round
+		expect(
+			askSchema.safeParse({
+				questions: [{ ...base, deepInterview: { component: "c", dimension: "goal", ambiguity: 0.5 } }],
+			}).success,
+		).toBe(false);
+		// empty component
+		expect(
+			askSchema.safeParse({
+				questions: [{ ...base, deepInterview: { round: 1, component: "", dimension: "goal", ambiguity: 0.5 } }],
+			}).success,
+		).toBe(false);
+		// valid metadata accepted
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{
+						...base,
+						deepInterview: { round_id: "r1", round: 1, component: "c", dimension: "goal", ambiguity: 0.5 },
+					},
+				],
+			}).success,
+		).toBe(true);
+		// absent metadata still valid (backward compatible)
+		expect(askSchema.safeParse({ questions: [base] }).success).toBe(true);
 	});
 });

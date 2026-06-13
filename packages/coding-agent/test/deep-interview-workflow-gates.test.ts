@@ -115,3 +115,52 @@ describe("end-to-end via the broker", () => {
 		expect(other.status).toBe("accepted");
 	});
 });
+
+describe("questionToGate structured deep-interview metadata", () => {
+	it("uses structured metadata for stage_state when present", () => {
+		const gate = questionToGate({
+			id: "q-struct",
+			question: "Round 1 | Component: Conflict Detection | Targeting: Goal | Ambiguity: 66%\n\nWhich triggers?",
+			options: [{ label: "A only" }, { label: "All four" }],
+			deepInterview: {
+				round_id: "r-1",
+				round: 1,
+				component: "conflict-detection",
+				dimension: "goal",
+				ambiguity: 0.66,
+			},
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.deep_interview_metadata).toBe(true);
+		expect(state.round).toBe(1);
+		expect(state.component).toBe("conflict-detection");
+		expect(state.dimension).toBe("goal");
+		expect(state.ambiguity).toBe(0.66);
+		expect(state.round_id).toBe("r-1");
+	});
+
+	it("structured metadata wins over conflicting question text", () => {
+		const gate = questionToGate({
+			id: "q-conflict",
+			question: "Round 99 | Topology confirmation | Ambiguity: 80%",
+			options: [{ label: "x" }],
+			deepInterview: { round: 2, component: "bidirectional-ambiguity", dimension: "constraints", ambiguity: 0.4 },
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.round).toBe(2);
+		expect(state.deep_interview_metadata).toBe(true);
+		// The regex would have parsed round 99 / topology_gate from the text; metadata overrides it.
+		expect(state.topology_gate).toBeUndefined();
+	});
+
+	it("falls back to regex parsing when metadata is absent (unchanged behavior)", () => {
+		const gate = questionToGate({
+			id: "q-regex",
+			question: "Round 3 | Targeting: Constraints | Ambiguity: 40%",
+			options: [{ label: "x" }],
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.round).toBe(3);
+		expect(state.deep_interview_metadata).toBeUndefined();
+	});
+});

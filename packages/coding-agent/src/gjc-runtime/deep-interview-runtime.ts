@@ -9,6 +9,8 @@ import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
 
+export * from "./deep-interview-recorder";
+
 /**
  * Native implementation of `gjc deep-interview`.
  *
@@ -92,7 +94,7 @@ function stateDirFor(cwd: string, sessionId: string | undefined): string {
 		: path.join(cwd, ".gjc", "state");
 }
 
-function deepInterviewStatePath(cwd: string, sessionId: string | undefined): string {
+export function deepInterviewStatePath(cwd: string, sessionId: string | undefined): string {
 	return path.join(stateDirFor(cwd, sessionId), "deep-interview-state.json");
 }
 
@@ -476,6 +478,7 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		state: {
 			initial_idea: resolved.idea,
 			rounds: [],
+			established_facts: [],
 			current_ambiguity: 1.0,
 			threshold: resolved.threshold,
 			threshold_source: resolved.thresholdSource,

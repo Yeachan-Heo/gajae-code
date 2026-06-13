@@ -238,6 +238,7 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.threshold).toBeCloseTo(0.05);
 		expect(state.threshold_source).toBe("default");
 		expect(state.state.initial_idea).toBe("my vague idea");
+		expect(state.state.established_facts).toEqual([]);
 	});
 
 	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/settings.json", async () => {

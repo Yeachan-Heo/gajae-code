@@ -132,6 +132,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
     "initial_idea": "<prompt-safe initial-context summary or user input>",
     "initial_context_summary": "<summary if oversized, else null>",
     "rounds": [],
+    "established_facts": [],
     "current_ambiguity": 1.0,
     "threshold": <resolvedThreshold>,
     "threshold_source": "<resolvedThresholdSource>",
@@ -281,6 +282,8 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 
 Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present.
 
+When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line; if metadata cannot be supplied, the legacy formatted question text remains the fallback.
+
 ### Step 2b′: Auto-Answer Opted-Out Questions
 
 After the `ask` tool resolves and before ambiguity scoring, if the user opts out of answering the current question or explicitly asks the agent to decide, load `auto-answer-uncertain.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect. Pass the opted-out question, prompt-safe transcript summary, locked topology, current scores/gaps, and any auto-research candidates used for the round. The architect must return exactly one decisive answer with rationale, confidence, and explicit uncertainty. Validate the response shape before using it; if valid, record it as the tentative answer for scoring, append the round number to `auto_answered_rounds`, and mark the transcript answer as architect-assisted.
@@ -292,6 +295,28 @@ Auto-answer has a clarity cap: unless the architect confidence is `high` and unc
 After receiving the user's answer, score clarity across all dimensions.
 
 If the round used an auto-answer, include the architect answer, rationale, confidence, and uncertainty in the scoring prompt. Apply the Step 2b′ clarity cap mechanically before calculating ambiguity, and treat any low-confidence or insufficient-context auto-answer as an unresolved gap rather than user-confirmed truth.
+
+Before scoring, compare the new answer against `state.established_facts`. Treat established facts as durable confirmed decisions with source-round evidence; do not score an answer in isolation from facts that the interview has already stabilized.
+
+Ambiguity is BIDIRECTIONAL and NON-MONOTONIC. A later answer can increase ambiguity when it invalidates, weakens, or expands prior understanding; convergence is not assumed to be a one-way decrease.
+
+Ambiguity-raising triggers:
+- **A direct contradiction**: the answer contradicts an established fact.
+- **B internal inconsistency**: two requirements that cannot co-hold are now present.
+- **C low-quality/evasive**: the answer avoids, hand-waves, or fails to resolve the targeted gap.
+- **D scope expansion**: the answer adds a component, entity, constraint, deliverable, or integration not already covered or explicitly deferred.
+
+Use **mechanism A** for every ambiguity rise: a trigger LOWERS the affected component/dimension clarity score, and the existing weighted formula raises ambiguity. There is **no separate penalty term**; ambiguity remains bounded by the same greenfield/brownfield formula.
+
+The rise is SILENT: no modal, no forced-resolution step, and no dedicated conflict UI. Surface it through the normal per-round report and by targeting the next question at the affected component/dimension.
+
+Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `prior_ambiguity`, `new_ambiguity`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable.
+
+Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it.
+
+TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve and overall ambiguity must rise vs the prior scored round, unless the trigger is explicitly marked disputed or unresolved with rationale.
+
+Convergence Pacing deferral: do not add a min-round floor, score-drop cap, confidence dampening, or other explicit pacing brake. Bidirectional scoring is the pacing mechanism.
 
 **Scoring prompt** (use opus model, temperature 0.1 for consistency):
 
@@ -305,6 +330,9 @@ Transcript or prompt-safe transcript summary:
 
 Locked topology:
 {state.topology.components and state.topology.deferrals}
+
+Established facts:
+{state.established_facts}
 
 Score each active component on each dimension, then provide the overall dimension scores as the minimum or coverage-weighted weakest score across active components. Deferred components are excluded from ambiguity math but must remain listed in topology and the final spec.
 
@@ -324,6 +352,7 @@ Also identify:
 - weakest_dimension: the single lowest-confidence dimension for that component this round
 - weakest_dimension_rationale: one sentence explaining why this component/dimension pair is the highest-leverage target for the next question
 - component_scores: object keyed by component id, with per-dimension scores and gaps
+- structured_scorer_output: object containing triggers, trigger_status, affected_component, affected_dimension, prior_dimension_score, new_dimension_score, prior_ambiguity, new_ambiguity, evidence, contradicted_established_fact when relevant, and disputed_unresolved_rationale when applicable
 
 5. Ontology Extraction: Identify all key entities (nouns) discussed in the transcript.
 
@@ -373,7 +402,7 @@ Round {n} complete.
 | Constraints | {s} | {w} | {s*w} | {gap or "Clear"} |
 | Success Criteria | {s} | {w} | {s*w} | {gap or "Clear"} |
 | Context (brownfield) | {s} | {w} | {s*w} | {gap or "Clear"} |
-| **Ambiguity** | | | **{score}%** | |
+| **Ambiguity** | | | **{prior_score}% -> {score}% {up|down|flat}** | {if up: trigger name such as "A direct contradiction"} |
 
 **Topology:** Targeted {target_component_name} | Active: {active_component_count} | Deferred: {deferred_component_count} | Next rotation after: {last_targeted_component_id}
 
@@ -389,7 +418,7 @@ Apply `language.instruction` when present before showing this progress report so
 
 ### Step 2e: Update State
 
-Update interview state with the new round, global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures` via `gjc state write`; never patch `.gjc/state` directly unless an explicit force override is active.
+Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/state` directly unless an explicit force override is active.
 
 ### Step 2f: Check Soft Limits
 
@@ -463,6 +492,12 @@ Spec structure:
 |-----------|--------|-------------|--------------------------|
 | {component.name} | {active|deferred} | {component.description} | {covered acceptance criteria or deferral reason} |
 
+## Established Facts
+{List stable confirmed decisions promoted into `state.established_facts`, including source round, evidence, and disputed status when any fact was contradicted.}
+
+## Trigger Metadata
+{Summarize per-round trigger metadata: trigger label/status, affected component/dimension, prior -> new ambiguity direction, evidence, contradicted established fact when relevant, and disputed/unresolved rationale when applicable.}
+
 ## Goal
 {crystal-clear goal statement derived from interview, covering every active topology component}
 
@@ -480,6 +515,9 @@ Spec structure:
 - [ ] {testable criterion 2}
 - [ ] {testable criterion 3}
 - ...
+
+## Deferrals
+{List user-confirmed topology deferrals and scoring/pacing deferrals, including Convergence Pacing when applicable: no min-round floor, score-drop cap, or dampening; bidirectional scoring is the pacing mechanism.}
 
 ## Assumptions Exposed & Resolved
 | Assumption | Challenge | Resolution |

@@ -17,12 +17,26 @@ import type { OpenGateInput } from "./workflow-gate-broker";
 /** "Other (type your own)" sentinel, mirroring the interactive ask tool. */
 export const GATE_OTHER_OPTION = "Other (type your own)";
 
+/** Optional structured deep-interview round metadata supplied by the agent. */
+export interface AskGateDeepInterviewState {
+	round_id?: string;
+	round: number;
+	component: string;
+	dimension: string;
+	ambiguity: number;
+}
+
 export interface AskGateQuestion {
 	id: string;
 	question: string;
 	options: Array<{ label: string }>;
 	multi?: boolean;
 	recommended?: number;
+	/**
+	 * Structured round metadata. When present it is the authoritative source for gate
+	 * `stage_state`; when absent, the question text is regex-parsed as a fallback.
+	 */
+	deepInterview?: AskGateDeepInterviewState;
 }
 
 export interface AskGateResult {
@@ -130,6 +144,19 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 	};
 }
 
+/** Build `stage_state` round metadata from the structured param (authoritative when present). */
+function structuredDeepInterviewState(meta: AskGateDeepInterviewState): Record<string, unknown> {
+	const state: Record<string, unknown> = {
+		deep_interview_metadata: true,
+		round: meta.round,
+		component: meta.component,
+		dimension: meta.dimension,
+		ambiguity: meta.ambiguity,
+	};
+	if (meta.round_id !== undefined) state.round_id = meta.round_id;
+	return state;
+}
+
 /** Build the `workflow_gate` open-input for one deep-interview question. */
 export function questionToGate(question: AskGateQuestion): OpenGateInput {
 	const labels = question.options.map(o => o.label);
@@ -151,7 +178,9 @@ export function questionToGate(question: AskGateQuestion): OpenGateInput {
 				multi: question.multi ?? false,
 				options: labels,
 				other_option: GATE_OTHER_OPTION,
-				...deepInterviewQuestionState(question.question),
+				...(question.deepInterview
+					? structuredDeepInterviewState(question.deepInterview)
+					: deepInterviewQuestionState(question.question)),
 			},
 		},
 	};
