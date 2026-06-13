@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import type { GcPidProbe, GcRecord } from "./gc-runtime";
 
 import { applyGjcTmuxProfile, GJC_TMUX_LAUNCHED_ENV } from "./launch-tmux";
 import {
@@ -677,6 +678,174 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
 		if (isEnoent(error)) return null;
 		throw error;
 	}
+}
+function isPositivePid(value: unknown): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function collectTeamGcWorkerPids(
+	heartbeat: WorkerHeartbeatFile | null,
+	lifecycle: GjcTeamWorkerLifecycle | null,
+): number[] {
+	const pids: number[] = [];
+	if (isPositivePid(heartbeat?.pid)) pids.push(heartbeat.pid);
+	if (isPositivePid(lifecycle?.pid) && !pids.includes(lifecycle.pid)) pids.push(lifecycle.pid);
+	return pids;
+}
+
+interface TeamGcPidClassification {
+	removable: boolean;
+	pidStatus: "dead" | "alive" | "eperm" | "unknown" | "none";
+	pid?: number;
+}
+
+/**
+ * Liveness-only, fail-closed: a worker is removable ONLY when it has at least
+ * one authoritative pid and EVERY candidate pid probes dead (ESRCH). Any alive,
+ * EPERM, or unknown candidate (heartbeat OR lifecycle) keeps the worker, so a
+ * dead heartbeat pid can never override a live lifecycle pid.
+ */
+function classifyTeamGcWorkerPids(pids: number[], probe: GcPidProbe): TeamGcPidClassification {
+	if (pids.length === 0) return { removable: false, pidStatus: "none" };
+	const statuses = pids.map(pid => ({ pid, status: gcProbeStatus(probe, pid) }));
+	const kept = statuses.find(entry => entry.status !== "dead");
+	if (kept) return { removable: false, pidStatus: kept.status, pid: kept.pid };
+	return { removable: true, pidStatus: "dead", pid: statuses[0]?.pid };
+}
+
+function gcProbeStatus(probe: GcPidProbe, pid: number): "dead" | "alive" | "eperm" | "unknown" {
+	const result = probe(pid);
+	if (result.status === "dead") return "dead";
+	return result.reason ?? "unknown";
+}
+
+function teamGcRecordDetail(heartbeat: WorkerHeartbeatFile | null, lifecycle: GjcTeamWorkerLifecycle | null): string {
+	return [
+		`heartbeat=${heartbeat ? "present" : "missing"}`,
+		...(heartbeat ? [`heartbeat_alive=${heartbeat.alive}`, `last_turn_at=${heartbeat.last_turn_at}`] : []),
+		`lifecycle=${lifecycle?.lifecycle_state ?? "missing"}`,
+		...(lifecycle?.pane_id ? [`pane_id=${lifecycle.pane_id}`] : []),
+		...(lifecycle?.stop_reason ? [`stop_reason=${lifecycle.stop_reason}`] : []),
+	].join(" ");
+}
+
+/** @internal */
+export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProbe): Promise<GcRecord[]> {
+	const teamEntries = await fs.readdir(teamRoot, { withFileTypes: true });
+	const records: GcRecord[] = [];
+	for (const teamEntry of teamEntries) {
+		if (!teamEntry.isDirectory()) continue;
+		const teamName = teamEntry.name;
+		const teamDirPath = path.join(teamRoot, teamName);
+		let workerEntries: import("node:fs").Dirent[];
+		try {
+			workerEntries = await fs.readdir(path.join(teamDirPath, "workers"), { withFileTypes: true });
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+
+		for (const workerEntry of workerEntries) {
+			if (!workerEntry.isDirectory()) continue;
+			const workerId = workerEntry.name;
+			const dir = path.join(teamDirPath, "workers", workerId);
+			let heartbeat: WorkerHeartbeatFile | null = null;
+			let lifecycle: GjcTeamWorkerLifecycle | null = null;
+			try {
+				heartbeat = await readJsonFile<WorkerHeartbeatFile>(path.join(dir, "heartbeat.json"));
+				lifecycle = await readJsonFile<GjcTeamWorkerLifecycle>(path.join(dir, "lifecycle.json"));
+			} catch (error) {
+				records.push({
+					store: "team_workers",
+					id: `${teamName}/${workerId}`,
+					root: teamRoot,
+					path: dir,
+					pid_status: "none",
+					status: "malformed",
+					stale: false,
+					removable: false,
+					action: "none",
+					reason: "worker_state_malformed_kept",
+					error: error instanceof Error ? error.message : String(error),
+				});
+				continue;
+			}
+			const pids = collectTeamGcWorkerPids(heartbeat, lifecycle);
+			const { removable, pidStatus, pid } = classifyTeamGcWorkerPids(pids, probe);
+			const terminalLifecycle = lifecycle?.lifecycle_state === "failed" || lifecycle?.lifecycle_state === "stopped";
+			const status = removable
+				? "dead"
+				: pidStatus === "none" && terminalLifecycle
+					? "terminal_lifecycle"
+					: pidStatus === "none"
+						? "no_pid"
+						: pidStatus;
+			records.push({
+				store: "team_workers",
+				id: `${teamName}/${workerId}`,
+				root: teamRoot,
+				path: dir,
+				pid,
+				pid_status: pidStatus,
+				status,
+				stale: removable,
+				removable,
+				action: "none",
+				reason: removable
+					? "worker_all_pids_dead"
+					: pidStatus === "none" && terminalLifecycle
+						? "terminal_lifecycle_without_pid_kept"
+						: pidStatus === "none"
+							? "worker_pid_missing_kept"
+							: `worker_pid_${pidStatus}_kept`,
+				detail: teamGcRecordDetail(heartbeat, lifecycle),
+			});
+		}
+	}
+	return records;
+}
+
+/** @internal */
+export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProbe): Promise<boolean> {
+	if (!record.path || !record.id.includes("/")) return false;
+	const [teamName, workerId] = record.id.split("/", 2);
+	if (!teamName || !workerId) return false;
+	const teamDirPath = path.dirname(path.dirname(record.path));
+	const heartbeat = await readJsonFile<WorkerHeartbeatFile>(path.join(record.path, "heartbeat.json"));
+	const lifecycle = await readJsonFile<GjcTeamWorkerLifecycle>(path.join(record.path, "lifecycle.json"));
+	const pids = collectTeamGcWorkerPids(heartbeat, lifecycle);
+	if (!classifyTeamGcWorkerPids(pids, probe).removable) return false;
+
+	const claimDir = path.join(teamDirPath, "claims");
+	try {
+		for (const entry of await fs.readdir(claimDir, { withFileTypes: true })) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			const claimPath = path.join(claimDir, entry.name);
+			const claim = readClaimRecord(await readJsonFile<unknown>(claimPath));
+			if (claim?.owner !== workerId) continue;
+			await removeFileAudited(claimPath, stateWriterOptions(claimPath, "prune", "gc-team-worker"));
+		}
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	for (const task of await readTasks(teamDirPath)) {
+		if (task.claim?.owner !== workerId && task.assignee !== workerId) continue;
+		if (task.status === "completed" || task.status === "failed") continue;
+		await writeTask(teamDirPath, {
+			...task,
+			status: "pending",
+			assignee: undefined,
+			claim: undefined,
+			version: task.version + 1,
+			updated_at: now(),
+		});
+	}
+
+	// Remove the stale worker record dir itself so a removable record always
+	// results in an observable removal, even when it owns no claims/tasks.
+	await fs.rm(record.path, { recursive: true, force: true });
+	return true;
 }
 function stateCategoryForJsonPath(filePath: string): "state" | "ledger" {
 	return filePath.endsWith(".jsonl") || filePath.includes(`${path.sep}telemetry${path.sep}`) ? "ledger" : "state";

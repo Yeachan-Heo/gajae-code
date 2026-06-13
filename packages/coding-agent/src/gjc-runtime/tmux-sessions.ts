@@ -24,6 +24,17 @@ export interface GjcTmuxSessionStatus {
 	project?: string;
 }
 
+export interface GjcTmuxSessionTagsForGc {
+	profile?: string;
+	project?: string;
+	branch?: string;
+}
+
+export interface GjcTmuxSessionsForGc {
+	tagged: GjcTmuxSessionStatus[];
+	untagged: string[];
+}
+
 function runTmux(args: string[], env: NodeJS.ProcessEnv = process.env): string {
 	const tmuxCommand = resolveGjcTmuxCommand(env);
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe", env });
@@ -108,6 +119,16 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** @internal */
+export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionsForGc {
+	const tagged = listGjcTmuxSessions(env);
+	const taggedNames = new Set(tagged.map(session => session.name));
+	const untagged = listRawTmuxSessionNames(env)
+		.filter(name => !taggedNames.has(name))
+		.sort((a, b) => a.localeCompare(b));
+	return { tagged, untagged };
+}
+
 export function findGjcTmuxSessionByBranch(
 	branch: string,
 	env: NodeJS.ProcessEnv = process.env,
@@ -153,6 +174,29 @@ function readProfileForExactTarget(sessionName: string, env: NodeJS.ProcessEnv):
 		["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), GJC_TMUX_PROFILE_OPTION],
 		env,
 	).trim();
+}
+
+function readExactOptionForGc(sessionName: string, option: string, env: NodeJS.ProcessEnv): string | undefined {
+	try {
+		return (
+			runTmux(["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), option], env).trim() ||
+			undefined
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+/** @internal */
+export function readTmuxSessionTagsForGc(
+	sessionName: string,
+	env: NodeJS.ProcessEnv = process.env,
+): GjcTmuxSessionTagsForGc {
+	return {
+		profile: readExactOptionForGc(sessionName, GJC_TMUX_PROFILE_OPTION, env),
+		project: readExactOptionForGc(sessionName, GJC_TMUX_PROJECT_OPTION, env),
+		branch: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_OPTION, env),
+	};
 }
 
 export function removeGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {

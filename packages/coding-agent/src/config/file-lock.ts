@@ -36,6 +36,20 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 }
 
+/** @internal */
+export async function readFileLockInfoForGc(lockDir: string): Promise<{ pid: number; timestamp: number } | null> {
+	const info = await readLockInfo(lockDir);
+	if (!info) return null;
+	if (!Number.isFinite(info.pid) || info.pid <= 0) return null;
+	if (!Number.isFinite(info.timestamp)) return null;
+	return info;
+}
+
+/** @internal */
+export async function removeFileLockDirForGc(lockDir: string): Promise<void> {
+	await fs.rm(lockDir, { recursive: true, force: true });
+}
+
 function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);

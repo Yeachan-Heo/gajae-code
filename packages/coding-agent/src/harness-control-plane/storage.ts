@@ -32,6 +32,18 @@ interface HarnessRootRegistry {
 	roots: HarnessRootRegistryEntry[];
 }
 
+export interface HarnessRootRegistryForGc {
+	sessionId: string;
+	roots: HarnessRootRegistryEntry[];
+}
+
+export interface HarnessRootRegistryListingForGc {
+	sessionId: string;
+	file: string;
+	roots: HarnessRootRegistryEntry[];
+	error?: string;
+}
+
 interface ResolveHarnessSessionRootOptions {
 	expectedWorkspace?: string;
 }
@@ -100,6 +112,64 @@ async function writeHarnessRootRegistry(
 	await ensurePrivateDir(dir);
 	const file = harnessRootRegistryPath(registry.sessionId, env);
 	await writeJsonAtomicPrivate(file, registry);
+}
+
+function parseHarnessRootRegistryForGc(value: unknown, fallbackSessionId: string): HarnessRootRegistryForGc | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const registry = value as Record<string, unknown>;
+	if (typeof registry.sessionId !== "string" || !Array.isArray(registry.roots)) return null;
+	const roots: HarnessRootRegistryEntry[] = [];
+	for (const entry of registry.roots) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+		const rootEntry = entry as Record<string, unknown>;
+		if (typeof rootEntry.root !== "string" || typeof rootEntry.updatedAt !== "string") return null;
+		roots.push({ root: rootEntry.root, updatedAt: rootEntry.updatedAt });
+	}
+	return { sessionId: registry.sessionId || fallbackSessionId, roots };
+}
+
+/** @internal */
+export async function listHarnessRootRegistriesForGc(
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<HarnessRootRegistryListingForGc[]> {
+	const dir = harnessRootRegistryDir(env);
+	let entries: string[];
+	try {
+		entries = await fs.readdir(dir);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return [];
+		return [{ sessionId: "", file: dir, roots: [], error: (error as Error).message }];
+	}
+
+	const registries: HarnessRootRegistryListingForGc[] = [];
+	for (const entry of entries) {
+		if (!entry.endsWith(".json")) continue;
+		const file = path.join(dir, entry);
+		const fallbackSessionId = entry.slice(0, -".json".length);
+		try {
+			const raw = await fs.readFile(file, "utf8");
+			const parsed = parseHarnessRootRegistryForGc(JSON.parse(raw), fallbackSessionId);
+			if (!parsed) {
+				registries.push({ sessionId: fallbackSessionId, file, roots: [], error: "malformed_registry" });
+				continue;
+			}
+			registries.push({ sessionId: parsed.sessionId, file, roots: parsed.roots });
+		} catch (error) {
+			registries.push({ sessionId: fallbackSessionId, file, roots: [], error: (error as Error).message });
+		}
+	}
+	return registries;
+}
+
+/** @internal */
+export async function rewriteHarnessRootRegistryForGc(file: string, registry: HarnessRootRegistryForGc): Promise<void> {
+	await writeJsonAtomicPrivate(file, registry);
+}
+
+/** @internal */
+export async function removeHarnessRootRegistryFileForGc(file: string): Promise<void> {
+	await fs.rm(file, { force: true });
 }
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const MAX_UNIX_SOCKET_PATH_BYTES = 100;

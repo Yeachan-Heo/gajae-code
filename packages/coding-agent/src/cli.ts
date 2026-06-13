@@ -32,6 +32,7 @@ const commands: CommandEntry[] = [
 	{ name: "coordinator", load: () => import("./commands/coordinator").then(m => m.default) },
 	{ name: "team", load: () => import("./commands/team").then(m => m.default) },
 	{ name: "ultragoal", load: () => import("./commands/ultragoal").then(m => m.default) },
+	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "ralplan", load: () => import("./commands/ralplan").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
