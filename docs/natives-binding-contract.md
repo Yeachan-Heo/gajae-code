@@ -2,6 +2,8 @@
 
 This document defines the JS/TS contract between `@gajae-code/natives` callers and the loaded N-API addon.
 
+> When a port is proposed to **optimize** a leftover algorithmic hot path (rather than add a new OS/process/native primitive), it must additionally clear the evidence and cost gates in [`native-ffi-optimization-policy.md`](./native-ffi-optimization-policy.md).
+
 Current package shape is direct-to-native: there is no `packages/natives/src/<module>` TypeScript wrapper layer. The public API is the generated `packages/natives/native/index.d.ts` declaration file, the CommonJS loader in `packages/natives/native/index.js`, and the Rust `#[napi]` exports in `crates/pi-natives/src`.
 
 ## Implementation files

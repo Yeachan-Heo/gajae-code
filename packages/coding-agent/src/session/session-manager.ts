@@ -41,9 +41,9 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	resolveImageData,
-	resolveImageDataSync,
 	resolveImageDataUrl,
-	resolveImageDataUrlSync,
+	resolveResidentImageDataSync,
+	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
 } from "./blob-store";
 import {
@@ -1265,9 +1265,9 @@ function materializeResidentValueSync(
 		if (cached !== undefined) return cached;
 		const resolved =
 			obj.kind === "imageUrl"
-				? resolveImageDataUrlSync(stores.imageStore, obj.ref)
+				? resolveResidentImageDataUrlSync(stores.imageStore, obj.ref, stores)
 				: obj.kind === "imageData"
-					? resolveImageDataSync(stores.imageStore, obj.ref)
+					? resolveResidentImageDataSync(stores.imageStore, obj.ref, stores)
 					: resolveTextBlobSync(stores.textStore, obj.ref, stores);
 		cache.set(cacheKey, resolved);
 		return resolved;

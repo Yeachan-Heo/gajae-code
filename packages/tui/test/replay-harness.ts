@@ -43,6 +43,30 @@ export interface ReplayResult {
 	scrollback: string[];
 	writeCount: number;
 	turns: number;
+	/** Perceived-latency metrics (advisory wall-clock proxy, never CPU self-time). */
+	latency: ReplayLatencyMetrics;
+}
+
+/**
+ * Perceived-latency metrics. These are WALL-CLOCK PROXY and process-CPU evidence
+ * only — never CPU self-time. They are advisory (report-only) and must not be
+ * promoted to hard CI gates until variance is characterized and ledger-approved
+ * (see docs/perf-profiling-corpus.md). Pure measurement: capturing them does not
+ * add/remove any render, so finalViewport/scrollback/writeCount are unchanged.
+ */
+export interface ReplayLatencyMetrics {
+	/** TUI construction + start(), before any turn render. */
+	startupMs: number;
+	/** First user-line render (request -> waitForRender). */
+	firstRenderMs: number;
+	/** Time-to-first-token proxy: first streamed assistant text render. */
+	ttftProxyMs: number;
+	/** Whole-replay wall-clock. */
+	totalReplayMs: number;
+	/** process.cpuUsage() delta over the whole replay (process-cpu evidence). */
+	processCpu: { userMicros: number; systemMicros: number; elapsedMs: number };
+	advisoryOnly: true;
+	evidenceClass: "wall-clock-proxy";
 }
 
 export interface ReplayOptions {
@@ -161,10 +185,18 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 		renderMetrics.enable();
 	}
 
+	const tReplayBegin = performance.now();
+	const cpu0 = process.cpuUsage();
 	const term = new VirtualTerminal(fixture.cols, fixture.rows);
 	const tui = new TUI(term);
 	tui.start();
+	const startupMs = performance.now() - tReplayBegin;
 	if (collect) renderMetrics.sampleRss(); // baseline
+
+	let firstRenderMs = 0;
+	let firstRenderCaptured = false;
+	let ttftProxyMs = 0;
+	let ttftCaptured = false;
 
 	let turnIndex = 0;
 	let componentCount = 0;
@@ -179,8 +211,13 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 
 		tui.addChild(new Text(`> ${turn.userText}`, 1, 0));
 		componentCount += 1;
+		const tUserRender = performance.now();
 		tui.requestRender(false, "replay.user");
 		await term.waitForRender();
+		if (!firstRenderCaptured) {
+			firstRenderMs = performance.now() - tUserRender;
+			firstRenderCaptured = true;
+		}
 
 		const stream = new Text("", 1, 0);
 		tui.addChild(stream);
@@ -194,8 +231,13 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 			acc += turn.assistantChunks[c];
 			if (c === mid - 1 || c === turn.assistantChunks.length - 1) {
 				stream.setText(acc);
+				const tStreamRender = performance.now();
 				tui.requestRender(false, "replay.stream");
 				await term.waitForRender();
+				if (!ttftCaptured) {
+					ttftProxyMs = performance.now() - tStreamRender;
+					ttftCaptured = true;
+				}
 			}
 		}
 
@@ -240,7 +282,19 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 	const metrics = renderMetrics.snapshot();
 	if (collect) renderMetrics.disable();
 
-	return { metrics, finalViewport, scrollback, writeCount, turns: turnIndex };
+	const cpuDelta = process.cpuUsage(cpu0);
+	const totalReplayMs = performance.now() - tReplayBegin;
+	const latency: ReplayLatencyMetrics = {
+		startupMs,
+		firstRenderMs,
+		ttftProxyMs,
+		totalReplayMs,
+		processCpu: { userMicros: cpuDelta.user, systemMicros: cpuDelta.system, elapsedMs: totalReplayMs },
+		advisoryOnly: true,
+		evidenceClass: "wall-clock-proxy",
+	};
+
+	return { metrics, finalViewport, scrollback, writeCount, turns: turnIndex, latency };
 }
 
 /**

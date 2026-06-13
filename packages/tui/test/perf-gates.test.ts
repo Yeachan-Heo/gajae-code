@@ -27,6 +27,16 @@ export const PERF_GATES = {
 	idleCpuFractionMax: 0.01,
 	// Stage-2 acceptance targets (measured now, enforced after leak elimination).
 	rssGrowthTargetBytes: 50 * 1024 * 1024,
+	// ADVISORY (report-only) perceived-latency thresholds. Wall-clock proxies are
+	// noisy (machine/scheduler/GC variance), so these are NEVER default CI fail
+	// gates; they are recorded for calibration until variance is characterized and
+	// ledger-approved (see docs/perf-profiling-corpus.md). Generous so a logged
+	// value is informational, not a tripwire.
+	advisory: {
+		startupMsAdvisory: 250,
+		ttftProxyMsAdvisory: 250,
+		scrollP95MsAdvisory: 50,
+	},
 };
 
 const HARD_GATES = $flag("PI_TUI_PERF_GATES");
@@ -50,6 +60,40 @@ describe("performance gates (structural, always on)", () => {
 		expect(idle).toBeGreaterThanOrEqual(0);
 		expect(Number.isFinite(idle)).toBe(true);
 	}, 30000);
+
+	it("reports perceived-latency metrics as advisory wall-clock proxy (never CPU self-time), finite", async () => {
+		const r = await runReplay(makeRecordedSession(60, 0x2026));
+		const l = r.latency;
+		expect(l.advisoryOnly).toBe(true);
+		expect(l.evidenceClass).toBe("wall-clock-proxy");
+		for (const v of [l.startupMs, l.firstRenderMs, l.ttftProxyMs, l.totalReplayMs]) {
+			expect(Number.isFinite(v)).toBe(true);
+			expect(v).toBeGreaterThanOrEqual(0);
+		}
+		expect(Number.isFinite(l.processCpu.userMicros)).toBe(true);
+		expect(Number.isFinite(l.processCpu.systemMicros)).toBe(true);
+		// Advisory thresholds are reported, never asserted as hard CI gates. The
+		// large-transcript scroll/repaint p95 is the renderer frame p95 (also
+		// enforced structurally elsewhere); here it is surfaced against its advisory
+		// budget for calibration only.
+		const scrollP95Ms = r.metrics.renderDurations.p95Ms;
+		console.log(
+			`[perf-gates][advisory] startup=${l.startupMs.toFixed(2)}ms firstRender=${l.firstRenderMs.toFixed(2)}ms ` +
+				`ttftProxy=${l.ttftProxyMs.toFixed(2)}ms total=${l.totalReplayMs.toFixed(2)}ms scrollP95=${scrollP95Ms.toFixed(2)}ms ` +
+				`(advisory budgets: startup<=${PERF_GATES.advisory.startupMsAdvisory} ttft<=${PERF_GATES.advisory.ttftProxyMsAdvisory} scrollP95<=${PERF_GATES.advisory.scrollP95MsAdvisory})`,
+		);
+	}, 60000);
+
+	it("latency/CPU instrumentation does not change rendered bytes (golden parity, metrics on vs off)", async () => {
+		const withMetrics = await runReplay(makeRecordedSession(40, 0x55aa), { metrics: true });
+		const withoutMetrics = await runReplay(makeRecordedSession(40, 0x55aa), { metrics: false });
+		// Same fixture seed + pure-measurement instrumentation => byte-identical output.
+		expect(withoutMetrics.finalViewport).toEqual(withMetrics.finalViewport);
+		expect(withoutMetrics.scrollback).toEqual(withMetrics.scrollback);
+		expect(withoutMetrics.writeCount).toBe(withMetrics.writeCount);
+		expect(withoutMetrics.turns).toBe(withMetrics.turns);
+		expect(Number.isFinite(withoutMetrics.latency.totalReplayMs)).toBe(true);
+	}, 60000);
 });
 
 if (HARD_GATES) {

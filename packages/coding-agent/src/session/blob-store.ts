@@ -267,7 +267,13 @@ export function externalizeImageDataSync(blobStore: BlobStore, base64Data: strin
 /**
  * Resolve an externalized provider image data URL back to its original string.
  * If the data is not a blob reference, returns it unchanged.
- * If the blob is missing, logs a warning and returns the reference as-is.
+ *
+ * LEGACY PERSISTED-IMAGE COMPATIBILITY BOUNDARY: when the persisted blob is missing
+ * (e.g. resuming an old session whose image blob was pruned), this warns and returns
+ * the reference as-is rather than throwing, so legacy resume degrades gracefully.
+ * New resident byte-sensitive TEXT uses the fail-closed path instead
+ * (`resolveTextBlobSync` -> `ResidentBlobMissingError`). Do NOT route new byte-sensitive
+ * resident data through this warn-and-return path.
  */
 export async function resolveImageDataUrl(blobStore: BlobStore, data: string): Promise<string> {
 	const hash = parseBlobRef(data);
@@ -284,7 +290,11 @@ export async function resolveImageDataUrl(blobStore: BlobStore, data: string): P
 /**
  * Resolve a blob reference back to base64 data.
  * If the data is not a blob reference, returns it unchanged.
- * If the blob is missing, logs a warning and returns a placeholder.
+ *
+ * LEGACY PERSISTED-IMAGE COMPATIBILITY BOUNDARY: when the blob is missing this warns
+ * and returns the reference as-is (downstream sees an invalid base64 ref but does not
+ * crash), preserving legacy-session resume. Byte-sensitive resident TEXT is fail-closed
+ * via `resolveTextBlobSync`; do NOT route new byte-sensitive resident data here.
  */
 export async function resolveImageData(blobStore: BlobStore, data: string): Promise<string> {
 	const hash = parseBlobRef(data);
@@ -322,7 +332,14 @@ export function resolveImageDataSync(blobStore: BlobStore, data: string): string
 	return buffer.toString("base64");
 }
 
-/** Synchronously resolve a blob reference back to utf8 text. */
+/**
+ * Synchronously resolve a blob reference back to utf8 text.
+ *
+ * FAIL-CLOSED byte-sensitive path: a missing resident blob throws
+ * `ResidentBlobMissingError` rather than degrading, so a missing resident text blob can
+ * never silently leak a `blob:sha256:` ref into provider payloads, UI, or exports.
+ * (Contrast the legacy persisted-image warn-and-return resolvers above.)
+ */
 export function resolveTextBlobSync(
 	blobStore: BlobStore,
 	data: string,
@@ -335,4 +352,43 @@ export function resolveTextBlobSync(
 		throw new ResidentBlobMissingError(hash, context?.kind ?? "text", context?.sessionId, context?.sessionFile);
 	}
 	return buffer.toString("utf8");
+}
+
+/**
+ * FAIL-CLOSED resident variant of {@link resolveImageDataUrlSync}: a missing resident
+ * image-data-url blob throws `ResidentBlobMissingError` ("imageUrl") instead of warn-returning,
+ * so resident byte-sensitive provider image data can never leak a `blob:sha256:` ref into
+ * materialized entries, context, or provider payloads. The warn-and-return `resolveImageDataUrl*`
+ * resolvers remain ONLY for legacy persisted-image resume.
+ */
+export function resolveResidentImageDataUrlSync(
+	blobStore: BlobStore,
+	data: string,
+	context?: { sessionId?: string; sessionFile?: string },
+): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	if (!buffer) {
+		throw new ResidentBlobMissingError(hash, "imageUrl", context?.sessionId, context?.sessionFile);
+	}
+	return buffer.toString("utf8");
+}
+
+/**
+ * FAIL-CLOSED resident variant of {@link resolveImageDataSync}: a missing resident image blob
+ * throws `ResidentBlobMissingError` ("imageData") instead of warn-returning a placeholder.
+ */
+export function resolveResidentImageDataSync(
+	blobStore: BlobStore,
+	data: string,
+	context?: { sessionId?: string; sessionFile?: string },
+): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	if (!buffer) {
+		throw new ResidentBlobMissingError(hash, "imageData", context?.sessionId, context?.sessionFile);
+	}
+	return buffer.toString("base64");
 }

@@ -5,7 +5,7 @@
 1. **CommonJS loader/package entrypoint** resolves and loads the correct `.node` addon and patches generated enum objects onto the export object.
 2. **Rust N-API module layer** implements the exported functions/classes and emits the generated TypeScript declarations.
 
-This document is the foundation for deeper module-level docs.
+This document is the foundation for deeper module-level docs. Performance-motivated native ports of leftover algorithmic hot paths are additionally gated by [`native-ffi-optimization-policy.md`](./native-ffi-optimization-policy.md).
 
 ## Implementation files
 

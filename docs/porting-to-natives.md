@@ -16,6 +16,8 @@ Rust is reserved for native bindings, native OS/process/filesystem integration, 
 
 Avoid ports that depend on JS-only state or dynamic imports. N-API exports should be data-in/data-out. Long-running work should go through `task::blocking` (CPU-bound/blocking I/O) or `task::future` (async I/O) with cancellation where the caller needs `timeoutMs` or `AbortSignal`.
 
+> **Optimization ports need evidence first.** A native port proposed to optimize a *leftover algorithmic hot path* must clear the gates in [`native-ffi-optimization-policy.md`](./native-ffi-optimization-policy.md) (corpus evidence, `profilerSelfTime` attribution, measured FFI overhead, representative p50/p95 win, byte parity, documented rollback cost). New OS/process/native-primitive bindings follow this guide as usual.
+
 ## Current package shape
 
 `@gajae-code/natives` no longer has a `packages/natives/src/<module>` TypeScript wrapper layer. The package root points at generated native artifacts:
