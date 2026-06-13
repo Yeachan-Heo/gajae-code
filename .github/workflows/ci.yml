@@ -163,36 +163,49 @@ jobs:
       runs-on: windows-latest
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3"
+         - name: Check job relevance
+           id: relevance
+           env:
+              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           shell: bash
+           run: bun scripts/ci-job-relevance.ts
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               toolchain: nightly-2026-04-29
          - name: Prepend rustup toolchain bin to PATH
+           if: steps.relevance.outputs.relevant == 'true'
            shell: bash
            run: |
               toolchain_bin="$(dirname "$(rustup which cargo)")"
               echo "$toolchain_bin" >> "$GITHUB_PATH"
          - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               shared-key: windows-smoke-win32-x64
               cache-on-failure: true
               save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
          - name: Cache bun dependencies
+           if: steps.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
+         - if: steps.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
          - name: Build native addon (win32-x64 baseline)
+           if: steps.relevance.outputs.relevant == 'true'
            env:
               TARGET_PLATFORM: win32
               TARGET_ARCH: x64
               TARGET_VARIANTS: baseline
            run: bun run ci:build:native
          - name: Smoke bun + gjc CLI (source runtime)
+           if: steps.relevance.outputs.relevant == 'true'
            shell: pwsh
            run: |
               bun --version
@@ -245,21 +258,7 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
-           run: |
-              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                 sudo apt-get update
-                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
-                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
-              else
-                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
-                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-                 for tool in fd rg convert tmux gh; do
-                    if ! command -v "$tool" >/dev/null 2>&1; then
-                       echo "warning: optional helper not on PATH: $tool"
-                    fi
-                 done
-              fi
+           run: bash scripts/ci-install-system-deps.sh
          - run: bun install --frozen-lockfile
          - name: Resolve native source run
            id: source
@@ -296,16 +295,25 @@ jobs:
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
+         - name: Check job relevance
+           id: relevance
+           env:
+              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           shell: bash
+           run: bun scripts/ci-job-relevance.ts
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           if: steps.relevance.outputs.relevant == 'true'
+           with:
+              node-version: "24"
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               toolchain: nightly-2026-04-29
          - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               shared-key: install-methods-linux-x64
               cache-on-failure: true
@@ -313,28 +321,18 @@ jobs:
                  startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
+           if: steps.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
-           run: |
-              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                 sudo apt-get update
-                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
-                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
-              else
-                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
-                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-                 for tool in fd rg convert tmux gh; do
-                    if ! command -v "$tool" >/dev/null 2>&1; then
-                       echo "warning: optional helper not on PATH: $tool"
-                    fi
-                 done
-              fi
-         - run: bun install --frozen-lockfile
+           if: steps.relevance.outputs.relevant == 'true'
+           run: bash scripts/ci-install-system-deps.sh
+         - if: steps.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
          - name: Install method smoke tests
+           if: steps.relevance.outputs.relevant == 'true'
            run: bun run ci:test:install-methods
 
    release_binary:
