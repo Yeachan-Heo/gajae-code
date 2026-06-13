@@ -2,6 +2,7 @@
 
 import { $ } from "bun";
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
@@ -29,6 +30,12 @@ interface Task {
 }
 
 const dryRun = process.argv.includes("--dry-run");
+const emitFlags = process.argv.includes("--emit-flags");
+
+if (emitFlags) {
+	await emitAffectedFlags();
+	process.exit(0);
+}
 const changedPaths = await getChangedPaths();
 const workspaces = await getWorkspacePackages();
 const tasks = planTasks(changedPaths, workspaces);
@@ -45,6 +52,33 @@ for (const task of tasks) {
 	console.log("::endgroup::");
 	if (exitCode !== 0) {
 		process.exit(exitCode);
+	}
+}
+
+// `--emit-flags` resolves changed paths exactly as a normal run does, then
+// reports whether the resulting plan needs the Rust toolchain (rust-check /
+// rust-test) and/or a native build, so dev-ci can gate its Rust setup. It
+// fails open (rust=true native=true) on any error or unresolved base so CI
+// never skips Rust setup it actually needs.
+async function emitAffectedFlags(): Promise<void> {
+	let rust = true;
+	let native = true;
+	try {
+		const paths = await getChangedPaths();
+		const packages = await getWorkspacePackages();
+		const planned = planTasks(paths, packages);
+		const keys = new Set(planned.map(task => task.key));
+		rust = keys.has("rust-check") || keys.has("rust-test");
+		native = keys.has("native-build") || keys.has("native-linux-x64");
+		console.log(`ci-dev-affected: rust=${rust} native=${native} (changed paths: ${paths.length})`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.log(`ci-dev-affected: flag computation failed (${message}); failing open to rust=true native=true`);
+		rust = true;
+		native = true;
+	}
+	if (process.env.GITHUB_OUTPUT) {
+		await fs.appendFile(process.env.GITHUB_OUTPUT, `rust=${rust}\nnative=${native}\n`);
 	}
 }
 
