@@ -17,6 +17,8 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 
 Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
 
+Coordinator MCP is a durable polling/await bridge, not a push subscription stream. Use `{{TOOL_PREFIX}}_read_coordination_status`, `{{TOOL_PREFIX}}_read_turn`, and bounded `{{TOOL_PREFIX}}_await_turn` as the authoritative consumption surface.
+
 ## Worktree, model, and provider policy
 
 The Hermes bridge does not choose a model/provider. Generated setup configures `GJC_COORDINATOR_MCP_SESSION_COMMAND` to `gjc --worktree` by default, so GJC creates and tracks the worktree while still using normal local model/provider resolution. Keep worktree creation inside GJC rather than creating unmanaged Hermes-side git worktrees; this preserves the original project identity for session listing and resume. If the operator config supplies a different `GJC_COORDINATOR_MCP_SESSION_COMMAND`, preserve it as explicit user intent.

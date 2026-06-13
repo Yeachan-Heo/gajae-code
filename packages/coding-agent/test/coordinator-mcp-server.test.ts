@@ -202,6 +202,60 @@ describe("Coordinator MCP server protocol", () => {
 		]);
 	});
 
+	it("exposes a canonical polling coordination snapshot", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-status");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "work",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "gjc-demo",
+			turn_id: turn.turn_id,
+			status: "completed",
+			summary: "Done",
+			allow_mutation: true,
+		});
+
+		const status = await server.callTool("gjc_coordinator_read_coordination_status");
+
+		expect(status).toMatchObject({
+			ok: true,
+			schema_version: 1,
+			transport: { mcp: "polling", push_subscriptions: false },
+			summary: { sessions: 1, turns: 1, terminal_turns: 1, reports: 1 },
+		});
+		expect(status.sessions).toHaveLength(1);
+		expect(status.session_states).toHaveLength(1);
+		expect(status.turns).toHaveLength(1);
+		expect(status.reports).toHaveLength(1);
+		expect(status.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ event_type: "session_state", session_id: "gjc-demo", status: "completed" }),
+				expect.objectContaining({ event_type: "turn_state", session_id: "gjc-demo", status: "completed" }),
+				expect.objectContaining({ event_type: "coordination_report", session_id: "gjc-demo", status: "completed" }),
+			]),
+		);
+	});
+
 	it("persists audited follow-up, question answers, and bounded reports", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-test");

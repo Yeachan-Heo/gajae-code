@@ -242,6 +242,8 @@ providers:
 
 `gjc mcp-serve coordinator` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. `gjc mcp-serve hermes` is a compatibility alias for the same bridge. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
 
+Coordinator MCP currently exposes durable polling/await tools, not push subscriptions. Consume `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` for state changes.
+
 | Variable | Behavior |
 | --- | --- |
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |

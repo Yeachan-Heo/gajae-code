@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Expanded coordinator MCP coordination status into a canonical polling snapshot for sessions, session states, turns, questions, reports, and bounded event summaries, and documented that Hermes/coordinator consumption is polling/await rather than push subscription.
+
 ### Fixed
 
 - Preserved provider abort root causes in the final TUI abort label, kept replay rendering idempotent, and added a `PI_STREAM_IDLE_TIMEOUT_MS` remediation hint when stream idle watchdogs fire.
+- Honored the documented `GJC_RPC_EMIT_TITLE` flag for RPC title events while preserving `PI_RPC_EMIT_TITLE` as a legacy alias.
 
 ## [0.4.3] - 2026-06-10
 

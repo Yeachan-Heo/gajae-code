@@ -1,7 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { shouldEmitRpcTitlesForTest } from "../../src/modes/rpc/rpc-mode";
 import { AGENT_WIRE_EVENT_TYPES } from "../../src/modes/shared/agent-wire/event-contract";
 import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../../src/modes/shared/agent-wire/event-envelope";
 import { EVENT_FIXTURES } from "../agent-wire/fixtures";
+
+const ORIGINAL_GJC_RPC_EMIT_TITLE = process.env.GJC_RPC_EMIT_TITLE;
+const ORIGINAL_PI_RPC_EMIT_TITLE = process.env.PI_RPC_EMIT_TITLE;
+
+afterEach(() => {
+	if (ORIGINAL_GJC_RPC_EMIT_TITLE === undefined) delete process.env.GJC_RPC_EMIT_TITLE;
+	else process.env.GJC_RPC_EMIT_TITLE = ORIGINAL_GJC_RPC_EMIT_TITLE;
+	if (ORIGINAL_PI_RPC_EMIT_TITLE === undefined) delete process.env.PI_RPC_EMIT_TITLE;
+	else process.env.PI_RPC_EMIT_TITLE = ORIGINAL_PI_RPC_EMIT_TITLE;
+});
 
 /**
  * Producer contract for RPC mode (rpc-mode.ts): every AgentSessionEvent forwarded
@@ -32,5 +43,19 @@ describe("RPC emission contract: session events are always wrapped", () => {
 			const raw = EVENT_FIXTURES[type] as { type: string };
 			expect(raw.type).not.toBe("event");
 		}
+	});
+});
+
+describe("RPC title emission flag", () => {
+	it("prefers the documented GJC flag while preserving the legacy PI alias", () => {
+		delete process.env.GJC_RPC_EMIT_TITLE;
+		process.env.PI_RPC_EMIT_TITLE = "1";
+		expect(shouldEmitRpcTitlesForTest()).toBe(true);
+
+		process.env.GJC_RPC_EMIT_TITLE = "false";
+		expect(shouldEmitRpcTitlesForTest()).toBe(false);
+
+		process.env.GJC_RPC_EMIT_TITLE = "yes";
+		expect(shouldEmitRpcTitlesForTest()).toBe(true);
 	});
 });

@@ -393,6 +393,70 @@ async function listJsonFiles(dir: string): Promise<unknown[]> {
 	}
 }
 
+const COORDINATOR_STATUS_EVENT_LIMIT = 100;
+
+function jsonRecords(values: unknown[]): Array<Record<string, unknown>> {
+	return values.map(value => asRecord(value)).filter((value): value is Record<string, unknown> => value !== null);
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]): string | null {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return null;
+}
+
+function eventTimestamp(record: Record<string, unknown>): string | null {
+	return firstString(record, ["updated_at", "completed_at", "answered_at", "created_at", "registered_at"]);
+}
+
+function canonicalCoordinatorEvent(
+	event_type: "session_state" | "turn_state" | "question_state" | "coordination_report",
+	record: Record<string, unknown>,
+): Record<string, unknown> {
+	return {
+		schema_version: 1,
+		event_type,
+		session_id: firstString(record, ["session_id", "sessionId"]),
+		turn_id: firstString(record, ["turn_id", "turnId", "current_turn_id", "last_turn_id"]),
+		question_id: event_type === "question_state" ? firstString(record, ["id", "question_id"]) : null,
+		status: firstString(record, ["status", "state"]),
+		source: firstString(record, ["source"]),
+		reason: firstString(record, ["reason"]),
+		updated_at: eventTimestamp(record),
+	};
+}
+
+function sortNewestFirst(records: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	return [...records].sort((left, right) => {
+		const leftTime = eventTimestamp(left) ?? "";
+		const rightTime = eventTimestamp(right) ?? "";
+		return rightTime.localeCompare(leftTime);
+	});
+}
+
+function buildCanonicalCoordinatorEvents(input: {
+	sessionStates: Array<Record<string, unknown>>;
+	turns: Array<Record<string, unknown>>;
+	questions: Array<Record<string, unknown>>;
+	reports: Array<Record<string, unknown>>;
+}): Array<Record<string, unknown>> {
+	return sortNewestFirst([
+		...input.sessionStates.map(record => canonicalCoordinatorEvent("session_state", record)),
+		...input.turns.map(record => canonicalCoordinatorEvent("turn_state", record)),
+		...input.questions.map(record => canonicalCoordinatorEvent("question_state", record)),
+		...input.reports.map(record => canonicalCoordinatorEvent("coordination_report", record)),
+	]).slice(0, COORDINATOR_STATUS_EVENT_LIMIT);
+}
+
+function activeSessionStates(sessionStates: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	return sessionStates.filter(record => {
+		const state = record.state;
+		return state === "booting" || state === "running" || state === "needs_user_input" || state === "stale";
+	});
+}
+
 function safeExternalId(kind: "session" | "question", value: unknown): string {
 	if (typeof value !== "string" || !SAFE_EXTERNAL_ID_PATTERN.test(value)) throw new Error(`invalid_${kind}_id`);
 	return value;
@@ -1136,8 +1200,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
-			if (name === "gjc_coordinator_read_coordination_status")
-				return { ok: true, reports: await listJsonFiles(path.join(namespaceDir, "reports")) };
+			if (name === "gjc_coordinator_read_coordination_status") {
+				const sessions = jsonRecords(await listSessions());
+				const sessionStates = jsonRecords(await listJsonFiles(path.join(namespaceDir, "session-states")));
+				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir)));
+				const questions = jsonRecords(await listQuestions(args));
+				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports")));
+				return {
+					ok: true,
+					schema_version: 1,
+					namespace: config.namespace,
+					state_root: namespaceDir,
+					transport: { mcp: "polling", push_subscriptions: false },
+					summary: {
+						sessions: sessions.length,
+						active_sessions: activeSessionStates(sessionStates).length,
+						turns: turns.length,
+						active_turns: turns.filter(turn => ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus)).length,
+						queued_turns: turns.filter(turn => turn.status === "queued").length,
+						terminal_turns: turns.filter(turn => TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)).length,
+						open_questions: questions.filter(question => question.status === "open").length,
+						reports: reports.length,
+					},
+					sessions,
+					session_states: sessionStates,
+					turns,
+					questions,
+					reports,
+					events: buildCanonicalCoordinatorEvents({ sessionStates, turns, questions, reports }),
+				};
+			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);
 				const cwd = await assertCoordinatorWorkdir(config, args.cwd);

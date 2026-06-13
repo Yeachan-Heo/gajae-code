@@ -90,7 +90,7 @@ Real tmux/GJC actuation uses the configured GJC-compatible session command. `gjc
 export GJC_COORDINATOR_MCP_SESSION_COMMAND="gjc --worktree"
 ```
 
-With that command configured, `gjc_coordinator_start_session` launches a detached tmux session, `gjc_coordinator_send_prompt` creates a durable turn and sends input to that pane, and `gjc_coordinator_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as `gjc_coordinator_report_status`.
+With that command configured, `gjc_coordinator_start_session` launches a detached tmux session, `gjc_coordinator_send_prompt` creates a durable turn and sends input to that pane, `gjc_coordinator_read_coordination_status` returns a canonical polling snapshot for sessions, session states, turns, questions, reports, and bounded event summaries, and `gjc_coordinator_read_tail` reads bounded advisory pane output. Tmux tail parsing is not the completion source of truth; turn completion comes from explicit durable turn state such as runtime session state or `gjc_coordinator_report_status`.
 
 For resume safety, prefer the generated GJC-native worktree command over creating a git worktree in Hermes itself. GJC's launch path records the original repo as the project identity while running in the worktree, so session listing/resume can still group the session under the source project. If Hermes creates and later deletes an unmanaged worktree, a saved session may still exist but its cwd can be gone.
 
@@ -186,6 +186,8 @@ A session may have only one active turn by default. A second prompt is rejected 
   }
 }
 ```
+
+The coordinator MCP bridge is currently a durable polling/await surface. It does not expose a push subscription stream; external coordinators should poll `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` instead of waiting for server-sent push events.
 
 External `session_id`, `turn_id`, and `question_id` values are validated before path use, and loaded records must match the requested session/turn owner.
 ## Hermes config snippet
