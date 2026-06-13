@@ -22,7 +22,7 @@ require ADR-level rationale per [`docs/bridge.md`](bridge.md).
 | --- | --- |
 | Network transport, TLS, bearer auth, fail-closed posture | Bridge mode (`gjc --mode bridge`), [`docs/bridge.md`](bridge.md) |
 | Client SDK / framing | `@gajae-code/bridge-client` (`BridgeClient`, `events()`) |
-| Live session enumeration, liveness, bounded status, submit | Harness control plane (`gjc harness`), `packages/coding-agent/src/harness-control-plane/` |
+| Session state storage, liveness, bounded status, submit gating | Harness control plane (`gjc harness`), `packages/coding-agent/src/harness-control-plane/` |
 | Bounded observation (never a raw transcript dump) | `Observation` / `SessionStateView` in `harness-control-plane/types.ts` |
 | Web client precedent (local server + SPA) | `packages/stats` (`server.ts` + `src/client/`) |
 
@@ -48,7 +48,7 @@ proliferation of per-session ports and pairing surfaces.
 
 ```
  phone (mobile web)
-        │  HTTPS + bearer (scoped: message:read + prompt)
+        │  HTTPS + bearer (scoped: remote:view + remote:submit)
         ▼
  Gajae Remote gateway  ── enumerates ─▶ harness control-plane session-state dir
    (one PC process)     ── observe ───▶ owner process (RuntimeOwner, lease holder)
@@ -66,8 +66,8 @@ The gateway MUST NOT, in v0:
 
 - edit files, run shell, or invoke any mutating tool;
 - answer workflow-gate / permission / approval prompts (those stay on the PC);
-- expose `bash`, `host_tools`, `host_uri`, `export`, `admin`, or `control`
-  scopes to the phone;
+- expose bridge/RPC command scopes (`message:read`, `session`, `model`, `bash`,
+  `host_tools`, `host_uri`, `export`, `admin`, or `control`) to the phone;
 - stream raw pane output, transcripts, tool arguments/results, diffs, file
   contents, environment, or secrets;
 - bypass the owner's `readyForSubmit` gating or submit while a session is busy.
@@ -96,7 +96,7 @@ projection from the control plane's already-bounded `Observation` /
 | Field | Source | Notes |
 | --- | --- | --- |
 | `sessionId` | `SessionState.sessionId` | opaque id |
-| `name` | session title / handle metadata | sanitized, length-capped |
+| `name` | derived from handle metadata (`issueOrPr`, repo, branch, or session id fallback) | sanitized, length-capped |
 | `harness` | `SessionState.harness` | `gajae-code` in v1 |
 | `status` | derived (see state mapping) | `idle` \| `working` \| `blocked` \| `offline` |
 | `lastActivityAt` | `Observation.lastActivityAt` | ISO timestamp |
@@ -160,16 +160,22 @@ marker rather than a redacted blob.
 
 ## Pairing and auth (minimum that is not security soup)
 
-v0 = **local pairing only**. Reuse the bridge security model exactly:
+v0 = **local pairing only**. Reuse the bridge security model for transport and authentication posture, but expose a gateway-specific authorization surface:
 
 - **TLS mandatory for every bind, including loopback** (no plaintext fallback;
   matches `docs/bridge.md`).
 - **Bearer token mandatory** for every endpoint except health/help.
 - Pairing flow: the PC prints/serves a short-lived **pairing code**; the phone
-  submits host + code and receives a **scoped bearer** whose scope floor is
-  `message:read` + `prompt` only. No `bash`/`host_*`/`control`/`admin`.
+  submits host + code and receives a **scoped bearer** capped to
+  gateway-only scopes: `remote:view` + `remote:submit` only. These scopes are
+  not aliases for bridge/RPC `message:read` or `prompt`. Phone bearers MUST NOT
+  authorize bridge command-catalog calls such as `get_messages`,
+  `get_last_assistant_text`, `get_state` with `include: ["systemPrompt",
+  "tools"]`, `new_session`, `switch_session`, `branch`, `set_model`,
+  `bash`, `host_*`, `control`, or `admin`.
 - Tokens expire; re-pairing is the recovery path. The gateway is fail-closed:
-  unknown/expired tokens and out-of-scope commands are rejected before dispatch.
+  unknown/expired tokens, non-gateway scopes, bridge command-catalog methods,
+  and out-of-scope commands are rejected before dispatch.
 
 Hosted relay is **deferred to v1** and gated behind a separate ADR (it changes
 the trust model and is where "security soup" risk concentrates).
@@ -179,7 +185,7 @@ the trust model and is where "security soup" risk concentrates).
 | Question | v0 decision | Deferred |
 | --- | --- | --- |
 | Hosted relay vs local pairing vs both | Local pairing only | Hosted relay → v1 (ADR) |
-| Minimum pairing/auth | Pairing code → scoped bearer, TLS mandatory | Identity/relay accounts → v1 |
+| Minimum pairing/auth | Pairing code → gateway-scoped bearer, TLS mandatory | Identity/relay accounts → v1 |
 | Which session states are public | Bounded: `idle`/`working`/`blocked`/`offline` + bounded observation vocab | Richer telemetry → v1 |
 | Web vs native first | Mobile web first (reuse stats SPA build pattern) | Native app / PWA polish → v1 |
 | Notifications / pause / resume | Out of scope for v0 | Staged in v1 |
@@ -202,9 +208,10 @@ Each step is independently shippable; later steps stay fail-closed until wired.
 4. **PR 4 — gateway submit path.** One-line submit through the owner's submit
    gating; typed rejections for busy/denied; idempotency. Tests for
    busy/rejected paths.
-5. **PR 5 — pairing/auth.** Pairing code → scoped bearer with the
-   `message:read`+`prompt` floor and expiry. Tests for scope enforcement and
-   expiry.
+5. **PR 5 — pairing/auth.** Pairing code → gateway-scoped bearer
+   (`remote:view` + `remote:submit`) with expiry. Tests prove phone bearers
+   cannot call bridge/RPC `message:read`, `prompt`, session/model, shell, host,
+   control, or admin surfaces.
 6. **PR 6 — mobile web client.** Minimal SPA (list → open → status → submit)
    using `@gajae-code/bridge-client` and the `packages/stats` build pattern.
 7. **PR 7 — failure-state UX + hardening.** Failure-state surfaces, redaction
