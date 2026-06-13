@@ -1,4 +1,5 @@
 import {
+	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxUntaggedSessionError,
@@ -148,7 +149,10 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 }
 
 function readProfileForExactTarget(sessionName: string, env: NodeJS.ProcessEnv): string {
-	return runTmux(["show-options", "-qv", "-t", `=${sessionName}`, GJC_TMUX_PROFILE_OPTION], env).trim();
+	return runTmux(
+		["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), GJC_TMUX_PROFILE_OPTION],
+		env,
+	).trim();
 }
 
 export function removeGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {

@@ -32,6 +32,20 @@ export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): str
 	return env[GJC_TMUX_COMMAND_ENV]?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
 }
 
+/**
+ * Build the exact-session target for tmux *option* commands
+ * (`show-options` / `set-option`) and `display-message -t`.
+ *
+ * Session-scoped commands such as `kill-session` / `attach-session` resolve a
+ * bare exact target (`=NAME`), but tmux 3.6a refuses to resolve a bare `=NAME`
+ * for option/display commands. Appending the empty window separator (`=NAME:`)
+ * keeps the exact-session match while giving tmux the window-qualified target
+ * those commands require. See gajae-code#580.
+ */
+export function buildGjcTmuxExactOptionTarget(sessionName: string): string {
+	return `=${sessionName}:`;
+}
+
 export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
 
 export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
