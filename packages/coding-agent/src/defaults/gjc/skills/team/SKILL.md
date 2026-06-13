@@ -306,8 +306,9 @@ Worker protocol:
 
 Useful runtime env vars:
 
-- `GJC_TEAM_TMUX_COMMAND`
-  - tmux binary/command override (default `tmux`)
+- `GJC_TMUX_COMMAND` / `GJC_TEAM_TMUX_COMMAND`
+  - tmux binary/command override (default `tmux`). `GJC_TMUX_COMMAND` applies to every GJC tmux flow; `GJC_TEAM_TMUX_COMMAND` is honored as an alias by the team path. Both resolve through the same resolver, so the team leader and `gjc session ...` always target the same multiplexer.
+  - Multiplexer support boundary: GJC-managed sessions and the team leader are detected via tmux user options (`@gjc-profile`, written with `set-option` and read back with `show-options` / `list-sessions -F`). A provider must round-trip those user options to be supported. Real tmux works. Alternative multiplexers such as psmux on Windows do not reliably persist tmux user options yet, so `gjc session status` reports `gjc_tmux_session_untagged` (the session exists in the multiplexer but is not GJC-tagged) and team startup rejects the leader as `unmanaged_tmux_session`. The Windows-native psmux path is therefore not fully supported; use real tmux for GJC-managed session and team flows.
 - `GJC_TEAM_WORKER_COMMAND`
   - worker command override (default resolves to active GJC entrypoint or `gjc`)
 - `GJC_TEAM_STATE_ROOT`

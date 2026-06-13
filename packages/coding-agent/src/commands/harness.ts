@@ -11,16 +11,18 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
+import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
-import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
+import { buildResponse, buildStateView, submitUnavailableReason } from "../harness-control-plane/state-machine";
 import {
 	canonicalWorkspacePath,
 	generateSessionId,
@@ -513,6 +515,9 @@ export default class Harness extends Command {
 		cursor: Flags.string({ description: "Event cursor for events --follow (exclusive)", default: "0" }),
 		follow: Flags.boolean({ description: "Tail the owner-written event log", default: false }),
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: true }),
+		"receipt-spool-dir": Flags.string({
+			description: "Append persisted ReceiptEnvelope records to spool.jsonl under this directory",
+		}),
 	};
 
 	static examples = [
@@ -527,6 +532,11 @@ export default class Harness extends Command {
 		const verb = String(args.verb);
 		let root = resolveHarnessRoot();
 		try {
+			const receiptSpoolDir = flags["receipt-spool-dir"];
+			if (receiptSpoolDir !== undefined) {
+				if (!receiptSpoolDir.trim()) throw new Error("receipt_spool_dir_empty");
+				process.env[RECEIPT_SPOOL_DIR_ENV] = path.resolve(receiptSpoolDir.trim());
+			}
 			const input = parseInput(flags.input);
 			const promptFile = flags["prompt-file"];
 			if (promptFile !== undefined) {
@@ -676,6 +686,9 @@ export default class Harness extends Command {
 		}
 		const sessionName = deterministicHarnessTmuxSessionName(sessionId);
 		const envAssignments = [`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`];
+		if (process.env[RECEIPT_SPOOL_DIR_ENV]) {
+			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
+		}
 		if (process.env.GJC_HARNESS_RPC_COMMAND) {
 			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
 		}
@@ -715,6 +728,9 @@ export default class Harness extends Command {
 			env: {
 				...process.env,
 				GJC_HARNESS_STATE_ROOT: root,
+				...(process.env[RECEIPT_SPOOL_DIR_ENV]
+					? { [RECEIPT_SPOOL_DIR_ENV]: process.env[RECEIPT_SPOOL_DIR_ENV] }
+					: {}),
 				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
 					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
 					: {}),
@@ -878,7 +894,9 @@ export default class Harness extends Command {
 	): Promise<boolean> {
 		const owner = await resolveOwner(root, sessionId);
 		if (!owner.live || !owner.socketPath) return false;
+		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
+			if (process.env[RECEIPT_SPOOL_DIR_ENV]) input[RECEIPT_SPOOL_DIR_ENV] = process.env[RECEIPT_SPOOL_DIR_ENV];
 			const res = (await callEndpoint(owner.socketPath, { verb, input })) as { ok?: boolean };
 			writeJson(res);
 			if (res?.ok === false) process.exitCode = 1;
@@ -886,6 +904,9 @@ export default class Harness extends Command {
 		} catch (error) {
 			if (error instanceof EndpointUnreachableError) return false;
 			throw error;
+		} finally {
+			if (priorSpoolDir === undefined) delete input[RECEIPT_SPOOL_DIR_ENV];
+			else input[RECEIPT_SPOOL_DIR_ENV] = priorSpoolDir;
 		}
 	}
 
@@ -978,8 +999,21 @@ export default class Harness extends Command {
 
 	async #submit(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
 		const sessionId = requireSessionId(input, flagSession);
-		if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
 		let state = await loadState(root, sessionId);
+		const noOwnerGate = submitUnavailableReason(state.lifecycle, false);
+		if (!noOwnerGate || noOwnerGate === "owner-not-live") {
+			if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
+			state = await loadState(root, sessionId);
+		}
+		const blockedByOwnerLiveness = state.blockers.some(
+			blocker => isOwnerLivenessBlocker(blocker) || blocker === OWNER_STARTUP_BLOCKER,
+		);
+		const lifecycleGate = submitUnavailableReason(state.lifecycle, false);
+		if (lifecycleGate && lifecycleGate !== "owner-not-live" && !blockedByOwnerLiveness) {
+			writeJson(buildResponse(state, false, { accepted: false, submitted: false, reason: lifecycleGate }, false));
+			process.exitCode = 1;
+			return;
+		}
 		// No live owner: submission is blocked (never echoed-as-accepted). Surface owner exit
 		// evidence + explicit recovery guidance so the caller is not left with a bare gate.
 		const ownerExit = await buildOwnerExitEvidence(root, state);

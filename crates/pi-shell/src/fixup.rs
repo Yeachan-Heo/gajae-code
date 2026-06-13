@@ -127,6 +127,21 @@ struct HeadTailOutcome {
 	last_idx: usize,
 }
 
+fn source_index_to_byte(cmd: &str, index: usize) -> Option<usize> {
+	let mut chars_seen = 0usize;
+	for (byte_idx, _) in cmd.char_indices() {
+		if chars_seen == index {
+			return Some(byte_idx);
+		}
+		chars_seen += 1;
+	}
+	if chars_seen == index {
+		Some(cmd.len())
+	} else {
+		None
+	}
+}
+
 fn try_strip_head_tail(
 	p: &Pipeline,
 	cmd: &str,
@@ -154,7 +169,12 @@ fn try_strip_head_tail(
 	// span under-reports when its suffix contains unlocated `IoRedirect`s
 	// (e.g. the synthetic `2>&1` inserted by `|&`).
 	let bytes = cmd.as_bytes();
-	let last_start = last_loc.start.index;
+	let Some(last_start) = source_index_to_byte(cmd, last_loc.start.index) else {
+		return default;
+	};
+	let Some(last_end) = source_index_to_byte(cmd, last_loc.end.index) else {
+		return default;
+	};
 	let Some(head) = cmd.get(..last_start) else {
 		return default;
 	};
@@ -172,7 +192,7 @@ fn try_strip_head_tail(
 	// Reported text starts at the pipe and is right-trimmed. The deletion
 	// range walks back through any leading whitespace so the rewrite is
 	// contiguous.
-	let stripped_text = cmd[pipe_pos..last_loc.end.index].trim_end().to_owned();
+	let stripped_text = cmd[pipe_pos..last_end].trim_end().to_owned();
 	if stripped_text.is_empty() {
 		return default;
 	}
@@ -180,7 +200,7 @@ fn try_strip_head_tail(
 	while delete_start > 0 && matches!(bytes[delete_start - 1], b' ' | b'\t') {
 		delete_start -= 1;
 	}
-	ranges.push((delete_start, last_loc.end.index));
+	ranges.push((delete_start, last_end));
 	stripped.push(stripped_text);
 	HeadTailOutcome { stripped: true, last_idx: n - 2 }
 }
@@ -253,10 +273,15 @@ fn try_strip_2to1(
 	let Some(name_loc) = name_word.loc.as_ref() else {
 		return;
 	};
-	let mut anchor = name_loc.end.index;
+	let Some(mut anchor) = source_index_to_byte(cmd, name_loc.end.index) else {
+		return;
+	};
 	for item in &suffix.0 {
 		if let Some(loc) = item.location() {
-			anchor = anchor.max(loc.end.index);
+			let Some(end) = source_index_to_byte(cmd, loc.end.index) else {
+				return;
+			};
+			anchor = anchor.max(end);
 		}
 	}
 	let bytes = cmd.as_bytes();
@@ -372,6 +397,16 @@ mod tests {
 			("git log --oneline | head -20", "git log --oneline", &["| head -20"]),
 			("echo a | tr a b | head -3", "echo a | tr a b", &["| head -3"]),
 			("just build |& head -5", "just build", &["|& head -5"]),
+			(
+				"printf '답해' && git log --oneline | head -20",
+				"printf '답해' && git log --oneline",
+				&["| head -20"],
+			),
+			(
+				"curl -s -d '{\"content\":\"한국어로만 답해\"}' http://example.test | head -1",
+				"curl -s -d '{\"content\":\"한국어로만 답해\"}' http://example.test",
+				&["| head -1"],
+			),
 		];
 		for (input, want_cmd, want_stripped) in cases {
 			let (cmd, stripped) = run(input);
@@ -387,6 +422,10 @@ mod tests {
 			("just build 2>&1", "just build", &["2>&1"]),
 			("just build 2>&1 | tail -3", "just build", &["| tail -3", "2>&1"]),
 			("cargo build 2>&1 | head -50", "cargo build", &["| head -50", "2>&1"]),
+			("printf '답해' && cargo test 2>&1 | head -50", "printf '답해' && cargo test", &[
+				"| head -50",
+				"2>&1",
+			]),
 		];
 		for (input, want_cmd, want_stripped) in cases {
 			let (cmd, stripped) = run(input);

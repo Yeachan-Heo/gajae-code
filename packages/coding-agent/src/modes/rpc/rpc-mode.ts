@@ -11,7 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import * as path from "node:path";
-import { $env, readJsonl, Snowflake } from "@gajae-code/utils";
+import { $env, readLines, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -169,6 +169,7 @@ export async function runRpcMode(
 		process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
+	const decodeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -229,6 +230,28 @@ export async function runRpcMode(
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
+	let shutdownStarted = false;
+	async function shutdown(exitCode: number, reason: string): Promise<never> {
+		if (shutdownStarted) {
+			process.exit(exitCode);
+		}
+		shutdownStarted = true;
+		hostToolBridge.rejectAllPending(`${reason} before host tool execution completed`);
+		hostUriBridge.clear(`${reason} before host URI request completed`);
+		try {
+			await session.sessionManager.ensureOnDisk();
+		} catch (err) {
+			output(error(undefined, "shutdown", decodeError(err)));
+			process.exit(1);
+		}
+		try {
+			await session.dispose();
+		} catch (err) {
+			output(error(undefined, "shutdown", decodeError(err)));
+			process.exit(1);
+		}
+		process.exit(exitCode);
+	}
 
 	/**
 	 * Extension UI context that uses the RPC protocol.
@@ -497,16 +520,24 @@ export async function runRpcMode(
 	 */
 	async function checkShutdownRequested(): Promise<void> {
 		if (!shutdownState.requested) return;
-
-		if (session.extensionRunner?.hasHandlers("session_shutdown")) {
-			await session.extensionRunner.emit({ type: "session_shutdown" });
-		}
-
-		process.exit(0);
+		await shutdown(0, "RPC shutdown requested");
 	}
 
-	// Listen for JSON input using Bun's stdin
-	for await (const parsed of readJsonl(Bun.stdin.stream())) {
+	// Listen for JSONL input using Bun's stdin. Parse frame-by-frame so a malformed
+	// command reports a parse error without poisoning the whole long-lived RPC session.
+	const inputDecoder = new TextDecoder("utf-8", { fatal: false });
+	for await (const line of readLines(Bun.stdin.stream())) {
+		const text = inputDecoder.decode(line).trim();
+		if (!text) continue;
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (err) {
+			output(error(undefined, "parse", `Failed to parse command: ${decodeError(err)}`));
+			continue;
+		}
+
 		try {
 			// Handle extension UI responses
 			if ((parsed as RpcExtensionUIResponse).type === "extension_ui_response") {
@@ -540,13 +571,12 @@ export async function runRpcMode(
 
 			// Check for deferred shutdown request (idle between commands)
 			await checkShutdownRequested();
-		} catch (e: any) {
-			output(error(undefined, "parse", `Failed to parse command: ${e.message}`));
+		} catch (err) {
+			output(error(undefined, "parse", `Failed to parse command: ${decodeError(err)}`));
 		}
 	}
 
-	// stdin closed — RPC client is gone, exit cleanly
-	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
-	hostUriBridge.clear("RPC client disconnected before host URI request completed");
-	process.exit(0);
+	// stdin closed — RPC client is gone, flush durable state and exit cleanly
+	await shutdown(0, "RPC client disconnected");
+	throw new Error("RPC shutdown returned unexpectedly");
 }

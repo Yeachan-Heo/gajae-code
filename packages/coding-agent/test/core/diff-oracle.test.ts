@@ -11,6 +11,36 @@ const fixtures = [
 		newText: "alpha delta gamma\nunchanged\n",
 	},
 	{
+		name: "single-token replacement fast path",
+		oldText: "const status = oldValue;\n",
+		newText: "const status = newValue;\n",
+	},
+	{
+		name: "prefix suffix change fast path",
+		oldText: "return renderChunk(previousState, options);\n",
+		newText: "return renderChunk(currentState, options);\n",
+	},
+	{
+		name: "whitespace-only change fast path",
+		oldText: "const value = call(alpha, beta);\n",
+		newText: "const  value = call(alpha,  beta);\n",
+	},
+	{
+		name: "tabs indent fast path",
+		oldText: "\tif (enabled) return oldName;\n",
+		newText: "\tif (enabled) return newName;\n",
+	},
+	{
+		name: "unicode combining marks fast path",
+		oldText: 'const label = "cafe\u0301";\n',
+		newText: 'const label = "café";\n',
+	},
+	{
+		name: "very long line fast path guard",
+		oldText: `${"a".repeat(2600)}old${"z".repeat(2600)}\n`,
+		newText: `${"a".repeat(2600)}new${"z".repeat(2600)}\n`,
+	},
+	{
 		name: "insert delete with context collapse",
 		oldText: Array.from({ length: 18 }, (_, i) => `line ${i + 1}`).join("\n"),
 		newText: Array.from({ length: 18 }, (_, i) =>
@@ -26,6 +56,16 @@ const fixtures = [
 		name: "blank and no final newline",
 		oldText: "alpha\n\n beta  \nlast",
 		newText: "alpha\nblank\n beta\t\nlast\nEOF",
+	},
+	{
+		name: "sub-word replacement falls back to diffWords",
+		oldText: "abc def\n",
+		newText: "abX def\n",
+	},
+	{
+		name: "word boundary spanning replacement",
+		oldText: "alpha beta gamma\n",
+		newText: "alpha BETAgamma\n",
 	},
 ];
 

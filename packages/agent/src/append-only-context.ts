@@ -387,8 +387,42 @@ function normalizeImportedTools(tools: readonly Tool[], options: BuildOptions): 
 	return cloneJson(normalizedTools);
 }
 
-function cloneJson<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value)) as T;
+export function cloneJson<T>(value: T): T {
+	return cloneJsonValue(value) as T;
+}
+
+function cloneJsonValue(value: unknown, key = "", applyToJson = true): unknown {
+	if (value === null) return null;
+	const type = typeof value;
+	if (type === "number") return Number.isFinite(value) ? value : null;
+	// JSON.stringify drops function/symbol/undefined values (object props
+	// omitted, array elements become null via the array walk below).
+	if (type === "undefined" || type === "function" || type === "symbol") return undefined;
+	if (type !== "object") return value;
+	if (applyToJson) {
+		// JSON.stringify performs a single Get of `toJSON` per holder/key and
+		// serializes the returned replacement WITHOUT re-dispatching the
+		// replacement's own toJSON at the same level (nested properties still
+		// dispatch normally). Mirror that exactly to keep byte parity.
+		const toJSON = (value as { toJSON?: unknown }).toJSON;
+		if (typeof toJSON === "function") {
+			return cloneJsonValue(toJSON.call(value, key), key, false);
+		}
+	}
+	if (Array.isArray(value)) {
+		const cloned: unknown[] = new Array(value.length);
+		for (let i = 0; i < value.length; i++) {
+			const item = Object.hasOwn(value, i) ? cloneJsonValue(value[i], String(i)) : undefined;
+			cloned[i] = item === undefined ? null : item;
+		}
+		return cloned;
+	}
+	const cloned: Record<string, unknown> = {};
+	for (const key of Object.keys(value as object)) {
+		const clonedValue = cloneJsonValue((value as Record<string, unknown>)[key], key);
+		if (clonedValue !== undefined) cloned[key] = clonedValue;
+	}
+	return cloned;
 }
 
 function computeFingerprint(systemPrompt: string[], tools: Tool[], options: BuildOptions): string {

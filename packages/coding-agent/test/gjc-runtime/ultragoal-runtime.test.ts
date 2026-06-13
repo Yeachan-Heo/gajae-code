@@ -271,6 +271,20 @@ function goalToolSnapshot(objective: string, status = "active", updatedAt: numbe
 	});
 }
 
+async function expectRejectedSteering(root: string, args: string[], kind: string): Promise<string> {
+	const beforeGoals = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+	const beforeLedger = await readUltragoalLedger(root);
+	const result = await runNativeUltragoalCommand(args, root);
+	const afterLedger = await readUltragoalLedger(root);
+	const rejection = afterLedger.at(-1);
+
+	expect(result.status).toBe(1);
+	expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(beforeGoals);
+	expect(afterLedger).toHaveLength(beforeLedger.length + 1);
+	expect(rejection).toMatchObject({ event: "steering_rejected", kind });
+	return result.stderr ?? "";
+}
+
 describe("native GJC ultragoal runtime", () => {
 	it("reports missing status from a fresh repo", async () => {
 		const root = await tempDir();
@@ -417,6 +431,315 @@ describe("native GJC ultragoal runtime", () => {
 			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
 		});
 		expect(receipt).not.toHaveProperty("goals");
+	});
+
+	it("supports split_subgoal steering with replacement ids and compact receipts", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: ["@goal: First", "Complete first story.", "", "@goal: Second", "Complete second story."].join("\n"),
+		});
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"split_subgoal",
+				"--goal-id",
+				"G001",
+				"--replacements-json",
+				JSON.stringify([
+					{ title: "Fix parser", objective: "Resolve the parser blocker." },
+					{ title: "Verify parser", objective: "Run focused parser verification." },
+				]),
+				"--evidence",
+				"implementation investigation found two independently verifiable parser risks",
+				"--rationale",
+				"split keeps each replacement story independently auditable",
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+		const plan = await readUltragoalPlan(root);
+		const accepted = (await readUltragoalLedger(root)).at(-1);
+
+		expect(result.status).toBe(0);
+		expect(receipt).toMatchObject({
+			ok: true,
+			kind: "split_subgoal",
+			goal_id: "G001",
+			replacement_goal_ids: ["G003", "G004"],
+			goals_path: path.join(root, ".gjc", "ultragoal", "goals.json"),
+		});
+		expect(receipt).not.toHaveProperty("goals");
+		expect(plan?.goals.map(goal => [goal.id, goal.status])).toEqual([
+			["G001", "superseded"],
+			["G003", "pending"],
+			["G004", "pending"],
+			["G002", "pending"],
+		]);
+		expect(accepted).toMatchObject({
+			event: "steering_accepted",
+			kind: "split_subgoal",
+			replacementGoalIds: ["G003", "G004"],
+		});
+	});
+
+	it("supports reorder, wording revision, ledger annotation, and blocked supersession", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: [
+				"@goal: First",
+				"Complete first story.",
+				"",
+				"@goal: Second",
+				"Complete second story.",
+				"",
+				"@goal: Third",
+				"Complete third story.",
+			].join("\n"),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+
+		const reorder = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"reorder_pending",
+				"--order-json",
+				JSON.stringify(["G003", "G002"]),
+				"--evidence",
+				"dependency investigation showed third story must precede second story",
+				"--rationale",
+				"pending-only reorder preserves active and terminal goal positions",
+				"--json",
+			],
+			root,
+		);
+		expect(reorder.status).toBe(0);
+		expect((await readUltragoalPlan(root))?.goals.map(goal => goal.id)).toEqual(["G001", "G003", "G002"]);
+
+		const revise = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"revise_pending_wording",
+				"--goal-id",
+				"G003",
+				"--title",
+				"Third story clarified",
+				"--evidence",
+				"review found the pending story title was too vague",
+				"--rationale",
+				"clear pending wording improves execution handoff without changing status",
+				"--json",
+			],
+			root,
+		);
+		expect(revise.status).toBe(0);
+		expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G003")?.title).toBe(
+			"Third story clarified",
+		);
+
+		const goalsBeforeAnnotation = await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text();
+		const annotation = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"annotate_ledger",
+				"--evidence",
+				"user changed release ordering while preserving the aggregate objective",
+				"--rationale",
+				"recording the runtime direction keeps the durable ledger auditable",
+				"--json",
+			],
+			root,
+		);
+		expect(annotation.status).toBe(0);
+		expect(await Bun.file(path.join(root, ".gjc", "ultragoal", "goals.json")).text()).toBe(goalsBeforeAnnotation);
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+		const supersede = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G002",
+				"--evidence",
+				"replacement evidence shows this blocked sub-goal is no longer required",
+				"--rationale",
+				"no replacement is needed because remaining required goals cover the aggregate objective",
+				"--json",
+			],
+			root,
+		);
+		const supersededGoal = (await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G002");
+		expect(supersede.status).toBe(0);
+		expect(supersededGoal).toMatchObject({ status: "superseded", steering: { noReplacementRequired: true } });
+	});
+
+	it("rejects blocked supersession when it would remove the final required goal", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Complete the only story" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+
+		const stderr = await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence shows this blocked sub-goal is no longer required",
+				"--rationale",
+				"negative test verifies the final required goal cannot be superseded without replacement",
+			],
+			"mark_blocked_superseded",
+		);
+
+		expect(stderr).toContain("only remaining required goal");
+	});
+
+	it("allows blocked supersession when another required goal remains", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: ["@goal: First", "Complete first story.", "", "@goal: Second", "Complete second story."].join("\n"),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+
+		const supersede = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G001",
+				"--evidence",
+				"replacement evidence shows this blocked sub-goal is no longer required",
+				"--rationale",
+				"remaining required goal covers the aggregate objective",
+				"--json",
+			],
+			root,
+		);
+		const plan = await readUltragoalPlan(root);
+
+		expect(supersede.status).toBe(0);
+		expect(plan?.goals.map(goal => [goal.id, goal.status])).toEqual([
+			["G001", "superseded"],
+			["G002", "pending"],
+		]);
+	});
+
+	it("audits known-kind steering rejections without mutating goals", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: ["@goal: First", "Complete first story.", "", "@goal: Second", "Complete second story."].join("\n"),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+
+		await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"split_subgoal",
+				"--goal-id",
+				"G001",
+				"--replacements-json",
+				JSON.stringify([
+					{ title: "A", objective: "A objective" },
+					{ title: "B", objective: "B objective" },
+				]),
+				"--evidence",
+				"split attempted against active goal status",
+				"--rationale",
+				"negative test verifies status boundary audit",
+			],
+			"split_subgoal",
+		);
+		await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"reorder_pending",
+				"--order-json",
+				JSON.stringify(["G001"]),
+				"--evidence",
+				"reorder attempted with active goal id",
+				"--rationale",
+				"negative test verifies pending-only ordering audit",
+			],
+			"reorder_pending",
+		);
+		await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"revise_pending_wording",
+				"--goal-id",
+				"G001",
+				"--title",
+				"Active rewrite rejected",
+				"--evidence",
+				"wording revision attempted against active goal status",
+				"--rationale",
+				"negative test verifies pending-only wording audit",
+			],
+			"revise_pending_wording",
+		);
+		await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"annotate_ledger",
+				"--evidence",
+				"annotation is missing required rationale for audit completeness",
+			],
+			"annotate_ledger",
+		);
+		await expectRejectedSteering(
+			root,
+			[
+				"steer",
+				"--kind",
+				"mark_blocked_superseded",
+				"--goal-id",
+				"G002",
+				"--evidence",
+				"supersession attempted against pending goal status",
+				"--rationale",
+				"negative test verifies blocked-only supersession audit",
+			],
+			"mark_blocked_superseded",
+		);
 	});
 
 	it("prints receipt-only json for review blockers", async () => {

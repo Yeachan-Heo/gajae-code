@@ -92,4 +92,29 @@ describe("GJC tmux session management", () => {
 		expect(() => removeGjcTmuxSession("gajae_code_work")).toThrow("gjc_tmux_session_not_managed:gajae_code_work");
 		expect(calls.some(call => call.includes("kill-session"))).toBe(false);
 	});
+
+	it("diagnoses sessions the multiplexer lists but did not tag with the GJC profile", () => {
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			if (cmd.includes("list-sessions")) {
+				const format = cmd[cmd.indexOf("-F") + 1] ?? "";
+				// The bare `#{session_name}` probe sees the session (psmux ls shows it)...
+				if (format === "#{session_name}") return spawnResult(0, "psmux_session\n");
+				// ...but the full format does not round-trip @gjc-profile, so the profile column is empty.
+				return spawnResult(0, "psmux_session\t1\t0\t1770000000\t\troot\t0\t\t\t\n");
+			}
+			return spawnResult(0, "");
+		});
+
+		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(
+			"gjc_tmux_session_untagged:psmux_session",
+		);
+		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(/not fully supported/);
+	});
+
+	it("still reports plain not-found when the multiplexer does not list the session", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(0, ""));
+
+		expect(() => statusGjcTmuxSession("ghost")).toThrow("gjc_tmux_session_not_found:ghost");
+	});
 });

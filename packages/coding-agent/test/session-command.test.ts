@@ -109,4 +109,24 @@ describe("gjc session command", () => {
 			},
 		});
 	});
+
+	it("surfaces an untagged-session diagnostic with a detail hint in JSON failures", async () => {
+		mockSpawnSync((cmd: string[]) => {
+			if (cmd.includes("list-sessions")) {
+				const format = cmd[cmd.indexOf("-F") + 1] ?? "";
+				if (format === "#{session_name}") return spawnResult(0, "winsess\n");
+				return spawnResult(0, "winsess\t1\t0\t1770000000\t\troot\t0\t\t\t\n");
+			}
+			return spawnResult(0, "");
+		});
+
+		const output = await runSessionCommand(["status", "winsess", "--json"]);
+		const payload = JSON.parse(output);
+
+		expect(payload.ok).toBe(false);
+		expect(payload.reason).toBe("gjc_tmux_session_untagged");
+		expect(typeof payload.detail).toBe("string");
+		expect(payload.detail).toContain("not fully supported");
+		expect(payload.detail).not.toContain(" — ");
+	});
 });

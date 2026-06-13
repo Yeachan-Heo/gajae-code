@@ -10,7 +10,7 @@
 
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import type { AgentMessage } from "../types";
-import { estimateTokens } from "./compaction";
+import { estimateEntryTokens } from "./compaction";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
 
 export interface PruneConfig {
@@ -47,8 +47,71 @@ export interface PruneResult {
 	prunedEntries: SessionMessageEntry[];
 }
 
-function createPrunedNotice(tokens: number): string {
+const DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER = 1.25;
+
+function createGenericPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
+}
+
+function firstTextContent(message: ToolResultMessage): string {
+	if (typeof message.content === "string") return message.content;
+	const block = message.content.find(part => part.type === "text");
+	return block?.type === "text" ? block.text : "";
+}
+
+function firstErrorLine(text: string): string | undefined {
+	return text
+		.split(/\r?\n/)
+		.find(line => /error|failed|exception|panic/i.test(line))
+		?.trim();
+}
+
+function truncateField(value: string, maxLength: number): string {
+	if (value.length <= maxLength) return value;
+	if (maxLength <= 1) return "…";
+	return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function resultDigest(message: ToolResultMessage): string | undefined {
+	const toolName = message.toolName.toLowerCase();
+	const text = firstTextContent(message);
+	if (toolName === "bash") {
+		const details = message as { details?: { exitCode?: unknown } };
+		const exitCode =
+			typeof details.details?.exitCode === "number" ? details.details.exitCode : message.isError ? 1 : 0;
+		const tail = text.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
+		const error = firstErrorLine(text);
+		return [`exit=${exitCode}`, tail ? `tail=${tail}` : undefined, error ? `error=${error}` : undefined]
+			.filter((part): part is string => part !== undefined)
+			.join("; ");
+	}
+	if (toolName === "search" || toolName === "grep") {
+		const match = text.match(/(\d+)\s+matches?/i) ?? text.match(/totalMatches["']?:\s*(\d+)/i);
+		const files = text.match(/(\d+)\s+files?/i) ?? text.match(/filesWithMatches["']?:\s*(\d+)/i);
+		const error = firstErrorLine(text);
+		return (
+			[
+				match ? `matches=${match[1]}` : undefined,
+				files ? `files=${files[1]}` : undefined,
+				error ? `error=${error}` : undefined,
+			]
+				.filter((part): part is string => part !== undefined)
+				.join("; ") || "search digest unavailable"
+		);
+	}
+	return undefined;
+}
+
+function createPrunedNotice(tokens: number, message?: ToolResultMessage): string {
+	const generic = createGenericPrunedNotice(tokens);
+	const digest = message ? resultDigest(message) : undefined;
+	if (!digest) return generic;
+	const genericTokens = Math.ceil(generic.length / 4);
+	const maxTokens = Math.max(genericTokens, Math.floor(genericTokens * DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER));
+	const prefix = `[Output truncated - ${tokens} tokens; `;
+	const suffix = "]";
+	const maxChars = Math.max(0, maxTokens * 4 - prefix.length - suffix.length);
+	return `${prefix}${truncateField(digest, maxChars)}${suffix}`;
 }
 
 function getToolResultMessage(entry: SessionEntry): ToolResultMessage | undefined {
@@ -58,8 +121,8 @@ function getToolResultMessage(entry: SessionEntry): ToolResultMessage | undefine
 	return message as ToolResultMessage;
 }
 
-function estimatePrunedSavings(tokens: number): number {
-	const noticeTokens = Math.ceil(createPrunedNotice(tokens).length / 4);
+function estimatePrunedSavings(tokens: number, notice: string): number {
+	const noticeTokens = Math.ceil(notice.length / 4);
 	return Math.max(0, tokens - noticeTokens);
 }
 
@@ -306,14 +369,14 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 
 	const { staleResultIndices } = buildStalenessIndex(entries);
 	const staleOverridable = new Set(config.staleOverridableTools ?? []);
-	const candidates: Array<{ entry: SessionMessageEntry; tokens: number }> = [];
+	const candidates: Array<{ entry: SessionMessageEntry; tokens: number; notice: string; savings: number }> = [];
 
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getToolResultMessage(entry);
 		if (!message) continue;
 
-		const tokens = estimateTokens(message as AgentMessage);
+		const tokens = estimateEntryTokens(entry);
 		const isStale = staleResultIndices.has(i);
 		// Staleness waives protected-tool immunity for overridable tools
 		// (e.g. a superseded `read`); the most recent result per target is
@@ -336,12 +399,18 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 			continue;
 		}
 
-		candidates.push({ entry: entry as SessionMessageEntry, tokens });
+		const notice = createPrunedNotice(tokens, message);
+		candidates.push({
+			entry: entry as SessionMessageEntry,
+			tokens,
+			notice,
+			savings: estimatePrunedSavings(tokens, notice),
+		});
 		accumulatedTokens += tokens;
 	}
 
 	for (const candidate of candidates) {
-		tokensSaved += estimatePrunedSavings(candidate.tokens);
+		tokensSaved += candidate.savings;
 	}
 
 	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
@@ -352,7 +421,7 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 	const prunedEntries: SessionMessageEntry[] = [];
 	for (const candidate of candidates) {
 		const message = candidate.entry.message as ToolResultMessage;
-		message.content = [{ type: "text", text: createPrunedNotice(candidate.tokens) }];
+		message.content = [{ type: "text", text: candidate.notice }];
 		message.prunedAt = prunedAt;
 		prunedEntries.push(candidate.entry);
 		prunedCount++;

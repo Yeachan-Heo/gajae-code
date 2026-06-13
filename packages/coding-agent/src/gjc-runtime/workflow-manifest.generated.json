@@ -1468,8 +1468,20 @@
         "appliesToVerbs": [
           "steer"
         ],
+        "name": "goal-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "steer"
+        ],
         "enumValues": [
-          "add_subgoal"
+          "add_subgoal",
+          "split_subgoal",
+          "reorder_pending",
+          "revise_pending_wording",
+          "annotate_ledger",
+          "mark_blocked_superseded"
         ],
         "name": "kind",
         "type": "enum"
@@ -1495,6 +1507,20 @@
           "steer"
         ],
         "name": "rationale",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "steer"
+        ],
+        "name": "replacements-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "steer"
+        ],
+        "name": "order-json",
         "type": "string"
       },
       {

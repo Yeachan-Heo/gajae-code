@@ -150,15 +150,19 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		throw err;
 	}
 
-	const sessionData: SessionData = {
-		header: sm.getHeader(),
-		entries: sm.getEntries(),
-		leafId: sm.getLeafId(),
-	};
+	try {
+		const sessionData: SessionData = {
+			header: sm.getHeader(),
+			entries: sm.getEntries(),
+			leafId: sm.getLeafId(),
+		};
 
-	const html = await generateHtml(sessionData, opts.themeName);
-	const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
+		const html = await generateHtml(sessionData, opts.themeName);
+		const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
 
-	await Bun.write(outputPath, html);
-	return outputPath;
+		await Bun.write(outputPath, html);
+		return outputPath;
+	} finally {
+		await sm.close();
+	}
 }

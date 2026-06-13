@@ -30,6 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { toolWireSchema } from "../utils/schema/wire";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
@@ -2284,12 +2285,18 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
+export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined, modelId?: string): string[] {
 	const systemPrompts = normalizeSystemPrompts(systemPrompt);
 	if (systemPrompts.length === 0) {
 		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
 	}
-	return systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	const jsons = systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	// Composer-harness models need anchor/edit discipline pinned ahead of the
+	// host prompt (see composer-discipline.ts for the observed failure modes).
+	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
+		jsons.unshift(JSON.stringify({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+	}
+	return jsons;
 }
 
 function buildRootPromptMessagesJson(
@@ -2501,7 +2508,7 @@ function buildGrpcRequest(
 } {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
+	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt, model.id).map(json =>
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 

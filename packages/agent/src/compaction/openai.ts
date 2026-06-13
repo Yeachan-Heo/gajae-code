@@ -154,7 +154,7 @@ export function withOpenAiRemoteCompactionPreserveData(
 // Input/output filtering for OpenAI compact endpoint
 // ============================================================================
 
-function estimateOpenAiCompactInputTokens(input: Array<Record<string, unknown>>, instructions: string): number {
+export function estimateOpenAiCompactInputTokens(input: Array<Record<string, unknown>>, instructions: string): number {
 	let chars = instructions.length;
 	for (const item of input) {
 		chars += JSON.stringify(item).length;
@@ -200,22 +200,31 @@ function shouldKeepOpenAiCompactOutputItem(item: Record<string, unknown>): boole
 	return shouldKeepOpenAiCompactOutputUserMessage(item);
 }
 
-function trimOpenAiCompactInput(
+export function trimOpenAiCompactInput(
 	input: Array<Record<string, unknown>>,
 	contextWindow: number,
 	instructions: string,
 ): Array<Record<string, unknown>> {
+	const itemLengths = input.map(item => JSON.stringify(item).length);
+	let chars = instructions.length;
+	for (const length of itemLengths) chars += length;
+
+	function removeAt(index: number): void {
+		chars -= itemLengths[index] ?? 0;
+		trimmed.splice(index, 1);
+		itemLengths.splice(index, 1);
+	}
 	const trimmed = [...input];
-	while (trimmed.length > 0 && estimateOpenAiCompactInputTokens(trimmed, instructions) > contextWindow) {
+	while (trimmed.length > 0 && Math.ceil(chars / 4) > contextWindow) {
 		const last = trimmed[trimmed.length - 1];
 		if (last?.type === "function_call_output" || last?.type === "custom_tool_call_output") {
 			const callId = typeof last.call_id === "string" ? last.call_id : undefined;
 			const callType = last.type === "custom_tool_call_output" ? "custom_tool_call" : "function_call";
-			trimmed.pop();
+			removeAt(trimmed.length - 1);
 			if (callId) {
 				const matchingCallIndex = trimmed.findLastIndex(item => item.type === callType && item.call_id === callId);
 				if (matchingCallIndex >= 0) {
-					trimmed.splice(matchingCallIndex, 1);
+					removeAt(matchingCallIndex);
 				}
 			}
 			continue;
@@ -223,7 +232,7 @@ function trimOpenAiCompactInput(
 		if (!last || !shouldTrimOpenAiCompactInputItem(last)) {
 			break;
 		}
-		trimmed.pop();
+		removeAt(trimmed.length - 1);
 	}
 	return trimmed;
 }

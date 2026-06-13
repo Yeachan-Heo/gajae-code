@@ -183,14 +183,19 @@ export async function dispatchRpcCommand(
 				messageCount: session.messages.length,
 				queuedMessageCount: session.queuedMessageCount,
 				todoPhases: session.getTodoPhases(),
-				systemPrompt: session.systemPrompt,
-				dumpTools: session.agent.state.tools.map(tool => ({
+				contextUsage: session.getContextUsage(),
+			};
+			const include = new Set(command.include ?? []);
+			if (include.has("systemPrompt")) {
+				state.systemPrompt = session.systemPrompt;
+			}
+			if (include.has("tools") || include.has("dumpTools")) {
+				state.dumpTools = session.agent.state.tools.map(tool => ({
 					name: tool.name,
 					description: tool.description,
 					parameters: tool.parameters,
-				})),
-				contextUsage: session.getContextUsage(),
-			};
+				}));
+			}
 			return rpcSuccess(id, "get_state", state);
 		}
 

@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
+import { RECEIPT_SPOOL_FILENAME, type ReceiptSpoolRecord } from "../../src/harness-control-plane/receipt-spool";
+import { type CompletionEvidence, validateReceipt } from "../../src/harness-control-plane/receipts";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
@@ -143,6 +145,27 @@ describe("gjc harness CLI -> live owner routing", () => {
 		expect(state.lifecycle).toBe("completed");
 	}, 30_000);
 
+	it("passes --receipt-spool-dir through live owner routing", async () => {
+		const spoolDir = await mkdtemp(path.join(tmpdir(), "harness-owner-spool-"));
+		try {
+			const res = await runHarness(["finalize", "--session", SID, "--receipt-spool-dir", spoolDir, "--input", "{}"]);
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+
+			const raw = await Bun.file(path.join(spoolDir, RECEIPT_SPOOL_FILENAME)).text();
+			const records = raw
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as ReceiptSpoolRecord);
+			expect(records.map(record => record.cursor)).toEqual(["000000000001", "000000000002"]);
+			expect(records.map(record => record.envelope.family)).toEqual(["validation", "completion"]);
+			expect(records.every(record => validateReceipt(record.envelope).valid)).toBe(true);
+			expect((records.at(-1)?.envelope.evidence as CompletionEvidence).finalLifecycle).toBe("completed");
+		} finally {
+			await rm(spoolDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("falls back to bounded observe when a live owner endpoint accepts but never responds", async () => {
 		await owner?.stop();
 		owner = null;
@@ -174,5 +197,42 @@ describe("gjc harness CLI -> live owner routing", () => {
 		expect(res.json).toHaveProperty("nextAllowedActions");
 		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
 		expect((res.json?.evidence as Record<string, unknown>).ownerRouted).toBeUndefined();
+	}, 10_000);
+
+	it("does not accept or advertise submit when the owner endpoint degrades", async () => {
+		await owner?.stop();
+		owner = null;
+		const socketPath = controlSocketPath(root, SID);
+		hungServer = net.createServer(socket => {
+			socket.end("not-json\n");
+		});
+		await new Promise<void>((resolve, reject) => {
+			hungServer?.once("error", reject);
+			hungServer?.listen(socketPath, () => {
+				hungServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+		await acquireLease(root, SID, {
+			ownerId: "bad-frame-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: socketPath },
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+
+		const res = await runHarness(["submit", "--session", SID, "--input", JSON.stringify({ prompt: "do it" })]);
+
+		expect(res.code).toBe(1);
+		expect(res.json?.ok).toBe(false);
+		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).accepted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).submitted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>).reason).toBe("owner-not-live");
+		expect(res.json?.nextAllowedActions).toContainEqual({
+			verb: "submit",
+			available: false,
+			reason: "owner-not-live",
+		});
 	}, 10_000);
 });

@@ -55,12 +55,6 @@ function tokens(entry: SessionMessageEntry): number {
 	return estimateTokens(entry.message);
 }
 
-function savingsFor(entry: SessionMessageEntry): number {
-	const tokenCount = tokens(entry);
-	const noticeTokens = Math.ceil(`[Output truncated - ${tokenCount} tokens]`.length / 4);
-	return Math.max(0, tokenCount - noticeTokens);
-}
-
 function config(overrides: Partial<PruneConfig> = {}): PruneConfig {
 	return {
 		protectTokens: 0,
@@ -74,7 +68,8 @@ describe("pruneToolOutputs red-team boundaries", () => {
 	test("minimumSavings boundary is strict below and inclusive at the threshold", () => {
 		const recent = toolEntry("recent", "bash", "recent guard text");
 		const old = toolEntry("old", "bash", textForTokens("old-boundary", 80));
-		const threshold = savingsFor(old);
+		const thresholdProbe = toolEntry("old", "bash", textForTokens("old-boundary", 80));
+		const threshold = pruneToolOutputs([thresholdProbe], config({ minimumSavings: 0 })).tokensSaved;
 
 		const belowEntries = [
 			toolEntry("old", "bash", textForTokens("old-boundary", 80)),
@@ -97,7 +92,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		expect(at.prunedCount).toBe(1);
 		expect(at.tokensSaved).toBe(threshold);
 		expect(at.prunedEntries.map(entry => entry.id)).toEqual(["old"]);
-		expect(textOf(atEntries[0] as SessionMessageEntry)).toBe(`[Output truncated - ${tokens(old)} tokens]`);
+		expect(textOf(atEntries[0] as SessionMessageEntry)).toStartWith(`[Output truncated - ${tokens(old)} tokens`);
 	});
 
 	test("protect window accumulates newest-first and never prunes newest protected toolResults", () => {
@@ -163,7 +158,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		expect(result.prunedEntries).toEqual([pruneB, pruneA]);
 		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["prune-b", "prune-a"]);
 		for (const entry of result.prunedEntries) {
-			expect(textOf(entry)).toBe(`[Output truncated - ${originalTokens.get(entry.id)} tokens]`);
+			expect(textOf(entry)).toStartWith(`[Output truncated - ${originalTokens.get(entry.id)} tokens`);
 			expect(typeof (entry.message as ToolResultMessage).prunedAt).toBe("number");
 		}
 		expect(result.prunedEntries.every(entry => textOf(entry).startsWith("[Output truncated - "))).toBe(true);
@@ -187,7 +182,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 
 		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["dup-b", "dup-a", "empty"]);
 		expect(result.prunedCount).toBe(3);
-		expect(textOf(empty)).toBe("[Output truncated - 0 tokens]");
+		expect(textOf(empty)).toStartWith("[Output truncated - 0 tokens");
 		expect(textOf(duplicateA)).toStartWith("[Output truncated - ");
 		expect(textOf(duplicateB)).toStartWith("[Output truncated - ");
 	});

@@ -15,7 +15,7 @@ import {
 import * as ai from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { encodeTextSignatureV1 } from "@gajae-code/ai/providers/openai-responses-shared";
-import type { AssistantMessage, Model, ProviderPayload, Usage } from "@gajae-code/ai/types";
+import type { AssistantMessage, Model, ProviderPayload, ToolResultMessage, Usage } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
 import {
 	buildSessionContext,
@@ -66,6 +66,17 @@ function createAssistantMessage(text: string, usage?: Usage): AssistantMessage {
 		api: "anthropic-messages",
 		provider: "anthropic",
 		model: "claude-sonnet-4-5",
+	};
+}
+
+function createToolResultMessage(text: string): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: `tool-${entryCounter}`,
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: Date.now(),
 	};
 }
 
@@ -809,6 +820,22 @@ describe("findCutPoint", () => {
 			expect(result.isSplitTurn).toBe(true);
 			expect(result.turnStartIndex).toBe(2); // Turn 2 starts at index 2
 		}
+	});
+
+	it("keeps the latest assistant/tool-result pair when the newest entry is an uncuttable tool result", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createAssistantMessage("A1")),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createAssistantMessage("A2")),
+			createMessageEntry(createToolResultMessage("x".repeat(10_000))),
+		];
+
+		const result = findCutPoint(entries, 0, entries.length, 1);
+
+		expect(result.firstKeptEntryIndex).toBe(3);
+		expect(result.isSplitTurn).toBe(true);
+		expect(result.turnStartIndex).toBe(2);
 	});
 });
 

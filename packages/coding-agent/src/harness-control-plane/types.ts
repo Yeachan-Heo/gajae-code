@@ -210,6 +210,10 @@ export interface Observation {
 	rpcLive?: boolean;
 	/** ISO timestamp of the most recent RPC frame the owner observed, if any. */
 	rpcLastFrameAt?: string | null;
+	/** True only when owner/rpc/lifecycle gates indicate a prompt can be submitted now. */
+	readyForSubmit?: boolean;
+	/** Present when readyForSubmit is false; mirrors submit's nextAllowedActions reason. */
+	submitUnavailableReason?: string | null;
 }
 
 /** Input to the deterministic recovery classifier. */

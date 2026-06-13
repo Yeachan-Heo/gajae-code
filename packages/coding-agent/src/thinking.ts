@@ -91,3 +91,28 @@ export function resolveThinkingLevelForModel(
 	}
 	return clampThinkingLevelForModel(model, level);
 }
+
+export function clampExplicitThinkingLevelForModel(
+	model: Model | undefined,
+	level: ThinkingLevel | undefined,
+): ThinkingLevel | undefined {
+	if (level === undefined || level === ThinkingLevel.Inherit || level === ThinkingLevel.Off) {
+		return level;
+	}
+	return clampThinkingLevelForModel(model, level);
+}
+
+export function formatClampedModelSelector(selector: string, model: Model | undefined): string {
+	const slashIdx = selector.indexOf("/");
+	if (slashIdx <= 0) return selector;
+	const id = selector.slice(slashIdx + 1);
+	const colonIdx = id.lastIndexOf(":");
+	if (colonIdx === -1) return selector;
+	const suffix = id.slice(colonIdx + 1);
+	const thinkingLevel = parseThinkingLevel(suffix);
+	if (!thinkingLevel) return selector;
+	const clamped = clampExplicitThinkingLevelForModel(model, thinkingLevel);
+	return clamped && clamped !== ThinkingLevel.Inherit
+		? `${selector.slice(0, slashIdx + 1)}${id.slice(0, colonIdx)}:${clamped}`
+		: selector.slice(0, slashIdx + 1) + id.slice(0, colonIdx);
+}

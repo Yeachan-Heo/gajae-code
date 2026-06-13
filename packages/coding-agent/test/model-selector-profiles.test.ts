@@ -128,16 +128,17 @@ describe("model selector profiles", () => {
 		installTestTheme();
 	});
 
-	test("renders Profiles above model rows", async () => {
+	test("renders preset landing above model rows", async () => {
 		installTestTheme();
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered.indexOf("Profiles")).toBeGreaterThanOrEqual(0);
-		expect(rendered.indexOf("profile-a")).toBeGreaterThan(rendered.indexOf("Profiles"));
-		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("profile-a"));
+		expect(rendered).toContain("Model presets");
+		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("profile-a");
+		expect(rendered).toContain("Browse all models");
 	});
 
 	test("temporary-only mode hides Profiles", async () => {

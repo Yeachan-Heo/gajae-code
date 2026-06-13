@@ -201,6 +201,49 @@ describe("Coordinator MCP server protocol", () => {
 			{ cwd: root, prompt: "hello", namespace: { profile: "local", repo: "repo" }, worktree: true },
 		]);
 	});
+	it("delivers start-session prompts exactly once after the active turn is durable", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-start-session-prompt");
+		const commands: string[][] = [];
+		let activeTurnExistedAtSend = false;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				commandRunner: async command => {
+					commands.push(command);
+					if (command[1] === "new-session")
+						return { exitCode: 0, stdout: "gjc-coordinator-test:0.0 %99\n", stderr: "" };
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "send-keys") {
+						const activeTurnsDir = path.join(stateRoot, "local", "repo", "active-turns");
+						const activeTurns = await fs.readdir(activeTurnsDir).catch(() => []);
+						activeTurnExistedAtSend = activeTurns.length === 1;
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		const response = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prompt: "hello",
+			allow_mutation: true,
+		});
+
+		expect(response.ok).toBe(true);
+		expect(activeTurnExistedAtSend).toBe(true);
+		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
+			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "hello", "C-m", "C-m"],
+		]);
+	});
 
 	it("persists audited follow-up, question answers, and bounded reports", async () => {
 		const root = await tempRoot();
@@ -637,6 +680,89 @@ describe("Coordinator MCP server protocol", () => {
 		});
 		expect((read.session_state as { state: string; last_turn_id: string }).state).toBe("completed");
 		expect((read.session_state as { state: string; last_turn_id: string }).last_turn_id).toBe(turnId);
+	});
+	it("preserves runtime completion when callback wins the turn activation race", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-runtime-race");
+		let runtimeStatePath = "";
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					tmuxSession: "gjc-demo",
+					tmuxTarget: "gjc-demo:0.0",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "send-keys") {
+						const activeTurn = JSON.parse(
+							await Bun.file(path.join(stateRoot, "local", "repo", "active-turns", "gjc-demo.json")).text(),
+						) as {
+							turn_id: string;
+						};
+						runtimeStatePath = path.join(stateRoot, "local", "repo", "session-states", "gjc-demo.json");
+						await fs.mkdir(path.dirname(runtimeStatePath), { recursive: true });
+						await Bun.write(
+							runtimeStatePath,
+							JSON.stringify({
+								schema_version: 1,
+								session_id: "gjc-demo",
+								state: "completed",
+								ready_for_input: true,
+								current_turn_id: activeTurn.turn_id,
+								last_turn_id: activeTurn.turn_id,
+								updated_at: "2026-06-07T00:00:01.000Z",
+								source: "agent_session_event",
+								live: null,
+								reason: "agent_end",
+								final_response: {
+									text: "Runtime final answer",
+									format: "markdown",
+									source: "agent_end",
+									artifact_path: null,
+									truncated: false,
+								},
+							}),
+						);
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "work",
+			allow_mutation: true,
+		});
+		const turnId = turn.turn_id as string;
+		const persistedState = JSON.parse(await Bun.file(runtimeStatePath).text()) as {
+			state: string;
+			current_turn_id: string;
+		};
+		expect(persistedState).toMatchObject({ state: "completed", current_turn_id: turnId });
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "gjc-demo",
+			turn_id: turnId,
+		});
+
+		expect((read.turn as { status: string }).status).toBe("completed");
+		expect((read.turn as { final_response: { source: string; text: string } }).final_response).toMatchObject({
+			source: "agent_end",
+			text: "Runtime final answer",
+		});
 	});
 	it("flags completed turns that lack reportable final responses", async () => {
 		const root = await tempRoot();

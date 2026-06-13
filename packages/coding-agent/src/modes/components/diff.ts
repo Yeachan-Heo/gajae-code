@@ -6,6 +6,9 @@ import { type CodeFrameMarker, formatCodeFrameLine, replaceTabs } from "../../to
 /** SGR dim on / normal intensity — additive, preserves fg/bg colors. */
 const DIM = "\x1b[2m";
 const DIM_OFF = "\x1b[22m";
+// Single-span fast path is tuned for rendered code lines; ~500 chars covers typical terminal widths
+// while avoiding duplicate prefix/suffix scans before diffWords on pathological long lines.
+const LONG_LINE_FAST_PATH_LIMIT = 500;
 
 /**
  * Visualize leading whitespace (indentation) with dim glyphs.
@@ -53,6 +56,15 @@ function parseDiffLine(line: string): { prefix: CodeFrameMarker; lineNum: string
  * Strips leading whitespace from inverse to avoid highlighting indentation.
  */
 function renderIntraLineDiff(oldContent: string, newContent: string): { removedLine: string; addedLine: string } {
+	const fastPath = renderIntraLineDiffFastPath(oldContent, newContent);
+	if (fastPath) return fastPath;
+	return renderIntraLineDiffWithDiffWords(oldContent, newContent);
+}
+
+function renderIntraLineDiffWithDiffWords(
+	oldContent: string,
+	newContent: string,
+): { removedLine: string; addedLine: string } {
 	const wordDiff = Diff.diffWords(oldContent, newContent);
 
 	let removedLine = "";
@@ -92,6 +104,91 @@ function renderIntraLineDiff(oldContent: string, newContent: string): { removedL
 	}
 
 	return { removedLine, addedLine };
+}
+
+function renderIntraLineDiffFastPath(
+	oldContent: string,
+	newContent: string,
+): { removedLine: string; addedLine: string } | null {
+	if (oldContent === newContent) return { removedLine: oldContent, addedLine: newContent };
+	if (Math.min(oldContent.length, newContent.length) > LONG_LINE_FAST_PATH_LIMIT) return null;
+
+	if (isWhitespaceOnlyChange(oldContent, newContent)) return null;
+	return renderSingleSpanIntraLineDiff(oldContent, newContent);
+}
+
+function isWhitespaceOnlyChange(oldContent: string, newContent: string): boolean {
+	return oldContent.replace(/\s+/g, "") === newContent.replace(/\s+/g, "");
+}
+
+function renderSingleSpanIntraLineDiff(
+	oldContent: string,
+	newContent: string,
+): { removedLine: string; addedLine: string } | null {
+	let prefixLength = 0;
+	const maxPrefixLength = Math.min(oldContent.length, newContent.length);
+	while (
+		prefixLength < maxPrefixLength &&
+		oldContent.charCodeAt(prefixLength) === newContent.charCodeAt(prefixLength)
+	) {
+		prefixLength++;
+		if (prefixLength > LONG_LINE_FAST_PATH_LIMIT) return null;
+	}
+	let suffixLength = 0;
+	const maxSuffixLength = maxPrefixLength - prefixLength;
+	while (
+		suffixLength < maxSuffixLength &&
+		oldContent.charCodeAt(oldContent.length - 1 - suffixLength) ===
+			newContent.charCodeAt(newContent.length - 1 - suffixLength)
+	) {
+		suffixLength++;
+		if (prefixLength + suffixLength > LONG_LINE_FAST_PATH_LIMIT) return null;
+	}
+
+	const oldMiddle = oldContent.slice(prefixLength, oldContent.length - suffixLength);
+	const newMiddle = newContent.slice(prefixLength, newContent.length - suffixLength);
+	if (oldMiddle.length === 0 || newMiddle.length === 0) return null;
+	if (!isSingleDiffWordsReplacement(oldContent, newContent, prefixLength, suffixLength)) return null;
+
+	const prefix = oldContent.slice(0, prefixLength);
+	const oldLeadingWs = oldMiddle.match(/^(\s*)/)?.[1] || "";
+	const newLeadingWs = newMiddle.match(/^(\s*)/)?.[1] || "";
+	return {
+		removedLine: `${prefix}${oldLeadingWs}${theme.inverse(oldMiddle.slice(oldLeadingWs.length))}${oldContent.slice(oldContent.length - suffixLength)}`,
+		addedLine: `${prefix}${newLeadingWs}${theme.inverse(newMiddle.slice(newLeadingWs.length))}${newContent.slice(newContent.length - suffixLength)}`,
+	};
+}
+
+function isSingleDiffWordsReplacement(
+	oldContent: string,
+	newContent: string,
+	prefixLength: number,
+	suffixLength: number,
+): boolean {
+	if (prefixLength === 0 && suffixLength === 0) return false;
+	const oldEnd = oldContent.length - suffixLength;
+	const newEnd = newContent.length - suffixLength;
+	const snappedPrefixLength = snapPrefixToWhitespaceBoundary(oldContent, newContent, prefixLength);
+	const snappedOldEnd = snapEndToWhitespaceBoundary(oldContent, oldEnd);
+	const snappedNewEnd = snapEndToWhitespaceBoundary(newContent, newEnd);
+	return snappedPrefixLength === prefixLength && snappedOldEnd === oldEnd && snappedNewEnd === newEnd;
+}
+
+function snapPrefixToWhitespaceBoundary(oldContent: string, newContent: string, prefixLength: number): number {
+	let snapped = prefixLength;
+	while (snapped > 0 && !(isWhitespaceBoundary(oldContent, snapped) && isWhitespaceBoundary(newContent, snapped)))
+		snapped--;
+	return snapped;
+}
+
+function snapEndToWhitespaceBoundary(content: string, end: number): number {
+	let snapped = end;
+	while (snapped < content.length && !isWhitespaceBoundary(content, snapped)) snapped++;
+	return snapped;
+}
+
+function isWhitespaceBoundary(content: string, index: number): boolean {
+	return index <= 0 || index >= content.length || /\s/.test(content[index - 1]!) || /\s/.test(content[index]!);
 }
 
 export interface RenderDiffOptions {

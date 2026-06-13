@@ -131,6 +131,12 @@ describe("owner frame -> observability", () => {
 		expect(obs.observedSignals).toContain("test-running");
 		expect(obs.observedSignals).toContain("completed");
 		expect(obs.rpcLive).toBe(true);
+		const completed = events.find(e => e.kind === "rpc_agent_completed");
+		expect(completed?.nextAllowedActions).toContainEqual({
+			verb: "submit",
+			available: false,
+			reason: "lifecycle-not-idle:finalizing",
+		});
 		expect(obs.lifecycle).toBe("finalizing");
 	});
 

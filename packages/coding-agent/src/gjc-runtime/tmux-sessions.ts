@@ -1,6 +1,7 @@
 import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
+	buildGjcTmuxUntaggedSessionError,
 	GJC_TMUX_BRANCH_OPTION,
 	GJC_TMUX_BRANCH_SLUG_OPTION,
 	GJC_TMUX_PROFILE_OPTION,
@@ -73,17 +74,10 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 	};
 }
 
-function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
+function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): string[] {
 	let output = "";
 	try {
-		output = runTmux(
-			[
-				"list-sessions",
-				"-F",
-				`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}`,
-			],
-			env,
-		);
+		output = runTmux(["list-sessions", "-F", format], env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (message.includes("no server running") || message.includes("failed to connect to server")) return [];
@@ -93,6 +87,17 @@ function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 		.split("\n")
 		.map(line => line.trim())
 		.filter(Boolean);
+}
+
+function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
+	return runListSessions(
+		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}`,
+		env,
+	);
+}
+
+function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[] {
+	return runListSessions("#{session_name}", env).map(line => line.split("\t")[0] ?? line);
 }
 
 export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus[] {
@@ -114,8 +119,11 @@ export function findGjcTmuxSessionByBranch(
 
 export function statusGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {
 	const session = listGjcTmuxSessions(env).find(candidate => candidate.name === sessionName);
-	if (!session) throw new Error(`gjc_tmux_session_not_found:${sessionName}`);
-	return session;
+	if (session) return session;
+	if (listRawTmuxSessionNames(env).includes(sessionName)) {
+		throw new Error(buildGjcTmuxUntaggedSessionError(sessionName, resolveGjcTmuxCommand(env)));
+	}
+	throw new Error(`gjc_tmux_session_not_found:${sessionName}`);
 }
 
 export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {

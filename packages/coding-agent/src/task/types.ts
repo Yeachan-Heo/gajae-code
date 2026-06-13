@@ -215,6 +215,12 @@ export interface AgentDefinition {
 	filePath?: string;
 }
 
+export interface ModelSubstitutionWarning {
+	requested: string;
+	effective: string;
+	reason: "auth_unavailable" | "assistant_model_mismatch";
+}
+
 /** Progress tracking for a single agent */
 export interface AgentProgress {
 	index: number;
@@ -247,6 +253,7 @@ export interface AgentProgress {
 	cost: number;
 	durationMs: number;
 	modelOverride?: string | string[];
+	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -306,6 +313,7 @@ export interface SingleResult {
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
