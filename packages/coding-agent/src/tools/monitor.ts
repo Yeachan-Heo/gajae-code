@@ -3,6 +3,7 @@ import { logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import monitorDescription from "../prompts/tools/monitor.md" with { type: "text" };
+import { truncateTail } from "../session/streaming-output";
 import { BashTool } from "./bash";
 import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
@@ -48,11 +49,41 @@ export interface MonitorToolDetails {
 
 const MONITOR_LABEL_MAX = 120;
 const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
+const MONITOR_NOTIFICATION_LINE_MAX_BYTES = 16 * 1024;
+const MONITOR_NOTIFICATION_LINE_MAX_LINES = 20;
 
 function buildMonitorLabel(params: MonitorParams): string {
 	const base = `[monitor:${params.kind}] ${params.description}`;
 	if (base.length <= MONITOR_LABEL_MAX) return base;
 	return `${base.slice(0, MONITOR_LABEL_MAX - 3)}...`;
+}
+
+function formatMonitorNotificationLine(line: string): {
+	content: string;
+	truncated: boolean;
+	totalBytes: number;
+	outputBytes: number;
+} {
+	const truncation = truncateTail(line, {
+		maxBytes: MONITOR_NOTIFICATION_LINE_MAX_BYTES,
+		maxLines: MONITOR_NOTIFICATION_LINE_MAX_LINES,
+	});
+	const outputBytes = truncation.outputBytes ?? truncation.totalBytes;
+	if (!truncation.truncated) {
+		return {
+			content: truncation.content,
+			truncated: false,
+			totalBytes: truncation.totalBytes,
+			outputBytes,
+		};
+	}
+	const notice = `[Monitor output truncated: showing last ${outputBytes} of ${truncation.totalBytes} bytes]`;
+	return {
+		content: `${truncation.content}\n${notice}`,
+		truncated: true,
+		totalBytes: truncation.totalBytes,
+		outputBytes,
+	};
 }
 
 export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolDetails> {
@@ -130,7 +161,8 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			if (controller.closed) return;
 			const notificationId = `${jobId}:${sequence}`;
 			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
-			const content = `<task-notification>\nMonitor task ${jobId} (${params.kind}: ${params.description}) emitted latest state:\n${line}${suffix}\n</task-notification>`;
+			const notificationLine = formatMonitorNotificationLine(line);
+			const content = `<task-notification>\nMonitor task ${jobId} (${params.kind}: ${params.description}) emitted latest state:\n${notificationLine.content}${suffix}\n</task-notification>`;
 			const details = {
 				taskId: jobId,
 				kind: params.kind,
@@ -139,6 +171,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				notificationId,
 				sequence,
 				coalescedCount: count,
+				outputTruncated: notificationLine.truncated,
+				outputTotalBytes: notificationLine.totalBytes,
+				outputBytes: notificationLine.outputBytes,
 			};
 			pendingNotifications += 1;
 			if (pendingNotifications > MAX_PENDING_MONITOR_NOTIFICATIONS) {

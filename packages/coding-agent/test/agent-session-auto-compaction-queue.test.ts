@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -11,6 +12,7 @@ import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extension
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir, withTimeout } from "@gajae-code/utils";
 
@@ -267,6 +269,99 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(streamCallCount).toBe(1);
 		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
 		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
+	});
+
+	it("compacts before agent-initiated task notifications that would overflow the next turn", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.thresholdTokens", 1000);
+		session.settings.set("compaction.keepRecentTokens", 1);
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Ready for monitor notification" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 800,
+				output: 50,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 850,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+
+		sessionManager.appendMessage(assistantMsg);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.sendCustomMessage(
+			{
+				customType: "task-notification",
+				content: `<task-notification>\n${"x".repeat(10_000)}\n</task-notification>`,
+				display: false,
+				attribution: "agent",
+				details: { taskId: "monitor-large-output", monitor: true },
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+
+		expect(streamCallCount).toBe(1);
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
+	});
+
+	it("keeps display context usage on cheap heuristic estimation for custom messages", () => {
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Ready for custom context" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const customContent = "hello ".repeat(1000);
+
+		sessionManager.appendMessage(assistantMsg);
+		sessionManager.appendCustomMessageEntry(
+			"task-notification",
+			customContent,
+			false,
+			{ taskId: "display" },
+			"agent",
+		);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const usage = session.getContextUsage();
+		if (!usage) {
+			throw new Error("Expected context usage to be available");
+		}
+		const llmCustomMessage = convertToLlm([
+			{
+				role: "custom",
+				customType: "task-notification",
+				content: customContent,
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+		])[0];
+		if (!llmCustomMessage) {
+			throw new Error("Expected custom message to convert to an LLM message");
+		}
+
+		expect(usage.tokens).toBe(100 + estimateMessageTokensHeuristic(llmCustomMessage));
 	});
 
 	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {

@@ -903,6 +903,7 @@ export class AgentSession {
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
 	#autoCompactionAbortController: AbortController | undefined = undefined;
+	#prePromptContextCheckPromise: Promise<void> | undefined = undefined;
 
 	// Branch summarization state
 	#branchSummaryAbortController: AbortController | undefined = undefined;
@@ -4754,7 +4755,11 @@ export class AgentSession {
 				await this.#checkCompaction(lastAssistant, false);
 			}
 			if (!options?.skipCompactionCheck) {
-				await this.#checkEstimatedContextBeforePrompt();
+				await this.#checkEstimatedContextBeforePrompt([
+					...(options?.prependMessages ?? []),
+					message,
+					...this.#pendingNextTurnMessages,
+				]);
 			}
 
 			// Build messages array (session context, eager todo prelude, then active prompt message)
@@ -5219,7 +5224,9 @@ export class AgentSession {
 				}
 				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 				try {
-					await this.agent.prompt(appMessage);
+					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
+						skipPostPromptRecoveryWait: true,
+					});
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 				}
@@ -5243,7 +5250,9 @@ export class AgentSession {
 			}
 			await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 			try {
-				await this.agent.prompt(appMessage);
+				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
+					skipPostPromptRecoveryWait: true,
+				});
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 			}
@@ -6546,7 +6555,23 @@ export class AgentSession {
 		}
 	}
 
-	async #checkEstimatedContextBeforePrompt(): Promise<void> {
+	async #checkEstimatedContextBeforePrompt(pendingMessages: readonly AgentMessage[] = []): Promise<void> {
+		if (this.#prePromptContextCheckPromise) {
+			await this.#prePromptContextCheckPromise;
+		}
+
+		const checkPromise = this.#checkEstimatedContextBeforePromptOnce(pendingMessages);
+		this.#prePromptContextCheckPromise = checkPromise;
+		try {
+			await checkPromise;
+		} finally {
+			if (this.#prePromptContextCheckPromise === checkPromise) {
+				this.#prePromptContextCheckPromise = undefined;
+			}
+		}
+	}
+
+	async #checkEstimatedContextBeforePromptOnce(pendingMessages: readonly AgentMessage[]): Promise<void> {
 		const model = this.model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -6554,7 +6579,7 @@ export class AgentSession {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
 
-		let contextTokens = this.#estimateContextTokens().tokens;
+		let contextTokens = this.#estimateContextTokensForCompaction(pendingMessages).tokens;
 		const maxOutputTokens = model.maxTokens ?? 0;
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
 
@@ -9598,6 +9623,21 @@ export class AgentSession {
 	#estimateContextTokens(): {
 		tokens: number;
 	} {
+		return this.#estimateContextTokensWith(message => this.#estimateMessageDisplayTokens(message));
+	}
+
+	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {
+		tokens: number;
+	} {
+		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageNativeContextTokens(message));
+		return {
+			tokens: estimate.tokens + this.#estimateMessagesNativeContextTokens(pendingMessages),
+		};
+	}
+
+	#estimateContextTokensWith(estimateMessage: (message: AgentMessage) => number): {
+		tokens: number;
+	} {
 		const messages = this.messages;
 
 		// Find last assistant message with usage
@@ -9619,7 +9659,7 @@ export class AgentSession {
 			// No usage data - estimate all messages
 			let estimated = 0;
 			for (const message of messages) {
-				estimated += estimateMessageTokensHeuristic(message);
+				estimated += estimateMessage(message);
 			}
 			return {
 				tokens: estimated,
@@ -9629,12 +9669,36 @@ export class AgentSession {
 		const usageTokens = calculatePromptTokens(lastUsage);
 		let trailingTokens = 0;
 		for (let i = lastUsageIndex + 1; i < messages.length; i++) {
-			trailingTokens += estimateMessageTokensHeuristic(messages[i]);
+			trailingTokens += estimateMessage(messages[i]);
 		}
 
 		return {
 			tokens: usageTokens + trailingTokens,
 		};
+	}
+
+	#estimateMessagesNativeContextTokens(messages: readonly AgentMessage[]): number {
+		let tokens = 0;
+		for (const message of messages) {
+			tokens += this.#estimateMessageNativeContextTokens(message);
+		}
+		return tokens;
+	}
+
+	#estimateMessageDisplayTokens(message: AgentMessage): number {
+		let tokens = 0;
+		for (const llmMessage of convertToLlm([message])) {
+			tokens += estimateMessageTokensHeuristic(llmMessage);
+		}
+		return tokens;
+	}
+
+	#estimateMessageNativeContextTokens(message: AgentMessage): number {
+		let tokens = 0;
+		for (const llmMessage of convertToLlm([message])) {
+			tokens += estimateTokens(llmMessage);
+		}
+		return tokens;
 	}
 
 	/**

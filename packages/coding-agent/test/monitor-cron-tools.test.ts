@@ -279,6 +279,29 @@ describe("MonitorTool", () => {
 		expect(manager.getJob(result.details.taskId)?.status).toBe("failed");
 		expect(manager.getJob(result.details.taskId)?.errorText).toContain("Command exited with code 2");
 	});
+
+	it("bounds oversized monitor notification lines while preserving the captured output", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		const result = expectText(
+			await tool.execute("call", {
+				command: "printf '%*sTAIL\\n' 20000 '' | tr ' ' A",
+				kind: "log",
+				description: "large line monitor",
+				persistent: false,
+			}),
+		);
+		await manager.waitForAll();
+
+		expect(steered).toHaveLength(1);
+		expect(Buffer.byteLength(steered[0]!.content, "utf8")).toBeLessThan(18_000);
+		expect(steered[0]!.content).toContain("TAIL");
+		expect(steered[0]!.content).toContain("Monitor output truncated");
+
+		const slice = manager.readOutputSince(result.details.taskId, 0, { ownerId: "0-Test" });
+		expect(slice?.text).toContain(`${"A".repeat(20_000)}TAIL`);
+	});
 });
 
 describe("Cron tools", () => {
