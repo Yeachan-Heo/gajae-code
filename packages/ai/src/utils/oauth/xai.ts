@@ -30,6 +30,15 @@ interface XaiTokenPayload {
 	token_type?: unknown;
 }
 
+export interface XaiOAuthFlowOptions {
+	extraAuthorizeParams?: Readonly<Record<string, string>>;
+}
+
+export interface XaiOAuthRefreshOptions {
+	signal?: AbortSignal;
+	extraTokenParams?: Readonly<Record<string, string>>;
+}
+
 interface XaiJwtPayload {
 	sub?: unknown;
 	email?: unknown;
@@ -39,6 +48,25 @@ interface XaiJwtPayload {
 function requestSignal(signal: AbortSignal | undefined): AbortSignal {
 	const timeoutSignal = AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS);
 	return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+}
+
+function addNonOverridingParams(target: URLSearchParams | Record<string, string>, params: Readonly<Record<string, string>>): void {
+	for (const [key, value] of Object.entries(params)) {
+		if (key.length === 0 || value.length === 0) continue;
+		if (target instanceof URLSearchParams) {
+			if (!target.has(key)) target.set(key, value);
+		} else if (!(key in target)) {
+			target[key] = value;
+		}
+	}
+}
+
+function isAbortSignal(value: AbortSignal | XaiOAuthRefreshOptions | undefined): value is AbortSignal {
+	return value instanceof AbortSignal;
+}
+
+function resolveRefreshOptions(options: AbortSignal | XaiOAuthRefreshOptions | undefined): XaiOAuthRefreshOptions {
+	return isAbortSignal(options) ? { signal: options } : (options ?? {});
 }
 
 function validateXaiEndpoint(rawUrl: string): string {
@@ -136,8 +164,9 @@ function credentialsFromTokenPayload(payload: XaiTokenPayload, refreshFallback =
 export class XaiOAuthFlow extends OAuthCallbackFlow {
 	#verifier = "";
 	#discovery: XaiDiscovery | undefined;
+	#extraAuthorizeParams: Readonly<Record<string, string>>;
 
-	constructor(ctrl: OAuthController) {
+	constructor(ctrl: OAuthController, options: XaiOAuthFlowOptions = {}) {
 		super(ctrl, {
 			preferredPort: XAI_OAUTH_CALLBACK_PORT,
 			callbackPath: XAI_OAUTH_CALLBACK_PATH,
@@ -145,6 +174,7 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 			callbackBindHostname: "127.0.0.1",
 			redirectUri: `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}${XAI_OAUTH_CALLBACK_PATH}`,
 		} satisfies OAuthCallbackFlowOptions);
+		this.#extraAuthorizeParams = options.extraAuthorizeParams ?? {};
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
@@ -161,6 +191,7 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 			state,
 			nonce: crypto.randomUUID(),
 		});
+		addNonOverridingParams(params, this.#extraAuthorizeParams);
 		return {
 			url: `${this.#discovery.authorizationEndpoint}?${params.toString()}`,
 			instructions:
@@ -188,23 +219,25 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 	}
 }
 
-export async function loginXai(ctrl: OAuthController): Promise<OAuthCredentials> {
-	return new XaiOAuthFlow(ctrl).login();
+export async function loginXai(ctrl: OAuthController, options?: XaiOAuthFlowOptions): Promise<OAuthCredentials> {
+	return new XaiOAuthFlow(ctrl, options).login();
 }
 
-export async function refreshXaiToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthCredentials> {
+export async function refreshXaiToken(
+	refreshToken: string,
+	options?: AbortSignal | XaiOAuthRefreshOptions,
+): Promise<OAuthCredentials> {
 	if (!refreshToken) {
 		throw new Error("xAI credentials are expired and do not include a refresh token");
 	}
+	const { signal, extraTokenParams = {} } = resolveRefreshOptions(options);
 	const discovery = await discoverXaiOAuthEndpoints(signal);
-	const tokenPayload = await postXaiToken(
-		discovery.tokenEndpoint,
-		{
-			grant_type: "refresh_token",
-			client_id: XAI_OAUTH_CLIENT_ID,
-			refresh_token: refreshToken,
-		},
-		signal,
-	);
+	const body = {
+		grant_type: "refresh_token",
+		client_id: XAI_OAUTH_CLIENT_ID,
+		refresh_token: refreshToken,
+	};
+	addNonOverridingParams(body, extraTokenParams);
+	const tokenPayload = await postXaiToken(discovery.tokenEndpoint, body, signal);
 	return credentialsFromTokenPayload(tokenPayload, refreshToken);
 }

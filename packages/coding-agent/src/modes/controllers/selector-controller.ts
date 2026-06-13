@@ -70,6 +70,7 @@ const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 	"google-gemini-cli",
 	"google-antigravity",
 	"xai",
+	"grok-build",
 ]);
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";

@@ -8,6 +8,7 @@ import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
 import type { OAuthCredentials } from "../src/utils/oauth/types";
 import {
 	discoverXaiOAuthEndpoints,
+	refreshXaiToken,
 	XAI_OAUTH_CLIENT_ID,
 	XAI_OAUTH_DISCOVERY_URL,
 	XAI_OAUTH_SCOPE,
@@ -142,6 +143,28 @@ describe("xAI OAuth login provider", () => {
 		expect(authUrl.searchParams.get("nonce")?.length).toBeGreaterThan(20);
 	});
 
+	it("adds provider-specific authorization metadata when requested", async () => {
+		const fetchMock = vi.fn(async () => discoveryResponse());
+		global.fetch = fetchMock as unknown as typeof fetch;
+		const flow = new XaiOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{
+				extraAuthorizeParams: {
+					client_id: "must-not-override",
+					plan: "generic",
+					referrer: "gjc-grok-cli",
+				},
+			},
+		);
+
+		const { url } = await flow.generateAuthUrl("state-123", "http://127.0.0.1:56121/callback");
+		const authUrl = new URL(url);
+
+		expect(authUrl.searchParams.get("client_id")).toBe(XAI_OAUTH_CLIENT_ID);
+		expect(authUrl.searchParams.get("plan")).toBe("generic");
+		expect(authUrl.searchParams.get("referrer")).toBe("gjc-grok-cli");
+	});
+
 	it("exchanges an authorization code for refreshable OAuth credentials", async () => {
 		let tokenBody = "";
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -245,6 +268,43 @@ describe("xAI OAuth login provider", () => {
 			refresh: "refresh-rotated",
 			accountId: "account-rotated",
 			email: "rotated@example.com",
+		});
+	});
+
+	it("adds provider-specific refresh metadata when requested", async () => {
+		let tokenBody = "";
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === XAI_OAUTH_DISCOVERY_URL) return discoveryResponse();
+			if (url === TOKEN_ENDPOINT) {
+				tokenBody = String(init?.body ?? "");
+				return tokenResponse("access-build", "refresh-build", "account-build", "build@example.com");
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const refreshed = await refreshXaiToken("refresh-old", {
+			extraTokenParams: {
+				client_id: "must-not-override",
+				plan: "generic",
+				referrer: "gjc-grok-cli",
+				scope: XAI_OAUTH_SCOPE,
+			},
+		});
+		const tokenParams = new URLSearchParams(tokenBody);
+
+		expect(tokenParams.get("grant_type")).toBe("refresh_token");
+		expect(tokenParams.get("client_id")).toBe(XAI_OAUTH_CLIENT_ID);
+		expect(tokenParams.get("refresh_token")).toBe("refresh-old");
+		expect(tokenParams.get("plan")).toBe("generic");
+		expect(tokenParams.get("referrer")).toBe("gjc-grok-cli");
+		expect(tokenParams.get("scope")).toBe(XAI_OAUTH_SCOPE);
+		expect(refreshed).toMatchObject({
+			access: "access-build",
+			refresh: "refresh-build",
+			accountId: "account-build",
+			email: "build@example.com",
 		});
 	});
 });

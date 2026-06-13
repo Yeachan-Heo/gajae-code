@@ -206,6 +206,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "grok-build-pro",
+		requiredProviders: ["grok-build"],
+		mapping: {
+			default: "grok-build/grok-composer-2.5-fast",
+			executor: "grok-build/grok-build",
+			planner: "grok-build/grok-composer-2.5-fast",
+			critic: "grok-build/grok-composer-2.5-fast",
+			architect: "grok-build/grok-build",
+		},
+	},
+	{
 		name: "cursor-eco",
 		requiredProviders: ["cursor"],
 		mapping: {
@@ -314,11 +325,12 @@ const oldNames = [
 function selectorExists(selector: string): boolean {
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
+	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 25-profile matrix cell-for-cell", () => {
+	test("contains exact 26-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -383,7 +395,21 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("kimi-code", profiles)?.name).toBe("kimi-coding-plan-medium");
 		expect(recommendModelProfileForProvider("xiaomi", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
+		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
+	});
+
+	test("grok-build-pro maps Composer 2.5 Fast and Grok Build roles", () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "grok-build-pro");
+		expect(profile).toBeDefined();
+		expect(profile?.requiredProviders).toEqual(["grok-build"]);
+		expect(profile?.modelMapping).toEqual({
+			default: "grok-build/grok-composer-2.5-fast",
+			executor: "grok-build/grok-build",
+			architect: "grok-build/grok-build",
+			planner: "grok-build/grok-composer-2.5-fast",
+			critic: "grok-build/grok-composer-2.5-fast",
+		});
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {
