@@ -66,7 +66,7 @@ function classifyProjectDir(pwd: string): { scratch: boolean; relative: string |
 const gajaeSegment: StatusLineSegment = {
 	id: "gajae",
 	render(_ctx) {
-		return { content: theme.fg("accent", "GJC"), visible: true };
+		return { content: theme.fg("accent", "🦞"), visible: true };
 	},
 };
 
