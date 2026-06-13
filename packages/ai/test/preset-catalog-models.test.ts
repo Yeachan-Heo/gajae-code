@@ -14,6 +14,19 @@ describe("preset catalog model entries", () => {
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High });
 	});
 
+	test("bundles zai/glm-5.2 flagship", () => {
+		const model = getBundledModel("zai", "glm-5.2");
+
+		expect(model.id).toBe("glm-5.2");
+		expect(model.provider).toBe("zai");
+		expect(model.name).toBe("GLM-5.2");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("text");
+		expect(model.contextWindow).toBe(200_000);
+		expect(model.maxTokens).toBe(131_072);
+		expect(model.thinking).toEqual({ mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
+	});
+
 	test("bundles minimax-code/minimax-v3", () => {
 		const model = getBundledModel("minimax-code", "minimax-v3");
 
