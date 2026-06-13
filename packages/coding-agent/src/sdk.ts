@@ -133,7 +133,7 @@ import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { EventBus } from "./utils/event-bus";
-import { buildNamedToolChoice } from "./utils/tool-choice";
+import { buildNamedToolChoice, buildNamedToolChoiceResult } from "./utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 type AsyncResultEntry = {
@@ -1212,6 +1212,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const m = session.model;
 				return m ? buildNamedToolChoice(name, m) : undefined;
 			},
+			buildToolChoiceResult: name => buildNamedToolChoiceResult(name, session.model),
 			steer: msg =>
 				session.agent.steer({
 					role: "custom",
@@ -1897,6 +1898,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					result = obfuscator.deobfuscateObject(result);
 				}
 				return result;
+			},
+			onToolChoiceIncapability: event => {
+				const droppedLabel = session?.toolChoiceQueue.degradeInFlight(event.reason);
+				logger.debug("Dropped in-flight tool choice after runtime incapability", {
+					droppedLabel,
+					api: event.api,
+					provider: event.provider,
+					model: event.model,
+					requestedLevel: event.requestedLevel,
+					resolvedLevel: event.resolvedLevel,
+					reason: event.reason,
+					registryKey: event.registryKey,
+				});
 			},
 			intentTracing: !!intentField,
 			getToolChoice: () => session?.nextToolChoice(),

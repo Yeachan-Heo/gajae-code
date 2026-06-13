@@ -20,6 +20,11 @@ import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-ins
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { toolWireSchema } from "../utils/schema/wire";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import { transformMessages } from "./transform-messages";
 
 export interface OllamaChatOptions extends StreamOptions {
@@ -253,10 +258,22 @@ function convertTools(tools: Tool[] | undefined): OllamaFunctionTool[] | undefin
 	}));
 }
 
-function createChatBody(model: Model<"ollama-chat">, context: Context, options: OllamaChatOptions | undefined) {
+export function createChatBody(model: Model<"ollama-chat">, context: Context, options: OllamaChatOptions | undefined) {
 	const think = mapReasoning(options?.reasoning);
-	const toolChoice = mapToolChoice(options?.toolChoice);
-	const selectedTools = selectToolsForToolChoice(context.tools, options?.toolChoice);
+	const resolved = resolveToolChoice(model, options?.toolChoice);
+	const toolChoice = mapToolChoice(resolved.resolvedChoice);
+
+	// Ollama's wire protocol has no named forcing — a named request rides
+	// `tool_choice: "required"` with the tool list narrowed to the target
+	// (issue #1236). Narrow whenever the resolved choice still forces a tool.
+	const shouldNarrowToNamedTool =
+		resolved.requestedLevel === "named" &&
+		(resolved.resolvedLevel === "named" || resolved.resolvedLevel === "required") &&
+		resolved.targetToolName !== undefined;
+	const selectedTools =
+		shouldNarrowToNamedTool && resolved.targetToolName
+			? selectToolsForToolChoice(context.tools, { type: "tool", name: resolved.targetToolName })
+			: context.tools;
 	const tools = convertTools(selectedTools);
 	return {
 		model: model.id,
@@ -382,6 +399,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			}
 			const baseUrl = normalizeBaseUrl(model.baseUrl);
 			let body = createChatBody(model, context, options);
+			const sentForcedToolChoice = body.tool_choice === "required";
 			const replacementPayload = await options.onPayload?.(body, model);
 			if (replacementPayload !== undefined) {
 				body = replacementPayload as typeof body;
@@ -394,7 +412,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				url: `${baseUrl}/api/chat`,
 				body,
 			};
-			const response = await fetchWithRetry(`${baseUrl}/api/chat`, {
+			let response = await fetchWithRetry(`${baseUrl}/api/chat`, {
 				method: "POST",
 				headers: {
 					...model.headers,
@@ -408,6 +426,44 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
 				fetch: options.fetch,
 			});
+			if (!response.ok && sentForcedToolChoice) {
+				const error = new Error(
+					`HTTP ${response.status} from ${baseUrl}/api/chat: ${await response.text().catch(() => "")}`,
+				);
+				(error as Error & { status?: number }).status = response.status;
+				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+					markToolChoiceIncapability(model, "auto", error.message);
+					stream.push({
+						type: "toolChoiceIncapability",
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						requestedLevel: "required",
+						resolvedLevel: "auto",
+						reason: error.message,
+						registryKey: resolveToolChoice(model, options?.toolChoice).registryKey,
+					});
+					body = { ...body };
+					delete (body as { tool_choice?: unknown }).tool_choice;
+					rawRequestDump = { ...rawRequestDump, body };
+					response = await fetchWithRetry(`${baseUrl}/api/chat`, {
+						method: "POST",
+						headers: {
+							...model.headers,
+							...options.headers,
+							Authorization: `Bearer ${apiKey}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(body),
+						signal: options.signal,
+						maxAttempts: 1,
+						defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
+						fetch: options.fetch,
+					});
+				} else {
+					throw error;
+				}
+			}
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status} from ${baseUrl}/api/chat`);
 			}

@@ -1,4 +1,4 @@
-import { $env, extractHttpStatusFromError } from "@gajae-code/utils";
+import { $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import { AzureOpenAI } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -30,6 +30,11 @@ import { resolveRetryBudget } from "../utils/retry-budget";
 import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import { normalizeOpenAIResponsesPromptCacheKey, supportsDeveloperRole } from "./openai-responses";
 import {
 	appendResponsesToolResultMessages,
@@ -130,7 +135,30 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				url: `${baseUrl}/responses`,
 				body: params,
 			};
-			const openaiStream = await client.responses.create(params, { signal: requestSignal });
+			let openaiStream: Awaited<ReturnType<typeof client.responses.create>>;
+			try {
+				openaiStream = await client.responses.create(params, { signal: requestSignal });
+			} catch (error) {
+				if (!isForcedToolChoiceUnsupportedError(error, isForcedAzureResponsesToolChoice(params.tool_choice))) {
+					throw error;
+				}
+				const reason = await finalizeErrorMessage(error, rawRequestDump);
+				markToolChoiceIncapability(model, "auto", reason);
+				const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
+				stream.push({
+					type: "toolChoiceIncapability",
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					requestedLevel: resolvedToolChoice.requestedLevel,
+					resolvedLevel: "auto",
+					reason,
+					registryKey: resolvedToolChoice.registryKey,
+				});
+				delete params.tool_choice;
+				rawRequestDump = { ...rawRequestDump, body: params };
+				openaiStream = await client.responses.create(params, { signal: requestSignal });
+			}
 			const firstEventWatchdog = createWatchdog(
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
 				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
@@ -278,13 +306,26 @@ function buildParams(
 	if (context.tools) {
 		params.tools = convertTools(context.tools);
 		if (options?.toolChoice) {
-			params.tool_choice = mapToOpenAIResponsesToolChoice(options.toolChoice);
+			const toolChoice = resolveToolChoice(model, options.toolChoice);
+			if (toolChoice.degraded && toolChoice.supportSource === "runtime") {
+				logger.debug("azure-openai-responses: degraded tool_choice after runtime capability discovery", {
+					model: model.id,
+					requestedLevel: toolChoice.requestedLevel,
+					resolvedLevel: toolChoice.resolvedLevel,
+					reason: toolChoice.reason,
+				});
+			}
+			params.tool_choice = mapToOpenAIResponsesToolChoice(toolChoice.resolvedChoice);
 		}
 	}
 
 	applyResponsesReasoningParams(params, model, options, messages);
 
 	return params;
+}
+
+function isForcedAzureResponsesToolChoice(choice: AzureOpenAIResponsesSamplingParams["tool_choice"]): boolean {
+	return !!choice && choice !== "none" && choice !== "auto";
 }
 
 function convertMessages(

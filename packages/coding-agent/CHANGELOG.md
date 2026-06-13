@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model") looping after `ast_edit` previews: named queue directives (resolve protocol, eager `todo_write` enforcement, subagent `yield` reminders) now enqueue only when the model supports exact named forcing; otherwise they degrade silently to the existing steer reminder without a forced `tool_choice`, and a runtime-discovered incapability drops the in-flight directive instead of requeueing it.
+- `models.yml` compat blocks now accept the `toolChoiceSupport` enum (`none`/`auto`/`required`/`named`) alongside the legacy `supportsToolChoice`/`supportsForcedToolChoice` booleans, mirrored in the generated JSON schema.
+
 ### Changed
 
 - Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).

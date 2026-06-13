@@ -134,6 +134,15 @@
 							"supportsForcedToolChoice": {
 								"type": "boolean"
 							},
+							"toolChoiceSupport": {
+								"type": "string",
+								"enum": [
+									"none",
+									"auto",
+									"required",
+									"named"
+								]
+							},
 							"disableReasoningOnForcedToolChoice": {
 								"type": "boolean"
 							},
@@ -527,6 +536,15 @@
 										"supportsForcedToolChoice": {
 											"type": "boolean"
 										},
+										"toolChoiceSupport": {
+											"type": "string",
+											"enum": [
+												"none",
+												"auto",
+												"required",
+												"named"
+											]
+										},
 										"disableReasoningOnForcedToolChoice": {
 											"type": "boolean"
 										},
@@ -886,6 +904,15 @@
 										},
 										"supportsForcedToolChoice": {
 											"type": "boolean"
+										},
+										"toolChoiceSupport": {
+											"type": "string",
+											"enum": [
+												"none",
+												"auto",
+												"required",
+												"named"
+											]
 										},
 										"disableReasoningOnForcedToolChoice": {
 											"type": "boolean"

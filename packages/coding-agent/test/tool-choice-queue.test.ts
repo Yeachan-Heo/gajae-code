@@ -80,6 +80,58 @@ describe("ToolChoiceQueue", () => {
 		});
 	});
 
+	describe("degradeInFlight", () => {
+		it("drops in-flight directive even when onRejected would requeue", () => {
+			const q = new ToolChoiceQueue();
+			const rejected: RejectInfo[] = [];
+			q.pushSequence([forced, "none"], {
+				label: "yield",
+				onRejected: info => {
+					rejected.push(info);
+					return "requeue";
+				},
+			});
+			q.pushOnce(forcedRead, { label: "other" });
+
+			expect(q.nextToolChoice()).toEqual(forced);
+			expect(q.degradeInFlight("unsupported forced choice")).toBe("yield");
+			expect(rejected).toEqual([]);
+			expect(q.hasInFlight).toBe(false);
+			expect(q.inspect()).toEqual(["other"]);
+			expect(q.nextToolChoice()).toEqual(forcedRead);
+		});
+
+		it("does not change ordinary aborted requeue behavior", () => {
+			const q = new ToolChoiceQueue();
+			q.pushOnce(forced, {
+				label: "yield",
+				onRejected: () => "requeue",
+			});
+
+			expect(q.nextToolChoice()).toEqual(forced);
+			q.reject("aborted");
+			expect(q.inspect()).toEqual(["yield-requeued", "yield"]);
+			expect(q.nextToolChoice()).toEqual(forced);
+		});
+
+		it("is a no-op with no in-flight directive", () => {
+			const q = new ToolChoiceQueue();
+			q.pushOnce(forced, { label: "queued" });
+
+			expect(q.degradeInFlight("nothing in flight")).toBeUndefined();
+			expect(q.inspect()).toEqual(["queued"]);
+			expect(q.nextToolChoice()).toEqual(forced);
+		});
+
+		it("returns the dropped directive label", () => {
+			const q = new ToolChoiceQueue();
+			q.pushOnce(forced, { label: "final-yield" });
+
+			q.nextToolChoice();
+			expect(q.degradeInFlight()).toBe("final-yield");
+		});
+	});
+
 	describe("removeByLabel", () => {
 		it("removes targeted directives without affecting others", () => {
 			const q = new ToolChoiceQueue();

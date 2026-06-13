@@ -161,6 +161,18 @@ export type ToolChoice =
 	| { type: "function"; function: { name: string } }
 	| { type: "tool"; name: string };
 
+export type ToolChoiceSupport = "none" | "auto" | "required" | "named";
+export type ToolChoiceSupportSource = "static" | "derived" | "runtime";
+
+export interface ToolChoiceCompat {
+	/** Maximum supported tool_choice level. */
+	toolChoiceSupport?: ToolChoiceSupport;
+	/** Legacy flag for accepting the tool_choice parameter. */
+	supportsToolChoice?: boolean;
+	/** Legacy flag for forced tool_choice support. */
+	supportsForcedToolChoice?: boolean;
+}
+
 // Base options all providers share
 export type CacheRetention = "none" | "short" | "long";
 
@@ -705,13 +717,24 @@ export type AssistantMessageEvent =
 			contentIndex?: undefined;
 			reason: Extract<StopReason, "aborted" | "error">;
 			error: AssistantMessage;
+	  }
+	| {
+			type: "toolChoiceIncapability";
+			contentIndex?: undefined;
+			api: string;
+			provider: string;
+			model: string;
+			requestedLevel: ToolChoiceSupport;
+			resolvedLevel: ToolChoiceSupport;
+			reason: string;
+			registryKey: string;
 	  };
 
 /**
  * Compatibility settings for openai-completions API.
  * Use this to override URL-based auto-detection for custom providers.
  */
-export interface OpenAICompat {
+export interface OpenAICompat extends ToolChoiceCompat {
 	/** Whether the provider supports the `store` field. Default: auto-detected from URL. */
 	supportsStore?: boolean;
 	/** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
@@ -757,6 +780,8 @@ export interface OpenAICompat {
 	requiresAssistantContentForToolCalls?: boolean;
 	/** Whether the provider supports the `tool_choice` parameter. Default: true. */
 	supportsToolChoice?: boolean;
+	/** Whether `tool_choice` may force a tool (`required` / named tool). Default: true. */
+	supportsForcedToolChoice?: boolean;
 	/**
 	 * Drop reasoning fields (`reasoning_effort`, OpenRouter `reasoning`) for
 	 * the request when `tool_choice` forces a tool call. Mirrors the Anthropic
@@ -789,7 +814,7 @@ export interface OpenAICompat {
  * Use this to disable features that strict-by-default Anthropic accepts but
  * that proxy gateways (Vertex AI, AWS Bedrock-style fronts, etc.) reject.
  */
-export interface AnthropicCompat {
+export interface AnthropicCompat extends ToolChoiceCompat {
 	/**
 	 * Drop the top-level `strict: true` field on tool definitions. Vertex AI's
 	 * Anthropic-compatible endpoint rejects unknown tool fields with
@@ -911,7 +936,16 @@ export interface Model<TApi extends Api = any> {
 		? OpenAICompat
 		: TApi extends "anthropic-messages"
 			? AnthropicCompat
-			: never;
+			: TApi extends
+						| "bedrock-converse-stream"
+						| "google-generative-ai"
+						| "google-gemini-cli"
+						| "google-vertex"
+						| "ollama-chat"
+						| "azure-openai-responses"
+						| "openai-codex-responses"
+				? ToolChoiceCompat
+				: never;
 	/**
 	 * Which shape to use when exposing the OpenAI code backend `apply_patch` tool to this model.
 	 * Generated catalog policy sets `"freeform"` for first-party GPT-5 Responses

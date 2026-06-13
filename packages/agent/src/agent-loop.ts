@@ -815,6 +815,10 @@ async function streamAssistantResponse(
 							stream.push({ type: "message_start", message: { ...partialMessage } });
 							break;
 
+						case "toolChoiceIncapability":
+							config.onToolChoiceIncapability?.(event);
+							break;
+
 						case "text_start":
 						case "text_delta":
 						case "text_end":

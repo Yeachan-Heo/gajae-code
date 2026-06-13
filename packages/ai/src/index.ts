@@ -51,4 +51,5 @@ export type {
 export * from "./utils/overflow";
 export * from "./utils/retry";
 export * from "./utils/schema";
+export * from "./utils/tool-choice-capability";
 export * from "./utils/validation";

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
-import { type AssistantMessage, Effort } from "@gajae-code/ai";
+import { type AssistantMessage, Effort, type Model } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "../../src/sdk";
@@ -39,6 +39,7 @@ function createMockSession(
 		emit: (event: AgentSessionEvent) => void;
 		state: { messages: AssistantMessage[] };
 	}) => void,
+	options?: { model?: Model },
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
@@ -51,7 +52,7 @@ function createMockSession(
 	const session = {
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
-		model: undefined,
+		model: options?.model,
 		extensionRunner: undefined,
 		sessionManager: {
 			appendSessionInit: () => {},
@@ -267,6 +268,35 @@ describe("runSubprocess yield reminders", () => {
 		expect(prompts[1]).toContain("Your last turn ended without a tool call");
 		expect(result.output).toContain('"done": true');
 		expect(result.output.includes("SYSTEM WARNING")).toBe(false);
+	});
+
+	it("omits forced yield toolChoice on final retry when named forcing degrades", async () => {
+		const promptOptions: Array<PromptOptions | undefined> = [];
+		const degradedModel = {
+			provider: "anthropic",
+			api: "anthropic-messages",
+			id: "mock-no-forced",
+			name: "Mock no forced",
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			compat: { supportsForcedToolChoice: false },
+		} as Model;
+		const session = createMockSession(
+			({ options, promptIndex, emit, state }) => {
+				promptOptions.push(options);
+				const assistant = createAssistantStopMessage(`stopped ${promptIndex}`);
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+			},
+			{ model: degradedModel },
+		);
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-final-degraded-yield" });
+
+		expect(promptOptions).toHaveLength(4);
+		expect(promptOptions[3]?.toolChoice).toBeUndefined();
+		expect(result.output).toContain("stopped 4");
 	});
 
 	it("keeps null yield warning when subagent submits success without data", async () => {

@@ -75,6 +75,8 @@ describe("openai-completions compatibility", () => {
 			reasoningEffortMap: {},
 			supportsUsageInStreaming: true,
 			supportsToolChoice: true,
+			supportsForcedToolChoice: true,
+			toolChoiceSupport: "named",
 			disableReasoningOnForcedToolChoice: false,
 			disableReasoningOnToolChoice: false,
 			maxTokensField: "max_completion_tokens",

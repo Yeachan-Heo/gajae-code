@@ -244,7 +244,7 @@ import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
-import { buildNamedToolChoice } from "../utils/tool-choice";
+import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 import {
@@ -4588,7 +4588,7 @@ export class AgentSession {
 			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
 		await this.refreshGjcSubskillTools();
 
-		if (eagerTodoPrelude) {
+		if (eagerTodoPrelude?.toolChoice) {
 			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
 				label: "eager-todo",
 			});
@@ -6627,7 +6627,7 @@ export class AgentSession {
 		});
 	}
 
-	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice: ToolChoice } | undefined {
+	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
 		const eagerTodosEnabled = this.settings.get("todo.eager");
 		const todosEnabled = this.settings.get("todo.enabled");
 		if (!eagerTodosEnabled || !todosEnabled) {
@@ -6661,13 +6661,15 @@ export class AgentSession {
 			return undefined;
 		}
 
-		const todoWriteToolChoice = buildNamedToolChoice("todo_write", this.model);
-		if (!todoWriteToolChoice) {
-			logger.warn("Eager todo enforcement skipped because the current model does not support forcing todo_write", {
+		const todoWriteToolChoiceResult = buildNamedToolChoiceResult("todo_write", this.model);
+		const todoWriteToolChoice = todoWriteToolChoiceResult.exactNamed ? todoWriteToolChoiceResult.choice : undefined;
+		if (!todoWriteToolChoiceResult.exactNamed) {
+			logger.debug("Eager todo enforcement degraded; sending reminder without forced tool choice", {
 				modelApi: this.model?.api,
 				modelId: this.model?.id,
+				resolvedLevel: todoWriteToolChoiceResult.resolved?.resolvedLevel,
+				reason: todoWriteToolChoiceResult.resolved?.reason,
 			});
-			return undefined;
 		}
 
 		const eagerTodoReminder = prompt.render(eagerTodoPrompt);
