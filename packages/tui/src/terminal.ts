@@ -1,12 +1,28 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import { $env } from "@gajae-code/utils";
+import { $env, $flag } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
+
+/**
+ * Whether GJC may reprogram the keyboard with enhanced input protocols
+ * (the Kitty keyboard protocol and the xterm modifyOtherKeys fallback).
+ *
+ * Enabled by default. Set `GJC_TUI_KEYBOARD_PROTOCOL=0` to leave the keyboard in
+ * its default mode. Some terminals — notably Android Termius — break IME
+ * composition (e.g. Korean/Hangul syllable composition) while these enhanced
+ * modes are active, committing every intermediate composing jamo/syllable
+ * instead of only the final character. Disabling the protocol restores normal
+ * IME behavior, matching how other TUIs that leave the keyboard untouched render
+ * Korean correctly.
+ */
+export function keyboardEnhancementEnabled(): boolean {
+	return $flag("GJC_TUI_KEYBOARD_PROTOCOL", true);
+}
 
 /**
  * Minimal terminal interface for TUI
@@ -513,6 +529,14 @@ export class ProcessTerminal implements Terminal {
 	#queryAndEnableKittyProtocol(): void {
 		this.#setupStdinBuffer();
 		process.stdin.on("data", this.#stdinDataHandler!);
+		// Leave the keyboard in its default mode when enhanced input protocols are
+		// disabled. Android Termius (and similar terminals) break IME/Hangul
+		// composition when the Kitty keyboard protocol or modifyOtherKeys is active,
+		// committing every intermediate composing jamo/syllable. Skipping the query
+		// and the modifyOtherKeys fallback restores normal IME composition.
+		if (!keyboardEnhancementEnabled()) {
+			return;
+		}
 		this.#safeWrite("\x1b[?u");
 		this.#modifyOtherKeysTimeout = setTimeout(() => {
 			this.#modifyOtherKeysTimeout = undefined;
