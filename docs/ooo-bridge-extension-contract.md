@@ -42,9 +42,9 @@ Exit-code mapping:
 
 ## Recursion guard
 
-Before dispatch, the helper sets `_OUROBOROS_GJC_BRIDGE_DEPTH` to the next numeric depth and restores the previous value after dispatch finishes. If the variable is already set to a positive numeric value, or to any non-empty non-numeric value, the handler returns `{}` without dispatching.
+Before dispatch, the helper sets `_OUROBOROS_GJC_BRIDGE_DEPTH` to the next numeric depth and restores the previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable, which preserves concurrent independent interactive inputs while marking child dispatcher processes with depth `1`. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching.
 
-The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
+This means the bridge allows exactly one inherited bridge-marked dispatcher level and blocks recursive re-entry from deeper bridge-marked children. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
 
 ## Installation and discovery
 
