@@ -1,4 +1,11 @@
-import { $env, $inheritedEnv, extractHttpStatusFromError, structuredCloneJSON } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	$env,
+	$inheritedEnv,
+	extractHttpStatusFromError,
+	logger,
+	structuredCloneJSON,
+} from "@gajae-code/utils";
 import OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
@@ -46,6 +53,11 @@ import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice, type OpenAIResponsesToolChoice } from "../utils/tool-choice";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -278,7 +290,31 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					return data;
 				},
 				{ provider: model.provider, signal: requestSignal },
-			);
+			).catch(async error => {
+				if (!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))) {
+					throw error;
+				}
+				const reason = await finalizeErrorMessage(error, rawRequestDump);
+				markToolChoiceIncapability(model, "auto", reason);
+				const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
+				stream.push({
+					type: "toolChoiceIncapability",
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					requestedLevel: resolvedToolChoice.requestedLevel,
+					resolvedLevel: "auto",
+					reason,
+					registryKey: resolvedToolChoice.registryKey,
+				});
+				delete params.tool_choice;
+				if (rawRequestDump) rawRequestDump.body = params;
+				const { data, response, request_id } = await client.responses
+					.create(params, { signal: requestSignal })
+					.withResponse();
+				await notifyProviderResponse(options, response, model, request_id);
+				return data;
+			});
 			const firstEventWatchdog = createWatchdog(
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
 				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
@@ -363,12 +399,12 @@ function createClient(
 	baseUrl: string | undefined;
 } {
 	if (!apiKey) {
-		if (!$env.OPENAI_API_KEY) {
+		apiKey = $credentialEnv("OPENAI_API_KEY");
+		if (!apiKey) {
 			throw new Error(
 				"OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it as an argument.",
 			);
 		}
-		apiKey = $env.OPENAI_API_KEY;
 	}
 	const rawApiKey = apiKey;
 
@@ -490,7 +526,16 @@ function buildParams(
 	if (context.tools) {
 		params.tools = convertTools(context.tools, supportsStrictMode(model), model);
 		if (options?.toolChoice) {
-			params.tool_choice = mapOpenAIResponsesToolChoiceForTools(options.toolChoice, context.tools, model);
+			const toolChoice = resolveToolChoice(model, options.toolChoice);
+			if (toolChoice.degraded && toolChoice.supportSource === "runtime") {
+				logger.debug("openai-responses: degraded tool_choice after runtime capability discovery", {
+					model: model.id,
+					requestedLevel: toolChoice.requestedLevel,
+					resolvedLevel: toolChoice.resolvedLevel,
+					reason: toolChoice.reason,
+				});
+			}
+			params.tool_choice = mapOpenAIResponsesToolChoiceForTools(toolChoice.resolvedChoice, context.tools, model);
 		}
 		// The apply_patch spec §1 marks only `apply_patch` itself as
 		// `supports_parallel_tool_calls = false`. OpenAI's Responses API
@@ -649,6 +694,10 @@ export function mapOpenAIResponsesToolChoiceForTools(
 		tool => tool.customFormat && (tool.name === mapped.name || tool.customWireName === mapped.name),
 	);
 	return customTool ? { type: "custom", name: customTool.customWireName ?? customTool.name } : mapped;
+}
+
+function isForcedOpenAIResponsesToolChoice(choice: unknown): boolean {
+	return !!choice && choice !== "none" && choice !== "auto";
 }
 
 /** @internal Exported for tests. */

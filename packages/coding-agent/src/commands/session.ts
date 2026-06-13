@@ -18,7 +18,9 @@ function writeText(lines: string[]): void {
 function writeJsonFailure(error: unknown): void {
 	const message = error instanceof Error ? error.message : String(error);
 	const [reason = "session_error"] = message.split(":");
-	writeJson({ ok: false, reason });
+	const hintIndex = message.indexOf(" — ");
+	const detail = hintIndex >= 0 ? message.slice(hintIndex + " — ".length).trim() : "";
+	writeJson(detail ? { ok: false, reason, detail } : { ok: false, reason });
 }
 
 interface SessionJsonDto {

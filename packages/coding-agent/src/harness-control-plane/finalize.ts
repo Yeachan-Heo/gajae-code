@@ -19,11 +19,12 @@ import {
 	type ReceiptSubject,
 	type ReviewFailureEvidence,
 	type ReviewVerdictEvidence,
+	sha256Hex,
 	type ValidationEvidence,
 	validateReceipt,
 } from "./receipts";
 import { readReceiptIndex, writeReceiptImmutable } from "./storage";
-import { isReviewVerdict, type ReviewVerdict } from "./types";
+import { extractReviewVerdict, isReviewVerdict, type ReviewVerdict } from "./types";
 
 export interface ValidationCommandSpec {
 	name: string;
@@ -56,6 +57,11 @@ export interface FinalizeOptions {
 	reviewOnly?: boolean;
 	/** Operator/loop-supplied terminal review verdict (closed vocabulary). */
 	verdict?: string | null;
+	/**
+	 * Final assistant text from the live RPC owner, used to extract a closed-vocabulary verdict
+	 * for review-only sessions when no explicit {@link verdict} is supplied. Never persisted raw.
+	 */
+	assistantText?: string | null;
 	/** Bounded PR/issue reference for the review target (e.g. "PR-414"). Never resolved from the live repo. */
 	prTarget?: string | null;
 	validationCommands?: ValidationCommandSpec[];
@@ -76,6 +82,14 @@ export interface FinalizeResult {
 
 function receiptId(prefix: string): string {
 	return `${prefix}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
+/** Bound + whitespace-collapse assistant text into a redaction-safe digest summary (never a raw dump). */
+function boundedAssistantSummary(text: string | null): string | null {
+	if (!text) return null;
+	const collapsed = text.replace(/\s+/g, " ").trim();
+	if (collapsed.length === 0) return null;
+	return collapsed.length > 280 ? `${collapsed.slice(0, 280)}…` : collapsed;
 }
 
 export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult> {
@@ -214,9 +228,27 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 		issueArtifact: null,
 	};
 
-	if (!isReviewVerdict(opts.verdict)) {
-		const reason = opts.verdict == null ? "review-verdict-missing" : "review-verdict-invalid";
-		const failure: ReviewFailureEvidence = { reason, prTarget, failedAt: now(), fallback: "operator-or-omx-review" };
+	// Explicit operator/loop verdict always wins. Only when none is supplied do we fall back to
+	// extracting a closed-vocabulary verdict from the live RPC owner's final assistant text.
+	const explicitProvided = opts.verdict != null;
+	const explicitValid = isReviewVerdict(opts.verdict);
+	const assistantText = typeof opts.assistantText === "string" ? opts.assistantText : null;
+	const extracted = explicitProvided ? null : extractReviewVerdict(assistantText);
+	const verdict: ReviewVerdict | null = explicitValid ? (opts.verdict as ReviewVerdict) : extracted;
+	const verdictSource: "input" | "assistant" = explicitValid ? "input" : "assistant";
+
+	if (!verdict) {
+		const reason = explicitProvided ? "review-verdict-invalid" : "review-verdict-missing";
+		const assistantDigest = assistantText ? sha256Hex(assistantText) : null;
+		const assistantSummary = boundedAssistantSummary(assistantText);
+		const failure: ReviewFailureEvidence = {
+			reason,
+			prTarget,
+			failedAt: now(),
+			fallback: "operator-or-omx-review",
+			...(assistantDigest ? { assistantDigest } : {}),
+			...(assistantSummary ? { assistantSummary } : {}),
+		};
 		const receipt = buildReceipt<ReviewFailureEvidence>({
 			receiptId: receiptId("revfail"),
 			sessionId: opts.sessionId,
@@ -238,12 +270,14 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 		return { ...baseResult, completed: false, receiptPath: entry.path, verdict: null, blockers };
 	}
 
-	const verdict = opts.verdict as ReviewVerdict;
+	const assistantDigest = verdictSource === "assistant" && assistantText ? sha256Hex(assistantText) : null;
 	const evidence: ReviewVerdictEvidence = {
 		verdict,
 		prTarget,
 		finalizedAt: now(),
 		summaryRef: typeof opts.prTarget === "string" ? `verdict:${verdict}@${opts.prTarget}` : `verdict:${verdict}`,
+		verdictSource,
+		...(assistantDigest ? { assistantDigest } : {}),
 	};
 	const receipt = buildReceipt<ReviewVerdictEvidence>({
 		receiptId: receiptId("verdict"),

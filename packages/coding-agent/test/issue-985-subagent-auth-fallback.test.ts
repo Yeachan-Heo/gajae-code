@@ -90,6 +90,9 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.authFallbackUsed).toBe(true);
 		expect(result.model?.provider).toBe("deepseek");
 		expect(result.model?.id).toBe("deepseek-v4-pro");
+		expect(result.requestedModel?.provider).toBe("opencode-zen");
+		expect(result.requestedModel?.id).toBe("qwen3.6-plus-free");
+		expect(result.fallbackReason).toBe("auth_unavailable");
 	});
 
 	test("does not fall back when resolved subagent model has working auth", async () => {
@@ -107,6 +110,9 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.authFallbackUsed).toBe(false);
 		expect(result.model?.provider).toBe("opencode-zen");
 		expect(result.model?.id).toBe("qwen3.6-plus-free");
+		expect(result.requestedModel?.provider).toBe("opencode-zen");
+		expect(result.requestedModel?.id).toBe("qwen3.6-plus-free");
+		expect(result.fallbackReason).toBeUndefined();
 	});
 
 	test("returns primary unchanged when parent active model also has no auth", async () => {

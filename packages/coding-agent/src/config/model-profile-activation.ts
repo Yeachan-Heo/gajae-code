@@ -1,6 +1,7 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
 import type { AgentSession } from "../session/agent-session";
+import { formatClampedModelSelector } from "../thinking";
 import {
 	aggregateModelProfileRequiredProviders,
 	formatAvailableProfileNames,
@@ -10,8 +11,14 @@ import { type GjcModelAssignmentTargetId, isAuthenticated, type ModelRegistry } 
 import { resolveModelRoleValue } from "./model-resolver";
 import type { Settings } from "./settings";
 
+type ModelProfileActivationSession = Pick<AgentSession, "model" | "thinkingLevel" | "sessionId"> & {
+	setModelTemporary?: AgentSession["setModelTemporary"];
+	setActiveModelProfile?: (name: string | undefined) => void;
+	getActiveModelProfile?: () => string | undefined;
+};
+
 export interface PrepareModelProfileActivationOptions {
-	session: Pick<AgentSession, "model" | "thinkingLevel" | "sessionId">;
+	session: ModelProfileActivationSession;
 	modelRegistry: Pick<
 		ModelRegistry,
 		| "getModelProfile"
@@ -29,7 +36,7 @@ export interface PrepareModelProfileActivationOptions {
 
 export interface PreparedModelProfileActivation {
 	profileName: string;
-	session: Pick<AgentSession, "model" | "thinkingLevel" | "sessionId" | "setModelTemporary">;
+	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
 	settings: Pick<Settings, "get" | "override" | "set" | "flush">;
 	previousModel: Model<Api> | undefined;
 	previousThinkingLevel: ThinkingLevel | undefined;
@@ -37,6 +44,7 @@ export interface PreparedModelProfileActivation {
 	defaultModel: Model<Api> | undefined;
 	defaultThinkingLevel: ThinkingLevel | undefined;
 	agentModelOverrides: Record<string, string>;
+	previousActiveModelProfile: string | undefined;
 }
 
 export function formatModelProfileCredentialError(profileName: string, providers: readonly string[]): string {
@@ -89,7 +97,7 @@ export async function prepareModelProfileActivation(
 		if (!resolved.model) {
 			throw new Error(`Model profile "${options.profileName}" ${role} selector did not resolve: ${selector}`);
 		}
-		agentModelOverrides[role] = selector;
+		agentModelOverrides[role] = formatClampedModelSelector(selector, resolved.model);
 	}
 
 	return {
@@ -102,6 +110,7 @@ export async function prepareModelProfileActivation(
 		defaultModel: resolvedDefault?.model,
 		defaultThinkingLevel: resolvedDefault?.thinkingLevel,
 		agentModelOverrides,
+		previousActiveModelProfile: options.session.getActiveModelProfile?.(),
 	};
 }
 
@@ -113,6 +122,7 @@ export async function applyPreparedModelProfileActivation(
 	const previousThinkingLevel = prepared.previousThinkingLevel;
 	const previousAgentModelOverrides = prepared.previousAgentModelOverrides;
 	const previousPersistedDefault = prepared.settings.get("modelProfile.default");
+	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	let modelChanged = false;
 	let overridesChanged = false;
 	let defaultChanged = false;
@@ -134,6 +144,7 @@ export async function applyPreparedModelProfileActivation(
 			defaultChanged = true;
 			await prepared.settings.flush();
 		}
+		prepared.session.setActiveModelProfile?.(prepared.profileName);
 	} catch (error) {
 		if (defaultChanged) {
 			prepared.settings.set("modelProfile.default", previousPersistedDefault);
@@ -141,6 +152,7 @@ export async function applyPreparedModelProfileActivation(
 		if (overridesChanged) {
 			prepared.settings.override("task.agentModelOverrides", previousAgentModelOverrides);
 		}
+		prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
 		if (modelChanged && previousModel) {
 			await prepared.session.setModelTemporary(previousModel, previousThinkingLevel);
 		}

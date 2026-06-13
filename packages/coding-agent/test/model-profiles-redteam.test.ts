@@ -103,14 +103,14 @@ describe("model profile red-team schema and catalog cases", () => {
 
 	test("user profile with a duplicate builtin name overrides it and changes source to user", () => {
 		const merged = mergeModelProfiles({
-			"codex-standard": {
+			"codex-medium": {
 				required_providers: ["custom-provider"],
 				model_mapping: { default: "custom-provider/custom-model" },
 			},
 		});
 
-		expect(merged.get("codex-standard")).toEqual({
-			name: "codex-standard",
+		expect(merged.get("codex-medium")).toEqual({
+			name: "codex-medium",
 			requiredProviders: ["custom-provider"],
 			modelMapping: { default: "custom-provider/custom-model" },
 			source: "user",
@@ -154,10 +154,11 @@ describe("model profile red-team schema and catalog cases", () => {
 		expect(resolved.agentModelOverrides).toEqual({ executor: "provider/executor:high" });
 	});
 
-	test("mergeModelProfiles with undefined returns exactly the 9 builtins", () => {
+	test("mergeModelProfiles with undefined returns exactly the builtin catalog", () => {
 		const merged = mergeModelProfiles(undefined);
 
-		expect(merged.size).toBe(9);
+		expect(merged.size).toBe(BUILTIN_MODEL_PROFILES.length);
+		expect(merged.size).toBe(25);
 		expect([...merged.values()]).toEqual([...BUILTIN_MODEL_PROFILES]);
 	});
 

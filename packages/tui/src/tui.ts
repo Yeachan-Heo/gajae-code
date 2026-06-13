@@ -12,6 +12,7 @@ import { ImageProtocol, setCellDimensions, setTerminalImageProtocol, TERMINAL } 
 import {
 	Ellipsis,
 	extractSegments,
+	isPrintableAscii,
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
@@ -227,12 +228,21 @@ export class Container implements Component {
 	}
 }
 
+type LineNormalizationCacheEntry = {
+	normalized: string;
+	terminated: string;
+};
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
 export class TUI extends Container {
 	terminal: Terminal;
 	#previousLines: string[] = [];
+	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
+	#lineTruncationCache = new Map<string, string>();
+	#lineNormalizationCacheLimit = 0;
+	#lineTruncationCacheLimit = 0;
 	#previousWidth = 0;
 	#previousHeight = 0;
 	#focusedComponent: Component | null = null;
@@ -648,6 +658,8 @@ export class TUI extends Container {
 		// focus/listener state is intentionally preserved so input routing survives
 		// a resume.
 		this.#previousLines = [];
+		this.#lineNormalizationCache.clear();
+		this.#lineTruncationCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
 	}
@@ -660,8 +672,12 @@ export class TUI extends Container {
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
 			this.#previousLines = [];
+			this.#lineNormalizationCache.clear();
+			this.#lineTruncationCache.clear();
 			this.#previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
 			this.#previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
+			this.#lineNormalizationCacheLimit = 0;
+			this.#lineTruncationCacheLimit = 0;
 			this.#cursorRow = 0;
 			this.#hardwareCursorRow = 0;
 			this.#viewportTopRow = 0;
@@ -1092,25 +1108,71 @@ export class TUI extends Container {
 	 * written to the terminal — without this, the diff cache disagrees with
 	 * emitted output and OSC 8 hyperlink state can leak across lines.
 	 */
-	#applyLineResets(lines: string[]): string[] {
+	#normalizeLineForRender(line: string): LineNormalizationCacheEntry {
+		const cached = this.#lineNormalizationCache.get(line);
+		if (cached !== undefined) return cached;
+		const normalized = normalizeTerminalOutput(line);
+		const terminated = normalized + (normalized.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+		this.#lineNormalizationCache.set(line, { normalized, terminated });
+		return { normalized, terminated };
+	}
+
+	#lineFitsWidth(normalizedLine: string, width: number): boolean {
+		return isPrintableAscii(normalizedLine) && normalizedLine.length <= width
+			? true
+			: visibleWidth(normalizedLine) <= width;
+	}
+
+	#truncateNormalizedLine(normalizedLine: string, width: number): string {
+		const key = `${width}\0${normalizedLine}`;
+		const cached = this.#lineTruncationCache.get(key);
+		if (cached !== undefined) return cached;
+		const truncated = truncateToWidth(normalizedLine, width, Ellipsis.Omit);
+		const terminated = truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+		this.#lineTruncationCache.set(key, terminated);
+		return terminated;
+	}
+
+	#trimLineCachesForRender(lineCount: number): void {
+		const limit = Math.max(1, lineCount * 2);
+		this.#lineNormalizationCacheLimit = limit;
+		this.#lineTruncationCacheLimit = limit;
+		while (this.#lineNormalizationCache.size > limit) {
+			const key = this.#lineNormalizationCache.keys().next().value;
+			if (key === undefined) break;
+			this.#lineNormalizationCache.delete(key);
+		}
+		while (this.#lineTruncationCache.size > limit) {
+			const key = this.#lineTruncationCache.keys().next().value;
+			if (key === undefined) break;
+			this.#lineTruncationCache.delete(key);
+		}
+	}
+
+	getLineRenderCacheStats(): {
+		normalizationSize: number;
+		truncationSize: number;
+		normalizationLimit: number;
+		truncationLimit: number;
+	} {
+		return {
+			normalizationSize: this.#lineNormalizationCache.size,
+			truncationSize: this.#lineTruncationCache.size,
+			normalizationLimit: this.#lineNormalizationCacheLimit,
+			truncationLimit: this.#lineTruncationCacheLimit,
+		};
+	}
+
+	#applyLineResetsAndTruncate(lines: string[], width: number): string[] {
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
 			if (TERMINAL.isImageLine(line)) continue;
-			const normalized = normalizeTerminalOutput(line);
-			// Only close OSC 8 hyperlinks when the line actually opened one;
-			// emitting `\x1b]8;;\x07` on every line just feeds the terminal's OSC
-			// parser for no reason (measurable cost in xterm.js parse loop).
-			lines[i] = normalized + (normalized.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+			const { normalized, terminated } = this.#normalizeLineForRender(line);
+			lines[i] = this.#lineFitsWidth(normalized, width)
+				? terminated
+				: this.#truncateNormalizedLine(normalized, width);
 		}
-		return lines;
-	}
-	#truncateLinesToWidth(lines: string[], width: number): string[] {
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (TERMINAL.isImageLine(line) || visibleWidth(line) <= width) continue;
-			const truncated = truncateToWidth(line, width, Ellipsis.Omit);
-			lines[i] = truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
-		}
+		this.#trimLineCachesForRender(lines.length);
 		return lines;
 	}
 
@@ -1144,8 +1206,7 @@ export class TUI extends Container {
 		// (closes SGR + OSC 8 hyperlink state). Must run after cursor extraction
 		// because the marker is embedded mid-line, and before any diff/full render
 		// path so cache comparisons stay byte-accurate.
-		newLines = this.#applyLineResets(newLines);
-		newLines = this.#truncateLinesToWidth(newLines, width);
+		newLines = this.#applyLineResetsAndTruncate(newLines, width);
 
 		// Width changed - need full re-render (line wrapping changes)
 		const widthChanged = this.#previousWidth !== 0 && this.#previousWidth !== width;

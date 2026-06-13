@@ -90,6 +90,21 @@ describe("task renderer: nested live rendering", () => {
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
 
+	async function renderResult(result: TaskResultReceipt): Promise<string> {
+		const theme = (await getThemeByName("red-claw"))!;
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [result],
+			totalDurationMs: result.durationMs,
+		};
+		const component = taskToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "Task complete" }], details },
+			{ expanded: false, isPartial: false, spinnerFrame: 0 },
+			theme,
+		);
+		return Bun.stripANSI(component.render(160).join("\n"));
+	}
+
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
 		const parent = makeRunningProgress({
 			id: "1-Parent",
@@ -144,6 +159,36 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).toContain("Delta child running");
 		expect(text).toContain("2.0 Parent>GammaSub");
 		expect(text).toContain("2.1 Parent>DeltaSub");
+	});
+
+	it("renders requested model substitution in live progress", async () => {
+		const text = await render(
+			makeRunningProgress({
+				id: "2-ModelSub",
+				modelSubstitutionWarning: {
+					requested: "openai-codex/gpt-5.3-codex",
+					effective: "openai-codex/gpt-5.5",
+					reason: "auth_unavailable",
+				},
+			}),
+		);
+
+		expect(text).toContain("Requested model substituted: openai-codex/gpt-5.3-codex -> openai-codex/gpt-5.5");
+		expect(text).not.toContain("Model override substituted");
+	});
+
+	it("renders requested model substitution in final results", async () => {
+		const text = await renderResult({
+			...makeCompletedSubResult("4-ModelSub", "Model substituted child"),
+			modelSubstitutionWarning: {
+				requested: "openai-codex/gpt-5.3-codex",
+				effective: "openai-codex/gpt-5.5",
+				reason: "assistant_model_mismatch",
+			},
+		});
+
+		expect(text).toContain("Requested model substituted: openai-codex/gpt-5.3-codex -> openai-codex/gpt-5.5");
+		expect(text).not.toContain("Model override substituted");
 	});
 
 	it("combines completed and in-flight nested snapshots in one tree", async () => {

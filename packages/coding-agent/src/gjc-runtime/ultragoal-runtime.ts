@@ -116,6 +116,27 @@ const GJC_GOAL_SNAPSHOT_MAX_AGE_MILLISECONDS = 10 * 60 * 1000;
 const GJC_GOAL_SNAPSHOT_MAX_FUTURE_SKEW_MILLISECONDS = 60 * 1000;
 
 const SCHEDULABLE_STATUSES = new Set<UltragoalGoalStatus>(["pending", "active", "failed"]);
+const NATIVE_STEERING_KINDS = [
+	"add_subgoal",
+	"split_subgoal",
+	"reorder_pending",
+	"revise_pending_wording",
+	"annotate_ledger",
+	"mark_blocked_superseded",
+] as const;
+type UltragoalSteeringKind = (typeof NATIVE_STEERING_KINDS)[number];
+const NATIVE_STEERING_KIND_SET = new Set<string>(NATIVE_STEERING_KINDS);
+
+interface ReplacementSpec {
+	title: string;
+	objective: string;
+}
+
+interface SteeringCommandResult {
+	kind: UltragoalSteeringKind;
+	message: string;
+	receipt: JsonObject;
+}
 
 function stableStructuredValue(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(item => stableStructuredValue(item));
@@ -1263,6 +1284,168 @@ export async function checkpointAndContinueUltragoalGoal(input: {
 	};
 }
 
+function nextUltragoalGoalId(plan: UltragoalPlan, offset = 1): string {
+	return `G${String(plan.goals.length + offset).padStart(3, "0")}`;
+}
+
+function requireSteeringText(value: string, label: string, kind: UltragoalSteeringKind): string {
+	const trimmed = value.trim();
+	if (!trimmed) throw new Error(`steer --${label} is required for ${kind}`);
+	return trimmed;
+}
+
+function requireSteeringEvidence(input: { kind: UltragoalSteeringKind; evidence: string; rationale: string }): {
+	evidence: string;
+	rationale: string;
+} {
+	return {
+		evidence: requireSteeringText(input.evidence, "evidence", input.kind),
+		rationale: requireSteeringText(input.rationale, "rationale", input.kind),
+	};
+}
+
+function findGoalOrThrow(plan: UltragoalPlan, goalId: string, kind: UltragoalSteeringKind): UltragoalGoal {
+	const id = goalId.trim();
+	if (!id) throw new Error(`steer --goal-id is required for ${kind}`);
+	const goal = plan.goals.find(item => item.id === id);
+	if (!goal) throw new Error(`No ultragoal goal found for ${id}.`);
+	return goal;
+}
+
+function requireGoalStatus(
+	goal: UltragoalGoal,
+	allowed: readonly UltragoalGoalStatus[],
+	kind: UltragoalSteeringKind,
+): void {
+	if (!allowed.includes(goal.status)) {
+		throw new Error(`steer ${kind} requires goal ${goal.id} status ${allowed.join(" or ")}; found ${goal.status}`);
+	}
+}
+
+function parseJsonFlag(value: string, label: string, kind: UltragoalSteeringKind): unknown {
+	const trimmed = requireSteeringText(value, label, kind);
+	try {
+		return JSON.parse(trimmed) as unknown;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`steer --${label} must be valid JSON for ${kind}: ${message}`);
+	}
+}
+
+function parseReplacementSpecs(value: string, kind: UltragoalSteeringKind): ReplacementSpec[] {
+	const raw = parseJsonFlag(value, "replacements-json", kind);
+	if (!Array.isArray(raw) || raw.length < 2) {
+		throw new Error("steer --replacements-json must be an array with at least two replacements");
+	}
+	const seen = new Set<string>();
+	return raw.map((item, index) => {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			throw new Error(`steer --replacements-json[${index}] must be an object`);
+		}
+		const record = item as Record<string, unknown>;
+		const title = typeof record.title === "string" ? record.title.trim() : "";
+		const objective = typeof record.objective === "string" ? record.objective.trim() : "";
+		if (!title || !objective) {
+			throw new Error(`steer --replacements-json[${index}] requires non-empty title and objective`);
+		}
+		const key = `${title}\u0000${objective}`;
+		if (seen.has(key)) throw new Error(`steer --replacements-json[${index}] duplicates an earlier replacement`);
+		seen.add(key);
+		return { title, objective };
+	});
+}
+
+function parsePendingOrder(value: string, kind: UltragoalSteeringKind): string[] {
+	const raw = parseJsonFlag(value, "order-json", kind);
+	if (!Array.isArray(raw) || raw.length === 0) {
+		throw new Error("steer --order-json must be a non-empty array of goal ids");
+	}
+	const seen = new Set<string>();
+	return raw.map((item, index) => {
+		if (typeof item !== "string" || item.trim().length === 0) {
+			throw new Error(`steer --order-json[${index}] must be a non-empty goal id string`);
+		}
+		const id = item.trim();
+		if (seen.has(id)) throw new Error(`steer --order-json contains duplicate goal id ${id}`);
+		seen.add(id);
+		return id;
+	});
+}
+
+async function appendSteeringRejected(input: {
+	cwd: string;
+	kind: UltragoalSteeringKind;
+	reason: string;
+	goalId?: string;
+	evidence?: string;
+	rationale?: string;
+	payload?: JsonObject;
+}): Promise<void> {
+	await appendLedger(input.cwd, {
+		event: "steering_rejected",
+		kind: input.kind,
+		goalId: input.goalId?.trim() || undefined,
+		reason: input.reason,
+		evidence: input.evidence?.trim() || undefined,
+		rationale: input.rationale?.trim() || undefined,
+		payload: input.payload,
+	});
+}
+
+function steeringPayloadSummary(args: readonly string[]): JsonObject {
+	return {
+		goalId: flagValue(args, "--goal-id"),
+		title: flagValue(args, "--title"),
+		objective: flagValue(args, "--objective"),
+		replacementsJson: flagValue(args, "--replacements-json"),
+		orderJson: flagValue(args, "--order-json"),
+	};
+}
+
+function parseNativeSteeringKind(value: string | undefined): UltragoalSteeringKind {
+	if (typeof value === "string" && NATIVE_STEERING_KIND_SET.has(value)) return value as UltragoalSteeringKind;
+	throw new Error(`native steering currently supports --kind ${NATIVE_STEERING_KINDS.join(", ")}`);
+}
+
+async function addUltragoalSubgoalToPlan(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	title: string;
+	objective: string;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan; goalId: string }> {
+	const kind = "add_subgoal";
+	const title = requireSteeringText(input.title, "title", kind);
+	const objective = requireSteeringText(input.objective, "objective", kind);
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
+	});
+	const now = new Date().toISOString();
+	const nextId = nextUltragoalGoalId(input.plan);
+	input.plan.goals.push({
+		id: nextId,
+		title,
+		objective,
+		status: "pending",
+		createdAt: now,
+		updatedAt: now,
+		steering: { kind, evidence, rationale },
+	});
+	input.plan.updatedAt = now;
+	await writePlan(input.cwd, input.plan);
+	await appendLedger(input.cwd, {
+		event: "steering_accepted",
+		kind,
+		goalId: nextId,
+		evidence,
+		rationale,
+	});
+	return { plan: input.plan, goalId: nextId };
+}
+
 export async function addUltragoalSubgoal(input: {
 	cwd: string;
 	title: string;
@@ -1272,35 +1455,201 @@ export async function addUltragoalSubgoal(input: {
 }): Promise<UltragoalPlan> {
 	const plan = await readUltragoalPlan(input.cwd);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
-	for (const [label, value] of [
-		["title", input.title],
-		["objective", input.objective],
-		["evidence", input.evidence],
-		["rationale", input.rationale],
-	] as const) {
-		if (!value.trim()) throw new Error(`steer --${label} is required for add_subgoal`);
-	}
-	const now = new Date().toISOString();
-	const nextId = `G${String(plan.goals.length + 1).padStart(3, "0")}`;
-	plan.goals.push({
-		id: nextId,
-		title: input.title.trim(),
-		objective: input.objective.trim(),
-		status: "pending",
-		createdAt: now,
-		updatedAt: now,
-		steering: { kind: "add_subgoal", evidence: input.evidence.trim(), rationale: input.rationale.trim() },
+	return (await addUltragoalSubgoalToPlan({ ...input, plan })).plan;
+}
+
+async function splitUltragoalSubgoal(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	goalId: string;
+	replacementsJson: string;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan; goalId: string; replacementGoalIds: string[] }> {
+	const kind = "split_subgoal";
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
 	});
-	plan.updatedAt = now;
-	await writePlan(input.cwd, plan);
+	const target = findGoalOrThrow(input.plan, input.goalId, kind);
+	requireGoalStatus(target, ["pending"], kind);
+	const replacements = parseReplacementSpecs(input.replacementsJson, kind);
+	const now = new Date().toISOString();
+	const replacementGoalIds = replacements.map((_, index) => nextUltragoalGoalId(input.plan, index + 1));
+	target.status = "superseded";
+	target.evidence = evidence;
+	target.updatedAt = now;
+	target.steering = { kind, evidence, rationale, replacementGoalIds };
+	const replacementGoals = replacements.map(
+		(replacement, index): UltragoalGoal => ({
+			id: replacementGoalIds[index]!,
+			title: replacement.title,
+			objective: replacement.objective,
+			status: "pending",
+			createdAt: now,
+			updatedAt: now,
+			steering: { kind: "split_replacement", sourceGoalId: target.id, evidence, rationale },
+		}),
+	);
+	const targetIndex = input.plan.goals.findIndex(goal => goal.id === target.id);
+	input.plan.goals.splice(targetIndex + 1, 0, ...replacementGoals);
+	input.plan.updatedAt = now;
+	await writePlan(input.cwd, input.plan);
 	await appendLedger(input.cwd, {
 		event: "steering_accepted",
-		kind: "add_subgoal",
-		goalId: nextId,
-		evidence: input.evidence.trim(),
-		rationale: input.rationale.trim(),
+		kind,
+		goalId: target.id,
+		replacementGoalIds,
+		evidence,
+		rationale,
 	});
-	return plan;
+	return { plan: input.plan, goalId: target.id, replacementGoalIds };
+}
+
+async function reorderPendingUltragoalGoals(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	orderJson: string;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan; pendingGoalIds: string[] }> {
+	const kind = "reorder_pending";
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
+	});
+	const pendingGoalIds = input.plan.goals.filter(goal => goal.status === "pending").map(goal => goal.id);
+	const requestedOrder = parsePendingOrder(input.orderJson, kind);
+	const pendingSet = new Set(pendingGoalIds);
+	for (const id of requestedOrder) {
+		const goal = input.plan.goals.find(item => item.id === id);
+		if (!goal) throw new Error(`steer --order-json references unknown goal id ${id}`);
+		if (goal.status !== "pending") throw new Error(`steer --order-json references non-pending goal id ${id}`);
+	}
+	const missing = pendingGoalIds.filter(id => !requestedOrder.includes(id));
+	if (missing.length > 0) throw new Error(`steer --order-json missing pending goal id(s): ${missing.join(", ")}`);
+	if (requestedOrder.length !== pendingSet.size)
+		throw new Error("steer --order-json must include every pending goal exactly once");
+	const pendingById = new Map(input.plan.goals.map(goal => [goal.id, goal]));
+	const remaining = [...requestedOrder];
+	input.plan.goals = input.plan.goals.map(goal =>
+		goal.status === "pending" ? pendingById.get(remaining.shift()!)! : goal,
+	);
+	input.plan.updatedAt = new Date().toISOString();
+	await writePlan(input.cwd, input.plan);
+	await appendLedger(input.cwd, {
+		event: "steering_accepted",
+		kind,
+		previousPendingGoalIds: pendingGoalIds,
+		pendingGoalIds: requestedOrder,
+		evidence,
+		rationale,
+	});
+	return { plan: input.plan, pendingGoalIds: requestedOrder };
+}
+
+async function revisePendingUltragoalWording(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	goalId: string;
+	title?: string;
+	objective?: string;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan; goalId: string; changedFields: string[] }> {
+	const kind = "revise_pending_wording";
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
+	});
+	const goal = findGoalOrThrow(input.plan, input.goalId, kind);
+	requireGoalStatus(goal, ["pending"], kind);
+	const title = input.title === undefined ? undefined : input.title.trim();
+	const objective = input.objective === undefined ? undefined : input.objective.trim();
+	if (input.title !== undefined && !title)
+		throw new Error("steer --title must be non-empty for revise_pending_wording");
+	if (input.objective !== undefined && !objective)
+		throw new Error("steer --objective must be non-empty for revise_pending_wording");
+	if (!title && !objective) throw new Error("revise_pending_wording requires --title and/or --objective");
+	const changedFields: string[] = [];
+	if (title !== undefined) {
+		goal.title = title;
+		changedFields.push("title");
+	}
+	if (objective !== undefined) {
+		goal.objective = objective;
+		changedFields.push("objective");
+	}
+	const now = new Date().toISOString();
+	goal.updatedAt = now;
+	goal.steering = { kind, evidence, rationale, changedFields };
+	input.plan.updatedAt = now;
+	await writePlan(input.cwd, input.plan);
+	await appendLedger(input.cwd, {
+		event: "steering_accepted",
+		kind,
+		goalId: goal.id,
+		changedFields,
+		evidence,
+		rationale,
+	});
+	return { plan: input.plan, goalId: goal.id, changedFields };
+}
+
+async function annotateUltragoalLedger(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan }> {
+	const kind = "annotate_ledger";
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
+	});
+	await appendLedger(input.cwd, { event: "steering_accepted", kind, evidence, rationale });
+	return { plan: input.plan };
+}
+
+async function markBlockedUltragoalSuperseded(input: {
+	cwd: string;
+	plan: UltragoalPlan;
+	goalId: string;
+	evidence: string;
+	rationale: string;
+}): Promise<{ plan: UltragoalPlan; goalId: string }> {
+	const kind = "mark_blocked_superseded";
+	const { evidence, rationale } = requireSteeringEvidence({
+		kind,
+		evidence: input.evidence,
+		rationale: input.rationale,
+	});
+	const goal = findGoalOrThrow(input.plan, input.goalId, kind);
+	requireGoalStatus(goal, ["blocked", "review_blocked"], kind);
+	const remainingRequiredGoals = requiredUltragoalGoals(input.plan).filter(item => item.id !== goal.id);
+	if (remainingRequiredGoals.length === 0) {
+		throw new Error(`steer ${kind} cannot supersede ${goal.id} because it is the only remaining required goal`);
+	}
+	const now = new Date().toISOString();
+	goal.status = "superseded";
+	goal.evidence = evidence;
+	goal.updatedAt = now;
+	goal.steering = { kind, evidence, rationale, noReplacementRequired: true };
+	input.plan.updatedAt = now;
+	await writePlan(input.cwd, input.plan);
+	await appendLedger(input.cwd, {
+		event: "steering_accepted",
+		kind,
+		goalId: goal.id,
+		noReplacementRequired: true,
+		evidence,
+		rationale,
+	});
+	return { plan: input.plan, goalId: goal.id };
 }
 
 export async function recordUltragoalReviewBlockers(input: {
@@ -1365,6 +1714,8 @@ const FLAGS_WITH_VALUES = new Set([
 	"--title",
 	"--objective",
 	"--rationale",
+	"--replacements-json",
+	"--order-json",
 ]);
 
 function isHelpArg(arg: string): boolean {
@@ -1523,6 +1874,135 @@ function renderCheckpointContinuation(
 	return lines.join("\n");
 }
 
+async function executeUltragoalSteeringCommand(args: readonly string[], cwd: string): Promise<SteeringCommandResult> {
+	const kind = parseNativeSteeringKind(flagValue(args, "--kind"));
+	const plan = await readUltragoalPlan(cwd);
+	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	const evidence = flagValue(args, "--evidence") ?? "";
+	const rationale = flagValue(args, "--rationale") ?? "";
+	try {
+		switch (kind) {
+			case "add_subgoal": {
+				const result = await addUltragoalSubgoalToPlan({
+					cwd,
+					plan,
+					title: flagValue(args, "--title") ?? "",
+					objective: flagValue(args, "--objective") ?? "",
+					evidence,
+					rationale,
+				});
+				return {
+					kind,
+					message: "Accepted add_subgoal steering.\n",
+					receipt: { ok: true, kind, goal_id: result.goalId, goals_path: getUltragoalPaths(cwd).goalsPath },
+				};
+			}
+			case "split_subgoal": {
+				const result = await splitUltragoalSubgoal({
+					cwd,
+					plan,
+					goalId: flagValue(args, "--goal-id") ?? "",
+					replacementsJson: flagValue(args, "--replacements-json") ?? "",
+					evidence,
+					rationale,
+				});
+				return {
+					kind,
+					message: "Accepted split_subgoal steering.\n",
+					receipt: {
+						ok: true,
+						kind,
+						goal_id: result.goalId,
+						replacement_goal_ids: result.replacementGoalIds,
+						goals_path: getUltragoalPaths(cwd).goalsPath,
+					},
+				};
+			}
+			case "reorder_pending": {
+				const result = await reorderPendingUltragoalGoals({
+					cwd,
+					plan,
+					orderJson: flagValue(args, "--order-json") ?? "",
+					evidence,
+					rationale,
+				});
+				return {
+					kind,
+					message: "Accepted reorder_pending steering.\n",
+					receipt: {
+						ok: true,
+						kind,
+						pending_goal_ids: result.pendingGoalIds,
+						goals_path: getUltragoalPaths(cwd).goalsPath,
+					},
+				};
+			}
+			case "revise_pending_wording": {
+				const result = await revisePendingUltragoalWording({
+					cwd,
+					plan,
+					goalId: flagValue(args, "--goal-id") ?? "",
+					title: flagValue(args, "--title"),
+					objective: flagValue(args, "--objective"),
+					evidence,
+					rationale,
+				});
+				return {
+					kind,
+					message: "Accepted revise_pending_wording steering.\n",
+					receipt: {
+						ok: true,
+						kind,
+						goal_id: result.goalId,
+						changed_fields: result.changedFields,
+						goals_path: getUltragoalPaths(cwd).goalsPath,
+					},
+				};
+			}
+			case "annotate_ledger": {
+				await annotateUltragoalLedger({ cwd, plan, evidence, rationale });
+				return {
+					kind,
+					message: "Accepted annotate_ledger steering.\n",
+					receipt: { ok: true, kind, ledger_path: getUltragoalPaths(cwd).ledgerPath },
+				};
+			}
+			case "mark_blocked_superseded": {
+				const result = await markBlockedUltragoalSuperseded({
+					cwd,
+					plan,
+					goalId: flagValue(args, "--goal-id") ?? "",
+					evidence,
+					rationale,
+				});
+				return {
+					kind,
+					message: "Accepted mark_blocked_superseded steering.\n",
+					receipt: {
+						ok: true,
+						kind,
+						goal_id: result.goalId,
+						no_replacement_required: true,
+						goals_path: getUltragoalPaths(cwd).goalsPath,
+					},
+				};
+			}
+		}
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		await appendSteeringRejected({
+			cwd,
+			kind,
+			reason,
+			goalId: flagValue(args, "--goal-id"),
+			evidence,
+			rationale,
+			payload: steeringPayloadSummary(args),
+		});
+		throw error;
+	}
+}
+
 async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
 	const help = renderUltragoalHelp(args);
 	if (help) return { status: 0, stdout: help };
@@ -1577,26 +2057,10 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				};
 			}
 			case "steer": {
-				const kind = flagValue(args, "--kind");
-				if (kind !== "add_subgoal") throw new Error("native steering currently supports --kind add_subgoal");
-				const plan = await addUltragoalSubgoal({
-					cwd,
-					title: flagValue(args, "--title") ?? "",
-					objective: flagValue(args, "--objective") ?? "",
-					evidence: flagValue(args, "--evidence") ?? "",
-					rationale: flagValue(args, "--rationale") ?? "",
-				});
-				const goal = plan.goals.at(-1);
+				const result = await executeUltragoalSteeringCommand(args, cwd);
 				return {
 					status: 0,
-					stdout: json
-						? renderCliWriteReceipt({
-								ok: true,
-								kind,
-								goal_id: goal?.id,
-								goals_path: getUltragoalPaths(cwd).goalsPath,
-							})
-						: "Accepted add_subgoal steering.\n",
+					stdout: json ? renderCliWriteReceipt(result.receipt) : result.message,
 				};
 			}
 			case "record-review-blockers": {

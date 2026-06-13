@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added process-isolated deterministic render-golden capture fixtures and coverage for editor overlays, rich-text resize, multiplexer viewport repaint, sixel preservation, Termux height diffs, and transcript shrink/clear regressions.
+- Added layout/rendering benchmarks for editor layout, markdown rendering, and frame rendering.
+
+### Changed
+
+- Tightened markdown/editor rendering and terminal repaint behavior for the compact tool-block spacing and render-golden stability work.
+
+## [0.4.5] - 2026-06-12
+
+- Version aligned with the 0.4.5 monorepo release; no functional changes in this package.
+
+## [0.4.4] - 2026-06-10
+
+- Version aligned with the 0.4.4 monorepo release; no functional changes in this package.
+
 ## [0.4.3] - 2026-06-10
 
 ### Fixed

@@ -39,11 +39,25 @@ markdownParser.setOptions({
 // (Rust FFI) work for content/layout combinations already seen this session.
 
 const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
-const renderCache = new LRUCache<string, string[]>({ max: RENDER_CACHE_MAX });
+const renderCache = new LRUCache<string, { source: string; lines: string[] }>({ max: RENDER_CACHE_MAX });
+const PARSE_CACHE_MAX = 128;
+const parseCache = new LRUCache<string, { source: string; tokens: Token[] }>({ max: PARSE_CACHE_MAX });
+
+// Full-content 64-bit wyhash over every byte (no lossy sampling). Cache hits
+// additionally verify entry.source against the normalized text, so even a
+// hash collision can never return another message's render.
+function markdownContentKey(text: string): string {
+	return `${text.length}:${Bun.hash(text).toString(36)}`;
+}
+
+function wrapTextIfNeeded(line: string, width: number): string[] {
+	return wrapTextWithAnsi(line, width);
+}
 
 /** Drop all L2 cache entries. Call on theme change to prevent stale styled output. */
 export function clearRenderCache(): void {
 	renderCache.clear();
+	parseCache.clear();
 }
 
 // Stable numeric IDs for structural theme/style objects (no ID field on type).
@@ -195,32 +209,36 @@ export class Markdown implements Component {
 		// Replace tabs with 3 spaces for consistent rendering
 		const normalizedText = replaceTabs(this.#text);
 
+		const contentKey = markdownContentKey(normalizedText);
+
 		// L2: module-level LRU — survives component disposal/recreation across
 		// session-tree navigations. Key encodes every dimension that affects the
-		// render output so different configurations never collide.
-		// Encode terminal capability state and theme/style function output samples
-		// so that capability shifts (image protocol changes, hyperlink toggle) or
-		// caller-supplied theme/bgColor functions that mutate their output without
-		// changing object identity invalidate the cache entry.
-		// bgColor probe uses \x01 (single non-printable byte): chalk/ANSI wrappers
-		// pass arbitrary bytes through verbatim, so this is safe and minimizes the
-		// risk of clashing with a function that returns text verbatim.
-		// theme.heading is used as the representative theme probe — it's required
-		// by MarkdownTheme and is one of the most styling-sensitive entries.
+		// render output so different configurations never collide. The markdown
+		// content dimension is a full-content hash; entries store the source text
+		// and verify it on hit so hash collisions can never serve wrong output.
 		const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
 		const headingProbe = this.#theme.heading("");
-		const cacheKey = `${normalizedText}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+		const cacheKey = `${contentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
-		if (cached !== undefined) {
+		if (cached !== undefined && cached.source === normalizedText) {
 			// Populate L1 so subsequent calls from this instance are O(1) map lookup.
 			this.#cachedText = this.#text;
 			this.#cachedWidth = width;
-			this.#cachedLines = cached;
-			return cached;
+			this.#cachedLines = cached.lines;
+			return cached.lines;
 		}
 
-		// Parse markdown to HTML-like tokens
-		const tokens = markdownParser.lexer(normalizedText);
+		// Parse markdown to marked tokens. Parse cache is width/theme independent,
+		// so the same content can be reused across resize/layout renders even when
+		// final wrapped output must differ by width.
+		const cachedParse = parseCache.get(contentKey);
+		let tokens: Token[];
+		if (cachedParse !== undefined && cachedParse.source === normalizedText) {
+			tokens = cachedParse.tokens;
+		} else {
+			tokens = markdownParser.lexer(normalizedText);
+			parseCache.set(contentKey, { source: normalizedText, tokens });
+		}
 
 		// Convert tokens to styled terminal output
 		const renderedLines: string[] = [];
@@ -235,11 +253,10 @@ export class Markdown implements Component {
 		// Wrap lines (NO padding, NO background yet)
 		const wrappedLines: string[] = [];
 		for (const line of renderedLines) {
-			// Skip wrapping for image protocol lines (would corrupt escape sequences)
 			if (TERMINAL.isImageLine(line)) {
 				wrappedLines.push(line);
 			} else {
-				wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
+				wrappedLines.push(...wrapTextIfNeeded(line, contentWidth));
 			}
 		}
 
@@ -287,7 +304,7 @@ export class Markdown implements Component {
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		renderCache.set(cacheKey, result);
+		renderCache.set(cacheKey, { source: normalizedText, lines: result });
 
 		return result;
 	}
@@ -495,7 +512,7 @@ export class Markdown implements Component {
 
 				for (const quoteLine of renderedQuoteLines) {
 					const styledLine = applyQuoteStyle(quoteLine);
-					const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
+					const wrappedLines = wrapTextIfNeeded(styledLine, quoteContentWidth);
 					for (const wrappedLine of wrappedLines) {
 						lines.push(this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) + wrappedLine);
 					}
@@ -755,7 +772,7 @@ export class Markdown implements Component {
 	 * consistently with the rest of the renderer.
 	 */
 	#wrapCellText(text: string, maxWidth: number): string[] {
-		return wrapTextWithAnsi(text, Math.max(1, maxWidth));
+		return wrapTextIfNeeded(text, Math.max(1, maxWidth));
 	}
 
 	/**

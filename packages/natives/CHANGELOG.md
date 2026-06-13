@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed pi-shell bash fixups on multibyte UTF-8 commands by converting parser source indexes to byte offsets before stripping `head`/`tail` pipelines.
+
+## [0.4.5] - 2026-06-12
+
+### Changed
+
+- Added native build/embed guard plumbing and version-sentinel export checks for the 0.4.5 native package surface, keeping stale `.node` files from silently loading under a new wrapper.
+- Refreshed native tokenizer/grammar loading paths for the reduced-memory compiled CLI surface.
+
+## [0.4.4] - 2026-06-10
+
+- Version aligned with the 0.4.4 monorepo release; no functional changes in this package.
+
 ## [0.4.0] - 2026-06-06
 
 ### Added

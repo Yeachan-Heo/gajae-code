@@ -38,8 +38,8 @@ function fakeSession(initial = model("initial-provider", "initial")) {
 }
 describe("CLI model profile args", () => {
 	test("parses --mpreset with separate value", () => {
-		const parsed = parseArgs(["--mpreset", "codex-standard"]);
-		expect(parsed.mpreset).toBe("codex-standard");
+		const parsed = parseArgs(["--mpreset", "codex-medium"]);
+		expect(parsed.mpreset).toBe("codex-medium");
 		expect(parsed.default).toBeUndefined();
 	});
 
@@ -49,8 +49,8 @@ describe("CLI model profile args", () => {
 	});
 
 	test("parses --default with --mpreset", () => {
-		const parsed = parseArgs(["--mpreset", "opencode-go-standard", "--default"]);
-		expect(parsed.mpreset).toBe("opencode-go-standard");
+		const parsed = parseArgs(["--mpreset", "opencodego", "--default"]);
+		expect(parsed.mpreset).toBe("opencodego");
 		expect(parsed.default).toBe(true);
 	});
 
@@ -96,13 +96,13 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 		settings,
 		modelRegistry: fakeRegistry([
 			{
-				name: "codex-standard",
+				name: "codex-medium",
 				requiredProviders: ["profile-provider"],
 				modelMapping: { default: "profile-provider/default:high" },
 				source: "user",
 			},
 		]) as never,
-		parsedArgs: { mpreset: "codex-standard", model: "cli-provider/explicit" },
+		parsedArgs: { mpreset: "codex-medium", model: "cli-provider/explicit" },
 		startupModel: undefined,
 		startupThinkingLevel: undefined,
 	});

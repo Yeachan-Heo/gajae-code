@@ -385,6 +385,84 @@ describe("Editor component", () => {
 		});
 	});
 
+	describe("layout cache lifecycle", () => {
+		it("does not retain stale large content after setText shrinks the buffer", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setText("x".repeat(10_000));
+			editor.render(40);
+
+			editor.setText("small");
+
+			expect(editor.render(40).join("\n")).toContain("small");
+			expect(editor.render(40).join("\n")).not.toContain("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+		});
+
+		it("does not retain pasted content after submit resets the buffer", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setText(Array.from({ length: 1000 }, (_, i) => `paste-${i}`).join("\n"));
+			editor.render(80);
+			editor.handleInput("\r");
+
+			expect(editor.getText()).toBe("");
+			expect(editor.render(80).join("\n")).not.toContain("paste-");
+		});
+
+		it("recomputes wrapped layout after width changes", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setText("abcdefghij".repeat(6));
+			const wide = editor.render(80).length;
+			const narrow = editor.render(20).length;
+
+			expect(narrow).toBeGreaterThan(wide);
+		});
+
+		it("recomputes layout after synchronous autocomplete replacement", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return null;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+				trySyncInlineReplace(textBeforeCursor) {
+					return textBeforeCursor.endsWith(":watch:")
+						? { replaceLen: ":watch:".length, insert: "⌚".repeat(8) }
+						: null;
+				},
+			});
+
+			for (const char of ":watch:") editor.handleInput(char);
+
+			expect(editor.getText()).toBe("⌚".repeat(8));
+			expect(editor.render(10).length).toBeGreaterThan(1);
+		});
+
+		it("does not retain stale entries after editing a large buffer down to empty", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			const lineCount = 50;
+			editor.setText(Array.from({ length: lineCount }, (_, i) => `stale-${i}`).join("\n"));
+			editor.render(80);
+			expect(editor.wrappedLineCacheSize).toBe(lineCount);
+
+			// Delete everything through the real editing path (backspace), which
+			// merges/edits lines WITHOUT going through the setText/submit clear
+			// hooks — only the empty-document layout branch bounds the cache.
+			const totalChars = editor.getText().length;
+			for (let i = 0; i < totalChars; i++) editor.handleInput("\x7f");
+			expect(editor.getText()).toBe("");
+			editor.render(80);
+
+			expect(editor.wrappedLineCacheSize).toBeLessThanOrEqual(1);
+			expect(editor.render(80).join("\n")).not.toContain("stale-");
+		});
+	});
+
 	describe("Unicode text editing behavior", () => {
 		it("inserts mixed ASCII, umlauts, and emojis as literal text", () => {
 			const editor = new Editor(defaultEditorTheme);

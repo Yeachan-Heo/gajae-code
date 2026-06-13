@@ -1057,7 +1057,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			if (event.state?.enabled === true && !this.#goalModePreviousTools) {
-				this.#goalModePreviousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
+				this.#goalModePreviousTools = this.session.getActiveToolNames();
 			}
 			this.goalModeEnabled = event.state?.enabled === true;
 			this.goalModePaused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
@@ -1146,10 +1146,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			const restored = await this.session.goalRuntime.onThreadResumed();
 			this.goalModeEnabled = restored?.enabled === true;
 			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
-			// sdk.ts excludes "goal" from the initial active tool set unconditionally.
-			// Re-add it now so the agent can call resume, complete, or drop on this goal.
+			// Keep `goal` armed on resumed threads; it is part of the default active tool set.
 			if (restored?.goal) {
-				const previousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
+				const previousTools = this.session.getActiveToolNames();
 				this.#goalModePreviousTools = previousTools;
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
@@ -1318,7 +1317,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Exit plan mode first.");
 			return;
 		}
-		const previousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
+		const previousTools = this.session.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		this.#goalModePreviousTools = previousTools;
 		this.goalModePaused = false;

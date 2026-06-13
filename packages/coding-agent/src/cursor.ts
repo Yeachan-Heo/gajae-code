@@ -160,8 +160,35 @@ function formatMcpToolErrorMessage(toolName: string, availableTools: string[]): 
 	return `MCP tool "${toolName}" not found. Available tools: ${list}`;
 }
 
+/**
+ * Cursor's wire protocol carries shell timeouts in milliseconds — the
+ * model-facing parameter is `block_until_ms`, and `ShellArgs.hard_timeout` is
+ * likewise documented in ms — while the bash tool's `timeout` is seconds.
+ * Passing the raw value through made a requested 30 s wait (30000 ms) arrive
+ * as 30000 s and clamp to the 3600 s ceiling, i.e. an accidental 1-hour
+ * timeout on a blocking command. Convert, rounding sub-second values up to 1 s
+ * so a tiny requested wait does not collapse to "no timeout".
+ */
+function shellTimeoutSeconds(timeout: number | undefined): number | undefined {
+	if (!timeout || timeout <= 0) return undefined;
+	return Math.max(1, Math.ceil(timeout / 1000));
+}
+
 export class CursorExecHandlers implements ICursorExecHandlers {
-	constructor(private options: CursorExecBridgeOptions) {}
+	constructor(private options: CursorExecBridgeOptions) {
+		// Bind every native handler so methods stay instance-safe when invoked
+		// detached/unbound by the Cursor provider (e.g. `const read = handlers.read`).
+		// Without this, `this.#optionsForCall()` throws "undefined is not an object".
+		this.read = this.read.bind(this);
+		this.ls = this.ls.bind(this);
+		this.grep = this.grep.bind(this);
+		this.write = this.write.bind(this);
+		this.delete = this.delete.bind(this);
+		this.shell = this.shell.bind(this);
+		this.shellStream = this.shellStream.bind(this);
+		this.diagnostics = this.diagnostics.bind(this);
+		this.mcp = this.mcp.bind(this);
+	}
 
 	#optionsForCall(): CursorExecBridgeOptions {
 		return {
@@ -185,9 +212,24 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 	async grep(args: Parameters<NonNullable<ICursorExecHandlers["grep"]>>[0]) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
+		// Cursor's native Glob tool arrives as a grep exec with a glob but no content
+		// pattern. The search tool requires a non-empty pattern, so an empty pattern
+		// means "list files matching this glob" — route that to find instead of
+		// throwing "Pattern must not be empty".
+		const pattern = typeof args.pattern === "string" ? args.pattern : "";
+		if (pattern.trim().length === 0) {
+			if (args.glob) {
+				const globPath = `${args.path || "."}/${args.glob}`;
+				return executeTool(this.#optionsForCall(), "find", toolCallId, { paths: [globPath] });
+			}
+			const result = buildToolErrorResult(
+				"Cursor grep request rejected: pattern must not be empty. Provide a non-empty search pattern.",
+			);
+			return createToolResultMessage(toolCallId, "search", result, true);
+		}
 		const searchPath = args.glob ? `${args.path || "."}/${args.glob}` : args.path || ".";
 		const toolResultMessage = await executeTool(this.#optionsForCall(), "search", toolCallId, {
-			pattern: args.pattern,
+			pattern,
 			paths: [searchPath],
 			i: args.caseInsensitive || undefined,
 		});
@@ -212,7 +254,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 	async shell(args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0]) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
-		const timeoutSeconds = args.timeout && args.timeout > 0 ? args.timeout : undefined;
+		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
 		const toolResultMessage = await executeTool(this.#optionsForCall(), "bash", toolCallId, {
 			command: args.command,
 			cwd: args.workingDirectory || undefined,
@@ -234,7 +276,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			return createToolResultMessage(toolCallId, toolName, result, true);
 		}
 
-		const timeoutSeconds = args.timeout && args.timeout > 0 ? args.timeout : undefined;
+		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
 		const toolArgs: Record<string, unknown> = {
 			command: args.command,
 			cwd: args.workingDirectory || undefined,

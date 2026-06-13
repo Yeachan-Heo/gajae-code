@@ -8,6 +8,7 @@
 import type { HarnessLifecycle, NextAllowedAction, PrimitiveResponse, SessionState, SessionStateView } from "./types";
 
 const TERMINAL_LIFECYCLES: ReadonlySet<HarnessLifecycle> = new Set(["completed", "retired"]);
+const SUBMIT_READY_LIFECYCLES: ReadonlySet<HarnessLifecycle> = new Set(["started", "observing"]);
 
 const TRANSITIONS: Record<HarnessLifecycle, readonly HarnessLifecycle[]> = {
 	new: ["started", "blocked", "retired"],
@@ -37,11 +38,32 @@ export function assertTransition(from: HarnessLifecycle, to: HarnessLifecycle): 
 	}
 }
 
+export interface NextAllowedActionsOptions {
+	/** Additional live-owner/RPC readiness gate for submit, e.g. rpc-not-idle. */
+	submitUnavailableReason?: string | null;
+}
+
+export function submitUnavailableReason(
+	lifecycle: HarnessLifecycle,
+	ownerLive: boolean,
+	gateReason: string | null = null,
+): string | null {
+	if (isTerminal(lifecycle)) return `lifecycle-terminal:${lifecycle}`;
+	if (lifecycle === "blocked") return "lifecycle-blocked";
+	if (!SUBMIT_READY_LIFECYCLES.has(lifecycle)) return `lifecycle-not-idle:${lifecycle}`;
+	if (!ownerLive) return "owner-not-live";
+	return gateReason;
+}
+
 /**
  * Derive the permitted next actions for a session given its lifecycle and whether
  * a live owner currently holds the lease.
  */
-export function nextAllowedActions(lifecycle: HarnessLifecycle, ownerLive: boolean): NextAllowedAction[] {
+export function nextAllowedActions(
+	lifecycle: HarnessLifecycle,
+	ownerLive: boolean,
+	options: NextAllowedActionsOptions = {},
+): NextAllowedAction[] {
 	const terminal = isTerminal(lifecycle);
 	const actions: NextAllowedAction[] = [];
 	const add = (verb: NextAllowedAction["verb"], available: boolean, reason?: string): void => {
@@ -57,11 +79,10 @@ export function nextAllowedActions(lifecycle: HarnessLifecycle, ownerLive: boole
 	// `start` creates a new session; never re-applicable to an existing record.
 	add("start", false, "session-already-exists");
 
-	// `submit` is owner-routed: it requires a live owner and a non-blocked, non-terminal lifecycle.
-	if (terminal) add("submit", false, `lifecycle-terminal:${lifecycle}`);
-	else if (lifecycle === "blocked") add("submit", false, "lifecycle-blocked");
-	else if (!ownerLive) add("submit", false, "owner-not-live");
-	else add("submit", true);
+	// `submit` is owner-routed: it requires a live owner, a submit-ready lifecycle,
+	// and (for owner-observed responses) an idle/routable RPC backend.
+	const submitReason = submitUnavailableReason(lifecycle, ownerLive, options.submitUnavailableReason ?? null);
+	add("submit", submitReason === null, submitReason ?? undefined);
 
 	// `recover` handles a dead/failed owner, so it is available without a live owner.
 	add("recover", !terminal, terminal ? `lifecycle-terminal:${lifecycle}` : undefined);

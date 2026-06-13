@@ -25,6 +25,11 @@ import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import { ANTIGRAVITY_SYSTEM_INSTRUCTION, getAntigravityUserAgent, getGeminiCliHeaders } from "./google-gemini-headers";
 import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "./google-shared";
 import {
@@ -48,7 +53,7 @@ import {
 export type { GoogleThinkingLevel };
 
 export interface GoogleGeminiCliOptions extends StreamOptions {
-	toolChoice?: "auto" | "none" | "any";
+	toolChoice?: "auto" | "none" | "any" | "required";
 	/**
 	 * Thinking/reasoning configuration.
 	 * - Gemini 2.x models: use `budgetTokens` to set the thinking budget
@@ -324,7 +329,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				...(needsClaudeThinkingBetaHeader(model) ? { "anthropic-beta": CLAUDE_THINKING_BETA_HEADER } : {}),
 				...(options?.headers ?? {}),
 			};
-			const requestBodyJson = JSON.stringify(requestBody);
+			let requestBodyJson = JSON.stringify(requestBody);
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,
@@ -334,7 +339,13 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				headers: requestHeaders,
 			};
 
-			const response = await fetchWithRetry(
+			const sentForcedToolChoice =
+				(requestBody.request.toolConfig?.functionCallingConfig?.mode === "ANY" ||
+					requestBody.request.toolConfig?.functionCallingConfig?.mode === "VALIDATED") &&
+				options?.toolChoice !== undefined &&
+				options.toolChoice !== "auto" &&
+				options.toolChoice !== "none";
+			let response = await fetchWithRetry(
 				attempt => `${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,
 				{
 					method: "POST",
@@ -347,6 +358,49 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					fetch: options?.fetch,
 				},
 			);
+			if (!response.ok && sentForcedToolChoice) {
+				const errorText = await response.text();
+				const error = withHttpStatus(
+					new Error(`Cloud Code Assist API error (${response.status}): ${extractErrorMessage(errorText)}`),
+					response.status,
+				);
+				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+					const beforeMark = resolveToolChoice(model, options?.toolChoice);
+					markToolChoiceIncapability(model, "auto", error.message);
+					stream.push({
+						type: "toolChoiceIncapability",
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						requestedLevel: beforeMark.requestedLevel,
+						resolvedLevel: "auto",
+						reason: error.message,
+						registryKey: beforeMark.registryKey,
+					});
+					requestBody = {
+						...requestBody,
+						request: { ...requestBody.request, toolConfig: undefined },
+					};
+					requestBodyJson = JSON.stringify(requestBody);
+					rawRequestDump = { ...rawRequestDump, body: requestBody };
+					response = await fetchWithRetry(
+						attempt =>
+							`${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,
+						{
+							method: "POST",
+							headers: requestHeaders,
+							body: requestBodyJson,
+							signal: options?.signal,
+							maxAttempts: 1,
+							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+							fetch: options?.fetch,
+						},
+					);
+				} else {
+					throw error;
+				}
+			}
 			if (!response.ok) {
 				const errorText = await response.text();
 				throw withHttpStatus(
@@ -743,13 +797,15 @@ export function buildRequest(
 		request.generationConfig = generationConfig;
 	}
 
+	const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
 	if (context.tools && context.tools.length > 0) {
 		const convertedTools = convertTools(context.tools, model);
 		request.tools = isAntigravity ? normalizeAntigravityTools(convertedTools) : convertedTools;
-		if (options.toolChoice) {
+		const resolved = resolvedToolChoice;
+		if (resolved.resolvedChoice) {
 			request.toolConfig = {
 				functionCallingConfig: {
-					mode: mapToolChoice(options.toolChoice),
+					mode: mapToolChoice(resolved.resolvedChoice as string),
 				},
 			};
 		}
@@ -763,11 +819,14 @@ export function buildRequest(
 	}
 
 	if (isAntigravity && isClaudeModel(model.id)) {
-		request.toolConfig = {
-			functionCallingConfig: {
-				mode: "VALIDATED" as FunctionCallingConfigMode,
-			},
-		};
+		const resolvedLevel = resolvedToolChoice.resolvedLevel;
+		if (resolvedLevel === "named" || resolvedLevel === "required") {
+			request.toolConfig = {
+				functionCallingConfig: {
+					mode: "VALIDATED" as FunctionCallingConfigMode,
+				},
+			};
+		}
 	}
 
 	if (isAntigravity && shouldInjectAntigravitySystemInstruction(model.id)) {

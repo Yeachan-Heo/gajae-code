@@ -1,0 +1,6 @@
+termux-line-00
+termux-keyboard-height
+termux-line-02
+termux-line-03
+
+

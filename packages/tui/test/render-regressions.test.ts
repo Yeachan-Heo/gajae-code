@@ -188,6 +188,31 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 	});
+	describe("render line cache bounds", () => {
+		it("keeps normalization and truncation caches bounded for streaming unique lines", async () => {
+			const term = new VirtualTerminal(40, 10);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				for (let i = 0; i < 10_000; i++) component.setLines([`stream-${i}-${"x".repeat(80)}`]);
+				tui.requestRender();
+				await settle(term);
+
+				const stats = tui.getLineRenderCacheStats();
+				expect(stats.normalizationSize).toBeLessThanOrEqual(stats.normalizationLimit);
+				expect(stats.truncationSize).toBeLessThanOrEqual(stats.truncationLimit);
+				expect(stats.normalizationLimit).toBe(2);
+				expect(stats.truncationLimit).toBe(2);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
 
 	describe("resize + viewport behavior", () => {
 		it("clears preexisting shell rows on startup and resize redraw", async () => {

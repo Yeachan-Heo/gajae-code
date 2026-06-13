@@ -6,9 +6,9 @@
  * openai) at startup. The loaded module promise is cached so subsequent calls
  * reuse the same import.
  *
- * NOTE: stream.ts currently imports providers directly, so this file is not yet
- * wired into the main streaming path. It provides the infrastructure for lazy
- * loading that can be integrated when stream.ts is refactored.
+ * stream.ts imports its provider stream functions from this module (see the
+ * lazy wrappers below), so this file IS the main streaming path's provider
+ * loader: heavy SDKs stay out of the CLI startup parse graph.
  */
 import type {
 	Api,
@@ -390,9 +390,8 @@ function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-conver
 // ---------------------------------------------------------------------------
 // Lazy stream function exports
 //
-// These use the same names as the direct provider stream functions. When
-// stream.ts is updated to import from this module instead of individual
-// providers, the lazy loading will take effect on the main code path.
+// Provider registry code imports these wrappers so the concrete provider modules
+// are loaded on first use instead of during package initialization.
 // ---------------------------------------------------------------------------
 
 export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);

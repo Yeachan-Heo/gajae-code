@@ -81,6 +81,7 @@ describe("createTools", () => {
 		expect(names).toContain("todo_write");
 		expect(names).toContain("web_search");
 		expect(names).toContain("resolve");
+		expect(names).toContain("goal");
 		expect(names).not.toContain("fetch");
 		expect(names).not.toContain("vim");
 	});
@@ -147,7 +148,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read", "lsp", "write"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "write", "resolve"]);
+		expect(names).toEqual(["read", "write", "goal", "resolve"]);
 	});
 
 	it("excludes lsp tool when disabled", async () => {
@@ -163,7 +164,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read", "write"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "write", "resolve"]);
+		expect(names).toEqual(["read", "write", "goal", "resolve"]);
 	});
 
 	it("ignores vim as an unknown requested tool even when vim edit mode is active", async () => {
@@ -175,7 +176,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read", "vim"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "resolve"]);
+		expect(names).toEqual(["read", "goal", "resolve"]);
 	});
 
 	it("lowercases requested tool subset", async () => {
@@ -183,7 +184,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["Read", "Write"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "write", "resolve"]);
+		expect(names).toEqual(["read", "write", "goal", "resolve"]);
 	});
 
 	it("includes hidden tools when explicitly requested", async () => {
@@ -191,7 +192,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["report_finding"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["report_finding", "resolve"]);
+		expect(names).toEqual(["report_finding", "goal", "resolve"]);
 	});
 
 	it("includes yield tool when required", async () => {
@@ -258,6 +259,20 @@ describe("createTools", () => {
 		expect(defaultTools.map(t => t.name)).not.toContain("exit_plan_mode");
 
 		const requestedTools = await createTools(session, ["read"]);
+		expect(requestedTools.map(t => t.name)).toEqual(["read", "goal", "resolve"]);
+	});
+
+	it("excludes the unified goal tool only when goal mode is disabled", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({
+				"goal.enabled": false,
+			}),
+		});
+
+		const defaultTools = await createTools(session);
+		expect(defaultTools.map(t => t.name)).not.toContain("goal");
+
+		const requestedTools = await createTools(session, ["read", "goal"]);
 		expect(requestedTools.map(t => t.name)).toEqual(["read", "resolve"]);
 	});
 	it("auto-includes the unified goal tool when goal mode is enabled", async () => {

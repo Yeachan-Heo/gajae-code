@@ -6,6 +6,7 @@ import { adaptSchemaForStrict, toolWireSchema } from "@gajae-code/ai/utils/schem
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ToolChoiceQueue } from "@gajae-code/coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { supportsLanguage } from "@gajae-code/natives";
 
 type InvokedToolResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -240,7 +241,7 @@ describe("ast_edit tool schema", () => {
 		}
 	});
 
-	it("infers tlaplus from .tla files for AST edits", async () => {
+	it.skipIf(!supportsLanguage("tlaplus"))("infers tlaplus from .tla files for AST edits", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-tlaplus-"));
 		try {
 			const filePath = path.join(tempDir, "Spec.tla");

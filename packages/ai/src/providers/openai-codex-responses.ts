@@ -51,6 +51,11 @@ import { getOpenAIStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/i
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import { compactGrammarDefinition } from "./grammar";
 import { CODEX_BASE_URL, getCodexAccountId, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "./openai-codex/constants";
 import {
@@ -173,6 +178,47 @@ interface CodexRequestContext {
 	websocketState?: CodexWebSocketSessionState;
 	transformedBody: RequestBody;
 	rawRequestDump: RawHttpRequestDump;
+}
+
+async function retryCodexInitialTransportWithoutToolChoice(
+	model: Model<"openai-codex-responses">,
+	options: OpenAICodexResponsesOptions | undefined,
+	requestSetup: CodexRequestSetup,
+	requestContext: CodexRequestContext,
+	stream: AssistantMessageEventStream,
+	error: unknown,
+): Promise<{
+	eventStream: AsyncGenerator<Record<string, unknown>>;
+	requestBodyForState: RequestBody;
+	transport: CodexTransport;
+}> {
+	if (
+		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(requestContext.transformedBody.tool_choice))
+	) {
+		throw error;
+	}
+	const reason = await finalizeErrorMessage(error, requestContext.rawRequestDump);
+	markToolChoiceIncapability(model, "auto", reason);
+	const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
+	stream.push({
+		type: "toolChoiceIncapability",
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		requestedLevel: resolvedToolChoice.requestedLevel,
+		resolvedLevel: "auto",
+		reason,
+		registryKey: resolvedToolChoice.registryKey,
+	});
+	const next = await openCodexSseTransportWithoutToolChoice(
+		model,
+		requestContext,
+		requestSetup,
+		options,
+		requestContext.websocketState,
+	);
+	requestContext.rawRequestDump = { ...requestContext.rawRequestDump, body: next.requestBodyForState };
+	return next;
 }
 
 interface CodexRequestSetup {
@@ -601,7 +647,16 @@ async function buildTransformedCodexRequestBody(
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
-			const toolChoice = normalizeCodexToolChoice(options.toolChoice, context.tools, model);
+			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
+			if (resolvedToolChoice.degraded && resolvedToolChoice.supportSource === "runtime") {
+				logCodexDebug("codex degraded tool_choice after runtime capability discovery", {
+					model: model.id,
+					requestedLevel: resolvedToolChoice.requestedLevel,
+					resolvedLevel: resolvedToolChoice.resolvedLevel,
+					reason: resolvedToolChoice.reason,
+				});
+			}
+			const toolChoice = normalizeCodexToolChoice(resolvedToolChoice.resolvedChoice, context.tools, model);
 			if (toolChoice) {
 				params.tool_choice = toolChoice;
 			}
@@ -752,6 +807,22 @@ async function openCodexSseTransport(
 		),
 	);
 	return { eventStream, requestBodyForState: structuredCloneJSON(body), transport: "sse" };
+}
+
+async function openCodexSseTransportWithoutToolChoice(
+	model: Model<"openai-codex-responses">,
+	requestContext: CodexRequestContext,
+	requestSetup: CodexRequestSetup,
+	options: OpenAICodexResponsesOptions | undefined,
+	state: CodexWebSocketSessionState | undefined,
+): Promise<{
+	eventStream: AsyncGenerator<Record<string, unknown>>;
+	requestBodyForState: RequestBody;
+	transport: CodexTransport;
+}> {
+	const body = structuredCloneJSON(requestContext.transformedBody);
+	delete body.tool_choice;
+	return openCodexSseTransport(model, requestContext, requestSetup, options, state, body);
 }
 
 async function reopenCodexWebSocketRuntimeStream(
@@ -1273,6 +1344,9 @@ async function recoverCodexStreamError(
 	runtime: CodexStreamRuntime,
 	error: unknown,
 ): Promise<boolean> {
+	if (await tryRetryWithoutForcedToolChoice(context, runtime, error)) {
+		return true;
+	}
 	if (await tryReconnectCodexWebSocketOnConnectionLimit(context, runtime, error)) {
 		return true;
 	}
@@ -1286,6 +1360,69 @@ async function recoverCodexStreamError(
 		return true;
 	}
 	return false;
+}
+
+async function tryRetryWithoutForcedToolChoice(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+	error: unknown,
+): Promise<boolean> {
+	if (
+		runtime.providerRetryAttempt > 0 ||
+		context.output.content.length > 0 ||
+		context.firstTokenTime !== undefined ||
+		context.options?.signal?.aborted ||
+		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(runtime.requestBodyForState.tool_choice))
+	) {
+		return false;
+	}
+
+	const reason = await finalizeErrorMessage(error, context.requestContext.rawRequestDump);
+	markToolChoiceIncapability(context.model, "auto", reason);
+	const resolvedToolChoice = resolveToolChoice(context.model, context.options?.toolChoice);
+	context.stream.push({
+		type: "toolChoiceIncapability",
+		api: context.model.api,
+		provider: context.model.provider,
+		model: context.model.id,
+		requestedLevel: resolvedToolChoice.requestedLevel,
+		resolvedLevel: "auto",
+		reason,
+		registryKey: resolvedToolChoice.registryKey,
+	});
+
+	runtime.providerRetryAttempt += 1;
+	runtime.currentItem = null;
+	runtime.currentBlock = null;
+	runtime.sawTerminalEvent = false;
+	runtime.nativeOutputItems.length = 0;
+	resetOutputState(context.output);
+	context.firstTokenTime = undefined;
+
+	const websocketState = context.requestContext.websocketState;
+	if (websocketState) {
+		resetCodexWebSocketAppendState(websocketState);
+		resetCodexSessionMetadata(websocketState);
+	}
+	const next = await openCodexSseTransportWithoutToolChoice(
+		context.model,
+		context.requestContext,
+		context.requestSetup,
+		context.options,
+		websocketState,
+	);
+	runtime.eventStream = next.eventStream;
+	runtime.requestBodyForState = next.requestBodyForState;
+	runtime.transport = next.transport;
+	if (websocketState) {
+		websocketState.lastTransport = next.transport;
+	}
+	context.requestContext.rawRequestDump = { ...context.requestContext.rawRequestDump, body: next.requestBodyForState };
+	return true;
+}
+
+function isForcedCodexToolChoice(choice: RequestBody["tool_choice"]): boolean {
+	return !!choice && choice !== "none" && choice !== "auto";
 }
 
 /**
@@ -1546,7 +1683,19 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 		try {
 			const requestContext = await buildCodexRequestContext(model, context, options, output);
-			const initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
+			let initialTransport: Awaited<ReturnType<typeof openInitialCodexEventStream>>;
+			try {
+				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
+			} catch (error) {
+				initialTransport = await retryCodexInitialTransportWithoutToolChoice(
+					model,
+					options,
+					requestSetup,
+					requestContext,
+					stream,
+					error,
+				);
+			}
 			const runtime = createCodexStreamRuntime({
 				...initialTransport,
 				websocketState: requestContext.websocketState,

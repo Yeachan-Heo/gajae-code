@@ -66,6 +66,12 @@ import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { spillToDescription } from "../utils/schema/spill";
 import { notifyRawSseEvent, wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	type ResolveToolChoiceResult,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
+import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
@@ -875,7 +881,8 @@ async function getAnthropicStreamResponse(
 
 function getAnthropicCompat(
 	model: Model<"anthropic-messages">,
-): Required<NonNullable<Model<"anthropic-messages">["compat"]>> {
+): Required<Omit<NonNullable<Model<"anthropic-messages">["compat"]>, "toolChoiceSupport">> &
+	Pick<NonNullable<Model<"anthropic-messages">["compat"]>, "toolChoiceSupport"> {
 	return {
 		disableStrictTools: model.compat?.disableStrictTools ?? false,
 		disableAdaptiveThinking: model.compat?.disableAdaptiveThinking ?? false,
@@ -883,6 +890,7 @@ function getAnthropicCompat(
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsToolChoice: model.compat?.supportsToolChoice ?? true,
 		supportsForcedToolChoice: model.compat?.supportsForcedToolChoice ?? true,
+		toolChoiceSupport: model.compat?.toolChoiceSupport,
 	};
 }
 
@@ -1076,8 +1084,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
+			let droppedForcedToolChoice = false;
 			const prepareParams = async (paramsOptions?: {
 				repairLatestAssistantThinking?: boolean;
+				dropForcedToolChoice?: boolean;
 			}): Promise<MessageCreateParamsStreaming> => {
 				let nextParams = buildParams(
 					model,
@@ -1088,6 +1098,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					disableStrictTools,
 					paramsOptions?.repairLatestAssistantThinking === true,
 				);
+				if (paramsOptions?.dropForcedToolChoice === true) {
+					delete nextParams.tool_choice;
+				}
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
@@ -1402,6 +1415,39 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						continue;
 					}
 					if (
+						!droppedForcedToolChoice &&
+						firstTokenTime === undefined &&
+						isSentForcedAnthropicToolChoice(params.tool_choice) &&
+						isForcedToolChoiceUnsupportedError(streamFailure, true)
+					) {
+						const message = await finalizeErrorMessage(streamFailure, rawRequestDump);
+						logger.debug("anthropic: forced tool_choice unsupported, retrying with auto tool choice", {
+							model: model.id,
+							error: message,
+						});
+						markToolChoiceIncapability(model, "auto", message);
+						stream.push({
+							type: "toolChoiceIncapability",
+							api: output.api,
+							provider: model.provider,
+							model: model.id,
+							requestedLevel: resolveToolChoice(model, options?.toolChoice).requestedLevel,
+							resolvedLevel: "auto",
+							reason: message,
+							registryKey: resolveToolChoice(model, options?.toolChoice).registryKey,
+						});
+						droppedForcedToolChoice = true;
+						params = await prepareParams({ dropForcedToolChoice: true });
+						providerRetryAttempt = 0;
+						output.content.length = 0;
+						output.responseId = undefined;
+						output.providerPayload = undefined;
+						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+						output.stopReason = "stop";
+						firstTokenTime = undefined;
+						continue;
+					}
+					if (
 						!thinkingRepairAttempted &&
 						firstTokenTime === undefined &&
 						isAnthropicThinkingBlockMutationError(streamFailure)
@@ -1684,28 +1730,29 @@ function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming)
 	}
 }
 
-function isForcedAnthropicToolChoice(toolChoice: NonNullable<AnthropicOptions["toolChoice"]>): boolean {
-	if (typeof toolChoice === "string") return toolChoice === "any";
-	if ("function" in toolChoice) return true;
-	if ("name" in toolChoice && typeof toolChoice.name === "string") return true;
-	return toolChoice.type === "tool" || toolChoice.type === "function";
+function mapAnthropicToolChoice(
+	toolChoice: NonNullable<ResolveToolChoiceResult["resolvedChoice"]>,
+	isOAuthToken: boolean,
+): NonNullable<MessageCreateParamsStreaming["tool_choice"]> | undefined {
+	if (typeof toolChoice === "string") {
+		if (toolChoice === "required") return { type: "any" };
+		return { type: toolChoice };
+	}
+	if ("function" in toolChoice) {
+		const name = typeof toolChoice.function === "string" ? toolChoice.function : toolChoice.function.name;
+		return { type: "tool", name: isOAuthToken ? applyClaudeToolPrefix(name) : name };
+	}
+	if ("name" in toolChoice && typeof toolChoice.name === "string") {
+		return {
+			...toolChoice,
+			type: "tool",
+			name: isOAuthToken ? applyClaudeToolPrefix(toolChoice.name) : toolChoice.name,
+		};
+	}
+	return toolChoice as NonNullable<MessageCreateParamsStreaming["tool_choice"]>;
 }
-
-function supportsForcedAnthropicToolChoice(model: Model<"anthropic-messages">): boolean {
-	const compat = model.compat;
-	if (compat?.supportsToolChoice === false || compat?.supportsForcedToolChoice === false) return false;
-
-	// Claude Mythos Preview is documented as accepting tools while rejecting
-	// forced tool use; Claude Fable currently returns the same Anthropic 400.
-	return !/^claude-(?:fable|mythos)(?:-|$)/i.test(model.id);
-}
-
-function shouldSendAnthropicToolChoice(
-	model: Model<"anthropic-messages">,
-	toolChoice: NonNullable<AnthropicOptions["toolChoice"]>,
-): boolean {
-	if (model.compat?.supportsToolChoice === false) return false;
-	return !isForcedAnthropicToolChoice(toolChoice) || supportsForcedAnthropicToolChoice(model);
+function isSentForcedAnthropicToolChoice(toolChoice: MessageCreateParamsStreaming["tool_choice"] | undefined): boolean {
+	return toolChoice?.type === "any" || toolChoice?.type === "tool";
 }
 
 function ensureMaxTokensForThinking(params: MessageCreateParamsStreaming, model: Model<"anthropic-messages">): void {
@@ -2055,16 +2102,22 @@ function buildParams(
 		(params as ParamsWithSpeed).speed = "fast";
 	}
 
-	if (options?.toolChoice && shouldSendAnthropicToolChoice(model, options.toolChoice)) {
-		if (typeof options.toolChoice === "string") {
-			params.tool_choice = { type: options.toolChoice };
-		} else if (isOAuthToken && options.toolChoice.name) {
-			params.tool_choice = {
-				...options.toolChoice,
-				name: applyClaudeToolPrefix(options.toolChoice.name),
-			};
-		} else {
-			params.tool_choice = options.toolChoice;
+	if (options?.toolChoice) {
+		const resolution = resolveToolChoice(model, options.toolChoice);
+		if (resolution.degraded && resolution.supportSource !== "runtime") {
+			logger.debug("anthropic: degrading tool_choice for model capability", {
+				model: model.id,
+				requestedLevel: resolution.requestedLevel,
+				resolvedLevel: resolution.resolvedLevel,
+				reason: resolution.reason,
+				supportSource: resolution.supportSource,
+			});
+		}
+		if (resolution.resolvedChoice) {
+			const mappedToolChoice = mapAnthropicToolChoice(resolution.resolvedChoice, isOAuthToken);
+			if (mappedToolChoice) {
+				params.tool_choice = mappedToolChoice;
+			}
 		}
 	}
 

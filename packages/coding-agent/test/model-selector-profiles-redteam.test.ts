@@ -173,6 +173,8 @@ describe("model selector profile red-team", () => {
 			selections.push(selection);
 		});
 		await renderSelector(applySelector);
+		applySelector.handleInput("\x1b[B");
+		applySelector.handleInput("\n");
 		applySelector.handleInput("\n");
 		applySelector.handleInput("\n");
 
@@ -180,6 +182,8 @@ describe("model selector profile red-team", () => {
 			selections.push(selection);
 		});
 		await renderSelector(defaultSelector);
+		defaultSelector.handleInput("\x1b[B");
+		defaultSelector.handleInput("\n");
 		defaultSelector.handleInput("\n");
 		defaultSelector.handleInput("\x1b[B");
 		defaultSelector.handleInput("\n");
@@ -230,18 +234,21 @@ describe("model selector profile red-team", () => {
 		const selector = createSelector(() => {}, { profiles: [weirdProfile] });
 		const rendered = await renderSelector(selector);
 
-		expect(rendered).toContain("Profiles");
+		expect(rendered).toContain("Model presets");
 		expect(rendered).toContain("Team/Profile: β 🚀 [default] {x}|$");
-		expect(rendered).toContain("provider-a/default");
+		expect(rendered).toContain("Browse all models");
 	});
 
-	test("profiles render above flat model rows", async () => {
+	test("Browse all models switches to flat model rows", async () => {
 		const selector = createSelector(() => {});
-		const rendered = await renderSelector(selector);
+		await renderSelector(selector);
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
-		expect(rendered.indexOf("Profiles")).toBeGreaterThanOrEqual(0);
-		expect(rendered.indexOf("profile-a")).toBeGreaterThan(rendered.indexOf("Profiles"));
-		expect(rendered.indexOf("provider-a/default")).toBeGreaterThan(rendered.indexOf("profile-a"));
-		expect(rendered.indexOf("provider-b/zzz-flat-model")).toBeGreaterThan(rendered.indexOf("profile-a"));
+		expect(rendered).toContain("Models");
+		expect(rendered).toContain("provider-a/default");
+		expect(rendered).toContain("provider-b/zzz-flat-model");
 	});
 });

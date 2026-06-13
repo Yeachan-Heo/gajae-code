@@ -1,7 +1,10 @@
-import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
+import type { Effort } from "@gajae-code/ai/model-thinking";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
-import { getThinkingLevelMetadata } from "../thinking";
+import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
+
+const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
 	DEFAULT_SKILL_DISCOVERY_SETTINGS,
@@ -665,7 +668,7 @@ export const SETTINGS_SCHEMA = {
 	defaultThinkingLevel: {
 		type: "enum",
 		values: THINKING_EFFORTS,
-		default: "high",
+		default: THINKING_EFFORTS[3],
 		ui: {
 			tab: "model",
 			label: "Thinking Level",

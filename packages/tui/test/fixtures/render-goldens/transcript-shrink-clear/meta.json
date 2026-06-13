@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "transcript-shrink-clear",
+  "terminalWidth": 52,
+  "terminalHeight": 8,
+  "capabilities": {
+    "kittyProtocolActive": true,
+    "hyperlinks": true,
+    "imageProtocol": null
+  },
+  "coverage": [
+    "long transcript append",
+    "shrink clear",
+    "height change"
+  ],
+  "artifacts": {
+    "viewport": {
+      "file": "viewport.txt",
+      "sha256": "f7137a6806243005cc0b4ac1b8472c5d8a8cf89e3b4d711ed5cc70e0fd1657c1"
+    },
+    "scrollback": {
+      "file": "scrollback.txt",
+      "sha256": "f7137a6806243005cc0b4ac1b8472c5d8a8cf89e3b4d711ed5cc70e0fd1657c1"
+    },
+    "writelog": {
+      "file": "writelog.bin",
+      "sha256": "89f64f45f72fbf7f7dbe63094ffcd73f1470f324680ee1b92a9abd76c7752822"
+    }
+  }
+}

@@ -133,7 +133,9 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect(handle.viewportHandle?.tmuxSessionName).toBe(`gajae_code_harness_${SID}`);
 
 		// A separate stateless CLI invocation re-grabs and drives the background session.
-		const sub = await runHarness(["submit", "--session", SID, "--input", JSON.stringify({ prompt: "go" })]);
+		const promptPath = path.join(workspace, "prompt.txt");
+		await writeFile(promptPath, "go", "utf8");
+		const sub = await runHarness(["submit", "--session", SID, "--prompt-file", promptPath]);
 		expect((sub.json?.evidence as Record<string, unknown>).accepted).toBe(true);
 		expect((sub.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
 

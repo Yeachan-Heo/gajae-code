@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "interactive-editor-overlay",
+  "terminalWidth": 64,
+  "terminalHeight": 16,
+  "capabilities": {
+    "kittyProtocolActive": true,
+    "hyperlinks": true,
+    "imageProtocol": null
+  },
+  "coverage": [
+    "overlay",
+    "autocomplete popup",
+    "focused editor cursor",
+    "no-change render"
+  ],
+  "artifacts": {
+    "viewport": {
+      "file": "viewport.txt",
+      "sha256": "3af064cc72fab31f1073b7d9728424d5006eb4d51b60deb010591a474afaf153"
+    },
+    "scrollback": {
+      "file": "scrollback.txt",
+      "sha256": "3af064cc72fab31f1073b7d9728424d5006eb4d51b60deb010591a474afaf153"
+    },
+    "writelog": {
+      "file": "writelog.bin",
+      "sha256": "055867cb794fd10c6291249df99db2624e0dc18143ef75dc838e9accf09585d4"
+    }
+  }
+}

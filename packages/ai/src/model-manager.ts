@@ -134,7 +134,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cache.staticFingerprint === staticFingerprint &&
 		cache.staticFingerprint.length > 0
 	) {
-		return { models: passModelList<TApi>(cache.models), stale: false };
+		const cachedModels = passModelList<TApi>(cache.models);
+		if (!hasStaticTransportDrift(staticModels, cachedModels)) {
+			return { models: cachedModels, stale: false };
+		}
+		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
+		writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
+		return { models: repairedModels, stale: false };
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -229,6 +235,20 @@ function shouldFetchRemoteSources(
 	return false;
 }
 
+function hasStaticTransportDrift<TApi extends Api>(
+	staticModels: readonly Model<TApi>[],
+	cachedModels: readonly Model<TApi>[],
+): boolean {
+	if (staticModels.length === 0 || cachedModels.length === 0) return false;
+	const cachedById = new Map(cachedModels.map(model => [model.id, model]));
+	for (const staticModel of staticModels) {
+		const cachedModel = cachedById.get(staticModel.id);
+		if (!cachedModel) continue;
+		if (cachedModel.api !== staticModel.api) return true;
+	}
+	return false;
+}
+
 function mergeModelSources<TApi extends Api>(...sources: readonly (readonly Model<TApi>[])[]): Model<TApi>[] {
 	// Strip out empty/missing sources up front. The hot path is `(static, [])`
 	// (modelsDev disabled / failed) — a single non-empty source means we can
@@ -292,9 +312,21 @@ function fingerprintStatic<TApi extends Api>(models: readonly Model<TApi>[]): st
 
 function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamicModel: Model<TApi>): Model<TApi> {
 	const supportsImage = existingModel.input.includes("image") || dynamicModel.input.includes("image");
+	// The static catalog is authoritative for transport: `api` (and its
+	// api-specific `baseUrl`). Dynamic discovery enumerates ids via a single
+	// hardcoded api (e.g. fetchOpenAICompatibleModels always tags
+	// `openai-completions`), so spreading it blindly would clobber catalog
+	// entries that route through a different format — e.g. opencode-go
+	// qwen3.7-max is `anthropic-messages` but would be downgraded to
+	// `openai-completions` and 401 with `not supported for format oa-compat`
+	// (issue #489). Keep the existing api, and only take the dynamic baseUrl
+	// when the api matches (same transport, same URL shape).
+	const baseUrl = existingModel.api === dynamicModel.api ? dynamicModel.baseUrl : existingModel.baseUrl;
 	return enrichModelThinking({
 		...existingModel,
 		...dynamicModel,
+		api: existingModel.api,
+		baseUrl,
 		name: preferDiscoveryName(dynamicModel.name, existingModel.name, dynamicModel.id),
 		reasoning: existingModel.reasoning || dynamicModel.reasoning,
 		input: supportsImage ? ["text", "image"] : ["text"],

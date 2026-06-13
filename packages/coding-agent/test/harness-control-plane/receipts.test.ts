@@ -225,3 +225,57 @@ describe("receipts: prompt-acceptance / validation / completion validators", () 
 		expect(requiresVanishBeforeAction("human-check")).toBe(false);
 	});
 });
+
+describe("receipts: envelope structural + malformed fail-closed (red-team)", () => {
+	function validation(over: Partial<ValidationEvidence> = {}): ValidationEvidence {
+		return {
+			command: "b",
+			exactCommand: "bun b",
+			cwd: "/ws",
+			exitStatus: 0,
+			pass: true,
+			commitUnderTest: null,
+			...over,
+		};
+	}
+
+	it("rejects non-object envelopes fail-closed without throwing", () => {
+		for (const malformed of [null, undefined, 42, "receipt", true, []]) {
+			const outcome = validateReceipt(malformed as unknown as Parameters<typeof validateReceipt>[0]);
+			expect(outcome.valid).toBe(false);
+			expect(outcome.reasons).toContain("malformed-envelope");
+		}
+	});
+
+	it("rejects a hash-self-consistent envelope with an empty receiptId", () => {
+		// Built so the hash IS self-consistent over the empty id: structural
+		// validation must still reject before any lifecycle transition.
+		const r = buildReceipt<ValidationEvidence>({
+			receiptId: "",
+			sessionId: "s",
+			family: "validation",
+			source: "t",
+			subject,
+			evidence: validation(),
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.reasons).not.toContain("hash-mismatch");
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("envelope-missing-receiptId");
+	});
+
+	it("rejects a hash-self-consistent envelope whose subject lacks a workspace", () => {
+		const r = buildReceipt<ValidationEvidence>({
+			receiptId: "ok",
+			sessionId: "s",
+			family: "validation",
+			source: "t",
+			subject: { workspace: "", branch: "b", head: "h", commit: "c" },
+			evidence: validation(),
+		});
+		const outcome = validateReceipt(r);
+		expect(outcome.reasons).not.toContain("hash-mismatch");
+		expect(outcome.valid).toBe(false);
+		expect(outcome.reasons).toContain("envelope-bad-subject");
+	});
+});

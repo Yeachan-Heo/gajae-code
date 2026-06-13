@@ -24,6 +24,14 @@ function recordTextHelper<T>(name: string, fn: () => T): T {
 	}
 }
 
+export function isPrintableAscii(text: string): boolean {
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code < 0x20 || code > 0x7e) return false;
+	}
+	return true;
+}
+
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
 	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getDefaultTabWidth());
 }

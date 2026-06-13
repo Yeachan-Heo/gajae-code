@@ -207,6 +207,17 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await toolNamesFor(harness)).toContain("goal");
 	});
 
+	it("arms the active goal tool after gjc ultragoal create-goals succeeds", async () => {
+		const cliPath = path.resolve(import.meta.dir, "..", "..", "src", "cli.ts");
+		const result = await harness.session.executeBash(
+			`bun ${JSON.stringify(cliPath)} ultragoal create-goals --brief "Complete ultragoal regression"`,
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(harness.session.getGoalModeState()?.goal.objective).toContain(".gjc/ultragoal/goals.json");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+	});
+
 	it("treats budget as objective text instead of a goal budget command", async () => {
 		await harness.mode.handleGoalModeCommand("budget 123");
 
@@ -233,7 +244,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 	});
 
-	it("removes the goal tool from the active set when goal({op:complete}) flows through getUserInput", async () => {
+	it("keeps the goal tool in the active set when goal({op:complete}) flows through getUserInput", async () => {
 		await harness.mode.handleGoalModeCommand("objective A");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 
@@ -252,7 +263,7 @@ describe("InteractiveMode goal mode integration", () => {
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;
 
-		expect(harness.session.getActiveToolNames()).not.toContain("goal");
+		expect(harness.session.getActiveToolNames()).toContain("goal");
 	});
 
 	it("supports create A → drop → create B → get in one session", async () => {

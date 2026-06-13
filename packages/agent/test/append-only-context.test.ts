@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Message, Tool } from "@gajae-code/ai";
-import { AppendOnlyContextManager, AppendOnlyLog, StablePrefix } from "../src/append-only-context";
+import { AppendOnlyContextManager, AppendOnlyLog, cloneJson, StablePrefix } from "../src/append-only-context";
 import type { AgentContext, AgentTool } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,181 @@ function makeTool(name: string, description?: string, parameters?: Record<string
 
 const BUILD_OPTS = { intentTracing: false } as const;
 
+function expectContextSnapshot(
+	result: { systemPrompt?: string[]; tools?: Tool[] },
+	expectedPrompt: string,
+	expectedTool: string,
+): void {
+	expect(result.systemPrompt).toEqual([expectedPrompt]);
+	expect(result.tools?.[0]?.name).toBe(expectedTool);
+}
+
+function oldJsonRoundTrip<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+class PrototypeFixture {
+	own = "value";
+	optional: string | undefined = undefined;
+}
+
+function makeCloneParityFixture(): Record<string, unknown> {
+	// biome-ignore lint/suspicious/noSparseArray: array holes are intentional fixtures — JSON treats holes and explicit undefined identically and the clone must cover both
+	const sparse = ["first", , undefined, new Date("2026-06-12T08:12:00.000Z")];
+	const nested = new PrototypeFixture();
+	return {
+		kept: true,
+		dropped: undefined,
+		array: sparse,
+		date: new Date("2026-06-12T08:12:00.000Z"),
+		nested,
+		plain: {
+			child: { value: 1, missing: undefined },
+			list: [undefined, { date: new Date("2024-01-02T03:04:05.000Z") }],
+			nonFinite: [NaN, Infinity, -Infinity],
+		},
+		tool: makeTool("parity", "Parity tool", {
+			type: "object",
+			properties: { args: { type: "array", items: { type: "string" } }, omitted: undefined },
+			required: ["args"],
+		}),
+	};
+}
+
+function expectByteParity(actual: unknown, expected: unknown): void {
+	expect(JSON.stringify(actual)).toBe(JSON.stringify(expected));
+}
+
+// ---------------------------------------------------------------------------
+// JSON clone parity
+// ---------------------------------------------------------------------------
+
+describe("cloneJson parity", () => {
+	it("matches JSON round-trip bytes for JSON edge cases", () => {
+		const fixtures: unknown[] = [
+			makeCloneParityFixture(),
+			// biome-ignore lint/suspicious/noSparseArray: array holes are intentional fixtures — JSON treats holes and explicit undefined identically and the clone must cover both
+			[undefined, , { value: undefined, date: new Date("2026-06-12T08:12:00.000Z") }],
+			new PrototypeFixture(),
+			{
+				messages: [
+					{ role: "user", content: undefined },
+					// biome-ignore lint/suspicious/noSparseArray: array holes are intentional fixtures — JSON treats holes and explicit undefined identically and the clone must cover both
+					{ role: "assistant", content: [undefined, , { type: "text", text: "hello" }] },
+				],
+			},
+		];
+
+		for (const fixture of fixtures) {
+			expectByteParity(cloneJson(fixture), oldJsonRoundTrip(fixture));
+		}
+	});
+
+	it("matches JSON toJSON key protocol with single getter access", () => {
+		let topGets = 0;
+		let nestedGets = 0;
+		const child = {
+			get toJSON() {
+				nestedGets++;
+				return function (this: unknown, key: string) {
+					return { key, owner: this === child, value: "child" };
+				};
+			},
+		};
+		const root = {
+			get toJSON() {
+				topGets++;
+				return (key: string) => ({ key, nested: { property: child }, array: [child] });
+			},
+		};
+
+		const actual: unknown = cloneJson(root);
+		expect(topGets).toBe(1);
+		expect(nestedGets).toBe(2);
+		expectByteParity(actual, oldJsonRoundTrip(root));
+		expect(actual).toEqual({
+			key: "",
+			nested: { property: { key: "property", owner: true, value: "child" } },
+			array: [{ key: "0", owner: true, value: "child" }],
+		});
+		expect(topGets).toBe(2);
+		expect(nestedGets).toBe(4);
+	});
+
+	it("does not re-dispatch toJSON on replacement values, matching JSON.stringify", () => {
+		// JSON.stringify calls toJSON once per holder/key; if the replacement
+		// itself has toJSON, it is NOT invoked again at the same level.
+		const replacementWithToJson = {
+			marker: "replacement",
+			toJSON() {
+				return { marker: "re-dispatched" };
+			},
+		};
+		const onceOnly = {
+			toJSON() {
+				return replacementWithToJson;
+			},
+		};
+		expectByteParity(cloneJson(onceOnly), oldJsonRoundTrip(onceOnly));
+
+		// toJSON returning `this` must terminate (stringify serializes the
+		// returned object without re-entering its toJSON).
+		const selfReturning = {
+			value: 42,
+			toJSON() {
+				return this;
+			},
+		};
+		expectByteParity(cloneJson(selfReturning), oldJsonRoundTrip(selfReturning));
+
+		// Nested properties of a replacement still dispatch their own toJSON.
+		const nestedChild = {
+			toJSON(key: string) {
+				return { from: key };
+			},
+		};
+		const replacementWithNested = {
+			toJSON() {
+				return { inner: nestedChild };
+			},
+		};
+		expectByteParity(cloneJson(replacementWithNested), oldJsonRoundTrip(replacementWithNested));
+	});
+
+	it("preserves provider-visible bytes across append-only clone call sites", () => {
+		const parameters = makeCloneParityFixture();
+		const context = makeContext({
+			systemPrompt: ["Clone parity"],
+			tools: [makeTool("parity", "Parity", parameters)],
+		});
+		const source = new StablePrefix();
+		source.build(context, BUILD_OPTS);
+		const snapshot = source.exportSnapshot()!;
+		const expectedSnapshot = oldJsonRoundTrip(snapshot);
+		expectByteParity(snapshot, expectedSnapshot);
+
+		const imported = new StablePrefix();
+		imported.importSnapshot(snapshot, BUILD_OPTS);
+		expectByteParity(imported.exportSnapshot(), expectedSnapshot);
+		expectByteParity(imported.toContext(), {
+			systemPrompt: expectedSnapshot.systemPrompt,
+			tools: expectedSnapshot.tools,
+		});
+
+		const seededMessages = [
+			// biome-ignore lint/suspicious/noSparseArray: array holes are intentional fixtures — JSON treats holes and explicit undefined identically and the clone must cover both
+			{ role: "user", content: ["hello", undefined, , new Date("2026-06-12T08:12:00.000Z")] },
+			{ role: "assistant", content: { nested: new PrototypeFixture(), missing: undefined } },
+		] as unknown as Message[];
+		const manager = AppendOnlyContextManager.forkFromSeed({ messages: seededMessages, options: BUILD_OPTS });
+		const expectedMessages = oldJsonRoundTrip(seededMessages);
+		expectByteParity(manager.build(makeContext(), BUILD_OPTS).messages, expectedMessages);
+
+		manager.syncMessages([...expectedMessages, { role: "user", content: "next" } as Message]);
+		const digestSource = JSON.stringify(manager.build(makeContext(), BUILD_OPTS).messages);
+		expect(digestSource).toBe(JSON.stringify([...expectedMessages, { role: "user", content: "next" }]));
+	});
+});
 // ---------------------------------------------------------------------------
 // StablePrefix
 // ---------------------------------------------------------------------------
@@ -390,6 +565,58 @@ describe("AppendOnlyContextManager", () => {
 		expect(tool!.description).toBe("");
 	});
 
+	it("reuses prefix snapshot for unchanged source array identities", () => {
+		const mgr = new AppendOnlyContextManager();
+		const ctx = makeContext({ systemPrompt: ["Stable"], tools: [makeTool("read")] });
+
+		mgr.build(ctx, BUILD_OPTS);
+		const version = mgr.prefix.version;
+		const fingerprint = mgr.prefix.fingerprint;
+
+		const result = mgr.build(ctx, BUILD_OPTS);
+		expectContextSnapshot(result, "Stable", "read");
+		expect(mgr.prefix.version).toBe(version);
+		expect(mgr.prefix.fingerprint).toBe(fingerprint);
+	});
+
+	it("rebuilds when same source identities are mutated in place", () => {
+		const mgr = new AppendOnlyContextManager();
+		const ctx = makeContext({ systemPrompt: ["Stable"], tools: [makeTool("read", "Read files")] });
+		mgr.build(ctx, BUILD_OPTS);
+
+		ctx.systemPrompt[0] = "Mutated";
+		(ctx.tools![0] as AgentTool).description = "Mutated tool";
+		const result = mgr.build(ctx, BUILD_OPTS);
+
+		expectContextSnapshot(result, "Mutated", "read");
+		expect(result.tools![0]!.description).toBe("Mutated tool");
+		expect(mgr.prefix.version).toBe(2);
+	});
+
+	it("invalidates prefix identity cache when systemPrompt array identity changes", () => {
+		const mgr = new AppendOnlyContextManager();
+		const ctx = makeContext({ systemPrompt: ["Old"], tools: [makeTool("read")] });
+		mgr.build(ctx, BUILD_OPTS);
+
+		const next = makeContext({ systemPrompt: ["New"], tools: ctx.tools });
+		const result = mgr.build(next, BUILD_OPTS);
+
+		expectContextSnapshot(result, "New", "read");
+		expect(mgr.prefix.version).toBe(2);
+	});
+
+	it("invalidates prefix identity cache when tools array identity changes", () => {
+		const mgr = new AppendOnlyContextManager();
+		const ctx = makeContext({ systemPrompt: ["Stable"], tools: [makeTool("read")] });
+		mgr.build(ctx, BUILD_OPTS);
+
+		const next = makeContext({ systemPrompt: ctx.systemPrompt, tools: [makeTool("write")] });
+		const result = mgr.build(next, BUILD_OPTS);
+
+		expectContextSnapshot(result, "Stable", "write");
+		expect(mgr.prefix.version).toBe(2);
+	});
+
 	it("tools returned from build are frozen in the cache", () => {
 		const mgr = new AppendOnlyContextManager();
 		const ctx = makeContext({ tools: [makeTool("read")] });
@@ -667,6 +894,65 @@ describe("message sync", () => {
 		const msgs = mgr.build(makeContext(), BUILD_OPTS).messages;
 		expect(msgs).toHaveLength(1);
 		expect(msgs[0]!.content).toBe("world");
+	});
+
+	it("detects rewrites to every JSON-serialized message field", () => {
+		const cases: Array<[string, (message: Record<string, unknown>) => void]> = [
+			["role", message => (message.role = "assistant")],
+			["content", message => (message.content = "changed")],
+			["toolCalls", message => (message.toolCalls = [{ id: "tc2", name: "write" }])],
+			[
+				"tool_calls",
+				message => (message.tool_calls = [{ id: "tc2", type: "function", function: { name: "write" } }]),
+			],
+			["tool_call_id", message => (message.tool_call_id = "call-2")],
+			["name", message => (message.name = "write")],
+			["id", message => (message.id = "msg-2")],
+			["providerPayload", message => (message.providerPayload = { wire: "changed" })],
+			["toolCallId", message => (message.toolCallId = "camel-2")],
+			["toolName", message => (message.toolName = "write")],
+			["isError", message => (message.isError = true)],
+			["api", message => (message.api = "responses")],
+			["provider", message => (message.provider = "anthropic")],
+			["model", message => (message.model = "changed-model")],
+			["stopReason", message => (message.stopReason = "tool_use")],
+			["attribution", message => (message.attribution = { source: "changed" })],
+			["responseId", message => (message.responseId = "resp-2")],
+		];
+
+		for (const [field, mutate] of cases) {
+			const mgr = new AppendOnlyContextManager();
+			mgr.build(makeContext(), BUILD_OPTS);
+			const message: Record<string, unknown> = {
+				role: "user",
+				content: "original",
+				toolCalls: [{ id: "tc1", name: "read" }],
+				tool_calls: [{ id: "tc1", type: "function", function: { name: "read" } }],
+				tool_call_id: "call-1",
+				name: "read",
+				id: "msg-1",
+				providerPayload: { wire: "original" },
+				toolCallId: "camel-1",
+				toolName: "read",
+				isError: false,
+				api: "chat",
+				provider: "openai",
+				model: "original-model",
+				stopReason: "stop",
+				attribution: { source: "original" },
+				responseId: "resp-1",
+			};
+			const messages = [message] as unknown as Message[];
+			mgr.syncMessages(messages);
+
+			const changedMessage = JSON.parse(JSON.stringify(message)) as Record<string, unknown>;
+			mutate(changedMessage);
+			mgr.syncMessages([changedMessage] as unknown as Message[]);
+
+			expect(
+				(mgr.build(makeContext(), BUILD_OPTS).messages[0] as unknown as Record<string, unknown>)[field],
+			).toEqual(changedMessage[field]);
+		}
 	});
 
 	it("no-op when content unchanged", () => {

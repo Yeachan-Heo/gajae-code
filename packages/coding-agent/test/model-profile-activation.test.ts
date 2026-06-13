@@ -10,8 +10,17 @@ import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 
-const model = (provider: string, id: string): Model =>
-	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
+const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
+	({
+		provider,
+		id,
+		name: id,
+		api: "openai-responses",
+		contextWindow: 1000,
+		maxTokens: 1000,
+		thinking,
+		reasoning: thinking !== undefined,
+	}) as Model;
 
 function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelProfileDefinition[] }) {
 	const profiles = new Map<string, ModelProfileDefinition>();
@@ -42,8 +51,16 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			model("openai-codex", "gpt-5.4"),
 			model("openai-codex", "gpt-5.1-codex-max"),
 			model("openai-codex", "gpt-5.2-codex"),
-			model("openai-codex", "gpt-5.5"),
+			model("openai-codex", "gpt-5.5", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
+			model("minimax-code", "minimax-m3"),
+			model("minimax-code-cn", "minimax-m3"),
+			model("kimi-code", "kimi-k2.5"),
+			model("zai", "glm-5.1"),
 		],
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
@@ -52,6 +69,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 }
 
 function fakeSession(initial = model("provider-a", "initial")) {
+	let activeModelProfile: string | undefined;
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -61,6 +79,12 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
+		},
+		setActiveModelProfile(name: string | undefined) {
+			activeModelProfile = name;
+		},
+		getActiveModelProfile() {
+			return activeModelProfile;
 		},
 	};
 }
@@ -83,31 +107,21 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("builtin profiles preserve explicit role thinking suffixes in overrides", async () => {
+	test("builtin codex-eco executor selector clamps from catalog minimal to prepared low", async () => {
 		const registry = fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] });
+		const catalog = BUILTIN_MODEL_PROFILES.find(profile => profile.name === "codex-eco");
+		expect(catalog?.modelMapping.executor).toBe("openai-codex/gpt-5.5:minimal");
 
-		const codexStandard = await prepareModelProfileActivation({
+		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
 			modelRegistry: registry,
 			settings: Settings.isolated(),
-			profileName: "codex-standard",
+			profileName: "codex-eco",
 		});
-		expect(codexStandard.agentModelOverrides).toEqual({
-			executor: "openai-codex/gpt-5.4:low",
-			architect: "openai-codex/gpt-5.4:xhigh",
-			planner: "openai-codex/gpt-5.4:medium",
-			critic: "openai-codex/gpt-5.4:high",
-		});
-
-		const codexPro = await prepareModelProfileActivation({
-			session: fakeSession(),
-			modelRegistry: registry,
-			settings: Settings.isolated(),
-			profileName: "codex-pro",
-		});
-		expect(codexPro.agentModelOverrides.architect).toBe("openai-codex/gpt-5.1-codex-max:high");
-		expect(codexPro.agentModelOverrides.planner).toBe("openai-codex/gpt-5.5:high");
-		expect(codexPro.agentModelOverrides.critic).toBe("openai-codex/gpt-5.3-codex-spark:high");
+		expect(prepared.agentModelOverrides.executor).toBe("openai-codex/gpt-5.5:low");
+		expect(prepared.agentModelOverrides.architect).toBe("openai-codex/gpt-5.5:high");
+		expect(prepared.agentModelOverrides.planner).toBe("openai-codex/gpt-5.5:low");
+		expect(prepared.agentModelOverrides.critic).toBe("openai-codex/gpt-5.5:medium");
 	});
 
 	test("session-only changes active model and applies runtime overrides without persisted sets", async () => {
@@ -131,6 +145,7 @@ describe("model profile activation", () => {
 		});
 		expect(setCalls).toEqual([]);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
 	test("--default persists only modelProfile.default and flushes", async () => {
@@ -155,6 +170,7 @@ describe("model profile activation", () => {
 		expect(setCalls).toEqual(["modelProfile.default"]);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
+		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
 	test("missing credentials hard-block before mutation", async () => {
@@ -218,6 +234,7 @@ describe("model profile activation", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
 	test("precedence composes configured, default, mpreset, and explicit overrides", async () => {

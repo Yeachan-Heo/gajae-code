@@ -133,7 +133,7 @@ import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { EventBus } from "./utils/event-bus";
-import { buildNamedToolChoice } from "./utils/tool-choice";
+import { buildNamedToolChoice, buildNamedToolChoiceResult } from "./utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 type AsyncResultEntry = {
@@ -234,6 +234,8 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
+	/** Runtime substitution metadata for the initial model_change session event. */
+	modelSubstitution?: { requestedModel: Model; reason: string };
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: ScopedModelSelection[];
 
@@ -1212,6 +1214,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const m = session.model;
 				return m ? buildNamedToolChoice(name, m) : undefined;
 			},
+			buildToolChoiceResult: name => buildNamedToolChoiceResult(name, session.model),
 			steer: msg =>
 				session.agent.steer({
 					role: "custom",
@@ -1622,9 +1625,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const requestedToolNames =
-			(options.toolNames ? [...new Set(options.toolNames.map(name => name.toLowerCase()))] : undefined) ??
-			toolNamesFromRegistry;
+		const requestedToolNames = options.toolNames
+			? [
+					...new Set([
+						...options.toolNames.map(name => name.toLowerCase()),
+						...(settings.get("goal.enabled") ? ["goal"] : []),
+					]),
+				]
+			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
 		// Effective discovery mode only covers built-in tools; MCP tool discovery
@@ -1635,7 +1643,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		const requestedActiveToolNames = normalizedRequested;
 		const initialRequestedActiveToolNames = options.toolNames
 			? requestedActiveToolNames
 			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
@@ -1893,6 +1901,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				return result;
 			},
+			onToolChoiceIncapability: event => {
+				const droppedLabel = session?.toolChoiceQueue.degradeInFlight(event.reason);
+				logger.debug("Dropped in-flight tool choice after runtime incapability", {
+					droppedLabel,
+					api: event.api,
+					provider: event.provider,
+					model: event.model,
+					requestedLevel: event.requestedLevel,
+					resolvedLevel: event.resolvedLevel,
+					reason: event.reason,
+					registryKey: event.registryKey,
+				});
+			},
 			intentTracing: !!intentField,
 			getToolChoice: () => session?.nextToolChoice(),
 			telemetry: options.telemetry,
@@ -1907,7 +1928,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
 			if (model) {
-				sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				const substitution = options.modelSubstitution;
+				sessionManager.appendModelChange(
+					`${model.provider}/${model.id}`,
+					undefined,
+					substitution
+						? {
+								previousModel: `${substitution.requestedModel.provider}/${substitution.requestedModel.id}`,
+								reason: substitution.reason,
+								thinkingLevel: thinkingLevel ?? null,
+							}
+						: undefined,
+				);
 			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 			if (initialServiceTier) {

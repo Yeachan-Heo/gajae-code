@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
+import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
@@ -34,6 +36,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	let sessionManager: SessionManager;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
+	let streamCallCount: number;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-auto-compaction-queue-");
@@ -94,6 +97,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		if (!model) {
 			throw new Error("Expected built-in anthropic model to exist");
 		}
+		streamCallCount = 0;
 
 		const agent = new Agent({
 			initialState: {
@@ -101,6 +105,32 @@ describe("AgentSession auto-compaction queue resume", () => {
 				systemPrompt: ["Test"],
 				tools: [],
 				messages: [],
+			},
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "ok" }],
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: "claude-sonnet-4-5",
+						stopReason: "stop",
+						usage: {
+							input: 100,
+							output: 10,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 110,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
 			},
 		});
 
@@ -195,6 +225,94 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
+	});
+
+	it("compacts before a new prompt when tool results push context over threshold", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.thresholdTokens", 1000);
+		session.settings.set("compaction.keepRecentTokens", 1);
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Ready for tool output" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 800,
+				output: 50,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 850,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const largeToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "tool-large-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(10_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		sessionManager.appendMessage(assistantMsg);
+		sessionManager.appendMessage(largeToolResult);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.prompt("next prompt after large read");
+
+		expect(streamCallCount).toBe(1);
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
+	});
+
+	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.strategy", "handoff");
+		session.settings.set("compaction.thresholdTokens", 1000);
+
+		const handoffSpy = vi.spyOn(session, "handoff").mockImplementation(async () => {
+			expect(streamCallCount).toBe(0);
+			return { document: "handoff document" };
+		});
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Ready for tool output" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 800,
+				output: 50,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 850,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const largeToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "tool-large-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(10_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		sessionManager.appendMessage(assistantMsg);
+		sessionManager.appendMessage(largeToolResult);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.prompt("next prompt after large read");
+
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(streamCallCount).toBe(1);
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
 	});
 
 	it("forwards todo reminder lifecycle signals to extensions", async () => {

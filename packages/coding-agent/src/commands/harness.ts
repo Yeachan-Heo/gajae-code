@@ -10,17 +10,19 @@
  */
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
+import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { GajaeCodeRpc } from "../harness-control-plane/rpc-adapter";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
-import { buildResponse, buildStateView } from "../harness-control-plane/state-machine";
+import { buildResponse, buildStateView, submitUnavailableReason } from "../harness-control-plane/state-machine";
 import {
 	canonicalWorkspacePath,
 	generateSessionId,
@@ -247,6 +249,30 @@ interface OwnerExitEvidence {
 	transient: boolean;
 	/** ISO timestamp of the most recent non-terminal RPC-derived owner event, if any (observability only). */
 	lastRpcActivityAt: string | null;
+	/**
+	 * True when the owner started (reported live) but died before accepting the first prompt.
+	 * This is a startup blocker, not a healthy live gate: callers must recover before submit.
+	 */
+	startupBlocker: boolean;
+	/** Explicit, human-actionable recovery guidance for the surfaced exit reason. */
+	recoveryGuidance: string;
+}
+
+function ownerExitGuidance(reason: string, startupBlocker: boolean): string {
+	if (startupBlocker) {
+		return "owner started and reported live but exited before accepting the first prompt; run `gjc harness recover --session <id>` to respawn the owner, then resubmit the prompt";
+	}
+	switch (reason) {
+		case "owner-exited-after-prompt-acceptance":
+			return "owner exited after accepting a prompt; run `gjc harness recover --session <id>` to preserve in-flight work and classify the vanish before resubmitting";
+		case "owner-lease-expired":
+		case "owner-endpoint-unreachable":
+			return "owner lease is stale or its endpoint did not route; run `gjc harness recover --session <id>` to respawn or take over the owner";
+		case "owner-liveness-unknown-permission-denied":
+			return "owner liveness cannot be probed (permission denied); verify the owner process out-of-band before recover";
+		default:
+			return "no live owner holds this session; run `gjc harness recover --session <id>` to (re)spawn an owner, then resubmit";
+	}
 }
 
 async function buildOwnerExitEvidence(root: string, state: SessionState): Promise<OwnerExitEvidence> {
@@ -286,6 +312,12 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 	} else {
 		reason = "owner-endpoint-unreachable";
 	}
+	// A just-started owner that emitted `owner_started` (so it reported live) but is now terminal
+	// without ever accepting a prompt died during startup. Surface this as an explicit, actionable
+	// startup blocker rather than letting `submit` fall through to a misleading `owner-not-live` gate.
+	const ownerStarted = events.some(event => event.kind === "owner_started");
+	const startupBlocker = terminal && ownerStarted && !promptAcceptedSeen && !completedSeen;
+	if (startupBlocker) reason = "owner-died-before-first-prompt";
 	return {
 		reason,
 		leaseStatus,
@@ -301,6 +333,8 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 		terminal,
 		transient,
 		lastRpcActivityAt,
+		startupBlocker,
+		recoveryGuidance: ownerExitGuidance(reason, startupBlocker),
 	};
 }
 
@@ -404,6 +438,29 @@ async function markVanishedOwnerBlocked(
 	return state;
 }
 
+const OWNER_STARTUP_BLOCKER = "owner-died-before-first-prompt";
+
+/**
+ * Persist an explicit startup blocker when an owner started, reported live, but died before
+ * accepting the first prompt. This makes the failure an actionable lifecycle state instead of a
+ * silent `owner-not-live` gate, so observe/recover surface it and recover can respawn the owner.
+ */
+async function markStartupOwnerBlocked(
+	root: string,
+	state: SessionState,
+	ownerExit: OwnerExitEvidence,
+): Promise<SessionState> {
+	if (!ownerExit.startupBlocker) return state;
+	if (state.lifecycle === "completed" || state.lifecycle === "retired") return state;
+	state.lifecycle = "blocked";
+	state.blockers = state.blockers.includes(OWNER_STARTUP_BLOCKER)
+		? state.blockers
+		: [...state.blockers, OWNER_STARTUP_BLOCKER];
+	state.updatedAt = nowIso();
+	await writeSessionState(root, state);
+	return state;
+}
+
 function resolveRetryBudget(input: Record<string, unknown>): RetryBudget {
 	const supplied = input.retryBudget;
 	if (supplied && typeof supplied === "object" && !Array.isArray(supplied)) {
@@ -453,10 +510,14 @@ export default class Harness extends Command {
 
 	static flags = {
 		input: Flags.string({ description: "JSON object input for the verb", default: "" }),
+		"prompt-file": Flags.string({ description: "Read submit prompt text from a file (submit verb only)" }),
 		session: Flags.string({ char: "s", description: "Session id (re-grab a session)" }),
 		cursor: Flags.string({ description: "Event cursor for events --follow (exclusive)", default: "0" }),
 		follow: Flags.boolean({ description: "Tail the owner-written event log", default: false }),
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: true }),
+		"receipt-spool-dir": Flags.string({
+			description: "Append persisted ReceiptEnvelope records to spool.jsonl under this directory",
+		}),
 	};
 
 	static examples = [
@@ -471,7 +532,20 @@ export default class Harness extends Command {
 		const verb = String(args.verb);
 		let root = resolveHarnessRoot();
 		try {
+			const receiptSpoolDir = flags["receipt-spool-dir"];
+			if (receiptSpoolDir !== undefined) {
+				if (!receiptSpoolDir.trim()) throw new Error("receipt_spool_dir_empty");
+				process.env[RECEIPT_SPOOL_DIR_ENV] = path.resolve(receiptSpoolDir.trim());
+			}
 			const input = parseInput(flags.input);
+			const promptFile = flags["prompt-file"];
+			if (promptFile !== undefined) {
+				if (verb !== "submit") throw new Error("prompt_file_only_supported_for_submit");
+				if (typeof input.prompt === "string" && input.prompt.length > 0) {
+					throw new Error("prompt_file_conflicts_with_input_prompt");
+				}
+				input.prompt = readFileSync(promptFile, "utf8");
+			}
 			const sessionId = flags.session ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
 			const expectedWorkspace = typeof input.workspace === "string" ? resolveInputWorkspace(input) : undefined;
 			if (verb !== "start" && sessionId) {
@@ -612,6 +686,9 @@ export default class Harness extends Command {
 		}
 		const sessionName = deterministicHarnessTmuxSessionName(sessionId);
 		const envAssignments = [`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`];
+		if (process.env[RECEIPT_SPOOL_DIR_ENV]) {
+			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
+		}
 		if (process.env.GJC_HARNESS_RPC_COMMAND) {
 			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
 		}
@@ -651,6 +728,9 @@ export default class Harness extends Command {
 			env: {
 				...process.env,
 				GJC_HARNESS_STATE_ROOT: root,
+				...(process.env[RECEIPT_SPOOL_DIR_ENV]
+					? { [RECEIPT_SPOOL_DIR_ENV]: process.env[RECEIPT_SPOOL_DIR_ENV] }
+					: {}),
 				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
 					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
 					: {}),
@@ -814,7 +894,9 @@ export default class Harness extends Command {
 	): Promise<boolean> {
 		const owner = await resolveOwner(root, sessionId);
 		if (!owner.live || !owner.socketPath) return false;
+		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
+			if (process.env[RECEIPT_SPOOL_DIR_ENV]) input[RECEIPT_SPOOL_DIR_ENV] = process.env[RECEIPT_SPOOL_DIR_ENV];
 			const res = (await callEndpoint(owner.socketPath, { verb, input })) as { ok?: boolean };
 			writeJson(res);
 			if (res?.ok === false) process.exitCode = 1;
@@ -822,6 +904,9 @@ export default class Harness extends Command {
 		} catch (error) {
 			if (error instanceof EndpointUnreachableError) return false;
 			throw error;
+		} finally {
+			if (priorSpoolDir === undefined) delete input[RECEIPT_SPOOL_DIR_ENV];
+			else input[RECEIPT_SPOOL_DIR_ENV] = priorSpoolDir;
 		}
 	}
 
@@ -834,10 +919,12 @@ export default class Harness extends Command {
 		state = await reconcileCompletedOwnerExited(root, state, observation, completedTerminalEvent);
 		const vanishedOwnerBlock = needsVanishedOwnerBlock(state, observation, completedTerminalEvent);
 		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
-		const ownerExit =
-			!ownerLive && (vanishedOwnerBlock || completedTerminalEvent)
-				? await buildOwnerExitEvidence(root, state)
-				: null;
+		// Build owner-exit evidence whenever the owner is gone so a startup death (owner started,
+		// reported live, then died before the first prompt) is detectable, not just vanish/completion.
+		const ownerExit = !ownerLive ? await buildOwnerExitEvidence(root, state) : null;
+		const startupBlocked = ownerExit?.startupBlocker ?? false;
+		if (ownerExit && startupBlocked) state = await markStartupOwnerBlocked(root, state, ownerExit);
+		const includeOwnerExit = Boolean(ownerExit && (vanishedOwnerBlock || completedTerminalEvent || startupBlocked));
 		writeJson(
 			buildResponse(state, ownerLive, {
 				observation: { ...observation, lifecycle: state.lifecycle },
@@ -848,7 +935,10 @@ export default class Harness extends Command {
 				...(completedTerminalEvent && !ownerLive
 					? { completedOwnerExited: true, terminalResult: completedTerminalEvent }
 					: {}),
-				...(ownerExit ? { ownerExit } : {}),
+				...(startupBlocked
+					? { startupBlocked: true, blockerReason: OWNER_STARTUP_BLOCKER, guidance: ownerExit?.recoveryGuidance }
+					: {}),
+				...(includeOwnerExit && ownerExit ? { ownerExit } : {}),
 			}),
 		);
 	}
@@ -909,10 +999,36 @@ export default class Harness extends Command {
 
 	async #submit(root: string, input: Record<string, unknown>, flagSession: string | undefined): Promise<void> {
 		const sessionId = requireSessionId(input, flagSession);
-		if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
-		const state = await loadState(root, sessionId);
-		// No live owner: submission is blocked (never echoed-as-accepted).
-		writeJson(buildResponse(state, false, { accepted: false, submitted: false, reason: "owner-not-live" }, false));
+		let state = await loadState(root, sessionId);
+		const noOwnerGate = submitUnavailableReason(state.lifecycle, false);
+		if (!noOwnerGate || noOwnerGate === "owner-not-live") {
+			if (await this.#tryOwnerRoute(root, sessionId, "submit", { ...input, sessionId })) return;
+			state = await loadState(root, sessionId);
+		}
+		const blockedByOwnerLiveness = state.blockers.some(
+			blocker => isOwnerLivenessBlocker(blocker) || blocker === OWNER_STARTUP_BLOCKER,
+		);
+		const lifecycleGate = submitUnavailableReason(state.lifecycle, false);
+		if (lifecycleGate && lifecycleGate !== "owner-not-live" && !blockedByOwnerLiveness) {
+			writeJson(buildResponse(state, false, { accepted: false, submitted: false, reason: lifecycleGate }, false));
+			process.exitCode = 1;
+			return;
+		}
+		// No live owner: submission is blocked (never echoed-as-accepted). Surface owner exit
+		// evidence + explicit recovery guidance so the caller is not left with a bare gate.
+		const ownerExit = await buildOwnerExitEvidence(root, state);
+		// An owner that started, reported live, then died before accepting the first prompt is a
+		// startup blocker, not a healthy `owner-not-live` gate — persist it and report it as such.
+		if (ownerExit.startupBlocker) state = await markStartupOwnerBlocked(root, state, ownerExit);
+		const reason = ownerExit.startupBlocker ? ownerExit.reason : "owner-not-live";
+		writeJson(
+			buildResponse(
+				state,
+				false,
+				{ accepted: false, submitted: false, reason, ownerExit, guidance: ownerExit.recoveryGuidance },
+				false,
+			),
+		);
 		process.exitCode = 1;
 	}
 
@@ -1030,6 +1146,7 @@ export default class Harness extends Command {
 					decision,
 					observation: { ...observation, lifecycle: state.lifecycle },
 					ownerExit: afterExit,
+					guidance: afterExit.recoveryGuidance,
 					...(restoredOwner
 						? {
 								restoreAttempt: {

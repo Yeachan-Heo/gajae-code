@@ -39,6 +39,10 @@ async function main(): Promise<void> {
 					"bun",
 					"build",
 					"--compile",
+					// Minify shrinks the bundled JS the compiled binary must parse at
+					// startup (302MB → ~114MB --help RSS measured on darwin-arm64).
+					// --keep-names below preserves identifiers for error reports.
+					"--minify",
 					"--no-compile-autoload-bunfig",
 					"--no-compile-autoload-dotenv",
 					"--no-compile-autoload-tsconfig",

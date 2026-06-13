@@ -37,15 +37,34 @@ describe("harness state machine", () => {
 		expect(submit.reason).toBe("owner-not-live");
 	});
 
-	it("submit is available with a live owner (non-terminal)", () => {
-		const submit = findAction(nextAllowedActions("submitted", true), "submit");
-		expect(submit.available).toBe(true);
+	it("submit is available only when a live owner is in a submit-ready lifecycle", () => {
+		for (const lifecycle of ["started", "observing"] as const) {
+			const submit = findAction(nextAllowedActions(lifecycle, true), "submit");
+			expect(submit.available).toBe(true);
+		}
 	});
 
 	it("submit is blocked while lifecycle is blocked even with a live owner", () => {
 		const submit = findAction(nextAllowedActions("blocked", true), "submit");
 		expect(submit.available).toBe(false);
 		expect(submit.reason).toBe("lifecycle-blocked");
+	});
+
+	it("submit is blocked during non-idle lifecycle windows even with a live owner", () => {
+		for (const lifecycle of ["submitted", "recovering", "validating", "finalizing"] as const) {
+			const submit = findAction(nextAllowedActions(lifecycle, true), "submit");
+			expect(submit.available).toBe(false);
+			expect(submit.reason).toBe(`lifecycle-not-idle:${lifecycle}`);
+		}
+	});
+
+	it("submit is blocked while the owner RPC is not idle", () => {
+		const submit = findAction(
+			nextAllowedActions("observing", true, { submitUnavailableReason: "rpc-not-idle" }),
+			"submit",
+		);
+		expect(submit.available).toBe(false);
+		expect(submit.reason).toBe("rpc-not-idle");
 	});
 
 	it("terminal lifecycles block submit/recover/validate/finalize", () => {

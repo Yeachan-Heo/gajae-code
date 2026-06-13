@@ -240,6 +240,8 @@ export interface ToolSession {
 	getToolChoiceQueue?(): ToolChoiceQueue;
 	/** Build a model-provider-specific ToolChoice that targets the named tool, or undefined if unsupported. */
 	buildToolChoice?(toolName: string): ToolChoice | undefined;
+	/** Build a named tool-choice decision, preserving whether exact named forcing survived capability degradation. */
+	buildToolChoiceResult?(toolName: string): import("../utils/tool-choice").NamedToolChoiceResult;
 	/** Steer a hidden custom message into the conversation (e.g. a preview reminder). */
 	steer?(message: { customType: string; content: string; details?: unknown }): void;
 	/** Peek the currently in-flight tool-choice queue directive's invocation handler. Used by the `resolve` tool to dispatch to the pending action. */
@@ -403,7 +405,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		toolNames && toolNames.length > 0 ? [...new Set(toolNames.map(name => name.toLowerCase()))] : undefined;
 	const goalEnabled = session.settings.get("goal.enabled");
 	const goalStateToolNames = [...GOAL_MODE_TOOL_NAMES];
-	if (goalEnabled && session.getGoalRuntime !== undefined && requestedTools && !requestedTools.includes("goal")) {
+	if (goalEnabled && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools = [...requestedTools, "goal"];
 	}
 	if (goalEnabled && requestedTools) {
@@ -482,7 +484,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		allToolsByRequestName.set(name.toLowerCase(), [name, factory]);
 	}
 	const isToolAllowed = (name: string) => {
-		if (name === "goal") return goalEnabled && session.getGoalRuntime !== undefined;
+		if (name === "goal") return goalEnabled;
 		if (goalStateToolNames.includes(name as (typeof GOAL_MODE_TOOL_NAMES)[number])) return goalEnabled;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return true;

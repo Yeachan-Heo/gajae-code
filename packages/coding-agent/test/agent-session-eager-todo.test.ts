@@ -201,6 +201,27 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(session.formatSessionAsText()).not.toContain("<user-request>");
 	});
 
+	it("sends eager todo reminder without toolChoice when named forcing degrades", async () => {
+		const degradedModel = {
+			...session.model!,
+			compat: { ...(session.model!.compat ?? {}), supportsForcedToolChoice: false },
+		};
+		(session.agent.state as { model?: typeof degradedModel }).model = degradedModel;
+
+		await session.prompt("list all work trees");
+
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]).toEqual({
+			toolChoice: undefined,
+			toolNames: ["todo_write", "bash"],
+			messageRoles: ["user", "user"],
+			messageTexts: [expect.any(String), "list all work trees"],
+			lastMessageRole: "user",
+			lastMessageText: "list all work trees",
+		});
+		expect(observedCalls[0]?.messageTexts[0]).toContain("todo_write");
+	});
+
 	it("initializes todos once, then continues within the same user turn", async () => {
 		scriptedResponses = [
 			createToolCallAssistantMessage("todo_write", {

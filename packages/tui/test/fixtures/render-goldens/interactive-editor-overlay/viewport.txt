@@ -1,0 +1,16 @@
+ Before editor                                                  
++-- GOLDEN EDIT -----------------------------------------------+
++- /he|                                                       -+
+> /help                           Show help
+  /history                        Show history
+  /handoff                        Create handoff
+
+
+
+
+
+
+
+
+
+

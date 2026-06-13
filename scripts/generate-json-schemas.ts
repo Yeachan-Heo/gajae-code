@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import * as path from "node:path";
-import { zodToWireSchema } from "@gajae-code/ai/utils/schema/wire";
+import { zodToWireSchema } from "../packages/ai/src/utils/schema/wire";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 import { ModelsConfigSchema } from "../packages/coding-agent/src/config/models-config-schema";
 

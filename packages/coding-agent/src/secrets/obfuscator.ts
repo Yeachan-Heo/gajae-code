@@ -73,8 +73,23 @@ export class SecretObfuscator {
 	/** Replace-mode plain mappings: secret → replacement */
 	#replaceMappings = new Map<string, string>();
 
+	/** Replace-mode plain mappings sorted longest-first for deterministic longest-match replacement. */
+	#sortedReplaceMappings: Array<{ secret: string; replacement: string }> = [];
+
+	/** Obfuscate-mode plain and regex-discovered mappings sorted longest-first. */
+	#sortedObfuscateMappings: Array<{ secret: string; index: number; placeholder: string }> = [];
+
+	/** Reverse lookup for obfuscate-mode secrets to avoid scanning mappings. */
+	#obfuscateIndexBySecret = new Map<string, number>();
+
 	/** Reverse lookup for deobfuscation: placeholder → secret */
 	#deobfuscateMap = new Map<string, string>();
+
+	/** Combined plain-secret regex cache for single-pass replacement. */
+	#combinedPlainRegex: RegExp | undefined;
+	#combinedPlainReplacementBySecret = new Map<string, string>();
+	#combinedPlainRegexDirty = true;
+	#useSequentialPlainReplacement = false;
 
 	/** Next available index for regex match discoveries */
 	#nextIndex: number;
@@ -93,6 +108,7 @@ export class SecretObfuscator {
 					this.#plainMappings.set(entry.content, index);
 					this.#obfuscateMappings.set(index, { secret: entry.content, placeholder });
 					this.#deobfuscateMap.set(placeholder, entry.content);
+					this.#obfuscateIndexBySecret.set(entry.content, index);
 					index++;
 				} else {
 					// replace mode
@@ -111,6 +127,16 @@ export class SecretObfuscator {
 		}
 
 		this.#nextIndex = index;
+		this.#sortedReplaceMappings = [...this.#replaceMappings]
+			.sort((a, b) => b[0].length - a[0].length)
+			.map(([secret, replacement]) => ({ secret, replacement }));
+		this.#sortedObfuscateMappings = [...this.#plainMappings]
+			.sort((a, b) => b[0].length - a[0].length)
+			.map(([secret, mappingIndex]) => ({
+				secret,
+				index: mappingIndex,
+				placeholder: this.#obfuscateMappings.get(mappingIndex)!.placeholder,
+			}));
 		this.#hasAny = entries.length > 0;
 	}
 
@@ -121,18 +147,7 @@ export class SecretObfuscator {
 	/** Obfuscate all secrets in text. Bidirectional placeholders for obfuscate mode, one-way for replace. */
 	obfuscate(text: string): string {
 		if (!this.#hasAny) return text;
-		let result = text;
-
-		// 1. Process replace-mode plain secrets
-		for (const [secret, replacement] of [...this.#replaceMappings].sort((a, b) => b[0].length - a[0].length)) {
-			result = replaceAll(result, secret, replacement);
-		}
-
-		// 2. Process obfuscate-mode plain secrets
-		for (const [secret, index] of [...this.#plainMappings].sort((a, b) => b[0].length - a[0].length)) {
-			const mapping = this.#obfuscateMappings.get(index)!;
-			result = replaceAll(result, secret, mapping.placeholder);
-		}
+		let result = this.#obfuscatePlainMappings(text);
 
 		// 3. Process regex entries — discover new matches
 		for (const entry of this.#regexEntries) {
@@ -160,6 +175,9 @@ export class SecretObfuscator {
 						const placeholder = buildPlaceholder(index);
 						this.#obfuscateMappings.set(index, { secret: matchValue, placeholder });
 						this.#deobfuscateMap.set(placeholder, matchValue);
+						this.#obfuscateIndexBySecret.set(matchValue, index);
+						this.#insertSortedObfuscateMapping({ secret: matchValue, index, placeholder });
+						this.#combinedPlainRegexDirty = true;
 					}
 					const mapping = this.#obfuscateMappings.get(index)!;
 					result = replaceAll(result, matchValue, mapping.placeholder);
@@ -186,15 +204,74 @@ export class SecretObfuscator {
 
 	/** Find the obfuscate index for a known secret value. */
 	#findObfuscateIndex(secret: string): number | undefined {
-		// Check plain mappings first
-		const plainIndex = this.#plainMappings.get(secret);
-		if (plainIndex !== undefined) return plainIndex;
+		return this.#obfuscateIndexBySecret.get(secret);
+	}
 
-		// Check regex-discovered mappings
-		for (const [index, mapping] of this.#obfuscateMappings) {
-			if (mapping.secret === secret) return index;
+	#insertSortedObfuscateMapping(mapping: { secret: string; index: number; placeholder: string }): void {
+		let lo = 0;
+		let hi = this.#sortedObfuscateMappings.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (this.#sortedObfuscateMappings[mid]!.secret.length < mapping.secret.length) {
+				hi = mid;
+			} else {
+				lo = mid + 1;
+			}
 		}
-		return undefined;
+		this.#sortedObfuscateMappings.splice(lo, 0, mapping);
+	}
+
+	#obfuscatePlainMappings(text: string): string {
+		this.#ensureCombinedPlainRegex();
+		if (this.#useSequentialPlainReplacement) return this.#obfuscatePlainMappingsSequential(text);
+		if (!this.#combinedPlainRegex) return text;
+		return text.replace(
+			this.#combinedPlainRegex,
+			match => this.#combinedPlainReplacementBySecret.get(match) ?? match,
+		);
+	}
+
+	#obfuscatePlainMappingsSequential(text: string): string {
+		let result = text;
+		for (const mapping of this.#sortedReplaceMappings) {
+			result = replaceAll(result, mapping.secret, mapping.replacement);
+		}
+		for (const mapping of this.#sortedObfuscateMappings) {
+			result = replaceAll(result, mapping.secret, mapping.placeholder);
+		}
+		return result;
+	}
+
+	#ensureCombinedPlainRegex(): void {
+		if (!this.#combinedPlainRegexDirty) return;
+		this.#combinedPlainRegexDirty = false;
+		this.#combinedPlainReplacementBySecret = new Map<string, string>();
+
+		const mappings = [
+			...this.#sortedReplaceMappings.map(mapping => ({ secret: mapping.secret, replacement: mapping.replacement })),
+			...this.#sortedObfuscateMappings.map(mapping => ({
+				secret: mapping.secret,
+				replacement: mapping.placeholder,
+			})),
+		];
+
+		this.#useSequentialPlainReplacement = mappings.some((mapping, index) =>
+			mappings.some(
+				(other, otherIndex) =>
+					other.secret.length > 0 &&
+					(mapping.replacement.includes(other.secret) ||
+						(index !== otherIndex &&
+							(mapping.secret.includes(other.secret) || other.secret.includes(mapping.secret)))),
+			),
+		);
+		for (const mapping of mappings) {
+			if (!this.#combinedPlainReplacementBySecret.has(mapping.secret))
+				this.#combinedPlainReplacementBySecret.set(mapping.secret, mapping.replacement);
+		}
+		this.#combinedPlainRegex =
+			mappings.length > 0
+				? new RegExp(mappings.map(mapping => escapeRegex(mapping.secret)).join("|"), "g")
+				: undefined;
 	}
 }
 
@@ -238,14 +315,12 @@ export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Messag
 
 /** Replace all occurrences of `search` in `text` with `replacement`. */
 function replaceAll(text: string, search: string, replacement: string): string {
-	if (search.length === 0) return text;
-	let result = text;
-	let idx = result.indexOf(search);
-	while (idx !== -1) {
-		result = result.slice(0, idx) + replacement + result.slice(idx + search.length);
-		idx = result.indexOf(search, idx + replacement.length);
-	}
-	return result;
+	if (search.length === 0 || !text.includes(search)) return text;
+	return text.split(search).join(replacement);
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Deep-walk an object, transforming all string values. */

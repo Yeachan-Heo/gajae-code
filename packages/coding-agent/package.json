@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.4.3",
+	"version": "0.4.5",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",
@@ -36,6 +36,7 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"bench:context": "bun run bench/context-optimization.bench.ts",
 		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
 		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
 		"fix": "biome check --write --unsafe . && bun run format-prompts && bun run generate-docs-index",

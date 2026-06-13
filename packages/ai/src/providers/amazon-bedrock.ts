@@ -25,6 +25,7 @@ import type {
 	ThinkingContent,
 	Tool,
 	ToolCall,
+	ToolChoice,
 	ToolResultMessage,
 } from "../types";
 import { normalizeToolCallId, resolveCacheRetention } from "../utils";
@@ -33,6 +34,11 @@ import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { toolWireSchema } from "../utils/schema/wire";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import { resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
 import { signRequest } from "./aws-sigv4";
@@ -43,7 +49,7 @@ export type BedrockThinkingDisplay = "summarized" | "omitted";
 export interface BedrockOptions extends StreamOptions {
 	region?: string;
 	profile?: string;
-	toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };
+	toolChoice?: ToolChoice;
 	/* See https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html for supported models. */
 	reasoning?: Effort;
 	/* Custom token budgets per thinking level. Overrides default budgets. */
@@ -191,11 +197,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 		try {
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
-			const toolConfig = convertToolConfig(context.tools, options.toolChoice);
+			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
+			const toolConfig = convertToolConfig(context.tools, resolvedToolChoice.resolvedChoice);
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
-			// When tool_choice forces tool use, disable thinking to avoid API errors.
+			// When the resolved tool_choice forces tool use, disable thinking to avoid API errors.
 			if (toolConfig?.toolChoice && additionalModelRequestFields) {
 				const tc = toolConfig.toolChoice;
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
@@ -254,8 +261,45 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				headers: baseHeaders,
 			});
 			const requestHeaders: Record<string, string> = { ...baseHeaders, ...signed };
+			const sentForcedToolChoice = Boolean(toolConfig?.toolChoice?.any || toolConfig?.toolChoice?.tool);
+			let fallbackRan = false;
+			const retryWithoutForcedToolChoice = async (reason: string) => {
+				fallbackRan = true;
+				markToolChoiceIncapability(model, "auto", reason);
+				stream.push({
+					type: "toolChoiceIncapability",
+					api: output.api,
+					provider: model.provider,
+					model: model.id,
+					requestedLevel: resolvedToolChoice.requestedLevel,
+					resolvedLevel: "auto",
+					reason,
+					registryKey: resolvedToolChoice.registryKey,
+				});
+				stripBedrockForcedToolChoiceForRetry(commandInput);
+				const retryBodyText = JSON.stringify(commandInput);
+				const retryBody = new TextEncoder().encode(retryBodyText);
+				const retrySigned = await signRequest({
+					method: "POST",
+					host,
+					path: urlPath,
+					body: retryBody,
+					region,
+					service: "bedrock",
+					credentials,
+					headers: baseHeaders,
+				});
+				if (rawRequestDump) rawRequestDump.body = commandInput;
+				return fetchWithRetry(url, {
+					method: "POST",
+					headers: { ...baseHeaders, ...retrySigned },
+					body: retryBody,
+					signal: options.signal,
+					maxAttempts: 1,
+				});
+			};
 
-			const response = await fetchWithRetry(url, {
+			let response = await fetchWithRetry(url, {
 				method: "POST",
 				headers: requestHeaders,
 				body,
@@ -263,6 +307,18 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				maxAttempts: resolveRetryBudget(options.requestMaxRetries, 4) + 1,
 			});
 
+			if (!response.ok && sentForcedToolChoice) {
+				const errBody = await response.text().catch(() => "");
+				const error = withHttpStatus(
+					new Error(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
+					response.status,
+				);
+				if (firstTokenTime === undefined && !fallbackRan && isForcedToolChoiceUnsupportedError(error, true)) {
+					response = await retryWithoutForcedToolChoice(error.message);
+				} else {
+					throw error;
+				}
+			}
 			if (!response.ok) {
 				const errBody = await response.text().catch(() => "");
 				throw withHttpStatus(
@@ -273,65 +329,86 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			if (!response.body) throw new Error("Bedrock response has no body");
 
 			// Track first event for the abort/diagnostic path (currently informational).
-			for await (const message of decodeEventStream(response.body)) {
-				const messageType = message.headers[":message-type"];
-				const eventType = message.headers[":event-type"];
+			streamLoop: while (true) {
+				for await (const message of decodeEventStream(response.body)) {
+					const messageType = message.headers[":message-type"];
+					const eventType = message.headers[":event-type"];
 
-				if (messageType === "exception") {
-					const exceptionType = message.headers[":exception-type"] || "Exception";
-					const payload = safeParsePayload(message.payload) as { message?: string } | undefined;
-					const errorMessage = payload?.message || new TextDecoder().decode(message.payload);
-					const status = exceptionType === "validationException" ? 400 : 0;
-					const err = new Error(`${exceptionType}: ${errorMessage}`);
-					throw status ? withHttpStatus(err, status) : err;
-				}
-				if (messageType === "error") {
-					const code = message.headers[":error-code"] || "UnknownError";
-					const errorMessage = message.headers[":error-message"] || new TextDecoder().decode(message.payload);
-					throw new Error(`${code}: ${errorMessage}`);
-				}
-				if (messageType !== "event") continue;
-
-				const payload = safeParsePayload(message.payload);
-				if (!payload) continue;
-
-				switch (eventType) {
-					case "messageStart": {
-						// no-op: first event marker is implicit by stream entry.
-						const ev = payload as MessageStartEvent;
-						if (ev.role !== "assistant") {
-							throw new Error("Unexpected assistant message start but got user message start instead");
+					if (messageType === "exception") {
+						const exceptionType = message.headers[":exception-type"] || "Exception";
+						const payload = safeParsePayload(message.payload) as { message?: string } | undefined;
+						const errorMessage = payload?.message || new TextDecoder().decode(message.payload);
+						const status = exceptionType === "validationException" ? 400 : 0;
+						const err = new Error(`${exceptionType}: ${errorMessage}`);
+						const error = status ? withHttpStatus(err, status) : err;
+						if (
+							firstTokenTime === undefined &&
+							sentForcedToolChoice &&
+							!fallbackRan &&
+							isForcedToolChoiceUnsupportedError(error, true)
+						) {
+							response = await retryWithoutForcedToolChoice(error.message);
+							if (!response.ok) {
+								const errBody = await response.text().catch(() => "");
+								throw withHttpStatus(
+									new Error(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
+									response.status,
+								);
+							}
+							if (!response.body) throw new Error("Bedrock response has no body");
+							continue streamLoop;
 						}
-						stream.push({ type: "start", partial: output });
-						break;
+						throw error;
 					}
-					case "contentBlockStart": {
-						if (!firstTokenTime) firstTokenTime = Date.now();
-						handleContentBlockStart(payload as ContentBlockStartEvent, blocks, output, stream);
-						break;
+					if (messageType === "error") {
+						const code = message.headers[":error-code"] || "UnknownError";
+						const errorMessage = message.headers[":error-message"] || new TextDecoder().decode(message.payload);
+						throw new Error(`${code}: ${errorMessage}`);
 					}
-					case "contentBlockDelta": {
-						if (!firstTokenTime) firstTokenTime = Date.now();
-						handleContentBlockDelta(payload as ContentBlockDeltaEvent, blocks, output, stream);
-						break;
+					if (messageType !== "event") continue;
+
+					const payload = safeParsePayload(message.payload);
+					if (!payload) continue;
+
+					switch (eventType) {
+						case "messageStart": {
+							// no-op: first event marker is implicit by stream entry.
+							const ev = payload as MessageStartEvent;
+							if (ev.role !== "assistant") {
+								throw new Error("Unexpected assistant message start but got user message start instead");
+							}
+							stream.push({ type: "start", partial: output });
+							break;
+						}
+						case "contentBlockStart": {
+							if (!firstTokenTime) firstTokenTime = Date.now();
+							handleContentBlockStart(payload as ContentBlockStartEvent, blocks, output, stream);
+							break;
+						}
+						case "contentBlockDelta": {
+							if (!firstTokenTime) firstTokenTime = Date.now();
+							handleContentBlockDelta(payload as ContentBlockDeltaEvent, blocks, output, stream);
+							break;
+						}
+						case "contentBlockStop": {
+							handleContentBlockStop(payload as ContentBlockStopEvent, blocks, output, stream);
+							break;
+						}
+						case "messageStop": {
+							const ev = payload as MessageStopEvent;
+							output.stopReason = mapStopReason(ev.stopReason);
+							break;
+						}
+						case "metadata": {
+							handleMetadata(payload as MetadataEvent, model, output);
+							break;
+						}
+						default:
+							// Unknown event types (Bedrock may add new ones) — ignore.
+							break;
 					}
-					case "contentBlockStop": {
-						handleContentBlockStop(payload as ContentBlockStopEvent, blocks, output, stream);
-						break;
-					}
-					case "messageStop": {
-						const ev = payload as MessageStopEvent;
-						output.stopReason = mapStopReason(ev.stopReason);
-						break;
-					}
-					case "metadata": {
-						handleMetadata(payload as MetadataEvent, model, output);
-						break;
-					}
-					default:
-						// Unknown event types (Bedrock may add new ones) — ignore.
-						break;
 				}
+				break;
 			}
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
@@ -714,7 +791,14 @@ function convertMessages(
 	return result;
 }
 
-function convertToolConfig(
+export function stripBedrockForcedToolChoiceForRetry<T extends { toolConfig?: { toolChoice?: unknown } }>(body: T): T {
+	if (body.toolConfig) {
+		body.toolConfig = { ...body.toolConfig, toolChoice: undefined };
+	}
+	return body;
+}
+
+export function convertToolConfig(
 	tools: Tool[] | undefined,
 	toolChoice: BedrockOptions["toolChoice"],
 ): WireToolConfig | undefined {
@@ -734,6 +818,7 @@ function convertToolConfig(
 			bedrockToolChoice = { auto: {} };
 			break;
 		case "any":
+		case "required":
 			bedrockToolChoice = { any: {} };
 			break;
 		default:
@@ -742,7 +827,7 @@ function convertToolConfig(
 			}
 	}
 
-	return { tools: bedrockTools, toolChoice: bedrockToolChoice };
+	return bedrockToolChoice ? { tools: bedrockTools, toolChoice: bedrockToolChoice } : { tools: bedrockTools };
 }
 
 function mapStopReason(reason: string | undefined): StopReason {

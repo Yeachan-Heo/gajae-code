@@ -30,6 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { toolWireSchema } from "../utils/schema/wire";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
@@ -569,7 +570,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	return stream;
 };
 
-type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" };
+type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" | "native" };
 
 interface BlockState {
 	currentTextBlock: (TextContent & { index: number }) | null;
@@ -1844,6 +1845,60 @@ function buildTodoWriteArgs(toolCall: CursorUpdateTodosToolCall): {
 	};
 }
 
+// Map a cursor ToolCall oneof field name (e.g. "shellToolCall") to a display tool
+// name. Mirrors cli-jaw's cursorToolKindLabel (src/agent/events/cursor.ts) so the
+// two surfaces label cursor-native tools identically.
+const CURSOR_NATIVE_KIND_ALIASES: Record<string, string> = {
+	shell: "bash",
+	read: "read",
+	write: "write",
+	delete: "delete",
+	edit: "edit",
+	grep: "grep",
+	glob: "glob",
+	ls: "ls",
+	semSearch: "codebase_search",
+	webSearch: "web_search",
+	fetch: "fetch",
+	task: "task",
+	createPlan: "create_plan",
+	askQuestion: "ask_question",
+	readLints: "read_lints",
+	applyAgentDiff: "apply_diff",
+};
+
+function cursorNativeToolName(kindKey: string): string {
+	const base = kindKey.replace(/ToolCall$/i, "");
+	if (!base) return "tool";
+	return CURSOR_NATIVE_KIND_ALIASES[base] ?? base;
+}
+
+// Cursor's model sometimes calls its own native IDE tools (shell/glob/grep/…)
+// instead of the advertised MCP tools. Those arrive as ToolCall oneof variants we
+// do not otherwise handle (everything except mcpToolCall / updateTodosToolCall), so
+// without this they are silently dropped and never render. Build a generic toolCall
+// block from whichever *ToolCall field is set so the call (and its result) is shown.
+function buildNativeToolCallBlock(
+	toolCall: Record<string, unknown>,
+	callId: string,
+	index: number,
+): ToolCallState | null {
+	for (const [key, payload] of Object.entries(toolCall)) {
+		if (!/ToolCall$/.test(key) || !payload || typeof payload !== "object") continue;
+		if (key === "mcpToolCall" || key === "updateTodosToolCall") continue;
+		const args = (payload as { args?: unknown }).args;
+		return {
+			type: "toolCall",
+			id: callId,
+			name: cursorNativeToolName(key),
+			arguments: args && typeof args === "object" ? (args as Record<string, unknown>) : { raw: payload },
+			index,
+			kind: "native",
+		};
+	}
+	return null;
+}
+
 function buildMcpResultFromToolResult(_mcpCall: CursorMcpCall, toolResult: ToolResultMessage) {
 	if (toolResult.isError) {
 		return buildMcpErrorResult(toolResultToText(toolResult) || "MCP tool failed");
@@ -1986,6 +2041,21 @@ function processInteractionUpdate(
 				};
 				output.content.push(block);
 				state.setToolCall(block);
+				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+				return;
+			}
+
+			// Fallback: cursor-native tool variants (shell/glob/grep/…) we don't model
+			// explicitly. Render them so the call and its result are visible instead of
+			// vanishing.
+			const nativeBlock = buildNativeToolCallBlock(
+				toolCall,
+				update.message.value.callId || crypto.randomUUID(),
+				output.content.length,
+			);
+			if (nativeBlock) {
+				output.content.push(nativeBlock);
+				state.setToolCall(nativeBlock);
 				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 			}
 		}
@@ -2215,12 +2285,18 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
+export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined, modelId?: string): string[] {
 	const systemPrompts = normalizeSystemPrompts(systemPrompt);
 	if (systemPrompts.length === 0) {
 		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
 	}
-	return systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	const jsons = systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	// Composer-harness models need anchor/edit discipline pinned ahead of the
+	// host prompt (see composer-discipline.ts for the observed failure modes).
+	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
+		jsons.unshift(JSON.stringify({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+	}
+	return jsons;
 }
 
 function buildRootPromptMessagesJson(
@@ -2432,7 +2508,7 @@ function buildGrpcRequest(
 } {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
+	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt, model.id).map(json =>
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 

@@ -9,6 +9,7 @@ import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
 import {
 	getSegmenter,
 	getWordNavKind,
+	isPrintableAscii,
 	moveWordLeft,
 	moveWordRight,
 	padding,
@@ -53,6 +54,53 @@ interface TextChunk {
 	endIndex: number;
 }
 
+interface WrappedLine {
+	chunks: TextChunk[];
+	width: number;
+}
+
+interface CachedWrappedLine extends WrappedLine {
+	lineRef: string;
+	contentWidth: number;
+}
+
+function wordWrapAsciiLine(line: string, maxWidth: number): TextChunk[] {
+	if (line.length <= maxWidth) {
+		return [{ text: line, startIndex: 0, endIndex: line.length }];
+	}
+
+	const chunks: TextChunk[] = [];
+	let chunkStart = 0;
+	while (chunkStart < line.length) {
+		let chunkEnd = Math.min(line.length, chunkStart + maxWidth);
+		if (chunkEnd < line.length) {
+			let breakAt = -1;
+			for (let i = chunkEnd; i > chunkStart; i--) {
+				const code = line.charCodeAt(i - 1);
+				if (code === 0x20 || code === 0x09) {
+					breakAt = i - 1;
+					break;
+				}
+			}
+			if (breakAt > chunkStart) chunkEnd = breakAt;
+		}
+
+		const raw = line.slice(chunkStart, chunkEnd);
+		const text = raw.trimEnd();
+		if (text || chunks.length === 0) {
+			chunks.push({ text, startIndex: chunkStart, endIndex: chunkStart + raw.length });
+		}
+		chunkStart = chunkEnd;
+		while (chunkStart < line.length) {
+			const code = line.charCodeAt(chunkStart);
+			if (code !== 0x20 && code !== 0x09) break;
+			chunkStart++;
+		}
+	}
+
+	return chunks.length > 0 ? chunks : [{ text: "", startIndex: 0, endIndex: 0 }];
+}
+
 /**
  * Split a line into word-wrapped chunks.
  * Wraps at word boundaries when possible, falling back to character-level
@@ -65,6 +113,9 @@ interface TextChunk {
 function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 	if (!line || maxWidth <= 0) {
 		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+	if (isPrintableAscii(line)) {
+		return wordWrapAsciiLine(line, maxWidth);
 	}
 
 	const lineWidth = visibleWidth(line);
@@ -349,6 +400,7 @@ export class Editor implements Component, Focusable {
 	#paddingXOverride: number | undefined;
 	#maxHeight?: number;
 	#scrollOffset: number = 0;
+	#wrappedLineCache: CachedWrappedLine[] = [];
 
 	// Emacs-style kill ring
 	#killRing = new KillRing();
@@ -566,10 +618,11 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#wrappedLineCache.length = 0;
 	}
 
 	invalidate(): void {
-		// No cached state to invalidate currently
+		this.#wrappedLineCache.length = 0;
 	}
 
 	#getEditorPaddingX(): number {
@@ -692,14 +745,18 @@ export class Editor implements Component, Focusable {
 		return Math.max(1, visibleHeight - 1);
 	}
 
-	#updateScrollOffset(layoutWidth: number, layoutLines: LayoutLine[], visibleHeight: number): void {
+	#findCurrentLayoutLine(layoutLines: LayoutLine[]): number {
+		const index = layoutLines.findIndex(line => line.hasCursor);
+		return index === -1 ? Math.max(0, layoutLines.length - 1) : index;
+	}
+
+	#updateScrollOffset(layoutLines: LayoutLine[], visibleHeight: number): void {
 		if (layoutLines.length <= visibleHeight) {
 			this.#scrollOffset = 0;
 			return;
 		}
 
-		const visualLines = this.#buildVisualLineMap(layoutWidth);
-		const cursorLine = this.#findCurrentVisualLine(visualLines);
+		const cursorLine = this.#findCurrentLayoutLine(layoutLines);
 		if (cursorLine < this.#scrollOffset) {
 			this.#scrollOffset = cursorLine;
 		} else if (cursorLine >= this.#scrollOffset + visibleHeight) {
@@ -730,7 +787,7 @@ export class Editor implements Component, Focusable {
 		// Layout the text
 		const layoutLines = this.#layoutText(layoutWidth);
 		const visibleContentHeight = this.#getVisibleContentHeight(layoutLines.length);
-		this.#updateScrollOffset(layoutWidth, layoutLines, visibleContentHeight);
+		this.#updateScrollOffset(layoutLines, visibleContentHeight);
 		const visibleLayoutLines = layoutLines.slice(this.#scrollOffset, this.#scrollOffset + visibleContentHeight);
 
 		const result: string[] = [];
@@ -1321,11 +1378,34 @@ export class Editor implements Component, Focusable {
 		}
 	}
 
+	#getWrappedLine(lineIndex: number, contentWidth: number): WrappedLine {
+		const line = this.#state.lines[lineIndex] || "";
+		const cached = this.#wrappedLineCache[lineIndex];
+		if (cached?.lineRef === line && cached.contentWidth === contentWidth) return cached;
+
+		const width = isPrintableAscii(line) ? line.length : visibleWidth(line);
+		const chunks =
+			width <= contentWidth
+				? [{ text: line, startIndex: 0, endIndex: line.length }]
+				: wordWrapLine(line, contentWidth);
+		const wrapped = { lineRef: line, contentWidth, width, chunks };
+		this.#wrappedLineCache[lineIndex] = wrapped;
+		return wrapped;
+	}
+
+	/** Test-only seam: current wrap-cache entry count (memory-bound assertions). */
+	get wrappedLineCacheSize(): number {
+		return this.#wrappedLineCache.length;
+	}
+
 	#layoutText(contentWidth: number): LayoutLine[] {
 		const layoutLines: LayoutLine[] = [];
 
 		if (this.#state.lines.length === 0 || (this.#state.lines.length === 1 && this.#state.lines[0] === "")) {
-			// Empty editor
+			// Empty editor — keep the wrap cache bounded by document size like
+			// the non-empty path below (stale entries from a previously large
+			// buffer must not be retained).
+			this.#wrappedLineCache.length = this.#state.lines.length;
 			layoutLines.push({
 				text: "",
 				hasCursor: true,
@@ -1338,9 +1418,9 @@ export class Editor implements Component, Focusable {
 		for (let i = 0; i < this.#state.lines.length; i++) {
 			const line = this.#state.lines[i] || "";
 			const isCurrentLine = i === this.#state.cursorLine;
-			const lineVisibleWidth = visibleWidth(line);
+			const wrappedLine = this.#getWrappedLine(i, contentWidth);
 
-			if (lineVisibleWidth <= contentWidth) {
+			if (wrappedLine.width <= contentWidth) {
 				// Line fits in one layout line
 				if (isCurrentLine) {
 					layoutLines.push({
@@ -1356,7 +1436,7 @@ export class Editor implements Component, Focusable {
 				}
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, contentWidth);
+				const chunks = wrappedLine.chunks;
 
 				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 					const chunk = chunks[chunkIndex];
@@ -1406,6 +1486,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
+		this.#wrappedLineCache.length = this.#state.lines.length;
 		return layoutLines;
 	}
 
@@ -1749,6 +1830,7 @@ export class Editor implements Component, Focusable {
 		this.#historyIndex = -1;
 		this.#scrollOffset = 0;
 		this.#undoStack.length = 0;
+		this.#wrappedLineCache.length = 0;
 
 		if (this.onChange) this.onChange("");
 		if (this.onSubmit) this.onSubmit(result);
@@ -2294,15 +2376,15 @@ export class Editor implements Component, Focusable {
 
 		for (let i = 0; i < this.#state.lines.length; i++) {
 			const line = this.#state.lines[i] || "";
-			const lineVisWidth = visibleWidth(line);
+			const wrappedLine = this.#getWrappedLine(i, width);
 			if (line.length === 0) {
 				// Empty line still takes one visual line
 				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
-			} else if (lineVisWidth <= width) {
+			} else if (wrappedLine.width <= width) {
 				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, width);
+				const chunks = wrappedLine.chunks;
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
@@ -2340,8 +2422,10 @@ export class Editor implements Component, Focusable {
 
 	#moveCursor(deltaLine: number, deltaCol: number): void {
 		this.#resetKillSequence();
-		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
-		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const needsVisualLines = deltaLine !== 0 || (deltaCol > 0 && this.#state.cursorCol >= currentLine.length);
+		const visualLines = needsVisualLines ? this.#buildVisualLineMap(this.#lastLayoutWidth) : [];
+		const currentVisualLine = needsVisualLines ? this.#findCurrentVisualLine(visualLines) : -1;
 
 		if (deltaLine !== 0) {
 			const targetVisualLine = currentVisualLine + deltaLine;
@@ -2352,15 +2436,18 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (deltaCol !== 0) {
-			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-
 			if (deltaCol > 0) {
 				// Moving right - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.#state.cursorCol < currentLine.length) {
-					const afterCursor = currentLine.slice(this.#state.cursorCol);
-					const graphemes = [...segmenter.segment(afterCursor)];
-					const firstGrapheme = graphemes[0];
-					this.#setCursorCol(this.#state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
+					const charCode = currentLine.charCodeAt(this.#state.cursorCol);
+					if (charCode >= 0x20 && charCode <= 0x7e) {
+						this.#setCursorCol(this.#state.cursorCol + 1);
+					} else {
+						const afterCursor = currentLine.slice(this.#state.cursorCol);
+						const graphemes = [...segmenter.segment(afterCursor)];
+						const firstGrapheme = graphemes[0];
+						this.#setCursorCol(this.#state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
+					}
 				} else if (this.#state.cursorLine < this.#state.lines.length - 1) {
 					// Wrap to start of next logical line
 					this.#state.cursorLine++;
@@ -2375,10 +2462,15 @@ export class Editor implements Component, Focusable {
 			} else {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.#state.cursorCol > 0) {
-					const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-					const graphemes = [...segmenter.segment(beforeCursor)];
-					const lastGrapheme = graphemes[graphemes.length - 1];
-					this.#setCursorCol(this.#state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
+					const charCode = currentLine.charCodeAt(this.#state.cursorCol - 1);
+					if (charCode >= 0x20 && charCode <= 0x7e) {
+						this.#setCursorCol(this.#state.cursorCol - 1);
+					} else {
+						const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
+						const graphemes = [...segmenter.segment(beforeCursor)];
+						const lastGrapheme = graphemes[graphemes.length - 1];
+						this.#setCursorCol(this.#state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
+					}
 				} else if (this.#state.cursorLine > 0) {
 					// Wrap to end of previous logical line
 					this.#state.cursorLine--;

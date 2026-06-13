@@ -47,11 +47,13 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
+import { adviseForkContextMode } from "./fork-context-advisory";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
+import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateReviewerExploreGate, evaluateSpawnGate } from "./spawn-gate";
 import {
@@ -578,6 +580,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								runMode: message ? "message" : "resume",
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+								suppressRoiReconciliation: true,
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -675,6 +678,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								frozenForkSeeds,
 								{
 									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
+									suppressRoiReconciliation: true,
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -874,6 +878,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			runMode?: "initial" | "resume" | "message";
 			resumeMessage?: string;
 			sessionFiles?: ReadonlyMap<string, string | null>;
+			/**
+			 * Set for per-child async runs: the spawnPlan is carried for gate
+			 * consistency, but batch-level ROI reconciliation must not be computed
+			 * against a single child's receipts.
+			 */
+			suppressRoiReconciliation?: boolean;
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
@@ -1293,6 +1303,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const forkContext = requestsForkContext(task)
 					? { mode: task.inheritContext, clonedTokens: forkContextSeed?.metadata.approximateTokens ?? 0 }
 					: undefined;
+				// Advisory-only recommendation (logged on the receipt); never overrides
+				// the caller's explicit inheritContext mode.
+				const advisory = adviseForkContextMode({
+					assignment: task.assignment,
+					context: sharedContext,
+					explicitMode: task.inheritContext,
+				});
+				const forkContextAdvisory = {
+					recommendedMode: advisory.recommendedMode,
+					reasons: advisory.reasons,
+				};
 				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
 				if (!isIsolated) {
 					const result = await runSubprocess({
@@ -1341,7 +1362,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					return forkContext ? { ...result, forkContext } : result;
+					return { ...result, ...(forkContext ? { forkContext } : {}), forkContextAdvisory };
 				}
 
 				const taskStart = Date.now();
@@ -1402,7 +1423,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					const resultWithForkContext = forkContext ? { ...result, forkContext } : result;
+					const resultWithForkContext = {
+						...result,
+						...(forkContext ? { forkContext } : {}),
+						forkContextAdvisory,
+					};
 					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
 						try {
 							const commitMsg =
@@ -1697,6 +1722,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const receipts = results.map(buildTaskReceipt);
 			const roiSummary = buildTaskRoiSummary(receipts);
+			const roiReconciliation = executionOverrides?.suppressRoiReconciliation
+				? undefined
+				: reconcileSpawnRoi(params.spawnPlan, receipts);
 			const summaries = receipts.map(r => {
 				const status = r.status === "merge_failed" ? "merge failed" : r.status;
 				return {
@@ -1739,6 +1767,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
 				forkContextClonedTokens: forkContextClonedTokens > 0 ? forkContextClonedTokens : undefined,
 				roiSummary,
+				roiReconciliation,
 			};
 			assertNoRawTaskFields(details, "task.return.details");
 			return {

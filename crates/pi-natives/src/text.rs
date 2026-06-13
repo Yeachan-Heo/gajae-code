@@ -1286,7 +1286,6 @@ pub fn visible_width(text: JsString, tab_width: u32) -> Result<u32> {
 	let tab_width = clamp_tab_width_for_ops(tab_width);
 	Ok(crate::utils::clamp_u32(visible_width_u16(text_u16.as_slice(), tab_width) as u64))
 }
-
 #[cfg(test)]
 mod tests {
 	use super::*;

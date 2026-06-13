@@ -164,6 +164,48 @@ describe("RuntimeOwner (in-process integration)", () => {
 		expect(warn?.severity).toBe("warn");
 	});
 
+	it("blocks submit during finalizing and does not call RPC", async () => {
+		const rpc = new FakeRpc();
+		await writeSessionState(root, { ...seedState(root), lifecycle: "finalizing" });
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc, acceptanceTimeoutMs: 100 });
+		const info = await owner.start();
+
+		const res = (await callEndpoint(info.socketPath, { verb: "submit", input: { prompt: "too soon" } })) as Record<
+			string,
+			unknown
+		>;
+
+		expect(res.ok).toBe(false);
+		expect((res.evidence as Record<string, unknown>).accepted).toBe(false);
+		expect((res.evidence as Record<string, unknown>).submitted).toBe(false);
+		expect((res.evidence as Record<string, unknown>).reason).toBe("lifecycle-not-idle:finalizing");
+		expect(res.nextAllowedActions).toContainEqual({
+			verb: "submit",
+			available: false,
+			reason: "lifecycle-not-idle:finalizing",
+		});
+		expect(rpc.cursor).toBe(0);
+	});
+
+	it("reports rpc-not-idle as not submitted and stops advertising submit", async () => {
+		const rpc = new FakeRpc();
+		rpc.state = { isStreaming: true, steeringQueueDepth: 0, followupQueueDepth: 0 };
+		owner = new RuntimeOwner({ root, sessionId: SID, rpc, acceptanceTimeoutMs: 100 });
+		const info = await owner.start();
+
+		const res = (await callEndpoint(info.socketPath, { verb: "submit", input: { prompt: "too soon" } })) as Record<
+			string,
+			unknown
+		>;
+
+		expect(res.ok).toBe(false);
+		expect((res.evidence as Record<string, unknown>).accepted).toBe(false);
+		expect((res.evidence as Record<string, unknown>).submitted).toBe(false);
+		expect((res.evidence as Record<string, unknown>).reason).toBe("pre-state-not-idle");
+		expect(res.nextAllowedActions).toContainEqual({ verb: "submit", available: false, reason: "rpc-not-idle" });
+		expect(rpc.cursor).toBe(0);
+	});
+
 	it("live owner reconcile preserves vanished blockers until recovery evidence", async () => {
 		const rpc = new FakeRpc();
 		await writeSessionState(root, {

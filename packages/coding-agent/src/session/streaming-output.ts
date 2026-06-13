@@ -1,7 +1,12 @@
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
+
 import { sanitizeText } from "@gajae-code/utils";
 import { formatBytes } from "../tools/render-utils";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
+
+function sanitizeOutputChunk(rawChunk: string): string {
+	return sanitizeWithOptionalSixelPassthrough(rawChunk, sanitizeText);
+}
 
 // =============================================================================
 // Constants
@@ -12,6 +17,7 @@ export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
 export const DEFAULT_MAX_COLUMN = 1024; // Max chars per grep match line
 
 const NL = "\n";
+
 const ELLIPSIS = "…";
 
 // =============================================================================
@@ -654,10 +660,11 @@ export class OutputSink {
 	#bufferBytes = 0;
 	#head = "";
 	#headBytes = 0;
-	#headLines = 0; // newline count inside #head
 	#headRetentionDisabled = false;
 	#totalLines = 0; // newline count
 	#totalBytes = 0;
+	#processedBytes = 0;
+	#processedLines = 0; // newline count after sanitize/column-cap
 	#sawData = false;
 	#truncated = false;
 	#lastChunkTime = 0;
@@ -674,8 +681,12 @@ export class OutputSink {
 		sink: Bun.FileSink;
 	};
 
-	// Queue of chunks waiting for the file sink to be created.
+	// Raw prefix chunks not yet confirmed written to the file sink. This queue is
+	// the only artifact replay source; retained head/tail windows are lossy views.
 	#pendingFileWrites?: string[];
+	#pendingFileWriteBytes = 0;
+	#finalized = false;
+
 	#fileReady = false;
 
 	readonly #artifactPath?: string;
@@ -708,76 +719,99 @@ export class OutputSink {
 		this.#chunkThrottleMs = chunkThrottleMs;
 	}
 
+	#headText(): string {
+		return this.#head;
+	}
+
+	#tailText(): string {
+		return this.#buffer;
+	}
+
+	#setTail(text: string, bytes = Buffer.byteLength(text, "utf-8")): void {
+		this.#buffer = text;
+		this.#bufferBytes = bytes;
+	}
+
+	#appendTail(text: string, bytes: number): void {
+		this.#buffer += text;
+		this.#bufferBytes += bytes;
+	}
+
+	#appendHead(text: string, bytes: number): void {
+		this.#head += text;
+		this.#headBytes += bytes;
+	}
+
+	#trimTailTo(maxBytes: number): void {
+		if (this.#bufferBytes <= maxBytes) return;
+		const { text, bytes } = truncateTailBytes(this.#buffer, maxBytes);
+		this.#buffer = text;
+		this.#bufferBytes = bytes;
+	}
+
 	/**
-	 * Push a chunk of output. The buffer management and onChunk callback run
-	 * synchronously. File sink writes are deferred and serialized internally.
+	 * Push a chunk of output. Raw bytes are mirrored to artifacts, while the
+	 * visible retention windows are selected from the sanitized/column-capped
+	 * stream so production-default display matches the historical processed view.
 	 */
 	push(chunk: string): void {
-		chunk = sanitizeWithOptionalSixelPassthrough(chunk, sanitizeText);
+		const rawChunk = chunk;
 
-		// Unthrottled raw-chunk hook fires before any throttle/cap gating so
-		// downstream consumers (e.g. AsyncJobManager.appendOutput) can record
-		// the complete process stream while UI/progress callbacks remain throttled.
-		if (this.#onRawChunk && chunk.length > 0) {
-			this.#onRawChunk(chunk);
+		// Live callbacks historically observe sanitized, uncapped chunks. The same
+		// sanitized text is also the input to visible accounting/retention.
+		const sanitizedChunk = sanitizeOutputChunk(rawChunk);
+
+		if (this.#onRawChunk && sanitizedChunk.length > 0) {
+			this.#onRawChunk(sanitizedChunk);
 		}
 
-		// Throttled onChunk: only call the callback when enough time has passed.
-		// Live preview gets the raw (pre-cap) chunk so the TUI never lags behind
-		// what reached the sink — the column cap is for the persisted LLM view.
 		if (this.#onChunk) {
 			const now = Date.now();
 			if (now - this.#lastChunkTime >= this.#chunkThrottleMs) {
 				this.#lastChunkTime = now;
-				this.#onChunk(chunk);
+				this.#onChunk(sanitizedChunk);
 			}
 		}
 
-		const rawBytes = Buffer.byteLength(chunk, "utf-8");
+		const rawBytes = Buffer.byteLength(rawChunk, "utf-8");
 		this.#totalBytes += rawBytes;
 
-		if (chunk.length > 0) {
+		if (rawChunk.length > 0) {
 			this.#sawData = true;
-			this.#totalLines += countNewlines(chunk);
+			this.#totalLines += countNewlines(rawChunk);
 		}
 
-		// Per-line column cap. State persists across chunks so a mid-line split
-		// still respects the budget. Operates on the sanitized chunk; the cap is
-		// applied before head/tail accounting but after artifact mirroring decides.
-		const capped = this.#maxColumns > 0 ? this.#applyColumnCap(chunk) : chunk;
-		const cappedBytes = capped === chunk ? rawBytes : Buffer.byteLength(capped, "utf-8");
-		const cappedThisChunk = cappedBytes < rawBytes;
-		if (cappedThisChunk) this.#truncated = true;
+		// Mirror the original, unsanitized/uncapped bytes. Until the artifact sink is
+		// open, keep an independent raw replay prefix because retained head/tail
+		// windows are trimmed and cannot reconstruct byte-correct artifacts.
+		if (this.#artifactPath && this.#maxColumns === 0) this.#enqueueFileWrite(rawChunk, rawBytes);
 
-		// Mirror RAW chunk to the artifact file so the on-disk record is the full
-		// uncapped stream. Mirror triggers on: in-memory overflow OR this chunk's
-		// column cap dropped bytes (otherwise we'd lose data) OR file already open.
-		if (this.#artifactPath && (this.#file != null || cappedThisChunk || this.#willOverflow(cappedBytes))) {
-			this.#writeToFile(chunk);
+		if (rawBytes === 0) return;
+
+		const visibleChunk = this.#maxColumns > 0 ? this.#applyColumnCap(sanitizedChunk) : sanitizedChunk;
+		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
+		if (this.#columnDroppedBytes > 0) this.#createFileSink();
+		const visibleBytes = Buffer.byteLength(visibleChunk, "utf-8");
+		if (visibleChunk.length > 0) {
+			this.#processedBytes += visibleBytes;
+			this.#processedLines += countNewlines(visibleChunk);
 		}
+		if (visibleBytes === 0) return;
 
-		if (cappedBytes === 0) return;
+		let tailChunk = visibleChunk;
+		let tailBytes = visibleBytes;
 
-		// Head retention: drain the (capped) chunk into #head until the budget is
-		// exhausted, then forward any leftover to the tail buffer.
-		let tailChunk = capped;
-		let tailBytes = cappedBytes;
 		if (this.#headLimit > 0 && !this.#headRetentionDisabled && this.#headBytes < this.#headLimit) {
 			const room = this.#headLimit - this.#headBytes;
-			if (cappedBytes <= room) {
-				this.#head += capped;
-				this.#headBytes += cappedBytes;
-				this.#headLines += countNewlines(capped);
+			if (visibleBytes <= room) {
+				this.#appendHead(visibleChunk, visibleBytes);
 				return;
 			}
-			// Split: head takes a UTF-8-safe prefix; remainder flows to tail.
-			const headSlice = truncateHeadBytes(capped, room);
+			const headSlice = truncateHeadBytes(visibleChunk, room);
 			if (headSlice.bytes > 0) {
-				this.#head += headSlice.text;
-				this.#headBytes += headSlice.bytes;
-				this.#headLines += countNewlines(headSlice.text);
-				tailChunk = capped.substring(headSlice.text.length);
-				tailBytes = cappedBytes - headSlice.bytes;
+				this.#appendHead(headSlice.text, headSlice.bytes);
+				tailChunk = visibleChunk.substring(headSlice.text.length);
+				tailBytes = visibleBytes - headSlice.bytes;
 			}
 		}
 
@@ -790,6 +824,7 @@ export class OutputSink {
 	 * cap; subsequent bytes are skipped until the next `\n`. State persists
 	 * across calls so a long line split across chunks still produces one marker.
 	 */
+
 	#applyColumnCap(chunk: string): string {
 		if (chunk.length === 0) return chunk;
 		const max = this.#maxColumns;
@@ -800,11 +835,11 @@ export class OutputSink {
 			const segEnd = nlIdx === -1 ? chunk.length : nlIdx;
 			if (segEnd > cursor) {
 				const segment = chunk.substring(cursor, segEnd);
+				const segBytes = Buffer.byteLength(segment, "utf-8");
 				if (this.#columnEllipsisAdded) {
 					// Past the cap; drop until newline.
-					this.#columnDroppedBytes += Buffer.byteLength(segment, "utf-8");
+					this.#columnDroppedBytes += segBytes;
 				} else {
-					const segBytes = Buffer.byteLength(segment, "utf-8");
 					const remaining = max - this.#currentLineBytes;
 					if (segBytes <= remaining) {
 						parts.push(segment);
@@ -814,13 +849,11 @@ export class OutputSink {
 						// arm the skip-until-newline flag.
 						const ellipsisBytes = 3; // "…" in UTF-8
 						const headRoom = Math.max(0, remaining - ellipsisBytes);
-						let kept = "";
 						let keptBytes = 0;
 						if (headRoom > 0) {
 							const sliced = truncateHeadBytes(segment, headRoom);
-							kept = sliced.text;
 							keptBytes = sliced.bytes;
-							parts.push(kept);
+							parts.push(sliced.text);
 						}
 						parts.push(ELLIPSIS);
 						this.#columnDroppedBytes += segBytes - keptBytes;
@@ -839,6 +872,10 @@ export class OutputSink {
 		return parts.join("");
 	}
 
+	#retainedSummary(text: string): { text: string; bytes: number; lines: number } {
+		return { text, bytes: Buffer.byteLength(text, "utf-8"), lines: text.length > 0 ? countNewlines(text) : 0 };
+	}
+
 	#willOverflow(dataBytes: number): boolean {
 		// Triggers file mirroring as soon as the next chunk would push us over
 		// the tail budget (head retention does not change spill-to-artifact).
@@ -852,8 +889,7 @@ export class OutputSink {
 		const willOverflow = this.#bufferBytes + dataBytes > threshold;
 
 		if (!willOverflow) {
-			this.#buffer += chunk;
-			this.#bufferBytes += dataBytes;
+			this.#appendTail(chunk, dataBytes);
 			return;
 		}
 
@@ -863,66 +899,75 @@ export class OutputSink {
 		// Avoid creating a giant intermediate string when chunk alone dominates.
 		if (dataBytes >= threshold) {
 			const { text, bytes } = truncateTailBytes(chunk, threshold);
-			this.#buffer = text;
-			this.#bufferBytes = bytes;
+			this.#setTail(text, bytes);
 		} else {
 			// Intermediate size is bounded (<= threshold + dataBytes), safe to concat.
-			this.#buffer += chunk;
-			this.#bufferBytes += dataBytes;
-
-			const { text, bytes } = truncateTailBytes(this.#buffer, threshold);
-			this.#buffer = text;
-			this.#bufferBytes = bytes;
+			this.#appendTail(chunk, dataBytes);
+			this.#trimTailTo(threshold);
 		}
 	}
 
-	/**
-	 * Write a chunk to the artifact file. Handles the async file sink creation
-	 * by queuing writes until the sink is ready, then draining synchronously.
-	 */
-	#writeToFile(chunk: string): void {
-		if (this.#fileReady && this.#file) {
-			// Fast path: file sink exists, write synchronously
-			this.#file.sink.write(chunk);
+	#queuePendingFileWrite(chunk: string, bytes = Buffer.byteLength(chunk, "utf-8")): void {
+		if (!this.#pendingFileWrites) this.#pendingFileWrites = [chunk];
+		else this.#pendingFileWrites.push(chunk);
+
+		this.#pendingFileWriteBytes += bytes;
+	}
+
+	#enqueueFileWrite(chunk: string, bytes: number): void {
+		if (!this.#fileReady || !this.#file) {
+			this.#queuePendingFileWrite(chunk, bytes);
+			if (this.#willOverflow(bytes) || this.#pendingFileWriteBytes > this.#spillThreshold) this.#createFileSink();
 			return;
 		}
-		// File sink not yet created — queue this chunk and kick off creation
-		if (!this.#pendingFileWrites) {
-			this.#pendingFileWrites = [chunk];
-			void this.#createFileSink();
-		} else {
-			this.#pendingFileWrites.push(chunk);
-		}
-	}
 
-	async #createFileSink(): Promise<void> {
-		if (!this.#artifactPath || this.#fileReady) return;
 		try {
-			const sink = Bun.file(this.#artifactPath).writer();
-			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
-
-			// Flush existing buffer to file BEFORE it gets trimmed further.
-			if (this.#buffer.length > 0) {
-				sink.write(this.#buffer);
-			}
-
-			// Drain any chunks that arrived while the sink was being created
-			if (this.#pendingFileWrites) {
-				for (const pending of this.#pendingFileWrites) {
-					sink.write(pending);
-				}
-				this.#pendingFileWrites = undefined;
-			}
-
-			this.#fileReady = true;
+			this.#file.sink.write(chunk);
 		} catch {
 			try {
-				await this.#file?.sink?.end();
+				void this.#file.sink.end();
 			} catch {
 				/* ignore */
 			}
 			this.#file = undefined;
+			this.#fileReady = false;
+			this.#queuePendingFileWrite(chunk, bytes);
+			this.#createFileSink();
+		}
+	}
+
+	#createFileSink(): boolean {
+		if (this.#finalized) return false;
+
+		if (!this.#artifactPath) return false;
+		if (this.#fileReady) return this.#file != null;
+		try {
+			const sink = Bun.file(this.#artifactPath).writer();
+			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
+
+			const pending = this.#pendingFileWrites;
+			if (pending) {
+				for (const chunk of pending) sink.write(chunk);
+			}
+
+			this.#fileReady = true;
 			this.#pendingFileWrites = undefined;
+			this.#pendingFileWriteBytes = 0;
+
+			return true;
+		} catch {
+			try {
+				void this.#file?.sink?.end();
+			} catch {
+				/* ignore */
+			}
+			this.#file = undefined;
+			// Keep #pendingFileWriteBytes in sync with the preserved queue so
+			// later retry/threshold decisions don't undercount retained bytes.
+			this.#pendingFileWriteBytes = this.#pendingFileWrites
+				? this.#pendingFileWrites.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0)
+				: 0;
+			return false;
 		}
 	}
 
@@ -953,14 +998,14 @@ export class OutputSink {
 	 * branch in `dump()` against stale totals.
 	 */
 	replace(text: string): void {
-		this.#buffer = text;
-		this.#bufferBytes = Buffer.byteLength(text, "utf-8");
+		this.#setTail(text);
 		this.#head = "";
 		this.#headBytes = 0;
-		this.#headLines = 0;
 		this.#headRetentionDisabled = true;
 		this.#totalBytes = this.#bufferBytes;
+		this.#processedBytes = this.#bufferBytes;
 		this.#totalLines = countNewlines(text);
+		this.#processedLines = this.#totalLines;
 		this.#sawData = text.length > 0;
 		this.#truncated = false;
 		this.#currentLineBytes = 0;
@@ -973,19 +1018,34 @@ export class OutputSink {
 		const noticeLine = notice ? `[${notice}]\n` : "";
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
-		if (this.#file) await this.#file.sink.end();
+		let artifactId: string | undefined;
+		if (this.#file) {
+			artifactId = this.#file.artifactId;
+			await this.#file.sink.end();
+			this.#finalized = true;
+		}
+		if (this.#finalized) {
+			// Terminal: the artifact is closed; replay state is no longer needed.
+			this.#pendingFileWrites = undefined;
+			this.#pendingFileWriteBytes = 0;
+			this.#fileReady = false;
+		}
+		// Non-finalized dumps (no artifact sink ever opened) keep the raw replay
+		// queue so a later post-dump push that spills produces a CUMULATIVE
+		// artifact, matching the cumulative visible summary/counters.
 
-		// Compose the visible output. With head retention, splice head + marker
-		// + tail when content was elided. Otherwise return the rolling buffer.
-		const headBytes = this.#headBytes;
-		const tailBuf = this.#buffer;
-		const tailBytes = this.#bufferBytes;
-		const headLines = this.#headLines + (headBytes > 0 && !this.#head.endsWith("\n") ? 1 : 0);
-		const tailLines = tailBuf.length > 0 ? countNewlines(tailBuf) + 1 : 0;
+		// Compose the visible output from already-processed retention windows.
+		const processedTotalLines = this.#sawData ? this.#processedLines + 1 : 0;
+		const headText = this.#headText();
+		const head = this.#retainedSummary(headText);
 
-		// Bytes that survived the column cap. Middle elision operates on these,
-		// so column-dropped bytes don't inflate the "elided from middle" count.
-		const effectiveTotalBytes = Math.max(0, this.#totalBytes - this.#columnDroppedBytes);
+		const headBytes = head.bytes;
+		const headLines = head.lines + (headBytes > 0 && !headText.endsWith("\n") ? 1 : 0);
+		const tailBuf = this.#tailText();
+		const tail = this.#retainedSummary(tailBuf);
+		const tailBytes = tail.bytes;
+		const tailLines = tailBuf.length > 0 ? tail.lines + 1 : 0;
+		const effectiveTotalBytes = this.#processedBytes;
 
 		let body: string;
 		let outputBytes: number;
@@ -996,23 +1056,25 @@ export class OutputSink {
 		if (headBytes > 0 && effectiveTotalBytes > headBytes + tailBytes) {
 			// Middle was elided. Emit head + marker + tail.
 			elidedBytes = Math.max(0, effectiveTotalBytes - headBytes - tailBytes);
-			elidedLines = Math.max(0, totalLines - headLines - tailLines);
-			const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
-			const markerBytes = Buffer.byteLength(marker, "utf-8");
-			const headSep = this.#head.endsWith("\n") ? "" : "\n";
-			const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
-			body = `${this.#head}${headSep}${marker}${tailSep}${tailBuf}`;
-			outputBytes =
-				headBytes +
-				markerBytes +
-				tailBytes +
-				Buffer.byteLength(headSep, "utf-8") +
-				Buffer.byteLength(tailSep, "utf-8");
-			outputLines = headLines + 1 + tailLines;
-			this.#truncated = true;
+			elidedLines = Math.max(0, processedTotalLines - headLines - tailLines);
+			if (elidedLines === 0) {
+				body = headText;
+				outputBytes = headBytes;
+				outputLines = headLines;
+				this.#truncated = true;
+			} else {
+				const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
+				const markerBytes = Buffer.byteLength(marker, "utf-8");
+				const headSep = headText.endsWith("\n") ? "" : "\n";
+				const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
+				body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
+				outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
+				outputLines = headLines + 1 + tailLines;
+				this.#truncated = true;
+			}
 		} else if (headBytes > 0) {
 			// Head + tail combine into the full buffered output (no overlap or elision).
-			body = `${this.#head}${tailBuf}`;
+			body = `${headText}${tailBuf}`;
 			outputBytes = headBytes + tailBytes;
 			outputLines = body.length > 0 ? countNewlines(body) + 1 : 0;
 		} else {
@@ -1021,6 +1083,7 @@ export class OutputSink {
 			outputLines = tailLines;
 		}
 
+		if (this.#columnDroppedBytes > 0) this.#truncated = true;
 		return {
 			output: `${noticeLine}${body}`,
 			truncated: this.#truncated,
@@ -1032,7 +1095,7 @@ export class OutputSink {
 			elidedLines,
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
-			artifactId: this.#file?.artifactId,
+			artifactId,
 		};
 	}
 }

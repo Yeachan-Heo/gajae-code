@@ -1148,3 +1148,4 @@ function parseKey(data: string): string | undefined {
 
 	return undefined;
 }
+export { setKittyProtocolActive, isKittyProtocolActive, matchesKey, parseKey };

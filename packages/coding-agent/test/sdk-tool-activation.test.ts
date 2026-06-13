@@ -32,6 +32,28 @@ const toolActivationExtension: ExtensionFactory = pi => {
 	});
 };
 
+async function createMinimalSession(tempDirs: string[], settings: Settings, toolNames?: string[]) {
+	const tempDir = path.join(os.tmpdir(), `pi-sdk-goal-tool-${Snowflake.next()}`);
+	tempDirs.push(tempDir);
+	fs.mkdirSync(tempDir, { recursive: true });
+	return createAgentSession({
+		cwd: tempDir,
+		agentDir: tempDir,
+		sessionManager: SessionManager.inMemory(),
+		settings,
+		model: getBundledModel("openai", "gpt-4o-mini"),
+		disableExtensionDiscovery: true,
+		extensions: [],
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMCP: false,
+		enableLsp: false,
+		toolNames,
+	});
+}
+
 describe("createAgentSession defaultInactive tool activation", () => {
 	const tempDirs: string[] = [];
 	const authStorages: AuthStorage[] = [];
@@ -44,6 +66,40 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			authStorage.close();
 		}
 		vi.restoreAllMocks();
+	});
+
+	it("registers and activates the goal tool by default", async () => {
+		const { session } = await createMinimalSession(tempDirs, Settings.isolated());
+
+		try {
+			expect(session.getAllToolNames()).toContain("goal");
+			expect(session.getActiveToolNames()).toContain("goal");
+			expect(session.systemPrompt.join("\n")).toContain("goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps the goal tool active with explicit toolNames lists", async () => {
+		const { session } = await createMinimalSession(tempDirs, Settings.isolated(), ["read", "bash"]);
+
+		try {
+			expect(session.getAllToolNames()).toContain("goal");
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "goal"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("excludes the goal tool only when goal mode is disabled", async () => {
+		const { session } = await createMinimalSession(tempDirs, Settings.isolated({ "goal.enabled": false }));
+
+		try {
+			expect(session.getAllToolNames()).not.toContain("goal");
+			expect(session.getActiveToolNames()).not.toContain("goal");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("excludes defaultInactive extension tools from the initial active set unless explicitly requested", async () => {

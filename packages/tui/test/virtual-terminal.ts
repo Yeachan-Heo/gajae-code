@@ -34,7 +34,7 @@ export class VirtualTerminal implements Terminal {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 		// Enable bracketed paste mode for consistency with ProcessTerminal
-		this.xterm.write("\x1b[?2004h");
+		this.#write("\x1b[?2004h");
 	}
 
 	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {
@@ -43,14 +43,18 @@ export class VirtualTerminal implements Terminal {
 
 	stop(): void {
 		// Disable bracketed paste mode
-		this.xterm.write("\x1b[?2004l");
+		this.#write("\x1b[?2004l");
 		this.inputHandler = undefined;
 		this.resizeHandler = undefined;
 	}
 
-	write(data: string): void {
+	#write(data: string): void {
 		this.#writeLog.push(data);
 		this.xterm.write(data);
+	}
+
+	write(data: string): void {
+		this.#write(data);
 	}
 
 	getWriteLog(): string[] {
@@ -89,42 +93,42 @@ export class VirtualTerminal implements Terminal {
 	moveBy(lines: number): void {
 		if (lines > 0) {
 			// Move down
-			this.xterm.write(`\x1b[${lines}B`);
+			this.#write(`\x1b[${lines}B`);
 		} else if (lines < 0) {
 			// Move up
-			this.xterm.write(`\x1b[${-lines}A`);
+			this.#write(`\x1b[${-lines}A`);
 		}
 		// lines === 0: no movement
 	}
 
 	hideCursor(): void {
-		this.xterm.write("\x1b[?25l");
+		this.#write("\x1b[?25l");
 	}
 
 	showCursor(): void {
-		this.xterm.write("\x1b[?25h");
+		this.#write("\x1b[?25h");
 	}
 
 	clearLine(): void {
-		this.xterm.write("\x1b[K");
+		this.#write("\x1b[K");
 	}
 
 	clearFromCursor(): void {
-		this.xterm.write("\x1b[J");
+		this.#write("\x1b[J");
 	}
 
 	clearScreen(): void {
-		this.xterm.write("\x1b[H\x1b[0J"); // Move to home (1,1) and clear from cursor to end
+		this.#write("\x1b[H\x1b[0J"); // Move to home (1,1) and clear from cursor to end
 	}
 
 	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title
-		this.xterm.write(`\x1b]0;${title}\x07`);
+		this.#write(`\x1b]0;${title}\x07`);
 	}
 
 	setProgress(active: boolean): void {
 		// OSC 9;4 progress sequence; no-op in tests beyond writing through to xterm.
-		this.xterm.write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
+		this.#write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
 	}
 
 	/** Wait for TUI's throttled render pipeline to settle (matches the 16ms frame budget). */

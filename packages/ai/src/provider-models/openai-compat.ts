@@ -11,6 +11,7 @@ import {
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
+import { isClaudeForcedToolChoiceIncapableModelId } from "../utils/tool-choice-capability";
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
@@ -68,6 +69,9 @@ async function fetchModelsDevPayload(fetchImpl: typeof fetch = fetch): Promise<u
 	return response.json();
 }
 
+function anthropicToolChoiceCompat(modelId: string): Pick<Model<"anthropic-messages">, "compat"> {
+	return isClaudeForcedToolChoiceIncapableModelId(modelId) ? { compat: { toolChoiceSupport: "auto" } } : {};
+}
 function mapAnthropicModelsDev(payload: unknown, baseUrl: string): Model<"anthropic-messages">[] {
 	if (!isRecord(payload)) {
 		return [];
@@ -106,6 +110,7 @@ function mapAnthropicModelsDev(payload: unknown, baseUrl: string): Model<"anthro
 			},
 			contextWindow: toPositiveNumber(model.limit?.context, UNK_CONTEXT_WINDOW),
 			maxTokens: toPositiveNumber(model.limit?.output, UNK_MAX_TOKENS),
+			...anthropicToolChoiceCompat(modelId),
 		});
 	}
 
@@ -141,7 +146,10 @@ function buildAnthropicReferenceMap(
 		(model): model is Model<"anthropic-messages"> => model.api === "anthropic-messages",
 	);
 	for (const model of bundledModels) {
-		merged.set(model.id, model);
+		merged.set(model.id, {
+			...model,
+			compat: { ...(model.compat ?? {}), ...anthropicToolChoiceCompat(model.id).compat },
+		});
 	}
 	return merged;
 }

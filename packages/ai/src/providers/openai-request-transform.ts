@@ -39,6 +39,7 @@ const OPENAI_PROXY_STRIP_HEADERS = [
 	"x-stainless-helper-method",
 	"openai-organization",
 	"openai-project",
+	"openai-beta",
 ] as const;
 
 function resolveRequestTransform(

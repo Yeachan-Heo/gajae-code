@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, $inheritedEnv, $pickenv, extractHttpStatusFromError } from "@gajae-code/utils";
+import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
@@ -61,7 +61,7 @@ let cachedVertexAdcCredentialsExists: boolean | null = null;
 
 function hasVertexAdcCredentials(): boolean {
 	if (cachedVertexAdcCredentialsExists === null) {
-		const gacPath = $env.GOOGLE_APPLICATION_CREDENTIALS;
+		const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
 		if (gacPath) {
 			cachedVertexAdcCredentialsExists = fs.existsSync(gacPath);
 		} else {
@@ -77,7 +77,7 @@ type KeyResolver = string | (() => string | undefined);
 
 const serviceProviderMap: Record<string, KeyResolver> = {
 	"alibaba-coding-plan": "ALIBABA_CODING_PLAN_API_KEY",
-	openai: () => $inheritedEnv("OPENAI_API_KEY") ?? $env.OPENAI_API_KEY,
+	openai: () => $credentialEnv("OPENAI_API_KEY"),
 	google: "GEMINI_API_KEY",
 	groq: "GROQ_API_KEY",
 	cerebras: "CEREBRAS_API_KEY",
@@ -107,18 +107,18 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
 	// GitHub Copilot uses GitHub personal access token
-	"github-copilot": () => $pickenv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
 	anthropic: () =>
 		isFoundryEnabled()
-			? $pickenv("ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
-			: $pickenv("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
+			? $pickCredentialEnv("ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+			: $pickCredentialEnv("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
 	"gitlab-duo": "GITLAB_TOKEN",
 	// Vertex AI supports either GOOGLE_CLOUD_API_KEY or Application Default Credentials.
 	"google-vertex": () => {
-		if ($env.GOOGLE_CLOUD_API_KEY) {
-			return $env.GOOGLE_CLOUD_API_KEY;
-		}
+		const googleCloudApiKey = $credentialEnv("GOOGLE_CLOUD_API_KEY");
+		if (googleCloudApiKey) return googleCloudApiKey;
+
 		const hasCredentials = hasVertexAdcCredentials();
 		const hasProject = !!($env.GOOGLE_CLOUD_PROJECT || $env.GCLOUD_PROJECT);
 		const hasLocation = !!$env.GOOGLE_CLOUD_LOCATION;
@@ -133,13 +133,18 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	// 4. AWS_CONTAINER_CREDENTIALS_* - ECS/Task IAM role credentials
 	// 5. AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN - IRSA (EKS) web identity
 	"amazon-bedrock": () => {
+		const awsProfile = $credentialEnv("AWS_PROFILE");
+		const awsAccessKeyId = $credentialEnv("AWS_ACCESS_KEY_ID");
+		const awsSecretAccessKey = $credentialEnv("AWS_SECRET_ACCESS_KEY");
+		const awsBearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
 		const hasEcsCredentials =
-			!!$env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || !!$env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
-		const hasWebIdentity = !!$env.AWS_WEB_IDENTITY_TOKEN_FILE && !!$env.AWS_ROLE_ARN;
+			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") ||
+			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_FULL_URI");
+		const hasWebIdentity = !!$credentialEnv("AWS_WEB_IDENTITY_TOKEN_FILE") && !!$credentialEnv("AWS_ROLE_ARN");
 		if (
-			$env.AWS_PROFILE ||
-			($env.AWS_ACCESS_KEY_ID && $env.AWS_SECRET_ACCESS_KEY) ||
-			$env.AWS_BEARER_TOKEN_BEDROCK ||
+			awsProfile ||
+			(awsAccessKeyId && awsSecretAccessKey) ||
+			awsBearerToken ||
 			hasEcsCredentials ||
 			hasWebIdentity
 		) {
@@ -148,7 +153,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	},
 	synthetic: "SYNTHETIC_API_KEY",
 	"cloudflare-ai-gateway": "CLOUDFLARE_AI_GATEWAY_API_KEY",
-	huggingface: () => $pickenv("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"),
+	huggingface: () => $pickCredentialEnv("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"),
 	litellm: "LITELLM_API_KEY",
 	moonshot: "MOONSHOT_API_KEY",
 	nvidia: "NVIDIA_API_KEY",
@@ -158,7 +163,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"ollama-cloud": "OLLAMA_CLOUD_API_KEY",
 	"llama.cpp": "LLAMA_CPP_API_KEY",
 	qianfan: "QIANFAN_API_KEY",
-	"qwen-portal": () => $pickenv("QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"),
+	"qwen-portal": () => $pickCredentialEnv("QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"),
 	together: "TOGETHER_API_KEY",
 	zenmux: "ZENMUX_API_KEY",
 	venice: "VENICE_API_KEY",
@@ -169,13 +174,13 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 /**
  * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
  *
- * Will not return API keys for providers that require OAuth tokens.
- * Checks Bun.env, then cwd/.env, then ~/.env.
+ * Provider authentication intentionally excludes cwd/.env values. Project dotenv files are
+ * loaded into $env for app/tool execution, but must not silently fund GJC model requests.
  */
 export function getEnvApiKey(provider: string): string | undefined {
 	const resolver = serviceProviderMap[provider];
 	if (typeof resolver === "string") {
-		return $env[resolver];
+		return $credentialEnv(resolver);
 	}
 	return resolver?.();
 }

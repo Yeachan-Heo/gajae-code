@@ -63,6 +63,11 @@ function createAzureOpenAICatalogModels(): Model<"azure-openai-responses">[] {
 }
 
 const packageRoot = path.join(import.meta.dir, "..");
+const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>(["anthropic/claude-fable-5"]);
+
+function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
+	return RETIRED_BUNDLED_MODEL_KEYS.has(`${model.provider}/${model.id}`);
+}
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
@@ -395,11 +400,16 @@ async function generateModels() {
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
 		for (const model of Object.values(models)) {
-			if (!fetchedKeys.has(`${model.provider}/${model.id}`) && !discoveryOnlyProviders.has(model.provider)) {
+			if (
+				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
+				!discoveryOnlyProviders.has(model.provider) &&
+				!isRetiredBundledModel(model)
+			) {
 				allModels.push(model.provider === "openai" ? { ...model, baseUrl: "" } : model);
 			}
 		}
 	}
+	allModels = allModels.filter(model => !isRetiredBundledModel(model));
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);

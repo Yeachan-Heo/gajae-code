@@ -1,4 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import type { ToolChoice } from "@gajae-code/ai";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
@@ -38,6 +39,21 @@ export interface ResolveToolDetails {
  * semantics. No session-level abstraction is needed: callers pass their
  * apply/reject functions directly.
  */
+/**
+ * Tags preview-fallback handlers installed in the session's standing-resolve
+ * slot so newer previews can replace older ones (latest-preview-wins) without
+ * ever displacing a mode-owned handler such as plan mode's approval handler.
+ */
+const previewResolveFallbacks = new WeakSet<object>();
+
+function markPreviewResolveFallback(handler: (input: unknown) => Promise<unknown> | unknown): void {
+	previewResolveFallbacks.add(handler);
+}
+
+function isPreviewResolveFallback(handler: (input: unknown) => Promise<unknown> | unknown): boolean {
+	return previewResolveFallbacks.has(handler);
+}
+
 export function queueResolveHandler(
 	session: ToolSession,
 	options: {
@@ -48,8 +64,6 @@ export function queueResolveHandler(
 	},
 ): void {
 	const queue = session.getToolChoiceQueue?.();
-	const forced = session.buildToolChoice?.("resolve");
-	if (!queue || !forced || typeof forced === "string") return;
 
 	const steerReminder = (): void => {
 		session.steer?.({
@@ -63,27 +77,88 @@ export function queueResolveHandler(
 		});
 	};
 
-	const pushDirective = (): void => {
+	// Re-evaluated on every push (including apply-error re-pushes) so a runtime
+	// incapability discovered mid-turn degrades the NEXT push instead of
+	// replaying a stale forced choice the model can never satisfy.
+	const resolveForcedChoice = (): { forced: ToolChoice | undefined; exactNamed: boolean } => {
+		const toolChoiceResult = session.buildToolChoiceResult?.("resolve");
+		if (toolChoiceResult !== undefined) {
+			return { forced: toolChoiceResult.choice, exactNamed: toolChoiceResult.exactNamed };
+		}
+		// Legacy bridge fallback: sessions that only provide buildToolChoice
+		// (older SDK embedders, test harnesses) keep the previous behavior — a
+		// named object choice is treated as exact named forcing.
+		const legacyChoice = session.buildToolChoice?.("resolve");
+		const isNamedObject = typeof legacyChoice === "object" && legacyChoice !== null;
+		return { forced: isNamedObject ? legacyChoice : undefined, exactNamed: isNamedObject };
+	};
+
+	const clearFallback = (): void => {
+		// Identity-aware: only clear the shared standing slot when it still holds
+		// THIS preview's fallback. Plan mode (or a newer preview) may have
+		// replaced it in the meantime — leave theirs untouched.
+		if (session.peekStandingResolveHandler?.() === invoke) {
+			session.setStandingResolveHandler?.(null);
+		}
+	};
+
+	const invoke = async (input: unknown): Promise<AgentToolResult<unknown>> => {
+		const result = await runResolveInvocation(input as ResolveParams, {
+			sourceToolName: options.sourceToolName,
+			label: options.label,
+			apply: options.apply,
+			reject: options.reject,
+			onApplyError: () => {
+				// Apply threw (e.g. ast_edit overlapping replacements). Re-push the
+				// same directive so the preview remains pending and the model can
+				// `discard` or fix-and-retry on the next turn instead of being
+				// stranded with no pending action to address. The re-push goes
+				// through the exactNamed gate again — degraded models fall back
+				// to the reminder alone. The standing fallback stays installed so
+				// a voluntary resolve can still reach the pending action.
+				pushDirective();
+				steerReminder();
+			},
+		});
+		// Apply succeeded or the preview was discarded: the pending action is
+		// finished, so the voluntary-dispatch fallback must not linger.
+		clearFallback();
+		return result;
+	};
+	markPreviewResolveFallback(invoke);
+
+	// Voluntary-dispatch fallback: when forcing is unavailable (statically
+	// degraded) or later removed (runtime degradeInFlight drops the queue
+	// directive that owns the invoker), the model can still call `resolve`.
+	// ResolveTool.execute consults the queue invoker first, so the standing
+	// handler only serves degraded paths. Latest preview wins (mirroring the
+	// queue's pushOnce now:true semantics): a newer preview's fallback replaces
+	// an older preview's, but NEVER clobbers a non-preview standing handler
+	// (e.g. plan mode's approval handler).
+	const installFallback = (): void => {
+		if (!session.setStandingResolveHandler) return;
+		const existing = session.peekStandingResolveHandler?.();
+		if (existing === invoke) return;
+		if (existing !== undefined && !isPreviewResolveFallback(existing)) return;
+		session.setStandingResolveHandler(invoke);
+	};
+
+	const pushDirective = (): boolean => {
+		const { forced, exactNamed } = resolveForcedChoice();
+		if (!queue || !forced || !exactNamed) {
+			installFallback();
+			return false;
+		}
 		queue.pushOnce(forced, {
 			label: `pending-action:${options.sourceToolName}`,
 			now: true,
 			onRejected: () => "requeue",
-			onInvoked: async (input: unknown) =>
-				runResolveInvocation(input as ResolveParams, {
-					sourceToolName: options.sourceToolName,
-					label: options.label,
-					apply: options.apply,
-					reject: options.reject,
-					onApplyError: () => {
-						// Apply threw (e.g. ast_edit overlapping replacements). Re-push the
-						// same directive so the preview remains pending and the model can
-						// `discard` or fix-and-retry on the next turn instead of being
-						// stranded with no pending action to address.
-						pushDirective();
-						steerReminder();
-					},
-				}),
+			onInvoked: invoke,
 		});
+		// Forced directive may still be degraded mid-turn by a runtime
+		// incapability discovery; keep the fallback armed for that case.
+		installFallback();
+		return true;
 	};
 
 	pushDirective();

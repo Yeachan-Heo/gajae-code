@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "layout-resize-rich-text",
+  "terminalWidth": 84,
+  "terminalHeight": 20,
+  "capabilities": {
+    "kittyProtocolActive": true,
+    "hyperlinks": true,
+    "imageProtocol": null
+  },
+  "coverage": [
+    "resize",
+    "width change",
+    "height change",
+    "OSC 8 hyperlink",
+    "markdown code block",
+    "markdown table",
+    "markdown list",
+    "markdown blockquote",
+    "wide/CJK",
+    "emoji ZWJ",
+    "Jamo"
+  ],
+  "artifacts": {
+    "viewport": {
+      "file": "viewport.txt",
+      "sha256": "d7c2d3820bd42e49a4cfa152e3dc8a3d61e3f75f74f13b450384e1c8dabece32"
+    },
+    "scrollback": {
+      "file": "scrollback.txt",
+      "sha256": "4b1772926f9e6e251e68c7257b3320d7d0909cdacea95a797e163ec0165a6fde"
+    },
+    "writelog": {
+      "file": "writelog.bin",
+      "sha256": "42663eab43ab284c5953ab04832748b669525ab5d1f95622fff7bbd525314f40"
+    }
+  }
+}

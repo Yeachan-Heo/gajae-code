@@ -8,8 +8,85 @@
 
 ### Fixed
 
+- Fixed forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model") looping after `ast_edit` previews: named queue directives (resolve protocol, eager `todo_write` enforcement, subagent `yield` reminders) now enqueue only when the model supports exact named forcing; otherwise they degrade silently to the existing steer reminder without a forced `tool_choice`, and a runtime-discovered incapability drops the in-flight directive instead of requeueing it.
+- `models.yml` compat blocks now accept the `toolChoiceSupport` enum (`none`/`auto`/`required`/`named`) alongside the legacy `supportsToolChoice`/`supportsForcedToolChoice` booleans, mirrored in the generated JSON schema.
+### Added
+
+- Made `/model` open to a preset-first landing view: provider-grouped presets with live auth checkmarks, highlight-to-expand tiers, a full clamped role→model preview before applying, and a session/default apply scope choice; typing still jumps straight to model search, "Browse all models" opens the classic tabbed selector, and temporary-only quick-switch bypasses the landing entirely.
+- Rebuilt the builtin model profile catalog as 25 profiles: `codex-{eco,medium,pro}` on `gpt-5.5` effort spreads, a single `opencodego` preset, `claude-opus`, `{glm,kimi-coding-plan,mimo,grok,cursor,minimax}-{eco,medium,pro}` trios with thinking levels clamped to provider support, and `opus-codex`/`codex-opencodego` combos. Legacy profile names (including the `*-standard` family and retired Fable presets) were removed clean-break and now fail with the available-profile listing.
+- Added a post-`/login` smart preset recommendation: when login succeeds and no profile is active, prompts "Apply <preset> now?" (session-only on confirm); when a profile is active, prints a one-line hint instead. The active profile is tracked in-memory on the session with rollback-safe activation.
+- Bundled `kimi-code/kimi-k2.7-code` and `minimax-code/minimax-v3` model entries; MiniMax presets use the canonical `minimax-code` provider id throughout.
+- Added a harness receipt JSONL spool exporter for gajae receipt-runtime interop: configured `gjc harness --receipt-spool-dir <dir>` / `GJC_RECEIPT_SPOOL_DIR` now appends persisted native `ReceiptEnvelope` records as `{cursor,envelope}` lines to `spool.jsonl`, with restart-safe 12-digit cursors and installed-package smoke coverage (#545).
+- Added Gajae Trinity compatibility golden fixtures and tests that pin ReceiptEnvelope hash basis, validator compatibility, and replayable RPC exchange shape for downstream receipt-runtime interop.
+- Optimization Suite v3 Lane 1 (RSS): large resident text in persisted sessions is now backed by an ephemeral session-scoped disk cache (`EphemeralBlobStore`) instead of being pinned in JS heap for the whole session lifetime; canonical JSONL persistence, reload, and export semantics are byte-identical (resident refs never persist). Missing resident text cache blobs now surface a typed `ResidentBlobMissingError` instead of silently leaking `blob:sha256:` refs into provider payloads, UI, or exports. `getEntries()`/`buildSessionContext()` are served from revision-keyed WeakRef caches below the public ownership boundary (callers still receive caller-owned copies). Fixture retained heap −82%, RSS −55%, warm `getEntries()` p95 −80% on 10k-entry sessions; one-shot `exportFromFile()` now closes its session manager.
+- Added process-isolated deterministic TUI render-golden capture and fixtures for interactive editor overlays, rich-text resizing, multiplexer viewport repaint, sixel image line preservation, Termux height diffs, and transcript shrink/clear regressions.
+
+### Removed
+
+- Removed the hardcoded OpenAI Codex role-preset action from the model selector; builtin model profiles are now the only preset concept.
+- Removed retired Fable model profiles (`claude-fable`, `fable-codex`) after `claude-fable-5` was removed upstream.
+
+### Changed
+
+- Optimization Suite v3 Lane 3 (serialization): session-switch message comparison now uses per-message cached source strings + xxHash64 as an accelerator (source-string compare remains the authority; collision fallback tested) — unchanged-session compares −95% median. The secret obfuscator precomputes a longest-first combined regex (single-pass replace, −70% median/−77% p95 on 100 secrets × 1MiB) with a conservative sequential fallback whenever secrets overlap each other or any replacement/placeholder contains a secret — output bytes are identical in all cases. Intra-line diff rendering gains byte-identical fast paths for identical lines and whitespace-token-aligned prefix/suffix spans (identical −67%, single-token −60%; long lines skip the scan). Mental-model LCS keeps legacy dense-DP tie-break semantics (a Hunt-Szymanski variant was rejected for changing rendered bytes). Provider-visible fork-context seeds use JSON-semantic cloning instead of structuredClone.
+- Tightened tool-block rendering to remove vertical padding and rely on Spacer-only separation, reducing transcript noise while preserving stable render-golden output.
+- Improved the Bun runtime version guard diagnostic: when the Bun running `gjc` is older than the required version, the error now names the exact detected Bun runtime path and prints a platform-specific upgrade and PATH fix (Windows gets the `irm bun.sh/install.ps1|iex` reinstall plus a `%USERPROFILE%\.bun\bin` PATH hint) instead of a bare `bun upgrade` (#525).
+- Aligned the `codex-standard` and `codex-pro` model profiles on the `openai-codex/gpt-5.5` baseline so they no longer default to stale mixed model generations (`gpt-5.4`, `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.3-codex-spark`); the profiles now differentiate purely by per-role reasoning effort (#532).
+- Reduced the default RPC `get_state` payload by omitting static `dumpTools` and `systemPrompt` fields unless requested via `include: ["tools", "systemPrompt"]` (#539).
+- Updated `/model` documentation and generated docs index for the rebuilt preset catalog and preset-first selector.
+
+### Fixed
+
+- Tightened the Windows/psmux tmux provider boundary: `gjc team` now honors `GJC_TMUX_COMMAND` (not just `GJC_TEAM_TMUX_COMMAND`) so the team leader resolves the same multiplexer as `gjc session`/`gjc --tmux`; and when a multiplexer lists a session that lacks GJC's `@gjc-profile` ownership tag, `gjc session status` now returns `gjc_tmux_session_untagged` with a `detail` hint and `gjc team` reports the same cause, instead of a bare `gjc_tmux_session_not_found` / `unmanaged_tmux_session`. Documented that alternative multiplexers such as psmux on Windows are not fully supported because they do not round-trip tmux user options (#531).
+- Hardened RPC stdio lifecycle behavior: `gjc --mode rpc` now reports malformed JSONL frames as parse-error responses without killing the session, flushes durable session state before exiting on EOF/shutdown, and has red-team coverage for attached persistence, reload, malformed-frame recovery, and concurrent child-session isolation.
+- Hardened the harness RPC submit/router contract so `submit` is no longer advertised or accepted during finalizing/non-idle lifecycle windows, non-idle RPC state reports `submitted:false` with a retryable gate, and degraded owner endpoints fall back to `owner-not-live` without false acceptance (#544).
+- Ran estimated context maintenance before sending a new prompt, including tool-output pruning and threshold compaction, so large tool results appended after the last assistant turn cannot push the next model request over the context window.
+- `gjc team` now self-heals a missing `@gjc-profile` ownership tag when the current leader pane was genuinely launched by `gjc --tmux` (detected via `GJC_TMUX_LAUNCHED=1`): the session is re-tagged with `set-option` and startup proceeds, instead of hard-failing with `unmanaged_tmux_session` after a mid-startup attach failure or registry race stripped the tag. Sessions without the GJC launch marker are still rejected unchanged, so foreign tmux sessions cannot be hijacked.
+- Subagent task receipts and live render output now warn when requested role-agent models are substituted by auth fallback or provider-reported assistant model mismatch, including session model-change annotations for server-side substitutions (#559).
+- Converted Cursor wire shell timeouts from millisecond values to bash-tool seconds so delegated Cursor-native shell calls honor the expected timeout units.
+- Fixed pi-shell bash fixups on multibyte UTF-8 commands by converting parser source indexes to byte offsets before stripping `head`/`tail` pipelines.
+
+## [0.4.5] - 2026-06-12
+
+### Added
+
+- Added a dim `(ctrl+s to observe sessions)` discoverability hint under the `subagent` await panel header while any awaited subagent is still running, pointing to the full session observer overlay; the hint shows in both collapsed and expanded states and disappears once no subagent is running.
+- Added a `phase-rollup` receipt family (receipt-of-receipts) to the harness control plane: a hash-sealed rollup that supersedes N child task receipts at a lifecycle boundary, preserving per-child `{id, status, outputUri, outputSha256, receiptSha256, tokens, costTotal, clonedTokens, lowRoi}` pointers plus aggregate ROI totals, with a pure deterministic builder (`buildPhaseRollupReceipt`) and fail-closed semantic validation.
+- Added a pure receipt-ingestion fast path (`ingestReceipts`): fail-closed batch validation + lifecycle transition computation via the existing state machine, plus a deterministic model-facing digest hard-capped at 280 chars — groundwork for LLM-free receipt routing.
+- Added advisory spawn-ROI reconciliation (`reconcileSpawnRoi`) and deterministic fork-context mode advice (`adviseForkContextMode`) surfaced in task receipts without changing task success semantics.
+- Added the Grok Build provider contract design document.
+
+### Changed
+
+- Reduced compiled CLI startup and native bundle pressure with default-small grammar loading, tokenizer tiering, and compiled fast-help paths.
+- Preserved dev/main release metadata and changelog consistency for the 0.4.5 lockstep release.
+
+- Added native `gjc ultragoal steer --kind` support for documented steering mutations beyond `add_subgoal`, including split, reorder, wording revision, ledger annotation, and blocked-goal supersession contracts with structured audit expectations.
+### Fixed
+
+- Kept the unified `goal` tool registered and active by default whenever `goal.enabled` is true, including explicit tool subsets and `gjc ultragoal create-goals` arming flows.
+- Restored no-argument `gjc` interactive startup instead of launching help.
+- Rendered and executed Cursor-native tool calls, including detached/native handler paths and empty-pattern composer grep guards.
+- Tool-output pruning no longer rewrites already-sent provider-facing history mid prompt-cache epoch and now persists pruned message updates back into canonical session storage.
 - Preserved provider abort root causes in the final TUI abort label, kept replay rendering idempotent, and added a `PI_STREAM_IDLE_TIMEOUT_MS` remediation hint when stream idle watchdogs fire.
 - Honored the documented `GJC_RPC_EMIT_TITLE` flag for RPC title events while preserving `PI_RPC_EMIT_TITLE` as a legacy alias.
+- Hardened harness owner recovery/finalize paths and submit-prompt-file handling.
+
+## [0.4.4] - 2026-06-10
+
+### Added
+
+- Made coordinator turns event-backed, adding an MCP coordinator server and the `gjc coordinator` / `gjc mcp-serve` commands backed by durable turn/session state (#479).
+- Surfaced awaited sub-agent live streaming status in the await panel (#475).
+
+### Changed
+
+- Refreshed the README brand images (#477).
+
+### Fixed
+
+- Persisted ralplan role-agent artifacts via the CLI, returning receipt-only output to the caller (#474).
+- Collected the `ask` tool "Other" custom input inline below the option list (#476).
 
 ## [0.4.3] - 2026-06-10
 

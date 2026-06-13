@@ -1,5 +1,6 @@
 import { resolveOpenAICompat } from "./providers/openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
+import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /** User-facing thinking levels, ordered least to most intensive. */
 export const enum Effort {
@@ -381,6 +382,14 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 		model.applyPatchToolType = applyPatchToolType;
 	} else {
 		delete model.applyPatchToolType;
+	}
+	if (
+		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
+		isClaudeForcedToolChoiceIncapableModelId(model.id)
+	) {
+		// Claude Mythos accepts tools but rejects forced tool use (Anthropic
+		// 400: "tool_choice forces tool use is not compatible with this model").
+		model.compat = { ...(model.compat ?? {}), toolChoiceSupport: "auto" } as typeof model.compat;
 	}
 	if (parsedModel.family === "anthropic") {
 		applyAnthropicCatalogPolicy(model, parsedModel);

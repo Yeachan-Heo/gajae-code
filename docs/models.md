@@ -192,20 +192,23 @@ profiles:
 
 Built-in profiles are grouped by provider mix and tier:
 
-- `opencode-go-{eco,standard,pro}`
-- `codex-{eco,standard,pro}`
-- `opencode-go-codex-{eco,standard,pro}`
+- `codex-{eco,medium,pro}` — all roles on `openai-codex/gpt-5.5`, differing only by per-role reasoning effort
+- `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
+- `claude-opus` — Anthropic OAuth preset centered on `claude-opus-4-8`
+- Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
+- Combos: `opus-codex` (Claude main agent with Codex support roles), `codex-opencodego` (Codex orchestrator/architect with OpenCode Go workers)
 
-The `eco` tier favors cheaper/faster defaults, `standard` matches normal production defaults (`codex-standard` is the current OpenAI Codex default set), and `pro` raises reasoning for architect, critic, and planner roles. User-defined profiles override built-ins by exact profile name.
+The `eco` tier favors cheaper/faster defaults, `medium` matches normal production defaults, and `pro` raises reasoning for architect, critic, and planner roles. Effort suffixes are clamped to each model's supported thinking range at preview and activation time (for example `codex-eco`'s executor `:minimal` resolves to effective `low` on `gpt-5.5`). Single-provider tiers pin each provider's current flagship (`zai/glm-5.1`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-v3`). User-defined profiles override built-ins by exact profile name.
+
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
 
 ```sh
-gjc --mpreset codex-standard
-gjc --mpreset opencode-go-pro --default
+gjc --mpreset codex-medium
+gjc --mpreset opencodego --default
 ```
 
-The `/model` command shows a `Profiles` section above model selection. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers.
+The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
@@ -274,7 +277,7 @@ Use provider-level `headers` for proxy-required headers. Keep the provider `api`
 
 When request shaping is needed:
 
-- `requestTransform.profile: openai-proxy` strips OpenAI SDK/Stainless telemetry headers at final fetch time and sets a generic GJC user agent.
+- `requestTransform.profile: openai-proxy` strips OpenAI SDK/Stainless telemetry and beta headers at final fetch time and sets a generic GJC user agent.
 - `stripHeaders` replaces the preset strip list when provided.
 - `setHeaders` is applied after stripping; use `null` to remove a header.
 - `extraBody` is shallow-merged into the JSON request body after provider compatibility fields; core transport keys such as `model`, `messages`/`input`, `stream`, `tools`, and `tool_choice` are protected and ignored.

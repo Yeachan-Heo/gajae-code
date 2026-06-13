@@ -25,22 +25,13 @@ interface SelectionCapture {
 	selector?: string;
 }
 
-interface PresetCapture {
-	kind: "preset";
+type TestModelSelectorSelection = {
+	kind: "assignment";
 	model: Model;
-	selector: string;
-	assignments: Record<GjcModelAssignmentTargetId, ThinkingLevel>;
-}
-
-type TestModelSelectorSelection =
-	| {
-			kind: "assignment";
-			model: Model;
-			role: GjcModelAssignmentTargetId | null;
-			thinkingLevel?: ThinkingLevel;
-			selector?: string;
-	  }
-	| PresetCapture;
+	role: GjcModelAssignmentTargetId | null;
+	thinkingLevel?: ThinkingLevel;
+	selector?: string;
+};
 
 interface CreateSelectorOptions {
 	modelRegistry?: ModelRegistry;
@@ -472,9 +463,9 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}:high`);
 	});
 
-	test("shows OpenAI Codex role preset action with requested reasoning map", async () => {
+	test("shows only role assignment actions for OpenAI Codex reasoning models", async () => {
 		installTestTheme();
-		const model = createOpenAIModel("openai-codex", "gpt-codex-preset-test");
+		const model = createOpenAIModel("openai-codex", "gpt-codex-actions-test");
 		model.thinking = {
 			minLevel: Effort.Low,
 			maxLevel: Effort.XHigh,
@@ -483,75 +474,22 @@ describe("ModelSelector canonical model selection", () => {
 		};
 		const settings = Settings.isolated({});
 
-		let selected: PresetCapture | undefined;
-		const selector = createSelector(
-			model,
-			settings,
-			selection => {
-				if (selection.kind === "preset") selected = selection;
-			},
-			{ thinkingLevel: null },
-		);
+		const selector = createSelector(model, settings, undefined, { thinkingLevel: null });
 		await Bun.sleep(0);
 		installTestTheme();
 
 		selector.handleInput("\n");
 		const actionRendered = normalizeRenderedText(selector.render(260).join("\n"));
-		expect(actionRendered).toContain("Apply OpenAI Codex role preset");
-		expect(actionRendered).toContain("Default medium, Executor low, Architect xhigh, Planner medium, Critic high");
 
-		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
-		selector.handleInput("\n");
-
-		const selectedAfterPreset = selected;
-		if (!selectedAfterPreset) throw new Error("Expected OpenAI Codex preset selection");
-		expect(selectedAfterPreset.kind).toBe("preset");
-		expect(selectedAfterPreset.selector).toBe(`${model.provider}/${model.id}`);
-		expect(selectedAfterPreset.assignments).toEqual({
-			default: ThinkingLevel.Medium,
-			executor: ThinkingLevel.Low,
-			architect: ThinkingLevel.XHigh,
-			planner: ThinkingLevel.Medium,
-			critic: ThinkingLevel.High,
-		});
-	});
-
-	test("clamps OpenAI Codex role preset to selected model supported reasoning", async () => {
-		installTestTheme();
-		const model = createOpenAIModel("openai-codex", "gpt-codex-clamped-preset-test");
-		model.thinking = {
-			minLevel: Effort.Medium,
-			maxLevel: Effort.High,
-			defaultLevel: Effort.Medium,
-			mode: "effort",
-		};
-		const settings = Settings.isolated({});
-
-		let selected: PresetCapture | undefined;
-		const selector = createSelector(
-			model,
-			settings,
-			selection => {
-				if (selection.kind === "preset") selected = selection;
-			},
-			{ thinkingLevel: null },
+		expect(actionRendered).toContain("Set as DEFAULT (Default)");
+		expect(actionRendered).toContain("Set as EXECUTOR (Executor)");
+		expect(actionRendered).toContain("Set as ARCHITECT (Architect)");
+		expect(actionRendered).toContain("Set as PLANNER (Planner)");
+		expect(actionRendered).toContain("Set as CRITIC (Critic)");
+		expect(actionRendered).not.toContain("Apply OpenAI Codex role preset");
+		expect(actionRendered).not.toContain(
+			"Default medium, Executor low, Architect xhigh, Planner medium, Critic high",
 		);
-		await Bun.sleep(0);
-		installTestTheme();
-
-		selector.handleInput("\n");
-		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
-		selector.handleInput("\n");
-
-		const selectedAfterPreset = selected;
-		if (!selectedAfterPreset) throw new Error("Expected OpenAI Codex preset selection");
-		expect(selectedAfterPreset.assignments).toEqual({
-			default: ThinkingLevel.Medium,
-			executor: ThinkingLevel.Medium,
-			architect: ThinkingLevel.High,
-			planner: ThinkingLevel.Medium,
-			critic: ThinkingLevel.High,
-		});
 	});
 
 	test("prompts for reasoning when scoped OpenAI thinking came from defaults", async () => {

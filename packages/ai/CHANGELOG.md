@@ -2,9 +2,45 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a generic tool-choice capability model: `toolChoiceSupport` compat enum (`none`/`auto`/`required`/`named`) available on every forced-choice-capable API, derived from the legacy `supportsToolChoice`/`supportsForcedToolChoice` booleans when absent, with a shared `resolveToolChoice` helper that clamps requested tool choices (`named` → `required` → omit) and returns structured degradation metadata.
+- Added a transparent one-shot fallback for forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model" and equivalents): transports retry once without the forced field at a pre-content streaming boundary, record the discovery in an in-memory per-process incapability registry, and emit an internal non-rendered `toolChoiceIncapability` event. Applies to Anthropic, OpenAI Completions/Responses, Azure Responses, OpenAI code Responses, Bedrock (including event-stream `validationException`), Ollama, Google, and Gemini CLI transports.
+- Added bundled catalog entries for `kimi-code/kimi-k2.7-code`, `minimax-code/minimax-v3`, and `xai/grok-composer-2.5-fast`.
+- Added composer-harness anchor/edit discipline injection for Cursor Composer and Grok Composer models so provider-specific coding harness priors do not override GJC hashline/edit contracts.
+
+### Removed
+
+- Removed the retired `anthropic/claude-fable-5` bundled catalog entry.
+
+### Changed
+
+- Moved the Claude Mythos forced-tool-use incapability knowledge out of Anthropic request code into catalog compat defaults (`toolChoiceSupport: "auto"`), applied during catalog generation, dynamic discovery, and bundled-model loading via a shared predicate.
+- Google `toolConfig` mapping now sends `FunctionCallingConfig` mode `ANY` for both `required` and `any` requests instead of silently relaxing `required` to `AUTO`.
+- Optimized `EventStream` queue draining with a head-indexed queue to avoid repeated array shifts in hot streaming paths.
+- Clarified lazy builtin provider registration as the main provider loading path.
+
 ### Fixed
 
-- Fixed direct Anthropic requests for Claude Fable/Mythos-style models that support tools but reject forced tool use by omitting forced `tool_choice` while preserving `auto`/`none` choices.
+- Stripped `OpenAI-Beta` in the `openai-proxy` request transform profile so OpenAI-compatible proxies do not receive SDK beta headers.
+
+## [0.4.5] - 2026-06-12
+
+### Changed
+
+- Bumped the spoofed Gemini CLI User-Agent version to 0.46.0 to track the upstream release.
+
+### Fixed
+
+- Fixed direct Anthropic requests for Claude Mythos-style models that support tools but reject forced tool use by omitting forced `tool_choice` while preserving `auto`/`none` choices.
+- Preserved catalog transport metadata for opencode-go `qwen3.7-max` model resolution.
+- Set SQLite auth-store `busy_timeout` before enabling WAL so initialization is reliable under contention.
+- Resolved provider credentials from inherited or GJC-owned environment sources instead of trusting the caller project's `.env` overlays.
+- Rendered and executed Cursor-native tool calls without dropping provider-specific call details.
+
+## [0.4.4] - 2026-06-10
+
+- Version aligned with the 0.4.4 monorepo release; no functional changes in this package.
 
 ## [0.4.2] - 2026-06-09
 

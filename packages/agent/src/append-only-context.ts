@@ -46,6 +46,9 @@ export interface BuildOptions {
 export class StablePrefix {
 	#snapshot: StablePrefixSnapshot | null = null;
 	#version = 0;
+	#sourceSystemPrompt: readonly string[] | null = null;
+	#sourceTools: AgentContext["tools"] | null = null;
+	#sourceIntentTracing: boolean | null = null;
 
 	get fingerprint(): string {
 		return this.#snapshot?.fingerprint ?? "<unbuilt>";
@@ -65,6 +68,9 @@ export class StablePrefix {
 		const systemPrompt = cloneJson(snapshot.systemPrompt);
 		const tools = normalizeImportedTools(snapshot.tools, options);
 		const fingerprint = computeFingerprint(systemPrompt, tools, options);
+		this.#sourceSystemPrompt = null;
+		this.#sourceTools = null;
+		this.#sourceIntentTracing = null;
 		if (fingerprint !== snapshot.fingerprint) {
 			throw new Error(
 				`StablePrefix.importSnapshot() fingerprint mismatch: expected ${fingerprint}, received ${snapshot.fingerprint}`,
@@ -79,11 +85,26 @@ export class StablePrefix {
 	 * Returns `true` if the prefix actually changed (cache miss imminent).
 	 */
 	build(context: AgentContext, options: BuildOptions): boolean {
+		if (
+			this.#snapshot &&
+			this.#sourceSystemPrompt === context.systemPrompt &&
+			this.#sourceTools === context.tools &&
+			this.#sourceIntentTracing === options.intentTracing
+		) {
+			const sourceFingerprint = takeSnapshot(context, options).fingerprint;
+			if (this.#snapshot.fingerprint === sourceFingerprint) return false;
+		}
 		const snapshot = takeSnapshot(context, options);
 		if (this.#snapshot && this.#snapshot.fingerprint === snapshot.fingerprint) {
+			this.#sourceSystemPrompt = context.systemPrompt;
+			this.#sourceTools = context.tools;
+			this.#sourceIntentTracing = options.intentTracing;
 			return false;
 		}
 		this.#snapshot = snapshot;
+		this.#sourceSystemPrompt = context.systemPrompt;
+		this.#sourceTools = context.tools;
+		this.#sourceIntentTracing = options.intentTracing;
 		this.#version++;
 		return true;
 	}
@@ -91,6 +112,9 @@ export class StablePrefix {
 	/** Force rebuild on the next `build()` call. */
 	invalidate(): void {
 		this.#snapshot = null;
+		this.#sourceSystemPrompt = null;
+		this.#sourceTools = null;
+		this.#sourceIntentTracing = null;
 	}
 
 	/**
@@ -175,8 +199,8 @@ export class AppendOnlyContextManager {
 	readonly log = new AppendOnlyLog();
 	/** How many normalized messages were synced into the log as of the last sync. */
 	#lastSyncCount = 0;
-	/** Rolling digest of synced message content — detects in-place rewrites. */
-	#syncedDigest = 0;
+	/** Fingerprint plus source bytes of synced message content — detects in-place rewrites with no hash-only equality. */
+	#syncedDigest = emptyMessageDigest();
 	/** Number of provider-normalized messages that were seeded before child-local messages. */
 	#seededPrefixCount = 0;
 
@@ -208,19 +232,22 @@ export class AppendOnlyContextManager {
 	 * (same length, changed content via a rolling digest).
 	 */
 	syncMessages(normalizedMessages: any[]): void {
-		const seededPrefix = this.#seededPrefixCount > 0 ? this.log.toMessages().slice(0, this.#seededPrefixCount) : [];
+		const seededPrefixLength = this.#seededPrefixCount;
 		const includesSeedPrefix =
-			seededPrefix.length > 0 &&
-			normalizedMessages.length >= seededPrefix.length &&
-			this.#computeDigest(normalizedMessages.slice(0, seededPrefix.length)) === this.#computeDigest(seededPrefix);
+			seededPrefixLength > 0 &&
+			normalizedMessages.length >= seededPrefixLength &&
+			this.#computeDigestRange(normalizedMessages, 0, seededPrefixLength).source ===
+				this.#computeDigestRange(this.log.entries(), 0, seededPrefixLength).source;
 		const messagesToSync =
-			seededPrefix.length > 0 && !includesSeedPrefix ? [...seededPrefix, ...normalizedMessages] : normalizedMessages;
+			seededPrefixLength > 0 && !includesSeedPrefix
+				? [...this.log.entries().slice(0, seededPrefixLength), ...normalizedMessages]
+				: normalizedMessages;
 
 		// Detect in-place rewrites of already-synced messages.
 		if (
 			this.#lastSyncCount > 0 &&
 			this.#lastSyncCount <= messagesToSync.length &&
-			this.#computeDigest(messagesToSync.slice(0, this.#lastSyncCount)) !== this.#syncedDigest
+			this.#computeDigestRange(messagesToSync, 0, this.#lastSyncCount).source !== this.#syncedDigest.source
 		) {
 			if (this.#seededPrefixCount > 0) {
 				throw new Error("AppendOnlyContextManager.syncMessages() seed prefix changed");
@@ -266,7 +293,7 @@ export class AppendOnlyContextManager {
 		this.prefix.invalidate();
 		this.log.clear();
 		this.#lastSyncCount = 0;
-		this.#syncedDigest = 0;
+		this.#syncedDigest = emptyMessageDigest();
 		this.#seededPrefixCount = 0;
 	}
 
@@ -274,7 +301,7 @@ export class AppendOnlyContextManager {
 	resetSyncCursor(): void {
 		this.log.clear();
 		this.#lastSyncCount = 0;
-		this.#syncedDigest = 0;
+		this.#syncedDigest = emptyMessageDigest();
 		this.#seededPrefixCount = 0;
 	}
 
@@ -294,42 +321,55 @@ export class AppendOnlyContextManager {
 		this.prefix.invalidate();
 		this.log.clear();
 		this.#lastSyncCount = 0;
-		this.#syncedDigest = 0;
+		this.#syncedDigest = emptyMessageDigest();
 		this.#seededPrefixCount = 0;
 		this.prefix.build(context, options);
 	}
 
 	/**
-	 * Deterministic digest over every field the provider may serialize — role,
-	 * content, tool calls (both `toolCalls` and OpenAI-wire `tool_calls`),
-	 * `tool_call_id`, `name`, `id`. Hashed with the same FNV-style rolling
-	 * accumulator so in-place rewrites of *any* of these fields are visible.
+	 * Deterministic digest over the provider-visible message payload. The source
+	 * string is kept and compared for equality so the hash is only a fast summary,
+	 * never the authority for accepting append-only sync state.
 	 */
-	#computeDigest(messages: readonly unknown[]): number {
-		let hash = 0;
-		for (let i = 0; i < messages.length; i++) {
-			const msg = messages[i];
-			if (!msg || typeof msg !== "object") continue;
-			const m = msg as Record<string, unknown>;
-			const payload = JSON.stringify({
-				r: m.role ?? null,
-				c: m.content ?? null,
-				tc: m.toolCalls ?? m.tool_calls ?? null,
-				tcid: m.tool_call_id ?? null,
-				n: m.name ?? null,
-				id: m.id ?? null,
-			});
-			for (let j = 0; j < payload.length; j++) {
-				hash = ((hash << 5) - hash + payload.charCodeAt(j)) | 0;
-			}
+	#computeDigest(messages: readonly unknown[]): MessageDigest {
+		return this.#computeDigestRange(messages, 0, messages.length);
+	}
+
+	#computeDigestRange(messages: readonly unknown[], start: number, end: number): MessageDigest {
+		let source = "[";
+		for (let i = start; i < end; i++) {
+			if (i > start) source += ",";
+			source += JSON.stringify(messages[i]) ?? "null";
 		}
-		return hash >>> 0;
+		source += "]";
+		return { hash: hashSource(source), source };
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot helpers
 // ---------------------------------------------------------------------------
+
+type MessageDigest = {
+	hash: number | bigint;
+	source: string;
+};
+
+function emptyMessageDigest(): MessageDigest {
+	return { hash: hashSource("[]"), source: "[]" };
+}
+
+function hashSource(source: string): number | bigint {
+	return typeof Bun !== "undefined" ? Bun.hash(source) : hashString32(source);
+}
+
+function hashString32(value: string): number {
+	let hash = 0;
+	for (let i = 0; i < value.length; i++) {
+		hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+	}
+	return hash >>> 0;
+}
 
 function takeSnapshot(context: AgentContext, options: BuildOptions): StablePrefixSnapshot {
 	const systemPrompt = [...context.systemPrompt];
@@ -347,8 +387,42 @@ function normalizeImportedTools(tools: readonly Tool[], options: BuildOptions): 
 	return cloneJson(normalizedTools);
 }
 
-function cloneJson<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value)) as T;
+export function cloneJson<T>(value: T): T {
+	return cloneJsonValue(value) as T;
+}
+
+function cloneJsonValue(value: unknown, key = "", applyToJson = true): unknown {
+	if (value === null) return null;
+	const type = typeof value;
+	if (type === "number") return Number.isFinite(value) ? value : null;
+	// JSON.stringify drops function/symbol/undefined values (object props
+	// omitted, array elements become null via the array walk below).
+	if (type === "undefined" || type === "function" || type === "symbol") return undefined;
+	if (type !== "object") return value;
+	if (applyToJson) {
+		// JSON.stringify performs a single Get of `toJSON` per holder/key and
+		// serializes the returned replacement WITHOUT re-dispatching the
+		// replacement's own toJSON at the same level (nested properties still
+		// dispatch normally). Mirror that exactly to keep byte parity.
+		const toJSON = (value as { toJSON?: unknown }).toJSON;
+		if (typeof toJSON === "function") {
+			return cloneJsonValue(toJSON.call(value, key), key, false);
+		}
+	}
+	if (Array.isArray(value)) {
+		const cloned: unknown[] = new Array(value.length);
+		for (let i = 0; i < value.length; i++) {
+			const item = Object.hasOwn(value, i) ? cloneJsonValue(value[i], String(i)) : undefined;
+			cloned[i] = item === undefined ? null : item;
+		}
+		return cloned;
+	}
+	const cloned: Record<string, unknown> = {};
+	for (const key of Object.keys(value as object)) {
+		const clonedValue = cloneJsonValue((value as Record<string, unknown>)[key], key);
+		if (clonedValue !== undefined) cloned[key] = clonedValue;
+	}
+	return cloned;
 }
 
 function computeFingerprint(systemPrompt: string[], tools: Tool[], options: BuildOptions): string {

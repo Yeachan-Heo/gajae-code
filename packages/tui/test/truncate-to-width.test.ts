@@ -40,6 +40,15 @@ describe("truncateToWidth", () => {
 		expect(visibleWidth(truncated)).toBeLessThanOrEqual(10);
 		expect(truncated.endsWith("\x1b[0m")).toBe(true);
 	});
+
+	it("truncates wide BMP emoji instead of treating them as printable ASCII", () => {
+		const text = "⌚".repeat(40);
+		const truncated = truncateToWidth(text, 40, Ellipsis.Omit);
+
+		expect(visibleWidth(text)).toBeGreaterThan(40);
+		expect(visibleWidth(truncated)).toBeLessThanOrEqual(40);
+		expect(truncated.length).toBeLessThan(text.length);
+	});
 });
 
 describe("visibleWidth", () => {

@@ -438,6 +438,31 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 		expect(inheritedAssistant.content.every(block => block.type !== "thinking")).toBe(true);
 
+		const jsonEdgeMessage = {
+			role: "user" as const,
+			content: {
+				dropped: undefined,
+				date: new Date("2026-06-12T08:12:00.000Z"),
+				proto: Object.assign(Object.create({ inherited: "ignored" }), { own: "kept" }),
+				// biome-ignore lint/suspicious/noSparseArray: array hole is an intentional JSON-semantics fixture
+				array: [undefined, , new Date("2024-01-02T03:04:05.000Z")],
+			},
+			timestamp: Date.now(),
+		};
+		const providerMessages = (
+			parent as unknown as { model: unknown; messages: Message[]; agent: { state: { messages: Message[] } } }
+		).messages;
+		const originalProviderMessages = [...providerMessages];
+		providerMessages.splice(0, providerMessages.length, jsonEdgeMessage as unknown as Message);
+		const jsonSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+		const seededJsonMessage = jsonSeed.messages.find(
+			message => message.role === "user" && typeof message.content === "object",
+		);
+		expect(JSON.stringify(seededJsonMessage)).toBe(
+			JSON.stringify({ ...JSON.parse(JSON.stringify(jsonEdgeMessage)), attribution: "user" }),
+		);
+		expect(jsonSeed.agentMessages).toEqual(jsonSeed.messages);
+		providerMessages.splice(0, providerMessages.length, ...originalProviderMessages);
 		const childState = new Map<string, ProviderSessionState>();
 		const childManager = SessionManager.create(tempDir, tempDir);
 		const { session: child, authStorage: childAuthStorage } = await createSessionHarness(tempDir, childManager, {

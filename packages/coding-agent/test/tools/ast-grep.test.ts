@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { supportsLanguage } from "@gajae-code/natives";
 
 function createTestSession(cwd = "/tmp/test", overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -111,7 +112,7 @@ describe("ast_grep parse errors", () => {
 		}
 	});
 
-	it("parses PlusCal content through the tlaplus language aliases", async () => {
+	it.skipIf(!supportsLanguage("tlaplus"))("parses PlusCal content through the tlaplus language aliases", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-tlaplus-"));
 		try {
 			const filePath = path.join(tempDir, "Spec.tla");

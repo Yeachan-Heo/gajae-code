@@ -23,6 +23,7 @@
 
 pub mod appearance;
 pub mod ast;
+pub mod build_info;
 pub mod clipboard;
 pub mod crash;
 pub mod edit_fuzzy;
@@ -71,5 +72,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_4_3")]
+#[napi(js_name = "__piNativesV0_4_5")]
 pub const fn pi_natives_version_sentinel() {}

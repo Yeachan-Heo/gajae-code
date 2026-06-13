@@ -22,6 +22,11 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
 import type {
 	Content,
 	FinishReason,
@@ -59,7 +64,7 @@ export type GoogleThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LO
  * `google-gemini-cli` uses a different transport and request shape — do not extend this for it.
  */
 export interface GoogleSharedStreamOptions extends StreamOptions {
-	toolChoice?: "auto" | "none" | "any";
+	toolChoice?: "auto" | "none" | "any" | "required";
 	thinking?: {
 		enabled: boolean;
 		budgetTokens?: number;
@@ -366,6 +371,7 @@ export function mapToolChoice(choice: string): FunctionCallingConfigMode {
 		case "none":
 			return "NONE";
 		case "any":
+		case "required":
 			return "ANY";
 		default:
 			return "AUTO";
@@ -689,14 +695,15 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools, model) }),
 	};
 
-	if (context.tools && context.tools.length > 0 && options.toolChoice) {
-		config.toolConfig = {
-			functionCallingConfig: {
-				mode: mapToolChoice(options.toolChoice),
-			},
-		};
-	} else {
-		config.toolConfig = undefined;
+	if (context.tools && context.tools.length > 0) {
+		const resolved = resolveToolChoice(model, options.toolChoice);
+		if (resolved.resolvedChoice) {
+			config.toolConfig = {
+				functionCallingConfig: {
+					mode: mapToolChoice(resolved.resolvedChoice as string),
+				},
+			};
+		}
 	}
 
 	if (options.thinking?.enabled && model.reasoning) {
@@ -789,14 +796,56 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				headers: plan.headers,
 			};
 
-			const wireBody = paramsToWireBody(params);
+			let wireBody = paramsToWireBody(params);
+			const sentForcedToolChoice =
+				(params.config?.toolConfig?.functionCallingConfig?.mode === "ANY" ||
+					params.config?.toolConfig?.functionCallingConfig?.mode === "VALIDATED") &&
+				options?.toolChoice !== undefined &&
+				options.toolChoice !== "auto" &&
+				options.toolChoice !== "none";
 			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
-			const response = await fetchImpl(plan.url, {
+			let response = await fetchImpl(plan.url, {
 				method: "POST",
 				headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
 				body: JSON.stringify(wireBody),
 				signal: options?.signal,
 			});
+			if (!response.ok && sentForcedToolChoice) {
+				const errorText = await response.text().catch(() => "");
+				const error = withHttpStatus(
+					new Error(`Google API error (${response.status}): ${extractGoogleErrorMessage(errorText)}`),
+					response.status,
+				);
+				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+					const beforeMark = resolveToolChoice(model, options?.toolChoice);
+					markToolChoiceIncapability(model, "auto", error.message);
+					stream.push({
+						type: "toolChoiceIncapability",
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						requestedLevel: beforeMark.requestedLevel,
+						resolvedLevel: "auto",
+						reason: error.message,
+						registryKey: beforeMark.registryKey,
+					});
+					const retryParams = {
+						...params,
+						config: params.config ? { ...params.config, toolConfig: undefined } : params.config,
+					};
+					params = retryParams;
+					rawRequestDump = { ...rawRequestDump, body: params };
+					wireBody = paramsToWireBody(params);
+					response = await fetchImpl(plan.url, {
+						method: "POST",
+						headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
+						body: JSON.stringify(wireBody),
+						signal: options?.signal,
+					});
+				} else {
+					throw error;
+				}
+			}
 			if (!response.ok) {
 				const errorText = await response.text().catch(() => "");
 				throw withHttpStatus(
@@ -857,7 +906,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
  * `abortSignal` is intentionally dropped — the SDK propagates it via `fetch.signal`,
  * which our caller already wires up through `options.signal`.
  */
-function paramsToWireBody(params: GenerateContentParameters): Record<string, unknown> {
+export function paramsToWireBody(params: GenerateContentParameters): Record<string, unknown> {
 	const body: Record<string, unknown> = { contents: params.contents };
 	const config = params.config;
 	if (!config) return body;

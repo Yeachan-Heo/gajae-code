@@ -280,6 +280,183 @@ describe("OutputSink", () => {
 		expect(dumped.output).toBe("bcdef");
 	});
 
+	test("artifact mirror keeps raw ANSI controls and sixel bytes while metadata stays stable", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "raw-output.log");
+		const sixel = '\x1bPq"1;1;1;1#0;2;0;0;0#0!4~\x1b\\';
+		const input = `head\n\x1b[31mred\x1b[0m\x00\x07${sixel}\n${"M".repeat(200)}\ntail`;
+		const sink = new OutputSink({
+			artifactPath,
+			artifactId: "artifact-raw",
+			spillThreshold: 24,
+			headBytes: 12,
+			maxColumns: 8,
+		});
+
+		for (let offset = 0; offset < input.length; offset += 17) {
+			sink.push(input.slice(offset, offset + 17));
+		}
+		const dumped = await sink.dump();
+		const artifactText = await Bun.file(artifactPath).text();
+
+		expect(artifactText).toBe(input);
+		expect(dumped.artifactId).toBe("artifact-raw");
+		expect(dumped.truncated).toBe(true);
+		expect(dumped.totalBytes).toBe(byteLength(input));
+		expect(dumped.totalLines).toBe(4);
+		expect(dumped.outputBytes).toBe(byteLength(dumped.output));
+		expect(dumped.elidedBytes).toBeUndefined();
+		expect(dumped.elidedLines).toBeUndefined();
+		expect(dumped.columnDroppedBytes).toBe(204);
+		expect(dumped.columnTruncatedLines).toBe(2);
+		expect(dumped.output).not.toContain("\x1bPq");
+		expect(dumped.output).not.toContain("\x00");
+	});
+
+	test("column-capped streams force raw artifact persistence before tail overflow", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "column-capped.log");
+		const input = `${"x".repeat(64)}\n${"y".repeat(64)}\n`;
+		const sink = new OutputSink({
+			artifactPath,
+			artifactId: "column-capped",
+			maxColumns: 4,
+			spillThreshold: 1024,
+		});
+
+		for (let offset = 0; offset < input.length; offset += 8) sink.push(input.slice(offset, offset + 8));
+		const dumped = await sink.dump();
+
+		expect(dumped.truncated).toBe(true);
+		expect(dumped.artifactId).toBe("column-capped");
+		expect(dumped.columnTruncatedLines).toBe(2);
+		expect(await Bun.file(artifactPath).text()).toBe(input);
+	});
+
+	test("post-dump push cannot reopen or overwrite a finalized artifact", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "finalized.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "finalized", spillThreshold: 4 });
+
+		sink.push("abcdef");
+		const first = await sink.dump();
+		const before = await Bun.file(artifactPath).text();
+		sink.push("LATE");
+		const second = await sink.dump();
+		const after = await Bun.file(artifactPath).text();
+
+		expect(first.artifactId).toBe("finalized");
+		expect(second.artifactId).toBe("finalized");
+		expect(before).toBe("abcdef");
+		expect(after).toBe(before);
+	});
+
+	test("post-dump dump remains cumulative like the HEAD lifecycle oracle", async () => {
+		const sink = new OutputSink({ spillThreshold: 5, headBytes: 4 });
+		sink.push("abcdef");
+		const first = await sink.dump();
+		sink.push("ghi");
+		const second = await sink.dump();
+
+		expect(first.output).toBe("abcdef");
+		expect(second.output).toBe("abcdefghi");
+		expect(second.totalBytes).toBe(byteLength("abcdefghi"));
+		expect(second.truncated).toBe(false);
+	});
+
+	test("raw replay survives a non-finalized dump so a later spill yields a cumulative artifact", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "cumulative.log");
+		// spillThreshold large enough that the first small push never opens the sink.
+		const sink = new OutputSink({ artifactPath, artifactId: "cumulative", spillThreshold: 32 });
+
+		sink.push("small-");
+		const first = await sink.dump(); // no artifact yet: sink never opened
+		expect(first.artifactId).toBeUndefined();
+
+		const large = "X".repeat(64); // crosses the spill threshold post-dump
+		sink.push(large);
+		const second = await sink.dump();
+
+		expect(second.artifactId).toBe("cumulative");
+		// The artifact must contain the CUMULATIVE raw stream, including the
+		// chunk pushed before the non-finalized dump.
+		expect(await Bun.file(artifactPath).text()).toBe(`small-${large}`);
+	});
+
+	test("artifact late-open replay remains byte-correct after tail trimming", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "late-open.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "late-open", spillThreshold: 10, headBytes: 4 });
+		const input = `HEAD-${"m".repeat(64)}-TAIL`;
+
+		for (let offset = 0; offset < input.length; offset += 7) sink.push(input.slice(offset, offset + 7));
+		await sink.dump();
+
+		expect(await Bun.file(artifactPath).text()).toBe(input);
+	});
+
+	test("artifact write failure retries from the raw replay queue without duplicating bytes", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "retry.log");
+		const originalFile = Bun.file;
+		let writes = 0;
+		let failed = false;
+		try {
+			Bun.file = ((filePath: string | URL, ...args: unknown[]) => {
+				const file = originalFile(filePath, ...(args as []));
+				if (String(filePath) !== artifactPath) return file;
+				return new Proxy(file, {
+					get(target, prop, _receiver) {
+						if (prop !== "writer") return Reflect.get(target, prop, target);
+						return () => {
+							const sink = target.writer();
+							return new Proxy(sink, {
+								get(sinkTarget, sinkProp, _sinkReceiver) {
+									if (sinkProp === "end") return sinkTarget.end.bind(sinkTarget);
+									if (sinkProp !== "write") return Reflect.get(sinkTarget, sinkProp, sinkTarget);
+									return (chunk: string | Uint8Array) => {
+										writes++;
+										if (!failed && writes === 2) {
+											failed = true;
+											throw new Error("simulated write failure");
+										}
+										return sinkTarget.write.call(sinkTarget, chunk as string);
+									};
+								},
+							});
+						};
+					},
+				});
+			}) as typeof Bun.file;
+
+			const sink = new OutputSink({ artifactPath, artifactId: "retry", spillThreshold: 5 });
+			const input = "abcde" + "fghij" + "klmno";
+			for (let offset = 0; offset < input.length; offset += 5) sink.push(input.slice(offset, offset + 5));
+			await sink.dump();
+
+			Bun.file = originalFile;
+			expect(await Bun.file(artifactPath).text()).toBe(input);
+		} finally {
+			Bun.file = originalFile;
+		}
+	});
+
+	test("artifact abort writes a clean raw prefix", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "abort.log");
+		const input = `prefix-${"x".repeat(128)}-suffix`;
+		const sink = new OutputSink({ artifactPath, artifactId: "abort", spillThreshold: 12 });
+
+		for (let offset = 0; offset < 73; offset += 11)
+			sink.push(input.slice(offset, Math.min(input.length, offset + 11)));
+		await sink.dump();
+
+		const artifactText = await Bun.file(artifactPath).text();
+		expect(input.startsWith(artifactText)).toBe(true);
+		expect(artifactText).toBe(input.slice(0, 77));
+	});
+
 	test("createInput decodes streamed UTF-8 chunks correctly", async () => {
 		const sink = new OutputSink();
 		const writer = sink.createInput().getWriter();
@@ -505,5 +682,18 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dropped).toBeGreaterThan(0);
 		// elided + dropped + kept ≤ totalBytes (with a small slack for the marker/newlines).
 		expect(elided + dropped).toBeLessThan(dumped.totalBytes);
+	});
+
+	test("middle-elided single overlong line matches HEAD column-cap oracle", async () => {
+		const input = `0123456789${"x".repeat(80)}TAIL`;
+		const sink = new OutputSink({ maxColumns: 8, spillThreshold: 12, headBytes: 10 });
+		await sink.push(input);
+		const dumped = await sink.dump();
+
+		expect(dumped.output).toBe("01234…");
+		expect(dumped.columnDroppedBytes).toBe(89);
+		expect(dumped.columnTruncatedLines).toBe(1);
+		expect(dumped.elidedBytes).toBeUndefined();
+		expect(dumped.totalBytes).toBe(byteLength(input));
 	});
 });

@@ -1,0 +1,246 @@
+import { beforeAll, describe, expect, test, vi } from "bun:test";
+import { Effort, type Model } from "@gajae-code/ai";
+import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	ModelSelectorComponent,
+	type ModelSelectorSelection,
+} from "@gajae-code/coding-agent/modes/components/model-selector";
+import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { TUI } from "@gajae-code/tui";
+
+function normalizeRenderedText(text: string): string {
+	return text
+		.replace(/\x1b\[[0-9;]*m/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+const model = (provider: string, id: string, minLevel = Effort.Low): Model =>
+	({
+		provider,
+		id,
+		name: id,
+		api: "openai-responses",
+		contextWindow: 1000,
+		maxTokens: 1000,
+		thinking: { minLevel, maxLevel: Effort.XHigh, mode: "effort" },
+	}) as Model;
+
+const codexModel = model("openai-codex", "gpt-5.5", Effort.Low);
+const anthropicModel = model("anthropic", "claude-opus-4-8");
+const minimaxModel = model("minimax-code", "minimax-v3");
+const noSuffixModel = model("provider-a", "default");
+
+const codexEco: ModelProfileDefinition = {
+	name: "codex-eco",
+	requiredProviders: ["openai-codex"],
+	modelMapping: {
+		default: "openai-codex/gpt-5.5:low",
+		executor: "openai-codex/gpt-5.5:minimal",
+		planner: "openai-codex/gpt-5.5:low",
+	},
+	source: "builtin",
+};
+const combo: ModelProfileDefinition = {
+	name: "opus-codex",
+	requiredProviders: ["anthropic", "openai-codex"],
+	modelMapping: { default: "anthropic/claude-opus-4-8:xhigh", executor: "openai-codex/gpt-5.5:low" },
+	source: "builtin",
+};
+const minimax: ModelProfileDefinition = {
+	name: "minimax-medium",
+	requiredProviders: ["minimax-code"],
+	modelMapping: { default: "minimax-code/minimax-v3:medium" },
+	source: "builtin",
+};
+const noSuffixProfile: ModelProfileDefinition = {
+	name: "profile-no-suffix",
+	requiredProviders: ["provider-a"],
+	modelMapping: { default: "provider-a/default" },
+	source: "user",
+};
+
+let testTheme = await getThemeByName("red-claw");
+function installTestTheme(): void {
+	if (!testTheme) throw new Error("Failed to load test theme");
+	setThemeInstance(testTheme);
+}
+
+function createRegistry(
+	authenticatedProviders: readonly string[],
+	profiles: ModelProfileDefinition[] = [codexEco, combo, minimax, noSuffixProfile],
+) {
+	const profileMap = new Map(profiles.map(profile => [profile.name, profile]));
+	return {
+		refresh: vi.fn(async () => {}),
+		getError: () => undefined,
+		getAvailable: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
+		getAll: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
+		getDiscoverableProviders: () => [],
+		getCanonicalModels: () => [],
+		resolveCanonicalModel: () => undefined,
+		getModelProfiles: () => new Map(profileMap),
+		getModelProfile: (name: string) => profileMap.get(name),
+		getAvailableModelProfileNames: () => [...profileMap.keys()],
+		getApiKeyForProvider: async (provider: string) => (authenticatedProviders.includes(provider) ? "key" : undefined),
+		getApiKey: async () => "key",
+	};
+}
+
+function createSelector(
+	options: {
+		authenticatedProviders?: readonly string[];
+		temporaryOnly?: boolean;
+		initialSearchInput?: string;
+		scopedModels?: Array<{ model: Model }>;
+		onCancel?: () => void;
+		onSelect?: (selection: ModelSelectorSelection) => void | Promise<void>;
+		profiles?: ModelProfileDefinition[];
+	} = {},
+) {
+	const ui = { requestRender: vi.fn() } as unknown as TUI;
+	return new ModelSelectorComponent(
+		ui,
+		undefined,
+		Settings.isolated(),
+		createRegistry(
+			options.authenticatedProviders ?? ["openai-codex", "anthropic", "minimax-code", "provider-a"],
+			options.profiles,
+		) as never,
+		options.scopedModels ?? [],
+		options.onSelect ?? (() => {}),
+		options.onCancel ?? (() => {}),
+		{ temporaryOnly: options.temporaryOnly, initialSearchInput: options.initialSearchInput },
+	);
+}
+
+async function rendered(selector: ModelSelectorComponent): Promise<string> {
+	await Bun.sleep(10);
+	installTestTheme();
+	return normalizeRenderedText(selector.render(260).join("\n"));
+}
+
+describe("preset landing adversarial QA", () => {
+	beforeAll(async () => {
+		testTheme = await getThemeByName("red-claw");
+		installTestTheme();
+	});
+
+	test("Escape closes exactly one preset layer in order", async () => {
+		const cancel = vi.fn();
+		const selector = createSelector({ onCancel: cancel });
+		await rendered(selector);
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n"); // preview first expanded profile
+		selector.handleInput("\n"); // scope menu
+		expect(normalizeRenderedText(selector.render(260).join("\n"))).toContain("Apply for this session");
+
+		selector.handleInput("\x1b");
+		let text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).not.toContain("Apply for this session");
+		expect(text).toContain("Preset preview: Codex Eco");
+
+		selector.handleInput("\x1b");
+		text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).not.toContain("Preset preview:");
+		expect(text).toContain("Codex Eco");
+
+		selector.handleInput("\x1b");
+		text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).not.toContain("codex-eco");
+		expect(text).toContain("CODEX");
+
+		selector.handleInput("\x1b");
+		expect(cancel).toHaveBeenCalledTimes(1);
+	});
+
+	test("printable input exits preview/scope menu into seeded model search", async () => {
+		const selector = createSelector();
+		await rendered(selector);
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		selector.handleInput("g");
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Models");
+		expect(text).toContain("gpt-5.5");
+		expect(text).not.toContain("Preset preview:");
+		expect(text).not.toContain("Apply for this session");
+	});
+
+	test("up/down wraps at landing boundaries and Browse all preserves model role menu", async () => {
+		const selector = createSelector();
+		await rendered(selector);
+		selector.handleInput("\x1b[A");
+		let text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Browse all models");
+		selector.handleInput("\x1b[B");
+		text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("CODEX");
+		selector.handleInput("\x1b[A");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Action for:");
+		expect(text).toContain("Set as DEFAULT");
+		expect(text).toContain("Set as EXECUTOR");
+	});
+
+	test("temporaryOnly, initialSearchInput, and scoped models bypass preset landing", async () => {
+		expect(await rendered(createSelector({ temporaryOnly: true }))).not.toContain("Model presets");
+		const initial = await rendered(createSelector({ initialSearchInput: "claude" }));
+		expect(initial).not.toContain("Model presets");
+		expect(initial).toContain("Models");
+		const scoped = await rendered(createSelector({ scopedModels: [{ model: codexModel }] }));
+		expect(scoped).not.toContain("Model presets");
+		expect(scoped).toContain("Showing models from --models scope");
+	});
+
+	test("partial combo auth blocks selection and MiniMax hint uses canonical provider id only", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const comboSelector = createSelector({
+			authenticatedProviders: ["openai-codex"],
+			onSelect: selection => {
+				selections.push(selection);
+			},
+		});
+		await rendered(comboSelector);
+		comboSelector.handleInput("\n"); // expand CODEX so COMBOS is visible
+		comboSelector.handleInput("\x1b[B"); // codex-eco profile
+		comboSelector.handleInput("\x1b[B"); // MINIMAX group
+		comboSelector.handleInput("\x1b[B"); // COMBOS group
+		comboSelector.handleInput("\n");
+		let text = normalizeRenderedText(comboSelector.render(260).join("\n"));
+		expect(text).toContain("✗ COMBOS");
+		expect(text).toContain("anthropic");
+		expect(selections).toEqual([]);
+
+		const miniSelector = createSelector({ authenticatedProviders: ["openai-codex", "anthropic", "provider-a"] });
+		await rendered(miniSelector);
+		for (let i = 0; i < 2; i++) miniSelector.handleInput("\x1b[B");
+		miniSelector.handleInput("\n");
+		text = normalizeRenderedText(miniSelector.render(260).join("\n"));
+		expect(text).toContain("/login minimax-code");
+		expect(text).not.toContain("minimax/");
+		expect(text).not.toContain("/login minimax ");
+	});
+
+	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {
+		const selector = createSelector();
+		await rendered(selector);
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		let text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("EXECUTOR: openai-codex/gpt-5.5");
+		expect(text).not.toContain("EXECUTOR: openai-codex/gpt-5.5:minimal");
+
+		const suffixless = createSelector({ profiles: [noSuffixProfile] });
+		await rendered(suffixless);
+		suffixless.handleInput("\x1b[B");
+		suffixless.handleInput("\n");
+		text = normalizeRenderedText(suffixless.render(260).join("\n"));
+		expect(text).toContain("DEFAULT: provider-a/default");
+		expect(text).not.toContain("DEFAULT: provider-a/default:");
+	});
+});

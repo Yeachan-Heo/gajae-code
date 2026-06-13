@@ -1,4 +1,4 @@
-import { $env, $inheritedEnv, extractHttpStatusFromError } from "@gajae-code/utils";
+import { $credentialEnv, $env, $inheritedEnv, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import OpenAI from "openai";
 import type {
 	ChatCompletionAssistantMessageParam,
@@ -61,6 +61,12 @@ import { adaptSchemaForStrict, NO_STRICT, toolWireSchema } from "../utils/schema
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
+import {
+	isForcedToolChoiceUnsupportedError,
+	markToolChoiceIncapability,
+	resolveToolChoice,
+} from "../utils/tool-choice-capability";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -493,7 +499,25 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				});
 			} catch (error) {
 				const capturedErrorResponse = getCapturedErrorResponse();
-				if (
+				const sentForcedToolChoice = isForcedToolChoice(
+					(rawRequestDump?.body as { tool_choice?: unknown } | undefined)?.tool_choice,
+				);
+				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)) {
+					const reason = await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse);
+					markToolChoiceIncapability(model, "auto", reason);
+					const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
+					stream.push({
+						type: "toolChoiceIncapability",
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						requestedLevel: resolvedToolChoice.requestedLevel,
+						resolvedLevel: "auto",
+						reason,
+						registryKey: resolvedToolChoice.registryKey,
+					});
+					openaiStream = await createCompletionsStream();
+				} else if (
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
@@ -928,12 +952,12 @@ async function createClient(
 	clearCapturedErrorResponse: () => void;
 }> {
 	if (!apiKey) {
-		if (!$env.OPENAI_API_KEY) {
+		apiKey = $credentialEnv("OPENAI_API_KEY");
+		if (!apiKey) {
 			throw new Error(
 				"OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it as an argument.",
 			);
 		}
-		apiKey = $env.OPENAI_API_KEY;
 	}
 	const rawApiKey = apiKey;
 
@@ -1166,8 +1190,19 @@ function buildParams(
 		params.tools = [];
 	}
 
-	if (options?.toolChoice && compat.supportsToolChoice) {
-		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
+	if (options?.toolChoice) {
+		const toolChoice = resolveToolChoice(model, options.toolChoice, compat);
+		if (toolChoice.degraded && toolChoice.supportSource === "runtime") {
+			logger.debug("openai-completions: degraded tool_choice after runtime capability discovery", {
+				model: model.id,
+				requestedLevel: toolChoice.requestedLevel,
+				resolvedLevel: toolChoice.resolvedLevel,
+				reason: toolChoice.reason,
+			});
+		}
+		if (toolChoice.resolvedChoice !== undefined) {
+			params.tool_choice = mapToOpenAICompletionsToolChoice(toolChoice.resolvedChoice);
+		}
 	}
 
 	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
@@ -1430,6 +1465,11 @@ export function convertMessages(
 	};
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	// Composer-harness models need anchor/edit discipline pinned ahead of the
+	// host prompt (see composer-discipline.ts for the observed failure modes).
+	if (systemPrompts.length > 0 && isComposerHarnessModel(model.id)) {
+		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
+	}
 	if (systemPrompts.length > 0) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
 		const role = useDeveloperRole ? "developer" : "system";

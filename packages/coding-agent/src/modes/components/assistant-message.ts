@@ -1,5 +1,5 @@
 import type { AssistantMessage, ImageContent, Usage } from "@gajae-code/ai";
-import { Container, Image, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@gajae-code/tui";
+import { type Component, Container, Image, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
 import { settings } from "../../config/settings";
 import { renderDeepInterviewAssistantText } from "../../deep-interview/render-middleware";
@@ -18,6 +18,7 @@ export class AssistantMessageComponent extends Container {
 	#convertedKittyImages = new Map<string, ImageContent>();
 	#kittyConversionsInFlight = new Set<string>();
 	#responseHeader = new Text(theme.bold(theme.fg("statusLineModel", "gajae")), 1, 0);
+	#contentBlocksCache = new WeakMap<object, { source: string; component: Component }>();
 
 	constructor(
 		message?: AssistantMessage,
@@ -106,6 +107,28 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
+	#renderTextBlock(content: { text: string }): Component {
+		const cached = this.#contentBlocksCache.get(content);
+		if (cached?.source === content.text) return cached.component;
+		const trimmed = content.text.trim();
+		const component =
+			renderDeepInterviewAssistantText(trimmed, theme) ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
+		this.#contentBlocksCache.set(content, { source: content.text, component });
+		return component;
+	}
+
+	#renderThinkingBlock(content: { thinking: string }): Markdown {
+		const cached = this.#contentBlocksCache.get(content);
+		if (cached?.source === content.thinking) return cached.component as Markdown;
+		const trimmed = content.thinking.trim();
+		const component = new Markdown(trimmed, 1, 0, getMarkdownTheme(), {
+			color: (text: string) => theme.fg("thinkingText", text),
+			italic: true,
+		});
+		this.#contentBlocksCache.set(content, { source: content.thinking, component });
+		return component;
+	}
+
 	#renderToolImages(): void {
 		const imageEntries = Array.from(this.#toolImagesByCallId.entries()).flatMap(([toolCallId, images]) =>
 			images.map((image, index) => ({ image, key: `${toolCallId}:${index}` })),
@@ -152,12 +175,7 @@ export class AssistantMessageComponent extends Container {
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content.type === "text" && content.text.trim()) {
-				// Assistant text messages with no background - trim the text
-				// Set paddingY=0 to avoid extra spacing before tool executions
-				const text = content.text.trim();
-				this.#contentContainer.addChild(
-					renderDeepInterviewAssistantText(text, theme) ?? new Markdown(text, 1, 0, getMarkdownTheme()),
-				);
+				this.#contentContainer.addChild(this.#renderTextBlock(content));
 			} else if (content.type === "thinking" && content.thinking.trim()) {
 				// Add spacing only when another visible assistant content block follows.
 				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
@@ -172,13 +190,7 @@ export class AssistantMessageComponent extends Container {
 						this.#contentContainer.addChild(new Spacer(1));
 					}
 				} else {
-					// Thinking traces in thinkingText color, italic
-					this.#contentContainer.addChild(
-						new Markdown(content.thinking.trim(), 1, 0, getMarkdownTheme(), {
-							color: (text: string) => theme.fg("thinkingText", text),
-							italic: true,
-						}),
-					);
+					this.#contentContainer.addChild(this.#renderThinkingBlock(content));
 					if (hasVisibleContentAfter) {
 						this.#contentContainer.addChild(new Spacer(1));
 					}

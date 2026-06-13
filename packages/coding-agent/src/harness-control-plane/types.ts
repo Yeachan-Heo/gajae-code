@@ -29,6 +29,33 @@ export function isReviewVerdict(value: unknown): value is ReviewVerdict {
 	return typeof value === "string" && (REVIEW_VERDICTS as readonly string[]).includes(value);
 }
 
+/**
+ * Alias verdict tokens accepted from free-form assistant text, mapped to their canonical verdict.
+ * `MERGE_READY` is treated as `APPROVE_MERGE_READY`.
+ */
+const VERDICT_ALIASES: Readonly<Record<string, ReviewVerdict>> = {
+	MERGE_READY: "APPROVE_MERGE_READY",
+};
+
+/**
+ * Extract a single closed-vocabulary review verdict from free-form assistant text.
+ *
+ * Scans for canonical verdict tokens (and accepted aliases) as whole words and returns the
+ * LAST occurrence — the agent's final stated decision wins over any earlier mention. Returns
+ * null when no allowed token is present, so the finalizer fails closed on a missing verdict.
+ */
+export function extractReviewVerdict(text: string | null | undefined): ReviewVerdict | null {
+	if (typeof text !== "string" || text.length === 0) return null;
+	const tokens = [...REVIEW_VERDICTS, ...Object.keys(VERDICT_ALIASES)];
+	const pattern = new RegExp(`\\b(${tokens.join("|")})\\b`, "g");
+	let last: ReviewVerdict | null = null;
+	for (const match of text.matchAll(pattern)) {
+		const token = match[1];
+		last = VERDICT_ALIASES[token] ?? (token as ReviewVerdict);
+	}
+	return last;
+}
+
 /** Lifecycle states of an operated session. */
 export type HarnessLifecycle =
 	| "new"
@@ -68,7 +95,8 @@ export type ReceiptFamily =
 	| "validation"
 	| "completion"
 	| "review-verdict"
-	| "review-failure";
+	| "review-failure"
+	| "phase-rollup";
 
 /** The CLI verbs / primitives exposed by `gjc harness <verb>`. */
 export type HarnessVerb =
@@ -182,6 +210,10 @@ export interface Observation {
 	rpcLive?: boolean;
 	/** ISO timestamp of the most recent RPC frame the owner observed, if any. */
 	rpcLastFrameAt?: string | null;
+	/** True only when owner/rpc/lifecycle gates indicate a prompt can be submitted now. */
+	readyForSubmit?: boolean;
+	/** Present when readyForSubmit is false; mirrors submit's nextAllowedActions reason. */
+	submitUnavailableReason?: string | null;
 }
 
 /** Input to the deterministic recovery classifier. */

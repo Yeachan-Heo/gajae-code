@@ -776,30 +776,33 @@ export async function resolveModelOverrideWithAuthFallback(
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel: boolean;
 	authFallbackUsed: boolean;
+	requestedModel?: Model<Api>;
+	fallbackReason?: "auth_unavailable";
 }> {
 	const primary = resolveModelOverride(modelPatterns, modelRegistry, settings);
+	const unchanged = { ...primary, requestedModel: primary.model, authFallbackUsed: false };
 	if (!primary.model || !parentActiveModelPattern) {
-		return { ...primary, authFallbackUsed: false };
+		return unchanged;
 	}
 
 	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
-		return { ...primary, authFallbackUsed: false };
+		return unchanged;
 	}
 
 	const fallback = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings);
 	if (!fallback.model) {
-		return { ...primary, authFallbackUsed: false };
+		return unchanged;
 	}
 	if (modelsAreEqual(fallback.model, primary.model)) {
-		return { ...primary, authFallbackUsed: false };
+		return unchanged;
 	}
 	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
 	if (!isAuthenticated(fallbackKey)) {
-		return { ...primary, authFallbackUsed: false };
+		return unchanged;
 	}
 
-	return { ...fallback, authFallbackUsed: true };
+	return { ...fallback, requestedModel: primary.model, authFallbackUsed: true, fallbackReason: "auth_unavailable" };
 }
 
 /**

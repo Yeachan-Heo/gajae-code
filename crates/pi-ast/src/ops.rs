@@ -10,7 +10,7 @@ use ast_grep_core::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
-use crate::language::SupportLang;
+use crate::language::{KNOWN_LONG_TAIL_ALIASES, SupportLang};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AstMatchStrictness {
@@ -70,7 +70,16 @@ pub fn supported_lang_list() -> String {
 
 pub fn resolve_supported_lang(value: &str) -> Result<SupportLang> {
 	SupportLang::from_alias(value).ok_or_else(|| {
-		anyhow!("Unsupported language '{value}'. Supported: {}", supported_lang_list())
+		let lowered = value.trim().to_ascii_lowercase();
+		if KNOWN_LONG_TAIL_ALIASES.contains(&lowered.as_str()) {
+			anyhow!(
+				"language \"{lowered}\" is not included in the default build; rebuild from source \
+				 with --features full-langs (PI_NATIVE_FULL_LANGS=1 bun --cwd=packages/natives run \
+				 build)"
+			)
+		} else {
+			anyhow!("Unsupported language '{value}'. Supported: {}", supported_lang_list())
+		}
 	})
 }
 
@@ -284,13 +293,28 @@ fn compile_rust_contextual_pattern(pattern: &str) -> Option<Pattern> {
 mod tests {
 	use ast_grep_core::source::Edit;
 
-	use super::{SupportLang, apply_edits, compile_search_patterns};
+	use super::{SupportLang, apply_edits, compile_search_patterns, resolve_supported_lang};
 
 	#[test]
 	fn compile_search_patterns_compiles_rust_patterns() {
 		let patterns = compile_search_patterns("foo($$$ARGS)", SupportLang::Rust)
 			.expect("rust pattern should compile");
 		assert!(!patterns.is_empty());
+	}
+
+	#[test]
+	fn resolves_core_aliases_and_reports_default_long_tail() {
+		assert_eq!(resolve_supported_lang("typescript").ok(), Some(SupportLang::TypeScript));
+		assert_eq!(resolve_supported_lang("python").ok(), Some(SupportLang::Python));
+
+		let swift = resolve_supported_lang("swift");
+		#[cfg(feature = "full-langs")]
+		assert_eq!(swift.ok(), Some(SupportLang::Swift));
+		#[cfg(not(feature = "full-langs"))]
+		{
+			let err = swift.expect_err("swift should require full-langs in default builds");
+			assert!(err.to_string().contains("full-langs"));
+		}
 	}
 
 	#[test]

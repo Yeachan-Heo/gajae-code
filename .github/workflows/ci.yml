@@ -79,7 +79,7 @@ jobs:
    # Branch protection must add the always-present `gjc-state-gates` status as required.
    gjc-state-gates:
       name: gjc-state-gates
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       timeout-minutes: 15
       env:
@@ -107,7 +107,7 @@ jobs:
    # Fast lint + type check (no Rust, no native build needed)
    check:
       timeout-minutes: 30
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -151,6 +151,69 @@ jobs:
               rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
               save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
 
+   # Windows-latest smoke for the `bun install -g gajae-code` runtime path
+   # (issue #525): build the win32-x64 native addon, then exercise the bun-run
+   # CLI surface a native install hits — bun + gjc version, help, `gjc team
+   # --help`, and the native/worker smoke probe. Runs on PRs and branch pushes
+   # so Windows regressions surface before release; release tags already run the
+   # Windows release-binary smoke in the publishing gate.
+   windows_smoke:
+      timeout-minutes: 60
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      runs-on: windows-latest
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3"
+         - name: Check job relevance
+           id: relevance
+           env:
+              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           shell: bash
+           run: bun scripts/ci-job-relevance.ts
+         - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: steps.relevance.outputs.relevant == 'true'
+           with:
+              toolchain: nightly-2026-04-29
+         - name: Prepend rustup toolchain bin to PATH
+           if: steps.relevance.outputs.relevant == 'true'
+           shell: bash
+           run: |
+              toolchain_bin="$(dirname "$(rustup which cargo)")"
+              echo "$toolchain_bin" >> "$GITHUB_PATH"
+         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: steps.relevance.outputs.relevant == 'true'
+           with:
+              shared-key: windows-smoke-win32-x64
+              cache-on-failure: true
+              save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+              cache-workspace-crates: true
+         - name: Cache bun dependencies
+           if: steps.relevance.outputs.relevant == 'true'
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - if: steps.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
+         - name: Build native addon (win32-x64 baseline)
+           if: steps.relevance.outputs.relevant == 'true'
+           env:
+              TARGET_PLATFORM: win32
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline
+           run: bun run ci:build:native
+         - name: Smoke bun + gjc CLI (source runtime)
+           if: steps.relevance.outputs.relevant == 'true'
+           shell: pwsh
+           run: |
+              bun --version
+              bun packages/coding-agent/src/cli.ts --version
+              bun packages/coding-agent/src/cli.ts --help
+              bun packages/coding-agent/src/cli.ts team --help
+              bun packages/coding-agent/src/cli.ts --smoke-test
+
    # Remaining platforms only ship in release tags; PRs and main never build them.
    native_release:
       timeout-minutes: 90
@@ -161,7 +224,6 @@ jobs:
          matrix:
             include:
                - { os: ubuntu-22.04, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
-               - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
                - { os: macos-14, platform: darwin, arch: arm64 }
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
       runs-on: ${{ matrix.os }}
@@ -196,21 +258,7 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
-           run: |
-              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                 sudo apt-get update
-                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
-                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
-              else
-                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
-                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-                 for tool in fd rg convert tmux gh; do
-                    if ! command -v "$tool" >/dev/null 2>&1; then
-                       echo "warning: optional helper not on PATH: $tool"
-                    fi
-                 done
-              fi
+           run: bash scripts/ci-install-system-deps.sh
          - run: bun install --frozen-lockfile
          - name: Resolve native source run
            id: source
@@ -243,20 +291,29 @@ jobs:
 
    install_methods:
       timeout-minutes: 45
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
+         - name: Check job relevance
+           id: relevance
+           env:
+              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           shell: bash
+           run: bun scripts/ci-job-relevance.ts
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           if: steps.relevance.outputs.relevant == 'true'
+           with:
+              node-version: "24"
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               toolchain: nightly-2026-04-29
          - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: steps.relevance.outputs.relevant == 'true'
            with:
               shared-key: install-methods-linux-x64
               cache-on-failure: true
@@ -264,35 +321,25 @@ jobs:
                  startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
+           if: steps.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
-           run: |
-              if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                 sudo apt-get update
-                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
-                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
-                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
-              else
-                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
-                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-                 for tool in fd rg convert tmux gh; do
-                    if ! command -v "$tool" >/dev/null 2>&1; then
-                       echo "warning: optional helper not on PATH: $tool"
-                    fi
-                 done
-              fi
-         - run: bun install --frozen-lockfile
+           if: steps.relevance.outputs.relevant == 'true'
+           run: bash scripts/ci-install-system-deps.sh
+         - if: steps.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
          - name: Install method smoke tests
+           if: steps.relevance.outputs.relevant == 'true'
            run: bun run ci:test:install-methods
 
    release_binary:
       timeout-minutes: 60
       if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.native_linux.result == 'success' && needs.native_release.result ==
-         'success' && needs.check.result == 'success' }}
+         'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') }}
       needs: [check, native_linux, native_release, rust-hash]
       strategy:
          fail-fast: false
@@ -311,13 +358,6 @@ jobs:
                     arch: arm64,
                     target_id: linux-arm64,
                     binary_path: packages/coding-agent/binaries/gjc-linux-arm64,
-                 }
-               - {
-                    os: macos-15-intel,
-                    platform: darwin,
-                    arch: x64,
-                    target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/gjc-darwin-x64,
                  }
                - {
                     os: macos-14,
@@ -389,7 +429,7 @@ jobs:
          startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' }}
       needs: [release_binary]
-      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      runs-on: ubuntu-22.04
       permissions:
          contents: write
       steps:
@@ -436,7 +476,7 @@ jobs:
          needs.release_github_verify.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_binary, release_github_verify, rust-hash]
-      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4

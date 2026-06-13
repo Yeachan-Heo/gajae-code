@@ -5,6 +5,7 @@ import type { Component, OverlayHandle } from "@gajae-code/tui";
 import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
 import { activateModelProfile } from "../../config/model-profile-activation";
+import { recommendModelProfileForProvider } from "../../config/model-profiles";
 import { settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -45,7 +46,7 @@ import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
-import { ModelSelectorComponent, type ModelSelectorSelection } from "../components/model-selector";
+import { ModelSelectorComponent } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
@@ -537,12 +538,6 @@ export class SelectorController {
 				this.ctx.session.scopedModels,
 				async selection => {
 					try {
-						if (selection.kind === "preset") {
-							await this.#applyModelAssignmentPreset(selection);
-							done();
-							this.ctx.ui.requestRender();
-							return;
-						}
 						if (selection.kind === "profile") {
 							await activateModelProfile(
 								{
@@ -609,43 +604,10 @@ export class SelectorController {
 					done();
 					this.ctx.ui.requestRender();
 				},
-				options,
+				{ ...options, sessionId: this.ctx.session.sessionId },
 			);
 			return { component: selector, focus: selector };
 		});
-	}
-
-	async #applyModelAssignmentPreset(selection: Extract<ModelSelectorSelection, { kind: "preset" }>): Promise<void> {
-		const { assignments, model, preset, selector } = selection;
-		const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
-
-		const defaultThinkingLevel = assignments.default;
-		await this.ctx.session.setModel(model, "default", {
-			selector,
-			thinkingLevel: defaultThinkingLevel,
-		});
-		if (defaultThinkingLevel && defaultThinkingLevel !== ThinkingLevel.Inherit) {
-			this.ctx.session.setThinkingLevel(defaultThinkingLevel);
-		}
-
-		const overrides = this.ctx.settings.get("task.agentModelOverrides");
-		const nextOverrides = { ...overrides };
-		for (const [targetRole, presetThinkingLevel] of Object.entries(assignments) as [
-			keyof Extract<ModelSelectorSelection, { kind: "preset" }>["assignments"],
-			ThinkingLevel,
-		][]) {
-			if (!targetRole || targetRole === "default") continue;
-			nextOverrides[targetRole] =
-				presetThinkingLevel === ThinkingLevel.Inherit ? selector : `${selector}:${presetThinkingLevel}`;
-		}
-		this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
-		this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-		this.ctx.statusLine.invalidate();
-		this.ctx.updateEditorBorderColor();
-		this.ctx.showStatus(`${preset.label}: ${selector}`);
 	}
 
 	async showPluginSelector(mode: "install" | "uninstall" = "install"): Promise<void> {
@@ -1034,6 +996,34 @@ export class SelectorController {
 		await this.showSessionSelector();
 	}
 
+	async #handlePostLoginModelProfileRecommendation(providerId: string): Promise<void> {
+		const recommendedProfile = recommendModelProfileForProvider(
+			providerId,
+			this.ctx.session.modelRegistry.getModelProfiles(),
+		);
+		if (!recommendedProfile) {
+			return;
+		}
+
+		const activeProfile = this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default");
+		if (activeProfile) {
+			this.ctx.showStatus(`Preset ${recommendedProfile.name} is available in /model.`);
+			return;
+		}
+
+		const confirmed = await this.ctx.showHookConfirm(`Apply ${recommendedProfile.name} now?`, "");
+		if (!confirmed) {
+			return;
+		}
+
+		await activateModelProfile({
+			session: this.ctx.session,
+			modelRegistry: this.ctx.session.modelRegistry,
+			settings: this.ctx.settings,
+			profileName: recommendedProfile.name,
+		});
+	}
+
 	async #handleOAuthLogin(providerId: string): Promise<void> {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
@@ -1090,6 +1080,7 @@ export class SelectorController {
 				new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}`), 1, 0),
 			);
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
+			await this.#handlePostLoginModelProfileRecommendation(providerId);
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1120,7 +1111,7 @@ export class SelectorController {
 	async showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
 		if (providerId) {
 			const oauthProvider = getOAuthProviders().find(provider => provider.id === providerId);
-			if (!oauthProvider) {
+			if (!oauthProvider && !this.ctx.session.modelRegistry.getModelProfiles().has(providerId)) {
 				this.ctx.showError(`Unknown OAuth provider: ${providerId}`);
 				return;
 			}

@@ -7,7 +7,7 @@ use ast_grep_core::tree_sitter::LanguageExt;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
-use crate::language::SupportLang;
+use crate::{language::SupportLang, ops};
 
 const DEFAULT_MIN_BODY_LINES: u32 = 4;
 const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
@@ -65,7 +65,7 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 		return Ok(unparsed_result(source, total_lines));
 	}
 
-	let Some(language) = resolve_language(options.lang.as_deref(), options.path.as_deref()) else {
+	let Some(language) = resolve_language(options.lang.as_deref(), options.path.as_deref())? else {
 		return Ok(unparsed_result(source, total_lines));
 	};
 
@@ -103,15 +103,14 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 	})
 }
 
-fn resolve_language(lang: Option<&str>, path: Option<&str>) -> Option<SupportLang> {
+fn resolve_language(lang: Option<&str>, path: Option<&str>) -> Result<Option<SupportLang>> {
 	if let Some(lang) = lang.map(str::trim).filter(|lang| !lang.is_empty()) {
-		return SupportLang::from_alias(lang);
+		return ops::resolve_supported_lang(lang).map(Some);
 	}
-	let path = path?.trim();
-	if path.is_empty() {
-		return None;
-	}
-	SupportLang::from_path(Path::new(path))
+	let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
+		return Ok(None);
+	};
+	Ok(SupportLang::from_path(Path::new(path)))
 }
 
 fn unparsed_result(source: String, total_lines: u32) -> SummaryResult {
@@ -274,13 +273,19 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Python => kind == "comment",
 		SupportLang::Go => kind == "comment",
 		SupportLang::Java => kind == "block_comment",
-		SupportLang::C | SupportLang::Cpp | SupportLang::ObjC => kind == "comment",
+		SupportLang::C | SupportLang::Cpp => kind == "comment",
+		#[cfg(feature = "full-langs")]
+		SupportLang::ObjC => kind == "comment",
 		SupportLang::CSharp => kind == "comment",
 		SupportLang::Ruby => kind == "comment",
 		SupportLang::Php => kind == "comment",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Swift => kind == "comment",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Kotlin => kind == "block_comment",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Scala => kind == "block_comment",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Lua => kind == "comment",
 		_ => false,
 	}
@@ -385,6 +390,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "raw_string_literal"
 				| "requires_clause"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::ObjC => matches!(
 			kind,
 			"compound_statement"
@@ -427,6 +433,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "heredoc"
 				| "nowdoc"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Swift => matches!(
 			kind,
 			"function_body"
@@ -439,6 +446,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "computed_property"
 				| "lambda_literal"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Kotlin => matches!(
 			kind,
 			"function_body"
@@ -449,6 +457,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "when_expression"
 				| "import_list"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Scala => matches!(
 			kind,
 			"block"
@@ -459,10 +468,13 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "for_expression"
 				| "string"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Lua => matches!(kind, "block" | "table_constructor" | "string"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Perl => {
 			matches!(kind, "block" | "list_expression" | "heredoc_content" | "regexp_content")
 		},
+		#[cfg(feature = "full-langs")]
 		SupportLang::Dart => matches!(
 			kind,
 			"block"
@@ -485,6 +497,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "array"
 				| "heredoc_body"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Powershell => matches!(
 			kind,
 			"script_block"
@@ -496,6 +509,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "expandable_here_string_literal"
 				| "verbatim_here_string_characters"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Haskell => matches!(
 			kind,
 			"imports"
@@ -507,6 +521,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "let" | "local_binds"
 				| "list" | "tuple"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Ocaml => matches!(
 			kind,
 			"structure"
@@ -519,7 +534,9 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "value_definition"
 				| "list_expression"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Elixir => matches!(kind, "do_block" | "list" | "map" | "string" | "sigil"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Erlang => matches!(
 			kind,
 			"fun_decl"
@@ -530,18 +547,24 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "list" | "map_expr"
 				| "tuple"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Clojure => {
 			matches!(kind, "list_lit" | "map_lit" | "vec_lit" | "set_lit" | "str_lit")
 		},
+		#[cfg(feature = "full-langs")]
 		SupportLang::Solidity => {
 			matches!(kind, "contract_body" | "function_body" | "struct_body" | "enum_body")
 		},
+		#[cfg(feature = "full-langs")]
 		SupportLang::Sql => matches!(kind, "column_definitions" | "case"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Zig => matches!(kind, "Block" | "ContainerDecl" | "InitList"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Odin => matches!(
 			kind,
 			"block" | "struct_declaration" | "enum_declaration" | "union_declaration" | "struct"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Verilog => matches!(
 			kind,
 			"module_declaration"
@@ -551,12 +574,16 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "task_declaration"
 				| "list_of_port_declarations"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Tlaplus => matches!(kind, "module" | "theorem" | "let_in"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Nix => matches!(
 			kind,
 			"attrset_expression" | "list_expression" | "let_expression" | "indented_string_expression"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Proto => matches!(kind, "message_body" | "enum_body" | "oneof" | "service"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Julia => matches!(
 			kind,
 			"function_definition"
@@ -566,20 +593,27 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "vector_expression"
 				| "string_literal"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::R => matches!(kind, "braced_expression" | "call" | "string"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Starlark => matches!(kind, "block" | "list" | "dictionary" | "string"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Astro => {
 			matches!(kind, "frontmatter_js_block" | "script_element" | "style_element" | "element")
 		},
+		#[cfg(feature = "full-langs")]
 		SupportLang::Vue => {
 			matches!(kind, "template_element" | "script_element" | "style_element" | "element")
 		},
+		#[cfg(feature = "full-langs")]
 		SupportLang::Svelte => matches!(kind, "script_element" | "style_element" | "element"),
 		SupportLang::Html => matches!(kind, "element" | "script_element" | "style_element"),
 		SupportLang::Css => matches!(kind, "block" | "keyframe_block_list"),
 		SupportLang::Json => matches!(kind, "object" | "array"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Xml => kind == "element",
 		SupportLang::Markdown => matches!(kind, "fenced_code_block" | "pipe_table" | "list"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Graphql => matches!(
 			kind,
 			"fields_definition"
@@ -587,21 +621,24 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "input_fields_definition"
 				| "schema_definition"
 		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Hcl => matches!(kind, "body" | "object"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Dockerfile => kind == "shell_command",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Cmake => matches!(kind, "argument_list" | "body"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Make => kind == "recipe",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Just => kind == "recipe_body",
 		// Skip: data formats with no closing-token anchor (Yaml mappings,
 		// Toml tables, Ini sections), the diff format whose informational
 		// content IS the lines inside hunks, and the leaf-token-only Regex
 		// grammar. Eliding any of these deletes the only content worth
 		// reading.
-		SupportLang::Yaml
-		| SupportLang::Toml
-		| SupportLang::Ini
-		| SupportLang::Diff
-		| SupportLang::Regex => false,
+		SupportLang::Yaml | SupportLang::Toml => false,
+		#[cfg(feature = "full-langs")]
+		SupportLang::Ini | SupportLang::Diff | SupportLang::Regex => false,
 	}
 }
 
@@ -617,25 +654,42 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Go => kind == "import_declaration",
 		SupportLang::Java => kind == "import_declaration",
 		SupportLang::C | SupportLang::Cpp => kind == "preproc_include",
+		#[cfg(feature = "full-langs")]
 		SupportLang::ObjC => matches!(kind, "preproc_include" | "import_declaration"),
 		SupportLang::CSharp => kind == "using_directive",
 		SupportLang::Php => kind == "namespace_use_declaration",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Swift => kind == "import_declaration",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Scala => matches!(kind, "import_declaration" | "import"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Dart => kind == "import_or_export",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Ocaml => kind == "open_module",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Solidity => kind == "import_directive",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Julia => matches!(kind, "import_statement" | "using_statement"),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Proto => kind == "import",
+		#[cfg(feature = "full-langs")]
 		SupportLang::Perl => kind == "use_statement",
 		// Languages where imports either have no run pattern, are wrapped in a
 		// single AST node already covered by `is_elidable_kind` (Kotlin's
 		// `import_list`, Haskell's `imports`), or live inside a too-generic
 		// container (Powershell `statement_list`).
+		SupportLang::Ruby
+		| SupportLang::Bash
+		| SupportLang::Html
+		| SupportLang::Css
+		| SupportLang::Json
+		| SupportLang::Markdown
+		| SupportLang::Yaml
+		| SupportLang::Toml => false,
+		#[cfg(feature = "full-langs")]
 		SupportLang::Kotlin
 		| SupportLang::Haskell
 		| SupportLang::Powershell
-		| SupportLang::Ruby
 		| SupportLang::Lua
 		| SupportLang::Elixir
 		| SupportLang::Erlang
@@ -648,23 +702,16 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		| SupportLang::Nix
 		| SupportLang::R
 		| SupportLang::Starlark
-		| SupportLang::Bash
 		| SupportLang::Astro
 		| SupportLang::Vue
 		| SupportLang::Svelte
-		| SupportLang::Html
-		| SupportLang::Css
-		| SupportLang::Json
 		| SupportLang::Xml
-		| SupportLang::Markdown
 		| SupportLang::Graphql
 		| SupportLang::Hcl
 		| SupportLang::Dockerfile
 		| SupportLang::Cmake
 		| SupportLang::Make
 		| SupportLang::Just
-		| SupportLang::Yaml
-		| SupportLang::Toml
 		| SupportLang::Ini
 		| SupportLang::Diff
 		| SupportLang::Regex => false,

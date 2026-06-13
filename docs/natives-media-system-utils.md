@@ -86,7 +86,7 @@ There is no current `packages/natives` TS wrapper that emits OSC52, handles Term
 
 - `countTokens(input, encoding?)` accepts a single string or an array of strings.
 - Arrays return one aggregate token count; encoding work is parallelized in Rust.
-- Default encoding is `O200kBase`; `Cl100kBase` is also exported.
+- Default encoding is `O200kBase`; `Cl100kBase` remains exported as a compatibility alias that routes to `o200k_base` (the cl100k BPE table is not embedded in default builds).
 - The implementation uses ordinary encoding, not special-token handling.
 
 ### macOS appearance and power helpers

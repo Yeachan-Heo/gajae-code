@@ -12,13 +12,20 @@ import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
-const DEFAULT_TERMINAL_TITLE = "π";
+const DEFAULT_TERMINAL_TITLE = "GJC";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 const MAX_INPUT_CHARS = 2000;
 const TITLE_MAX_TOKENS = 30;
 const REASONING_SAFE_MAX_TOKENS = 1024;
 const SET_TITLE_TOOL_NAME = "set_title";
+
+// Some models (notably cursor/composer-*) ignore the forced set_title tool call
+// and instead emit a long free-text narrative. Without the tool call we fall back
+// to the plain text, so cap its length: a real 3-6 word title never exceeds these.
+// Beyond the cap we treat the response as a non-title hallucination and reject it.
+const MAX_TITLE_CHARS = 80;
+const MAX_TITLE_WORDS = 12;
 
 const setTitleTool: Tool = {
 	name: SET_TITLE_TOOL_NAME,
@@ -169,7 +176,14 @@ function extractGeneratedTitle(contentBlocks: AssistantMessage["content"]): stri
 			textTitle += content.text;
 		}
 	}
-	return textTitle.trim();
+	// Plain-text fallback (no set_title tool call): only accept it if it actually
+	// looks like a title. A model that ignored the tool and rambled produces a long
+	// blob — reject it so the caller falls back rather than persisting the narrative.
+	const trimmed = textTitle.trim();
+	if (trimmed.length > MAX_TITLE_CHARS || trimmed.split(/\s+/).length > MAX_TITLE_WORDS) {
+		return "";
+	}
+	return trimmed;
 }
 
 /**

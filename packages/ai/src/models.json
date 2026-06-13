@@ -18021,6 +18021,40 @@
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
+		},
+		"kimi-k2.7-code": {
+			"id": "kimi-k2.7-code",
+			"name": "Kimi K2.7 Code",
+			"api": "openai-completions",
+			"provider": "kimi-code",
+			"baseUrl": "https://api.kimi.com/coding/v1",
+			"headers": {
+				"User-Agent": "KimiCLI/1.0",
+				"X-Msh-Platform": "kimi_cli"
+			},
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 65536,
+			"compat": {
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		}
 	},
 	"litellm": {
@@ -35126,6 +35160,37 @@
 		"minimax-m3": {
 			"id": "minimax-m3",
 			"name": "MiniMax-M3",
+			"api": "openai-completions",
+			"provider": "minimax-code",
+			"baseUrl": "https://api.minimax.io/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 512000,
+			"maxTokens": 128000,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"reasoningContentField": "reasoning_content"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"minimax-v3": {
+			"id": "minimax-v3",
+			"name": "MiniMax-V3",
 			"api": "openai-completions",
 			"provider": "minimax-code",
 			"baseUrl": "https://api.minimax.io/v1",
@@ -70514,6 +70579,33 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 10000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"grok-composer-2.5-fast": {
+			"id": "grok-composer-2.5-fast",
+			"name": "Grok Composer 2.5 Fast",
+			"api": "openai-completions",
+			"provider": "xai",
+			"baseUrl": "https://api.x.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"compat": {
+				"supportsReasoningEffort": false
+			},
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",

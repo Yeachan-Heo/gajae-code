@@ -24,6 +24,12 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default", "smol", "slow", etc. Undefined treated as "default" */
 	role?: string;
+	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */
+	previousModel?: string;
+	/** Machine-readable reason for runtime model substitution/fallback. */
+	reason?: string;
+	/** Effective thinking level when the change was recorded. */
+	thinkingLevel?: string | null;
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {

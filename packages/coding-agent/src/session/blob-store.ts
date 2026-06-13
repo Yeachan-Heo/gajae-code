@@ -95,6 +95,77 @@ export class BlobStore {
 	}
 }
 
+export class EphemeralBlobStore extends BlobStore {
+	/**
+	 * Bounded LRU byte budget for the in-memory buffer cache. Keeps recent
+	 * resident blobs hot for rematerialization after the weak materialized
+	 * view is collected, without re-pinning the whole session in RAM.
+	 */
+	static readonly #BUFFER_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+	#bufferCache = new Map<string, Buffer>();
+	#bufferCacheBytes = 0;
+
+	constructor(dir: string) {
+		super(dir);
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.mkdirSync(dir, { recursive: true });
+	}
+
+	#cachePut(hash: string, data: Buffer): void {
+		const existing = this.#bufferCache.get(hash);
+		if (existing) {
+			this.#bufferCache.delete(hash);
+			this.#bufferCacheBytes -= existing.byteLength;
+		}
+		if (data.byteLength > EphemeralBlobStore.#BUFFER_CACHE_MAX_BYTES) return;
+		this.#bufferCache.set(hash, data);
+		this.#bufferCacheBytes += data.byteLength;
+		for (const [oldHash, oldData] of this.#bufferCache) {
+			if (this.#bufferCacheBytes <= EphemeralBlobStore.#BUFFER_CACHE_MAX_BYTES) break;
+			this.#bufferCache.delete(oldHash);
+			this.#bufferCacheBytes -= oldData.byteLength;
+		}
+	}
+
+	putSync(data: Buffer): BlobPutResult {
+		const result = super.putSync(data);
+		this.#cachePut(result.hash, Buffer.from(data));
+		return result;
+	}
+
+	getSync(hash: string): Buffer | null {
+		const cached = this.#bufferCache.get(hash);
+		if (cached) {
+			const blobPath = path.join(this.dir, hash);
+			if (fs.existsSync(blobPath)) {
+				// Refresh LRU recency on hit.
+				this.#bufferCache.delete(hash);
+				this.#bufferCache.set(hash, cached);
+				return Buffer.from(cached);
+			}
+			this.#bufferCache.delete(hash);
+			this.#bufferCacheBytes -= cached.byteLength;
+		}
+		const data = super.getSync(hash);
+		if (data) this.#cachePut(hash, Buffer.from(data));
+		return data;
+	}
+
+	clear(): void {
+		this.#bufferCache.clear();
+		this.#bufferCacheBytes = 0;
+		fs.rmSync(this.dir, { recursive: true, force: true });
+		fs.mkdirSync(this.dir, { recursive: true });
+	}
+
+	dispose(): void {
+		this.#bufferCache.clear();
+		this.#bufferCacheBytes = 0;
+		fs.rmSync(this.dir, { recursive: true, force: true });
+	}
+}
+
 export class MemoryBlobStore extends BlobStore {
 	#blobs = new Map<string, Buffer>();
 
@@ -129,6 +200,18 @@ export class MemoryBlobStore extends BlobStore {
 
 	async has(hash: string): Promise<boolean> {
 		return this.#blobs.has(hash);
+	}
+}
+
+export class ResidentBlobMissingError extends Error {
+	constructor(
+		readonly hash: string,
+		readonly kind: "text" | "imageUrl" | "imageData",
+		readonly sessionId?: string,
+		readonly sessionFile?: string,
+	) {
+		super(`Missing resident ${kind} blob: ${hash}`);
+		this.name = "ResidentBlobMissingError";
 	}
 }
 
@@ -240,13 +323,16 @@ export function resolveImageDataSync(blobStore: BlobStore, data: string): string
 }
 
 /** Synchronously resolve a blob reference back to utf8 text. */
-export function resolveTextBlobSync(blobStore: BlobStore, data: string): string {
+export function resolveTextBlobSync(
+	blobStore: BlobStore,
+	data: string,
+	context?: { kind?: "text"; sessionId?: string; sessionFile?: string },
+): string {
 	const hash = parseBlobRef(data);
 	if (!hash) return data;
 	const buffer = blobStore.getSync(hash);
 	if (!buffer) {
-		logger.warn("Blob not found for text reference", { hash });
-		return data;
+		throw new ResidentBlobMissingError(hash, context?.kind ?? "text", context?.sessionId, context?.sessionFile);
 	}
 	return buffer.toString("utf8");
 }

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "sixel-image-line-preservation",
+  "terminalWidth": 44,
+  "terminalHeight": 8,
+  "capabilities": {
+    "kittyProtocolActive": true,
+    "hyperlinks": true,
+    "imageProtocol": "\u001bPq"
+  },
+  "coverage": [
+    "image/sixel line preservation",
+    "TERMINAL.isImageLine sixel branch",
+    "no line terminator on image passthrough",
+    "DCS sixel marker"
+  ],
+  "artifacts": {
+    "viewport": {
+      "file": "viewport.txt",
+      "sha256": "cc62399fd97c42919fcb83350a860b85a3874dc847522d639964001d5f80b36d"
+    },
+    "scrollback": {
+      "file": "scrollback.txt",
+      "sha256": "cc62399fd97c42919fcb83350a860b85a3874dc847522d639964001d5f80b36d"
+    },
+    "writelog": {
+      "file": "writelog.bin",
+      "sha256": "a2bfd9adcd64682b12b6c8a091d621279526f61616049b712e5158a54c64515b"
+    }
+  }
+}

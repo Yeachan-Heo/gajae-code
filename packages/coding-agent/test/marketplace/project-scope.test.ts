@@ -8,7 +8,7 @@
  * This file imports from helpers.ts directly — the native addon IS present in the
  * test environment (verified: `bun run import-helpers.ts` succeeds).
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -83,9 +83,16 @@ describe("resolveActiveProjectRegistryPath", () => {
 		const cwd = path.join(tmpDir, "sub");
 		fs.mkdirSync(cwd, { recursive: true });
 
-		const result = await resolveActiveProjectRegistryPath(cwd);
-
-		expect(result).toBe(path.join(tmpDir, ".gjc", "plugins", "installed_plugins.json"));
+		// Bound the walk-up at os.tmpdir() so a `.gjc/` polluting a shared ancestor
+		// (e.g. a /tmp/.gjc left by other processes on CI runners) cannot shadow the
+		// intended .git fallback. resolveActiveProjectRegistryPath stops before homedir.
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(os.tmpdir());
+		try {
+			const result = await resolveActiveProjectRegistryPath(cwd);
+			expect(result).toBe(path.join(tmpDir, ".gjc", "plugins", "installed_plugins.json"));
+		} finally {
+			homeSpy.mockRestore();
+		}
 	});
 
 	it("returns null when neither .gjc/ nor .git/ found anywhere in the tree", async () => {

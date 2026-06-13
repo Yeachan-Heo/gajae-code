@@ -1,4 +1,5 @@
 import type { ToolChoice } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 
 // ── Callback types ──────────────────────────────────────────────────────────
 
@@ -166,6 +167,28 @@ export class ToolChoiceQueue {
 				},
 			});
 		}
+	}
+
+	/**
+	 * Drop an in-flight yield after runtime tool_choice degradation. This bypasses
+	 * onRejected so forced directives cannot requeue themselves after the model
+	 * proved incapable of honoring the forced choice.
+	 */
+	degradeInFlight(reason?: string): string | undefined {
+		const inFlight = this.#inFlight;
+		this.#inFlight = undefined;
+		if (!inFlight) return undefined;
+
+		const label = inFlight.directive.label;
+		if (this.#queue[0] === inFlight.directive) {
+			this.#queue.shift();
+		}
+
+		logger.debug("ToolChoiceQueue: dropped in-flight directive after tool_choice degradation", {
+			label,
+			reason,
+		});
+		return label;
 	}
 
 	/** True if there is an in-flight yield that hasn't been resolved or rejected. */

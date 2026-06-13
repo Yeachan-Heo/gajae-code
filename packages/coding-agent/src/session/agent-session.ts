@@ -41,6 +41,7 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateMessageTokensHeuristic,
 	estimateTokens,
 	generateBranchSummary,
 	generateHandoff,
@@ -243,7 +244,7 @@ import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
-import { buildNamedToolChoice } from "../utils/tool-choice";
+import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 import {
@@ -838,6 +839,8 @@ export type BeforeAgentStartInternalMessage = Pick<
 	"customType" | "content" | "display" | "details" | "attribution"
 >;
 
+type ProviderReplaySourceCacheEntry = { source: string; hash: bigint };
+
 /**
  * Internal (first-party, non-user-hook) contributor invoked at the active
  * before-agent-start point alongside the extension runner. Returns an optional
@@ -862,6 +865,7 @@ export class AgentSession {
 
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
+	#activeModelProfile: string | undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1055,6 +1059,7 @@ export class AgentSession {
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
+	#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
@@ -1418,7 +1423,7 @@ export class AgentSession {
 				recordSkip("unsupported-role");
 				return undefined;
 			}
-			const cloned = structuredClone(message) as Message;
+			const cloned = cloneJsonValueForForkSeed(message) as Message;
 			if ("providerPayload" in cloned) {
 				delete (cloned as { providerPayload?: unknown }).providerPayload;
 			}
@@ -1465,7 +1470,7 @@ export class AgentSession {
 		}
 		return {
 			messages,
-			agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+			agentMessages: messages.map(message => cloneJsonValueForForkSeed(message) as AgentMessage),
 			metadata: {
 				sourceSessionId: this.sessionId,
 				parentMessageCount: providerMessages.length,
@@ -4388,7 +4393,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const previousTools = this.getActiveToolNames().filter(name => name !== "goal");
+		const previousTools = this.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective });
 		await this.setActiveToolsByName(goalTools);
@@ -4587,7 +4592,7 @@ export class AgentSession {
 			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
 		await this.refreshGjcSubskillTools();
 
-		if (eagerTodoPrelude) {
+		if (eagerTodoPrelude?.toolChoice) {
 			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
 				label: "eager-todo",
 			});
@@ -4747,6 +4752,9 @@ export class AgentSession {
 			const lastAssistant = this.#findLastAssistantMessage();
 			if (lastAssistant && !options?.skipCompactionCheck) {
 				await this.#checkCompaction(lastAssistant, false);
+			}
+			if (!options?.skipCompactionCheck) {
+				await this.#checkEstimatedContextBeforePrompt();
 			}
 
 			// Build messages array (session context, eager todo prelude, then active prompt message)
@@ -5727,6 +5735,14 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
+	setActiveModelProfile(name: string | undefined): void {
+		this.#activeModelProfile = name;
+	}
+
+	getActiveModelProfile(): string | undefined {
+		return this.#activeModelProfile;
+	}
+
 	/**
 	 * Set model temporarily (for this session only).
 	 * Validates API key, saves to session log but NOT to settings.
@@ -6063,6 +6079,9 @@ export class AgentSession {
 			return undefined;
 		}
 
+		// getBranch() returns materialized copies for blob-externalized entries, so
+		// the pruning mutations must be written back into the canonical store.
+		this.sessionManager.applyEntryMessageUpdates(result.prunedEntries);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
@@ -6507,12 +6526,18 @@ export class AgentSession {
 		// Case 2: Threshold - turn succeeded but context is getting large
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return;
-		const pruneResult = await this.#pruneToolOutputs();
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
+		const maxOutputTokens = this.model?.maxTokens ?? 0;
+		// Cache-epoch invariant: pruning rewrites already-sent toolResult history,
+		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
+		// sanctioned maintenance boundary, i.e. when the un-pruned context already
+		// crosses the compaction threshold. Pruning may then avert full compaction.
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
+		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, this.model?.maxTokens ?? 0)) {
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {
@@ -6520,6 +6545,31 @@ export class AgentSession {
 			}
 		}
 	}
+
+	async #checkEstimatedContextBeforePrompt(): Promise<void> {
+		const model = this.model;
+		if (!model) return;
+		const contextWindow = model.contextWindow ?? 0;
+		if (contextWindow <= 0) return;
+		const compactionSettings = this.settings.getGroup("compaction");
+		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
+
+		let contextTokens = this.#estimateContextTokens().tokens;
+		const maxOutputTokens = model.maxTokens ?? 0;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
+
+		const pruneResult = await this.#pruneToolOutputs();
+		if (pruneResult) {
+			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+		}
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
+			await this.#runAutoCompaction("threshold", false, false, {
+				continueAfterMaintenance: false,
+				deferHandoffMaintenance: false,
+			});
+		}
+	}
+
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
 		const toolCallId = this.#lastSuccessfulYieldToolCallId;
 		if (!toolCallId) return false;
@@ -6617,7 +6667,7 @@ export class AgentSession {
 		});
 	}
 
-	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice: ToolChoice } | undefined {
+	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
 		const eagerTodosEnabled = this.settings.get("todo.eager");
 		const todosEnabled = this.settings.get("todo.enabled");
 		if (!eagerTodosEnabled || !todosEnabled) {
@@ -6651,13 +6701,15 @@ export class AgentSession {
 			return undefined;
 		}
 
-		const todoWriteToolChoice = buildNamedToolChoice("todo_write", this.model);
-		if (!todoWriteToolChoice) {
-			logger.warn("Eager todo enforcement skipped because the current model does not support forcing todo_write", {
+		const todoWriteToolChoiceResult = buildNamedToolChoiceResult("todo_write", this.model);
+		const todoWriteToolChoice = todoWriteToolChoiceResult.exactNamed ? todoWriteToolChoiceResult.choice : undefined;
+		if (!todoWriteToolChoiceResult.exactNamed) {
+			logger.debug("Eager todo enforcement degraded; sending reminder without forced tool choice", {
 				modelApi: this.model?.api,
 				modelId: this.model?.id,
+				resolvedLevel: todoWriteToolChoiceResult.resolved?.resolvedLevel,
+				reason: todoWriteToolChoiceResult.resolved?.reason,
 			});
-			return undefined;
 		}
 
 		const eagerTodoReminder = prompt.render(eagerTodoPrompt);
@@ -7039,11 +7091,37 @@ export class AgentSession {
 		}
 	}
 
+	#getProviderReplaySource(message: AgentMessage): ProviderReplaySourceCacheEntry {
+		const cached = this.#providerReplaySourceCache.get(message);
+		if (cached) return cached;
+		const source = JSON.stringify(this.#normalizeSessionMessageForProviderReplay(message));
+		const hash = this.#hashProviderReplaySource(source);
+		const entry = { source, hash };
+		this.#providerReplaySourceCache.set(message, entry);
+		return entry;
+	}
+
+	#hashProviderReplaySource(source: string): bigint {
+		return Bun.hash.xxHash64(source);
+	}
+
 	#didSessionMessagesChange(previousMessages: AgentMessage[], nextMessages: AgentMessage[]): boolean {
-		return (
-			JSON.stringify(previousMessages.map(message => this.#normalizeSessionMessageForProviderReplay(message))) !==
-			JSON.stringify(nextMessages.map(message => this.#normalizeSessionMessageForProviderReplay(message)))
-		);
+		if (previousMessages.length !== nextMessages.length) return true;
+
+		const previousSources: ProviderReplaySourceCacheEntry[] = [];
+		const nextSources: ProviderReplaySourceCacheEntry[] = [];
+		for (let i = 0; i < previousMessages.length; i++) {
+			const previous = this.#getProviderReplaySource(previousMessages[i]!);
+			const next = this.#getProviderReplaySource(nextMessages[i]!);
+			if (previous.hash !== next.hash) return true;
+			previousSources.push(previous);
+			nextSources.push(next);
+		}
+
+		for (let i = 0; i < previousSources.length; i++) {
+			if (previousSources[i]!.source !== nextSources[i]!.source) return true;
+		}
+		return false;
 	}
 
 	#getModelKey(model: Model): string {
@@ -7248,17 +7326,24 @@ export class AgentSession {
 		reason: "overflow" | "threshold" | "idle",
 		willRetry: boolean,
 		deferred = false,
+		options?: { continueAfterMaintenance?: boolean; deferHandoffMaintenance?: boolean },
 	): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.strategy === "off") return;
 		if (reason !== "idle" && !compactionSettings.enabled) return;
 		const generation = this.#promptGeneration;
-		if (!deferred && reason !== "overflow" && reason !== "idle" && compactionSettings.strategy === "handoff") {
+		if (
+			options?.deferHandoffMaintenance !== false &&
+			!deferred &&
+			reason !== "overflow" &&
+			reason !== "idle" &&
+			compactionSettings.strategy === "handoff"
+		) {
 			this.#schedulePostPromptTask(
 				async signal => {
 					await Promise.resolve();
 					if (signal.aborted) return;
-					await this.#runAutoCompaction(reason, willRetry, true);
+					await this.#runAutoCompaction(reason, willRetry, true, options);
 				},
 				{ generation },
 			);
@@ -7267,6 +7352,7 @@ export class AgentSession {
 
 		let action: "context-full" | "handoff" =
 			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
+		const continueAfterMaintenance = options?.continueAfterMaintenance !== false;
 		await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 		// Abort any older auto-compaction before installing this run's controller.
 		this.#autoCompactionAbortController?.abort();
@@ -7306,7 +7392,12 @@ export class AgentSession {
 						aborted: false,
 						willRetry: false,
 					});
-					if (!autoCompactionSignal.aborted && reason !== "idle" && compactionSettings.autoContinue !== false) {
+					if (
+						continueAfterMaintenance &&
+						!autoCompactionSignal.aborted &&
+						reason !== "idle" &&
+						compactionSettings.autoContinue !== false
+					) {
 						this.#scheduleAutoContinuePrompt(generation);
 					}
 					return;
@@ -7368,7 +7459,7 @@ export class AgentSession {
 							stopReason: tail?.stopReason,
 						});
 					}
-				} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
+				} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
@@ -7376,7 +7467,7 @@ export class AgentSession {
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
-				} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
 					this.#scheduleAutoContinuePrompt(generation);
 				}
 				return;
@@ -7597,7 +7688,7 @@ export class AgentSession {
 						onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 					});
 				}
-			} else if (reason !== "idle" && this.agent.hasQueuedMessages()) {
+			} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this.#scheduleAgentContinue({
@@ -7607,7 +7698,7 @@ export class AgentSession {
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
-			} else if (reason !== "idle" && compactionSettings.autoContinue !== false) {
+			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
 				this.#scheduleAutoContinuePrompt(generation);
 			}
 		} catch (error) {
@@ -8338,6 +8429,7 @@ export class AgentSession {
 				onChunk,
 				signal: abortController.signal,
 				sessionKey: this.sessionId,
+				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
 					sessionFile: this.sessionManager.getSessionFile(),
@@ -9527,7 +9619,7 @@ export class AgentSession {
 			// No usage data - estimate all messages
 			let estimated = 0;
 			for (const message of messages) {
-				estimated += estimateTokens(message);
+				estimated += estimateMessageTokensHeuristic(message);
 			}
 			return {
 				tokens: estimated,
@@ -9537,7 +9629,7 @@ export class AgentSession {
 		const usageTokens = calculatePromptTokens(lastUsage);
 		let trailingTokens = 0;
 		for (let i = lastUsageIndex + 1; i < messages.length; i++) {
-			trailingTokens += estimateTokens(messages[i]);
+			trailingTokens += estimateMessageTokensHeuristic(messages[i]);
 		}
 
 		return {
@@ -9756,4 +9848,8 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
 	}
+}
+
+function cloneJsonValueForForkSeed<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
 }

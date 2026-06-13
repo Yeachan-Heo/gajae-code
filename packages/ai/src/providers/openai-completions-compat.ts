@@ -4,12 +4,17 @@ type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "
 type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
 
 export type ResolvedOpenAICompat = Required<
-	Omit<OpenAICompat, "openRouterRouting" | "vercelGatewayRouting" | "extraBody" | "toolStrictMode">
+	Omit<
+		OpenAICompat,
+		"openRouterRouting" | "vercelGatewayRouting" | "extraBody" | "toolStrictMode" | "toolChoiceSupport"
+	>
 > & {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
 	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
 	extraBody?: OpenAICompat["extraBody"];
 	toolStrictMode: ResolvedToolStrictMode;
+	/** Optional explicit capability override; resolved via deriveToolChoiceSupport. */
+	toolChoiceSupport?: OpenAICompat["toolChoiceSupport"];
 };
 
 function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
@@ -191,6 +196,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(model.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
+		supportsForcedToolChoice: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: false,
@@ -254,6 +260,8 @@ export function resolveOpenAICompat(
 		reasoningEffortMap: { ...detected.reasoningEffortMap, ...(model.compat.reasoningEffortMap ?? {}) },
 		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
 		supportsToolChoice: model.compat.supportsToolChoice ?? detected.supportsToolChoice,
+		supportsForcedToolChoice: model.compat.supportsForcedToolChoice ?? detected.supportsForcedToolChoice,
+		toolChoiceSupport: model.compat.toolChoiceSupport ?? detected.toolChoiceSupport,
 		maxTokensField: model.compat.maxTokensField ?? detected.maxTokensField,
 		requiresToolResultName: model.compat.requiresToolResultName ?? detected.requiresToolResultName,
 		requiresAssistantAfterToolResult:

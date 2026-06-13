@@ -29,6 +29,7 @@ export interface TaskResultReceipt {
 	contextTokens?: number;
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
 	usage?: SingleResult["usage"];
 	cost?: number;
 	branchName?: string;
@@ -46,6 +47,7 @@ export interface TaskResultReceipt {
 	};
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
+	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
 	roi?: TaskRoi;
 }
 
@@ -77,6 +79,9 @@ function truncateText(value: string | undefined, maxChars: number): string | und
 
 function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
 	const status = getStatus(raw);
+	if (raw.modelSubstitutionWarning) {
+		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
+	}
 	if (raw.retryFailure) {
 		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
 	}
@@ -219,6 +224,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		contextTokens: raw.contextTokens,
 		contextWindow: raw.contextWindow,
 		modelOverride: raw.modelOverride,
+		modelSubstitutionWarning: raw.modelSubstitutionWarning,
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
 		branchName: raw.branchName,
@@ -234,6 +240,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		review: buildReview(raw),
 		extractedToolCounts,
 		forkContext: raw.forkContext,
+		forkContextAdvisory: raw.forkContextAdvisory,
 		roi: buildTaskRoi(raw),
 	};
 }

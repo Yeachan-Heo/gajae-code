@@ -4,6 +4,7 @@ import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
+import type { SpawnRoiReconciliation } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import type { SpawnPlanReceipt } from "./spawn-gate";
 import type { NestedRepoPatch } from "./worktree";
@@ -214,6 +215,12 @@ export interface AgentDefinition {
 	filePath?: string;
 }
 
+export interface ModelSubstitutionWarning {
+	requested: string;
+	effective: string;
+	reason: "auth_unavailable" | "assistant_model_mismatch";
+}
+
 /** Progress tracking for a single agent */
 export interface AgentProgress {
 	index: number;
@@ -246,6 +253,7 @@ export interface AgentProgress {
 	cost: number;
 	durationMs: number;
 	modelOverride?: string | string[];
+	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -305,6 +313,7 @@ export interface SingleResult {
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
@@ -337,6 +346,11 @@ export interface SingleResult {
 	outputMeta?: { lineCount: number; charCount: number; byteSize?: number; sha256?: string };
 	/** Fork-context seed accounting for this subagent, when inherited parent context was cloned. */
 	forkContext?: { mode: ForkContextMode; clonedTokens: number };
+	/**
+	 * Advisory fork-context mode recommendation for this task (logged only;
+	 * never changes the actual mode selection).
+	 */
+	forkContextAdvisory?: { recommendedMode: ForkContextMode; reasons: string[] };
 }
 
 /** Tool details for TUI rendering */
@@ -356,6 +370,7 @@ export interface TaskToolDetails {
 		/** Advisory ids for terminal children that spent tokens without detectable output/review/changes. */
 		lowRoiChildIds: string[];
 	};
+	roiReconciliation?: SpawnRoiReconciliation;
 	progress?: AgentProgress[];
 	async?: {
 		state: "running" | "paused" | "queued" | "completed" | "failed";

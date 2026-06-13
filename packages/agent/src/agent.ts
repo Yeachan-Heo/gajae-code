@@ -151,6 +151,8 @@ export interface AgentOptions {
 	 * Use this when abort decisions must happen before buffered events continue flowing.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** Called for non-content tool-choice incapability stream events. */
+	onToolChoiceIncapability?: AgentLoopConfig["onToolChoiceIncapability"];
 
 	/**
 	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
@@ -309,6 +311,7 @@ export class Agent {
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	#onToolChoiceIncapability?: AgentLoopConfig["onToolChoiceIncapability"];
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
@@ -373,6 +376,7 @@ export class Agent {
 		this.#intentTracing = opts.intentTracing === true;
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
+		this.#onToolChoiceIncapability = opts.onToolChoiceIncapability;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
@@ -680,7 +684,11 @@ export class Agent {
 		if (!source) return undefined;
 
 		const guarded: CursorExecHandlers = {};
-		const read = source.read;
+		// Bind each handler to `source`: they are methods of a CursorExecHandlers
+		// instance that reference private fields via `this`. Extracting them bare
+		// (`const read = source.read`) and calling `read(args)` would invoke them with
+		// `this === undefined`, throwing "undefined is not an object (this.#optionsForCall)".
+		const read = source.read?.bind(source);
 		if (read) {
 			guarded.read = async args => {
 				this.#assertActiveRun(runId);
@@ -689,7 +697,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const ls = source.ls;
+		const ls = source.ls?.bind(source);
 		if (ls) {
 			guarded.ls = async args => {
 				this.#assertActiveRun(runId);
@@ -698,7 +706,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const grep = source.grep;
+		const grep = source.grep?.bind(source);
 		if (grep) {
 			guarded.grep = async args => {
 				this.#assertActiveRun(runId);
@@ -707,7 +715,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const write = source.write;
+		const write = source.write?.bind(source);
 		if (write) {
 			guarded.write = async args => {
 				this.#assertActiveRun(runId);
@@ -716,7 +724,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const deleteHandler = source.delete;
+		const deleteHandler = source.delete?.bind(source);
 		if (deleteHandler) {
 			guarded.delete = async args => {
 				this.#assertActiveRun(runId);
@@ -725,7 +733,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const shell = source.shell;
+		const shell = source.shell?.bind(source);
 		if (shell) {
 			guarded.shell = async args => {
 				this.#assertActiveRun(runId);
@@ -734,7 +742,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const shellStream = source.shellStream;
+		const shellStream = source.shellStream?.bind(source);
 		if (shellStream) {
 			guarded.shellStream = async (args, callbacks) => {
 				this.#assertActiveRun(runId);
@@ -743,7 +751,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const diagnostics = source.diagnostics;
+		const diagnostics = source.diagnostics?.bind(source);
 		if (diagnostics) {
 			guarded.diagnostics = async args => {
 				this.#assertActiveRun(runId);
@@ -752,7 +760,7 @@ export class Agent {
 				return result;
 			};
 		}
-		const mcp = source.mcp;
+		const mcp = source.mcp?.bind(source);
 		if (mcp) {
 			guarded.mcp = async call => {
 				this.#assertActiveRun(runId);
@@ -1216,6 +1224,12 @@ export class Agent {
 				? (message, event) => {
 						if (this.#activeRunId !== runId) return;
 						this.#onAssistantMessageEvent?.(message, event);
+					}
+				: undefined,
+			onToolChoiceIncapability: this.#onToolChoiceIncapability
+				? event => {
+						if (this.#activeRunId !== runId) return;
+						this.#onToolChoiceIncapability?.(event);
 					}
 				: undefined,
 			onHarmonyLeak: this.#onHarmonyLeak,

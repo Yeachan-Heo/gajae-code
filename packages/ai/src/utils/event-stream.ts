@@ -2,7 +2,8 @@ import type { AssistantMessage, AssistantMessageEvent } from "../types";
 
 // Generic event stream class for async iteration
 export class EventStream<T, R = T> implements AsyncIterable<T> {
-	queue: T[] = [];
+	#queue: T[] = [];
+	#queueHead = 0;
 	waiting: Array<{ resolve: (value: IteratorResult<T>) => void; reject: (err: unknown) => void }> = [];
 	done = false;
 	#failed = false;
@@ -25,6 +26,35 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		this.extractResult = extractResult;
 	}
 
+	#enqueue(event: T): void {
+		this.#queue.push(event);
+	}
+
+	#dequeue(): T | undefined {
+		if (this.#queueHead >= this.#queue.length) return undefined;
+		const event = this.#queue[this.#queueHead]!;
+		this.#queue[this.#queueHead] = undefined as T;
+		this.#queueHead++;
+		if (this.#queueHead > 1024 && this.#queueHead * 2 >= this.#queue.length) {
+			this.#queue = this.#queue.slice(this.#queueHead);
+			this.#queueHead = 0;
+		}
+		return event;
+	}
+
+	get #queueLength(): number {
+		return this.#queue.length - this.#queueHead;
+	}
+
+	/**
+	 * Read-only snapshot of the not-yet-consumed events. Always a fresh copy:
+	 * external code can never mutate internal queue state or observe head-index
+	 * tombstones, so the deque cannot desynchronize.
+	 */
+	get queue(): T[] {
+		return this.#queue.slice(this.#queueHead);
+	}
+
 	push(event: T): void {
 		if (this.done) return;
 
@@ -38,7 +68,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		if (waiter) {
 			waiter.resolve({ value: event, done: false });
 		} else {
-			this.queue.push(event);
+			this.#enqueue(event);
 		}
 	}
 
@@ -47,7 +77,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		if (waiter) {
 			waiter.resolve({ value: event, done: false });
 		} else {
-			this.queue.push(event);
+			this.#enqueue(event);
 		}
 	}
 
@@ -84,8 +114,8 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 	async *[Symbol.asyncIterator](): AsyncIterator<T> {
 		while (true) {
-			if (this.queue.length > 0) {
-				yield this.queue.shift()!;
+			if (this.#queueLength > 0) {
+				yield this.#dequeue()!;
 			} else if (this.#failed) {
 				throw this.#error;
 			} else if (this.done) {

@@ -13,7 +13,7 @@ import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { ModelRegistry } from "../config/model-registry";
-import { resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
+import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
@@ -38,7 +38,7 @@ import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import { type ReportFindingDetails, toReviewFinding } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
-import { buildNamedToolChoice } from "../utils/tool-choice";
+import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
@@ -46,6 +46,7 @@ import {
 	type AgentProgress,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
+	type ModelSubstitutionWarning,
 	type ReviewFinding,
 	type SingleResult,
 	TASK_SUBAGENT_EVENT_CHANNEL,
@@ -627,6 +628,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let yieldCalled = false;
 	let pauseRequested = false;
 	let paused = false;
+	let modelSubstitutionWarning: ModelSubstitutionWarning | undefined;
+	let resolvedModelString: string | undefined;
+	let lastAssistantModelString: string | undefined;
+	let effectiveThinkingLevelForWarning: ThinkingLevel | undefined;
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -760,6 +765,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			return (message as { usage?: unknown }).usage;
 		}
 		return undefined;
+	};
+
+	const getMessageModelString = (message: unknown): string | undefined => {
+		if (!message || typeof message !== "object") return undefined;
+		const record = message as { provider?: unknown; model?: unknown };
+		return typeof record.provider === "string" && typeof record.model === "string"
+			? `${record.provider}/${record.model}`
+			: undefined;
 	};
 
 	const updateRecentOutputLines = () => {
@@ -964,6 +977,29 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							}
 						}
 					}
+					const assistantModel = getMessageModelString(event.message);
+					if (assistantModel) {
+						lastAssistantModelString = assistantModel;
+						if (resolvedModelString && assistantModel !== resolvedModelString && !modelSubstitutionWarning) {
+							modelSubstitutionWarning = {
+								requested: resolvedModelString,
+								effective: assistantModel,
+								reason: "assistant_model_mismatch",
+							};
+							progress.modelSubstitutionWarning = modelSubstitutionWarning;
+							activeSession?.sessionManager.appendModelChange(assistantModel, undefined, {
+								previousModel: resolvedModelString,
+								reason: modelSubstitutionWarning.reason,
+								thinkingLevel: effectiveThinkingLevelForWarning ?? null,
+							});
+							logger.warn("Subagent assistant response reported a substituted effective model", {
+								requested: resolvedModelString,
+								effective: assistantModel,
+								agent: agent.name,
+								id,
+							});
+						}
+					}
 				}
 				// Extract and accumulate usage (prefer message.usage, fallback to event.usage)
 				const messageUsage = getMessageUsage(event.message) || (event as AgentEvent & { usage?: unknown }).usage;
@@ -1090,6 +1126,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
 				authFallbackUsed,
+				requestedModel,
+				fallbackReason,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -1099,9 +1137,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentSessionId,
 				),
 			);
-			if (authFallbackUsed && model) {
+			if (model) {
+				resolvedModelString = formatModelString(model);
+			}
+			if (authFallbackUsed && model && requestedModel) {
+				modelSubstitutionWarning = {
+					requested: formatModelString(requestedModel),
+					effective: formatModelString(model),
+					reason: fallbackReason ?? "auth_unavailable",
+				};
+				progress.modelSubstitutionWarning = modelSubstitutionWarning;
 				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
-					requested: modelPatterns,
+					requested: modelSubstitutionWarning.requested,
 					parentModel: options.parentActiveModelPattern,
 					resolvedProvider: model.provider,
 					resolvedModel: model.id,
@@ -1113,6 +1160,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
+			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = sessionFile
 				? await awaitAbortable(SessionManager.open(sessionFile))
@@ -1174,6 +1222,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					settings: subagentSettings,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
+					modelSubstitution:
+						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
+							? { requestedModel, reason: modelSubstitutionWarning.reason }
+							: undefined,
 					toolNames,
 					outputSchema,
 					requireYieldTool: true,
@@ -1412,7 +1464,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				await awaitAbortable(session.waitForIdle());
 			}
 
-			const reminderToolChoice = buildNamedToolChoice("yield", session.model);
+			const reminderToolChoiceResult = buildNamedToolChoiceResult("yield", session.model);
 
 			let retryCount = 0;
 			while (!paused && !yieldCalled && retryCount < MAX_YIELD_RETRIES && !abortSignal.aborted) {
@@ -1433,7 +1485,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					await awaitAbortable(
 						session.prompt(reminder, {
 							attribution: "agent",
-							...(isFinalRetry && reminderToolChoice ? { toolChoice: reminderToolChoice } : {}),
+							...(isFinalRetry && reminderToolChoiceResult.exactNamed && reminderToolChoiceResult.choice
+								? { toolChoice: reminderToolChoiceResult.choice }
+								: {}),
 						}),
 					);
 					await awaitAbortable(session.waitForIdle());
@@ -1465,6 +1519,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					exitCode = 0;
 					error = undefined;
 				}
+			}
+			if (lastAssistantModelString && resolvedModelString && lastAssistantModelString !== resolvedModelString) {
+				modelSubstitutionWarning ??= {
+					requested: resolvedModelString,
+					effective: lastAssistantModelString,
+					reason: "assistant_model_mismatch",
+				};
+				progress.modelSubstitutionWarning = modelSubstitutionWarning;
 			}
 		} catch (err) {
 			exitCode = 1;
@@ -1642,6 +1704,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		modelSubstitutionWarning,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,

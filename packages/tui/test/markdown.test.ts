@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
-import { Markdown, renderInlineMarkdown } from "../src/components/markdown.js";
+import { clearRenderCache, Markdown, renderInlineMarkdown } from "../src/components/markdown.js";
 import { TERMINAL } from "../src/terminal-capabilities.js";
 import { type Component, TUI } from "../src/tui.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
@@ -1197,5 +1197,52 @@ describe("Module-level LRU render cache", () => {
 
 		// Output must be byte-identical — cache is transparent to callers.
 		expect(lines2).toEqual(lines1);
+	});
+
+	it("keeps distinct markdown render cache bounded", () => {
+		clearRenderCache();
+		let highlightCallCount = 0;
+		const themeWithSpy = {
+			...defaultMarkdownTheme,
+			highlightCode: (code: string, _lang?: string): string[] => {
+				highlightCallCount++;
+				return [code];
+			},
+		};
+
+		for (let i = 0; i < 300; i++) {
+			new Markdown(`message ${i}\n\n\`\`\`js\nconst value = ${i};\n\`\`\``, 0, 0, themeWithSpy).render(80);
+		}
+
+		new Markdown("message 0\n\n```js\nconst value = 0;\n```", 0, 0, themeWithSpy).render(80);
+		expect(highlightCallCount).toBe(301);
+	});
+
+	it("never serves another message's render on content-key collision attempts", () => {
+		clearRenderCache();
+		// Force a DETERMINISTIC key collision: stub Bun.hash to a constant so
+		// two different documents map to the same content hash. The cache's
+		// source-verification on hit is then the only thing preventing wrong
+		// output — exactly the guard this regression must pin down.
+		const realHash = Bun.hash;
+		const stub = Object.assign((..._args: unknown[]) => 0xdeadbeefn, realHash);
+		(Bun as { hash: typeof Bun.hash }).hash = stub as typeof Bun.hash;
+		try {
+			const head = "# Title\n\n";
+			const tail = "\n\n---\nfooter line for the collision probe";
+			const docA = `${head}body ${"a".repeat(200)} unique-AAAA${tail}`;
+			const docB = `${head}body ${"a".repeat(200)} unique-BBBB${tail}`;
+			expect(docA.length).toBe(docB.length); // same length + stubbed hash => identical cache key
+
+			const linesA = new Markdown(docA, 0, 0, defaultMarkdownTheme).render(80);
+			const linesB = new Markdown(docB, 0, 0, defaultMarkdownTheme).render(80);
+
+			expect(linesB.join("\n")).toContain("unique-BBBB");
+			expect(linesB.join("\n")).not.toContain("unique-AAAA");
+			expect(linesA.join("\n")).toContain("unique-AAAA");
+		} finally {
+			(Bun as { hash: typeof Bun.hash }).hash = realHash;
+			clearRenderCache();
+		}
 	});
 });

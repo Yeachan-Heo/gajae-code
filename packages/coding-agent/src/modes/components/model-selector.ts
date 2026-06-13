@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { clampThinkingLevelForModel, getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
+import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
 import {
 	Container,
 	fuzzyFilter,
@@ -12,9 +12,17 @@ import {
 	Text,
 	type TUI,
 } from "@gajae-code/tui";
-import type { ModelProfileDefinition } from "../../config/model-profiles";
+import {
+	getModelProfilePresentation,
+	groupModelProfilesForPresetLanding,
+	type ModelProfileDefinition,
+} from "../../config/model-profiles";
 import type { GjcModelAssignmentTargetId, ModelRegistry } from "../../config/model-registry";
-import { GJC_MODEL_ASSIGNMENT_TARGET_IDS, GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
+import {
+	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
+	GJC_MODEL_ASSIGNMENT_TARGETS,
+	isAuthenticated,
+} from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
 	resolveModelRoleValue,
@@ -23,7 +31,7 @@ import {
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
-import { getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
+import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -75,24 +83,11 @@ interface CanonicalModelItem {
 	explicitThinkingLevel?: boolean;
 }
 
-interface ProfileItem {
-	kind: "profile";
-	name: string;
-	profile: ModelProfileDefinition;
-}
-
 type ScopedModelItem = ScopedModelSelection;
 
 interface RoleAssignment {
 	model: Model;
 	thinkingLevel: ThinkingLevel;
-}
-
-export interface ModelAssignmentPreset {
-	id: "openai-codex";
-	label: string;
-	description: string;
-	assignments: Partial<Record<GjcModelAssignmentTargetId, ThinkingLevel>>;
 }
 
 export type ModelSelectorSelection =
@@ -102,13 +97,6 @@ export type ModelSelectorSelection =
 			role: GjcModelAssignmentTargetId | null;
 			thinkingLevel?: ThinkingLevel;
 			selector?: string;
-	  }
-	| {
-			kind: "preset";
-			model: Model;
-			selector: string;
-			preset: ModelAssignmentPreset;
-			assignments: Record<GjcModelAssignmentTargetId, ThinkingLevel>;
 	  }
 	| {
 			kind: "profile";
@@ -137,18 +125,6 @@ const STATIC_PROVIDER_TABS: ProviderTabState[] = [
 	{ id: ALL_TAB, label: ALL_TAB },
 	{ id: CANONICAL_TAB, label: CANONICAL_TAB },
 ];
-const OPENAI_CODE_PROFILE_PRESET: ModelAssignmentPreset = {
-	id: "openai-codex",
-	label: "Apply OpenAI Codex role preset",
-	description: "Default medium, Executor low, Architect xhigh, Planner medium, Critic high",
-	assignments: {
-		default: ThinkingLevel.Medium,
-		executor: ThinkingLevel.Low,
-		architect: ThinkingLevel.XHigh,
-		planner: ThinkingLevel.Medium,
-		critic: ThinkingLevel.High,
-	},
-};
 
 function formatProviderTabLabel(providerId: string): string {
 	return providerId.replace(/[-_]+/g, " ").toUpperCase();
@@ -156,6 +132,43 @@ function formatProviderTabLabel(providerId: string): string {
 
 function createProviderTab(providerId: string): ProviderTabState {
 	return { id: providerId, label: formatProviderTabLabel(providerId), providerId };
+}
+
+type ModelSelectorViewMode = "presets" | "models";
+
+interface PresetGroupRow {
+	kind: "group";
+	groupId: string;
+	profiles: ModelProfileDefinition[];
+}
+
+interface PresetProfileRow {
+	kind: "profile";
+	groupId: string;
+	profile: ModelProfileDefinition;
+}
+
+interface PresetBrowseRow {
+	kind: "browse";
+}
+
+type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetBrowseRow;
+
+const PROFILE_ROLE_PREVIEW_ORDER: GjcModelAssignmentTargetId[] = [
+	"default",
+	"executor",
+	"planner",
+	"critic",
+	"architect",
+];
+const PRESET_SCOPE_LABELS = ["Apply for this session", "Set as default"];
+
+function isPrintableCharacter(keyData: string): boolean {
+	return keyData.length === 1 && keyData >= " " && keyData !== "\x7f";
+}
+
+function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
+	return [...new Set(profile.requiredProviders)].sort((a, b) => a.localeCompare(b));
 }
 /**
  * Component that renders a canonical model selector with provider tabs.
@@ -173,7 +186,6 @@ export class ModelSelectorComponent extends Container {
 	#filteredModels: ModelItem[] = [];
 	#canonicalModels: CanonicalModelItem[] = [];
 	#filteredCanonicalModels: CanonicalModelItem[] = [];
-	#profileItems: ProfileItem[] = [];
 	#selectedIndex: number = 0;
 	#roles = {} as Record<string, RoleAssignment | undefined>;
 	#settings = null as unknown as Settings;
@@ -189,6 +201,18 @@ export class ModelSelectorComponent extends Container {
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
 
+	// Preset landing state
+	#viewMode: ModelSelectorViewMode = "presets";
+	#presetCursor: number = 0;
+	#expandedPresetProviderId?: string;
+	#previewProfileName?: string;
+	#presetScopeMenuOpen: boolean = false;
+	#presetScopeIndex: number = 0;
+	#providerAuthById = new Map<string, boolean>();
+	#providerAuthPending: boolean = false;
+	#presetLoginHint?: string;
+	#authSessionId?: string;
+
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
 	#activeTabIndex: number = 0;
@@ -201,7 +225,7 @@ export class ModelSelectorComponent extends Container {
 		scopedModels: ReadonlyArray<ScopedModelItem>,
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
-		options?: { temporaryOnly?: boolean; initialSearchInput?: string },
+		options?: { temporaryOnly?: boolean; initialSearchInput?: string; sessionId?: string },
 	) {
 		super();
 
@@ -212,7 +236,9 @@ export class ModelSelectorComponent extends Container {
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
+		this.#authSessionId = options?.sessionId;
 		const initialSearchInput = options?.initialSearchInput;
+		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
 		// Load current role assignments from settings
 		this.#loadRoleModels();
@@ -240,13 +266,7 @@ export class ModelSelectorComponent extends Container {
 		}
 		this.#searchInput.onSubmit = () => {
 			const selectedItem = this.#getSelectedItem();
-			if (selectedItem) {
-				if (selectedItem.kind === "profile") {
-					this.#beginProfileActionMenu(selectedItem);
-				} else {
-					this.#beginActionMenuOrSelect(selectedItem);
-				}
-			}
+			if (selectedItem) this.#beginActionMenuOrSelect(selectedItem);
 		};
 		this.addChild(this.#searchInput);
 
@@ -264,14 +284,23 @@ export class ModelSelectorComponent extends Container {
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
-			this.#updateTabBar();
-			// Always apply the current search query — the user may have typed
-			// while models were loading asynchronously.
-			const currentQuery = this.#searchInput.getValue();
-			if (currentQuery) {
-				this.#filterModels(currentQuery);
+			if (this.#viewMode === "presets" && (this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0) {
+				this.#viewMode = "models";
+			}
+			if (this.#viewMode === "presets") {
+				this.#updatePresetExpansion();
+				void this.#refreshProviderAuth();
+				this.#renderPresetLanding();
 			} else {
-				this.#updateList();
+				this.#updateTabBar();
+				// Always apply the current search query — the user may have typed
+				// while models were loading asynchronously.
+				const currentQuery = this.#searchInput.getValue();
+				if (currentQuery) {
+					this.#filterModels(currentQuery);
+				} else {
+					this.#updateList();
+				}
 			}
 			// Request re-render after models are loaded
 			this.#tui.requestRender();
@@ -482,18 +511,10 @@ export class ModelSelectorComponent extends Container {
 
 		this.#sortModels(models);
 		this.#sortCanonicalModels(canonicalModels);
-		const profiles = this.#modelRegistry.getModelProfiles?.() ?? new Map();
-		const profileItems = this.#temporaryOnly
-			? []
-			: [...profiles.values()]
-					.sort((a, b) => a.name.localeCompare(b.name))
-					.map(profile => ({ kind: "profile" as const, name: profile.name, profile }));
-
 		this.#allModels = models;
 		this.#filteredModels = models;
 		this.#canonicalModels = canonicalModels;
 		this.#filteredCanonicalModels = canonicalModels;
-		this.#profileItems = profileItems;
 		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, models.length - 1));
 	}
 
@@ -642,6 +663,164 @@ export class ModelSelectorComponent extends Container {
 		return `${ageMinutes}m ago`;
 	}
 
+	#getPresetGroups(): Map<string, ModelProfileDefinition[]> {
+		return groupModelProfilesForPresetLanding(this.#modelRegistry.getModelProfiles?.() ?? new Map());
+	}
+
+	#getPresetRows(): PresetLandingRow[] {
+		const rows: PresetLandingRow[] = [];
+		for (const [groupId, profiles] of this.#getPresetGroups()) {
+			rows.push({ kind: "group", groupId, profiles });
+			if (this.#expandedPresetProviderId === groupId) {
+				for (const profile of profiles) rows.push({ kind: "profile", groupId, profile });
+			}
+		}
+		rows.push({ kind: "browse" });
+		return rows;
+	}
+
+	#getSelectedPresetRow(): PresetLandingRow | undefined {
+		return this.#getPresetRows()[this.#presetCursor];
+	}
+
+	#getProfileByName(name: string | undefined): ModelProfileDefinition | undefined {
+		if (!name) return undefined;
+		return this.#modelRegistry.getModelProfile?.(name) ?? this.#modelRegistry.getModelProfiles?.().get(name);
+	}
+
+	#isProviderAuthenticated(providerId: string): boolean | undefined {
+		return this.#providerAuthById.get(providerId);
+	}
+
+	#getMissingProviders(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): string[] {
+		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
+		const providers = new Set<string>();
+		for (const profile of profiles) for (const provider of profileRequiredProviders(profile)) providers.add(provider);
+		return [...providers]
+			.filter(provider => this.#isProviderAuthenticated(provider) !== true)
+			.sort((a, b) => a.localeCompare(b));
+	}
+
+	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
+		return this.#getMissingProviders(profileOrProfiles).length === 0;
+	}
+
+	async #refreshProviderAuth(): Promise<void> {
+		const providers = new Set<string>();
+		for (const profiles of this.#getPresetGroups().values()) {
+			for (const profile of profiles)
+				for (const provider of profileRequiredProviders(profile)) providers.add(provider);
+		}
+		this.#providerAuthPending = providers.size > 0;
+		this.#renderPresetLanding();
+		const entries = await Promise.all(
+			[...providers].map(async provider => {
+				const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
+				return [provider, isAuthenticated(apiKey)] as const;
+			}),
+		);
+		this.#providerAuthById = new Map(entries);
+		this.#providerAuthPending = false;
+		this.#renderPresetLanding();
+		this.#tui.requestRender();
+	}
+
+	#updatePresetExpansion(): void {
+		const selected = this.#getSelectedPresetRow();
+		if (selected?.kind === "group") this.#expandedPresetProviderId = selected.groupId;
+		if (selected?.kind === "profile") this.#expandedPresetProviderId = selected.groupId;
+		const rows = this.#getPresetRows();
+		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, rows.length - 1));
+	}
+
+	#switchToModelMode(seed?: string): void {
+		this.#viewMode = "models";
+		this.#expandedPresetProviderId = undefined;
+		this.#previewProfileName = undefined;
+		this.#presetScopeMenuOpen = false;
+		this.#presetScopeIndex = 0;
+		this.#presetLoginHint = undefined;
+		this.#activeTabIndex = 0;
+		this.#selectedIndex = 0;
+		this.#searchInput.setValue(seed ?? this.#searchInput.getValue());
+		this.#updateTabBar();
+		this.#filterModels(this.#searchInput.getValue());
+	}
+
+	#renderPresetLanding(): void {
+		this.#headerContainer.clear();
+		this.#tabBar = null;
+		this.#listContainer.clear();
+		this.#headerContainer.addChild(new Text(theme.fg("accent", "Model presets"), 0, 0));
+		const rows = this.#getPresetRows();
+		for (let i = 0; i < rows.length; i++) {
+			const row = rows[i];
+			const selected = i === this.#presetCursor;
+			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			if (row.kind === "browse") {
+				const label = "Browse all models";
+				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
+			if (row.kind === "group") {
+				const authenticated = this.#isPresetAuthenticated(row.profiles);
+				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+				const label = `${mark} ${row.groupId}`;
+				const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+				continue;
+			}
+			const presentation = getModelProfilePresentation(row.profile.name);
+			const authenticated = this.#isPresetAuthenticated(row.profile);
+			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+			const label = `  ${mark} ${presentation.displayName}`;
+			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
+			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+		}
+		if (this.#presetLoginHint) {
+			this.#listContainer.addChild(new Spacer(1));
+			this.#listContainer.addChild(new Text(theme.fg("warning", `  ${this.#presetLoginHint}`), 0, 0));
+		}
+		const previewProfile = this.#getProfileByName(this.#previewProfileName);
+		if (previewProfile) this.#renderPresetPreview(previewProfile);
+	}
+
+	#renderPresetPreview(profile: ModelProfileDefinition): void {
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(
+			new Text(
+				theme.fg("muted", `  Preset preview: ${getModelProfilePresentation(profile.name).displayName}`),
+				0,
+				0,
+			),
+		);
+		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
+			const selector = profile.modelMapping[role];
+			if (!selector) continue;
+			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+				settings: this.#settings,
+				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
+				modelRegistry: this.#modelRegistry,
+			});
+			const label = GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase();
+			this.#listContainer.addChild(
+				new Text(`  ${label}: ${formatClampedModelSelector(selector, resolved.model)}`, 0, 0),
+			);
+		}
+		this.#listContainer.addChild(new Spacer(1));
+		if (this.#presetScopeMenuOpen) {
+			for (let i = 0; i < PRESET_SCOPE_LABELS.length; i++) {
+				const label = PRESET_SCOPE_LABELS[i] ?? "";
+				const prefix = i === this.#presetScopeIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+				this.#listContainer.addChild(
+					new Text(`${prefix}${i === this.#presetScopeIndex ? theme.fg("accent", label) : label}`, 0, 0),
+				);
+			}
+		} else {
+			this.#listContainer.addChild(new Text(theme.fg("muted", "  Press Enter to apply this preset"), 0, 0));
+		}
+	}
+
 	#formatDiscoveryErrorHint(error: string | undefined): string | undefined {
 		if (!error) {
 			return undefined;
@@ -688,17 +867,10 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
-	#getVisibleProfiles(): ProfileItem[] {
-		return !this.#temporaryOnly && !this.#isCanonicalTab() && this.#getActiveTabId() === ALL_TAB
-			? this.#profileItems
-			: [];
-	}
-
 	#updateList(): void {
 		this.#listContainer.clear();
 		const isCanonicalTab = this.#isCanonicalTab();
-		const visibleProfiles = this.#getVisibleProfiles();
-		const modelSelectedIndex = Math.max(0, this.#selectedIndex - visibleProfiles.length);
+		const modelSelectedIndex = this.#selectedIndex;
 		const visibleItems = isCanonicalTab ? this.#filteredCanonicalModels : this.#filteredModels;
 
 		const maxVisible = 10;
@@ -710,18 +882,6 @@ export class ModelSelectorComponent extends Container {
 
 		const showProvider = this.#getActiveTabId() === ALL_TAB;
 
-		if (visibleProfiles.length > 0) {
-			this.#listContainer.addChild(new Text(theme.fg("muted", "Profiles"), 0, 0));
-			for (let i = 0; i < visibleProfiles.length; i++) {
-				const profile = visibleProfiles[i];
-				if (!profile) continue;
-				const isSelected = i === this.#selectedIndex;
-				const prefix = isSelected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
-				const label = isSelected ? theme.fg("accent", profile.name) : profile.name;
-				this.#listContainer.addChild(new Text(`${prefix}${label}`, 0, 0));
-			}
-			this.#listContainer.addChild(new Spacer(1));
-		}
 		// Show visible slice of filtered models
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = visibleItems[i];
@@ -729,7 +889,7 @@ export class ModelSelectorComponent extends Container {
 			const canonicalItem = isCanonicalTab ? (item as CanonicalModelItem) : undefined;
 			const providerItem = isCanonicalTab ? undefined : (item as ModelItem);
 
-			const isSelected = i + visibleProfiles.length === this.#selectedIndex;
+			const isSelected = i === this.#selectedIndex;
 
 			// Build role badges (inverted: color as background, black text)
 			const roleBadgeTokens: string[] = [];
@@ -786,7 +946,7 @@ export class ModelSelectorComponent extends Container {
 			for (const line of errorLines) {
 				this.#listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
-		} else if (visibleItems.length === 0 && visibleProfiles.length === 0) {
+		} else if (visibleItems.length === 0) {
 			const statusMessage = this.#getProviderEmptyStateMessage();
 			this.#listContainer.addChild(
 				new Text(
@@ -795,11 +955,6 @@ export class ModelSelectorComponent extends Container {
 					0,
 				),
 			);
-		} else if (this.#selectedIndex < visibleProfiles.length) {
-			const selectedProfile = visibleProfiles[this.#selectedIndex];
-			if (selectedProfile && this.#pendingActionItem) {
-				this.#renderProfileActionMenu(selectedProfile);
-			}
 		} else {
 			const selected = visibleItems[modelSelectedIndex];
 			if (!selected) {
@@ -828,9 +983,7 @@ export class ModelSelectorComponent extends Container {
 		for (let i = 0; i < actionCount; i++) {
 			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
-			const label = role
-				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
-				: `${OPENAI_CODE_PROFILE_PRESET.label} (${OPENAI_CODE_PROFILE_PRESET.description})`;
+			const label = `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`;
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
@@ -855,32 +1008,17 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
-	#renderProfileActionMenu(profile: ProfileItem): void {
-		this.#listContainer.addChild(new Spacer(1));
-		this.#listContainer.addChild(new Text(theme.fg("muted", `  Action for profile: ${profile.name}`), 0, 0));
-		this.#listContainer.addChild(new Spacer(1));
-		const labels = ["Apply for this session", "Set as default"];
-		for (let i = 0; i < labels.length; i++) {
-			const label = labels[i] ?? "";
-			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
-			this.#listContainer.addChild(
-				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
-			);
-		}
-	}
-
 	#getCurrentRoleThinkingLevel(role: string): ThinkingLevel {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
 	}
-	#getActionCount(model: Model): number {
-		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (supportsOpenAICodexPreset(model) ? 1 : 0);
+	#getActionCount(_model: Model): number {
+		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length;
 	}
 
-	#getSelectedItem(): ModelItem | CanonicalModelItem | ProfileItem | undefined {
-		const visibleProfiles = this.#getVisibleProfiles();
-		if (this.#selectedIndex < visibleProfiles.length) return visibleProfiles[this.#selectedIndex];
-		const modelIndex = this.#selectedIndex - visibleProfiles.length;
-		return this.#isCanonicalTab() ? this.#filteredCanonicalModels[modelIndex] : this.#filteredModels[modelIndex];
+	#getSelectedItem(): ModelItem | CanonicalModelItem | undefined {
+		return this.#isCanonicalTab()
+			? this.#filteredCanonicalModels[this.#selectedIndex]
+			: this.#filteredModels[this.#selectedIndex];
 	}
 
 	handleInput(keyData: string): void {
@@ -893,6 +1031,11 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
+		if (this.#viewMode === "presets") {
+			this.#handlePresetLandingInput(keyData);
+			return;
+		}
+
 		// Tab bar navigation
 		if (this.#tabBar?.handleInput(keyData)) {
 			return;
@@ -900,9 +1043,7 @@ export class ModelSelectorComponent extends Container {
 
 		// Up arrow - navigate list (wrap to bottom when at top)
 		if (matchesKey(keyData, "up")) {
-			const itemCount =
-				this.#getVisibleProfiles().length +
-				(this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length);
+			const itemCount = this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length;
 			if (itemCount === 0) return;
 			this.#selectedIndex = this.#selectedIndex === 0 ? itemCount - 1 : this.#selectedIndex - 1;
 			this.#updateList();
@@ -911,9 +1052,7 @@ export class ModelSelectorComponent extends Container {
 
 		// Down arrow - navigate list (wrap to top when at bottom)
 		if (matchesKey(keyData, "down")) {
-			const itemCount =
-				this.#getVisibleProfiles().length +
-				(this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length);
+			const itemCount = this.#isCanonicalTab() ? this.#filteredCanonicalModels.length : this.#filteredModels.length;
 			if (itemCount === 0) return;
 			this.#selectedIndex = this.#selectedIndex === itemCount - 1 ? 0 : this.#selectedIndex + 1;
 			this.#updateList();
@@ -924,13 +1063,7 @@ export class ModelSelectorComponent extends Container {
 		// existing non-persistent quick-switch behavior.
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selectedItem = this.#getSelectedItem();
-			if (selectedItem) {
-				if (selectedItem.kind === "profile") {
-					this.#beginProfileActionMenu(selectedItem);
-				} else {
-					this.#beginActionMenuOrSelect(selectedItem);
-				}
-			}
+			if (selectedItem) this.#beginActionMenuOrSelect(selectedItem);
 			return;
 		}
 
@@ -944,10 +1077,99 @@ export class ModelSelectorComponent extends Container {
 		this.#searchInput.handleInput(keyData);
 		this.#filterModels(this.#searchInput.getValue());
 	}
-	#beginProfileActionMenu(profile: ProfileItem): void {
-		this.#pendingActionItem = profile as unknown as ModelItem;
-		this.#selectedActionIndex = 0;
-		this.#updateList();
+
+	#handlePresetLandingInput(keyData: string): void {
+		if (isPrintableCharacter(keyData)) {
+			this.#switchToModelMode(keyData);
+			return;
+		}
+		if (matchesKey(keyData, "up")) {
+			const rows = this.#getPresetRows();
+			if (rows.length === 0) return;
+			if (this.#presetScopeMenuOpen) {
+				this.#presetScopeIndex =
+					this.#presetScopeIndex === 0 ? PRESET_SCOPE_LABELS.length - 1 : this.#presetScopeIndex - 1;
+			} else {
+				this.#presetCursor = this.#presetCursor === 0 ? rows.length - 1 : this.#presetCursor - 1;
+				this.#previewProfileName = undefined;
+				this.#presetLoginHint = undefined;
+				this.#updatePresetExpansion();
+			}
+			this.#renderPresetLanding();
+			return;
+		}
+		if (matchesKey(keyData, "down")) {
+			const rows = this.#getPresetRows();
+			if (rows.length === 0) return;
+			if (this.#presetScopeMenuOpen) {
+				this.#presetScopeIndex = (this.#presetScopeIndex + 1) % PRESET_SCOPE_LABELS.length;
+			} else {
+				this.#presetCursor = (this.#presetCursor + 1) % rows.length;
+				this.#previewProfileName = undefined;
+				this.#presetLoginHint = undefined;
+				this.#updatePresetExpansion();
+			}
+			this.#renderPresetLanding();
+			return;
+		}
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			this.#handlePresetEnter();
+			return;
+		}
+		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+			if (this.#presetScopeMenuOpen) {
+				this.#presetScopeMenuOpen = false;
+				this.#renderPresetLanding();
+				return;
+			}
+			if (this.#previewProfileName) {
+				this.#previewProfileName = undefined;
+				this.#renderPresetLanding();
+				return;
+			}
+			if (this.#expandedPresetProviderId) {
+				this.#expandedPresetProviderId = undefined;
+				this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
+				this.#renderPresetLanding();
+				return;
+			}
+			this.#onCancelCallback();
+		}
+	}
+
+	#handlePresetEnter(): void {
+		if (this.#presetScopeMenuOpen && this.#previewProfileName) {
+			this.#onSelectCallback({
+				kind: "profile",
+				profileName: this.#previewProfileName,
+				setDefault: this.#presetScopeIndex === 1,
+			});
+			return;
+		}
+		if (this.#previewProfileName) {
+			this.#presetScopeMenuOpen = true;
+			this.#presetScopeIndex = 0;
+			this.#renderPresetLanding();
+			return;
+		}
+		const row = this.#getSelectedPresetRow();
+		if (!row) return;
+		if (row.kind === "browse") {
+			this.#switchToModelMode();
+			return;
+		}
+		const missing =
+			row.kind === "group" ? this.#getMissingProviders(row.profiles) : this.#getMissingProviders(row.profile);
+		if (missing.length > 0) {
+			this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+			this.#renderPresetLanding();
+			return;
+		}
+		if (row.kind === "profile") {
+			this.#previewProfileName = row.profile.name;
+			this.#presetLoginHint = undefined;
+			this.#renderPresetLanding();
+		}
 	}
 
 	#beginActionMenuOrSelect(item: ModelItem | CanonicalModelItem): void {
@@ -963,7 +1185,7 @@ export class ModelSelectorComponent extends Container {
 	#handleActionMenuInput(keyData: string): void {
 		const item = this.#pendingActionItem;
 		if (!item) return;
-		const actionCount = (item as unknown as ProfileItem).kind === "profile" ? 2 : this.#getActionCount(item.model);
+		const actionCount = this.#getActionCount(item.model);
 		if (matchesKey(keyData, "up")) {
 			this.#selectedActionIndex = this.#selectedActionIndex === 0 ? actionCount - 1 : this.#selectedActionIndex - 1;
 			this.#updateList();
@@ -976,21 +1198,8 @@ export class ModelSelectorComponent extends Container {
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			this.#pendingActionItem = undefined;
-			if ((item as unknown as ProfileItem).kind === "profile") {
-				const profile = item as unknown as ProfileItem;
-				this.#onSelectCallback({
-					kind: "profile",
-					profileName: profile.name,
-					setDefault: this.#selectedActionIndex === 1,
-				});
-			} else {
-				const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
-				if (role) {
-					this.#handleSelect(item, role);
-				} else {
-					this.#handlePresetSelect(item, OPENAI_CODE_PROFILE_PRESET);
-				}
-			}
+			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
+			if (role) this.#handleSelect(item, role);
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
@@ -1028,18 +1237,6 @@ export class ModelSelectorComponent extends Container {
 			}
 			this.#updateList();
 		}
-	}
-	#handlePresetSelect(item: ModelItem | CanonicalModelItem, preset: ModelAssignmentPreset): void {
-		const selectorValue = item.selector;
-		const assignments = resolvePresetAssignments(item.model, preset);
-		for (const [role, thinkingLevel] of Object.entries(assignments) as [
-			GjcModelAssignmentTargetId,
-			ThinkingLevel,
-		][]) {
-			this.#roles[role] = { model: item.model, thinkingLevel };
-		}
-		this.#onSelectCallback({ kind: "preset", model: item.model, selector: selectorValue, preset, assignments });
-		this.#updateList();
 	}
 
 	#handleSelect(
@@ -1098,31 +1295,6 @@ export class ModelSelectorComponent extends Container {
 
 function requiresExplicitThinkingChoice(model: Model): boolean {
 	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
-}
-
-function supportsOpenAICodexPreset(model: Model): boolean {
-	return model.provider === "openai-codex" && model.reasoning === true;
-}
-
-function resolvePresetAssignments(
-	model: Model,
-	preset: ModelAssignmentPreset,
-): Record<GjcModelAssignmentTargetId, ThinkingLevel> {
-	const resolved = {} as Record<GjcModelAssignmentTargetId, ThinkingLevel>;
-	for (const [role, requestedLevel] of Object.entries(preset.assignments) as [
-		GjcModelAssignmentTargetId,
-		ThinkingLevel,
-	][]) {
-		const clampedLevel =
-			requestedLevel === ThinkingLevel.Off || requestedLevel === ThinkingLevel.Inherit
-				? requestedLevel
-				: clampThinkingLevelForModel(model, requestedLevel);
-		if (!clampedLevel) {
-			throw new Error(`Model ${model.provider}/${model.id} does not support ${requestedLevel} reasoning`);
-		}
-		resolved[role] = clampedLevel;
-	}
-	return resolved;
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

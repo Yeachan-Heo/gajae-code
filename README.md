@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://gajae-code.com"><img alt="Website" src="https://img.shields.io/badge/website-gajae--code.com-ff4d4f?style=flat-square"></a>
   <a href="https://www.npmjs.com/package/gajae-code"><img alt="npm package" src="https://img.shields.io/npm/v/gajae-code?style=flat-square"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
   <a href="https://discord.gg/sj4exxQ9v"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
@@ -20,6 +21,10 @@
 </p>
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
+
+## Website
+
+Visit **[gajae-code.com](https://gajae-code.com)** for the Gajae Code landing page, quick-start guide, architecture overview, harness notes, bridge/RPC docs, skills, receipts, remote-control design, and troubleshooting.
 
 ## What is Gajae-Code?
 
@@ -39,6 +44,39 @@ bun install -g gajae-code
 ```
 
 The scoped package is also available as `@gajae-code/coding-agent`.
+
+### Windows (native install)
+
+On a clean Windows 11 machine, install Bun first, then install `gjc` with Bun's
+global installer:
+
+```powershell
+# 1. Install Bun
+powershell -c "irm bun.sh/install.ps1|iex"
+
+# 2. Restart the terminal so PATH and the Bun runtime refresh, then confirm Bun
+bun --version
+
+# 3. Install and verify gjc
+bun install -g gajae-code
+gjc --version
+gjc --smoke-test
+```
+
+`bun install -g` places the `gjc` launcher in `%USERPROFILE%\.bun\bin`. That
+directory must be on `PATH` for `gjc` to resolve as a command. Bun's installer
+adds it automatically, but the change only applies to terminals started after
+installation — restart PowerShell (or sign out/in) if `gjc` is "not recognized".
+
+Troubleshooting:
+
+- **`gjc` reports an old Bun runtime.** Re-run the Bun installer above, restart
+  the terminal, and confirm `bun --version` matches what `gjc --version`
+  expects. If an older Bun still wins, make sure `%USERPROFILE%\.bun\bin` is
+  first on `PATH` and remove any stale Bun installs shadowing it.
+- **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed
+  but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in
+  `echo $env:Path`, then restart the terminal.
 
 ## Quick start
 

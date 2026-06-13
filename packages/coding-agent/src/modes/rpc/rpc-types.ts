@@ -12,6 +12,8 @@ import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { SessionStats } from "../../session/agent-session";
 import type { TodoPhase } from "../../tools/todo-write";
 
+export type RpcGetStateInclude = "tools" | "dumpTools" | "systemPrompt";
+
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
@@ -26,7 +28,7 @@ export type RpcCommand =
 	| { id?: string; type: "new_session"; parentSession?: string }
 
 	// State
-	| { id?: string; type: "get_state" }
+	| { id?: string; type: "get_state"; include?: RpcGetStateInclude[] }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
@@ -99,8 +101,9 @@ export interface RpcSessionState {
 	messageCount: number;
 	queuedMessageCount: number;
 	todoPhases: TodoPhase[];
-	/** For session dump / export (plain-text parity with /dump). */
+	/** Optional static system prompt blocks. Omitted by default; request with get_state include ["systemPrompt"]. */
 	systemPrompt?: string[];
+	/** Optional static tool schemas. Omitted by default; request with get_state include ["tools"]. */
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
 	/** Current context window usage. Null tokens/percent when unknown (e.g. right after compaction). */
 	contextUsage?: ContextUsage;

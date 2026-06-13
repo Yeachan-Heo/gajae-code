@@ -189,6 +189,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 
+	/** Called for non-content tool-choice incapability stream events. */
+	onToolChoiceIncapability?: (event: Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }>) => void;
+
 	/**
 	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
 	 */
