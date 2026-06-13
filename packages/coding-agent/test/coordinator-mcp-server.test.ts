@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1020,6 +1021,37 @@ describe("Coordinator MCP server protocol", () => {
 		expect((persisted.events as Array<{ seq: number }>).map(event => event.seq)).toEqual(
 			allEvents.map(event => event.seq),
 		);
+	});
+
+	it("serializes concurrent coordinator event appends per namespace", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "event-concurrent");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: crypto.randomUUID(),
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+
+		await Promise.all(
+			Array.from({ length: 8 }, () =>
+				server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true }),
+			),
+		);
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, limit: 100 });
+		const seqs = (watched.events as Array<{ seq: number }>).map(event => event.seq);
+		expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+		expect(new Set(seqs).size).toBe(seqs.length);
 	});
 
 	it("long-polls coordinator events until timeout or a journal write", async () => {

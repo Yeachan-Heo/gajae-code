@@ -546,28 +546,47 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 	return latestSeq;
 }
 
+const eventAppendQueues = new Map<string, Promise<unknown>>();
+
 async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEventInput): Promise<CoordinatorEvent> {
-	const latestSeq = await readLatestEventSeq(namespaceDir);
-	const seq = latestSeq + 1;
-	const timestamp = new Date().toISOString();
-	const event: CoordinatorEvent = {
-		schema_version: 1,
-		seq,
-		id: `event-${seq.toString().padStart(12, "0")}`,
-		timestamp,
-		kind: input.kind,
-		summary: boundSummary(input.summary),
-		...(input.sessionId ? { session_id: input.sessionId } : {}),
-		...(input.turnId ? { turn_id: input.turnId } : {}),
-		...(input.questionId ? { question_id: input.questionId } : {}),
-		...(input.reportId ? { report_id: input.reportId } : {}),
-		...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
-		...(input.metadata ? { metadata: input.metadata } : {}),
-	};
-	await ensureDir(eventsDir(namespaceDir));
-	await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
-	await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
-	return event;
+	const previous = eventAppendQueues.get(namespaceDir) ?? Promise.resolve();
+	let release!: () => void;
+	const current = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	const queued = previous.then(
+		() => current,
+		() => current,
+	);
+	eventAppendQueues.set(namespaceDir, queued);
+
+	await previous.catch(() => undefined);
+	try {
+		const latestSeq = await readLatestEventSeq(namespaceDir);
+		const seq = latestSeq + 1;
+		const timestamp = new Date().toISOString();
+		const event: CoordinatorEvent = {
+			schema_version: 1,
+			seq,
+			id: `event-${seq.toString().padStart(12, "0")}`,
+			timestamp,
+			kind: input.kind,
+			summary: boundSummary(input.summary),
+			...(input.sessionId ? { session_id: input.sessionId } : {}),
+			...(input.turnId ? { turn_id: input.turnId } : {}),
+			...(input.questionId ? { question_id: input.questionId } : {}),
+			...(input.reportId ? { report_id: input.reportId } : {}),
+			...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
+			...(input.metadata ? { metadata: input.metadata } : {}),
+		};
+		await ensureDir(eventsDir(namespaceDir));
+		await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
+		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+		return event;
+	} finally {
+		release();
+		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
+	}
 }
 
 function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
