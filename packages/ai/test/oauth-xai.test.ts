@@ -142,6 +142,28 @@ describe("xAI OAuth login provider", () => {
 		expect(authUrl.searchParams.get("nonce")?.length).toBeGreaterThan(20);
 	});
 
+	it("adds provider-specific authorization metadata when requested", async () => {
+		const fetchMock = vi.fn(async () => discoveryResponse());
+		global.fetch = fetchMock as unknown as typeof fetch;
+		const flow = new XaiOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{
+				extraAuthorizeParams: {
+					client_id: "must-not-override",
+					plan: "generic",
+					referrer: "gjc-grok-cli",
+				},
+			},
+		);
+
+		const { url } = await flow.generateAuthUrl("state-123", "http://127.0.0.1:56121/callback");
+		const authUrl = new URL(url);
+
+		expect(authUrl.searchParams.get("client_id")).toBe(XAI_OAUTH_CLIENT_ID);
+		expect(authUrl.searchParams.get("plan")).toBe("generic");
+		expect(authUrl.searchParams.get("referrer")).toBe("gjc-grok-cli");
+	});
+
 	it("exchanges an authorization code for refreshable OAuth credentials", async () => {
 		let tokenBody = "";
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

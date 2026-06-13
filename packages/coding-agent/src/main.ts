@@ -30,6 +30,7 @@ import { activateModelProfile } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
+import { getBundledGrokBuildExtensionPaths } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
@@ -742,7 +743,7 @@ export async function runRootCommand(
 		await runListModelsCommand({
 			modelRegistry,
 			cwd: getProjectDir(),
-			additionalExtensionPaths: [],
+			additionalExtensionPaths: await getBundledGrokBuildExtensionPaths(),
 			settingsExtensions: [],
 			disabledExtensionIds: [],
 			disableExtensionDiscovery: true,

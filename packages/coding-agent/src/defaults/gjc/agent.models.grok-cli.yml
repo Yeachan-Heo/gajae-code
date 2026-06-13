@@ -1,0 +1,36 @@
+# Merge into ~/.gjc/agent/models.yml (or use as reference)
+# Remove global x-grok-model-override when using multiple Grok Build models.
+
+providers:
+  grok-build:
+    baseUrl: https://cli-chat-proxy.grok.com/v1
+    apiKeyEnv: GROK_CLI_OAUTH_TOKEN
+    api: grok-cli-responses
+    auth: oauth
+    headers:
+      x-xai-token-auth: xai-grok-cli
+      x-grok-client-identifier: gjc-grok-cli
+      x-grok-client-version: 0.2.33
+    models:
+      - id: grok-composer-2.5-fast
+        name: Composer 2.5 Fast
+        reasoning: false
+        input: [text, image]
+        contextWindow: 200000
+        maxTokens: 30000
+        cost:
+          input: 3
+          output: 15
+          cacheRead: 0.5
+          cacheWrite: 0
+      - id: grok-build
+        name: Grok Build
+        reasoning: true
+        input: [text, image]
+        contextWindow: 512000
+        maxTokens: 30000
+        cost:
+          input: 1
+          output: 2
+          cacheRead: 0.2
+          cacheWrite: 0.2

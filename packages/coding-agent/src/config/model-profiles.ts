@@ -173,6 +173,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "xai/grok-4.3:xhigh",
 		architect: "xai/grok-4.3:xhigh",
 	}),
+	profile("grok-build-pro", ["grok-build"], {
+		default: "grok-build/grok-composer-2.5-fast",
+		executor: "grok-build/grok-build",
+		planner: "grok-build/grok-composer-2.5-fast",
+		critic: "grok-build/grok-composer-2.5-fast",
+		architect: "grok-build/grok-build",
+	}),
 	profile("cursor-eco", ["cursor"], {
 		default: "cursor/composer-1.5:low",
 		executor: "cursor/composer-1.5:minimal",
@@ -254,6 +261,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"grok-eco": { displayName: "Grok Eco", providerGroup: "GROK" },
 	"grok-medium": { displayName: "Grok Medium", providerGroup: "GROK" },
 	"grok-pro": { displayName: "Grok Pro", providerGroup: "GROK" },
+	"grok-build-pro": { displayName: "Grok Build Pro", providerGroup: "GROK" },
 	"cursor-eco": { displayName: "Cursor Eco", providerGroup: "CURSOR" },
 	"cursor-medium": { displayName: "Cursor Medium", providerGroup: "CURSOR" },
 	"cursor-pro": { displayName: "Cursor Pro", providerGroup: "CURSOR" },
@@ -285,6 +293,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"kimi-code": "kimi-coding-plan-medium",
 	xiaomi: "mimo-medium",
 	xai: "grok-medium",
+	"grok-build": "grok-build-pro",
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
 };

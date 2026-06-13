@@ -30,6 +30,10 @@ interface XaiTokenPayload {
 	token_type?: unknown;
 }
 
+export interface XaiOAuthFlowOptions {
+	extraAuthorizeParams?: Readonly<Record<string, string>>;
+}
+
 interface XaiJwtPayload {
 	sub?: unknown;
 	email?: unknown;
@@ -136,8 +140,9 @@ function credentialsFromTokenPayload(payload: XaiTokenPayload, refreshFallback =
 export class XaiOAuthFlow extends OAuthCallbackFlow {
 	#verifier = "";
 	#discovery: XaiDiscovery | undefined;
+	#extraAuthorizeParams: Readonly<Record<string, string>>;
 
-	constructor(ctrl: OAuthController) {
+	constructor(ctrl: OAuthController, options: XaiOAuthFlowOptions = {}) {
 		super(ctrl, {
 			preferredPort: XAI_OAUTH_CALLBACK_PORT,
 			callbackPath: XAI_OAUTH_CALLBACK_PATH,
@@ -145,6 +150,7 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 			callbackBindHostname: "127.0.0.1",
 			redirectUri: `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}${XAI_OAUTH_CALLBACK_PATH}`,
 		} satisfies OAuthCallbackFlowOptions);
+		this.#extraAuthorizeParams = options.extraAuthorizeParams ?? {};
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
@@ -161,6 +167,11 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 			state,
 			nonce: crypto.randomUUID(),
 		});
+		for (const [key, value] of Object.entries(this.#extraAuthorizeParams)) {
+			if (key.length > 0 && value.length > 0 && !params.has(key)) {
+				params.set(key, value);
+			}
+		}
 		return {
 			url: `${this.#discovery.authorizationEndpoint}?${params.toString()}`,
 			instructions:
@@ -188,8 +199,8 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
 	}
 }
 
-export async function loginXai(ctrl: OAuthController): Promise<OAuthCredentials> {
-	return new XaiOAuthFlow(ctrl).login();
+export async function loginXai(ctrl: OAuthController, options?: XaiOAuthFlowOptions): Promise<OAuthCredentials> {
+	return new XaiOAuthFlow(ctrl, options).login();
 }
 
 export async function refreshXaiToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthCredentials> {
