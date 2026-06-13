@@ -23,6 +23,7 @@ import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
 import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../shared/agent-wire/event-envelope";
 import { rpcError as error } from "../shared/agent-wire/responses";
+import { registerRpcSession, unregisterRpcSession } from "../shared/agent-wire/session-registry";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
 import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
 import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
@@ -246,6 +247,7 @@ export async function runRpcMode(
 		if (inFlightCommands.size > 0) {
 			await Promise.race([Promise.allSettled([...inFlightCommands]), Bun.sleep(5000)]);
 		}
+		await unregisterRpcSession(session.sessionId).catch(() => {});
 		hostToolBridge.rejectAllPending(`${reason} before host tool execution completed`);
 		hostUriBridge.clear(`${reason} before host URI request completed`);
 		try {
@@ -560,6 +562,17 @@ export async function runRpcMode(
 		if (!shutdownState.requested) return;
 		await shutdown(0, "RPC shutdown requested");
 	}
+
+	// Register this RPC session so other processes can discover it (issue 10).
+	// Best-effort: a registry write failure must not break the protocol channel.
+	await registerRpcSession({
+		sessionId: session.sessionId,
+		pid: process.pid,
+		transport: "stdio",
+		cwd: session.sessionManager.getCwd(),
+		model: session.model?.id,
+		startedAt: new Date().toISOString(),
+	}).catch(() => {});
 
 	// Listen for JSONL input using Bun's stdin. Parse frame-by-frame so a malformed
 	// command reports a parse error without poisoning the whole long-lived RPC session.

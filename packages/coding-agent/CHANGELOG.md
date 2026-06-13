@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `gjc --mode rpc` registers each live session in a cross-process registry (`<agent-dir>/rpc-sessions/<id>.json`) on start and removes it on shutdown, so other processes can enumerate running RPC sessions. The Python `gjc_rpc` client exposes `list_sessions()` / `RpcClient.list_sessions()` returning typed `SessionHandle`s and reaps records whose owning process is gone (issue 10; foundation for reattach/issue 09).
+
 ### Fixed
 
 - RPC control-plane hardening (from dogfooding `gjc --mode rpc`): `dispatchRpcCommand` now wraps the command switch so failures return a correlated response carrying the request `id` and the real command name, instead of dropping the id and mislabeling handler exceptions as `parse`; `set_thinking_level`/`set_steering_mode`/`set_follow_up_mode`/`set_interrupt_mode` validate their inputs and reject out-of-contract values instead of silently corrupting session state; `negotiate_unattended` rejects unknown scopes/action classes with `invalid_unattended_declaration` and merges the mandatory `prompt` scope plus its `command.prompt` action floor into the accepted grant (so prompt/`workflow_gate_response` are never locked out); and read-only/control RPC commands no longer consume the unattended `max_tool_calls` budget while wall-time enforcement is preserved. `docs/rpc.md`'s first `workflow_gate` example now matches the canonical `RpcWorkflowGate` shape.

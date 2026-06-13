@@ -17,6 +17,7 @@ from .client import (
     UiRequestListener,
     WorkflowGateListener,
 )
+from .registry import SessionHandle, list_sessions
 from .host_tools import HostTool, HostToolContext, HostToolResultPayload, HostToolResultValue, host_tool
 from .host_uris import (
     HostUri,
@@ -107,6 +108,8 @@ from .protocol import (
 )
 
 __all__ = [
+    "SessionHandle",
+    "list_sessions",
     "ContextUsage",
     "HandoffResult",
     "LoginProvider",

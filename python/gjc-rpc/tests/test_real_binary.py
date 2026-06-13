@@ -98,6 +98,13 @@ class RealBinaryRpcTest(unittest.TestCase):
                     action_allowlist=[],
                 )
 
+    def test_live_session_appears_in_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self._client(tmp) as client:
+            state = client.get_state()
+            registry_dir = os.path.join(tmp, ".agent", "rpc-sessions")
+            handles = RpcClient.list_sessions(sessions_dir=registry_dir)
+            self.assertIn(state.session_id, [h.session_id for h in handles])
+
 
 if __name__ == "__main__":
     unittest.main()

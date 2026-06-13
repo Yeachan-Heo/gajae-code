@@ -12,6 +12,7 @@ from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar, cast
 
 from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
+from .registry import SessionHandle, list_sessions as _list_sessions
 from .protocol import (
     AgentStartEvent,
     AgentEndEvent,
@@ -870,6 +871,11 @@ class RpcClient:
     def login(self, provider_id: str) -> str:
         payload = self._request("login", providerId=provider_id)
         return str(payload.get("providerId", provider_id))
+
+    @staticmethod
+    def list_sessions(sessions_dir: str | Path | None = None) -> tuple[SessionHandle, ...]:
+        """Discover live gjc RPC sessions from the cross-process registry (issue 10)."""
+        return _list_sessions(sessions_dir)
 
     def set_custom_tools(self, tools: Sequence[HostTool[Any, Any]]) -> tuple[str, ...]:
         self._custom_tools = tuple(tools)
