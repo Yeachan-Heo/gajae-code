@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { buildGjcTmuxExactOptionTarget } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	listGjcTmuxSessions,
 	removeGjcTmuxSession,
@@ -116,5 +117,31 @@ describe("GJC tmux session management", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(0, ""));
 
 		expect(() => statusGjcTmuxSession("ghost")).toThrow("gjc_tmux_session_not_found:ghost");
+	});
+
+	it("builds a window-qualified exact target for tmux option commands", () => {
+		// tmux 3.6a only resolves the exact session for option commands when the
+		// target is window-qualified (`=NAME:`); a bare `=NAME` does not (#580).
+		expect(buildGjcTmuxExactOptionTarget("gajae_code_work")).toBe("=gajae_code_work:");
+	});
+
+	it("queries the profile option with a window-qualified exact target", () => {
+		const calls: string[][] = [];
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			calls.push(cmd);
+			if (cmd.includes("list-sessions")) {
+				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\n");
+			}
+			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
+			return spawnResult(0, "");
+		});
+
+		removeGjcTmuxSession("gajae_code_work");
+
+		const showOptions = calls.find(call => call.includes("show-options"));
+		expect(showOptions).toEqual(["tmux", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
+		// Session-scoped commands keep the bare exact target, which tmux resolves.
+		expect(calls.at(-1)).toEqual(["tmux", "kill-session", "-t", "=gajae_code_work"]);
 	});
 });

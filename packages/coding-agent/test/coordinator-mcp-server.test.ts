@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,6 +36,23 @@ describe("Coordinator MCP server protocol", () => {
 
 		const resources = await server.handleJsonRpc({ jsonrpc: "2.0", id: 21, method: "resources/list", params: {} });
 		expect(resources.result.resources).toEqual([]);
+	});
+
+	it("does not read ambient coordinator MCP env when explicit env is provided", async () => {
+		const root = await tempRoot();
+		const original = process.env.GJC_COORDINATOR_MCP_MUTATIONS;
+		process.env.GJC_COORDINATOR_MCP_MUTATIONS = "sessions";
+		try {
+			const server = createCoordinatorMcpServer({ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } });
+			const response = await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+			expect(response).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
+		} finally {
+			if (original === undefined) {
+				delete process.env.GJC_COORDINATOR_MCP_MUTATIONS;
+			} else {
+				process.env.GJC_COORDINATOR_MCP_MUTATIONS = original;
+			}
+		}
 	});
 
 	it("rejects unknown mcp-serve subcommands before launch fallback", async () => {
@@ -243,6 +261,60 @@ describe("Coordinator MCP server protocol", () => {
 		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
 			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "hello", "C-m", "C-m"],
 		]);
+	});
+
+	it("exposes a canonical polling coordination snapshot", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-status");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,reports",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "work",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "gjc-demo",
+			turn_id: turn.turn_id,
+			status: "completed",
+			summary: "Done",
+			allow_mutation: true,
+		});
+
+		const status = await server.callTool("gjc_coordinator_read_coordination_status");
+
+		expect(status).toMatchObject({
+			ok: true,
+			schema_version: 1,
+			transport: { mcp: "polling", push_subscriptions: false },
+			summary: { sessions: 1, turns: 1, terminal_turns: 1, reports: 1 },
+		});
+		expect(status.sessions).toHaveLength(1);
+		expect(status.session_states).toHaveLength(1);
+		expect(status.turns).toHaveLength(1);
+		expect(status.reports).toHaveLength(1);
+		expect(status.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ event_type: "session_state", session_id: "gjc-demo", status: "completed" }),
+				expect.objectContaining({ event_type: "turn_state", session_id: "gjc-demo", status: "completed" }),
+				expect.objectContaining({ event_type: "coordination_report", session_id: "gjc-demo", status: "completed" }),
+			]),
+		);
 	});
 
 	it("persists audited follow-up, question answers, and bounded reports", async () => {
@@ -867,5 +939,163 @@ describe("Coordinator MCP server protocol", () => {
 		});
 		expect(second.ok).toBe(true);
 		expect(second.reason).toBeUndefined();
+	});
+	it("persists monotonic coordinator events and exposes long-poll watch semantics", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "event-watch");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					tmuxSession: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const firstWatch = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, limit: 2 });
+		expect(firstWatch.ok).toBe(true);
+		expect(firstWatch.timed_out).toBe(false);
+		expect(firstWatch.transport).toEqual({ mcp: "long_poll", push_subscriptions: false });
+		const firstEvents = firstWatch.events as Array<{ seq: number; kind: string; session_id?: string }>;
+		expect(firstEvents).toHaveLength(2);
+		expect(firstEvents.map(event => event.seq)).toEqual([1, 2]);
+		expect(firstEvents.map(event => event.kind)).toEqual(["session.started", "session.state_changed"]);
+
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "continue",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "gjc-demo",
+			turn_id: turn.turn_id,
+			status: "completed",
+			summary: "Done",
+			allow_mutation: true,
+		});
+
+		const all = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		const allEvents = all.events as Array<{
+			seq: number;
+			id: string;
+			kind: string;
+			session_id?: string;
+			turn_id?: string;
+		}>;
+		expect(allEvents.map(event => event.seq)).toEqual(allEvents.map((_, index) => index + 1));
+		expect(new Set(allEvents.map(event => event.id)).size).toBe(allEvents.length);
+		expect(allEvents.map(event => event.kind)).toContain("turn.active");
+		expect(allEvents.map(event => event.kind)).toContain("tmux.delivery_failed");
+		expect(allEvents.map(event => event.kind)).toContain("turn.completed");
+		expect(allEvents.map(event => event.kind)).toContain("report.written");
+
+		const filtered = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: 0,
+			session_id: "gjc-demo",
+			event_types: ["turn.completed", "report.written"],
+		});
+		expect((filtered.events as Array<{ kind: string }>).map(event => event.kind)).toEqual([
+			"turn.completed",
+			"report.written",
+		]);
+
+		const persistedServer = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+		});
+		const persisted = await persistedServer.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		expect((persisted.events as Array<{ seq: number }>).map(event => event.seq)).toEqual(
+			allEvents.map(event => event.seq),
+		);
+	});
+
+	it("serializes concurrent coordinator event appends per namespace", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "event-concurrent");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: crypto.randomUUID(),
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+
+		await Promise.all(
+			Array.from({ length: 8 }, () =>
+				server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true }),
+			),
+		);
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, limit: 100 });
+		const seqs = (watched.events as Array<{ seq: number }>).map(event => event.seq);
+		expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+		expect(new Set(seqs).size).toBe(seqs.length);
+	});
+
+	it("long-polls coordinator events until timeout or a journal write", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "event-long-poll");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+			},
+		});
+
+		const empty = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 5 });
+		expect(empty).toMatchObject({ ok: true, events: [], latest_seq: 0, timed_out: true });
+
+		const watching = server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 1000 });
+		const started = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			void server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true }).then(
+				() => started.resolve(),
+				error => started.reject(error),
+			);
+		}, 25);
+		try {
+			const watched = await watching;
+			expect(watched.timed_out).toBe(false);
+			expect((watched.events as Array<{ kind: string }>).map(event => event.kind)).toContain("session.started");
+			await started.promise;
+		} finally {
+			clearTimeout(timer);
+		}
+
+		const status = await server.callTool("gjc_coordinator_read_coordination_status", {});
+		expect(status.latest_event_seq).toBeGreaterThanOrEqual(2);
+		expect((status.recent_events as Array<{ kind: string }>).map(event => event.kind)).toContain("session.started");
 	});
 });

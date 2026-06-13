@@ -88,7 +88,7 @@ describe("gjc mcp-serve coordinator", () => {
 	});
 
 	it("implements initialize, tools/list, and read-only mutating rejection", async () => {
-		const env = { ...process.env, GJC_COORDINATOR_MCP_REPO: "repo-a" };
+		const env = { GJC_COORDINATOR_MCP_REPO: "repo-a" };
 		const initialize = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" }, { env });
 		expect(initialize).toEqual({
 			jsonrpc: "2.0",
@@ -128,7 +128,6 @@ describe("gjc mcp-serve coordinator", () => {
 		await withTempRoot(async root => {
 			let created = false;
 			const env = {
-				...process.env,
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES: "session",
 			};
@@ -197,7 +196,7 @@ describe("gjc mcp-serve coordinator", () => {
 				const link = path.join(root, "escape");
 				await fs.symlink(outside, link);
 				const policy = await createCoordinatorSafetyPolicy({
-					env: { ...process.env, GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root },
+					env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root },
 				});
 				expect(await policy.resolveWorkdir(path.join(root, "..", path.basename(root)))).toBe(root);
 				await expect(policy.resolveWorkdir(path.join(root, "..", path.basename(outside)))).rejects.toThrow(
@@ -216,7 +215,6 @@ describe("gjc mcp-serve coordinator", () => {
 			await Bun.write(artifact, "🙂🙂abcdef");
 			const byteCap = 5;
 			const env = {
-				...process.env,
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
 			};

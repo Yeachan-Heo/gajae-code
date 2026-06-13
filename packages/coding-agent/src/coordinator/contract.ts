@@ -9,6 +9,7 @@ export const COORDINATOR_MCP_TOOL_NAMES = [
 	"gjc_coordinator_list_artifacts",
 	"gjc_coordinator_read_artifact",
 	"gjc_coordinator_read_coordination_status",
+	"gjc_coordinator_watch_events",
 	"gjc_coordinator_register_session",
 	"gjc_coordinator_start_session",
 	"gjc_coordinator_send_prompt",

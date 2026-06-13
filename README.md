@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://gajae-code.com"><img alt="Website" src="https://img.shields.io/badge/website-gajae--code.com-ff4d4f?style=flat-square"></a>
   <a href="https://www.npmjs.com/package/gajae-code"><img alt="npm package" src="https://img.shields.io/npm/v/gajae-code?style=flat-square"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
   <a href="https://discord.gg/sj4exxQ9v"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
@@ -20,6 +21,10 @@
 </p>
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
+
+## Website
+
+Visit **[gajae-code.com](https://gajae-code.com)** for the Gajae Code landing page, quick-start guide, architecture overview, harness notes, bridge/RPC docs, skills, receipts, remote-control design, and troubleshooting.
 
 ## What is Gajae-Code?
 
@@ -136,7 +141,7 @@ No sprawling default skill zoo: GJC improves by making this small method better.
 | OpenCode    | `gjc` or `gjc --tmux`                          | External-runner workflow only today.                   |
 | Claw Code   | `gjc --tmux --worktree <path>`                 | GJC does not install into or replace Claw Code.        |
 
-For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md).
+For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). For the Gajae Remote thin phone steering wheel design (v0), see [`docs/gajae-remote.md`](docs/gajae-remote.md).
 
 ## Configuration
 
@@ -200,3 +205,10 @@ Gajae-Code's default TUI identity is the crustacean pair: red-claw for dark appe
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+## GEO visibility benchmark
+
+Gajae-Code includes a [`geobench`](https://github.com/NomaDamas/geobench) product spec for measuring LLM hit rate, MRR, share of voice, and citations.
+
+- Spec: [`geobench/gajae-code.yaml`](geobench/gajae-code.yaml)
+- Runbook: [`docs/geobench.md`](docs/geobench.md)

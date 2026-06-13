@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Expanded coordinator MCP coordination status into a canonical polling snapshot for sessions, session states, turns, questions, reports, and bounded event summaries, and documented that Hermes/coordinator consumption is polling/await rather than push subscription.
+
 ### Fixed
 
 - Fixed forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model") looping after `ast_edit` previews: named queue directives (resolve protocol, eager `todo_write` enforcement, subagent `yield` reminders) now enqueue only when the model supports exact named forcing; otherwise they degrade silently to the existing steer reminder without a forced `tool_choice`, and a runtime-discovered incapability drops the in-flight directive instead of requeueing it.
@@ -37,6 +41,8 @@
 - Hardened RPC stdio lifecycle behavior: `gjc --mode rpc` now reports malformed JSONL frames as parse-error responses without killing the session, flushes durable session state before exiting on EOF/shutdown, and has red-team coverage for attached persistence, reload, malformed-frame recovery, and concurrent child-session isolation.
 - Hardened the harness RPC submit/router contract so `submit` is no longer advertised or accepted during finalizing/non-idle lifecycle windows, non-idle RPC state reports `submitted:false` with a retryable gate, and degraded owner endpoints fall back to `owner-not-live` without false acceptance (#544).
 - Ran estimated context maintenance before sending a new prompt, including tool-output pruning and threshold compaction, so large tool results appended after the last assistant turn cannot push the next model request over the context window.
+- Counted active prompts and agent-initiated custom messages in pre-prompt context maintenance so background task notifications trigger compaction before they can overflow the next model request.
+- Bounded monitor task-notification payloads to a compact tail window while preserving full background job output for job inspection.
 - `gjc team` now self-heals a missing `@gjc-profile` ownership tag when the current leader pane was genuinely launched by `gjc --tmux` (detected via `GJC_TMUX_LAUNCHED=1`): the session is re-tagged with `set-option` and startup proceeds, instead of hard-failing with `unmanaged_tmux_session` after a mid-startup attach failure or registry race stripped the tag. Sessions without the GJC launch marker are still rejected unchanged, so foreign tmux sessions cannot be hijacked.
 - Subagent task receipts and live render output now warn when requested role-agent models are substituted by auth fallback or provider-reported assistant model mismatch, including session model-change annotations for server-side substitutions (#559).
 - Converted Cursor wire shell timeouts from millisecond values to bash-tool seconds so delegated Cursor-native shell calls honor the expected timeout units.
@@ -58,6 +64,10 @@
 - Preserved dev/main release metadata and changelog consistency for the 0.4.5 lockstep release.
 
 - Added native `gjc ultragoal steer --kind` support for documented steering mutations beyond `add_subgoal`, including split, reorder, wording revision, ledger annotation, and blocked-goal supersession contracts with structured audit expectations.
+### Added
+
+- Added a durable coordinator event journal and `gjc_coordinator_watch_events` long-poll MCP tool so Hermes-style coordinators can react to session, turn, question, report, and tmux-delivery changes without fixed snapshot polling.
+
 ### Fixed
 
 - Kept the unified `goal` tool registered and active by default whenever `goal.enabled` is true, including explicit tool subsets and `gjc ultragoal create-goals` arming flows.
@@ -65,6 +75,7 @@
 - Rendered and executed Cursor-native tool calls, including detached/native handler paths and empty-pattern composer grep guards.
 - Tool-output pruning no longer rewrites already-sent provider-facing history mid prompt-cache epoch and now persists pruned message updates back into canonical session storage.
 - Preserved provider abort root causes in the final TUI abort label, kept replay rendering idempotent, and added a `PI_STREAM_IDLE_TIMEOUT_MS` remediation hint when stream idle watchdogs fire.
+- Honored the documented `GJC_RPC_EMIT_TITLE` flag for RPC title events while preserving `PI_RPC_EMIT_TITLE` as a legacy alias.
 - Hardened harness owner recovery/finalize paths and submit-prompt-file handling.
 
 ## [0.4.4] - 2026-06-10

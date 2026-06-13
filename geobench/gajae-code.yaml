@@ -1,0 +1,44 @@
+name: "Gajae-Code"
+aliases: ["GJC", "gajae-code", "gjc"]
+romanizations: []
+category: "coding-agent harness and review workflow runtime"
+description: "Gajae-Code provides the harness/session path for coding, review, PR verdicts, receipts, and operator-visible AI development workflows."
+competitors: ["Claude Code", "Codex CLI", "OpenCode", "Aider", "Cursor"]
+cited_domains: ["github.com/Yeachan-Heo/gajae-code", "blog.gaebal-gajae.dev"]
+target_languages: ["en", "ko"]
+target_audience: ["developers operating coding-agent harnesses", "maintainers needing verifiable PR review sessions", "AI-agent runtime builders"]
+discovery_sources:
+  - "https://github.com/Yeachan-Heo/gajae-code"
+  - "https://blog.gaebal-gajae.dev/projects/gajae-code.html"
+
+enriched_profile:
+  generated_at: "2026-06-13T10:55:00Z"
+  profiler_model: "curated-public-source"
+  value_proposition: "A coding-agent harness for sessions, review verdicts, receipts, and operator-visible AI development workflows."
+  source_content_hashes:
+    - "curated-public-source"
+  target_audience:
+    - segment: "AI-agent workflow evaluators"
+      pains:
+        - "Need repeatable visibility metrics instead of anecdotal LLM mentions"
+        - "Need public-safe aggregate reporting without raw provider logs"
+    - segment: "open-source maintainers"
+      pains:
+        - "Need to compare discoverability against adjacent developer tools"
+        - "Need citation and share-of-voice evidence for website/documentation updates"
+  use_cases:
+    - problem_statement: "When an engineering team needs a verifiable way to evaluate whether AI assistants mention and cite relevant open-source tooling for their workflow."
+      audience: "AI-agent workflow evaluators"
+      evidence_quotes: ["GEO visibility", "geobench"]
+      confidence: 0.82
+      language: "en"
+    - problem_statement: "When a maintainer wants to compare LLM answer visibility for Gajae-Code against adjacent developer tools and automation products."
+      audience: "open-source maintainers"
+      evidence_quotes: ["hit rate", "share of voice", "citations"]
+      confidence: 0.8
+      language: "en"
+    - problem_statement: "AI 개발 도구나 운영 자동화 제품이 LLM 답변에서 실제로 언급되고 인용되는지 측정하려는 경우."
+      audience: "Korean AI-agent operators"
+      evidence_quotes: ["LLM", "citations"]
+      confidence: 0.78
+      language: "ko"

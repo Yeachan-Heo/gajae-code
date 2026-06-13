@@ -280,7 +280,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => zenmuxModelManagerOptions(config),
 		catalog("ZenMux", ["ZENMUX_API_KEY"]),
 	),
-	catalogDescriptor("zai", "glm-5.1", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
+	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(

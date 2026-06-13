@@ -3,8 +3,10 @@ import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import {
 	appendEvent,
+	controlSocketPath,
 	readSessionState,
 	sessionPaths,
 	writeSessionState,
@@ -721,6 +723,30 @@ describe("gjc harness CLI (foundation)", () => {
 		assertContract(res.json);
 		expect(res.json.evidence.decision.classification).toBe("restart-preserve-delta");
 		expect(res.json.evidence.decision.requiredReceiptFamily).toBe("vanish");
+	});
+
+	it("classify --session treats a live manual owner as active, not vanished (#575)", async () => {
+		await initCleanGitWorkspace();
+		const started = runHarness(["start", "--input", JSON.stringify({ harness: "gajae-code", workspace })]);
+		const sessionId = started.json.evidence.handle.sessionId as string;
+		const state = await readSessionState(root, sessionId);
+		if (!state) throw new Error("expected session state");
+		await acquireLease(root, sessionId, {
+			ownerId: "manual-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: controlSocketPath(root, sessionId) },
+			eventsPath: sessionPaths(root, sessionId).events,
+			ttlMs: 30_000,
+		});
+
+		const res = runHarness(["classify", "--session", sessionId]);
+
+		expect(res.code).toBe(0);
+		assertContract(res.json);
+		expect(res.json.state.ownerLive).toBe(true);
+		expect(res.json.evidence.observation.ownerLive).toBe(true);
+		expect(res.json.evidence.decision.classification).toBe("continue");
+		expect(res.json.evidence.decision.reason).toBe("owner-live-active");
 	});
 
 	it("retire is blocked on an unknown/dirty delta (data-loss safety)", () => {

@@ -18,6 +18,7 @@ import {
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import {
+	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
@@ -1633,7 +1634,7 @@ function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
 }
 function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): string {
 	const result = Bun.spawnSync(
-		[tmuxCommand, "show-options", "-qv", "-t", `=${sessionName}`, GJC_TMUX_PROFILE_OPTION],
+		[tmuxCommand, "show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), GJC_TMUX_PROFILE_OPTION],
 		{
 			stdout: "pipe",
 			stderr: "pipe",
@@ -1645,7 +1646,14 @@ function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): stri
 
 function retagGjcLaunchedTmuxSession(tmuxCommand: string, sessionName: string): boolean {
 	const result = Bun.spawnSync(
-		[tmuxCommand, "set-option", "-t", `=${sessionName}`, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
+		[
+			tmuxCommand,
+			"set-option",
+			"-t",
+			buildGjcTmuxExactOptionTarget(sessionName),
+			GJC_TMUX_PROFILE_OPTION,
+			GJC_TMUX_PROFILE_VALUE,
+		],
 		{
 			stdout: "pipe",
 			stderr: "pipe",

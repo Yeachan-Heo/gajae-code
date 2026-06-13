@@ -630,7 +630,10 @@ describe("native gjc team runtime", () => {
 		).toBe(false);
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
-		expect(tmuxLog).toContain("show-options -qv -t =test-session @gjc-profile");
+		// Option commands must use the window-qualified exact target (`=NAME:`);
+		// tmux 3.6a refuses to resolve the bare `=NAME` form for show-options (#580).
+		expect(tmuxLog).toContain("show-options -qv -t =test-session: @gjc-profile");
+		expect(tmuxLog).not.toContain("show-options -qv -t =test-session @gjc-profile");
 		expect(tmuxLog).not.toContain("split-window");
 		expect(tmuxLog).not.toContain("set-option -t test-session:0");
 	});
@@ -657,7 +660,10 @@ describe("native gjc team runtime", () => {
 		expect(snapshot.team_name).toBe("self-heal-team");
 		expect(snapshot.tmux_target).toBe("test-session:0");
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
-		expect(tmuxLog).toContain("set-option -t =test-session @gjc-profile 1");
+		// Re-tagging the stranded leader must target the window-qualified exact
+		// session (`=NAME:`) so tmux 3.6a resolves the set-option target (#580).
+		expect(tmuxLog).toContain("set-option -t =test-session: @gjc-profile 1");
+		expect(tmuxLog).not.toContain("set-option -t =test-session @gjc-profile 1");
 		expect(tmuxLog).toContain("split-window");
 	});
 

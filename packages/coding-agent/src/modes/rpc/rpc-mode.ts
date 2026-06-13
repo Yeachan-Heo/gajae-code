@@ -11,7 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import * as path from "node:path";
-import { $env, readLines, Snowflake } from "@gajae-code/utils";
+import { $pickenv, readLines, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -70,12 +70,14 @@ function parseValueDialogResponse(
 	return undefined;
 }
 
-function shouldEmitRpcTitles(): boolean {
-	const raw = $env.PI_RPC_EMIT_TITLE;
+export function shouldEmitRpcTitlesForTest(): boolean {
+	const raw = $pickenv("GJC_RPC_EMIT_TITLE", "PI_RPC_EMIT_TITLE");
 	if (!raw) return false;
 	const normalized = raw.trim().toLowerCase();
 	return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
+
+const shouldEmitRpcTitles = shouldEmitRpcTitlesForTest;
 
 function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "exceeded" | "aborted" | "info" {
 	if (event.includes("denied")) return "denied";
@@ -399,7 +401,7 @@ export async function runRpcMode(
 		}
 
 		setTitle(title: string): void {
-			// Title updates are low-value noise for most RPC hosts; opt in via PI_RPC_EMIT_TITLE=1.
+			// Title updates are low-value noise for most RPC hosts; opt in via GJC_RPC_EMIT_TITLE=1.
 			if (!emitRpcTitles) return;
 			this.output({
 				type: "extension_ui_request",

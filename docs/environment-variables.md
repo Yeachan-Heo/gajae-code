@@ -242,6 +242,8 @@ providers:
 
 `gjc mcp-serve coordinator` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. `gjc mcp-serve hermes` is a compatibility alias for the same bridge. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
 
+Coordinator MCP currently exposes durable polling/await tools, not push subscriptions. Consume `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` for state changes.
+
 | Variable | Behavior |
 | --- | --- |
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
@@ -468,6 +470,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_DEBUG_REDRAW`         | If `1`, enables redraw debug logging                                                  |
 | `GJC_TUI_DEBUG`            | If `1`, enables deep TUI debug dump path                                              |
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
+| `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. Use this when a terminal (e.g. Android Termius) breaks IME/Hangul composition while these enhanced modes are active. |
 
 ---
 

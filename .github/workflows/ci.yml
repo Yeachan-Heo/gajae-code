@@ -76,6 +76,27 @@ jobs:
               fi
               echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
 
+   # Single conservative changed-path relevance decision, shared by the
+   # expensive PR jobs below via needs.relevance.outputs.relevant. Fail-open:
+   # non-pull_request events, a missing base SHA, or any error => relevant=true.
+   relevance:
+      name: relevance
+      timeout-minutes: 10
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+      outputs:
+         relevant: ${{ steps.relevance.outputs.relevant }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3"
+         - name: Check changed-path relevance
+           id: relevance
+           env:
+              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           run: bun scripts/ci-job-relevance.ts
+
    # Branch protection must add the always-present `gjc-state-gates` status as required.
    gjc-state-gates:
       name: gjc-state-gates
@@ -107,6 +128,7 @@ jobs:
    # Fast lint + type check (no Rust, no native build needed)
    check:
       timeout-minutes: 30
+      needs: [relevance]
       if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
@@ -122,15 +144,17 @@ jobs:
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
+         - if: needs.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
          - name: Type check workspace
+           if: needs.relevance.outputs.relevant == 'true'
            run: bun run ci:check:full
 
    # Linux x64 baseline + modern: required by `test`, so it runs on every PR
    # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
    native_linux:
       timeout-minutes: 60
-      needs: [rust-hash]
+      needs: [rust-hash, relevance]
       if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
          (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
       runs-on: ubuntu-22.04
@@ -143,6 +167,7 @@ jobs:
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: ./.github/actions/build-native
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               hash: ${{ needs.rust-hash.outputs.hash }}
               platform: linux
@@ -159,6 +184,7 @@ jobs:
    # Windows release-binary smoke in the publishing gate.
    windows_smoke:
       timeout-minutes: 60
+      needs: [relevance]
       if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: windows-latest
       steps:
@@ -166,46 +192,40 @@ jobs:
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
-         - name: Check job relevance
-           id: relevance
-           env:
-              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-           shell: bash
-           run: bun scripts/ci-job-relevance.ts
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               toolchain: nightly-2026-04-29
          - name: Prepend rustup toolchain bin to PATH
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            shell: bash
            run: |
               toolchain_bin="$(dirname "$(rustup which cargo)")"
               echo "$toolchain_bin" >> "$GITHUB_PATH"
          - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               shared-key: windows-smoke-win32-x64
               cache-on-failure: true
               save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - if: steps.relevance.outputs.relevant == 'true'
+         - if: needs.relevance.outputs.relevant == 'true'
            run: bun install --frozen-lockfile
          - name: Build native addon (win32-x64 baseline)
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            env:
               TARGET_PLATFORM: win32
               TARGET_ARCH: x64
               TARGET_VARIANTS: baseline
            run: bun run ci:build:native
          - name: Smoke bun + gjc CLI (source runtime)
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            shell: pwsh
            run: |
               bun --version
@@ -240,7 +260,7 @@ jobs:
 
    test:
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
-      needs: [native_linux, rust-hash]
+      needs: [native_linux, rust-hash, relevance]
       if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
          !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
       timeout-minutes: 30
@@ -258,9 +278,12 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
+           if: needs.relevance.outputs.relevant == 'true'
            run: bash scripts/ci-install-system-deps.sh
-         - run: bun install --frozen-lockfile
+         - if: needs.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
          - name: Resolve native source run
+           if: needs.relevance.outputs.relevant == 'true'
            id: source
            shell: bash
            run: |
@@ -270,6 +293,7 @@ jobs:
                 echo "run-id=${{ needs.rust-hash.outputs.run-id }}" >> "$GITHUB_OUTPUT"
               fi
          - name: Download native addons
+           if: needs.relevance.outputs.relevant == 'true'
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: pi-natives-linux-x64-*-h${{ needs.rust-hash.outputs.hash }}
@@ -278,6 +302,7 @@ jobs:
               run-id: ${{ steps.source.outputs.run-id }}
               github-token: ${{ secrets.GITHUB_TOKEN }}
          - name: Test workspace (TS)
+           if: needs.relevance.outputs.relevant == 'true'
            env:
               # Bun's `bun test` emits `::group::`/`::endgroup::` per file under
               # GHA. `--workspaces` prefixes each output line with `<pkg> test: `,
@@ -287,10 +312,12 @@ jobs:
               GITHUB_ACTIONS: ""
            run: bun run test:ts
          - name: CLI smoke test
+           if: needs.relevance.outputs.relevant == 'true'
            run: bun run ci:test:smoke
 
    install_methods:
       timeout-minutes: 45
+      needs: [relevance]
       if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
@@ -298,22 +325,16 @@ jobs:
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
-         - name: Check job relevance
-           id: relevance
-           env:
-              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-           shell: bash
-           run: bun scripts/ci-job-relevance.ts
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               node-version: "24"
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               toolchain: nightly-2026-04-29
          - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            with:
               shared-key: install-methods-linux-x64
               cache-on-failure: true
@@ -321,18 +342,18 @@ jobs:
                  startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            run: bash scripts/ci-install-system-deps.sh
-         - if: steps.relevance.outputs.relevant == 'true'
+         - if: needs.relevance.outputs.relevant == 'true'
            run: bun install --frozen-lockfile
          - name: Install method smoke tests
-           if: steps.relevance.outputs.relevant == 'true'
+           if: needs.relevance.outputs.relevant == 'true'
            run: bun run ci:test:install-methods
 
    release_binary:
