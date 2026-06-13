@@ -136,7 +136,7 @@ No sprawling default skill zoo: GJC improves by making this small method better.
 | OpenCode    | `gjc` or `gjc --tmux`                          | External-runner workflow only today.                   |
 | Claw Code   | `gjc --tmux --worktree <path>`                 | GJC does not install into or replace Claw Code.        |
 
-For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md).
+For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). For the Gajae Remote thin phone steering wheel design (v0), see [`docs/gajae-remote.md`](docs/gajae-remote.md).
 
 ## Configuration
 
