@@ -6,7 +6,7 @@
 
 - Added a generic tool-choice capability model: `toolChoiceSupport` compat enum (`none`/`auto`/`required`/`named`) available on every forced-choice-capable API, derived from the legacy `supportsToolChoice`/`supportsForcedToolChoice` booleans when absent, with a shared `resolveToolChoice` helper that clamps requested tool choices (`named` → `required` → omit) and returns structured degradation metadata.
 - Added a transparent one-shot fallback for forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model" and equivalents): transports retry once without the forced field at a pre-content streaming boundary, record the discovery in an in-memory per-process incapability registry, and emit an internal non-rendered `toolChoiceIncapability` event. Applies to Anthropic, OpenAI Completions/Responses, Azure Responses, OpenAI code Responses, Bedrock (including event-stream `validationException`), Ollama, Google, and Gemini CLI transports.
-- Added bundled catalog entries for `kimi-code/kimi-k2.7-code`, `minimax-code/minimax-v3`, and `xai/grok-composer-2.5-fast`.
+- Added bundled catalog entries for `kimi-code/kimi-k2.7-code`, `minimax-code/minimax-v3`, `xai/grok-composer-2.5-fast`, and `xai/grok-composer-2.5-max` (wired to `grok-composer-2.5-fast` with max-effort thinking metadata).
 - Added composer-harness anchor/edit discipline injection for Cursor Composer and Grok Composer models so provider-specific coding harness priors do not override GJC hashline/edit contracts.
 
 ### Removed
