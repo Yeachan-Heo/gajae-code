@@ -47,7 +47,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 	{ name: "codex-opencodego", requiredProviders: ["openai-codex", "opencode-go"], mapping: { default: "openai-codex/gpt-5.5:medium", executor: "opencode-go/deepseek-v4-pro", planner: "opencode-go/kimi-k2.6", critic: "opencode-go/mimo-v2.5-pro", architect: "openai-codex/gpt-5.5:xhigh" } },
 ];
 
-const oldNames = ["opencode-go-eco", "opencode-go-standard", "opencode-go-pro", "codex-standard", "opencode-go-codex-eco", "opencode-go-codex-standard", "opencode-go-codex-pro"];
+const oldNames = ["opencode-go-eco", "opencode-go-standard", "opencode-go-pro", "codex-standard", "opencode-go-codex-eco", "opencode-go-codex-standard", "opencode-go-codex-pro", "minimax-standard", "minimax-cn-standard", "kimi-standard", "glm-standard"];
 
 function selectorExists(selector: string): boolean {
 	const parsed = parseModelString(selector);
