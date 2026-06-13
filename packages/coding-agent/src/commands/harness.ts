@@ -16,7 +16,7 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
-import { type ResolvedOwner, RuntimeOwner, resolveOwner } from "../harness-control-plane/owner";
+import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
 import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
@@ -948,10 +948,14 @@ export default class Harness extends Command {
 		let observation = input.observation as Partial<Observation> | undefined;
 		let stateView: SessionState | null = null;
 		const sessionId = flagSession ?? (typeof input.sessionId === "string" ? input.sessionId : undefined);
+		// Session-backed classify derives owner liveness from the same lease/socket probe observe
+		// uses for routing, so a live (e.g. manual) owner is never misread as vanished/restart-clean.
+		let ownerLive = false;
 		if (sessionId) {
 			stateView = await loadState(root, sessionId);
+			ownerLive = await resolveOwnerLive(root, sessionId);
 			if (!observation) {
-				const built = await buildObservation(root, stateView, ownerLiveFor(stateView));
+				const built = await buildObservation(root, stateView, ownerLive);
 				observation = built.observation;
 				stateView = await markVanishedOwnerBlocked(
 					root,
@@ -975,7 +979,7 @@ export default class Harness extends Command {
 		const decision = classifyRecovery({ observation: full, retryBudget: budget });
 		if (stateView) {
 			writeJson(
-				buildResponse(stateView, ownerLiveFor(stateView), {
+				buildResponse(stateView, ownerLive, {
 					decision,
 					observation: { ...full, lifecycle: stateView.lifecycle },
 				}),

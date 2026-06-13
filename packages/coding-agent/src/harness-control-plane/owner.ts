@@ -670,3 +670,14 @@ export async function resolveOwner(root: string, sessionId: string): Promise<Res
 	const live = status === "live" || status === "expiredAlive" || status === "epermAlive";
 	return { live, socketPath: lease.endpoint?.path ?? null, lease };
 }
+
+/**
+ * Owner liveness for verbs that do not route to the owner (e.g. `classify`): a routable owner
+ * has a live lease and a socket endpoint. This is the same lease/socket probe `observe` uses to
+ * decide routing, so non-routing verbs derive `ownerLive` consistently instead of assuming the
+ * owner is gone (which would misclassify a live owner as vanished/restart-clean).
+ */
+export async function resolveOwnerLive(root: string, sessionId: string): Promise<boolean> {
+	const owner = await resolveOwner(root, sessionId);
+	return owner.live && owner.socketPath !== null;
+}

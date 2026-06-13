@@ -3,12 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
-import { RuntimeOwner, resolveOwner } from "../../src/harness-control-plane/owner";
+import { RuntimeOwner, resolveOwner, resolveOwnerLive } from "../../src/harness-control-plane/owner";
 import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
+import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import {
+	controlSocketPath,
 	readEvents,
 	readReceiptIndex,
 	readSessionState,
+	sessionPaths,
 	writeSessionState,
 } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
@@ -292,5 +295,32 @@ describe("RuntimeOwner (in-process integration)", () => {
 			after = await resolveOwner(root, SID);
 		}
 		expect(after.live).toBe(false);
+	});
+});
+
+describe("resolveOwnerLive (lease/socket liveness probe)", () => {
+	it("returns false when no lease exists (owner never started)", async () => {
+		expect(await resolveOwnerLive(root, SID)).toBe(false);
+	});
+
+	it("returns true for a live lease with a socket endpoint (live manual owner)", async () => {
+		await acquireLease(root, SID, {
+			ownerId: "manual-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+		expect(await resolveOwnerLive(root, SID)).toBe(true);
+	});
+
+	it("returns false for a live lease without a routable endpoint", async () => {
+		await acquireLease(root, SID, {
+			ownerId: "endpointless-owner",
+			pid: process.pid,
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+		expect(await resolveOwnerLive(root, SID)).toBe(false);
 	});
 });
