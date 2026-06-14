@@ -118,7 +118,9 @@ export function supportsReasoningEffort(modelId: string): boolean {
   if (model) {
     if (!model.reasoning) return false;
     if (!model.thinkingLevelMap) return true;
-    return Object.values(model.thinkingLevelMap).some((level) => level !== null && level !== 'none');
+    return Object.values(model.thinkingLevelMap).some(
+      (level) => level !== null && level !== 'none',
+    );
   }
   // Effort-capable id not listed in GJC_GROK_CLI_MODELS env list — still honor prefix (avoids spurious 400s).
   return true;

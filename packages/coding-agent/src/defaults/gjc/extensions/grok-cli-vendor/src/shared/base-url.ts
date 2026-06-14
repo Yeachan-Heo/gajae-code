@@ -30,5 +30,7 @@ export function isGrokBuildBaseUrlOverrideIgnored(): boolean {
   const configured = process.env.GJC_GROK_CLI_BASE_URL || process.env.GROK_CLI_BASE_URL;
   if (!configured) return false;
   const normalized = normalizeBaseUrl(configured);
-  return !isAllowedCredentialHost(normalized) && process.env.GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL !== '1';
+  return (
+    !isAllowedCredentialHost(normalized) && process.env.GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL !== '1'
+  );
 }

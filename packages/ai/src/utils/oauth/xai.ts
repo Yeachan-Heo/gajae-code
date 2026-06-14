@@ -50,7 +50,10 @@ function requestSignal(signal: AbortSignal | undefined): AbortSignal {
 	return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 }
 
-function addNonOverridingParams(target: URLSearchParams | Record<string, string>, params: Readonly<Record<string, string>>): void {
+function addNonOverridingParams(
+	target: URLSearchParams | Record<string, string>,
+	params: Readonly<Record<string, string>>,
+): void {
 	for (const [key, value] of Object.entries(params)) {
 		if (key.length === 0 || value.length === 0) continue;
 		if (target instanceof URLSearchParams) {

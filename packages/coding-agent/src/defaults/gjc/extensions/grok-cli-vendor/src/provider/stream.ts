@@ -1,9 +1,9 @@
-import {
-  type Api,
-  type AssistantMessageEventStream,
-  type Context,
-  type Model,
-  type SimpleStreamOptions,
+import type {
+  Api,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  SimpleStreamOptions,
 } from '@gajae-code/ai';
 import { streamOpenAIResponses } from '@gajae-code/ai/providers/openai-responses';
 

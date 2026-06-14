@@ -222,7 +222,6 @@ function rewriteFunctionCallOutput(input: Record<string, unknown>[]): Record<str
   return rewritten;
 }
 
-
 // ─── xAI 400 guards ───────────────────────────────────────────────────────────
 
 const REPLAYED_INPUT_TYPES = new Set([

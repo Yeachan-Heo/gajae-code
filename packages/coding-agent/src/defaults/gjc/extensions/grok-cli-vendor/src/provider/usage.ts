@@ -19,7 +19,10 @@ export function registerUsageCommand(api: Pick<ExtensionAPI, 'registerCommand'>)
         const registry = ctx.modelRegistry;
         const grokModels = registry.getAll().filter((m: Model<Api>) => m.provider === 'grok-build');
         if (grokModels.length === 0) {
-          ctx.ui.notify('Grok Build: no models registered. Run /login grok-build first.', 'warning');
+          ctx.ui.notify(
+            'Grok Build: no models registered. Run /login grok-build first.',
+            'warning',
+          );
           return;
         }
 

@@ -7,9 +7,9 @@ import { formatNumber } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	discoverAndLoadExtensions,
+	type ExtensionFactory,
 	loadExtensionFromFactory,
 	loadExtensions,
-	type ExtensionFactory,
 } from "../extensibility/extensions";
 import { EventBus } from "../utils/event-bus";
 

@@ -2,14 +2,14 @@
  * GJC Grok Build provider — SuperGrok OAuth + cli-chat-proxy models.
  */
 
-import { Effort } from '@gajae-code/ai/model-thinking';
 import type { Api, Model } from '@gajae-code/ai';
+import { Effort } from '@gajae-code/ai/model-thinking';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@gajae-code/ai/utils/oauth/types';
-import { XAI_OAUTH_SCOPE, loginXai, refreshXaiToken } from '@gajae-code/ai/utils/oauth/xai';
+import { loginXai, refreshXaiToken, XAI_OAUTH_SCOPE } from '@gajae-code/ai/utils/oauth/xai';
 import type { ExtensionAPI, ProviderConfig } from '@gajae-code/coding-agent';
-import { getBaseUrl, isGrokBuildBaseUrlOverrideIgnored } from '../shared/base-url.js';
 import { type GrokCliModelConfig, resolveModels } from '../models/catalog.js';
 import { sanitizePayload } from '../payload/sanitize.js';
+import { getBaseUrl, isGrokBuildBaseUrlOverrideIgnored } from '../shared/base-url.js';
 import { streamGrokCli } from './stream.js';
 import { registerUsageCommand } from './usage.js';
 
@@ -27,7 +27,6 @@ export default function registerGrokCli(api: ExtensionAPI) {
   const baseUrl = getBaseUrl();
   const models = resolveModels();
 
-
   api.registerProvider('grok-build', {
     baseUrl,
     apiKey: process.env.GROK_CLI_OAUTH_TOKEN ? 'GROK_CLI_OAUTH_TOKEN' : undefined,
@@ -36,7 +35,9 @@ export default function registerGrokCli(api: ExtensionAPI) {
       id: m.id,
       name: m.name,
       reasoning: m.reasoning,
-      thinking: m.reasoning ? { minLevel: Effort.Low, maxLevel: Effort.XHigh, mode: 'effort' } : undefined,
+      thinking: m.reasoning
+        ? { minLevel: Effort.Low, maxLevel: Effort.XHigh, mode: 'effort' }
+        : undefined,
       input: m.input,
       cost: m.cost,
       contextWindow: m.contextWindow,
@@ -50,7 +51,9 @@ export default function registerGrokCli(api: ExtensionAPI) {
       },
 
       async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-        return refreshXaiToken(credentials.refresh, { extraTokenParams: GROK_BUILD_XAI_REFRESH_PARAMS });
+        return refreshXaiToken(credentials.refresh, {
+          extraTokenParams: GROK_BUILD_XAI_REFRESH_PARAMS,
+        });
       },
 
       getApiKey(credentials: OAuthCredentials): string {
@@ -69,7 +72,6 @@ export default function registerGrokCli(api: ExtensionAPI) {
     streamSimple: streamGrokCli,
   });
 
-
   api.on('session_start', (_event, ctx) => {
     if (process.env.GROK_CLI_OAUTH_TOKEN) {
       ctx.ui.notify(
@@ -83,7 +85,6 @@ export default function registerGrokCli(api: ExtensionAPI) {
         'warning',
       );
     }
-
   });
 
   api.on('before_provider_request', (event, ctx) => {

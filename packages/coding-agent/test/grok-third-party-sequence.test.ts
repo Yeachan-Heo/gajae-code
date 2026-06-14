@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import type { ExtensionAPI } from "../src/extensibility/extensions";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
-import type { ExtensionAPI } from "../src/extensibility/extensions";
 
 function registerTestProvider(api: ExtensionAPI, providerName: string): void {
 	api.registerProvider(providerName, {

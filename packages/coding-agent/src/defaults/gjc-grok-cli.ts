@@ -1,6 +1,6 @@
 import type { ExtensionFactory } from "../extensibility/extensions/types";
-import grokBuildExtensionFactory from "./gjc/extensions/grok-build/index";
 import grokCliModelDefaults from "./gjc/agent.models.grok-cli.yml" with { type: "text" };
+import grokBuildExtensionFactory from "./gjc/extensions/grok-build/index";
 
 export const BUNDLED_GROK_BUILD_EXTENSION_ID = "bundled:grok-build";
 
