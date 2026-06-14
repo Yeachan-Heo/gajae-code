@@ -2731,6 +2731,18 @@ function executorQaBlockers(executorQa: JsonObject): UltragoalReviewFinding[] {
 	return (blockers ?? []).map(message => ({ severity: "blocker", message: `executorQa.blockers: ${message}` }));
 }
 
+const RESOLVED_REVIEW_BLOCKER_STATUSES = new Set<UltragoalGoalStatus>(["complete", "superseded"]);
+
+function findOpenReviewBlockerGoal(plan: UltragoalPlan, message: string): UltragoalGoal | undefined {
+	const objective = message.trim();
+	return plan.goals.find(
+		goal =>
+			goal.steering?.kind === "review_blocker" &&
+			goal.objective.trim() === objective &&
+			!RESOLVED_REVIEW_BLOCKER_STATUSES.has(goal.status),
+	);
+}
+
 async function recordReviewFindingGoals(cwd: string, findings: readonly UltragoalReviewFinding[]): Promise<string[]> {
 	let plan = await readUltragoalPlan(cwd);
 	const now = new Date().toISOString();
@@ -2745,8 +2757,14 @@ async function recordReviewFindingGoals(cwd: string, findings: readonly Ultragoa
 			goals: [],
 		};
 	}
-	const created: string[] = [];
+	const blockerGoalIds: string[] = [];
+	const createdGoalIds: string[] = [];
 	for (const finding of findings) {
+		const existing = findOpenReviewBlockerGoal(plan, finding.message);
+		if (existing) {
+			if (!blockerGoalIds.includes(existing.id)) blockerGoalIds.push(existing.id);
+			continue;
+		}
 		const id = nextUltragoalGoalId(plan);
 		plan.goals.push({
 			id,
@@ -2757,16 +2775,19 @@ async function recordReviewFindingGoals(cwd: string, findings: readonly Ultragoa
 			updatedAt: now,
 			steering: { kind: "review_blocker" },
 		});
-		created.push(id);
+		blockerGoalIds.push(id);
+		createdGoalIds.push(id);
 	}
-	plan.updatedAt = now;
-	await writePlan(cwd, plan);
-	await appendLedger(cwd, {
-		event: "review_blockers_recorded",
-		blockerGoalIds: created,
-		findings: findings.map(finding => finding.message),
-	});
-	return created;
+	if (createdGoalIds.length > 0) {
+		plan.updatedAt = now;
+		await writePlan(cwd, plan);
+		await appendLedger(cwd, {
+			event: "review_blockers_recorded",
+			blockerGoalIds: createdGoalIds,
+			findings: findings.map(finding => finding.message),
+		});
+	}
+	return blockerGoalIds;
 }
 
 export async function runUltragoalReview(cwd: string, args: readonly string[]): Promise<UltragoalReviewResult> {
@@ -3252,6 +3273,7 @@ const RECONCILE_COMMANDS = new Set([
 	"checkpoint",
 	"steer",
 	"record-review-blockers",
+	"review",
 ]);
 
 /**

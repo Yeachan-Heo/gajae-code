@@ -201,6 +201,66 @@ async function review(root: string, args: string[]): Promise<Record<string, unkn
 	return JSON.parse(result.stdout ?? "{}");
 }
 
+function modeStatePath(root: string): string {
+	const sessionId = process.env.GJC_SESSION_ID?.trim();
+	if (sessionId) {
+		const encoded = encodeURIComponent(sessionId).replaceAll(".", "%2E");
+		return path.join(root, ".gjc", "state", "sessions", encoded, "ultragoal-state.json");
+	}
+	return path.join(root, ".gjc", "state", "ultragoal-state.json");
+}
+
+async function readModeState(root: string): Promise<Record<string, unknown>> {
+	return JSON.parse(await Bun.file(modeStatePath(root)).text());
+}
+
+function passingQualityGate(): Record<string, unknown> {
+	return {
+		architectReview: {
+			architectureStatus: "CLEAR",
+			productStatus: "CLEAR",
+			codeStatus: "CLEAR",
+			recommendation: "APPROVE",
+			evidence: "architect reviewed architecture, product behavior, and code changes",
+			commands: ["architect-review"],
+			blockers: [],
+		},
+		executorQa: validExecutorQa(),
+		iteration: {
+			status: "passed",
+			evidence: "no verification findings remain after steering iterations",
+			fullRerun: true,
+			rerunCommands: ["bun test:e2e"],
+			blockers: [],
+		},
+	};
+}
+
+async function completeSingleGoal(root: string): Promise<void> {
+	await writeStructuralArtifacts(root);
+	const created = await createUltragoalPlan({ cwd: root, brief: "Ship review reconcile" });
+	await startNextUltragoalGoal({ cwd: root });
+	const checkpoint = await runNativeUltragoalCommand(
+		[
+			"checkpoint",
+			"--goal-id",
+			"G001",
+			"--status",
+			"complete",
+			"--evidence",
+			"final story verified with targeted regression coverage",
+			"--gjc-goal-json",
+			JSON.stringify({
+				goal: { threadId: "test", objective: created.gjcObjective, status: "active", updatedAt: Date.now() },
+			}),
+			"--quality-gate-json",
+			JSON.stringify(passingQualityGate()),
+		],
+		root,
+	);
+	expect(checkpoint.status).toBe(0);
+}
+
 describe("ultragoal review command", () => {
 	it("parses branch and worktree sources and falls back when gh is unavailable for pr", async () => {
 		const root = await tempDir();
@@ -249,6 +309,48 @@ describe("ultragoal review command", () => {
 		expect((output.blockerGoalIds as unknown[]).length).toBeGreaterThan(0);
 		expect(plan?.goals[0]?.status).toBe("pending");
 		expect(plan?.goals[0]?.steering?.kind).toBe("review_blocker");
+	});
+
+	it("review --mode review-start reconciles mode-state after recording blocker goals (#643)", async () => {
+		const root = await tempDir();
+		await completeSingleGoal(root);
+
+		const before = await readModeState(root);
+		expect(before.active).toBe(false);
+		expect(before.current_phase).toBe("complete");
+
+		const output = await review(root, [
+			"--mode",
+			"review-start",
+			"--executor-qa-json",
+			await writeQa(root, invalidInlineOnlyExecutorQa()),
+		]);
+		expect((output.blockerGoalIds as unknown[]).length).toBeGreaterThan(0);
+
+		const plan = await readUltragoalPlan(root);
+		const pendingBlockers = (plan?.goals ?? []).filter(
+			goal => goal.steering?.kind === "review_blocker" && goal.status === "pending",
+		);
+		expect(pendingBlockers.length).toBeGreaterThan(0);
+
+		const after = await readModeState(root);
+		expect(after.active).toBe(true);
+		expect(after.current_phase).toBe("pending");
+	});
+
+	it("review --mode review-start does not duplicate blocker goals on repeat (#643)", async () => {
+		const root = await tempDir();
+		const qaPath = await writeQa(root, invalidInlineOnlyExecutorQa());
+
+		const first = await review(root, ["--mode", "review-start", "--executor-qa-json", qaPath]);
+		const second = await review(root, ["--mode", "review-start", "--executor-qa-json", qaPath]);
+
+		const plan = await readUltragoalPlan(root);
+		const blockerGoals = (plan?.goals ?? []).filter(goal => goal.steering?.kind === "review_blocker");
+		const objectives = blockerGoals.map(goal => goal.objective);
+		expect(new Set(objectives).size).toBe(objectives.length);
+		expect(blockerGoals.length).toBe((first.blockerGoalIds as unknown[]).length);
+		expect(second.blockerGoalIds).toEqual(first.blockerGoalIds);
 	});
 
 	it("rejects the same invalid live artifact as checkpoint", async () => {
