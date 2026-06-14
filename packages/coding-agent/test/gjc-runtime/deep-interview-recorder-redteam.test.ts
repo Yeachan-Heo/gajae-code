@@ -188,6 +188,58 @@ describe("deep-interview recorder redteam: validator bypass attempts", () => {
 	});
 });
 
+describe("deep-interview recorder redteam: out-of-order re-score never compares against a future round", () => {
+	it("re-scoring an earlier round compares against its chronological predecessor, not a later scored round", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+
+		// Round 1: chronological predecessor — low ambiguity, high goal clarity.
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 1, questionId: "q1" }));
+		await enrichDeepInterviewRoundScoring(cwd, statePath, {
+			interviewId: "iv-redteam",
+			round: 1,
+			questionId: "q1",
+			scores: { goal: 0.6 },
+			ambiguity: 0.4,
+		});
+
+		// Round 2: answered shell, deferred for an out-of-order re-score below.
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 2, questionId: "q2" }));
+
+		// Round 3: a LATER scored round with high ambiguity / low goal clarity. If the
+		// validator compared against the latest round in array order, this "future" round
+		// would be picked as the baseline for round 2.
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 3, questionId: "q3" }));
+		await enrichDeepInterviewRoundScoring(cwd, statePath, {
+			interviewId: "iv-redteam",
+			round: 3,
+			questionId: "q3",
+			scores: { goal: 0.2 },
+			ambiguity: 0.9,
+		});
+
+		// Re-score round 2 with an active goal trigger. This transition is VALID against
+		// round 1 (ambiguity rises 0.4 -> 0.5, goal does not improve 0.6 -> 0.5) but would
+		// be INVALID against the future round 3 (ambiguity 0.9 -> 0.5 does not rise; goal
+		// 0.2 -> 0.5 improves). It must succeed, proving the chronological prior is used.
+		await enrichDeepInterviewRoundScoring(cwd, statePath, {
+			interviewId: "iv-redteam",
+			round: 2,
+			questionId: "q2",
+			scores: { goal: 0.5 },
+			ambiguity: 0.5,
+			triggers: [trigger({ dimension: "goal" })],
+		});
+
+		const rounds = await readPersistedRounds(statePath);
+		const round2 = rounds.find(r => r.round === 2);
+		expect(round2?.lifecycle).toBe("scored");
+		expect(round2?.ambiguity).toBe(0.5);
+		// Round 3 stays untouched as the later scored round.
+		expect(rounds.find(r => r.round === 3)?.lifecycle).toBe("scored");
+	});
+});
+
 describe("deep-interview recorder redteam: round_key collision safety", () => {
 	it("keeps different question ids in the same round distinct", () => {
 		expect(deriveRoundKey("iv-redteam", { round: 4, questionId: "q-left" })).not.toBe(

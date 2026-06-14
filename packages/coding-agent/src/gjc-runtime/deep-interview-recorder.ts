@@ -389,19 +389,31 @@ export async function appendOrMergeDeepInterviewRound(
 }
 
 /**
- * The most recent scored round preceding the round currently being scored
- * (matched by durable key). Used as the `prior` baseline for the scored-transition
- * invariant so a re-score of the same key compares against an earlier round, not itself.
+ * The chronological scored predecessor of the round currently being scored: the
+ * scored round with the greatest `round` strictly less than `currentRound`, with
+ * the same durable key excluded. Selecting by `round` (not array position) ensures
+ * an out-of-order re-score of an earlier round compares against its true prior, never
+ * a later ("future") scored round that happens to sit later in the array.
+ *
+ * Fail-safe: if `currentRound` is not a finite number, or a candidate's `round` is
+ * not finite, that comparison is treated as non-matching, so no prior is selected
+ * rather than risking a spurious comparison against an unrelated round.
  */
 function latestPriorScoredRound(
 	rounds: readonly DeepInterviewRoundRecord[],
 	currentKey: string,
+	currentRound: number,
 ): DeepInterviewRoundRecord | undefined {
-	for (let i = rounds.length - 1; i >= 0; i--) {
-		const candidate = rounds[i];
-		if (candidate.lifecycle === "scored" && candidate.round_key !== currentKey) return candidate;
+	if (!Number.isFinite(currentRound)) return undefined;
+	let prior: DeepInterviewRoundRecord | undefined;
+	for (const candidate of rounds) {
+		if (candidate.lifecycle !== "scored") continue;
+		if (candidate.round_key === currentKey) continue;
+		if (!Number.isFinite(candidate.round)) continue;
+		if (!(candidate.round < currentRound)) continue;
+		if (prior === undefined || candidate.round > prior.round) prior = candidate;
 	}
-	return undefined;
+	return prior;
 }
 
 /** Merge scoring output into the same round record, transitioning to `scored`. */
@@ -420,7 +432,7 @@ export async function enrichDeepInterviewRoundScoring(
 	// overall ambiguity, or a disputed/unresolved trigger lacking a rationale) must
 	// never be persisted — storing it lets the interview falsely converge. Validate
 	// against the most recent prior scored round before writing any durable state.
-	const prior = latestPriorScoredRound(rounds, record.round_key);
+	const prior = latestPriorScoredRound(rounds, record.round_key, record.round);
 	const validation = validateDeepInterviewScoredTransition(prior, record);
 	if (!validation.ok) {
 		throw new Error(
