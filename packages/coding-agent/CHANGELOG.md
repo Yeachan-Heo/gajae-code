@@ -6,6 +6,10 @@
 
 - Fixed interactive goal-mode auto-continuation looping `Error: Agent is already processing…` (`AgentBusyError`) while the session is busy. A wedged/orphaned subagent turn — or an in-progress compaction — can leave the session non-idle while the interactive loop is back at `getUserInput()`; the 800 ms continuation timer then fired `prompt()`, threw `AgentBusyError`, surfaced it via `showError`, and re-armed — spamming the error roughly every 800 ms. The continuation now skips and re-arms while `isStreaming`/`isCompacting`, firing only once the session returns to idle.
 
+### Added
+
+- Added three bundled dark TUI migration themes — `claude-code`, `codex`, and `opencode` — whose palettes mirror the Claude Code, OpenAI Codex CLI, and opencode TUIs for easy eye-migration. They join the crustacean defaults (`red-claw` dark, `blue-crab` light) as selectable built-ins via Settings or `/theme`; defaults are unchanged and the new themes keep GJC's default symbol identity. A built-in inventory test now validates every bundled theme against the required `THEME_COLOR_KEYS` token set, name/key equality, var resolution, dark classification, and brand-vs-semantic token separation.
+
 ## [0.5.1] - 2026-06-14
 
 ### Added

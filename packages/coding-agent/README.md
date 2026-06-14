@@ -34,4 +34,4 @@ Switching backends mid-session is honoured on the next system-prompt rebuild and
 
 ## Red-claw TUI theme
 
-The interactive TUI defaults to the bundled `red-claw` crustacean theme for dark terminals and the bundled `blue-crab` theme for light-appearance terminals, with matching welcome/icon assets. Explicit user theme settings still win; set `theme.dark: red-claw` and `theme.light: blue-crab` in `~/.gjc/agent/config.yml` to pin them.
+The interactive TUI defaults to the bundled `red-claw` crustacean theme for dark terminals and the bundled `blue-crab` theme for light-appearance terminals, with matching welcome/icon assets. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win; set `theme.dark: red-claw` and `theme.light: blue-crab` in `~/.gjc/agent/config.yml` to pin them.
