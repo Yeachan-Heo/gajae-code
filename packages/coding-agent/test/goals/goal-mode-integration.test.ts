@@ -418,9 +418,7 @@ describe("InteractiveMode goal mode integration", () => {
 			for (let i = 0; i < 5; i++) {
 				vi.advanceTimersByTime(800);
 			}
-			const compactingCalls = startPending.mock.calls.filter(
-				call => call[0]?.customType === "goal-continuation",
-			);
+			const compactingCalls = startPending.mock.calls.filter(call => call[0]?.customType === "goal-continuation");
 			expect(compactingCalls.length).toBe(0);
 
 			// Compaction finished: the re-armed continuation fires.
