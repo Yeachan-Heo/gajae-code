@@ -10,6 +10,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
+import { getProjectDir } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import type { HistoryEntry, HistoryStorage } from "../../session/history-storage";
@@ -72,6 +73,7 @@ class HistoryResultsList implements Component {
 
 export class HistorySearchComponent extends Container {
 	#historyStorage: HistoryStorage;
+	#cwd: string;
 	#searchInput: Input;
 	#results: HistoryEntry[] = [];
 	#selectedIndex = 0;
@@ -83,6 +85,7 @@ export class HistorySearchComponent extends Container {
 	constructor(historyStorage: HistoryStorage, onSelect: (prompt: string) => void, onCancel: () => void) {
 		super();
 		this.#historyStorage = historyStorage;
+		this.#cwd = getProjectDir();
 		this.#onSelect = onSelect;
 		this.#onCancel = onCancel;
 
@@ -150,8 +153,8 @@ export class HistorySearchComponent extends Container {
 	#updateResults(): void {
 		const query = this.#searchInput.getValue().trim();
 		this.#results = query
-			? this.#historyStorage.search(query, this.#resultLimit)
-			: this.#historyStorage.getRecent(this.#resultLimit);
+			? this.#historyStorage.search(query, this.#resultLimit, this.#cwd)
+			: this.#historyStorage.getRecent(this.#resultLimit, this.#cwd);
 		this.#selectedIndex = 0;
 		this.#resultsList.setResults(this.#results, this.#selectedIndex);
 	}

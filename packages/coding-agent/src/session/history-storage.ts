@@ -67,10 +67,14 @@ export class HistoryStorage {
 	// Prepared statements
 	#insertRowStmt: Statement;
 	#recentStmt: Statement;
+	#recentByCwdStmt: Statement;
 	#searchStmt: Statement;
+	#searchByCwdStmt: Statement;
 	#lastPromptStmt: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
+	// Cache cwd-filtered substring-fallback statements keyed by token count.
+	#substringCwdStmts = new Map<number, Statement>();
 
 	// In-memory cache of last prompt to avoid sync DB reads on add
 	#lastPromptCache: string | null = null;
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS history (
 	cwd TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_history_cwd_created_at ON history(cwd, created_at DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id');
 
@@ -117,8 +122,14 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		this.#recentStmt = this.#db.prepare(
 			"SELECT id, prompt, created_at, cwd FROM history ORDER BY created_at DESC, id DESC LIMIT ?",
 		);
+		this.#recentByCwdStmt = this.#db.prepare(
+			"SELECT id, prompt, created_at, cwd FROM history WHERE cwd = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+		);
 		this.#searchStmt = this.#db.prepare(
 			"SELECT h.id, h.prompt, h.created_at, h.cwd FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ? ORDER BY h.created_at DESC, h.id DESC LIMIT ?",
+		);
+		this.#searchByCwdStmt = this.#db.prepare(
+			"SELECT h.id, h.prompt, h.created_at, h.cwd FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ? AND h.cwd = ? ORDER BY h.created_at DESC, h.id DESC LIMIT ?",
 		);
 		this.#lastPromptStmt = this.#db.prepare("SELECT prompt FROM history ORDER BY id DESC LIMIT 1");
 
@@ -158,12 +169,14 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		});
 	}
 
-	getRecent(limit: number): HistoryEntry[] {
+	getRecent(limit: number, cwd?: string): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
 
 		try {
-			const rows = this.#recentStmt.all(safeLimit) as HistoryRow[];
+			const rows = (
+				cwd === undefined ? this.#recentStmt.all(safeLimit) : this.#recentByCwdStmt.all(cwd, safeLimit)
+			) as HistoryRow[];
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
@@ -171,7 +184,7 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		}
 	}
 
-	search(query: string, limit: number): HistoryEntry[] {
+	search(query: string, limit: number, cwd?: string): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
 
@@ -184,7 +197,11 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		const ftsQuery = tokens.map(tok => `"${tok.replace(/"/g, '""')}"*`).join(" ");
 		let ftsRows: HistoryRow[] = [];
 		try {
-			ftsRows = this.#searchStmt.all(ftsQuery, safeLimit) as HistoryRow[];
+			ftsRows = (
+				cwd === undefined
+					? this.#searchStmt.all(ftsQuery, safeLimit)
+					: this.#searchByCwdStmt.all(ftsQuery, cwd, safeLimit)
+			) as HistoryRow[];
 		} catch (error) {
 			// Malformed FTS expression - fall through to substring path.
 			logger.debug("HistoryStorage FTS query failed, using substring only", { error: String(error) });
@@ -199,7 +216,7 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		//    by safeLimit, ordered by recency - no full-table load into JS.
 		let subRows: HistoryRow[] = [];
 		try {
-			subRows = this.#searchSubstring(tokens, safeLimit);
+			subRows = this.#searchSubstring(tokens, safeLimit, cwd);
 		} catch (error) {
 			logger.error("HistoryStorage substring search failed", { error: String(error) });
 		}
@@ -250,6 +267,7 @@ CREATE TABLE history (
 	cwd TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_history_cwd_created_at ON history(cwd, created_at DESC);
 INSERT INTO history (id, prompt, created_at, cwd)
 SELECT id, prompt, created_at, cwd
 FROM history_legacy;
@@ -282,21 +300,24 @@ END;
 			.filter(tok => tok.length > 0);
 	}
 
-	#searchSubstring(tokens: string[], limit: number): HistoryRow[] {
-		const stmt = this.#getSubstringStmt(tokens.length);
+	#searchSubstring(tokens: string[], limit: number, cwd?: string): HistoryRow[] {
+		const stmt = this.#getSubstringStmt(tokens.length, cwd !== undefined);
 		const params: unknown[] = tokens.map(tok => `%${escapeLikePattern(tok)}%`);
+		if (cwd !== undefined) params.push(cwd);
 		params.push(limit);
 		return stmt.all(...(params as [string, ...unknown[]])) as HistoryRow[];
 	}
 
-	#getSubstringStmt(tokenCount: number): Statement {
-		let stmt = this.#substringStmts.get(tokenCount);
+	#getSubstringStmt(tokenCount: number, withCwd: boolean): Statement {
+		const cache = withCwd ? this.#substringCwdStmts : this.#substringStmts;
+		let stmt = cache.get(tokenCount);
 		if (stmt) return stmt;
 		const whereClause = Array(tokenCount).fill("prompt LIKE ? ESCAPE '\\' COLLATE NOCASE").join(" AND ");
+		const cwdClause = withCwd ? " AND cwd = ?" : "";
 		stmt = this.#db.prepare(
-			`SELECT id, prompt, created_at, cwd FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?`,
+			`SELECT id, prompt, created_at, cwd FROM history WHERE ${whereClause}${cwdClause} ORDER BY created_at DESC, id DESC LIMIT ?`,
 		);
-		this.#substringStmts.set(tokenCount, stmt);
+		cache.set(tokenCount, stmt);
 		return stmt;
 	}
 

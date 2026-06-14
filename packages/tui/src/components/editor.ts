@@ -368,7 +368,7 @@ interface HistoryEntry {
 
 interface HistoryStorage {
 	add(prompt: string, cwd?: string): Promise<void>;
-	getRecent(limit: number): HistoryEntry[];
+	getRecent(limit: number, cwd?: string): HistoryEntry[];
 }
 
 type HistoryCursorAnchor = "start" | "end";
@@ -545,7 +545,7 @@ export class Editor implements Component, Focusable {
 
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
-		const recent = storage.getRecent(100);
+		const recent = storage.getRecent(100, getProjectDir());
 		this.#history = recent.map(entry => entry.prompt);
 		this.#historyIndex = -1;
 	}

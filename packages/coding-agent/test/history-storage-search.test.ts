@@ -135,3 +135,38 @@ describe("HistoryStorage.search", () => {
 		expect(results.map(r => r.prompt)).toEqual(["go commit changes"]);
 	});
 });
+
+describe("HistoryStorage cwd filtering", () => {
+	async function seedWithCwd(storage: HistoryStorage, rows: Array<[string, string]>): Promise<void> {
+		const writes = rows.map(([prompt, cwd]) => storage.add(prompt, cwd));
+		vi.advanceTimersByTime(100);
+		await Promise.all(writes);
+	}
+
+	it("getRecent scoped to a cwd returns only that project's prompts", async () => {
+		const storage = await freshStorage();
+		await seedWithCwd(storage, [
+			["alpha task", "/proj/a"],
+			["beta task", "/proj/b"],
+			["gamma task", "/proj/a"],
+		]);
+
+		expect(storage.getRecent(10, "/proj/a").map(r => r.prompt)).toEqual(["gamma task", "alpha task"]);
+		expect(storage.getRecent(10).map(r => r.prompt)).toEqual(["gamma task", "beta task", "alpha task"]);
+	});
+
+	it("search scoped to a cwd excludes other projects via FTS and substring paths", async () => {
+		const storage = await freshStorage();
+		await seedWithCwd(storage, [
+			["run git commit now", "/proj/a"],
+			["git commit later please", "/proj/b"],
+		]);
+
+		// FTS prefix path
+		expect(storage.search("commit", 10, "/proj/a").map(r => r.prompt)).toEqual(["run git commit now"]);
+		// substring fallback path (infix `mit` of `commit`)
+		expect(storage.search("mit", 10, "/proj/a").map(r => r.prompt)).toEqual(["run git commit now"]);
+		// unscoped search still spans every project
+		expect(storage.search("commit", 10).length).toBe(2);
+	});
+});
