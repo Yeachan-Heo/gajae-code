@@ -254,6 +254,11 @@ export class TUI extends Container {
 	#renderTimer: NodeJS.Timeout | undefined;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
+	// Input-priority scheduling: an input keystroke must never be starved behind a
+	// pending normal (frame-budget) render timer. When set, an input-priority render
+	// is queued for the next tick and supersedes any pending normal timer.
+	#inputRenderPending = false;
+
 	#cursorRow = 0; // Logical cursor row (end of rendered content)
 	#hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
 	#viewportTopRow = 0; // Content row currently mapped to screen row 0
@@ -671,6 +676,8 @@ export class TUI extends Container {
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
+			// A forced full redraw supersedes any queued input-priority render.
+			this.#inputRenderPending = false;
 			this.#previousLines = [];
 			this.#lineNormalizationCache.clear();
 			this.#lineTruncationCache.clear();
@@ -700,6 +707,19 @@ export class TUI extends Container {
 			});
 			return;
 		}
+		// Input-priority path: expedite so the keystroke echoes within the next tick
+		// instead of waiting for (or behind) the frame-budget timer. Re-entrant input
+		// requests in the same turn coalesce via #inputRenderPending, so at most one
+		// expedited render commits per event-loop turn (no repaint storms). This only
+		// changes WHEN #doRender runs; the render output path is unchanged.
+		if (source === "input" || source === "editor.input") {
+			if (!this.#inputRenderPending) {
+				this.#inputRenderPending = true;
+				this.#renderRequested = true;
+				process.nextTick(() => this.#commitExpeditedRender());
+			}
+			return;
+		}
 		if (this.#renderRequested) return;
 		this.#renderRequested = true;
 		process.nextTick(() => this.#scheduleRender());
@@ -727,6 +747,27 @@ export class TUI extends Container {
 			}
 		}, delay);
 		if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 1);
+	}
+
+	// Commit a single input-priority render on the next tick, cancelling any normal
+	// frame-budget timer scheduled in the same turn. nextTick always precedes a
+	// pending setTimeout, so the keystroke is never starved behind streaming renders.
+	#commitExpeditedRender(): void {
+		if (!this.#inputRenderPending) return; // cancelled (e.g., by a forced render)
+		this.#inputRenderPending = false;
+		if (this.#stopped || !this.#renderRequested) {
+			return;
+		}
+		if (this.#renderTimer) {
+			clearTimeout(this.#renderTimer);
+			this.#renderTimer = undefined;
+			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
+		}
+		this.#renderRequested = false;
+		this.#lastRenderAt = performance.now();
+		const t0 = renderMetrics.now();
+		this.#doRender();
+		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 	}
 
 	#handleInput(data: string): void {
@@ -780,7 +821,7 @@ export class TUI extends Container {
 				return;
 			}
 			this.#focusedComponent.handleInput(data);
-			this.requestRender();
+			this.requestRender(false, "input");
 		}
 	}
 
