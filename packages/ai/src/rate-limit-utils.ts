@@ -45,7 +45,16 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		return "RATE_LIMIT_EXCEEDED";
 	}
 
-	if (lower.includes("exhausted") || lower.includes("quota") || lower.includes("usage limit")) {
+	if (
+		lower.includes("exhausted") ||
+		lower.includes("quota") ||
+		lower.includes("usage limit") ||
+		lower.includes("model limit") ||
+		lower.includes("model_limit") ||
+		lower.includes("message limit") ||
+		lower.includes("message_limit") ||
+		lower.includes("limit for this model")
+	) {
 		return "QUOTA_EXHAUSTED";
 	}
 
@@ -77,7 +86,7 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 
 /** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?exceeded|resource.?exhausted/i;
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|model.?limit|model_limit_reached|message.?limit|message_limit_reached|limit for this model|quota.?exceeded|resource has been exhausted[^\n]*(?:quota|limit)/i;
 
 export function isUsageLimitError(errorMessage: string): boolean {
 	return USAGE_LIMIT_PATTERN.test(errorMessage);

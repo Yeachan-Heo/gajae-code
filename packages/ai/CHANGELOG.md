@@ -23,6 +23,7 @@
 ### Fixed
 
 - Stripped `OpenAI-Beta` in the `openai-proxy` request transform profile so OpenAI-compatible proxies do not receive SDK beta headers.
+- Classified model/message limit exhaustion as persistent usage-limit errors so hosts fail fast or switch credentials instead of leaving sessions in an unbounded retry/working state.
 
 ## [0.4.5] - 2026-06-12
 
