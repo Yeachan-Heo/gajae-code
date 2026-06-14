@@ -40,6 +40,7 @@ import {
 	isBlobRef,
 	isImageDataUrl,
 	MemoryBlobStore,
+	ResidentBlobMissingError,
 	resolveImageData,
 	resolveImageDataUrl,
 	resolveResidentImageDataSync,
@@ -1201,6 +1202,12 @@ interface ResidentBlobStores {
 	sessionFile?: string;
 }
 
+type ResidentBlobMissingPolicy = "throw" | "placeholder";
+
+function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
+	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
+}
+
 function externalizeResidentValueSync(obj: unknown, stores: ResidentBlobStores, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (typeof obj === "string") {
@@ -1256,6 +1263,7 @@ function materializeResidentValueSync(
 	stores: ResidentBlobStores,
 	key?: string,
 	cache = new Map<string, string>(),
+	missingPolicy: ResidentBlobMissingPolicy = "throw",
 ): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (typeof obj === "string") return obj;
@@ -1263,19 +1271,28 @@ function materializeResidentValueSync(
 		const cacheKey = `${obj.kind}:${obj.ref}`;
 		const cached = cache.get(cacheKey);
 		if (cached !== undefined) return cached;
-		const resolved =
-			obj.kind === "imageUrl"
-				? resolveResidentImageDataUrlSync(stores.imageStore, obj.ref, stores)
-				: obj.kind === "imageData"
-					? resolveResidentImageDataSync(stores.imageStore, obj.ref, stores)
-					: resolveTextBlobSync(stores.textStore, obj.ref, stores);
+		let resolved: string;
+		try {
+			resolved =
+				obj.kind === "imageUrl"
+					? resolveResidentImageDataUrlSync(stores.imageStore, obj.ref, stores)
+					: obj.kind === "imageData"
+						? resolveResidentImageDataSync(stores.imageStore, obj.ref, stores)
+						: resolveTextBlobSync(stores.textStore, obj.ref, stores);
+		} catch (err) {
+			if (missingPolicy === "placeholder" && err instanceof ResidentBlobMissingError) {
+				resolved = residentBlobMissingPlaceholder(err);
+			} else {
+				throw err;
+			}
+		}
 		cache.set(cacheKey, resolved);
 		return resolved;
 	}
 	if (Array.isArray(obj)) {
 		let changed = false;
 		const result = obj.map(item => {
-			const newItem = materializeResidentValueSync(item, stores, key, cache);
+			const newItem = materializeResidentValueSync(item, stores, key, cache, missingPolicy);
 			if (newItem !== item) changed = true;
 			return newItem;
 		});
@@ -1284,7 +1301,7 @@ function materializeResidentValueSync(
 	if (typeof obj === "object") {
 		let changed = false;
 		const entries = Object.entries(obj).map(([childKey, value]) => {
-			const newValue = materializeResidentValueSync(value, stores, childKey, cache);
+			const newValue = materializeResidentValueSync(value, stores, childKey, cache, missingPolicy);
 			if (newValue !== value) changed = true;
 			return [childKey, newValue] as const;
 		});
@@ -1297,8 +1314,9 @@ function materializeResidentEntrySync<T extends FileEntry | SessionEntry>(
 	entry: T,
 	stores: ResidentBlobStores,
 	cache: Map<string, string>,
+	missingPolicy: ResidentBlobMissingPolicy = "throw",
 ): T {
-	return materializeResidentValueSync(entry, stores, undefined, cache) as T;
+	return materializeResidentValueSync(entry, stores, undefined, cache, missingPolicy) as T;
 }
 
 function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(
@@ -1307,6 +1325,37 @@ function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(
 ): T[] {
 	const cache = new Map<string, string>();
 	return entries.map(entry => materializeResidentEntrySync(entry, stores, cache));
+}
+
+function materializeResidentEntryForPersistenceSync<T extends FileEntry | SessionEntry>(
+	entry: T,
+	stores: ResidentBlobStores,
+	cache: Map<string, string>,
+): T {
+	return materializeResidentEntrySync(entry, stores, cache, "placeholder");
+}
+
+function materializeResidentEntriesForPersistenceSync<T extends FileEntry | SessionEntry>(
+	entries: T[],
+	stores: ResidentBlobStores,
+): T[] {
+	const cache = new Map<string, string>();
+	return entries.map(entry => materializeResidentEntryForPersistenceSync(entry, stores, cache));
+}
+
+export function residentBlobSentinelForTests(kind: ResidentBlobKind, ref: string): ResidentBlobSentinel {
+	return residentBlobSentinel(kind, ref);
+}
+
+export function materializeResidentEntriesForPersistenceForTests<T>(
+	entries: T[],
+	textStore: BlobStore,
+	imageStore: BlobStore = textStore,
+): T[] {
+	return materializeResidentEntriesForPersistenceSync(entries as Array<T & FileEntry>, {
+		textStore,
+		imageStore,
+	}) as T[];
 }
 function cloneJsonSemantic<T>(value: T): T {
 	if (value === null || value === undefined || typeof value !== "object") return value;
@@ -2817,7 +2866,7 @@ export class SessionManager {
 		await this.#queuePersistTask(async () => {
 			await this.#closePersistWriterInternal();
 			const entries = await Promise.all(
-				materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
+				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
@@ -2831,8 +2880,8 @@ export class SessionManager {
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
 		this.#closePersistWriterInternalSync();
-		const entries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
-			prepareEntryForPersistenceSync(entry, this.#blobStore),
+		const entries = materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(
+			entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
 		);
 		this.#writeEntriesAtomicallySync(entries);
 		this.#needsFullRewriteOnNextPersist = false;
@@ -3139,7 +3188,11 @@ export class SessionManager {
 				this.#rewriteFile().catch(() => {});
 				return;
 			}
-			const materializedEntry = materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map());
+			const materializedEntry = materializeResidentEntryForPersistenceSync(
+				entry,
+				this.#residentBlobStores(),
+				new Map(),
+			);
 			const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 			writer.writeSync(persistedEntry);
 		} catch (err) {

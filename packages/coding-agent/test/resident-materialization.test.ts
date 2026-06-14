@@ -13,7 +13,11 @@ import {
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
 } from "@gajae-code/coding-agent/session/blob-store";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	materializeResidentEntriesForPersistenceForTests,
+	residentBlobSentinelForTests,
+	SessionManager,
+} from "@gajae-code/coding-agent/session/session-manager";
 import { measureSessionMemory } from "../bench/session-memory.bench";
 
 const tmpRoots: string[] = [];
@@ -46,6 +50,27 @@ describe("resident byte-sensitive TEXT materialization is fail-closed", () => {
 	test("resolveTextBlobSync throws ResidentBlobMissingError when the resident blob is missing (never leaks a blob ref)", () => {
 		const store = makeStore();
 		expect(() => resolveTextBlobSync(store, MISSING_REF)).toThrow(ResidentBlobMissingError);
+	});
+
+	test("persistence materialization replaces a missing resident blob with a placeholder instead of throwing", () => {
+		const store = makeStore();
+		const entry = {
+			type: "message",
+			id: "missing-resident-entry",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: residentBlobSentinelForTests("text", MISSING_REF) }],
+				timestamp: 0,
+			},
+		};
+
+		const [materialized] = materializeResidentEntriesForPersistenceForTests([entry], store);
+		const serialized = JSON.stringify(materialized);
+		expect(serialized).toContain("Session resident text blob missing");
+		expect(serialized).toContain("original content unavailable");
+		expect(serialized).not.toContain(MISSING_REF);
 	});
 });
 
