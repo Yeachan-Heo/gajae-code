@@ -174,7 +174,26 @@ bun install
 bun run install:defaults
 ```
 
-Run the CLI from source:
+### Canonical: build and link the dev `gjc`
+
+To make the global `gjc` command run **this checkout's TypeScript source** (hot to every edit, with skills/natives working), link it onto your `PATH`:
+
+```sh
+bun install
+bun run dev:link
+```
+
+`dev:link` symlinks `gjc` → `packages/coding-agent/src/cli.ts` into `~/.local/bin` (override with `GJC_DEV_LINK_DIR`), removes stale/compiled `gjc` shims that would shadow it, and runs `--smoke-test` to confirm `@gajae-code/natives` loads. Use `bun run install:dev` for the full bootstrap (install + link + `setup defaults`).
+
+Check at any time whether your `gjc` has drifted (wrong source, or a compiled binary that can't load skills):
+
+```sh
+bun run dev:doctor
+```
+
+> Do **not** use the compiled binary for day-to-day development. `bun --cwd=packages/coding-agent run build` produces a standalone `dist/gjc`, but a `bun build --compile` binary cannot dynamically load `@gajae-code/natives`, so skills fail with `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc'`. Running from source via `dev:link` avoids this. Build the binary only when validating a release.
+
+Run the CLI from source directly without linking:
 
 ```sh
 bun packages/coding-agent/src/cli.ts --help

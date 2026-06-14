@@ -78,9 +78,11 @@
   },
   "overrides": {},
   "scripts": {
-    "install:dev": "bun install && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link && bun packages/coding-agent/src/cli.ts setup defaults",
+    "install:dev": "bun install && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link && bun run dev:link && bun packages/coding-agent/src/cli.ts setup defaults",
     "install:defaults": "bun packages/coding-agent/src/cli.ts setup defaults",
     "dev": "bun --cwd=packages/coding-agent src/cli.ts",
+    "dev:link": "bun scripts/dev-link.ts",
+    "dev:doctor": "bun scripts/dev-link.ts --check",
     "stats": "bun --cwd=packages/coding-agent src/cli.ts stats",
     "build": "bun run --workspaces --if-present build",
     "build:native": "bun --cwd=packages/natives run build",
