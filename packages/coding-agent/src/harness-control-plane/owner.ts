@@ -106,7 +106,7 @@ export class RuntimeOwner {
 	#server: ControlServer;
 	#cursor = 0;
 	#leaseEpoch = 0;
-	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];

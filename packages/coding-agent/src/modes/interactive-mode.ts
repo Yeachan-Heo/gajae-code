@@ -283,7 +283,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 	autoCompactionEscapeHandler?: () => void;
 	retryEscapeHandler?: () => void;
-	retryCountdownTimer?: ReturnType<typeof setInterval>;
+	retryCountdownTimer?: NodeJS.Timeout;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
