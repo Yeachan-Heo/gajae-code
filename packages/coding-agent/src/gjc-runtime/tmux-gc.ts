@@ -11,6 +11,7 @@ import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapt
 import { GJC_TMUX_PROFILE_VALUE } from "./tmux-common";
 import {
 	type GjcTmuxSessionStatus,
+	type GjcTmuxSessionsForGc,
 	listTmuxSessionsForGc,
 	readTmuxSessionTagsForGc,
 	removeGjcTmuxSession,
@@ -124,7 +125,7 @@ export const tmuxSessionsGcAdapter: GcStoreAdapter = {
 	async collect(ctx: GcContext): Promise<GcCollectResult> {
 		const records: GcRecord[] = [];
 		const errors: GcCollectResult["errors"] = [];
-		let sessions: ReturnType<typeof listTmuxSessionsForGc>;
+		let sessions: GjcTmuxSessionsForGc;
 		try {
 			sessions = listTmuxSessionsForGc(ctx.env);
 		} catch (error) {

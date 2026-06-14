@@ -52,6 +52,7 @@ import {
 	type StateWriterAuditContext,
 	softDelete,
 	updateWorkflowTransactionJournal,
+	type WorkflowEnvelopeIntegrityMismatch,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor } from "./workflow-manifest";
@@ -659,7 +660,7 @@ async function warnAndAuditOutOfBandIfNeeded(
 	skill: CanonicalGjcWorkflowSkill,
 	options?: { mutationId?: string; forced?: boolean },
 ): Promise<string | undefined> {
-	let mismatch: Awaited<ReturnType<typeof detectWorkflowEnvelopeIntegrityMismatch>>;
+	let mismatch: WorkflowEnvelopeIntegrityMismatch | undefined;
 	try {
 		mismatch = await detectWorkflowEnvelopeIntegrityMismatch(filePath);
 	} catch {
