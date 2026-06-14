@@ -94,6 +94,19 @@ function smokeTest(gjcPath: string): { ok: boolean; output: string } {
 	return { ok: res.exitCode === 0 && output.includes("smoke-test: ok"), output };
 }
 
+function assertResolvedGjcIsSource(winner: GjcHit | undefined): void {
+	if (!winner || winner.real === cliSourceReal) return;
+
+	console.error("");
+	console.error("✗ Linked, but `gjc` still resolves to a different command earlier on PATH.");
+	console.error(`  Resolved: ${winner.file}`);
+	console.error(`       -> ${describe(winner.real)}`);
+	console.error(`  Expected source: ${cliSourceReal}`);
+	console.error(`  The managed link was created at: ${path.join(targetDir, "gjc")}`);
+	console.error("  Move the managed link directory earlier on PATH or remove the shadowing command.");
+	process.exit(1);
+}
+
 function assertSourceExists(): void {
 	if (!fs.existsSync(cliSource)) {
 		console.error(`✗ Cannot find CLI source at ${cliSource}`);
@@ -178,7 +191,10 @@ function link(): never {
 	}
 
 	const winner = findGjcOnPath()[0];
-	const smoke = smokeTest(winner?.file ?? target);
+	assertResolvedGjcIsSource(winner);
+
+	const smokePath = winner?.file ?? target;
+	const smoke = smokeTest(smokePath);
 	if (!smoke.ok) {
 		console.error("");
 		console.error("✗ Linked, but `gjc --smoke-test` failed (natives/worker did not load):");
