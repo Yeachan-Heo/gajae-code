@@ -1,6 +1,6 @@
-# Hermes MCP bridge
+# Coordinator MCP bridge
 
-GJC exposes a native outward MCP bridge for Hermes-style coordinators:
+GJC exposes a native outward MCP bridge for external coordinators:
 
 ```bash
 gjc mcp-serve coordinator
@@ -12,18 +12,18 @@ The bridge is intentionally separate from GJC's client-side MCP runtime. It lets
 
 ## Core contract and adapters
 
-The coordinator bridge is intentionally a core contract with multiple adapters, not an MCP-only product direction. Hermes is one coordinator preset, not a product layer:
+The coordinator bridge is intentionally a core contract with multiple adapters, not an MCP-only or Hermes-only product direction. Hermes is one compatibility preset, not a privileged integration mode:
 
 - `packages/coding-agent/src/coordinator/contract.ts` owns transport-neutral server metadata and tool names.
-- `gjc mcp-serve coordinator` is the outward MCP adapter for Hermes-style agents.
+- `gjc mcp-serve coordinator` is the outward MCP adapter for external agents.
 - `gjc coordinator` is the read-only CLI/debug adapter for humans and scripts that need to inspect the same contract without starting MCP transport.
-- `gjc setup hermes` is the setup adapter that renders coordinator config and operator guidance.
+- `gjc setup hermes` is the compatibility setup adapter that renders coordinator config and operator guidance.
 
 Future session, turn, question, artifact, and report behavior should move toward shared coordinator core services that both MCP and CLI adapters call instead of duplicating transport-specific logic.
 
-## Standard Hermes setup
+## Coordinator setup adapter
 
-Use `gjc setup hermes` to render or install a portable Hermes MCP setup package:
+Use `gjc setup hermes` to render or install a portable MCP setup package for any controller that accepts Hermes-compatible MCP config:
 
 ```bash
 gjc setup hermes --root /path/to/repo --profile my-bot --repo gajae-code
@@ -103,7 +103,7 @@ Artifact reads are canonicalized, symlink escapes are rejected, and returned con
 Use namespace variables to prevent cross-profile or cross-repo enumeration:
 
 ```bash
-export GJC_COORDINATOR_MCP_PROFILE="meeseeks2"
+export GJC_COORDINATOR_MCP_PROFILE="team-a"
 export GJC_COORDINATOR_MCP_REPO="gajae-code"
 ```
 
@@ -134,10 +134,10 @@ Mutating tools:
 - `gjc_coordinator_report_status`
 
 
-`gjc_coordinator_register_session` registers an existing visible tmux-backed GJC pane as the coordinator-authoritative session. Use it when an operator has already launched a visible Warp/tmux lane and Hermes must send prompts to that same pane instead of creating a hidden `gjc-coordinator-*` session. The tool validates the workdir allowlist, safe session/target tokens, and tmux target liveness before writing session state.
+`gjc_coordinator_register_session` registers an existing visible tmux-backed GJC pane as the coordinator-authoritative session. Use it when an operator has already launched a visible terminal/tmux lane and the external coordinator must send prompts to that same pane instead of creating a hidden `gjc-coordinator-*` session. The tool validates the workdir allowlist, safe session/target tokens, and tmux target liveness before writing session state.
 ## Turn orchestration flow
 
-Hermes coordinators should treat turns, not terminal scrollback, as the unit of work:
+External coordinators should treat turns, not terminal scrollback, as the unit of work:
 
 1. Call `gjc_coordinator_start_session` with `allow_mutation: true`.
 2. Call `gjc_coordinator_send_prompt` with `allow_mutation: true`.
@@ -145,6 +145,7 @@ Hermes coordinators should treat turns, not terminal scrollback, as the unit of 
 4. Poll `gjc_coordinator_read_turn`, or call bounded `gjc_coordinator_await_turn`, until the turn is terminal.
 5. If `gjc_coordinator_list_questions` shows a question for that turn, answer with `gjc_coordinator_submit_question_answer`.
 6. Use `gjc_coordinator_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
+   Use `status: "cancelled"` for coordinator-policy cancellation, and `status: "failed"` plus `blocker` for provider/tool/task failures.
 
 `gjc_coordinator_send_prompt` preserves the legacy `queued` and `delivered` fields and adds turn fields:
 
@@ -161,6 +162,7 @@ Hermes coordinators should treat turns, not terminal scrollback, as the unit of 
 ```
 
 A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable and the next queued turn is promoted when the active turn reaches a terminal `gjc_coordinator_report_status`. Force supersedes the previous active turn and audits that state in the turn journal.
+Coordinator cancellation is recorded through `gjc_coordinator_report_status` with terminal `status: "cancelled"`; this updates durable turn state but does not kill the underlying tmux process. If the correct policy is replacement work rather than cancellation, send the replacement prompt with `force: true` so the previous active turn is superseded and audited.
 
 `gjc_coordinator_read_turn` returns the authoritative durable turn plus advisory pane status:
 
@@ -206,7 +208,8 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
 `gjc_coordinator_watch_events` is a bounded long-poll MCP tool, not an unbounded stream. Inputs are `after_seq` (default `0`), optional `session_id`, optional `event_types`, `timeout_ms` capped at 30000, and `limit` capped at 100. If matching events already exist after `after_seq`, it returns immediately. Otherwise it waits for the event journal to change or for timeout. The response includes `events`, `latest_seq`, `timed_out`, and `transport: { "mcp": "long_poll", "push_subscriptions": false }`, so coordinators can persist `latest_seq` and resume safely after restart.
 
 `gjc_coordinator_read_coordination_status` keeps its existing report fields and now also includes `latest_event_seq` plus recent event summaries for snapshot-style consumers.
-## Hermes config snippet
+
+## Generic controller config snippet
 
 ```json
 {
@@ -215,10 +218,10 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
       "command": "gjc",
       "args": ["mcp-serve", "coordinator"],
       "env": {
-        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "/home/doyun/src/gajae-code",
-        "GJC_COORDINATOR_MCP_PROFILE": "meeseeks2",
-        "GJC_COORDINATOR_MCP_REPO": "gajae-code",
-        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "/home/doyun/.local/bin/gjc-dev-meeseeks2"
+        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "/path/to/repo",
+        "GJC_COORDINATOR_MCP_PROFILE": "team-a",
+        "GJC_COORDINATOR_MCP_REPO": "project",
+        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "gjc --worktree"
       },
       "enabled": true
     }

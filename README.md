@@ -136,16 +136,17 @@ And four bundled role agents:
 
 No sprawling default skill zoo: GJC improves by making this small method better.
 
-## Works beside your existing agent
+## Works beside your existing agent or bot
 
-| Tool        | Recommended GJC command                        | Boundary                                               |
-| ----------- | ---------------------------------------------- | ------------------------------------------------------ |
-| Codex CLI   | `gjc --tmux --worktree <name>` or `gjc`        | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
-| Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension.           |
-| OpenCode    | `gjc` or `gjc --tmux`                          | External-runner workflow only today.                   |
-| Claw Code   | `gjc --tmux --worktree <name>`                 | GJC does not install into or replace Claw Code.        |
+| Tool or bot | Recommended GJC command | Boundary |
+| ----------- | ----------------------- | -------- |
+| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
+| Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
+| OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
+| Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
+| External controller / bot | `gjc mcp-serve coordinator` plus `gjc setup hermes` for compatible config, or `gjc --mode rpc` for a subprocess worker | Any MCP/RPC-capable bot drives GJC through the generic coordinator/RPC contract, not scrollback scraping. |
 
-For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). For the Gajae Remote thin phone steering wheel design (v0), see [`docs/gajae-remote.md`](docs/gajae-remote.md).
+For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), [`docs/bridge.md`](docs/bridge.md), and [`docs/gajae-remote.md`](docs/gajae-remote.md).
 
 ## Configuration
 
