@@ -227,7 +227,11 @@ async function persistActiveRunId(
 	}
 	let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 
-	const nextPhase = advanceCurrentPhase(existing.current_phase, stage);
+	// A new run_id is a fresh run, not a stray write on the prior run: never inherit a
+	// previous run's terminal/locked phase (which would start the new run already
+	// "complete"/"handoff" and disarm the Stop hook). PHASE_LOCK only guards same-run writes.
+	const isNewRun = existing.run_id !== runId;
+	const nextPhase = isNewRun ? stage : advanceCurrentPhase(existing.current_phase, stage);
 	if (
 		existing.run_id === runId &&
 		existing.version === WORKFLOW_STATE_VERSION &&
@@ -237,7 +241,9 @@ async function persistActiveRunId(
 	}
 	existing.run_id = runId;
 	if (typeof existing.skill !== "string") existing.skill = "ralplan";
-	if (typeof existing.active !== "boolean") existing.active = true;
+	// A successful persist means ralplan is actively writing this run's artifacts, so always
+	// re-assert active. Fallback-only init left active:false after a clear (#644, sibling of #638).
+	existing.active = true;
 	existing.current_phase = nextPhase;
 	existing = migrateWorkflowState(existing, "ralplan").state;
 	existing.updated_at = new Date().toISOString();

@@ -829,3 +829,54 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 		expect(result.stderr).toContain("missing value for --planner-id");
 	});
 });
+
+describe("native gjc ralplan runtime — post-clear re-activation (#644)", () => {
+	const readState = async (root: string): Promise<{ active?: unknown; current_phase?: unknown; run_id?: unknown }> => {
+		const raw = await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8");
+		return JSON.parse(raw);
+	};
+
+	it("re-asserts active:true and resets phase out of terminal lock when a new run_id is written after a clear", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const seeded = await readState(root);
+		expect(seeded.active).toBe(true);
+
+		// Simulate `gjc state ralplan clear`: active -> false, phase -> complete.
+		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+
+		// A subsequent --write with a NEW run_id starts a fresh run and must re-arm the skill.
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "new-run-after-clear"],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.run_id).toBe("new-run-after-clear");
+		expect(after.active).toBe(true);
+		expect(after.current_phase).toBe("planner");
+	});
+
+	it("does not re-arm a cleared run on a stray same-run-id --write (demote-on-clear preserved)", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const seeded = await readState(root);
+		const seededRunId = seeded.run_id as string;
+
+		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+
+		// A stray --write reusing the SAME (cleared) run_id must not silently re-arm a finished run.
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", seededRunId],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.active).toBe(false);
+		expect(after.current_phase).toBe("complete");
+	});
+});
