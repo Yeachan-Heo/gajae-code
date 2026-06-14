@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `GJC_CREDENTIAL_RANKING_MODE` env var (`balanced` (default) | `earliest-reset`), wired through `discoverAuthStorage` into `AuthStorage.credentialRankingMode`. `earliest-reset` selects multi-account OAuth credentials earliest-expiry-first so soon-to-reset tumbling-window quota (e.g. Claude 5h/7d) is drained before it is lost at reset; unset/unknown leaves the default `balanced` behavior unchanged.
+
 ## [0.5.1] - 2026-06-14
 
 ### Added

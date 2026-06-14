@@ -288,9 +288,27 @@ export interface CredentialDisabledEvent {
 	disabledCause: string;
 }
 
+/**
+ * How {@link AuthStorage} orders multiple healthy OAuth credentials of the same
+ * provider:type pool when selecting one for a (new) session.
+ *
+ * - `balanced` (default): prefer the least-used / lowest-drain-rate account.
+ *   Spreads load across accounts and keeps burst headroom on every account.
+ * - `earliest-reset`: prefer the non-blocked account whose usage window resets
+ *   soonest (earliest-expiry-first). Tumbling-window quota is perishable —
+ *   unused quota is lost at reset — so draining the soonest-to-reset account
+ *   first minimizes wasted quota. Drain/used metrics remain tiebreakers.
+ *
+ * Only affects ranking, which the `shouldRank` guard already limits to session
+ * start (or when the session's preferred credential is blocked), so this never
+ * thrashes accounts mid-session / cold-starts the server-side prompt cache.
+ */
+export type CredentialRankingMode = "balanced" | "earliest-reset";
+
 export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
+	credentialRankingMode?: CredentialRankingMode;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -655,6 +673,7 @@ export class AuthStorage {
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#usageFetch: typeof fetch;
 	#usageRequestTimeoutMs: number;
+	#credentialRankingMode: CredentialRankingMode = "balanced";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#store: AuthCredentialStore;
@@ -686,6 +705,7 @@ export class AuthStorage {
 		this.#usageCache = new AuthStorageUsageCache(this.#store);
 		this.#usageFetch = options.usageFetch ?? fetch;
 		this.#usageRequestTimeoutMs = options.usageRequestTimeoutMs ?? DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
+		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
 		this.#sourceLabel = options.sourceLabel;
@@ -2453,6 +2473,7 @@ export class AuthStorage {
 			secondaryDrainRate: number;
 			primaryUsed: number;
 			primaryDrainRate: number;
+			resetAtMs: number;
 			orderPos: number;
 		}> = [];
 		// Pre-fetch usage reports in parallel for non-blocked credentials.
@@ -2522,6 +2543,10 @@ export class AuthStorage {
 				),
 				primaryUsed: this.#normalizeUsageFraction(primary),
 				primaryDrainRate: this.#computeWindowDrainRate(primary, nowMs, strategy.windowDefaults.primaryMs),
+				resetAtMs:
+					this.#resolveWindowResetAt(primary?.window) ??
+					this.#resolveWindowResetAt(secondary?.window) ??
+					Number.POSITIVE_INFINITY,
 				orderPos,
 			});
 		}
@@ -2539,6 +2564,11 @@ export class AuthStorage {
 				if (leftPlanPriority !== rightPlanPriority) return leftPlanPriority - rightPlanPriority;
 			}
 			if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
+			if (this.#credentialRankingMode === "earliest-reset" && left.resetAtMs !== right.resetAtMs) {
+				// Earliest-expiry-first: drain the soonest-to-reset account before
+				// its perishable tumbling-window quota is lost at reset.
+				return left.resetAtMs - right.resetAtMs;
+			}
 			if (left.secondaryDrainRate !== right.secondaryDrainRate)
 				return left.secondaryDrainRate - right.secondaryDrainRate;
 			if (left.secondaryUsed !== right.secondaryUsed) return left.secondaryUsed - right.secondaryUsed;
