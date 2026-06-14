@@ -116,7 +116,7 @@ describe("default launch worktrees", () => {
 	});
 
 	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {
-		const repo = await createRepo("gjc-launch-nested-source-worktree-");
+		const repo = await fs.realpath(await createRepo("gjc-launch-nested-source-worktree-"));
 		const first = prepareLaunchWorktree(repo, ["--worktree"]);
 		expect(first.worktree.enabled && first.worktree.created).toBe(true);
 
