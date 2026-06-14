@@ -829,8 +829,7 @@ export class ModelSelectorComponent extends Container {
 			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
-			const profileMarker =
-				row.profile.name === this.#activeModelProfileName ? theme.fg("accent", " ● in use") : "";
+			const profileMarker = row.profile.name === this.#activeModelProfileName ? theme.fg("accent", " ● in use") : "";
 			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${profileMarker}`, 0, 0));
 		}
 		if (this.#presetLoginHint) {
