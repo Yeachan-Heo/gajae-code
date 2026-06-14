@@ -100,6 +100,95 @@ export function buildDeepInterviewHudSummary(state: DeepInterviewHudState): Work
 	};
 }
 
+export interface DeepInterviewHudDeriveOptions {
+	phase?: string;
+	specStatus?: string;
+	updatedAt?: string;
+}
+
+function diIsPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function latestScoredAmbiguity(rounds: unknown): number | undefined {
+	if (!Array.isArray(rounds)) return undefined;
+	for (let index = rounds.length - 1; index >= 0; index--) {
+		const round = rounds[index];
+		if (diIsPlainObject(round) && round.lifecycle === "scored" && typeof round.ambiguity === "number") {
+			return round.ambiguity;
+		}
+	}
+	return undefined;
+}
+
+function weakestDimensionFromTopology(
+	topology: Record<string, unknown>,
+	targetComponent: string | undefined,
+): string | undefined {
+	if (!Array.isArray(topology.components)) return undefined;
+	const components = topology.components.filter(diIsPlainObject);
+	const dimensionOf = (component: Record<string, unknown>): string | undefined =>
+		typeof component.weakest_dimension === "string" && component.weakest_dimension.trim()
+			? component.weakest_dimension
+			: undefined;
+	if (targetComponent) {
+		const targeted = components.find(component => component.id === targetComponent && dimensionOf(component));
+		if (targeted) return dimensionOf(targeted);
+	}
+	const active = components.find(component => component.status !== "deferred" && dimensionOf(component));
+	if (active) return dimensionOf(active);
+	const any = components.find(component => dimensionOf(component));
+	return any ? dimensionOf(any) : undefined;
+}
+
+/**
+ * Single source of deep-interview HUD derivation. Reads a complete (normalized)
+ * mode-state envelope so recorder, `gjc state write`, reconcile, seed, and handoff
+ * all produce identical chips. Topology-aware `target`/`weakest` come from
+ * `state.topology`; `legacy_missing` topology omits those chips (no synthetic values).
+ */
+export function deriveDeepInterviewHud(
+	payload: Record<string, unknown>,
+	options: DeepInterviewHudDeriveOptions = {},
+): WorkflowHudSummary {
+	const stateField = diIsPlainObject(payload.state) ? payload.state : {};
+	const isNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+	const isArray = (value: unknown): value is unknown[] => Array.isArray(value);
+	const pick = <T>(key: string, guard: (value: unknown) => value is T): T | undefined => {
+		const value = stateField[key] ?? payload[key];
+		return guard(value) ? value : undefined;
+	};
+
+	const phase = options.phase ?? (typeof payload.current_phase === "string" ? payload.current_phase : undefined);
+	const rounds = pick("rounds", isArray);
+	const ambiguity = pick("current_ambiguity", isNumber) ?? latestScoredAmbiguity(rounds);
+	const threshold = pick("threshold", isNumber);
+	const rawTopology = diIsPlainObject(stateField.topology)
+		? stateField.topology
+		: diIsPlainObject(payload.topology)
+			? payload.topology
+			: undefined;
+	// `legacy_missing` topology was never confirmed: omit target/weakest even if stale fields linger.
+	const topology = rawTopology && rawTopology.status !== "legacy_missing" ? rawTopology : undefined;
+	const targetComponent =
+		topology && typeof topology.last_targeted_component_id === "string"
+			? topology.last_targeted_component_id
+			: undefined;
+	const weakestDimension = topology ? weakestDimensionFromTopology(topology, targetComponent) : undefined;
+	const specStatus = options.specStatus ?? (typeof payload.spec_status === "string" ? payload.spec_status : undefined);
+
+	return buildDeepInterviewHudSummary({
+		phase,
+		ambiguity,
+		threshold,
+		roundCount: rounds?.length,
+		targetComponent,
+		weakestDimension,
+		specStatus,
+		updatedAt: options.updatedAt ?? new Date().toISOString(),
+	});
+}
+
 export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSummary {
 	const verdict = state.verdict?.toUpperCase();
 	const verdictSeverity =

@@ -11,10 +11,10 @@ import {
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 import {
-	buildDeepInterviewHudSummary,
 	buildRalplanHudSummary,
 	buildTeamHudSummary,
 	buildUltragoalHudSummary,
+	deriveDeepInterviewHud,
 } from "../skill-state/workflow-hud";
 import {
 	type AuditEntry,
@@ -26,6 +26,7 @@ import {
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
+import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
 import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState, migrateWorkflowState } from "./state-migrations";
 import {
@@ -833,31 +834,9 @@ function buildHudForMode(
 ): WorkflowHudSummary | undefined {
 	const updatedAt = new Date().toISOString();
 	const phase = typeof payload.current_phase === "string" ? payload.current_phase : undefined;
-	const stateField = isPlainObject(payload.state) ? (payload.state as Record<string, unknown>) : {};
 	switch (mode) {
-		case "deep-interview": {
-			const pick = <T>(key: string, guard: (value: unknown) => value is T): T | undefined => {
-				const v = (stateField as Record<string, unknown>)[key] ?? (payload as Record<string, unknown>)[key];
-				return guard(v) ? v : undefined;
-			};
-			const isNumber = (v: unknown): v is number => typeof v === "number";
-			const isString = (v: unknown): v is string => typeof v === "string";
-			const isArray = (v: unknown): v is unknown[] => Array.isArray(v);
-			const ambiguity = pick("current_ambiguity", isNumber);
-			const threshold = pick("threshold", isNumber);
-			const rounds = pick("rounds", isArray);
-			const targetComponent = pick("last_targeted_component_id", isString);
-			const weakestDimension = pick("weakest_dimension", isString);
-			return buildDeepInterviewHudSummary({
-				phase,
-				ambiguity,
-				threshold,
-				roundCount: rounds?.length,
-				targetComponent,
-				weakestDimension,
-				updatedAt,
-			});
-		}
+		case "deep-interview":
+			return deriveDeepInterviewHud(payload, { updatedAt });
 		case "ralplan": {
 			const stage =
 				typeof payload.current_phase === "string"
@@ -1009,7 +988,10 @@ export async function reconcileWorkflowSkillState(options: {
 	receipt.from_phase = fromPhase;
 	receipt.to_phase = trimmedPhase;
 
-	const merged = mergeWithNullDelete(existingPayload, payload);
+	const merged =
+		mode === "deep-interview"
+			? (mergeDeepInterviewEnvelope(existingPayload, payload) as Record<string, unknown>)
+			: mergeWithNullDelete(existingPayload, payload);
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
 	merged.active = active;
@@ -1173,7 +1155,11 @@ async function handleWrite(
 					? (innerState.current_phase as string).trim()
 					: undefined;
 	let merged: Record<string, unknown>;
-	if (hasFlag(args, "--replace")) {
+	if (mode === "deep-interview") {
+		// Deep-interview keeps interview data nested under `state` and merges rounds
+		// losslessly by durable key; never flatten or delete `state` (that drops recorder history).
+		merged = mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") });
+	} else if (hasFlag(args, "--replace")) {
 		merged = { ...payload };
 	} else {
 		merged = mergeWithNullDelete(existingPayload, payload);
@@ -1423,8 +1409,20 @@ async function handleHandoff(
 	});
 
 	const calleeInitial = initialPhaseForSkill(callee);
-	const normalizedCaller = migrateWorkflowState(existingCaller, caller).state;
-	const normalizedCallee = migrateWorkflowState(existingCallee, callee).state;
+	const normalizedCaller =
+		caller === "deep-interview"
+			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
+					string,
+					unknown
+				>)
+			: migrateWorkflowState(existingCaller, caller).state;
+	const normalizedCallee =
+		callee === "deep-interview"
+			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCallee, callee).state) as Record<
+					string,
+					unknown
+				>)
+			: migrateWorkflowState(existingCallee, callee).state;
 	const mergedCalleeState: Record<string, unknown> = {
 		...normalizedCallee,
 		skill: callee,

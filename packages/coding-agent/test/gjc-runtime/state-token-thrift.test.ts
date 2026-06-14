@@ -52,7 +52,7 @@ describe("GJC state token thrift", () => {
 		expect(compactJson.status).toBe(0);
 		const parsedCompact = JSON.parse(compactJson.stdout ?? "{}");
 		expect(parsedCompact.rounds).toBeUndefined();
-		expect(parsedCompact.elided.rounds).toEqual({ type: "array", count: 2, pointer: "/rounds" });
+		expect(parsedCompact.elided.rounds).toEqual({ type: "array", count: 2, pointer: "/state/rounds" });
 
 		const json = await runNativeStateCommand(
 			["read", "--mode", "deep-interview", "--session-id", "", "--json"],
@@ -62,7 +62,7 @@ describe("GJC state token thrift", () => {
 		const parsed = JSON.parse(json.stdout ?? "{}");
 		const raw = await readWorkflowStateJson(root, "deep-interview");
 		expect(parsed.state).toEqual(raw);
-		expect(parsed.state.rounds).toEqual(payload.rounds);
+		expect(parsed.state.state.rounds).toEqual(payload.rounds);
 	});
 
 	it("projects requested fields in requested order", async () => {

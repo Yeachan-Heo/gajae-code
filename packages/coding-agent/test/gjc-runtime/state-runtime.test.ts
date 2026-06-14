@@ -77,7 +77,7 @@ describe("native gjc state runtime", () => {
 
 		expect(result.status).toBe(0);
 		const parsed = envelopeState(result.stdout);
-		expect(parsed.interview_id).toBe("abc");
+		expect((parsed.state as Record<string, unknown>).interview_id).toBe("abc");
 	});
 
 	it("prefers CLI --mode over --input payload mode", async () => {
@@ -137,9 +137,9 @@ describe("native gjc state runtime", () => {
 		const merged = JSON.parse(
 			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
 		);
-		expect(merged.current_ambiguity).toBe(0.5);
-		expect(merged.threshold_source).toBe("user");
-		expect(merged.interview_id).toBe("abc");
+		expect(merged.state.current_ambiguity).toBe(0.5);
+		expect(merged.state.threshold_source).toBe("user");
+		expect(merged.state.interview_id).toBe("abc");
 	});
 
 	it("deletes a key when the payload value is null", async () => {

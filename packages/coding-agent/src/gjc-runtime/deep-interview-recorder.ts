@@ -1,6 +1,19 @@
-import { createHash } from "node:crypto";
+import { syncSkillActiveState } from "../skill-state/active-state";
+import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import {
+	answerHash,
+	type DeepInterviewEstablishedFact,
+	type DeepInterviewRoundRecord,
+	type DeepInterviewStateEnvelope,
+	type DeepInterviewTriggerMetadata,
+	deriveRoundKey,
+	normalizeDeepInterviewEnvelope,
+	questionHash,
+} from "./deep-interview-state";
 import { readExistingStateForMutation, writeWorkflowEnvelopeAtomic } from "./state-writer";
+
+export * from "./deep-interview-state";
 
 /**
  * Runtime-owned deep-interview round recorder (conflict-aware scoring support).
@@ -16,60 +29,6 @@ import { readExistingStateForMutation, writeWorkflowEnvelopeAtomic } from "./sta
 // =============================================================================
 // Domain types
 // =============================================================================
-
-export type DeepInterviewRoundLifecycle = "answered" | "pending_scoring" | "scored";
-
-export type DeepInterviewTriggerKind = "A" | "B" | "C" | "D";
-
-/** `active` triggers must satisfy the bidirectional invariant; disputed/unresolved are exempt with rationale. */
-export type DeepInterviewTriggerStatus = "active" | "disputed" | "unresolved";
-
-export interface DeepInterviewEstablishedFact {
-	id: string;
-	statement: string;
-	round: number;
-	component?: string;
-	dimension?: string;
-	evidence?: string;
-	disputed: boolean;
-}
-
-export interface DeepInterviewTriggerMetadata {
-	kind: DeepInterviewTriggerKind;
-	name: string;
-	status: DeepInterviewTriggerStatus;
-	component: string;
-	dimension: string;
-	priorDimensionScore?: number;
-	newDimensionScore?: number;
-	priorAmbiguity?: number;
-	newAmbiguity?: number;
-	evidence?: string;
-	contradictedFactId?: string;
-	/** Required when status is `disputed` or `unresolved` to exempt the invariant. */
-	rationale?: string;
-}
-
-export interface DeepInterviewRoundRecord {
-	round_key: string;
-	round_id?: string;
-	round: number;
-	question_id?: string;
-	question_text?: string;
-	question_hash: string;
-	answer_hash: string;
-	selected_options?: string[];
-	custom_input?: string;
-	component?: string;
-	dimension?: string;
-	ambiguity_at_ask?: number;
-	lifecycle: DeepInterviewRoundLifecycle;
-	answered_at: string;
-	scored_at?: string;
-	scores?: Record<string, number>;
-	ambiguity?: number;
-	triggers?: DeepInterviewTriggerMetadata[];
-}
 
 export interface DeepInterviewAnswerInput {
 	interviewId?: string;
@@ -116,37 +75,6 @@ export interface DeepInterviewCompactState {
 export interface TransitionValidationResult {
 	ok: boolean;
 	violations: string[];
-}
-
-// =============================================================================
-// Pure helpers: identity + hashing
-// =============================================================================
-
-export function hashContent(value: string): string {
-	return createHash("sha256").update(value).digest("hex").slice(0, 32);
-}
-
-export function questionHash(questionText: string): string {
-	return hashContent(questionText);
-}
-
-export function answerHash(selectedOptions: string[] | undefined, customInput: string | undefined): string {
-	return hashContent(JSON.stringify({ selected: selectedOptions ?? [], custom: customInput ?? null }));
-}
-
-/**
- * Durable round identity. Prefer `interview_id + round_id`; fall back to
- * `interview_id + round + question.id` when no caller-supplied `round_id` exists.
- */
-export function deriveRoundKey(
-	interviewId: string | undefined,
-	input: { round_id?: string; round: number; questionId?: string },
-): string {
-	const interview = interviewId && interviewId.trim() !== "" ? interviewId : "nointerview";
-	if (input.round_id && input.round_id.trim() !== "") {
-		return `${interview}::rid:${input.round_id}`;
-	}
-	return `${interview}::r:${input.round}::q:${input.questionId ?? "noqid"}`;
 }
 
 // =============================================================================
@@ -296,26 +224,9 @@ export function validateDeepInterviewScoredTransition(
 // Pure helper: state-shape migration + compact projection
 // =============================================================================
 
-interface DeepInterviewStateEnvelope {
-	threshold?: number;
-	threshold_source?: string;
-	state?: Record<string, unknown>;
-	[key: string]: unknown;
-}
-
-/**
- * Default new fields for legacy state written before conflict-aware scoring.
- * Returns a shallow-cloned envelope safe to mutate; never deletes existing fields.
- */
+/** Back-compat wrapper: normalize a deep-interview envelope to its canonical nested shape. */
 export function ensureDeepInterviewStateShape(value: unknown): DeepInterviewStateEnvelope {
-	const envelope: DeepInterviewStateEnvelope =
-		value && typeof value === "object" && !Array.isArray(value) ? { ...(value as DeepInterviewStateEnvelope) } : {};
-	const inner =
-		envelope.state && typeof envelope.state === "object" ? { ...(envelope.state as Record<string, unknown>) } : {};
-	if (!Array.isArray(inner.rounds)) inner.rounds = [];
-	if (!Array.isArray(inner.established_facts)) inner.established_facts = [];
-	envelope.state = inner;
-	return envelope;
+	return normalizeDeepInterviewEnvelope(value);
 }
 
 function readRounds(envelope: DeepInterviewStateEnvelope): DeepInterviewRoundRecord[] {
@@ -400,7 +311,7 @@ async function persistEnvelope(
 	command: string,
 ): Promise<void> {
 	const now = new Date().toISOString();
-	const payload: Record<string, unknown> = { ...envelope, updated_at: now };
+	const payload: Record<string, unknown> = { ...normalizeDeepInterviewEnvelope(envelope), updated_at: now };
 	// Guarantee RequiredOnWriteEnvelopeSchema fields for the fresh/absent fallback;
 	// existing real state already carries these and is preserved by the spread above.
 	payload.skill ??= "deep-interview";
@@ -412,6 +323,47 @@ async function persistEnvelope(
 		receipt: { cwd, skill: "deep-interview", owner: "gjc-runtime", command, sessionId, nowIso: now },
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
 	});
+}
+
+/**
+ * Best-effort active-state/HUD cache refresh for the deep-interview rail, derived
+ * from the complete normalized mode-state envelope. HUD is a cache; a failure here
+ * must never change durable record semantics.
+ */
+async function syncRecorderHud(
+	cwd: string,
+	envelope: DeepInterviewStateEnvelope,
+	sessionId: string | undefined,
+): Promise<void> {
+	try {
+		const phase = typeof envelope.current_phase === "string" ? envelope.current_phase : "interviewing";
+		await syncSkillActiveState({
+			cwd,
+			skill: "deep-interview",
+			active: phase !== "complete",
+			phase,
+			sessionId,
+			source: "gjc-runtime-deep-interview-recorder",
+			hud: deriveDeepInterviewHud(envelope as Record<string, unknown>, { phase }),
+		});
+	} catch {
+		// HUD sync is best-effort cache maintenance and must not change record semantics.
+	}
+}
+
+/**
+ * Repair the cached HUD after a no-op append. A no-op writes no mode-state, so the
+ * HUD is derived from a fresh read of the current persisted state (never from the
+ * pre-noop in-memory envelope) to avoid overwriting newer active-state with stale values.
+ */
+async function repairRecorderHudFromPersisted(
+	cwd: string,
+	statePath: string,
+	sessionId: string | undefined,
+): Promise<void> {
+	const read = await readExistingStateForMutation(statePath);
+	if (read.kind !== "valid") return;
+	await syncRecorderHud(cwd, normalizeDeepInterviewEnvelope(read.value), sessionId);
 }
 
 /** Record an `answered` shell for one round (append-or-merge by durable key). */
@@ -426,9 +378,13 @@ export async function appendOrMergeDeepInterviewRound(
 	const shell = buildAnswerShell({ ...input, interviewId });
 	const rounds = readRounds(envelope);
 	const result = appendOrMergeRound(rounds, shell);
-	if (result.action === "noop") return { action: result.action, record: result.record };
+	if (result.action === "noop") {
+		await repairRecorderHudFromPersisted(cwd, statePath, options.sessionId);
+		return { action: result.action, record: result.record };
+	}
 	(envelope.state as Record<string, unknown>).rounds = result.rounds;
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview record-answer");
+	await syncRecorderHud(cwd, envelope, options.sessionId);
 	return { action: result.action, record: result.record };
 }
 
@@ -446,6 +402,7 @@ export async function enrichDeepInterviewRoundScoring(
 	(envelope.state as Record<string, unknown>).rounds = nextRounds;
 	(envelope.state as Record<string, unknown>).current_ambiguity = input.ambiguity;
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview score-round");
+	await syncRecorderHud(cwd, envelope, options.sessionId);
 	return { record };
 }
 

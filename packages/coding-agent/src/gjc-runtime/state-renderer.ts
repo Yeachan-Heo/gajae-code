@@ -118,8 +118,13 @@ export interface StateStatusSummary {
 
 function compactStateFields(state: Record<string, unknown>): Array<[string, string]> {
 	const fields: Array<[string, string]> = [];
+	const nested = isRecord(state.state) ? state.state : undefined;
 	for (const key of COMPACT_ELIDE_KEYS) {
-		const value = state[key];
+		const value = Array.isArray(state[key])
+			? state[key]
+			: nested && Array.isArray(nested[key])
+				? nested[key]
+				: undefined;
 		if (Array.isArray(value)) fields.push([key, `${value.length} entries (elided)`]);
 	}
 	return fields;
@@ -133,9 +138,13 @@ export function compactProjectStateJson(
 	const state = stateObject(stateJson);
 	const compact = projectStateFields(skill, stateJson, manifest, STATE_FIELD_ALLOWLIST);
 	const elisions: Record<string, unknown> = {};
+	const nested = isRecord(state.state) ? state.state : undefined;
 	for (const key of COMPACT_ELIDE_KEYS) {
-		const value = state[key];
-		if (Array.isArray(value)) elisions[key] = { type: "array", count: value.length, pointer: `/${key}` };
+		if (Array.isArray(state[key])) {
+			elisions[key] = { type: "array", count: (state[key] as unknown[]).length, pointer: `/${key}` };
+		} else if (nested && Array.isArray(nested[key])) {
+			elisions[key] = { type: "array", count: (nested[key] as unknown[]).length, pointer: `/state/${key}` };
+		}
 	}
 	if (Object.keys(elisions).length) compact.elided = elisions;
 	return compact;

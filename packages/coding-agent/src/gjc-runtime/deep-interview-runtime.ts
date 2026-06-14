@@ -3,8 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
-import { buildDeepInterviewHudSummary } from "../skill-state/workflow-hud";
+import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { normalizeDeepInterviewEnvelope } from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
@@ -415,7 +416,7 @@ export async function persistDeepInterviewSpec(
 		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview" } },
 	);
 
-	const payload: Record<string, unknown> = {
+	const payload = normalizeDeepInterviewEnvelope({
 		...existing,
 		active: true,
 		current_phase: "handoff",
@@ -427,7 +428,7 @@ export async function persistDeepInterviewSpec(
 		spec_stage: resolved.stage,
 		spec_persisted_at: createdAt,
 		updated_at: createdAt,
-	};
+	}) as Record<string, unknown>;
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
 	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
@@ -450,6 +451,7 @@ export async function persistDeepInterviewSpec(
 	await syncDeepInterviewHud({
 		cwd,
 		sessionId: resolved.sessionId,
+		payload,
 		phase: "handoff",
 		specStatus: "persisted",
 	});
@@ -502,34 +504,29 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
 	});
+	await syncDeepInterviewHud({ cwd, sessionId: resolved.sessionId, payload, phase: "interviewing" });
 	return statePath;
 }
 
 async function syncDeepInterviewHud(options: {
 	cwd: string;
 	sessionId?: string;
-	phase: string;
-	ambiguity?: number;
-	threshold?: number;
-	roundCount?: number;
+	payload: Record<string, unknown>;
+	phase?: string;
 	specStatus?: string;
 }): Promise<void> {
 	try {
+		const phase =
+			options.phase ??
+			(typeof options.payload.current_phase === "string" ? options.payload.current_phase : "interviewing");
 		await syncSkillActiveState({
 			cwd: options.cwd,
 			skill: "deep-interview",
-			active: options.phase !== "complete",
-			phase: options.phase,
+			active: phase !== "complete",
+			phase,
 			sessionId: options.sessionId,
 			source: "gjc-deep-interview-native",
-			hud: buildDeepInterviewHudSummary({
-				phase: options.phase,
-				ambiguity: options.ambiguity,
-				threshold: options.threshold,
-				roundCount: options.roundCount,
-				specStatus: options.specStatus,
-				updatedAt: new Date().toISOString(),
-			}),
+			hud: deriveDeepInterviewHud(options.payload, { phase, specStatus: options.specStatus }),
 		});
 	} catch {
 		// HUD sync is best-effort and must not change command semantics.
@@ -614,14 +611,6 @@ export async function runNativeDeepInterviewCommand(
 			);
 		}
 		const statePath = await seedDeepInterviewState(cwd, resolved);
-		await syncDeepInterviewHud({
-			cwd,
-			sessionId: resolved.sessionId,
-			phase: "interviewing",
-			ambiguity: 1,
-			threshold: resolved.threshold,
-			roundCount: 0,
-		});
 
 		const summary = {
 			skill: "deep-interview",

@@ -231,9 +231,9 @@ describe("gjc state write hardening", () => {
 		const onDisk = JSON.parse(
 			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
 		);
-		expect(onDisk.rounds).toEqual(extension.rounds);
-		expect(onDisk.topology).toEqual(extension.topology);
-		expect(onDisk.ontology_snapshots).toEqual(extension.ontology_snapshots);
+		expect(onDisk.state.rounds).toEqual(extension.rounds);
+		expect(onDisk.state.topology).toEqual(extension.topology);
+		expect(onDisk.state.ontology_snapshots).toEqual(extension.ontology_snapshots);
 		expect(onDisk.architect_findings).toEqual(extension.architect_findings);
 		expect(onDisk.new_requirements).toEqual(extension.new_requirements);
 		expect(onDisk.ci_gates).toEqual(extension.ci_gates);
