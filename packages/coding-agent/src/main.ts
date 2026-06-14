@@ -975,7 +975,9 @@ export async function runRootCommand(
 
 		if (mode === "rpc" || mode === "rpc-ui") {
 			const { runRpcMode } = await import("./modes/rpc/rpc-mode");
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined);
+			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, {
+				listen: parsedArgs.rpcListen,
+			});
 		} else if (mode === "bridge") {
 			const { runBridgeMode } = await import("./modes/bridge/bridge-mode");
 			await runBridgeMode(session, setToolUIContext);

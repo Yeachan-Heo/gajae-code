@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 
-export type RpcSessionTransport = "stdio" | "bridge";
+export type RpcSessionTransport = "stdio" | "bridge" | "socket";
 
 export interface RpcSessionRecord {
 	sessionId: string;

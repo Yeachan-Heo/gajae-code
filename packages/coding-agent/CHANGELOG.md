@@ -5,6 +5,7 @@
 ### Added
 
 - `gjc --mode rpc` registers each live session in a cross-process registry (`<agent-dir>/rpc-sessions/<id>.json`) on start and removes it on shutdown, so other processes can enumerate running RPC sessions. The Python `gjc_rpc` client exposes `list_sessions()` / `RpcClient.list_sessions()` returning typed `SessionHandle`s and reaps records whose owning process is gone (issue 10; foundation for reattach/issue 09).
+- `gjc --mode rpc --listen <socket-path>` runs a persistent Unix-domain-socket RPC server: the `AgentSession` outlives client disconnects (no stdin-EOF teardown) and a client can disconnect and reconnect to the same live session over the socket. The session is registered with `transport: "socket"` and the socket path as its `endpoint`, so it is discoverable/attachable via the registry. The stdio path is unchanged (frame output routes through a swappable sink shared by both transports) (issue 09).
 
 ### Fixed
 
