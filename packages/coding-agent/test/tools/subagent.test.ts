@@ -545,4 +545,29 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 		await fs.rm(artifactsDir, { recursive: true, force: true });
 	});
+
+	it("freezes durationMs once a subagent completes instead of counting forever", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register("task", "quick subagent", async () => "done", {
+			id: "job-frozen",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: { id: "0-Frozen", agent: "executor", agentSource: "bundled" },
+			},
+		});
+		await manager.getJob(jobId)?.promise;
+
+		const first = await tool.execute("subagent-list", { action: "list" });
+		const d1 = first.details?.subagents[0]?.durationMs ?? -1;
+		expect(first.details?.subagents[0]?.status).toBe("completed");
+
+		await Bun.sleep(40);
+		const second = await tool.execute("subagent-list", { action: "list" });
+		const d2 = second.details?.subagents[0]?.durationMs ?? -1;
+
+		// Duration is frozen at completion, so it must not grow on a later read.
+		expect(d2).toBe(d1);
+		await manager.dispose({ timeoutMs: 100 });
+	});
 });

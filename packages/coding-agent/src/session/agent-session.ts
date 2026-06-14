@@ -322,7 +322,10 @@ function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
-export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime" | "metadata">;
+export type AsyncJobSnapshotItem = Pick<
+	AsyncJob,
+	"id" | "type" | "status" | "label" | "startTime" | "endTime" | "metadata"
+>;
 
 export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
@@ -1564,6 +1567,7 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			endTime: job.endTime,
 			metadata: job.metadata,
 		}));
 		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
@@ -1572,6 +1576,7 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			endTime: job.endTime,
 			metadata: job.metadata,
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);

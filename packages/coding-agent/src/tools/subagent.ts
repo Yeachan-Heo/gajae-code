@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager, type SubagentRecord } from "../async";
+import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentProgress, AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
@@ -608,7 +608,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			label: sanitizeText(job.label, RECEIPT_PREVIEW_WIDTH),
 			agent: subagent?.agent ?? "unknown",
 			agentSource: subagent?.agentSource ?? "bundled",
-			durationMs: Math.max(0, Date.now() - job.startTime),
+			durationMs: jobElapsedMs(job),
 			...(subagent?.description ? { description: sanitizeText(subagent.description, RECEIPT_PREVIEW_WIDTH) } : {}),
 			...(verbosity === "full" && subagent?.assignment
 				? { assignment: sanitizeText(subagent.assignment, FULL_PREVIEW_WIDTH) }

@@ -3,7 +3,7 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
+import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
@@ -257,6 +257,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			status: string;
 			label: string;
 			startTime: number;
+			endTime?: number;
 			resultText?: string;
 			errorText?: string;
 		}[],
@@ -270,7 +271,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 				type: latest.type,
 				status: latest.status as JobSnapshot["status"],
 				label: latest.label,
-				durationMs: Math.max(0, now - latest.startTime),
+				durationMs: jobElapsedMs(latest, now),
 				...(latest.resultText ? { resultText: latest.resultText } : {}),
 				...(latest.errorText ? { errorText: latest.errorText } : {}),
 			};

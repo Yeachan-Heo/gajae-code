@@ -32,7 +32,7 @@ import {
 	Snowflake,
 } from "@gajae-code/utils";
 
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
+import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "./async";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { ModelRegistry } from "./config/model-registry";
@@ -1125,7 +1125,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const formattedResult = await formatAsyncResultForFollowUp(result);
 						if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
 
-						const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
+						const durationMs = job ? jobElapsedMs(job) : undefined;
 						session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 							jobId,
 							result: formattedResult,

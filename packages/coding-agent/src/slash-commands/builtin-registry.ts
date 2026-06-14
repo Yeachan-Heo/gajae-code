@@ -4,6 +4,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { setProjectDir } from "@gajae-code/utils";
+import { jobElapsedMs } from "../async";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -506,14 +507,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (snapshot.running.length > 0) {
 				lines.push("", "Running Jobs");
 				for (const job of snapshot.running) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(jobElapsedMs(job, now))}`);
 					lines.push(`    ${job.label}`);
 				}
 			}
 			if (snapshot.recent.length > 0) {
 				lines.push("", "Recent Jobs");
 				for (const job of snapshot.recent) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(jobElapsedMs(job, now))}`);
 					lines.push(`    ${job.label}`);
 				}
 			}

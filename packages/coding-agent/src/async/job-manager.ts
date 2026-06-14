@@ -13,6 +13,14 @@ export interface AsyncJob {
 	type: "bash" | "task";
 	status: "running" | "completed" | "failed" | "cancelled" | "paused";
 	startTime: number;
+
+	/**
+	 * Wall-clock ms when the job left the `running` state (completed, failed,
+	 * cancelled, or paused). Undefined while running. Frozen on the first
+	 * terminal/pause transition so elapsed-time renderers stop counting once a
+	 * job is no longer active instead of growing forever against `Date.now()`.
+	 */
+	endTime?: number;
 	label: string;
 	abortController: AbortController;
 	promise: Promise<void>;
@@ -26,6 +34,16 @@ export interface AsyncJob {
 	 * supply an id (e.g. legacy tests, SDK consumers without an agent context).
 	 */
 	ownerId?: string;
+}
+
+/**
+ * Elapsed wall-clock ms for a job, frozen once it stops running. While the job
+ * is active (`endTime` undefined) this counts against `now`; after it stops it
+ * returns the fixed `endTime - startTime` span so status renderers do not keep
+ * incrementing a completed job's timer.
+ */
+export function jobElapsedMs(job: Pick<AsyncJob, "startTime" | "endTime">, now: number = Date.now()): number {
+	return Math.max(0, (job.endTime ?? now) - job.startTime);
 }
 
 export interface AsyncJobMetadata {
@@ -368,6 +386,7 @@ export class AsyncJobManager {
 					// delivery and no eviction scheduling: a paused subagent stays
 					// listed and resumable from its sessionFile.
 					job.status = "paused";
+					this.#freezeEndTime(job);
 					if (outcome.note) job.resultText = outcome.note;
 					this.#markRecordPaused(id);
 					this.#drainResumeQueue();
@@ -375,6 +394,7 @@ export class AsyncJobManager {
 				}
 
 				job.status = "completed";
+				this.#freezeEndTime(job);
 				job.resultText = outcome.text;
 				this.#enqueueDelivery(id, outcome.text);
 				this.#runLifecycle(id, "terminal");
@@ -393,6 +413,7 @@ export class AsyncJobManager {
 				this.#runLifecycle(id, "terminal");
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
+				this.#freezeEndTime(job);
 				job.errorText = errorText;
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
@@ -428,8 +449,20 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		this.#runLifecycle(id, "cancel");
 		job.status = "cancelled";
+		this.#freezeEndTime(job);
 		job.abortController.abort();
 		return true;
+	}
+
+	/**
+	 * Freeze the wall-clock instant a job stopped running. Idempotent: the
+	 * first stop (completed/failed/cancelled/paused) wins so elapsed-time
+	 * renderers report a stable duration instead of counting against
+	 * `Date.now()` forever. A resumed subagent registers a brand-new job with
+	 * its own `startTime`, so a paused job's frozen `endTime` is never reused.
+	 */
+	#freezeEndTime(job: AsyncJob): void {
+		job.endTime ??= Date.now();
 	}
 
 	#runLifecycle(jobId: string, phase: "cancel" | "terminal" | "evict"): void {
@@ -978,6 +1011,7 @@ export class AsyncJobManager {
 		for (const job of this.getRunningJobs(filter)) {
 			this.#runLifecycle(job.id, "cancel");
 			job.status = "cancelled";
+			this.#freezeEndTime(job);
 			job.abortController.abort();
 			this.#scheduleEviction(job.id);
 		}

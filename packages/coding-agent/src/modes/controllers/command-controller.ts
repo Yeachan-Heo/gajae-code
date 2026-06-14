@@ -13,6 +13,7 @@ import {
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
+import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
@@ -1279,7 +1280,7 @@ const BAR_WIDTH_MAX = 24;
 const BAR_WIDTH_MIN = 4;
 
 function renderJobLine(job: AsyncJobSnapshotItem, now: number): string {
-	const duration = formatDuration(Math.max(0, now - job.startTime));
+	const duration = formatDuration(jobElapsedMs(job, now));
 	const status = formatJobStatus(job.status);
 	return `${theme.fg("dim", job.id)} ${theme.fg("dim", `[${job.type}]`)} ${status} ${theme.fg("dim", `(${duration})`)}`;
 }
