@@ -2158,7 +2158,7 @@ export class SessionManager {
 	#labelRevision = 0;
 	#replayMetadataRevision = 0;
 	#materializedEntriesRevision = -1;
-	#materializedEntriesCache: WeakRef<SessionEntry[]> | undefined;
+	#materializedEntriesCache: SessionEntry[] | undefined;
 	#sessionContextCache: WeakRef<SessionContext> | undefined;
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
@@ -3661,15 +3661,14 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	#getMaterializedEntriesInternal(): SessionEntry[] {
-		if (this.#materializedEntriesRevision === this.#entryRevision) {
-			const cached = this.#materializedEntriesCache?.deref();
-			if (cached) return cached;
+		if (this.#materializedEntriesRevision === this.#entryRevision && this.#materializedEntriesCache) {
+			return this.#materializedEntriesCache;
 		}
 		const resolvedTextBlobCache = new Map<string, string>();
 		const materializedEntries = this.#fileEntries
 			.filter((e): e is SessionEntry => e.type !== "session")
 			.map(entry => materializeResidentEntrySync(entry, this.#residentBlobStores(), resolvedTextBlobCache));
-		this.#materializedEntriesCache = new WeakRef(materializedEntries);
+		this.#materializedEntriesCache = materializedEntries;
 		this.#materializedEntriesRevision = this.#entryRevision;
 		return materializedEntries;
 	}

@@ -216,6 +216,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		expect(JSON.stringify(warmEntries)).toContain(sentinel);
 
 		await fs.promises.rm(residentCacheRoot(sm), { recursive: true, force: true });
+		Bun.gc(true);
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 
 		sm.appendMessage(assistantMessage("invalidate warm resident view"));
