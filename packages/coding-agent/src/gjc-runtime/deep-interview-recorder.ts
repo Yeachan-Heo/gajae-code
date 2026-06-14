@@ -388,6 +388,22 @@ export async function appendOrMergeDeepInterviewRound(
 	return { action: result.action, record: result.record };
 }
 
+/**
+ * The most recent scored round preceding the round currently being scored
+ * (matched by durable key). Used as the `prior` baseline for the scored-transition
+ * invariant so a re-score of the same key compares against an earlier round, not itself.
+ */
+function latestPriorScoredRound(
+	rounds: readonly DeepInterviewRoundRecord[],
+	currentKey: string,
+): DeepInterviewRoundRecord | undefined {
+	for (let i = rounds.length - 1; i >= 0; i--) {
+		const candidate = rounds[i];
+		if (candidate.lifecycle === "scored" && candidate.round_key !== currentKey) return candidate;
+	}
+	return undefined;
+}
+
 /** Merge scoring output into the same round record, transitioning to `scored`. */
 export async function enrichDeepInterviewRoundScoring(
 	cwd: string,
@@ -399,6 +415,18 @@ export async function enrichDeepInterviewRoundScoring(
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
 	const { rounds: nextRounds, record } = enrichRoundWithScoring(rounds, { ...input, interviewId });
+	// Fail closed: a scored transition that violates the bidirectional invariant
+	// (an active trigger that improves the affected dimension or fails to raise
+	// overall ambiguity, or a disputed/unresolved trigger lacking a rationale) must
+	// never be persisted — storing it lets the interview falsely converge. Validate
+	// against the most recent prior scored round before writing any durable state.
+	const prior = latestPriorScoredRound(rounds, record.round_key);
+	const validation = validateDeepInterviewScoredTransition(prior, record);
+	if (!validation.ok) {
+		throw new Error(
+			`deep-interview scored transition for round ${record.round} is invalid and was refused: ${validation.violations.join("; ")}`,
+		);
+	}
 	(envelope.state as Record<string, unknown>).rounds = nextRounds;
 	(envelope.state as Record<string, unknown>).current_ambiguity = input.ambiguity;
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview score-round");
