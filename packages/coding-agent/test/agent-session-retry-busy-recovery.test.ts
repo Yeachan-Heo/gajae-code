@@ -16,7 +16,7 @@ type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 	// Uses a real timer (not the mocked scheduler.wait) so it survives the
 	// scheduler.wait spy that skips retry backoff.
-	let timer: ReturnType<typeof setTimeout>;
+	let timer: NodeJS.Timeout;
 	const timeout = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => reject(new Error(`TIMEOUT (session wedged busy): ${label}`)), ms);
 	});

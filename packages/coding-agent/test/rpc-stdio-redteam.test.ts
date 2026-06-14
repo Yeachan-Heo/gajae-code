@@ -118,7 +118,7 @@ function spawnRpcServer(options: { cwd?: string; sessionDir?: string } = {}): Rp
 		proc,
 		stderrText,
 		async nextFrame(timeoutMs = 10_000): Promise<Frame> {
-			let timer: ReturnType<typeof setTimeout> | undefined;
+			let timer: NodeJS.Timeout | undefined;
 			const timeout = new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("Timed out waiting for RPC frame")), timeoutMs);
 			});

@@ -391,7 +391,7 @@ export function calculateCronFireTimeMs(params: {
 }
 
 function setCronTimeout(callback: () => void, delayMs: number): CronTimerHandle {
-	let handle: ReturnType<typeof setTimeout> | undefined;
+	let handle: NodeJS.Timeout | undefined;
 	let cleared = false;
 	const schedule = (remainingMs: number) => {
 		if (cleared) return;

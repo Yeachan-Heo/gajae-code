@@ -1532,8 +1532,8 @@ export async function waitForReplayProcessWithTimeout(
 	timeoutMs: number,
 	graceMs = 2000,
 ): Promise<number> {
-	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	let timeoutTimer: NodeJS.Timeout | undefined;
+	let graceTimer: NodeJS.Timeout | undefined;
 	const timedOut = Symbol("timedOut");
 	const timeout = new Promise<typeof timedOut>(resolve => {
 		timeoutTimer = setTimeout(() => resolve(timedOut), timeoutMs);

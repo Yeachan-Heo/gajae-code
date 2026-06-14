@@ -120,7 +120,7 @@ export class GajaeCodeRpc implements HarnessRpc {
 	#waiters: {
 		afterCursor: number;
 		resolve: (v: { cursor: number } | null) => void;
-		timer: ReturnType<typeof setTimeout>;
+		timer: NodeJS.Timeout;
 	}[] = [];
 	#frameListeners: ((frame: Record<string, unknown>) => void)[] = [];
 	#lastFrameAt: string | null = null;
