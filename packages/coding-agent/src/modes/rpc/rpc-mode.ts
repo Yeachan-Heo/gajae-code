@@ -27,7 +27,7 @@ import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../shared/agent-
 import { rpcError as error } from "../shared/agent-wire/responses";
 import { registerRpcSession, unregisterRpcSession } from "../shared/agent-wire/session-registry";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
-import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
+import { modelSupportsTokenCostMetrics, UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
 import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
@@ -89,6 +89,26 @@ function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "e
 	if (event.includes("rejected") || event.includes("conflict")) return "rejected";
 	if (event.includes("accepted") || event.includes("negotiated") || event.includes("emitted")) return "accepted";
 	return "info";
+}
+
+/**
+ * Probe whether a unix-domain socket path has a live server accepting
+ * connections. Returns `true` only when a connection succeeds (a previous owner
+ * is still alive), so `--listen` startup can refuse to unlink a live endpoint
+ * instead of stealing it (#606). A missing path or a stale socket with no
+ * listener (ENOENT / ECONNREFUSED) returns `false`.
+ */
+export async function isUnixSocketAlive(socketPath: string): Promise<boolean> {
+	try {
+		const socket = await Bun.connect({
+			unix: socketPath,
+			socket: { data() {}, open() {}, error() {}, close() {} },
+		});
+		socket.end();
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export function requestRpcEditor(
@@ -230,6 +250,7 @@ export async function runRpcMode(
 		emitFrame: gate => output(gate),
 		store: gateStore,
 		audit: recordAudit,
+		providerSupportsTokenCostMetrics: modelSupportsTokenCostMetrics(session.model),
 		getUsageSnapshot: () => {
 			const stats = session.getSessionStats();
 			return { tokens: stats.tokens.total, costUsd: stats.cost };
@@ -620,6 +641,15 @@ export async function runRpcMode(
 	if (options?.listen) {
 		const socketPath = options.listen;
 		await fs.mkdir(path.dirname(socketPath), { recursive: true }).catch(() => {});
+		// Refuse to clobber a live previous owner: probe the path first and only
+		// unlink a stale endpoint. A second `--listen` on the same path must not
+		// remove the socket another running server is still serving (#606).
+		if (await isUnixSocketAlive(socketPath)) {
+			throw new Error(
+				`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
+					"Stop it first or choose a different --listen path.",
+			);
+		}
 		await fs.rm(socketPath, { force: true }).catch(() => {});
 		await registerRpcSession({
 			sessionId: session.sessionId,

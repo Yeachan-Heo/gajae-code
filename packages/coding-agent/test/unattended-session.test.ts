@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import type { RpcUnattendedDeclaration, RpcWorkflowGate } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 import { approvalGate } from "@gajae-code/coding-agent/modes/shared/agent-wire/approval-gate";
 import { questionToGate } from "@gajae-code/coding-agent/modes/shared/agent-wire/deep-interview-gate";
-import { UnattendedSessionControlPlane } from "@gajae-code/coding-agent/modes/shared/agent-wire/unattended-session";
+import {
+	modelSupportsTokenCostMetrics,
+	UnattendedSessionControlPlane,
+} from "@gajae-code/coding-agent/modes/shared/agent-wire/unattended-session";
 
 const DECL: RpcUnattendedDeclaration = {
 	actor: "hermes",
@@ -13,7 +16,11 @@ const DECL: RpcUnattendedDeclaration = {
 
 function makePlane() {
 	const emitted: RpcWorkflowGate[] = [];
-	const plane = new UnattendedSessionControlPlane({ runId: "run-1", emitFrame: g => emitted.push(g) });
+	const plane = new UnattendedSessionControlPlane({
+		runId: "run-1",
+		emitFrame: g => emitted.push(g),
+		providerSupportsTokenCostMetrics: true,
+	});
 	return { plane, emitted };
 }
 
@@ -30,6 +37,17 @@ describe("UnattendedSessionControlPlane", () => {
 			runId: "r",
 			emitFrame: g => emitted.push(g),
 			providerSupportsTokenCostMetrics: false,
+		});
+		expect(() => plane.negotiate(DECL)).toThrow();
+		expect(plane.isUnattended()).toBe(false);
+	});
+
+	it("negotiates fail-closed when the token/cost capability is omitted (#606: no implicit true default)", () => {
+		const emitted: RpcWorkflowGate[] = [];
+		const plane = new UnattendedSessionControlPlane({
+			runId: "r-omitted",
+			emitFrame: g => emitted.push(g),
+			// providerSupportsTokenCostMetrics intentionally omitted (undefined).
 		});
 		expect(() => plane.negotiate(DECL)).toThrow();
 		expect(plane.isUnattended()).toBe(false);
@@ -58,6 +76,7 @@ describe("UnattendedSessionControlPlane", () => {
 		const emitted: RpcWorkflowGate[] = [];
 		plane = new UnattendedSessionControlPlane({
 			runId: "run-sync",
+			providerSupportsTokenCostMetrics: true,
 			emitFrame: gate => {
 				emitted.push(gate);
 				void plane.resolveGate({ gate_id: gate.gate_id, answer: { decision: "approve" } });
@@ -102,7 +121,11 @@ describe("UnattendedSessionControlPlane", () => {
 
 	it("rejects a pending emitGate when the unattended run aborts (no forever-hang)", async () => {
 		const emitted: RpcWorkflowGate[] = [];
-		const plane = new UnattendedSessionControlPlane({ runId: "run-abort", emitFrame: g => emitted.push(g) });
+		const plane = new UnattendedSessionControlPlane({
+			runId: "run-abort",
+			emitFrame: g => emitted.push(g),
+			providerSupportsTokenCostMetrics: true,
+		});
 		plane.negotiate({
 			...DECL,
 			budget: { max_tokens: 1000, max_tool_calls: 1, max_wall_time_ms: 10_000, max_cost_usd: 5 },
@@ -123,7 +146,11 @@ describe("UnattendedSessionControlPlane", () => {
 	});
 	it("does not charge max_tool_calls for read-only/control commands; bash still charges (issue 04)", () => {
 		const emitted: RpcWorkflowGate[] = [];
-		const plane = new UnattendedSessionControlPlane({ runId: "budget-run", emitFrame: g => emitted.push(g) });
+		const plane = new UnattendedSessionControlPlane({
+			runId: "budget-run",
+			emitFrame: g => emitted.push(g),
+			providerSupportsTokenCostMetrics: true,
+		});
 		plane.negotiate({
 			actor: "hermes",
 			budget: { max_tokens: 1000, max_tool_calls: 10, max_wall_time_ms: 60_000, max_cost_usd: 5 },
@@ -148,5 +175,23 @@ describe("UnattendedSessionControlPlane", () => {
 		// A bash command performs real tool work and still charges one unit.
 		plane.preflightCommand({ type: "bash", command: "pwd" });
 		expect(controller?.usageSnapshot().toolCalls).toBe(1);
+	});
+});
+
+describe("modelSupportsTokenCostMetrics", () => {
+	it("fails closed for an undefined model", () => {
+		expect(modelSupportsTokenCostMetrics(undefined)).toBe(false);
+	});
+
+	it("supports a model with no compat overrides", () => {
+		expect(modelSupportsTokenCostMetrics({} as never)).toBe(true);
+	});
+
+	it("supports a model whose compat enables streaming usage", () => {
+		expect(modelSupportsTokenCostMetrics({ compat: { supportsUsageInStreaming: true } } as never)).toBe(true);
+	});
+
+	it("fails closed for a model that suppresses streaming usage", () => {
+		expect(modelSupportsTokenCostMetrics({ compat: { supportsUsageInStreaming: false } } as never)).toBe(false);
 	});
 });

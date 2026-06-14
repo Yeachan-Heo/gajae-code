@@ -48,7 +48,12 @@ describe("live bridge unattended workflow gate wiring", () => {
 	});
 
 	it("negotiates unattended during handshake and resolves gates through bridge ui-response compatibility route", async () => {
-		const cp = new UnattendedSessionControlPlane({ runId: "run-b", sessionId: "sess-b", emitFrame: () => undefined });
+		const cp = new UnattendedSessionControlPlane({
+			runId: "run-b",
+			sessionId: "sess-b",
+			emitFrame: () => undefined,
+			providerSupportsTokenCostMetrics: true,
+		});
 		const handle = createBridgeFetchHandler({
 			sessionId: "sess-b",
 			token: "secret",
