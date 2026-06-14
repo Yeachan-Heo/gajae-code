@@ -1492,6 +1492,31 @@
 					"type": "boolean",
 					"description": "Enable the web_search tool for web searching",
 					"default": true
+				},
+				"fallback": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"enum": [
+							"duckduckgo",
+							"exa",
+							"brave",
+							"jina",
+							"kimi",
+							"zai",
+							"anthropic",
+							"perplexity",
+							"gemini",
+							"codex",
+							"tavily",
+							"parallel",
+							"kagi",
+							"synthetic",
+							"searxng"
+						]
+					},
+					"description": "Ordered fallback web search providers after the active model native provider",
+					"default": []
 				}
 			},
 			"additionalProperties": false

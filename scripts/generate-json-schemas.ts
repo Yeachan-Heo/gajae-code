@@ -115,13 +115,14 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 		case "enum":
 			return { type: "string", enum: definition.values };
 		case "array":
-			return { type: "array", items: arrayItemsSchema(definition.default) };
+			return { type: "array", items: arrayItemsSchema(definition.default, definition.items) };
 		case "record":
 			return { type: "object", additionalProperties: true };
 	}
 }
 
-function arrayItemsSchema(defaultValue: unknown): JsonSchema {
+function arrayItemsSchema(defaultValue: unknown, items?: { enum?: readonly string[] }): JsonSchema {
+	if (items?.enum) return { type: "string", enum: items.enum };
 	if (!Array.isArray(defaultValue) || defaultValue.length === 0) return true;
 	if (defaultValue.every(value => typeof value === "string")) return { type: "string" };
 	if (defaultValue.every(value => typeof value === "number")) return { type: "number" };

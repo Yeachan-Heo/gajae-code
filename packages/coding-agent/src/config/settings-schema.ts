@@ -2,6 +2,7 @@ import type { Effort } from "@gajae-code/ai/model-thinking";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
+import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
 
@@ -164,6 +165,7 @@ interface EnumDef<T extends readonly string[]> {
 interface ArrayDef<T> {
 	type: "array";
 	default: T[];
+	items?: { enum: readonly string[] };
 	ui?: UiBase;
 }
 
@@ -2066,6 +2068,17 @@ export const SETTINGS_SCHEMA = {
 		type: "boolean",
 		default: true,
 		ui: { tab: "tools", label: "Web Search", description: "Enable the web_search tool for web searching" },
+	},
+
+	"web_search.fallback": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		items: { enum: CONFIGURABLE_SEARCH_PROVIDER_IDS },
+		ui: {
+			tab: "tools",
+			label: "Web Search Fallback",
+			description: "Ordered fallback web search providers after the active model native provider",
+		},
 	},
 
 	"browser.enabled": {

@@ -35,6 +35,7 @@ import { $pickenv, isRecord, logger } from "@gajae-code/utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
+import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
 import {
 	buildCanonicalModelIndex,
@@ -964,6 +965,7 @@ export class ModelRegistry {
 	#models: Model<Api>[] = [];
 	#canonicalIndex: CanonicalModelIndex = { records: [], byId: new Map(), bySelector: new Map() };
 	#customProviderApiKeys: Map<string, string> = new Map();
+	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
 	#customModelOverlays: CustomModelOverlay[] = [];
@@ -1073,6 +1075,7 @@ export class ModelRegistry {
 		}
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
+		this.#providerWebSearchModes.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
@@ -1390,6 +1393,7 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
+			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
 			const providerApiKeyConfig = providerConfig.apiKey ?? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/transport are present
 			if (
@@ -2439,6 +2443,22 @@ export class ModelRegistry {
 			this.#models.find(m => m.provider === provider && m.baseUrl)?.baseUrl ??
 			resolveProviderBaseUrlFromEnv(provider)
 		);
+	}
+
+	getProviderWebSearchMode(provider: string): WebSearchMode | undefined {
+		return this.#providerWebSearchModes.get(provider);
+	}
+
+	getActiveSearchModelContext(model: Model<Api>): ActiveSearchModelContext {
+		return {
+			provider: model.provider,
+			modelId: model.id,
+			wireModelId: model.wireModelId,
+			api: model.api,
+			baseUrl: model.baseUrl,
+			headers: model.headers,
+			webSearch: this.getProviderWebSearchMode(model.provider),
+		};
 	}
 
 	/**

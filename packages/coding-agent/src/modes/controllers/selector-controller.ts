@@ -38,7 +38,13 @@ import {
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
-import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
+import {
+	isConfigurableSearchProviderId,
+	isSearchProviderPreference,
+	setPreferredImageProvider,
+	setPreferredSearchProvider,
+	setSearchFallbackProviders,
+} from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
@@ -504,6 +510,13 @@ export class SelectorController {
 			case "providers.webSearch":
 				if (typeof value === "string" && isSearchProviderPreference(value)) {
 					setPreferredSearchProvider(value);
+				}
+				break;
+			case "web_search.fallback":
+				if (Array.isArray(value)) {
+					setSearchFallbackProviders(
+						value.filter(item => typeof item === "string" && isConfigurableSearchProviderId(item)),
+					);
 				}
 				break;
 			case "providers.image":
