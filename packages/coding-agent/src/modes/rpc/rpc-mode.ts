@@ -82,6 +82,88 @@ export function shouldEmitRpcTitlesForTest(): boolean {
 
 const shouldEmitRpcTitles = shouldEmitRpcTitlesForTest;
 
+/**
+ * Cancellation commands bypass the ordered serial chain because they must
+ * interrupt in-flight work — they cannot wait behind the very command they are
+ * meant to abort.
+ */
+export const RPC_CANCELLATION_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	"abort",
+	"abort_bash",
+	"abort_retry",
+]);
+
+/**
+ * Safe read/control commands that also bypass the ordered serial chain so they
+ * never head-of-line-block behind a long-running ordered command like
+ * `bash`/`compact`/`handoff`/`login` (#606, issue 13 — the partial fix only
+ * fast-laned cancellation).
+ *
+ * Every command listed here has a dispatch handler that is **fully synchronous**:
+ * on the single-threaded event loop it runs to completion between the await
+ * points of any in-flight ordered command, so it can neither observe torn state
+ * nor mutate state mid-operation. Each is additionally either a pure live-state
+ * read or a control-flag setter that only affects *future* turns — never the
+ * in-flight command it jumps ahead of. Mutually they preserve arrival order
+ * (synchronous handlers run in the read loop's order), and every mutating
+ * command still returns its own response, so a client that needs read-your-writes
+ * awaits that response rather than a racing read.
+ *
+ * Deliberately excluded (kept ordered): every async/long command (`prompt`,
+ * `steer`, `follow_up`, `abort_and_prompt`, `bash`, `compact`, `handoff`,
+ * `login`, `new_session`, `switch_session`, `branch`, `export_html`,
+ * `set_session_name`, `set_host_tools`, `set_host_uri_schemes`) and causally
+ * significant async mutations (`set_model`, `cycle_model`, `set_todos`,
+ * `negotiate_unattended`, `workflow_gate_response`). New commands default to the
+ * ordered chain (fail-safe).
+ */
+export const RPC_SAFE_READ_CONTROL_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	// Pure synchronous reads — return a live snapshot at processing time.
+	"get_state",
+	"get_session_stats",
+	"get_available_models",
+	"get_branch_messages",
+	"get_last_assistant_text",
+	"get_messages",
+	"get_login_providers",
+	// Synchronous control-flag setters — affect only subsequent turns.
+	"set_thinking_level",
+	"cycle_thinking_level",
+	"set_steering_mode",
+	"set_follow_up_mode",
+	"set_interrupt_mode",
+	"set_auto_compaction",
+	"set_auto_retry",
+]);
+
+/** True when a command may bypass the ordered serial chain and run immediately. */
+export function isFastLaneRpcCommand(type: RpcCommand["type"]): boolean {
+	return RPC_CANCELLATION_COMMANDS.has(type) || RPC_SAFE_READ_CONTROL_COMMANDS.has(type);
+}
+
+/**
+ * Schedules inbound RPC commands: fast-lane commands run immediately while
+ * everything else runs through a serial chain so causal order is preserved. The
+ * read loop never blocks, which is what lets a fast-lane command reach a
+ * long-running ordered command instead of being head-of-line-blocked behind it.
+ */
+export function createRpcCommandScheduler(
+	run: (command: RpcCommand) => Promise<void>,
+	track: (task: Promise<void>) => void,
+): { dispatch: (command: RpcCommand) => void } {
+	let orderedChain: Promise<void> = Promise.resolve();
+	return {
+		dispatch(command: RpcCommand): void {
+			if (isFastLaneRpcCommand(command.type)) {
+				track(run(command));
+				return;
+			}
+			orderedChain = orderedChain.then(() => run(command));
+			track(orderedChain);
+		},
+	};
+}
+
 function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "exceeded" | "aborted" | "info" {
 	if (event.includes("denied")) return "denied";
 	if (event.includes("exceeded")) return "exceeded";
@@ -558,14 +640,13 @@ export async function runRpcMode(
 			unattendedControlPlane,
 		});
 
-	// Cancellation commands must interrupt in-flight work, so they bypass the ordered
-	// queue and run immediately. Everything else runs through a serial chain so causal
-	// order is preserved (e.g. `get_state` after `bash` still observes the bash result)
-	// while the read loop itself never blocks — that is what lets a cancellation command
-	// reach a long-running `bash`/`compact`/`handoff`/`login` instead of being
-	// head-of-line-blocked behind it (issue 13).
-	const CANCELLATION_COMMANDS = new Set<RpcCommand["type"]>(["abort", "abort_bash", "abort_retry"]);
-	let orderedChain: Promise<void> = Promise.resolve();
+	// Fast-lane commands (cancellation + safe read/control, see
+	// isFastLaneRpcCommand) bypass the ordered serial chain and run immediately;
+	// everything else runs through a serial chain so causal order is preserved
+	// (e.g. an ordered `set_model` after `bash` still applies after the bash
+	// result) while the read loop itself never blocks — that is what lets a
+	// fast-lane command reach a long-running `bash`/`compact`/`handoff`/`login`
+	// instead of being head-of-line-blocked behind it (issue 13).
 	const runCommand = async (command: RpcCommand): Promise<void> => {
 		try {
 			output(await handleCommand(command));
@@ -577,14 +658,7 @@ export async function runRpcMode(
 		inFlightCommands.add(task);
 		void task.finally(() => inFlightCommands.delete(task));
 	};
-	const dispatchCommand = (command: RpcCommand): void => {
-		if (CANCELLATION_COMMANDS.has(command.type)) {
-			trackCommand(runCommand(command));
-			return;
-		}
-		orderedChain = orderedChain.then(() => runCommand(command));
-		trackCommand(orderedChain);
-	};
+	const { dispatch: dispatchCommand } = createRpcCommandScheduler(runCommand, trackCommand);
 
 	/**
 	 * Check if shutdown was requested and perform shutdown if so.

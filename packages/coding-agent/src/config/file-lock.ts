@@ -45,9 +45,42 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<{ pid: num
 	return info;
 }
 
-/** @internal */
-export async function removeFileLockDirForGc(lockDir: string): Promise<void> {
+/** Owner identity stamped into a `<file>.lock/info` record. */
+export interface FileLockOwnerToken {
+	pid: number;
+	timestamp: number;
+}
+
+/** Outcome of a guarded GC removal attempt (`removeFileLockDirForGc`). */
+export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
+
+/**
+ * @internal
+ * Fail-closed removal of a dead lock dir for GC. Re-reads the on-disk owner
+ * token as close to the unlink as possible and only deletes the dir when it
+ * STILL holds the exact `{pid, timestamp}` identity the caller observed dead.
+ *
+ * Closes the prune-time TOCTOU window (#606): between GC's dead re-read/probe
+ * and the unlink, a live process can reclaim a stale lock at the same path
+ * (`acquireLock` rms the stale dir, then re-`mkdir`s and rewrites `info` with a
+ * fresh pid+timestamp). Deleting by path alone would reap that LIVE lock. Any
+ * mismatch (`owner_changed`) or absent/unreadable info (`missing` — e.g. a
+ * fresh acquirer between `mkdir` and `writeLockInfo`) refuses the delete and
+ * leaves the dir intact. POSIX has no atomic compare-and-delete for a
+ * directory, so the residual read->unlink window cannot be fully eliminated,
+ * but the reclaim-after-stale scenario the issue describes is now guarded.
+ */
+export async function removeFileLockDirForGc(
+	lockDir: string,
+	expected: FileLockOwnerToken,
+): Promise<FileLockGcRemoval> {
+	const current = await readLockInfo(lockDir);
+	if (!current) return "missing";
+	if (current.pid !== expected.pid || current.timestamp !== expected.timestamp) {
+		return "owner_changed";
+	}
 	await fs.rm(lockDir, { recursive: true, force: true });
+	return "removed";
 }
 
 function isProcessAlive(pid: number): boolean {
