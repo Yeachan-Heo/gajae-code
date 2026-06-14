@@ -110,6 +110,39 @@ describe("deep-interview-state: mergeDeepInterviewEnvelope", () => {
 		expect("rounds" in merged).toBe(false);
 	});
 
+	it("preserves established facts when incoming partial state omits them", () => {
+		const facts = [{ id: "f1", statement: "confirmed fact", round: 1, disputed: false }];
+		const existing = {
+			skill: "deep-interview",
+			state: {
+				rounds: [{ round_key: "k1", round: 1, lifecycle: "scored", ambiguity: 0.5 }],
+				established_facts: facts,
+				topology: { status: "confirmed" },
+			},
+		};
+
+		const nestedPartial = mergeDeepInterviewEnvelope(existing, { state: { current_ambiguity: 0.3 } });
+		expect(inner(nestedPartial).established_facts).toEqual(facts);
+		expect(inner(nestedPartial).current_ambiguity).toBe(0.3);
+		expect(inner(nestedPartial).rounds).toHaveLength(1);
+
+		const topLevelPartial = mergeDeepInterviewEnvelope(existing, { current_phase: "handoff" });
+		expect(inner(topLevelPartial).established_facts).toEqual(facts);
+		expect(topLevelPartial.current_phase).toBe("handoff");
+	});
+
+	it("allows explicit established facts replacement", () => {
+		const existing = {
+			state: {
+				rounds: [],
+				established_facts: [{ id: "f1", statement: "old fact", round: 1, disputed: false }],
+			},
+		};
+
+		const merged = mergeDeepInterviewEnvelope(existing, { state: { established_facts: [] } });
+		expect(inner(merged).established_facts).toEqual([]);
+	});
+
 	it("replace returns the normalized incoming envelope", () => {
 		const merged = mergeDeepInterviewEnvelope(
 			{ state: { rounds: [{ round_key: "k1" }] } },

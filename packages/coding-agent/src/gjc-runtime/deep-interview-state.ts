@@ -288,6 +288,10 @@ export function mergeDeepInterviewEnvelope(
 	incoming: unknown,
 	options: { replace?: boolean } = {},
 ): DeepInterviewStateEnvelope {
+	const incomingEnvelope = isPlainObject(incoming) ? incoming : {};
+	const incomingNestedState = isPlainObject(incomingEnvelope.state) ? incomingEnvelope.state : {};
+	const incomingHasEstablishedFacts =
+		Object.hasOwn(incomingNestedState, "established_facts") || Object.hasOwn(incomingEnvelope, "established_facts");
 	const normalizedIncoming = normalizeDeepInterviewEnvelope(incoming);
 	if (options.replace) return normalizedIncoming;
 
@@ -307,6 +311,7 @@ export function mergeDeepInterviewEnvelope(
 	const mergedState: Record<string, unknown> = { ...existingState };
 	for (const [key, value] of Object.entries(incomingState)) {
 		if (key === "rounds") continue;
+		if (key === "established_facts" && !incomingHasEstablishedFacts) continue;
 		if (value === null) delete mergedState[key];
 		else mergedState[key] = value;
 	}
