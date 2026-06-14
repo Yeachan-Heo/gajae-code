@@ -59,6 +59,58 @@ describe("external controller integration docs", () => {
 		expect(readme).toContain("provider-independent smokes");
 		expect(overview).toContain("docs/bot-integration.md");
 		expect(generated).toContain('"bot-integration.md"');
+		expect(readme).toContain("docs/external-control-readiness.md");
+		expect(overview).toContain("docs/external-control-readiness.md");
+		expect(generated).toContain('"external-control-readiness.md"');
+	});
+
+	it("classifies external control surface readiness against code and smoke coverage", async () => {
+		const readiness = await readRepoFile("docs", "external-control-readiness.md");
+		const cliArgs = await readRepoFile("packages", "coding-agent", "src", "cli", "args.ts");
+		const acpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "acp.ts");
+		const mcpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "mcp-serve.ts");
+		const bridgeMode = await readRepoFile("packages", "coding-agent", "src", "modes", "bridge", "bridge-mode.ts");
+
+		expect(readiness).toContain("# External control surface readiness");
+		expect(readiness).toContain("Coordinator MCP | Preferred multi-session bot/control-plane surface");
+		expect(readiness).toContain("RPC stdio | Stable subprocess worker surface");
+		expect(readiness).toContain("ACP mode | Editor/ACP client surface");
+		expect(readiness).toContain("Bridge HTTPS | Experimental, fail-closed remote session-control surface");
+		expect(readiness).toContain(
+			"Do not document events, commands, controller ownership, UI responses, host tool results, or host URI results as enabled by default",
+		);
+		expect(readiness).toContain("Optional live smokes are useful diagnostics");
+
+		for (const command of [
+			"gjc mcp-serve coordinator",
+			"gjc --mode rpc",
+			"gjc --mode acp",
+			"gjc acp",
+			"gjc --mode bridge",
+		]) {
+			expect(readiness).toContain(command);
+		}
+
+		for (const smoke of [
+			"packages/coding-agent/test/coordinator-mcp.test.ts",
+			"packages/coding-agent/test/setup-cli.test.ts",
+			"packages/coding-agent/test/rpc-unattended-stdio.test.ts",
+			"packages/coding-agent/test/rpc-client.start.test.ts",
+			"packages/coding-agent/test/acp-initialize-conformance.test.ts",
+			"packages/coding-agent/test/acp-stdout-hygiene.test.ts",
+			"packages/coding-agent/test/bridge/bridge-mode-handler.test.ts",
+			"packages/bridge-client/test/bridge-client.test.ts",
+		]) {
+			expect(readiness).toContain(smoke);
+		}
+
+		expect(cliArgs).toContain('export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge"');
+		expect(acpCommand).toContain("Run Gajae Code as an ACP (Agent Client Protocol) server over stdio");
+		expect(mcpCommand).toContain('server !== "coordinator" && server !== "hermes"');
+		expect(bridgeMode).toContain("const FAIL_CLOSED_BRIDGE_ENDPOINTS");
+		for (const endpoint of ["events", "commands", "control", "uiResponses", "hostToolResults", "hostUriResults"]) {
+			expect(bridgeMode).toContain(`${endpoint}: false`);
+		}
 	});
 
 	it("keeps bot integration docs free of local-only operator details", async () => {
@@ -67,6 +119,7 @@ describe("external controller integration docs", () => {
 			await readRepoFile("docs", "bot-integration.md"),
 			await readRepoFile("docs", "hermes-mcp-bridge.md"),
 			await readRepoFile("docs", "codebase-overview.md"),
+			await readRepoFile("docs", "external-control-readiness.md"),
 		];
 
 		for (const content of docs) {
