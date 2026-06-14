@@ -6,6 +6,32 @@ function stripHtmlComments(content: string): string {
 	return content.replace(/<!--[\s\S]*?-->/g, "");
 }
 
+function stripLooseScalarTrailingCommas(metadata: string): string {
+	return metadata
+		.split("\n")
+		.map(line => {
+			const match = line.match(/^(\s*[\w-]+\s*:\s+.+),(\s*)$/);
+			if (!match) return line;
+			return `${match[1]}${match[2]}`;
+		})
+		.join("\n");
+}
+
+function parseYamlMetadata(metadata: string): Record<string, unknown> | null {
+	const normalized = metadata.replaceAll("\t", "  ");
+	try {
+		return YAML.parse(normalized) as Record<string, unknown> | null;
+	} catch (strictError) {
+		const loose = stripLooseScalarTrailingCommas(normalized);
+		if (loose === normalized) throw strictError;
+		try {
+			return YAML.parse(loose) as Record<string, unknown> | null;
+		} catch {
+			throw strictError;
+		}
+	}
+}
+
 /** Convert kebab-case to camelCase (e.g. "thinking-level" -> "thinkingLevel") */
 function kebabToCamel(key: string): string {
 	if (!key.includes("-")) return key;
@@ -101,7 +127,7 @@ export function parseFrontmatter(
 
 	try {
 		// Replace tabs with spaces for YAML compatibility, use failsafe mode for robustness
-		const loaded = YAML.parse(metadata.replaceAll("\t", "  ")) as Record<string, unknown> | null;
+		const loaded = parseYamlMetadata(metadata);
 		return { frontmatter: normalizeKeys({ ...frontmatter, ...loaded }), body };
 	} catch (error) {
 		const err = new FrontmatterError(
