@@ -941,7 +941,7 @@ export async function runRootCommand(
 		// Subagents do not enter this CLI startup path; keep runtime MCP discovery scoped to standard sessions.
 		const startupMCP = await prepareStartupMCPDiscovery({
 			cwd,
-			enabled: settingsInstance.get("mcp.enableRuntimeDiscovery") === true,
+			enabled: settingsInstance.get("mcp.enableRuntimeServers") === true,
 			enableProjectConfig: settingsInstance.get("mcp.enableProjectConfig"),
 			authStorage,
 		});

@@ -2,9 +2,9 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
 
-describe("mcp.enableRuntimeDiscovery setting", () => {
+describe("mcp.enableRuntimeServers setting", () => {
 	it("exists in the TS settings schema and defaults to false", () => {
-		const def = SETTINGS_SCHEMA["mcp.enableRuntimeDiscovery"];
+		const def = SETTINGS_SCHEMA["mcp.enableRuntimeServers"];
 		expect(def).toBeDefined();
 		expect(def.type).toBe("boolean");
 		expect(def.default).toBe(false);
@@ -20,9 +20,9 @@ describe("mcp.enableRuntimeDiscovery setting", () => {
 			properties: { mcp: { properties: Record<string, { type?: string; default?: unknown }> } };
 		};
 		const mcp = schema.properties.mcp.properties;
-		expect(mcp.enableRuntimeDiscovery).toBeDefined();
-		expect(mcp.enableRuntimeDiscovery.type).toBe("boolean");
-		expect(mcp.enableRuntimeDiscovery.default).toBe(false);
+		expect(mcp.enableRuntimeServers).toBeDefined();
+		expect(mcp.enableRuntimeServers.type).toBe("boolean");
+		expect(mcp.enableRuntimeServers.default).toBe(false);
 		expect(mcp.enableProjectConfig.default).toBe(false);
 	});
 });

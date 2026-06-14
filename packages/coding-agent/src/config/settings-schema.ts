@@ -2205,11 +2205,11 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 	},
 
-	"mcp.enableRuntimeDiscovery": {
+	"mcp.enableRuntimeServers": {
 		type: "boolean",
 		default: false,
 		description:
-			"Enable standard (non-ACP) session startup discovery and connection of configured runtime MCP servers (e.g. ~/.gjc/agent/mcp.json). Off by default for security; project-level MCP config still requires mcp.enableProjectConfig=true. Does not affect ACP sessions or subagents.",
+			"Enable standard (non-ACP) sessions to connect configured runtime MCP servers at startup (e.g. ~/.gjc/agent/mcp.json) and surface their tools. Off by default for security; project-level MCP config still requires mcp.enableProjectConfig=true. Distinct from mcp.discoveryMode, which only controls whether already-connected MCP tools are hidden behind tool search. Does not affect ACP sessions or subagents.",
 	},
 
 	"mcp.discoveryMode": {
