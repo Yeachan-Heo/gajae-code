@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
 	staleMs?: number;
