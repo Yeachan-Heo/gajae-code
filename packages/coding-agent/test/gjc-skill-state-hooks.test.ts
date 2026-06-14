@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
@@ -212,7 +213,7 @@ describe("GJC native skill-state hooks", () => {
 		const stateDir = path.join(root, "custom-state");
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), "{");
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
@@ -264,7 +265,7 @@ describe("GJC native skill-state hooks", () => {
 			}),
 		);
 		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "team-state.json"), "{");
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{
@@ -299,7 +300,7 @@ describe("GJC native skill-state hooks", () => {
 			path.join(stateDir, "sessions", "session-invalid", "team-state.json"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{
@@ -326,7 +327,7 @@ describe("GJC native skill-state hooks", () => {
 			path.join(stateDir, "ultragoal-state.json"),
 			JSON.stringify({ active: true, current_phase: 7, objective: "ship" }),
 		);
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{

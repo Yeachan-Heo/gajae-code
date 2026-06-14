@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import {
 	getDeepInterviewMutationDecision,
 } from "@gajae-code/coding-agent/skill-state/deep-interview-mutation-guard";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { logger } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 
@@ -282,7 +283,7 @@ describe("deep-interview mutation guard", () => {
 			path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"),
 			JSON.stringify({ active: "yes", current_phase: "interviewing", session_id: "session-a" }),
 		);
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const decision = await getDeepInterviewMutationDecision({
 				cwd,
@@ -302,7 +303,7 @@ describe("deep-interview mutation guard", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
 		await Bun.write(path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"), "{");
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const decision = await getDeepInterviewMutationDecision({
 				cwd,
