@@ -81,9 +81,15 @@ describe("GJC red-claw redesign defaults", () => {
 
 	it("keeps migration themes dark-classified with distinct semantic tokens and no dead link token", async () => {
 		for (const name of ["claude-code", "codex", "opencode"] as const) {
-			const themeJson = defaultThemes[name] as { colors: Record<string, unknown> };
+			const themeJson = defaultThemes[name] as {
+				colors: Record<string, unknown>;
+				symbols?: { overrides?: Record<string, unknown> };
+			};
 			// Do not carry the legacy non-schema `link` token into migration themes.
 			expect(Object.keys(themeJson.colors), `${name} has dead link token`).not.toContain("link");
+
+			// Migration themes keep GJC's symbol identity: preset only, no crab/source-tool overrides.
+			expect(themeJson.symbols?.overrides, `${name} must not override GJC symbols`).toBeUndefined();
 
 			expect(themeModule.isLightTheme(name), `${name} should classify as dark`).toBe(false);
 
