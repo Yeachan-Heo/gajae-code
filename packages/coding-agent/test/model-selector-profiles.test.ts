@@ -55,9 +55,54 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 	};
 }
 
+const codexProfile: ModelProfileDefinition = {
+	name: "codex-eco",
+	requiredProviders: ["provider-a"],
+	modelMapping: { default: "provider-a/default" },
+	source: "user",
+};
+const comboProfile: ModelProfileDefinition = {
+	name: "opus-codex",
+	requiredProviders: ["provider-a"],
+	modelMapping: { default: "provider-a/default" },
+	source: "user",
+};
+
+function createMultiGroupSelector(activeModelProfileName: string) {
+	const profiles = new Map([
+		[codexProfile.name, codexProfile],
+		[comboProfile.name, comboProfile],
+	]);
+	const registry = {
+		refresh: vi.fn(async () => {}),
+		getError: () => undefined,
+		getAvailable: () => [defaultModel, alternateModel],
+		getAll: () => [defaultModel, alternateModel],
+		getDiscoverableProviders: () => [],
+		getCanonicalModels: () => [],
+		resolveCanonicalModel: () => undefined,
+		getModelProfiles: () => new Map(profiles),
+		getModelProfile: (name: string) => profiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		getApiKeyForProvider: async () => "key",
+		getApiKey: async () => "key",
+	};
+	const ui = { requestRender: vi.fn() } as unknown as TUI;
+	return new ModelSelectorComponent(
+		ui,
+		undefined,
+		Settings.isolated(),
+		registry as never,
+		[],
+		() => {},
+		() => {},
+		{ activeModelProfileName },
+	);
+}
+
 function createSelector(
 	onSelect: (selection: ModelSelectorSelection) => void,
-	options: { temporaryOnly?: boolean } = {},
+	options: { temporaryOnly?: boolean; activeModelProfileName?: string } = {},
 ) {
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
 	return new ModelSelectorComponent(
@@ -68,7 +113,7 @@ function createSelector(
 		[],
 		onSelect,
 		() => {},
-		options,
+		{ temporaryOnly: options.temporaryOnly, activeModelProfileName: options.activeModelProfileName },
 	);
 }
 
@@ -189,5 +234,41 @@ describe("model selector profiles", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original-executor" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
+
+	test("AC-1/AC-3: active profile row shows marker in expanded group, group row does not", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, { activeModelProfileName: "profile-a" });
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("profile-a ● in use");
+		expect(rendered).not.toContain("COMBOS ● in use");
+		expect(rendered).not.toContain("Browse all models ● in use");
+	});
+
+	test("AC-2: collapsed group with active profile shows marker; hidden profile row does not", async () => {
+		installTestTheme();
+		const selector = createMultiGroupSelector("opus-codex");
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("COMBOS ● in use");
+		expect(rendered).not.toContain("Opus + Codex");
+	});
+
+	test("AC-4: no marker when active profile is unset or unknown", async () => {
+		installTestTheme();
+		const none = createSelector(() => {});
+		await Bun.sleep(10);
+		installTestTheme();
+		expect(normalizeRenderedText(none.render(220).join("\n"))).not.toContain("● in use");
+
+		const missing = createSelector(() => {}, { activeModelProfileName: "missing-profile" });
+		await Bun.sleep(10);
+		installTestTheme();
+		expect(normalizeRenderedText(missing.render(220).join("\n"))).not.toContain("● in use");
 	});
 });

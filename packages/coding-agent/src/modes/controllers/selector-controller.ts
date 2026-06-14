@@ -604,7 +604,13 @@ export class SelectorController {
 					done();
 					this.ctx.ui.requestRender();
 				},
-				{ ...options, sessionId: this.ctx.session.sessionId },
+				{
+					...options,
+					sessionId: this.ctx.session.sessionId,
+					activeModelProfileName:
+						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+					activeDefaultThinkingLevel: this.ctx.session.thinkingLevel,
+				},
 			);
 			return { component: selector, focus: selector };
 		});

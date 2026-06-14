@@ -126,6 +126,45 @@ function installTestTheme(): void {
 	setThemeInstance(testTheme);
 }
 
+function createDefaultBadgeSelector(args: {
+	currentModel: Model | undefined;
+	scoped: Array<{ model: Model; thinkingLevel?: ThinkingLevel; explicitThinkingLevel?: boolean }>;
+	settings: Settings;
+	activeDefaultThinkingLevel?: ThinkingLevel;
+}): ModelSelectorComponent {
+	const allModels = args.scoped.map(s => s.model);
+	const modelRegistry = {
+		getAll: () => allModels,
+		getDiscoverableProviders: () => [],
+		getCanonicalModels: () => [],
+		resolveCanonicalModel: () => undefined,
+	} as unknown as ModelRegistry;
+	const ui = { requestRender: vi.fn() } as unknown as TUI;
+	return new ModelSelectorComponent(
+		ui,
+		args.currentModel,
+		args.settings,
+		modelRegistry,
+		args.scoped.map(s => ({
+			model: s.model,
+			thinkingLevel: s.thinkingLevel ?? ThinkingLevel.Off,
+			explicitThinkingLevel: s.explicitThinkingLevel,
+		})),
+		() => {},
+		() => {},
+		{ activeDefaultThinkingLevel: args.activeDefaultThinkingLevel },
+	);
+}
+
+function strippedLines(selector: ModelSelectorComponent): string[] {
+	return selector.render(220).map(line =>
+		line
+			.replace(/\x1b\[[0-9;]*m/g, "")
+			.replace(/\s+/g, " ")
+			.trim(),
+	);
+}
+
 describe("ModelSelector canonical model selection", () => {
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");
@@ -597,5 +636,95 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterEnter.role).toBe("default");
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Inherit);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("AC-5/AC-6: session model wins over modelRoles.default for DEFAULT badge and preserves session thinking", async () => {
+		installTestTheme();
+		const sessionModel = createOpenAIModel("openai", "session-model");
+		const settingsDefaultModel = createOpenAIModel("openai", "settings-default");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${settingsDefaultModel.provider}/${settingsDefaultModel.id}:high` },
+		});
+		const selector = createDefaultBadgeSelector({
+			currentModel: sessionModel,
+			scoped: [{ model: sessionModel }, { model: settingsDefaultModel }],
+			settings,
+			activeDefaultThinkingLevel: ThinkingLevel.Low,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const lines = strippedLines(selector);
+		const sessionLine = lines.find(line => line.includes("session-model"));
+		const settingsLine = lines.find(line => line.includes("settings-default"));
+		expect(sessionLine).toBeDefined();
+		expect(sessionLine).toContain("DEFAULT (low)");
+		expect(settingsLine).toBeDefined();
+		expect(settingsLine).not.toContain("DEFAULT");
+		expect(lines.filter(line => line.includes("DEFAULT"))).toHaveLength(1);
+	});
+
+	test("AC-5 fallback: with no session model, modelRoles.default keeps DEFAULT and explicit thinking", async () => {
+		installTestTheme();
+		const settingsDefaultModel = createOpenAIModel("openai", "settings-default");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${settingsDefaultModel.provider}/${settingsDefaultModel.id}:high` },
+		});
+		const selector = createDefaultBadgeSelector({
+			currentModel: undefined,
+			scoped: [{ model: settingsDefaultModel }],
+			settings,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const settingsLine = strippedLines(selector).find(line => line.includes("settings-default"));
+		expect(settingsLine).toBeDefined();
+		expect(settingsLine).toContain("DEFAULT (high)");
+	});
+
+	test("thinking is not regressed to inherit when session model matches modelRoles.default", async () => {
+		installTestTheme();
+		const sessionModel = createOpenAIModel("openai", "session-model");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${sessionModel.provider}/${sessionModel.id}:low` },
+		});
+		const selector = createDefaultBadgeSelector({
+			currentModel: sessionModel,
+			scoped: [{ model: sessionModel }],
+			settings,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const sessionLine = strippedLines(selector).find(line => line.includes("session-model"));
+		expect(sessionLine).toBeDefined();
+		expect(sessionLine).toContain("DEFAULT (low)");
+		expect(sessionLine).not.toContain("DEFAULT (inherit)");
+	});
+
+	test("AC-7: executor override badge stays on override model even when session model differs", async () => {
+		installTestTheme();
+		const sessionModel = createOpenAIModel("openai", "session-model");
+		const executorModel = createOpenAIModel("openai", "executor-model");
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: `${executorModel.provider}/${executorModel.id}:high` },
+		});
+		const selector = createDefaultBadgeSelector({
+			currentModel: sessionModel,
+			scoped: [{ model: sessionModel }, { model: executorModel }],
+			settings,
+			activeDefaultThinkingLevel: ThinkingLevel.Low,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const lines = strippedLines(selector);
+		const sessionLine = lines.find(line => line.includes("session-model"));
+		const executorLine = lines.find(line => line.includes("executor-model"));
+		expect(sessionLine).toContain("DEFAULT (low)");
+		expect(executorLine).toBeDefined();
+		expect(executorLine).toContain("EXECUTOR (high)");
+		expect(executorLine).not.toContain("DEFAULT");
 	});
 });

@@ -188,6 +188,8 @@ export class ModelSelectorComponent extends Container {
 	#filteredCanonicalModels: CanonicalModelItem[] = [];
 	#selectedIndex: number = 0;
 	#roles = {} as Record<string, RoleAssignment | undefined>;
+	#currentModel: Model | undefined;
+	#activeDefaultThinkingLevel?: ThinkingLevel;
 	#settings = null as unknown as Settings;
 	#modelRegistry = null as unknown as ModelRegistry;
 	#onSelectCallback = (() => {}) as RoleSelectCallback;
@@ -206,6 +208,7 @@ export class ModelSelectorComponent extends Container {
 	#presetCursor: number = 0;
 	#expandedPresetProviderId?: string;
 	#previewProfileName?: string;
+	#activeModelProfileName?: string;
 	#presetScopeMenuOpen: boolean = false;
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
@@ -219,13 +222,19 @@ export class ModelSelectorComponent extends Container {
 
 	constructor(
 		tui: TUI,
-		_currentModel: Model | undefined,
+		currentModel: Model | undefined,
 		settings: Settings,
 		modelRegistry: ModelRegistry,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
-		options?: { temporaryOnly?: boolean; initialSearchInput?: string; sessionId?: string },
+		options?: {
+			temporaryOnly?: boolean;
+			initialSearchInput?: string;
+			sessionId?: string;
+			activeModelProfileName?: string;
+			activeDefaultThinkingLevel?: ThinkingLevel;
+		},
 	) {
 		super();
 
@@ -237,6 +246,9 @@ export class ModelSelectorComponent extends Container {
 		this.#onCancelCallback = onCancel;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
+		this.#currentModel = currentModel;
+		this.#activeModelProfileName = options?.activeModelProfileName;
+		this.#activeDefaultThinkingLevel = options?.activeDefaultThinkingLevel;
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -315,6 +327,34 @@ export class ModelSelectorComponent extends Container {
 			const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 			const roleValue =
 				target.settingsPath === "modelRoles" ? this.#settings.getModelRole(role) : agentModelOverrides[role];
+			if (role === "default" && this.#currentModel) {
+				// The active session model is the live default (e.g. applied by a preset via
+				// setModelTemporary) and takes precedence over the persisted modelRoles.default.
+				// Prefer the session thinking level supplied by the controller; otherwise, when the
+				// persisted default resolves to this same model, preserve its explicit thinking so
+				// an existing `DEFAULT (low)` does not regress to `DEFAULT (inherit)`.
+				let defaultThinking = this.#activeDefaultThinkingLevel;
+				if (defaultThinking === undefined && roleValue) {
+					const resolvedDefault = resolveModelRoleValue(roleValue, allModels, {
+						settings: this.#settings,
+						matchPreferences,
+						modelRegistry: this.#modelRegistry,
+					});
+					if (
+						resolvedDefault.model &&
+						modelsAreEqual(resolvedDefault.model, this.#currentModel) &&
+						resolvedDefault.explicitThinkingLevel &&
+						resolvedDefault.thinkingLevel !== undefined
+					) {
+						defaultThinking = resolvedDefault.thinkingLevel;
+					}
+				}
+				this.#roles.default = {
+					model: this.#currentModel,
+					thinkingLevel: defaultThinking ?? ThinkingLevel.Inherit,
+				};
+				continue;
+			}
 			if (!roleValue) continue;
 
 			const resolved = resolveModelRoleValue(roleValue, allModels, {
@@ -776,7 +816,12 @@ export class ModelSelectorComponent extends Container {
 				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
 				const label = `${mark} ${row.groupId}`;
 				const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
-				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+				const groupCollapsed = this.#expandedPresetProviderId !== row.groupId;
+				const groupHasActive =
+					this.#activeModelProfileName !== undefined &&
+					row.profiles.some(profile => profile.name === this.#activeModelProfileName);
+				const groupMarker = groupCollapsed && groupHasActive ? theme.fg("accent", " ● in use") : "";
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${groupMarker}`, 0, 0));
 				continue;
 			}
 			const presentation = getModelProfilePresentation(row.profile.name);
@@ -784,7 +829,9 @@ export class ModelSelectorComponent extends Container {
 			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
-			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+			const profileMarker =
+				row.profile.name === this.#activeModelProfileName ? theme.fg("accent", " ● in use") : "";
+			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${profileMarker}`, 0, 0));
 		}
 		if (this.#presetLoginHint) {
 			this.#listContainer.addChild(new Spacer(1));
