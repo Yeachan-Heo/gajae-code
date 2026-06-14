@@ -243,5 +243,7 @@ describe("UnattendedAuditLog red-team coverage", () => {
 		expect(reader.export({ outcome: "exceeded" })).toHaveLength(72);
 		expect(reader.export({ run_id: "run-odd", actor: "hermes", outcome: "accepted" })).toHaveLength(71);
 		expect(reader.export({ session_id: "session-4", gate_id: "gate-3" })).toHaveLength(9);
-	});
+		// 500 records each go through a durable openSync+writeSync+fsyncSync+closeSync;
+		// on contended CI disks fsync can run ~10ms+ apiece, so allow headroom past the 5s default.
+	}, 30000);
 });
