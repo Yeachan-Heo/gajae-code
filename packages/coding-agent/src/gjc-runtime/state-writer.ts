@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type FileLockOptions, withFileLock } from "../config/file-lock";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
 	type AuditEntry,
@@ -81,6 +82,12 @@ export interface StateWriterOptions {
 	cwd?: string;
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
+	/**
+	 * Cross-process lock tuning for read-modify-write paths that route through
+	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
+	 * `withFileLock` defaults.
+	 */
+	lock?: FileLockOptions;
 }
 
 export interface DeleteIfOwnedOptions extends StateWriterOptions {
@@ -417,17 +424,55 @@ export async function writeTextAtomic(targetPath: string, text: string, options?
 	return filePath;
 }
 
+/**
+ * Serialize a read-modify-write (or any multi-step mutation) against concurrent
+ * writers of the same `.gjc/**` target. Uses the cross-process directory lock
+ * from `withFileLock`, keyed on the resolved file path, so separate CLI/agent
+ * processes (e.g. team-mode workers) cannot interleave one writer's read with
+ * another writer's write and silently drop the first mutation (issue #646).
+ *
+ * The lock is advisory: it only protects callers that route through it, so every
+ * read-modify-write of a given file MUST acquire this lock for the same resolved
+ * path. `atomicWrite`'s temp-file + rename crash-atomicity is preserved; this
+ * layers concurrency-atomicity on top without weakening it.
+ */
+export async function withWorkflowStateLock<T>(
+	targetPath: string,
+	fn: () => Promise<T>,
+	options?: StateWriterOptions,
+): Promise<T> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+}
+
+async function lockResolvedWorkflowTarget<T>(
+	filePath: string,
+	fn: () => Promise<T>,
+	lockOptions?: FileLockOptions,
+): Promise<T> {
+	// `withFileLock` creates the lock dir next to the target with a non-recursive
+	// mkdir, so the parent directory must exist before the lock is acquired.
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	return withFileLock(filePath, fn, lockOptions);
+}
+
 export async function updateJsonAtomic<T = unknown>(
 	targetPath: string,
 	mutator: (current: T | undefined) => T | Promise<T>,
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = (await readJsonIfPresent(filePath)) as T | undefined;
-	const next = await mutator(current);
-	await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
-	await maybeAudit(filePath, options);
-	return filePath;
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = (await readJsonIfPresent(filePath)) as T | undefined;
+			const next = await mutator(current);
+			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
+			await maybeAudit(filePath, options);
+			return filePath;
+		},
+		options?.lock,
+	);
 }
 
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
