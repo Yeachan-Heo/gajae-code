@@ -247,4 +247,28 @@ describe("subagentToolRenderer", () => {
 		const out = render({ subagents: [] });
 		expect(out).toContain("No subagents");
 	});
+
+	it("renders the effective model for a subagent", () => {
+		const out = render({
+			subagents: [snapshot({ id: "0-Codex", effectiveModel: "openai-codex/gpt-5.5" })],
+		});
+		expect(out).toContain("Model: openai-codex/gpt-5.5");
+		expect(out).not.toContain("fell back");
+	});
+
+	it("flags an auth fallback with the requested vs effective model", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-Fallback",
+					effectiveModel: "anthropic/claude-opus-4-8",
+					requestedModel: "openai-codex/gpt-5.5",
+					modelFellBack: true,
+				}),
+			],
+		});
+		expect(out).toContain("Model: anthropic/claude-opus-4-8");
+		expect(out).toContain("requested openai-codex/gpt-5.5");
+		expect(out).toContain("fell back");
+	});
 });

@@ -1154,6 +1154,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					resolvedModel: model.id,
 				});
 			}
+			// Record which model the subagent actually runs on (and any auth fallback,
+			// see #985) so the subagent panel can surface it to the user.
+			if (model) {
+				AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+					effectiveModel: resolvedModelString,
+					modelFellBack: authFallbackUsed === true,
+				});
+			}
 			if (model?.contextWindow && model.contextWindow > 0) {
 				progress.contextWindow = model.contextWindow;
 			}

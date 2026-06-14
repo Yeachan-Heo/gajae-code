@@ -80,6 +80,12 @@ export interface SubagentRecord {
 	/** False for ephemeral sessions (no persistent artifacts dir). */
 	resumable: boolean;
 	queued?: { ownerId?: string; seq: number; message?: string; createdAt: number };
+	/** Resolved model the subagent was asked to use, e.g. "openai-codex/gpt-5.5". */
+	requestedModel?: string;
+	/** Model actually used after auth fallback (#985); equals requestedModel when no fallback. */
+	effectiveModel?: string;
+	/** True when the requested model lacked credentials and the subagent fell back to the parent model. */
+	modelFellBack?: boolean;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -501,6 +507,18 @@ export class AsyncJobManager {
 	/** Register or replace the canonical record for a subagent. */
 	registerSubagentRecord(record: SubagentRecord): void {
 		this.#subagentRecords.set(record.subagentId, record);
+	}
+
+	/** Patch model metadata onto an existing subagent record (best-effort; no-op if unknown). */
+	updateSubagentModel(
+		subagentId: string,
+		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean },
+	): void {
+		const record = this.#subagentRecords.get(subagentId);
+		if (!record) return;
+		record.requestedModel = model.requestedModel;
+		record.effectiveModel = model.effectiveModel;
+		record.modelFellBack = model.modelFellBack;
 	}
 
 	getSubagentRecord(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {

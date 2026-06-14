@@ -66,6 +66,15 @@ function renderSubagentSnapshot(
 	if (snapshot.agent && snapshot.agent !== "unknown") {
 		lines.push(`  ${theme.fg("dim", `Agent: ${snapshot.agent} (${snapshot.agentSource})`)}`);
 	}
+	if (snapshot.effectiveModel) {
+		if (snapshot.modelFellBack && snapshot.requestedModel) {
+			lines.push(
+				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}`,
+			);
+		} else {
+			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}`);
+		}
+	}
 	if (snapshot.description) lines.push(`  ${theme.fg("dim", `Description: ${snapshot.description}`)}`);
 	if (snapshot.outputRef) lines.push(`  ${theme.fg("dim", `Output: ${snapshot.outputRef}`)}`);
 	if (snapshot.assignment) {

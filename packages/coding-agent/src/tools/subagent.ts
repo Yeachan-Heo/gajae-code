@@ -67,6 +67,12 @@ export interface SubagentSnapshot {
 	progress?: AgentProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
 	liveProgressAvailable?: boolean;
+	/** Model the subagent actually runs on (after any auth fallback). */
+	effectiveModel?: string;
+	/** Model originally requested via role/preset mapping; differs from effective on fallback. */
+	requestedModel?: string;
+	/** True when the requested model lacked credentials and fell back to the parent model. */
+	modelFellBack?: boolean;
 }
 
 export interface SubagentToolDetails {
@@ -508,6 +514,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			lines.push(`### ${snapshot.id} — ${snapshot.status}`);
 			if (snapshot.jobId !== snapshot.id) lines.push(`Job: ${snapshot.jobId}`);
 			if (snapshot.agent) lines.push(`Agent: ${snapshot.agent} (${snapshot.agentSource})`);
+			if (snapshot.effectiveModel) {
+				lines.push(
+					snapshot.modelFellBack && snapshot.requestedModel
+						? `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`
+						: `Model: ${snapshot.effectiveModel}`,
+				);
+			}
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
@@ -584,7 +597,17 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			durationMs: 0,
 			...(verifiedOutputIds.has(record.subagentId) ? { outputRef: `agent://${record.subagentId}` } : {}),
 			...liveFields,
+			...this.#modelFields(record),
 		};
+	}
+
+	#modelFields(record?: SubagentRecord): Partial<SubagentSnapshot> {
+		if (!record) return {};
+		const fields: Partial<SubagentSnapshot> = {};
+		if (record.effectiveModel) fields.effectiveModel = record.effectiveModel;
+		if (record.requestedModel) fields.requestedModel = record.requestedModel;
+		if (record.modelFellBack) fields.modelFellBack = true;
+		return fields;
 	}
 
 	#snapshot(
@@ -622,6 +645,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				: {}),
 			...(outputRef ? { outputRef } : {}),
 			...(runningTimeoutGuidance ? { guidance: runningTimeoutGuidance } : {}),
+			...this.#modelFields(record),
 		};
 	}
 
