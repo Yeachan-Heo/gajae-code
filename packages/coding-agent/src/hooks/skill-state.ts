@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import { writeJsonAtomic, writeWorkflowEnvelopeAtomic } from "../gjc-runtime/state-writer";
@@ -221,7 +222,7 @@ function skillStatePath(stateDir: string, sessionId?: string): string {
 }
 
 function warnInvalidState(kind: string, filePath: string, error: string): void {
-	console.warn(`gjc skill-state: invalid ${kind} at ${filePath}: ${error}`);
+	logger.warn(`gjc skill-state: invalid ${kind} at ${filePath}: ${error}`);
 }
 
 async function readValidatedJsonFile<T>(
