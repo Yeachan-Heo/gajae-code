@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed interactive goal-mode auto-continuation looping `Error: Agent is already processing…` (`AgentBusyError`) while the session is busy. A wedged/orphaned subagent turn — or an in-progress compaction — can leave the session non-idle while the interactive loop is back at `getUserInput()`; the 800 ms continuation timer then fired `prompt()`, threw `AgentBusyError`, surfaced it via `showError`, and re-armed — spamming the error roughly every 800 ms. The continuation now skips and re-arms while `isStreaming`/`isCompacting`, firing only once the session returns to idle.
+
 ## [0.5.1] - 2026-06-14
 
 ### Added
