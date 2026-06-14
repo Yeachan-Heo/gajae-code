@@ -329,4 +329,59 @@ describe("default GJC tmux launch", () => {
 
 		expect(plan).toBeUndefined();
 	});
+
+	it("applies session-scoped mouse scrolling when launching tmux on WSL/Linux", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { WSL_DISTRO_NAME: "Ubuntu" },
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "linux",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		const created = calls.find(call => call.args[0] === "new-session");
+		expect(created).toBeDefined();
+		const sessionName = created?.args[3] ?? "";
+		expect(sessionName.startsWith(GJC_TMUX_SESSION_PREFIX)).toBe(true);
+		// The GJC-launched tmux/profile path must not bypass mouse scrolling on WSL.
+		expect(calls.some(call => call.command === "tmux")).toBe(true);
+		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "mouse", "on"]);
+		// All profile mutations stay scoped to the GJC session, never global tmux state.
+		expect(calls.flatMap(call => call.args)).not.toContain("-g");
+	});
+
+	it("honors GJC_MOUSE=off on WSL/Linux without disabling the rest of the profile", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { WSL_DISTRO_NAME: "Ubuntu", GJC_MOUSE: "off" },
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "linux",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		const created = calls.find(call => call.args[0] === "new-session");
+		const sessionName = created?.args[3] ?? "";
+		expect(calls.flatMap(call => call.args)).not.toContain("mouse");
+		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "@gjc-profile", "1"]);
+	});
 });
