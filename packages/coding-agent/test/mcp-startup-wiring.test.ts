@@ -3,6 +3,7 @@ import { MCPManager } from "../src/runtime-mcp/manager";
 import {
 	adoptStartupMCPDiscovery,
 	cleanupStartupMCPDiscovery,
+	collectMCPServerSecrets,
 	prepareStartupMCPDiscovery,
 	redactMCPStartupError,
 	type StartupMCPDiscovery,
@@ -211,5 +212,61 @@ describe("runtime MCP startup wiring", () => {
 		expect(
 			redactMCPStartupError('{"apiKey":"jsonsecret","token": "tokensecret"} --api-key sk-space --token cli-secret'),
 		).not.toMatch(/jsonsecret|tokensecret|sk-space|cli-secret/);
+	});
+
+	it("redacts every credential form in the threat model (no secret value survives)", () => {
+		// Secret-shaped fixtures are assembled at runtime so this source file never contains a
+		// contiguous token literal (avoids GitHub secret-scanning push protection on test data).
+		const ghPat = `ghp${"_"}0123456789abcdefghijABCDEFGHIJ012345`;
+		const ghFineGrained = `github${"_pat_"}11ABCDEFG0abcdefghijklmnopqrstuvwxyz0123`;
+		const slackToken = ["xoxb", "1234567890", "abcdefghijklmnop"].join("-");
+		const googleKey = `AIza${"SyA1234567890abcdefghijklmnopqrstuv"}`;
+		const jwt = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0In0", "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"].join(
+			".",
+		);
+		const cases: Array<[string, string]> = [
+			["connect failed https://svc:S3cr3tP%40ss@host/sse ECONNREFUSED", "S3cr3tP%40ss"],
+			["spawn env PASSWORD=hunter2Correct node server.js", "hunter2Correct"],
+			[
+				"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY leaked",
+				"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+			],
+			[`auth failed token ${ghPat}`, ghPat],
+			[`${ghFineGrained} rejected`, ghFineGrained],
+			[`HTTP 401 {"token":"${slackToken}"}`, slackToken],
+			["OAuth client_secret=abcd1234secretvalue9876 invalid", "abcd1234secretvalue9876"],
+			[`bearer ${jwt}`, jwt],
+			[`key ${googleKey} rejected`, googleKey],
+		];
+		for (const [message, secret] of cases) {
+			expect(redactMCPStartupError(message)).not.toContain(secret);
+		}
+	});
+
+	it("redacts secret values supplied structurally from server config (headers, url, env)", () => {
+		const httpSecrets = collectMCPServerSecrets({
+			type: "http",
+			url: "https://user:Tok3nP%40ss@example.com/mcp",
+			headers: { Authorization: "raw-header-secret-value" },
+		} as any);
+		expect(httpSecrets).toContain("raw-header-secret-value");
+		expect(redactMCPStartupError("HTTP 500: header was raw-header-secret-value", httpSecrets)).not.toContain(
+			"raw-header-secret-value",
+		);
+
+		const stdioSecrets = collectMCPServerSecrets({
+			type: "stdio",
+			command: "x",
+			env: { DB_PASSWORD: "sup3rSecretValue123" },
+		} as any);
+		expect(
+			redactMCPStartupError("spawn error: DB_PASSWORD set to sup3rSecretValue123 here", stdioSecrets),
+		).not.toContain("sup3rSecretValue123");
+	});
+
+	it("caps the logged error length so a large untrusted body is never dumped raw", () => {
+		const out = redactMCPStartupError(`prefix ${"x".repeat(2000)}`);
+		expect(out.length).toBeLessThanOrEqual(520);
+		expect(out.endsWith("…[truncated]")).toBe(true);
 	});
 });

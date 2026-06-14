@@ -645,6 +645,13 @@ export class MCPManager {
 	}
 
 	/**
+	 * Get the resolved config for a server (used for structural secret redaction of startup errors).
+	 */
+	getServerConfig(name: string): MCPServerConfig | undefined {
+		return this.#serverConfigs.get(name);
+	}
+
+	/**
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
