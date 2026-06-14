@@ -464,6 +464,15 @@ export class Editor implements Component, Focusable {
 		this.#autocompleteProvider = provider;
 	}
 
+	getAutocompleteProvider(): AutocompleteProvider | undefined {
+		return this.#autocompleteProvider;
+	}
+
+	/** Whether the autocomplete dropdown is currently open. */
+	isAutocompleteOpen(): boolean {
+		return this.#autocompleteState !== null && this.#autocompleteList !== undefined;
+	}
+
 	/**
 	 * Set custom content for the top border (e.g., status line).
 	 * Pass undefined to use the default plain border.

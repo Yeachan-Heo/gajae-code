@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { AutocompleteItem, AutocompleteProvider } from "@gajae-code/tui/autocomplete";
 
 beforeAll(async () => {
 	const themeInstance = await getThemeByName("red-claw");
@@ -20,7 +21,7 @@ interface Callbacks {
 	submitted: string[];
 }
 
-function createSelector(opts?: { scrollTitleRows?: number }): {
+function createSelector(opts?: { scrollTitleRows?: number; autocompleteProvider?: AutocompleteProvider }): {
 	component: HookSelectorComponent;
 	calls: Callbacks;
 } {
@@ -36,6 +37,7 @@ function createSelector(opts?: { scrollTitleRows?: number }): {
 				onSubmit: text => calls.submitted.push(text),
 			},
 			scrollTitleRows: opts?.scrollTitleRows,
+			autocompleteProvider: opts?.autocompleteProvider,
 		},
 	);
 	return { component, calls };
@@ -48,6 +50,33 @@ function renderText(component: HookSelectorComponent, width = 80): string {
 function moveToOther(component: HookSelectorComponent): void {
 	component.handleInput("\x1b[B"); // down
 	component.handleInput("\x1b[B"); // down
+}
+
+// Minimal provider that completes an "@" file-link prefix, mirroring the real
+// CombinedAutocompleteProvider's `@` behavior closely enough to exercise wiring.
+class AtFileProvider implements AutocompleteProvider {
+	async getSuggestions(
+		lines: string[],
+		_cursorLine: number,
+		cursorCol: number,
+	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
+		const prefix = (lines[0] || "").slice(0, cursorCol);
+		if (!prefix.startsWith("@")) return null;
+		return { prefix, items: [{ value: "@src/app.ts", label: "src/app.ts" }] };
+	}
+
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		item: AutocompleteItem,
+		prefix: string,
+	): { lines: string[]; cursorLine: number; cursorCol: number } {
+		const line = lines[cursorLine] || "";
+		const start = cursorCol - prefix.length;
+		const newLine = line.slice(0, start) + item.value + line.slice(cursorCol);
+		return { lines: [newLine], cursorLine, cursorCol: start + item.value.length };
+	}
 }
 
 describe("HookSelectorComponent inline custom input", () => {
@@ -151,5 +180,35 @@ describe("HookSelectorComponent inline custom input", () => {
 		const after = renderText(component);
 		expect(after).not.toContain("Deep Interview question body");
 		expect(after).toContain("esc back to options");
+	});
+
+	it("opens @ file autocomplete in the inline input and applies it with enter", async () => {
+		const { component, calls } = createSelector({ autocompleteProvider: new AtFileProvider() });
+		moveToOther(component);
+		component.handleInput("\r");
+
+		component.handleInput("@");
+		await Bun.sleep(0); // let async getSuggestions resolve and open the dropdown
+
+		// Enter belongs to the open dropdown: it applies the completion, not submit.
+		component.handleInput("\r");
+		expect(calls.submitted).toEqual([]);
+		expect(renderText(component)).toContain("@src/app.ts");
+
+		// With the dropdown closed, enter now submits the completed file link.
+		component.handleInput("\r");
+		expect(calls.submitted).toEqual(["@src/app.ts"]);
+	});
+
+	it("without an autocomplete provider, @ stays literal and enter submits it", async () => {
+		const { component, calls } = createSelector();
+		moveToOther(component);
+		component.handleInput("\r");
+
+		component.handleInput("@");
+		await Bun.sleep(0);
+		component.handleInput("\r");
+
+		expect(calls.submitted).toEqual(["@"]);
 	});
 });

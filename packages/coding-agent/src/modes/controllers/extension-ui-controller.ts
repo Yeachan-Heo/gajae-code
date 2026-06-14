@@ -645,6 +645,9 @@ export class ExtensionUiController {
 				timeout: dialogOptions?.timeout,
 				onTimeout: dialogOptions?.onTimeout,
 				tui: this.ctx.ui,
+				// Share the main prompt editor's autocomplete provider so the
+				// inline "Other (type your own)" editor supports `@` file links.
+				autocompleteProvider: dialogOptions?.customInput ? this.ctx.editor.getAutocompleteProvider() : undefined,
 				outline: dialogOptions?.outline,
 				wrapFocused: dialogOptions?.wrapFocused,
 				scrollTitleRows,

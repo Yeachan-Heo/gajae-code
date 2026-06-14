@@ -3,6 +3,7 @@
  * Displays a list of string options with keyboard navigation.
  */
 import {
+	type AutocompleteProvider,
 	Container,
 	Editor,
 	Markdown,
@@ -73,6 +74,12 @@ export interface HookSelectorOptions {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
 	};
+	/**
+	 * Autocomplete provider for the inline custom-input editor. When present,
+	 * the "Other (type your own)" editor gains the same `@` file-link and `/`
+	 * completion behavior as the main prompt editor.
+	 */
+	autocompleteProvider?: AutocompleteProvider;
 }
 
 class OutlinedList extends Container {
@@ -320,6 +327,7 @@ export class HookSelectorComponent extends Container {
 	#helpTextComponent: Text;
 	#baseHelpText: string;
 	#tui: TUI | undefined;
+	#autocompleteProvider: AutocompleteProvider | undefined;
 	constructor(
 		title: string,
 		options: string[],
@@ -342,6 +350,7 @@ export class HookSelectorComponent extends Container {
 		this.#outline = opts?.outline === true;
 		this.#customInput = opts?.customInput;
 		this.#tui = opts?.tui;
+		this.#autocompleteProvider = opts?.autocompleteProvider;
 
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
@@ -491,6 +500,13 @@ export class HookSelectorComponent extends Container {
 
 	/** Keys while the inline custom-input editor is open below the option list. */
 	#handleInputModeKey(keyData: string, editor: Editor): void {
+		// While the autocomplete dropdown is open, every key belongs to the
+		// editor (navigate/apply/cancel the suggestion) instead of submitting
+		// or backing out of input mode.
+		if (editor.isAutocompleteOpen()) {
+			editor.handleInput(keyData);
+			return;
+		}
 		// Escape backs out to option selection instead of cancelling the dialog,
 		// so a stray Esc never throws away the question context.
 		if (matchesKey(keyData, "escape") || matchesAppInterrupt(keyData)) {
@@ -521,6 +537,9 @@ export class HookSelectorComponent extends Container {
 		editor.setBorderVisible(false);
 		editor.setPromptGutter("> ");
 		editor.disableSubmit = true;
+		if (this.#autocompleteProvider) {
+			editor.setAutocompleteProvider(this.#autocompleteProvider);
+		}
 		this.#inlineEditor = editor;
 		this.#inputArea.addChild(new Spacer(1));
 		this.#inputArea.addChild(editor);
