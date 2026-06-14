@@ -165,7 +165,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await fileDoesNotContainBlobRef(sessionFile);
 	});
 
-	it("surfaces typed missing resident text errors from exports and rewrites after disk cache deletion", async () => {
+	it("surfaces typed missing resident text errors from exports and persists a placeholder on rewrite after disk cache deletion", async () => {
 		const sentinel = `corrupt resident text ${"z".repeat(2048)}`;
 		const { sm, sessionFile } = await createPersistedLargeTextSession(sentinel);
 		const liveCacheDir = activeResidentCacheDir(sm);
@@ -197,8 +197,13 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		const rewrite = await SessionManager.open(sessionFile);
 		const rewriteCacheDir = activeResidentCacheDir(rewrite);
 		await fs.promises.rm(rewriteCacheDir, { recursive: true, force: true });
-		await expectMissingBlobAsync(() => rewrite.rewriteEntries());
+		await rewrite.rewriteEntries();
 		await rewrite.close().catch(() => {});
+		const rewritten = await Bun.file(sessionFile).text();
+		expect(rewritten).toContain("Session resident text blob missing");
+		expect(rewritten).toContain("original content unavailable");
+		expect(rewritten).not.toContain(sentinel);
+		await fileDoesNotContainBlobRef(sessionFile);
 	});
 
 	it("keeps warm materialized resident text readable until entry revision invalidation after cache deletion", async () => {

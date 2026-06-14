@@ -70,9 +70,15 @@ describe("GJC native skill-state hooks", () => {
 				artifactRefs: [
 					{
 						id: "cli-run",
-						kind: "test-report",
+						kind: "cli-replay",
 						description: "CLI verification transcript",
-						inlineEvidence: "The CLI test report verified the approved flow and recorded the passing result.",
+						replay: {
+							schemaVersion: 1,
+							kind: "cli-replay",
+							replaySafe: true,
+							command: ["bun", "-e", 'console.log("ultragoal-cli-ok")'],
+							recordedStdout: "ultragoal-cli-ok\n",
+						},
 					},
 					{
 						id: "adversarial",
