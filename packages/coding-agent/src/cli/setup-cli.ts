@@ -3,8 +3,11 @@
  *
  * Handles `gjc setup [component]` to install the normal defaults or optional feature dependencies.
  */
+
 import * as path from "node:path";
-import { $which, APP_NAME, getPythonEnvDir } from "@gajae-code/utils";
+import { createInterface } from "node:readline/promises";
+import { SqliteAuthCredentialStore } from "@gajae-code/ai";
+import { $which, APP_NAME, getAgentDbPath, getPythonEnvDir } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
@@ -14,6 +17,7 @@ import {
 	readGjcManagedCodexHooksStatus,
 } from "../hooks/codex-native-hooks-config";
 import { theme } from "../modes/theme/theme";
+import { discoverExternalCredentials, formatDiscoverySummary, importCredentials } from "../setup/credential-import";
 import {
 	formatHermesSetupResult,
 	type HermesSetupFlags,
@@ -27,7 +31,7 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 
-export type SetupComponent = "defaults" | "hermes" | "hooks" | "provider" | "python" | "stt";
+export type SetupComponent = "credentials" | "defaults" | "hermes" | "hooks" | "provider" | "python" | "stt";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -57,10 +61,12 @@ export interface SetupCommandArgs {
 		gjcCommand?: string;
 		target?: string;
 		profileDir?: string;
+		yes?: boolean;
+		dryRun?: boolean;
 	};
 }
 
-const VALID_COMPONENTS: SetupComponent[] = ["defaults", "hermes", "hooks", "provider", "python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -113,6 +119,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.smoke = true;
 		} else if (arg === "--install") {
 			flags.install = true;
+		} else if (arg === "--yes" || arg === "-y") {
+			flags.yes = true;
+		} else if (arg === "--dry-run") {
+			flags.dryRun = true;
 		} else if (arg === "--root") {
 			flags.root = [...(flags.root ?? []), args[++i] ?? ""];
 		} else if (arg === "--repo") {
@@ -242,6 +252,9 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			break;
 		case "stt":
 			await handleSttSetup(cmd.flags);
+			break;
+		case "credentials":
+			await handleCredentialsSetup(cmd.flags);
 			break;
 	}
 }
@@ -472,6 +485,122 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 		process.exit(1);
 	}
 }
+async function confirmImport(count: number): Promise<boolean> {
+	if (!process.stdin.isTTY) return false;
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		const answer = (await rl.question(`Import ${count} credential(s) into ${getAgentDbPath()}? [y/N] `))
+			.trim()
+			.toLowerCase();
+		return answer === "y" || answer === "yes";
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * Discover existing Claude Code / Codex CLI credentials and import them into the
+ * gjc credential store after a redacted preview + confirmation. Falls back to
+ * manual-setup guidance when nothing importable is found.
+ */
+async function handleCredentialsSetup(flags: { json?: boolean; yes?: boolean; dryRun?: boolean }): Promise<void> {
+	const result = await discoverExternalCredentials();
+	const redactedPlan = {
+		importable: result.importable.map(c => ({
+			provider: c.provider,
+			kind: c.kind,
+			source: c.source,
+			identity: c.identity,
+			expiresAt: c.expiresAt,
+			redactedToken: c.redactedToken,
+		})),
+		skipped: result.skipped,
+		environment: result.environment,
+	};
+
+	if (result.importable.length === 0) {
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
+			return;
+		}
+		for (const line of formatDiscoverySummary(result)) process.stdout.write(`  ${line}\n`);
+		process.stdout.write(
+			chalk.yellow(
+				`\nNo importable Claude/Codex credentials found. Continue with manual setup:\n` +
+					`  ${APP_NAME} setup provider   (add an API-compatible provider)\n` +
+					`  ${APP_NAME} (then /login)     (interactive OAuth/subscription login)\n`,
+			),
+		);
+		return;
+	}
+
+	if (!flags.json) {
+		process.stdout.write(chalk.bold("Discovered credentials (redacted):\n"));
+		for (const line of formatDiscoverySummary(result)) process.stdout.write(`  ${line}\n`);
+	}
+
+	if (flags.dryRun) {
+		if (flags.json) process.stdout.write(`${JSON.stringify({ ...redactedPlan, dryRun: true, imported: [] })}\n`);
+		else process.stdout.write(chalk.dim(`\nDry run — no credentials imported.\n`));
+		return;
+	}
+
+	const confirmed = flags.yes || (await confirmImport(result.importable.length));
+	if (!confirmed) {
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
+			return;
+		}
+		process.stdout.write(chalk.dim(`\nImport cancelled. Re-run with --yes to import non-interactively.\n`));
+		return;
+	}
+
+	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+	let summary: Awaited<ReturnType<typeof importCredentials>>;
+	try {
+		summary = await importCredentials(result.importable, (provider, credential) =>
+			store.upsertAuthCredentialForProvider(provider, credential),
+		);
+	} finally {
+		store.close();
+	}
+
+	if (flags.json) {
+		process.stdout.write(
+			`${JSON.stringify({
+				...redactedPlan,
+				imported: summary.imported.map(c => ({ provider: c.provider, kind: c.kind, source: c.source })),
+				failed: summary.failed.map(f => ({
+					provider: f.credential.provider,
+					source: f.credential.source,
+					error: f.error,
+				})),
+			})}\n`,
+		);
+		if (summary.failed.length > 0) process.exitCode = 1;
+		return;
+	}
+
+	for (const credential of summary.imported) {
+		process.stdout.write(
+			`${chalk.green(`${theme.status.success} imported`)} ${formatCredentialSummaryLine(credential)}\n`,
+		);
+	}
+	for (const failure of summary.failed) {
+		process.stdout.write(
+			`${chalk.red(`${theme.status.error} failed`)} ${failure.credential.provider} (${failure.credential.source}): ${failure.error}\n`,
+		);
+	}
+	if (summary.failed.length > 0) {
+		process.exitCode = 1;
+		return;
+	}
+	process.stdout.write(chalk.dim(`\nCredentials saved to ${getAgentDbPath()}\n`));
+}
+
+function formatCredentialSummaryLine(credential: { provider: string; kind: string; source: string }): string {
+	return `${credential.provider} · ${credential.kind} (from ${credential.source})`;
+}
 
 /**
  * Print setup command help.
@@ -489,6 +618,7 @@ ${chalk.bold("Components:")}
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
+  credentials Optional: import existing Claude Code / Codex CLI credentials
 
 
 ${chalk.bold("Provider example:")}
@@ -524,6 +654,8 @@ ${chalk.bold("Options:")}
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
   --target          Hermes config file target for config-only install
   --profile-dir     Hermes profile directory for full setup install
+  --dry-run         Preview discovered credentials without importing (credentials)
+  -y, --yes         Import discovered credentials without an interactive prompt (credentials)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills
@@ -536,5 +668,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available
   ${APP_NAME} setup python --check   Check if Python execution is available
+  ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
+  ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
+  ${APP_NAME} setup credentials --yes      Import without an interactive prompt
 `);
 }

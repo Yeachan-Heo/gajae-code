@@ -5,7 +5,7 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const COMPONENTS: SetupComponent[] = ["defaults", "hermes", "hooks", "provider", "python", "stt"];
+const COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
 
 export default class Setup extends Command {
 	static description = "Install GJC defaults or optional feature dependencies";
@@ -47,6 +47,8 @@ export default class Setup extends Command {
 		"api-key-env": Flags.string({ description: "Read provider API key from this environment variable" }),
 		model: Flags.string({ description: "Model id to add (repeat or comma-separate)", multiple: true }),
 		"models-path": Flags.string({ description: "Override models config path" }),
+		yes: Flags.boolean({ char: "y", description: "Import discovered credentials without an interactive prompt" }),
+		"dry-run": Flags.boolean({ description: "Preview discovered credentials without importing" }),
 	};
 
 	async run(): Promise<void> {
@@ -79,6 +81,8 @@ export default class Setup extends Command {
 				gjcCommand: flags["gjc-command"],
 				target: flags.target,
 				profileDir: flags["profile-dir"],
+				yes: flags.yes,
+				dryRun: flags["dry-run"],
 			},
 		};
 		await initTheme();

@@ -4,7 +4,7 @@ import { matchesSelectCancel } from "../../modes/utils/keybinding-matchers";
 import { formatModelOnboardingGuidance } from "../../setup/model-onboarding-guidance";
 import { DynamicBorder } from "./dynamic-border";
 
-export type ProviderOnboardingAction = "custom-provider-wizard" | "oauth-login" | "api-guide";
+export type ProviderOnboardingAction = "custom-provider-wizard" | "oauth-login" | "import-credentials" | "api-guide";
 
 interface ProviderOnboardingOption {
 	label: string;
@@ -13,6 +13,11 @@ interface ProviderOnboardingOption {
 }
 
 const PROVIDER_ONBOARDING_OPTIONS: ProviderOnboardingOption[] = [
+	{
+		label: "Import existing credentials",
+		description: "Detect and import Claude Code / Codex CLI logins already on this machine.",
+		action: "import-credentials",
+	},
 	{
 		label: "Add custom provider",
 		description: "Configure an OpenAI- or Anthropic-compatible API provider interactively.",
