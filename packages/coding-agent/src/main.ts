@@ -39,6 +39,11 @@ import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import type { MCPManager } from "./runtime-mcp";
 import {
+	adoptStartupMCPDiscovery,
+	cleanupStartupMCPDiscovery,
+	prepareStartupMCPDiscovery,
+} from "./runtime-mcp/startup-wiring";
+import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
@@ -933,8 +938,31 @@ export async function runRootCommand(
 		});
 		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)(createAcpSession);
 	} else {
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } =
-			await createSession(sessionOptions);
+		// Subagents do not enter this CLI startup path; keep runtime MCP discovery scoped to standard sessions.
+		const startupMCP = await prepareStartupMCPDiscovery({
+			cwd,
+			enabled: settingsInstance.get("mcp.enableRuntimeDiscovery") === true,
+			enableProjectConfig: settingsInstance.get("mcp.enableProjectConfig"),
+			authStorage,
+		});
+		if (startupMCP) sessionOptions.mcpManager = startupMCP.manager;
+
+		let sessionResult: CreateAgentSessionResult;
+		try {
+			sessionResult = await createSession(sessionOptions);
+			if (startupMCP) {
+				await adoptStartupMCPDiscovery({
+					session: sessionResult.session,
+					settings: settingsInstance,
+					startup: startupMCP,
+				});
+			}
+		} catch (error) {
+			await cleanupStartupMCPDiscovery(startupMCP);
+			throw error;
+		}
+
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = sessionResult;
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}

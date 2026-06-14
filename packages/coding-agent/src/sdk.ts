@@ -54,7 +54,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
 import { TtsrManager } from "./export/ttsr";
-import type { CustomCommandsLoadResult, LoadedCustomCommand } from "./extensibility/custom-commands";
+import type { CustomCommandsLoadResult } from "./extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
 import { CustomToolAdapter } from "./extensibility/custom-tools/wrapper";
 import {
@@ -80,6 +80,7 @@ import { resolveMemoryBackend } from "./memory-backend";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import { MCPManager } from "./runtime-mcp";
+import { wireRuntimeMCPManager } from "./runtime-mcp/manager-wiring";
 import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
@@ -707,54 +708,6 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 
 // Factory
 
-/**
- * Build LoadedCustomCommand entries for all MCP prompts across connected servers.
- * These are re-created whenever prompts change (setOnPromptsChanged callback).
- */
-function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
-	const commands: LoadedCustomCommand[] = [];
-	for (const serverName of manager.getConnectedServers()) {
-		const prompts = manager.getServerPrompts(serverName);
-		if (!prompts?.length) continue;
-		for (const prompt of prompts) {
-			const commandName = `${serverName}:${prompt.name}`;
-			commands.push({
-				path: `mcp:${commandName}`,
-				resolvedPath: `mcp:${commandName}`,
-				source: "bundled",
-				command: {
-					name: commandName,
-					description: prompt.description ?? `MCP prompt from ${serverName}`,
-					async execute(args: string[]) {
-						const promptArgs: Record<string, string> = {};
-						for (const arg of args) {
-							const eqIdx = arg.indexOf("=");
-							if (eqIdx > 0) {
-								promptArgs[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
-							}
-						}
-						const result = await manager.executePrompt(serverName, prompt.name, promptArgs);
-						if (!result) return "";
-						const parts: string[] = [];
-						for (const msg of result.messages) {
-							const contentItems = Array.isArray(msg.content) ? msg.content : [msg.content];
-							for (const item of contentItems) {
-								if (item.type === "text") {
-									parts.push(item.text);
-								} else if (item.type === "resource") {
-									const resource = item.resource;
-									if (resource.text) parts.push(resource.text);
-								}
-							}
-						}
-						return parts.join("\n\n");
-					},
-				},
-			});
-		}
-	}
-	return commands;
-}
 /**
  * Create an AgentSession with the specified options.
  *
@@ -2138,37 +2091,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Wire MCP manager callbacks to session for reactive tool updates.
 		// Skip when reusing a parent's manager — the parent owns the callbacks.
 		if (mcpManager && !options.mcpManager) {
-			mcpManager.setOnToolsChanged(tools => {
-				void session.refreshMCPTools(tools);
-			});
-			// Wire prompt refresh → rebuild MCP prompt slash commands
-			mcpManager.setOnPromptsChanged(serverName => {
-				const promptCommands = buildMCPPromptCommands(mcpManager);
-				session.setMCPPromptCommands(promptCommands);
-				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
-			});
-			const notificationDebounceTimers = new Map<string, Timer>();
-			const clearDebounceTimers = () => {
-				for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
-				notificationDebounceTimers.clear();
-			};
-			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
-			mcpManager.setOnResourcesChanged((serverName, uri) => {
-				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
-				if (!settings.get("mcp.notifications")) return;
-				const debounceMs = settings.get("mcp.notificationDebounceMs");
-				const key = `${serverName}:${uri}`;
-				const existing = notificationDebounceTimers.get(key);
-				if (existing) clearTimeout(existing);
-				notificationDebounceTimers.set(
-					key,
-					setTimeout(() => {
-						notificationDebounceTimers.delete(key);
-						// Re-check: user may have disabled notifications during the debounce window
-						if (!settings.get("mcp.notifications")) return;
-						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
-					}, debounceMs),
-				);
+			wireRuntimeMCPManager({
+				manager: mcpManager,
+				session,
+				settings,
+				registerCleanup: postmortem.register,
 			});
 		}
 

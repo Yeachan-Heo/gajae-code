@@ -1550,6 +1550,11 @@
 					"type": "boolean",
 					"default": false
 				},
+				"enableRuntimeDiscovery": {
+					"type": "boolean",
+					"description": "Enable standard (non-ACP) session startup discovery and connection of configured runtime MCP servers (e.g. ~/.gjc/agent/mcp.json). Off by default for security; project-level MCP config still requires mcp.enableProjectConfig=true. Does not affect ACP sessions or subagents.",
+					"default": false
+				},
 				"discoveryMode": {
 					"type": "boolean",
 					"default": false

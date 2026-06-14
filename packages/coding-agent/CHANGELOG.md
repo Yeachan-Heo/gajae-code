@@ -8,6 +8,9 @@
 
 - `gjc --mode rpc` registers each live session in a cross-process registry (`<agent-dir>/rpc-sessions/<id>.json`) on start and removes it on shutdown, so other processes can enumerate running RPC sessions. The Python `gjc_rpc` client exposes `list_sessions()` / `RpcClient.list_sessions()` returning typed `SessionHandle`s and reaps records whose owning process is gone (issue 10; foundation for reattach/issue 09).
 - `gjc --mode rpc --listen <socket-path>` runs a persistent Unix-domain-socket RPC server: the `AgentSession` outlives client disconnects (no stdin-EOF teardown) and a client can disconnect and reconnect to the same live session over the socket. The session is registered with `transport: "socket"` and the socket path as its `endpoint`, so it is discoverable/attachable via the registry. The stdio path is unchanged (frame output routes through a swappable sink shared by both transports) (issue 09).
+### Added
+
+- Standard (non-ACP) `gjc` sessions can opt into runtime MCP server discovery via the new `mcp.enableRuntimeDiscovery` setting (default **false**). When enabled, MCP servers configured in `~/.gjc/agent/mcp.json` (and, only when `mcp.enableProjectConfig=true`, project-level `.mcp.json` / `.gjc/mcp.json`) are discovered, connected, and their tools surfaced as active session tools — e.g. CodeGraph via `codegraph serve --mcp`. Default-off preserves the existing MCP quarantine: no manager is constructed, no on-disk MCP config is read or connected, and no `mcp__*` tools register unless the setting is enabled. Project-level config may be read by capability loading but project servers are filtered out before connect unless `mcp.enableProjectConfig=true`. ACP sessions (client-supplied `session/new.mcpServers` only) and subagents (MCP-free) are unchanged. Failed MCP servers degrade non-fatally with redacted startup warnings keyed by `mcp:<name>`.
 
 ### Fixed
 

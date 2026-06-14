@@ -2205,6 +2205,13 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 	},
 
+	"mcp.enableRuntimeDiscovery": {
+		type: "boolean",
+		default: false,
+		description:
+			"Enable standard (non-ACP) session startup discovery and connection of configured runtime MCP servers (e.g. ~/.gjc/agent/mcp.json). Off by default for security; project-level MCP config still requires mcp.enableProjectConfig=true. Does not affect ACP sessions or subagents.",
+	},
+
 	"mcp.discoveryMode": {
 		type: "boolean",
 		default: false,
