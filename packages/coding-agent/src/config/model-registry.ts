@@ -910,7 +910,7 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 	const output = resolvedModel.output ?? reference?.output;
 	return enrichModelThinking({
 		id: resolvedModel.id,
-		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
+		name: resolvedModel.name ?? reference?.name ?? (options.useDefaults ? resolvedModel.id : undefined),
 		api: resolvedModel.api,
 		provider: resolvedModel.provider,
 		baseUrl: resolvedModel.baseUrl,
