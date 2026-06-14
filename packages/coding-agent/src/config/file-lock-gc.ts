@@ -2,6 +2,7 @@
  * GC adapter for config file-locks (`<file>.lock` dirs holding `{pid, timestamp}`).
  */
 
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir, isEnoent } from "@gajae-code/utils";
@@ -92,7 +93,7 @@ async function walkForLockDirs(
 		return;
 	}
 
-	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	let stat: Stats;
 	try {
 		stat = await fs.lstat(dir);
 	} catch (error) {

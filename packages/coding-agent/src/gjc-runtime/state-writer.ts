@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
@@ -113,7 +114,7 @@ export interface GenericHardPruneTarget {
 export interface GenericHardPruneSelectorContext {
 	path: string;
 	category: WriterCategory | string;
-	stat: Awaited<ReturnType<typeof fs.stat>>;
+	stat: Stats;
 	readJson: () => Promise<unknown>;
 }
 
@@ -639,7 +640,7 @@ export async function hardPrune(
 	const removed: string[] = [];
 	for (const target of targets) {
 		const filePath = resolveGjcTarget(target.path, cwd);
-		let stat: Awaited<ReturnType<typeof fs.stat>>;
+		let stat: Stats;
 		try {
 			stat = await fs.stat(filePath);
 		} catch (error) {
