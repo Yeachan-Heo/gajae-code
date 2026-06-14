@@ -2065,6 +2065,26 @@ export async function checkpointUltragoalGoal(input: {
 	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
+	const ledgerBefore = await readUltragoalLedger(input.cwd);
+	if (
+		goal.status === input.status &&
+		goal.evidence === evidence &&
+		ledgerBefore.some(
+			event =>
+				event.event === "goal_checkpointed" &&
+				event.goalId === goal.id &&
+				event.status === input.status &&
+				event.evidence === evidence,
+		)
+	) {
+		// Idempotent re-checkpoint: this goal is already recorded in the target status with the same
+		// evidence, so skip the plan rewrite and ledger append to avoid duplicate goal_checkpointed
+		// events. The ledger is the dedup source of truth because it is exactly what a duplicate write
+		// would corrupt (mirrors the ralplan #638 guard). Requiring a matching ledger row means an
+		// interrupted prior write (plan persisted, ledger append lost) still re-appends the event
+		// instead of silently dropping it.
+		return plan;
+	}
 	const qualityGateJson =
 		input.status === "complete"
 			? await readRequiredCompletionQualityGate(input.cwd, input.qualityGateJson)
@@ -2072,7 +2092,6 @@ export async function checkpointUltragoalGoal(input: {
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
 	const now = new Date().toISOString();
-	const ledgerBefore = await readUltragoalLedger(input.cwd);
 	const beforeStatus = goal.status;
 	if (input.status === "complete") {
 		const blockedGoalId =

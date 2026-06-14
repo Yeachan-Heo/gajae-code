@@ -1268,6 +1268,54 @@ describe("native GJC ultragoal runtime", () => {
 		});
 	});
 
+	it("dedups duplicate checkpoint ledger entries for an unchanged status and evidence (#645)", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const goalsPath = path.join(root, ".gjc", "ultragoal", "goals.json");
+		const countCheckpoints = async (): Promise<number> =>
+			(await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed").length;
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		const goalsAfterFirst = await Bun.file(goalsPath).text();
+
+		// Re-checkpoint with identical status + evidence: idempotent — no ledger append, no plan rewrite.
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFirst);
+
+		// Whitespace-only differences still resolve to the same checkpoint (evidence is trimmed).
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "  blocked by obsolete dependency  ",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFirst);
+
+		// A genuine change (new evidence) is still recorded as a fresh checkpoint.
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by a different upstream regression",
+		});
+		expect(await countCheckpoints()).toBe(2);
+	});
+
 	it("accepts full goal get tool result snapshots with millisecond timestamps", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
