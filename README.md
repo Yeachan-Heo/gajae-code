@@ -168,12 +168,15 @@ The default dark TUI identity is the GJC red-claw theme, while light-appearance 
 
 ## Development
 
-Install dependencies and local defaults:
+Install dependencies, build native bindings, and set up local defaults:
 
 ```sh
 bun install
+bun run build:native
 bun run install:defaults
 ```
+
+The `.node` binary for `@gajae-code/natives` is gitignored and required before any CLI invocation (`install:defaults`, `dev:link`, tests).
 
 ### Canonical: build and link the dev `gjc`
 
