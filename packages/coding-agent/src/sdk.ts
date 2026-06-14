@@ -132,6 +132,7 @@ import {
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { guardToolForUltragoalAsk } from "./tools/ultragoal-ask-guard";
 import { EventBus } from "./utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "./utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -1792,7 +1793,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const initialTools = initialToolNames
 			.map(name => toolRegistry.get(name))
-			.filter((tool): tool is AgentTool => tool !== undefined);
+			.filter((tool): tool is AgentTool => tool !== undefined)
+			// AgentSession tool wrapping is not installed until after Agent construction.
+			.map(tool => guardToolForUltragoalAsk(tool, () => sessionManager.getCwd()));
 
 		const openaiWebsocketSetting = settings.get("providers.openaiWebsockets") ?? "off";
 		const preferOpenAICodexWebsockets =

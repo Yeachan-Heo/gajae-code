@@ -93,6 +93,9 @@ export class RpcHostToolBridge {
 	}
 
 	setTools(tools: RpcHostToolDefinition[]): AgentTool[] {
+		if (tools.some(tool => tool.name === "ask")) {
+			throw new Error('RPC host tool "ask" is reserved and cannot be supplied by the host');
+		}
 		this.#definitions = new Map(tools.map(tool => [tool.name, tool]));
 		return tools.map(tool => new RpcHostToolAdapter(tool, this));
 	}
