@@ -50,10 +50,14 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 		.filter(([left, right]) => resolveColor(colors[left], vars) === resolveColor(colors[right], vars))
 		.map(([left, right]) => `${left} matches ${right}`);
 
+	const expectedBuiltIns = ["blue-crab", "claude-code", "codex", "opencode", "red-claw"];
 	const retainedBuiltIns =
-		[...defaultIndex.matchAll(/^import /gm)].length === 2 &&
-		[...defaultIndex.matchAll(/^\t"/gm)].length === 2 &&
+		[...defaultIndex.matchAll(/^import /gm)].length === expectedBuiltIns.length &&
+		[...defaultIndex.matchAll(/^\t/gm)].length === expectedBuiltIns.length &&
 		defaultIndex.includes('"blue-crab": blue_crab') &&
+		defaultIndex.includes('"claude-code": claude_code') &&
+		defaultIndex.includes("\tcodex,") &&
+		defaultIndex.includes("\topencode,") &&
 		defaultIndex.includes('"red-claw": red_claw') &&
 		!defaultIndex.includes("dark_") &&
 		!defaultIndex.includes("light_") &&
@@ -77,7 +81,7 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 			`settings default blue-crab: ${settings.includes('default: "blue-crab"')}`,
 			`runtime autoDarkTheme red-claw: ${themeRuntime.includes('autoDarkTheme: string = "red-claw"')}`,
 			`runtime autoLightTheme blue-crab: ${themeRuntime.includes('autoLightTheme: string = "blue-crab"')}`,
-			`retained built-ins only: ${retainedBuiltIns}`,
+			`expected built-in themes (${expectedBuiltIns.join(", ")}): ${retainedBuiltIns}`,
 			`semantic collisions: ${semanticFindings.join("; ") || "<none>"}`,
 		],
 	};

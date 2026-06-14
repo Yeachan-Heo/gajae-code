@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { TEMPLATE } from "../src/export/html/template.generated";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
+import { defaultThemes } from "../src/modes/theme/defaults";
 import blueCrabTheme from "../src/modes/theme/defaults/blue-crab.json" with { type: "json" };
 import redClawTheme from "../src/modes/theme/defaults/red-claw.json" with { type: "json" };
-import { defaultThemes } from "../src/modes/theme/defaults";
 import * as themeModule from "../src/modes/theme/theme";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 import { lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
@@ -52,13 +52,7 @@ describe("GJC red-claw redesign defaults", () => {
 		const themes = await themeModule.getAvailableThemes();
 
 		expect(themes).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
-		expect(Object.keys(defaultThemes).sort()).toEqual([
-			"blue-crab",
-			"claude-code",
-			"codex",
-			"opencode",
-			"red-claw",
-		]);
+		expect(Object.keys(defaultThemes).sort()).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
 		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
 	});
