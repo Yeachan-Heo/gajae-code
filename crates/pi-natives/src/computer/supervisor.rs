@@ -14,8 +14,8 @@
 //!
 //! This module is pure state (atomics + timestamps) so the safety logic is
 //! unit-tested deterministically without OS event taps; the OS hotkey listener
-//! (a CFRunLoop CGEventTap) drives `set_hotkey_live`/`heartbeat`/`trigger_stop`
-//! and is verified separately.
+//! (a `CFRunLoop` `CGEventTap`) drives
+//! `set_hotkey_live`/`heartbeat`/`trigger_stop` and is verified separately.
 
 use std::{
 	sync::{
@@ -57,8 +57,7 @@ pub struct Supervisor {
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
-		.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-		.unwrap_or(0)
+		.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl Supervisor {
@@ -75,7 +74,7 @@ impl Supervisor {
 	/// The process-global supervisor singleton.
 	pub fn global() -> &'static Self {
 		static GLOBAL: OnceLock<Supervisor> = OnceLock::new();
-		GLOBAL.get_or_init(Supervisor::new)
+		GLOBAL.get_or_init(Self::new)
 	}
 
 	/// Record that the stop path is live (or not) and refresh its heartbeat.
