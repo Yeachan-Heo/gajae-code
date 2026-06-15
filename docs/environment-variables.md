@@ -334,7 +334,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 
 | Variable             | Behavior                                                                                                          |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `GJC_CACHE_RETENTION` | If `long`, enables long retention where supported (`anthropic`, `openai-responses`, Bedrock retention resolution) |
+| `GJC_CACHE_RETENTION` | If `long`, enables long retention where supported (`anthropic`, `openai-responses`, Bedrock retention resolution); any other value forces `short`. The Anthropic provider already defaults to `long` (1h) when unset, so this is mainly an opt-out (`short`) or a way to extend long retention to other providers. |
 
 ---
 
