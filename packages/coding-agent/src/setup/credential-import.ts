@@ -136,6 +136,26 @@ function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
+/**
+ * Build a user-safe `skipped.reason` for a failed credential source.
+ *
+ * NEVER include the raw exception message: JSON parse errors and filesystem
+ * errors can echo back file contents (including bare token-like substrings) or
+ * other sensitive material, which then surfaces through CLI text/JSON and TUI
+ * discovery summaries. We expose only a generic phrase plus a non-sensitive
+ * error class (e.g. `SyntaxError`) or a standard Node syscall code (e.g.
+ * `EACCES`), both of which come from fixed, non-secret vocabularies.
+ */
+function sanitizedFailureReason(
+	base: "malformed credential file" | "unreadable credential file",
+	err: unknown,
+): string {
+	if (!(err instanceof Error)) return base;
+	const code = (err as NodeJS.ErrnoException).code;
+	const detail = typeof code === "string" && /^[A-Z][A-Z0-9_]*$/.test(code) ? code : err.constructor.name;
+	return detail ? `${base} (${detail})` : base;
+}
+
 // ─── Claude Code discovery ───────────────────────────────────────────────────
 
 function parseClaudeCredentials(
@@ -147,7 +167,7 @@ function parseClaudeCredentials(
 	try {
 		parsed = JSON.parse(raw) as ClaudeCredentialsFile;
 	} catch (err) {
-		return { origin, source, reason: `unreadable JSON (${String(err)})` };
+		return { origin, source, reason: sanitizedFailureReason("malformed credential file", err) };
 	}
 	const oauth = parsed.claudeAiOauth;
 	if (typeof oauth !== "object" || oauth === null) {
@@ -191,7 +211,7 @@ async function discoverClaudeCode(
 			result.skipped.push({
 				origin: "claude-code-file",
 				source: `Claude Code (${displayPath})`,
-				reason: `unreadable file (${String(err)})`,
+				reason: sanitizedFailureReason("unreadable credential file", err),
 			});
 		}
 	}
@@ -207,7 +227,7 @@ async function discoverClaudeCode(
 			result.skipped.push({
 				origin: "claude-code-keychain",
 				source: "Claude Code (macOS Keychain)",
-				reason: `keychain read failed (${String(err)})`,
+				reason: sanitizedFailureReason("unreadable credential file", err),
 			});
 		}
 		if (keychainRaw !== null && keychainRaw.trim().length > 0) {
@@ -232,7 +252,7 @@ function parseCodexAuth(raw: string, source: string): ImportableCredential | Ski
 	try {
 		parsed = JSON.parse(raw) as CodexAuthFile;
 	} catch (err) {
-		return { origin: "codex-file", source, reason: `unreadable JSON (${String(err)})` };
+		return { origin: "codex-file", source, reason: sanitizedFailureReason("malformed credential file", err) };
 	}
 	const tokens = parsed.tokens;
 	const access = nonEmptyString(tokens?.access_token);
@@ -302,7 +322,7 @@ async function discoverCodex(homeDir: string, result: CredentialDiscoveryResult)
 			result.skipped.push({
 				origin: "codex-file",
 				source: `Codex CLI (${displayPath})`,
-				reason: `unreadable file (${String(err)})`,
+				reason: sanitizedFailureReason("unreadable credential file", err),
 			});
 		}
 		return;

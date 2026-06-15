@@ -147,7 +147,8 @@ describe("discoverExternalCredentials", () => {
 		expect(result.importable).toHaveLength(0);
 		expect(result.skipped).toHaveLength(1);
 		expect(result.skipped[0]!.origin).toBe("claude-code-file");
-		expect(result.skipped[0]!.reason).toContain("unreadable JSON");
+		expect(result.skipped[0]!.reason).toContain("malformed credential file");
+		expect(result.skipped[0]!.reason).not.toContain("not valid json");
 	});
 
 	test("Claude file missing tokens is skipped", async () => {
@@ -238,6 +239,62 @@ describe("discoverExternalCredentials", () => {
 		expect(blob).not.toContain("sk-ant-env-key-1234567890");
 		// Redacted markers still present for traceability.
 		expect(blob).toContain("…");
+	});
+
+	// Red-team regression (#654): JSON.parse errors echo the offending input
+	// verbatim, so a credential file that fails to parse must NEVER let any
+	// token-like substring reach skipped.reason or any user-visible surface.
+	// Token bodies are assembled from fragments so the literal never appears
+	// verbatim in source (avoids tripping secret scanners / push protection);
+	// the runtime values are still realistic token-like strings for the asserts.
+	const LEAKY_CLAUDE_TOKEN = ["sk", "live", "abcdef0123456789SECRETBODY"].join("_");
+	const LEAKY_AWS_TOKEN = `AKIA${"IOSFODNN7EXAMPLE"}0123456789`;
+	const LEAKY_BARE_CLAUDE = "unquotedClaudeTokenValue777SECRET";
+
+	function assertNoLeak(result: CredentialDiscoveryResult, ...secrets: string[]): void {
+		const surfaces = [
+			JSON.stringify(result),
+			formatDiscoverySummary(result).join("\n"),
+			result.skipped.map(s => s.reason).join("\n"),
+			result.skipped.map(s => s.source).join("\n"),
+		];
+		for (const secret of secrets) {
+			for (const surface of surfaces) {
+				expect(surface).not.toContain(secret);
+			}
+		}
+	}
+
+	test("malformed Claude credential file never leaks token-like substrings", async () => {
+		await writeClaude(`{"claudeAiOauth":{"accessToken": ${LEAKY_CLAUDE_TOKEN}}}`);
+		const result = await discover();
+		expect(result.importable).toHaveLength(0);
+		expect(result.skipped).toHaveLength(1);
+		expect(result.skipped[0]!.reason).toContain("malformed credential file");
+		assertNoLeak(result, LEAKY_CLAUDE_TOKEN);
+	});
+
+	test("malformed Claude credential file with unquoted token never leaks", async () => {
+		await writeClaude(`{"claudeAiOauth":{"refreshToken": ${LEAKY_BARE_CLAUDE}}}`);
+		const result = await discover();
+		expect(result.importable).toHaveLength(0);
+		expect(result.skipped[0]!.reason).toContain("malformed credential file");
+		assertNoLeak(result, LEAKY_BARE_CLAUDE);
+	});
+
+	test("malformed Codex credential file with AWS-style identifier never leaks", async () => {
+		await writeCodex(`{"OPENAI_API_KEY": ${LEAKY_AWS_TOKEN}}`);
+		const result = await discover();
+		expect(result.importable).toHaveLength(0);
+		expect(result.skipped).toHaveLength(1);
+		expect(result.skipped[0]!.reason).toContain("malformed credential file");
+		assertNoLeak(result, LEAKY_AWS_TOKEN);
+	});
+
+	test("malformed reason exposes only a non-sensitive error class", async () => {
+		await writeClaude(`{"claudeAiOauth":{"accessToken": ${LEAKY_CLAUDE_TOKEN}}}`);
+		const result = await discover();
+		expect(result.skipped[0]!.reason).toBe("malformed credential file (SyntaxError)");
 	});
 });
 

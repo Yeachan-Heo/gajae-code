@@ -14,11 +14,6 @@ interface ProviderOnboardingOption {
 
 const PROVIDER_ONBOARDING_OPTIONS: ProviderOnboardingOption[] = [
 	{
-		label: "Import existing credentials",
-		description: "Detect and import Claude Code / Codex CLI logins already on this machine.",
-		action: "import-credentials",
-	},
-	{
 		label: "Add custom provider",
 		description: "Configure an OpenAI- or Anthropic-compatible API provider interactively.",
 		action: "custom-provider-wizard",
@@ -32,6 +27,11 @@ const PROVIDER_ONBOARDING_OPTIONS: ProviderOnboardingOption[] = [
 		label: "Add API-compatible provider",
 		description: "Show the /provider add and gjc setup provider commands.",
 		action: "api-guide",
+	},
+	{
+		label: "Import existing credentials",
+		description: "Detect and import Claude Code / Codex CLI logins already on this machine.",
+		action: "import-credentials",
 	},
 ];
 
