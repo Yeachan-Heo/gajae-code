@@ -36,8 +36,19 @@ export class ExtensionUiController {
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
 	#hookSelectorMouseReportingEnabled = false;
+	#activeHookCustomComponent?: Component & { dispose?(): void };
+	#activeHookCustomOverlay?: OverlayHandle;
 
 	constructor(private ctx: InteractiveModeContext) {}
+
+	#clearActiveHookCustom(): void {
+		const component = this.#activeHookCustomComponent;
+		const overlay = this.#activeHookCustomOverlay;
+		this.#activeHookCustomComponent = undefined;
+		this.#activeHookCustomOverlay = undefined;
+		component?.dispose?.();
+		overlay?.hide();
+	}
 
 	/**
 	 * Initialize the hook system with TUI-based UI context.
@@ -301,7 +312,11 @@ export class ExtensionUiController {
 		spacerWhenEmpty: boolean,
 		leadingSpacer: boolean,
 	): void {
-		container.clear();
+		// Detach (not dispose): hook widgets are persistent instances owned by the
+		// #hookWidgets* maps and re-added on every rebuild. Disposal happens only on
+		// explicit removal (#removeHookWidget) or clearHookWidgets(), so a rebuild must
+		// not tear down a still-live widget (e.g. an extension CancellableLoader timer).
+		container.detachAll();
 
 		if (widgets.size === 0) {
 			if (spacerWhenEmpty) {
@@ -840,15 +855,12 @@ export class ExtensionUiController {
 
 		const { promise, resolve } = Promise.withResolvers<T>();
 		let component: (Component & { dispose?(): void }) | undefined;
-		let overlayHandle: OverlayHandle | undefined;
 		let closed = false;
 
 		const close = (result: T) => {
 			if (closed) return;
 			closed = true;
-			component?.dispose?.();
-			overlayHandle?.hide();
-			overlayHandle = undefined;
+			this.#clearActiveHookCustom();
 			if (!options?.overlay) {
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
@@ -859,14 +871,16 @@ export class ExtensionUiController {
 			resolve(result);
 		};
 
+		this.#clearActiveHookCustom();
 		Promise.try(() => factory(this.ctx.ui, theme, keybindings, close)).then(c => {
 			if (closed) {
 				c.dispose?.();
 				return;
 			}
 			component = c;
+			this.#activeHookCustomComponent = c;
 			if (options?.overlay) {
-				overlayHandle = this.ctx.ui.showOverlay(component, {
+				this.#activeHookCustomOverlay = this.ctx.ui.showOverlay(component, {
 					anchor: "bottom-center",
 					width: "100%",
 					maxHeight: "100%",
@@ -895,6 +909,7 @@ export class ExtensionUiController {
 	}
 
 	clearHookWidgets(): void {
+		this.#clearActiveHookCustom();
 		for (const widget of this.#hookWidgetsAbove.values()) {
 			widget.dispose?.();
 		}

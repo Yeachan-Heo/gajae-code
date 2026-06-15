@@ -59,6 +59,14 @@ export interface Component {
 	 * Called when theme changes or when component needs to re-render from scratch.
 	 */
 	invalidate(): void;
+
+	/**
+	 * Optional cleanup hook. Called once when the component is permanently
+	 * removed from the tree via removeChild/clear/dispose. Implementations MUST
+	 * be idempotent. Components meant to be re-added should be detached, not
+	 * removed/cleared.
+	 */
+	dispose?(): void;
 }
 
 /**
@@ -196,6 +204,7 @@ export interface OverlayHandle {
  */
 export class Container implements Component {
 	children: Component[] = [];
+	#disposed = false;
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -205,11 +214,36 @@ export class Container implements Component {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {
 			this.children.splice(index, 1);
+			component.dispose?.();
+		}
+	}
+
+	/** Remove a child without disposing it (for detach-then-readd reuse). */
+	detachChild(component: Component): void {
+		const index = this.children.indexOf(component);
+		if (index !== -1) {
+			this.children.splice(index, 1);
 		}
 	}
 
 	clear(): void {
+		for (const child of this.children) {
+			child.dispose?.();
+		}
 		this.children = [];
+	}
+
+	/** Remove all children without disposing them (for detach-then-readd reuse). */
+	detachAll(): void {
+		this.children = [];
+	}
+
+	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		for (const child of this.children) {
+			child.dispose?.();
+		}
 	}
 
 	invalidate(): void {
@@ -222,7 +256,10 @@ export class Container implements Component {
 		width = Math.max(1, width);
 		const lines: string[] = [];
 		for (const child of this.children) {
-			lines.push(...child.render(width));
+			const childLines = child.render(width);
+			for (let i = 0; i < childLines.length; i++) {
+				lines.push(childLines[i]);
+			}
 		}
 		return lines;
 	}
@@ -239,6 +276,13 @@ type LineNormalizationCacheEntry = {
 export class TUI extends Container {
 	terminal: Terminal;
 	#previousLines: string[] = [];
+	/**
+	 * Raw (pre-normalization) lines from the previous frame, kept only when the
+	 * virtual-viewport flag is on. Used to detect whether the off-screen prefix is
+	 * unchanged (by raw value equality, with a fast reference short-circuit when components
+	 * return stable string instances) so its normalized form can be reused (bounded normalize).
+	 */
+	#previousRaw: string[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
 	#lineTruncationCache = new Map<string, string>();
 	#lineNormalizationCacheLimit = 0;
@@ -269,6 +313,9 @@ export class TUI extends Container {
 	#sixelProbeUnsubscribe?: () => void;
 	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
 	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
+	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
+	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
+	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT");
 	#maxLinesRendered = 0; // Line count from last render, used for viewport calculation
 	#fullRedrawCount = 0;
 	#stopped = false;
@@ -663,6 +710,7 @@ export class TUI extends Container {
 		// focus/listener state is intentionally preserved so input routing survives
 		// a resume.
 		this.#previousLines = [];
+		this.#previousRaw = [];
 		this.#lineNormalizationCache.clear();
 		this.#lineTruncationCache.clear();
 		this.#previousWidth = 0;
@@ -679,6 +727,7 @@ export class TUI extends Container {
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
+			this.#previousRaw = [];
 			this.#lineNormalizationCache.clear();
 			this.#lineTruncationCache.clear();
 			this.#previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
@@ -1204,14 +1253,16 @@ export class TUI extends Container {
 		};
 	}
 
+	/** Normalize + width-fit a single line for emission (image lines pass through). */
+	#normalizeLineForEmit(line: string, width: number): string {
+		if (TERMINAL.isImageLine(line)) return line;
+		const { normalized, terminated } = this.#normalizeLineForRender(line);
+		return this.#lineFitsWidth(normalized, width) ? terminated : this.#truncateNormalizedLine(normalized, width);
+	}
+
 	#applyLineResetsAndTruncate(lines: string[], width: number): string[] {
 		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (TERMINAL.isImageLine(line)) continue;
-			const { normalized, terminated } = this.#normalizeLineForRender(line);
-			lines[i] = this.#lineFitsWidth(normalized, width)
-				? terminated
-				: this.#truncateNormalizedLine(normalized, width);
+			lines[i] = this.#normalizeLineForEmit(lines[i], width);
 		}
 		this.#trimLineCachesForRender(lines.length);
 		return lines;
@@ -1247,11 +1298,60 @@ export class TUI extends Container {
 		// (closes SGR + OSC 8 hyperlink state). Must run after cursor extraction
 		// because the marker is embedded mid-line, and before any diff/full render
 		// path so cache comparisons stay byte-accurate.
-		newLines = this.#applyLineResetsAndTruncate(newLines, width);
-
-		// Width changed - need full re-render (line wrapping changes)
+		// Width/height change detection (used for both normalization reuse and full-redraw decisions).
 		const widthChanged = this.#previousWidth !== 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
+
+		// Normalize/truncate lines for emission. With the opt-in virtual-viewport flag
+		// (PI_TUI_VIRTUAL_VIEWPORT) we reuse the previous frame's normalized prefix when the
+		// off-screen raw prefix is unchanged (raw value equality per line; fast reference
+		// short-circuit for cached components), so only the visible window is
+		// re-normalized and the diff starts at the window. Output is byte-identical to the
+		// full path (reused entries are deterministic normalizations of identical raw lines).
+		const VIEWPORT_NORMALIZE_OVERSCAN = 8;
+		const rawLines = newLines;
+		const total = rawLines.length;
+		let diffStart = 0;
+		let usedWindowNormalize = false;
+		if (
+			this.#virtualViewport &&
+			!widthChanged &&
+			this.#previousRaw.length > 0 &&
+			this.#previousLines.length === this.#previousRaw.length
+		) {
+			const winTop = Math.max(0, total - height - VIEWPORT_NORMALIZE_OVERSCAN);
+			if (winTop <= this.#previousLines.length && winTop <= this.#previousRaw.length) {
+				let stable = true;
+				for (let i = 0; i < winTop; i++) {
+					if (rawLines[i] !== this.#previousRaw[i]) {
+						stable = false;
+						break;
+					}
+				}
+				if (stable) {
+					const windowed = this.#previousLines.slice(0, winTop);
+					for (let i = winTop; i < total; i++) {
+						windowed.push(this.#normalizeLineForEmit(rawLines[i], width));
+					}
+					this.#trimLineCachesForRender(total);
+					newLines = windowed;
+					diffStart = winTop;
+					usedWindowNormalize = true;
+				}
+			}
+		}
+		if (!usedWindowNormalize) {
+			newLines = this.#applyLineResetsAndTruncate(this.#virtualViewport ? rawLines.slice() : rawLines, width);
+		}
+		if (this.#virtualViewport) {
+			this.#previousRaw = rawLines;
+		}
+		if (renderMetrics.enabled) {
+			renderMetrics.recordLineCount("rendered", total);
+			renderMetrics.recordLineCount("normalized", total - diffStart);
+			renderMetrics.recordLineCount("measured", total - diffStart);
+			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
+		}
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean, reason = "full render"): void => {
@@ -1390,7 +1490,10 @@ export class TUI extends Container {
 		let firstChanged = -1;
 		let lastChanged = -1;
 		const maxLines = Math.max(newLines.length, this.#previousLines.length);
-		for (let i = 0; i < maxLines; i++) {
+		if (renderMetrics.enabled) renderMetrics.recordLineCount("diffed", maxLines - diffStart);
+		// When the off-screen prefix was reused (virtual viewport), it is verified
+		// unchanged (raw value equality), so the diff can safely start at the window boundary.
+		for (let i = diffStart; i < maxLines; i++) {
 			const oldLine = i < this.#previousLines.length ? this.#previousLines[i] : "";
 			const newLine = i < newLines.length ? newLines[i] : "";
 

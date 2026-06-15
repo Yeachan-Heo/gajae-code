@@ -65,6 +65,11 @@ export class OAuthSelectorComponent extends Container {
 		this.#validationGeneration += 1;
 		this.#stopSpinner();
 	}
+
+	dispose(): void {
+		this.stopValidation();
+		super.dispose();
+	}
 	#loadProviders(): void {
 		this.#allProviders = getOAuthProviders();
 	}

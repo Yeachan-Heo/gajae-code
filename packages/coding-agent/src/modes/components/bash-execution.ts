@@ -155,7 +155,11 @@ export class BashExecutionComponent extends Container {
 		const hasSixelOutput = sixelLineMask?.some(Boolean) ?? false;
 
 		// Rebuild content container
-		this.#contentContainer.clear();
+		// Detach (not dispose): #headerText and the running #loader are persistent,
+		// reused instances re-added below. A disposing clear() would stop the loader's
+		// animation timer mid-run. Final teardown still stops the loader via the
+		// component's recursive dispose().
+		this.#contentContainer.detachAll();
 
 		// Command header
 		this.#contentContainer.addChild(this.#headerText);

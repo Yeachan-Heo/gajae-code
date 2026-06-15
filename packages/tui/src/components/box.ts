@@ -11,6 +11,7 @@ type Cache = {
  */
 export class Box implements Component {
 	children: Component[] = [];
+	#disposed = false;
 	#paddingX: number;
 	#paddingY: number;
 	#bgFn?: (text: string) => string;
@@ -34,11 +35,39 @@ export class Box implements Component {
 		if (index !== -1) {
 			this.children.splice(index, 1);
 			this.#invalidateCache();
+			component.dispose?.();
+		}
+	}
+
+	/** Remove a child without disposing it (for detach-then-readd reuse). */
+	detachChild(component: Component): void {
+		const index = this.children.indexOf(component);
+		if (index !== -1) {
+			this.children.splice(index, 1);
+			this.#invalidateCache();
 		}
 	}
 
 	clear(): void {
+		for (const child of this.children) {
+			child.dispose?.();
+		}
 		this.children = [];
+		this.#invalidateCache();
+	}
+
+	/** Remove all children without disposing them (for detach-then-readd reuse). */
+	detachAll(): void {
+		this.children = [];
+		this.#invalidateCache();
+	}
+
+	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		for (const child of this.children) {
+			child.dispose?.();
+		}
 		this.#invalidateCache();
 	}
 

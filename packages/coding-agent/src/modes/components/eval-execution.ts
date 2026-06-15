@@ -114,7 +114,11 @@ export class EvalExecutionComponent extends Container {
 		const previewLogicalLines = availableLines.slice(-PREVIEW_LINES);
 		const hiddenLineCount = availableLines.length - previewLogicalLines.length;
 
-		this.#contentContainer.clear();
+		// Detach (not dispose): #headerText and the running #loader are persistent,
+		// reused instances re-added below. A disposing clear() would stop the loader's
+		// animation timer mid-run. Final teardown still stops the loader via the
+		// component's recursive dispose().
+		this.#contentContainer.detachAll();
 
 		this.#contentContainer.addChild(this.#headerText);
 
