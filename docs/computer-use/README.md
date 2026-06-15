@@ -1,6 +1,8 @@
 # Native computer-use tool
 
-Status: **in progress (draft)** — Slice 1 foundation only.
+Status: **in progress (draft)** — coordinate contract + native `screenshot`
+capture landed and verified; input primitives, kill-switch, and napi/TS surface
+to follow.
 
 A new, model-agnostic `computer` tool that lets any model drive the user's real
 macOS desktop via the OpenAI computer-use action set. Built fresh (the
@@ -44,7 +46,7 @@ the committed summary and roadmap.
   boundary so an out-of-process daemon can replace it later without changing the
   napi surface.
 
-## Coordinate contract (shipped)
+## Capture + coordinate contract (shipped)
 
 `crates/pi-natives/src/computer/coords.rs` implements the pure, framework-free
 core: `NormalizedDisplay` maps a screenshot-space pixel `(x, y)` to a macOS
@@ -52,6 +54,14 @@ logical point via per-axis scale and the display's logical origin, rejecting
 out-of-bounds and non-finite inputs. It is unit-tested (scale 1.0/2.0,
 fractional and anisotropic scale, non-zero origins, edges, out-of-bounds,
 invalid scale) and requires no display or granted permissions.
+
+`crates/pi-natives/src/computer/capture.rs` (macOS) implements the read-only
+`screenshot` primitive: it captures the primary display via CoreGraphics into a
+PNG and derives the `NormalizedDisplay` scale from captured physical pixels vs
+logical bounds, surfacing a missing Screen Recording grant as
+`CaptureError::CaptureFailed` (never a silent black frame). Verified live: a
+real, non-uniform primary-display capture decodes as a PNG with matching
+dimensions (`cargo test -p pi-natives --ignored captures_non_uniform_primary_display`).
 
 ## Delivery roadmap
 
@@ -63,12 +73,13 @@ manual macOS E2E).
 | Slice | Scope | Status |
 |-------|-------|--------|
 | Coordinate contract + planning docs | `coords` module + unit tests + this doc | **done (this PR)** |
-| Native capture + input backend | capture, input, permissions, `execute_action` | planned |
+| Native screen capture (`screenshot`) | `capture` module, primary display, PNG + scale | **done (this PR, verified live)** |
+| Native input backend | `input`, `permissions`, `execute_action` (click/type/drag/scroll/keypress) | planned |
 | Kill-switch supervisor + event-tap lifecycle | supervisor, hotkey, abort/release/suspend/snapshot | planned |
 | napi bindings + TS `computer` tool surface | `ComputerController`, schema, gating, prompt, renderer | planned |
 | Manual macOS E2E acceptance | TextEdit all-nine + kill-switch drill | planned (requires macOS hardware + granted TCC + human operator) |
 
-The native backend, kill-switch, napi/TS surface, and manual end-to-end
-acceptance require real macOS hardware, granted TCC permissions, and a
+The remaining input backend, kill-switch, napi/TS surface, and manual
+end-to-end acceptance still require injecting events into a live desktop and a
 human-operated drill, so they are tracked as follow-up work rather than landed
 in this draft.
