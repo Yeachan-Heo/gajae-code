@@ -2161,11 +2161,18 @@ mod tests {
 			}
 		});
 
-		let first_seen = time::timeout(Duration::from_secs(2), first_rx.recv())
-			.await
-			.expect("first command should emit startup marker")
-			.expect("first output channel should remain open");
-		assert!(first_seen.starts_with("first-start"), "unexpected first chunk: {first_seen:?}");
+		// Output may arrive in multiple chunks: the reader emits whatever bytes
+		// are decodable per pipe read, so a logical marker can be split across
+		// chunks (e.g. a lone "f"). Accumulate until the full marker is present.
+		let mut first_seen = String::new();
+		while !first_seen.starts_with("first-started") {
+			let chunk = time::timeout(Duration::from_secs(2), first_rx.recv())
+				.await
+				.expect("first command should emit startup marker")
+				.expect("first output channel should remain open");
+			first_seen.push_str(&chunk);
+		}
+		assert!(first_seen.starts_with("first-started"), "unexpected first output: {first_seen:?}");
 
 		let second = tokio::spawn({
 			let shell = shell.clone();
@@ -2202,10 +2209,16 @@ mod tests {
 		assert!(!second_result.cancelled, "queued run must not steal the abort target");
 		assert_eq!(second_result.exit_code, Some(0));
 
-		let second_seen = time::timeout(Duration::from_secs(2), second_rx.recv())
-			.await
-			.expect("second command should emit after active abort")
-			.expect("second output channel should remain open");
+		// The queued run's `printf second-ran` output can likewise be split
+		// across chunks; accumulate until the full marker is received.
+		let mut second_seen = String::new();
+		while second_seen != "second-ran" {
+			let chunk = time::timeout(Duration::from_secs(2), second_rx.recv())
+				.await
+				.expect("second command should emit after active abort")
+				.expect("second output channel should remain open");
+			second_seen.push_str(&chunk);
+		}
 		assert_eq!(second_seen, "second-ran");
 	}
 
