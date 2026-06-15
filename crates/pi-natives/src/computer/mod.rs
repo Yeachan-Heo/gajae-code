@@ -24,7 +24,11 @@
 #[cfg(target_os = "macos")]
 pub mod capture;
 pub mod coords;
+#[cfg(target_os = "macos")]
+pub mod permissions;
 
 #[cfg(target_os = "macos")]
 pub use capture::{CaptureError, CapturedFrame, capture_primary_display};
 pub use coords::{CoordError, LogicalPoint, NormalizedDisplay};
+#[cfg(target_os = "macos")]
+pub use permissions::{PermissionError, PreflightStatus, TccPermission, preflight};
