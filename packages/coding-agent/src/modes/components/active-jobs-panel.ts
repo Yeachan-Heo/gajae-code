@@ -245,9 +245,12 @@ export class ActiveJobsPanelComponent extends Container {
 		const delay = this.#nextRefreshDelay(this.#now());
 		this.#labelTimer = setTimeout(() => {
 			this.#labelTimer = undefined;
-			if (this.#disposed || !this.isVisible()) return;
+			if (this.#disposed) return;
+			// Always redraw at the boundary: if this deadline expired the last
+			// visible job, the render clears the panel. Only keep the timer
+			// running while something remains visible.
 			this.#requestRender();
-			this.#scheduleLabelRefresh();
+			if (this.isVisible()) this.#scheduleLabelRefresh();
 		}, delay);
 		this.#labelTimer.unref?.();
 	}

@@ -165,4 +165,23 @@ describe("ActiveJobsPanelComponent", () => {
 		}
 		panel.dispose();
 	});
+	test("requests a render and clears itself when the last job expires at its TTL deadline", async () => {
+		let nowValue = NOW;
+		const expiringSoon = mon({ id: "done", status: "completed", endTime: NOW - (COMPLETED_MONITOR_VISIBLE_MS - 60) });
+		const snapshot = snap({ monitors: [expiringSoon] });
+		const controller = makeController(snapshot);
+		let renders = 0;
+		const panel = new ActiveJobsPanelComponent(controller, { requestRender: () => renders++, now: () => nowValue });
+		panel.setSnapshot(snapshot);
+		expect(panel.isVisible()).toBe(true);
+		const before = renders;
+		// Advance time past the completed TTL; the scheduled boundary timer must
+		// redraw (clearing the panel) even though no observer event fires.
+		nowValue = NOW + 200;
+		await new Promise(resolve => setTimeout(resolve, 160));
+		expect(renders).toBeGreaterThan(before);
+		expect(panel.isVisible()).toBe(false);
+		expect(panel.render(80)).toEqual([]);
+		panel.dispose();
+	});
 });
