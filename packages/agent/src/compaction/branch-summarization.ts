@@ -5,7 +5,7 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { Model } from "@gajae-code/ai";
+import type { Model, ProviderSessionState } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
@@ -79,6 +79,10 @@ export interface GenerateBranchSummaryOptions {
 	reserveTokens?: number;
 	/** Optional metadata forwarded to the underlying API request (e.g. user_id for session attribution). */
 	metadata?: Record<string, unknown>;
+	sessionId?: string;
+	providerSessionState?: Map<string, ProviderSessionState>;
+	preferWebsockets?: boolean;
+	authCredentialType?: "api_key" | "oauth";
 	/** Convert app-specific messages before serializing the branch summary prompt. */
 	convertToLlm?: ConvertToLlm;
 	/**
@@ -307,7 +311,16 @@ export async function generateBranchSummary(
 	const response = await instrumentedCompleteSimple(
 		model,
 		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
-		{ apiKey, signal, maxTokens: 2048, metadata },
+		{
+			apiKey,
+			signal,
+			maxTokens: 2048,
+			metadata,
+			sessionId: options.sessionId,
+			providerSessionState: options.providerSessionState,
+			preferWebsockets: options.preferWebsockets,
+			authCredentialType: options.authCredentialType,
+		},
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
 	);
 
