@@ -76,7 +76,8 @@ manual macOS E2E).
 | Native screen capture (`screenshot`) | `capture` module, primary display, PNG + scale | **done (this PR, verified live)** |
 | TCC preflight (`permissions`) | Accessibility + Screen Recording checks, Settings openers, fail-closed guards | **done (this PR, verified live)** |
 | napi screenshot binding (`computerScreenshot`) | napi → `packages/natives` → TS, verified live | **done (this PR)** |
-| Native input backend | `input`, `execute_action` (click/type/drag/scroll/keypress) | planned (gated on Accessibility in a granted gjc process) |
+| Native input orchestration (`input`) | `InputController` click/double_click/move/drag/scroll/type/keypress + release_all over an `EventSink` | **logic done (this PR, unit-verified)** — real `CGEvent` firing gated on Accessibility in a granted gjc process |
+| Central `execute_action` state machine | preflight + supervisor + cancellation + audit + release-all | planned |
 | Kill-switch supervisor + event-tap lifecycle | supervisor, hotkey, abort/release/suspend/snapshot | planned |
 | TS `computer` tool surface | full `ComputerController` + `computer.ts` schema/gating/prompt/renderer | planned |
 | Manual macOS E2E acceptance | TextEdit all-nine + kill-switch drill | planned (requires macOS hardware + granted TCC + human operator) |
