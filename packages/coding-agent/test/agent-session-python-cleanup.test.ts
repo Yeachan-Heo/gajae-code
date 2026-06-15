@@ -84,12 +84,10 @@ const emptyWorkspaceTree = (cwd: string): WorkspaceTree => ({
 });
 
 const PYTHON_DISPOSE_WAIT_MS = 3_000;
-const MOCK_IMMEDIATE_SLEEP_THRESHOLD_MS = 2_500;
-
 const mockLongPythonDisposeSleepsImmediate = () => {
 	const realSleep = Bun.sleep.bind(Bun);
 	return vi.spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
-		if (typeof duration === "number" && duration >= MOCK_IMMEDIATE_SLEEP_THRESHOLD_MS) {
+		if (typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS) {
 			return Promise.resolve();
 		}
 		return realSleep(duration ?? 0);
@@ -419,9 +417,7 @@ describe("AgentSession python cleanup", () => {
 		const [toolResult] = await Promise.all([toolExecution, disposeSession]);
 
 		expect(
-			sleepSpy.mock.calls.some(
-				([duration]) => typeof duration === "number" && duration >= MOCK_IMMEDIATE_SLEEP_THRESHOLD_MS,
-			),
+			sleepSpy.mock.calls.some(([duration]) => typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS),
 		).toBe(true);
 
 		expect(disposed).toBe(true);
