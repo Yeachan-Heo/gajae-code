@@ -458,13 +458,13 @@ fn run_pty_sync(
 	ct.heartbeat()
 		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before openpty: {err}")))?;
 
-	const PTY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 	let pair = if cfg!(windows) {
 		// Windows ConPTY openpty() can hang indefinitely when the console
 		// subsystem isn't properly initialized. Gate attempts process-wide so
 		// a hung openpty can leave at most one residual blocked thread behind.
 		#[cfg(windows)]
 		{
+			const PTY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 			let attempt = WindowsOpenptyAttempt::acquire()?;
 			let (tx, rx) = mpsc::channel();
 			let handle = std::thread::spawn(move || {
@@ -538,15 +538,17 @@ fn run_pty_sync(
 	ct.heartbeat()
 		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before reader: {err}")))?;
 
-	let mut writer = setup_guard.take_writer()?;
+	let writer = setup_guard.take_writer()?;
 	// ConPTY sends ESC[6n (cursor position query) and blocks until we reply.
 	// Reply with cursor at 1,1 so it unblocks the child spawn.
 	// Only needed on Windows; on Unix/macOS this would corrupt stdin.
 	#[cfg(windows)]
-	{
+	let writer = {
+		let mut writer = writer;
 		let _ = writer.write_all(b"\x1b[1;1R");
 		let _ = writer.flush();
-	}
+		writer
+	};
 	setup_guard.set_writer(writer);
 	let mut reader = setup_guard.try_clone_reader()?;
 
