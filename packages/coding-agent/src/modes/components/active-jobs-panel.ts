@@ -16,7 +16,11 @@ import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import {
 	buildCollapsedRows,
 	buildExpandedWindow,
+	COLLAPSED_JOB_ROW_CAP,
+	COMPLETED_MONITOR_VISIBLE_MS,
 	clampScrollOffset,
+	FAILED_MONITOR_VISIBLE_MS,
+	filterVisibleJobs,
 	hasVisibleJobs,
 	TAIL_MAX_BYTES,
 	TAIL_MAX_LINES_PER_MONITOR,
@@ -104,13 +108,16 @@ export class ActiveJobsPanelComponent extends Container {
 		this.#requestRender();
 	}
 
-	/** ctrl+down: scroll down while expanded; collapse when already at the top. */
+	/** ctrl+down: scroll the expanded list down; collapse only once at the bottom. */
 	onCollapseDown(): void {
 		if (this.#disposed || !this.isVisible() || !this.#expanded) return;
-		if (this.#scrollOffset <= 0) {
-			this.#expanded = false;
-		} else {
+		const budget = this.#expandedHeightBudget();
+		const win = buildExpandedWindow(this.#snapshot, this.#now(), this.#scrollOffset, budget, this.#tailRecord());
+		this.#scrollOffset = win.scrollOffset;
+		if (win.canScrollDown) {
 			this.#scrollBy(1);
+		} else {
+			this.#expanded = false;
 		}
 		this.#syncTimers();
 		this.#requestRender();
@@ -138,10 +145,21 @@ export class ActiveJobsPanelComponent extends Container {
 	}
 
 	#renderCollapsed(width: number, now: number): string[] {
-		const view = buildCollapsedRows(this.#snapshot, now, { width });
-		const lines: string[] = [`Active jobs (${view.totalVisible}) — ctrl+↑ expand`];
-		for (const row of view.rows) lines.push(`  ${row.text}`);
-		if (view.overflow > 0) lines.push(`  +${view.overflow} more`);
+		const maxRows = Math.max(1, this.#maxRows);
+		const full = buildCollapsedRows(this.#snapshot, now, { cap: COLLAPSED_JOB_ROW_CAP, width });
+		const header = `Active jobs (${full.totalVisible}) — ctrl+↑ expand`;
+		// On a tiny budget the header alone is the one-line summary.
+		if (maxRows <= 1) return [header];
+		// Reserve the header row; reserve one more for "+N more" only when needed.
+		const rowBudget = maxRows - 1;
+		let shown = full.rows.slice(0, rowBudget);
+		let overflow = full.totalVisible - shown.length;
+		if (overflow > 0 && shown.length === rowBudget) {
+			shown = full.rows.slice(0, Math.max(0, rowBudget - 1));
+			overflow = full.totalVisible - shown.length;
+		}
+		const lines: string[] = [header, ...shown.map(row => `  ${row.text}`)];
+		if (overflow > 0) lines.push(`  +${overflow} more`);
 		return lines;
 	}
 
@@ -149,6 +167,8 @@ export class ActiveJobsPanelComponent extends Container {
 		const budget = this.#expandedHeightBudget();
 		const win = buildExpandedWindow(this.#snapshot, now, this.#scrollOffset, budget, this.#tailRecord(), width);
 		this.#visibleMonitorIds = win.visibleMonitorTailIds;
+		// Keep internal scroll state aligned with the clamped window after job/tail churn.
+		this.#scrollOffset = win.scrollOffset;
 		const shownStart = win.totalRows === 0 ? 0 : win.scrollOffset + 1;
 		const shownEnd = win.scrollOffset + win.visibleRows.length;
 		const indicators = `${win.canScrollUp ? "↑" : " "}${win.canScrollDown ? "↓" : " "}`;
@@ -205,8 +225,24 @@ export class ActiveJobsPanelComponent extends Container {
 		}
 	}
 
+	/**
+	 * Next refresh delay: the earlier of the next minute label boundary and the
+	 * nearest visible terminal-monitor TTL deadline, so completed/failed rows drop
+	 * on time even without an upstream observer event.
+	 */
+	#nextRefreshDelay(now: number): number {
+		let delay = MS_PER_MINUTE - (now % MS_PER_MINUTE);
+		for (const monitor of filterVisibleJobs(this.#snapshot, now).monitors) {
+			if (monitor.status === "running" || monitor.status === "paused" || monitor.endTime === undefined) continue;
+			const ttl = monitor.status === "failed" ? FAILED_MONITOR_VISIBLE_MS : COMPLETED_MONITOR_VISIBLE_MS;
+			const remaining = monitor.endTime + ttl - now;
+			if (remaining > 0 && remaining < delay) delay = remaining;
+		}
+		return Math.max(1, delay);
+	}
+
 	#scheduleLabelRefresh(): void {
-		const delay = MS_PER_MINUTE - (this.#now() % MS_PER_MINUTE);
+		const delay = this.#nextRefreshDelay(this.#now());
 		this.#labelTimer = setTimeout(() => {
 			this.#labelTimer = undefined;
 			if (this.#disposed || !this.isVisible()) return;

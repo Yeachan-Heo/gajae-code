@@ -129,4 +129,40 @@ describe("ActiveJobsPanelComponent", () => {
 		expect(panel.isExpanded()).toBe(false);
 		panel.dispose();
 	});
+	test("ctrl+down scrolls the expanded list to the last job, then collapses at the bottom", () => {
+		const monitors = Array.from({ length: 15 }, (_, i) =>
+			mon({ id: `m${i}`, label: `mon${i}`, status: "running", startTime: NOW - i }),
+		);
+		const crons = Array.from({ length: 50 }, (_, i) =>
+			cron({ id: `c${i}`, prompt: `promptnum${i}`, createdAt: NOW - i }),
+		);
+		const { panel } = makePanel(snap({ monitors, crons }));
+		panel.setMaxRows(8); // small window forces real scrolling
+		panel.onExpandUp();
+		expect(panel.isExpanded()).toBe(true);
+
+		const seen: string[] = [];
+		let guard = 0;
+		while (panel.isExpanded() && guard++ < 1000) {
+			seen.push(...panel.render(120));
+			panel.onCollapseDown();
+		}
+		// last cron (oldest createdAt -> c49) is reachable before the panel collapses
+		expect(seen.some(line => line.includes("promptnum49"))).toBe(true);
+		// and the panel does eventually collapse at the bottom
+		expect(panel.isExpanded()).toBe(false);
+		panel.dispose();
+	});
+
+	test("collapsed render never exceeds the max-row budget", () => {
+		const monitors = Array.from({ length: 6 }, (_, i) => mon({ id: `m${i}`, startTime: NOW - i }));
+		const { panel } = makePanel(snap({ monitors }));
+		for (const max of [1, 2, 3, 5, 10]) {
+			panel.setMaxRows(max);
+			const lines = panel.render(120);
+			expect(lines.length).toBeLessThanOrEqual(max);
+			expect(lines[0]).toContain("Active jobs");
+		}
+		panel.dispose();
+	});
 });

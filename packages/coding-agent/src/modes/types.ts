@@ -71,6 +71,8 @@ export interface InteractiveModeContext {
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
+	/** Owned slot for the passive monitor/cron panel (sibling of the hook containers). */
+	activeJobsPanelContainer: Container;
 	/** Passive monitor/cron visualization panel rendered below the editor. */
 	activeJobsPanel?: ActiveJobsPanelComponent;
 	statusLine: StatusLineComponent;
