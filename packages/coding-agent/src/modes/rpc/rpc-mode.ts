@@ -13,7 +13,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $pickenv, readLines, Snowflake } from "@gajae-code/utils";
+import { $pickenv, logger, readLines, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -167,12 +167,22 @@ function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "e
 	return "info";
 }
 
+export class RpcListenRefusedError extends Error {
+	constructor(socketPath: string) {
+		super(
+			`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
+				"Stop it first or choose a different --listen path.",
+		);
+		this.name = "RpcListenRefusedError";
+	}
+}
+
 /**
  * Probe whether a unix-domain socket path has a live server accepting
- * connections. Returns `true` only when a connection succeeds (a previous owner
- * is still alive), so `--listen` startup can refuse to unlink a live endpoint
- * instead of stealing it (#606). A missing path or a stale socket with no
- * listener (ENOENT / ECONNREFUSED) returns `false`.
+ * connections. Returns `true` when a connection succeeds (a previous owner is
+ * still alive), and returns `false` only for known missing/stale endpoints
+ * (ENOENT / ECONNREFUSED). Unexpected probe failures fail closed as "alive" so
+ * `--listen` startup refuses to unlink a path it could not safely classify.
  */
 export async function isUnixSocketAlive(socketPath: string): Promise<boolean> {
 	try {
@@ -182,8 +192,15 @@ export async function isUnixSocketAlive(socketPath: string): Promise<boolean> {
 		});
 		socket.end();
 		return true;
-	} catch {
-		return false;
+	} catch (err) {
+		const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+		if (code === "ENOENT" || code === "ECONNREFUSED") return false;
+		logger.warn("RPC --listen socket probe failed closed", {
+			socketPath,
+			code: typeof code === "string" ? code : undefined,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return true;
 	}
 }
 
@@ -712,11 +729,10 @@ export async function runRpcMode(
 		// Refuse to clobber a live previous owner: probe the path first and only
 		// unlink a stale endpoint. A second `--listen` on the same path must not
 		// remove the socket another running server is still serving (#606).
+		// Unexpected probe failures are treated as alive, so this also refuses
+		// rather than unlinking a socket path we could not safely classify.
 		if (await isUnixSocketAlive(socketPath)) {
-			throw new Error(
-				`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
-					"Stop it first or choose a different --listen path.",
-			);
+			throw new RpcListenRefusedError(socketPath);
 		}
 		await fs.rm(socketPath, { force: true }).catch(() => {});
 		await registerRpcSession({

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -15,6 +15,12 @@ afterEach(async () => {
 });
 
 describe("isUnixSocketAlive (--listen live-owner probe, #606)", () => {
+	const originalConnect = Bun.connect;
+
+	afterEach(() => {
+		Bun.connect = originalConnect;
+	});
+
 	it("returns false for a socket path that does not exist", async () => {
 		expect(await isUnixSocketAlive(path.join(dir, "missing.sock"))).toBe(false);
 	});
@@ -36,5 +42,27 @@ describe("isUnixSocketAlive (--listen live-owner probe, #606)", () => {
 
 		server.stop(true);
 		expect(await isUnixSocketAlive(socketPath)).toBe(false);
+	});
+
+	it("returns false only for known stale/missing connect error codes", async () => {
+		for (const code of ["ENOENT", "ECONNREFUSED"]) {
+			Bun.connect = mock(async () => {
+				const error = new Error(code) as Error & { code: string };
+				error.code = code;
+				throw error;
+			}) as typeof Bun.connect;
+
+			expect(await isUnixSocketAlive(path.join(dir, `${code}.sock`))).toBe(false);
+		}
+	});
+
+	it("fails closed for unexpected connect error codes", async () => {
+		Bun.connect = mock(async () => {
+			const error = new Error("permission denied") as Error & { code: string };
+			error.code = "EACCES";
+			throw error;
+		}) as typeof Bun.connect;
+
+		expect(await isUnixSocketAlive(path.join(dir, "permission.sock"))).toBe(true);
 	});
 });
