@@ -7,6 +7,9 @@
 ### Fixed
 
 - Bounded agent context growth, compaction, and token accounting for long-running sessions: `appendMessage` pushes in place instead of rebuilding the array; the append-only context keeps rolling per-message hashes instead of rescanning the full digest; an emergency-compaction floor that cannot be disabled now surfaces its reason; `getSessionStats` is single-pass; and `nativeCountTokens` skips the synchronous ~39 MB BPE tokenizer above a 2 MiB input cap, falling back to the cheap heuristic (#717).
+### Fixed
+
+- Forwarded local summary, handoff, and branch-summary transport/session options to one-shot model calls so callers can preserve provider session state and WebSocket preferences.
 
 ## [0.5.2] - 2026-06-15
 

@@ -25,7 +25,7 @@ import {
 	resolveTelemetry,
 } from "@gajae-code/agent-core/telemetry";
 import type { AgentMessage } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Model, Usage } from "@gajae-code/ai";
+import type { AssistantMessage, Model, ProviderSessionState, Usage } from "@gajae-code/ai";
 import * as ai from "@gajae-code/ai";
 import { SpanStatusCode } from "@opentelemetry/api";
 import {
@@ -163,6 +163,60 @@ describe("compaction oneshot telemetry", () => {
 		expect(spansByOneshotKind(chats, "compaction_short_summary")).toHaveLength(1);
 	});
 
+	it("runs split-turn compaction summary requests sequentially", async () => {
+		let inFlight = false;
+		let maxConcurrent = 0;
+		let currentConcurrent = 0;
+		const spy = vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			if (inFlight) throw new Error("provider rejected parallel request");
+			inFlight = true;
+			currentConcurrent += 1;
+			maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
+			await Bun.sleep(1);
+			currentConcurrent -= 1;
+			inFlight = false;
+			return makeAssistantMessage("ok");
+		});
+
+		const preparation = makePreparation({
+			isSplitTurn: true,
+			turnPrefixMessages: [makeUserMessage("Inline mid-turn instruction")],
+		});
+		await compact(preparation, MODEL, "test-api-key", undefined, undefined, {
+			sessionId: "provider-session-1",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+			preferWebsockets: true,
+		});
+
+		expect(spy).toHaveBeenCalledTimes(3);
+		expect(maxConcurrent).toBe(1);
+	});
+
+	it("forwards transport options to every local compaction summary request", async () => {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(makeAssistantMessage("history summary"))
+			.mockResolvedValueOnce(makeAssistantMessage("short summary"));
+
+		await compact(makePreparation(), MODEL, "test-api-key", undefined, undefined, {
+			sessionId: "provider-session-1",
+			providerSessionState,
+			preferWebsockets: true,
+			authCredentialType: "oauth",
+		});
+
+		expect(spy).toHaveBeenCalledTimes(2);
+		for (const call of spy.mock.calls) {
+			const options = call[2];
+			if (!options) throw new Error("expected completeSimple options");
+			expect(options.sessionId).toBe("provider-session-1");
+			expect(options.providerSessionState).toBe(providerSessionState);
+			expect(options.preferWebsockets).toBe(true);
+			expect(options.authCredentialType).toBe("oauth");
+		}
+	});
+
 	it("emits no spans when telemetry is undefined", async () => {
 		vi.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(makeAssistantMessage("history"))
@@ -211,6 +265,7 @@ describe("handoff oneshot telemetry", () => {
 		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValueOnce(makeAssistantMessage("## Goal\nContinue"));
 
 		const telemetry = resolveTelemetry(makeTelemetryConfig(), "session-handoff");
+		const providerSessionState = new Map<string, ProviderSessionState>();
 		const messages: AgentMessage[] = [makeUserMessage("start"), makeAssistantMessage("starting")];
 
 		const document = await generateHandoff(messages, MODEL, "test-api-key", {
@@ -218,10 +273,19 @@ describe("handoff oneshot telemetry", () => {
 			tools: [],
 			initiatorOverride: "agent",
 			telemetry,
+			sessionId: "provider-session-handoff",
+			providerSessionState,
+			preferWebsockets: true,
+			authCredentialType: "oauth",
 		});
 
 		expect(document).toContain("Goal");
 		expect(spy).toHaveBeenCalledTimes(1);
+		const options = spy.mock.calls[0]?.[2];
+		expect(options?.sessionId).toBe("provider-session-handoff");
+		expect(options?.providerSessionState).toBe(providerSessionState);
+		expect(options?.preferWebsockets).toBe(true);
+		expect(options?.authCredentialType).toBe("oauth");
 
 		const chats = chatSpans(exporter.getFinishedSpans());
 		expect(chats).toHaveLength(1);
@@ -238,6 +302,7 @@ describe("branch summary oneshot telemetry", () => {
 			.mockResolvedValueOnce(makeAssistantMessage("branch summary text", makeUsage(50, 30)));
 
 		const telemetry = resolveTelemetry(makeTelemetryConfig(), "session-branch");
+		const providerSessionState = new Map<string, ProviderSessionState>();
 		const entries = [
 			{
 				type: "message" as const,
@@ -260,10 +325,19 @@ describe("branch summary oneshot telemetry", () => {
 			apiKey: "test-api-key",
 			signal: new AbortController().signal,
 			telemetry,
+			sessionId: "provider-session-branch",
+			providerSessionState,
+			preferWebsockets: true,
+			authCredentialType: "oauth",
 		});
 
 		expect(result.summary).toContain("branch summary text");
 		expect(spy).toHaveBeenCalledTimes(1);
+		const options = spy.mock.calls[0]?.[2];
+		expect(options?.sessionId).toBe("provider-session-branch");
+		expect(options?.providerSessionState).toBe(providerSessionState);
+		expect(options?.preferWebsockets).toBe(true);
+		expect(options?.authCredentialType).toBe("oauth");
 
 		const chats = chatSpans(exporter.getFinishedSpans());
 		expect(chats).toHaveLength(1);

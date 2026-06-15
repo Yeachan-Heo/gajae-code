@@ -12,6 +12,7 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	type ProviderSessionState,
 	type Usage,
 } from "@gajae-code/ai";
 import { isCompiledBinary, logger, prompt } from "@gajae-code/utils";
@@ -726,6 +727,9 @@ export interface SummaryOptions {
 	remoteInstructions?: string;
 	initiatorOverride?: MessageAttribution;
 	metadata?: Record<string, unknown>;
+	sessionId?: string;
+	providerSessionState?: Map<string, ProviderSessionState>;
+	preferWebsockets?: boolean;
 	convertToLlm?: ConvertToLlm;
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
@@ -801,6 +805,10 @@ export async function generateSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary" },
 	);
@@ -830,6 +838,9 @@ export interface HandoffOptions {
 	convertToLlm?: ConvertToLlm;
 	initiatorOverride?: MessageAttribution;
 	metadata?: Record<string, unknown>;
+	sessionId?: string;
+	providerSessionState?: Map<string, ProviderSessionState>;
+	preferWebsockets?: boolean;
 	/**
 	 * Optional telemetry handle. When provided, the handoff LLM call is
 	 * wrapped in an OTEL chat span tagged with `pi.gen_ai.oneshot.kind = "handoff"`.
@@ -877,6 +888,10 @@ export async function generateHandoff(
 			toolChoice: "none",
 			initiatorOverride: options.initiatorOverride,
 			metadata: options.metadata,
+			sessionId: options.sessionId,
+			providerSessionState: options.providerSessionState,
+			preferWebsockets: options.preferWebsockets,
+			authCredentialType: options.authCredentialType,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "handoff" },
 	);
@@ -936,6 +951,10 @@ async function generateShortSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary" },
 	);
@@ -1118,8 +1137,12 @@ export async function compact(
 		remoteInstructions: options?.remoteInstructions,
 		initiatorOverride: options?.initiatorOverride,
 		metadata: options?.metadata,
+		sessionId: options?.sessionId,
+		providerSessionState: options?.providerSessionState,
+		preferWebsockets: options?.preferWebsockets,
 		convertToLlm: options?.convertToLlm,
 		telemetry: options?.telemetry,
+		authCredentialType: options?.authCredentialType,
 	};
 
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
@@ -1160,10 +1183,9 @@ export async function compact(
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
-		const [historyResult, turnPrefixResult] = await Promise.all([
+		const historyResult =
 			messagesToSummarize.length > 0
-				? generateSummary(
+				? await generateSummary(
 						messagesToSummarize,
 						model,
 						settings.reserveTokens,
@@ -1173,9 +1195,15 @@ export async function compact(
 						previousSummary,
 						summaryOptions,
 					)
-				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(turnPrefixMessages, model, settings.reserveTokens, apiKey, signal, summaryOptions),
-		]);
+				: "No prior history.";
+		const turnPrefixResult = await generateTurnPrefixSummary(
+			turnPrefixMessages,
+			model,
+			settings.reserveTokens,
+			apiKey,
+			signal,
+			summaryOptions,
+		);
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
 	} else if (messagesToSummarize.length > 0) {
@@ -1205,13 +1233,7 @@ export async function compact(
 		settings.reserveTokens,
 		apiKey,
 		signal,
-		{
-			extraContext: options?.extraContext,
-			remoteEndpoint: summaryOptions.remoteEndpoint,
-			initiatorOverride: summaryOptions.initiatorOverride,
-			metadata: summaryOptions.metadata,
-			telemetry: summaryOptions.telemetry,
-		},
+		summaryOptions,
 	);
 
 	// Compute file lists and append to summary
@@ -1266,6 +1288,10 @@ async function generateTurnPrefixSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix" },
 	);

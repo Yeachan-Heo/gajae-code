@@ -56,6 +56,35 @@ describe("#697 auto-compaction respects the active custom provider", () => {
 		return modelsPath;
 	}
 
+	function writeCodexProviderModels(): string {
+		const modelsPath = path.join(tempDir.path(), "models.json");
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					codexproxy: {
+						baseUrl: "http://127.0.0.1:3455/backend-api/codex",
+						apiKeyEnv: "CODEXPROXY_API_KEY",
+						api: "openai-codex-responses",
+						auth: "apiKey",
+						models: [
+							{
+								id: "gpt-5.5",
+								name: "GPT-5.5 via codexproxy",
+								reasoning: true,
+								input: ["text", "image"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 272000,
+								maxTokens: 128000,
+							},
+						],
+					},
+				},
+			}),
+		);
+		return modelsPath;
+	}
+
 	function seedConversation(): void {
 		for (const [u, a] of [
 			["first question", "first answer"],
@@ -125,6 +154,143 @@ describe("#697 auto-compaction respects the active custom provider", () => {
 		expect(key).toBe("myproxy-secret");
 		// Regression: no OpenAI attempt anywhere in the candidate chain.
 		expect(compactSpy.mock.calls.every(([, m]) => m.provider === "myproxy")).toBe(true);
+	});
+
+	it("forwards websocket transport state to manual Codex compaction calls", async () => {
+		const modelsPath = writeCodexProviderModels();
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, modelsPath);
+		const configError = modelRegistry.getError();
+		if (configError) throw new Error(`models config error: ${configError.message}`);
+
+		const currentModel = modelRegistry.find("codexproxy", "gpt-5.5");
+		if (!currentModel) throw new Error("expected codexproxy model to load");
+
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model =>
+			model.provider === "codexproxy" ? "codexproxy-secret" : undefined,
+		);
+		vi.spyOn(modelRegistry, "getSessionCredentialType").mockReturnValue("oauth");
+
+		const agent = new Agent({
+			initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		const settings = Settings.isolated({
+			"compaction.keepRecentTokens": 1,
+			"providers.openaiWebsockets": "on",
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+		seedConversation();
+
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "ok",
+			shortSummary: "ok short",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 1,
+			details: {},
+		}));
+
+		await session.compact();
+
+		const options = compactSpy.mock.calls[0]?.[5];
+		expect(options?.preferWebsockets).toBe(true);
+		expect(options?.sessionId).toBe(agent.providerSessionId);
+		expect(options?.providerSessionState).toBe(session.providerSessionState);
+	});
+
+	it("forwards websocket transport state to manual Codex handoff calls", async () => {
+		const modelsPath = writeCodexProviderModels();
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, modelsPath);
+		const configError = modelRegistry.getError();
+		if (configError) throw new Error(`models config error: ${configError.message}`);
+
+		const currentModel = modelRegistry.find("codexproxy", "gpt-5.5");
+		if (!currentModel) throw new Error("expected codexproxy model to load");
+
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model =>
+			model.provider === "codexproxy" ? "codexproxy-secret" : undefined,
+		);
+		vi.spyOn(modelRegistry, "getSessionCredentialType").mockReturnValue("oauth");
+
+		const agent = new Agent({
+			initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		const settings = Settings.isolated({ "providers.openaiWebsockets": "on" });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+		seedConversation();
+
+		const handoffSpy = vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue");
+		const providerSessionIdBeforeHandoff = agent.providerSessionId;
+
+		const result = await session.handoff("focus on next work");
+
+		expect(result?.document).toBe("## Goal\nContinue");
+		const options = handoffSpy.mock.calls[0]?.[3];
+		expect(options?.preferWebsockets).toBe(true);
+		expect(options?.sessionId).toBe(providerSessionIdBeforeHandoff);
+		expect(options?.providerSessionState).toBe(session.providerSessionState);
+		expect(options?.authCredentialType).toBe("oauth");
+	});
+
+	it("forwards websocket transport state to Codex branch summary calls", async () => {
+		const modelsPath = writeCodexProviderModels();
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, modelsPath);
+		const configError = modelRegistry.getError();
+		if (configError) throw new Error(`models config error: ${configError.message}`);
+
+		const currentModel = modelRegistry.find("codexproxy", "gpt-5.5");
+		if (!currentModel) throw new Error("expected codexproxy model to load");
+
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model =>
+			model.provider === "codexproxy" ? "codexproxy-secret" : undefined,
+		);
+		vi.spyOn(modelRegistry, "getSessionCredentialType").mockReturnValue("oauth");
+
+		const agent = new Agent({
+			initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		const settings = Settings.isolated({ "providers.openaiWebsockets": "on" });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+		seedConversation();
+
+		const firstAssistantEntry = session.sessionManager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (!firstAssistantEntry) throw new Error("expected seeded assistant entry");
+
+		const branchSpy = vi.spyOn(compactionModule, "generateBranchSummary").mockResolvedValue({
+			summary: "branch summary",
+			readFiles: [],
+			modifiedFiles: [],
+		});
+
+		const result = await session.navigateTree(firstAssistantEntry.id, { summarize: true });
+
+		expect(result.summaryEntry?.summary).toBe("branch summary");
+		const options = branchSpy.mock.calls[0]?.[1];
+		expect(options?.preferWebsockets).toBe(true);
+		expect(options?.sessionId).toBe(agent.providerSessionId);
+		expect(options?.providerSessionState).toBe(session.providerSessionState);
+		expect(options?.authCredentialType).toBe("oauth");
 	});
 
 	it("does not fall back to OpenAI when the active provider cannot compact and only a stray OpenAI credential exists", async () => {
