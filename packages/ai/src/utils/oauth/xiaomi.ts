@@ -4,23 +4,44 @@
  * Xiaomi MiMo provides OpenAI-compatible models via
  * https://api.xiaomimimo.com/v1.
  *
- * This is not OAuth - it's a simple API key flow:
- * 1. Open browser to Xiaomi MiMo API key console
- * 2. User copies their API key
- * 3. User pastes the API key into the CLI
+ * Standard Xiaomi login opens the pay-as-you-go API key console. Token Plan
+ * login opens plan management so users copy the regional `tp-...` key.
  */
 
+import type { FetchImpl } from "../../types";
 import type { OAuthController } from "./types";
 
 const PROVIDER_ID = "xiaomi";
 const PROVIDER_NAME = "Xiaomi MiMo";
 const STANDARD_AUTH_URL = "https://platform.xiaomimimo.com/#/console/api-keys";
+const TOKEN_PLAN_AUTH_URL = "https://platform.xiaomimimo.com/console/plan-manage";
 const STANDARD_API_BASE_URL = "https://api.xiaomimimo.com/v1";
-const TOKEN_PLAN_SGP_API_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1";
-const TOKEN_PLAN_AMS_API_BASE_URL = "https://token-plan-ams.xiaomimimo.com/v1";
 const TOKEN_PLAN_KEY_PREFIX = "tp-";
 const STANDARD_VALIDATION_MODEL = "mimo-v2-flash";
 const TOKEN_PLAN_VALIDATION_MODEL = "mimo-v2.5";
+const TOKEN_PLAN_SGP_API_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1";
+const TOKEN_PLAN_AMS_API_BASE_URL = "https://token-plan-ams.xiaomimimo.com/v1";
+const TOKEN_PLAN_CN_API_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1";
+
+/** Region codes accepted by the Xiaomi Token Plan login flow. */
+export type XiaomiTokenPlanRegion = "sgp" | "ams" | "cn";
+
+type XiaomiValidationEndpoint = {
+	baseUrl: string;
+	model: string;
+};
+
+const TOKEN_PLAN_VALIDATION_ENDPOINTS: Record<XiaomiTokenPlanRegion, XiaomiValidationEndpoint> = {
+	sgp: { baseUrl: TOKEN_PLAN_SGP_API_BASE_URL, model: TOKEN_PLAN_VALIDATION_MODEL },
+	ams: { baseUrl: TOKEN_PLAN_AMS_API_BASE_URL, model: TOKEN_PLAN_VALIDATION_MODEL },
+	cn: { baseUrl: TOKEN_PLAN_CN_API_BASE_URL, model: TOKEN_PLAN_VALIDATION_MODEL },
+};
+
+const TOKEN_PLAN_REGION_NAMES: Record<XiaomiTokenPlanRegion, string> = {
+	sgp: "Singapore",
+	ams: "Europe",
+	cn: "China",
+};
 
 function isTokenPlanKey(apiKey: string): boolean {
 	return apiKey.startsWith(TOKEN_PLAN_KEY_PREFIX);
@@ -28,15 +49,24 @@ function isTokenPlanKey(apiKey: string): boolean {
 
 const VALIDATION_TIMEOUT_MS = 15_000;
 
-async function validateXiaomiApiKey(apiKey: string, signal?: AbortSignal): Promise<void> {
-	// For token-plan keys try SGP first, then AMS as fallback.
-	// Standard sk- keys only hit the one endpoint.
-	const endpoints = isTokenPlanKey(apiKey)
-		? [
-				{ baseUrl: TOKEN_PLAN_SGP_API_BASE_URL, model: TOKEN_PLAN_VALIDATION_MODEL },
-				{ baseUrl: TOKEN_PLAN_AMS_API_BASE_URL, model: TOKEN_PLAN_VALIDATION_MODEL },
-			]
-		: [{ baseUrl: STANDARD_API_BASE_URL, model: STANDARD_VALIDATION_MODEL }];
+async function validateXiaomiApiKey(
+	apiKey: string,
+	tokenPlanRegion: XiaomiTokenPlanRegion | undefined,
+	signal?: AbortSignal,
+	fetchOverride?: FetchImpl,
+): Promise<void> {
+	const fetchImpl = fetchOverride ?? fetch;
+	// Region-specific Token Plan logins must validate against the selected
+	// cluster. Generic Xiaomi login keeps the historical SGP → AMS → CN fallback.
+	const endpoints = tokenPlanRegion
+		? [TOKEN_PLAN_VALIDATION_ENDPOINTS[tokenPlanRegion]]
+		: isTokenPlanKey(apiKey)
+			? [
+					TOKEN_PLAN_VALIDATION_ENDPOINTS.sgp,
+					TOKEN_PLAN_VALIDATION_ENDPOINTS.ams,
+					TOKEN_PLAN_VALIDATION_ENDPOINTS.cn,
+				]
+			: [{ baseUrl: STANDARD_API_BASE_URL, model: STANDARD_VALIDATION_MODEL }];
 
 	let lastError: Error | null = null;
 
@@ -47,11 +77,11 @@ async function validateXiaomiApiKey(apiKey: string, signal?: AbortSignal): Promi
 		const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 		const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		try {
-			const response = await fetch(`${ep.baseUrl}/chat/completions`, {
+			const response = await fetchImpl(`${ep.baseUrl}/chat/completions`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"x-api-key": apiKey,
+					Authorization: `Bearer ${apiKey}`,
 				},
 				body: JSON.stringify({
 					model: ep.model,
@@ -112,6 +142,7 @@ async function validateXiaomiApiKey(apiKey: string, signal?: AbortSignal): Promi
  * Returns the API key directly (not OAuthCredentials - this isn't OAuth).
  */
 export async function loginXiaomi(options: OAuthController): Promise<string> {
+	const fetchImpl = options.fetch ?? fetch;
 	if (!options.onPrompt) {
 		throw new Error(`${PROVIDER_NAME} login requires onPrompt callback`);
 	}
@@ -132,6 +163,37 @@ export async function loginXiaomi(options: OAuthController): Promise<string> {
 	}
 
 	options.onProgress?.(`Validating ${PROVIDER_ID} API key...`);
-	await validateXiaomiApiKey(trimmed, options.signal);
+	await validateXiaomiApiKey(trimmed, undefined, options.signal, fetchImpl);
+	return trimmed;
+}
+
+/**
+ * Login to a regional Xiaomi Token Plan endpoint.
+ *
+ * Prompts for a token-plan API key and validates it against the selected region.
+ */
+export async function loginXiaomiTokenPlan(options: OAuthController, region: XiaomiTokenPlanRegion): Promise<string> {
+	const fetchImpl = options.fetch ?? fetch;
+	if (!options.onPrompt) {
+		throw new Error(`Xiaomi Token Plan (${TOKEN_PLAN_REGION_NAMES[region]}) login requires onPrompt callback`);
+	}
+	options.onAuth?.({
+		url: TOKEN_PLAN_AUTH_URL,
+		instructions: `Copy your token-plan API key for the ${TOKEN_PLAN_REGION_NAMES[region]} region`,
+	});
+	const apiKey = await options.onPrompt({
+		message: `Paste your Xiaomi Token Plan ${TOKEN_PLAN_REGION_NAMES[region]} API key (tp-...)`,
+		placeholder: "tp-...",
+	});
+	if (options.signal?.aborted) {
+		throw new Error("Login cancelled");
+	}
+	const trimmed = apiKey.trim();
+	if (!trimmed) {
+		throw new Error("API key is required");
+	}
+
+	options.onProgress?.(`Validating Xiaomi Token Plan (${TOKEN_PLAN_REGION_NAMES[region]}) API key...`);
+	await validateXiaomiApiKey(trimmed, region, options.signal, fetchImpl);
 	return trimmed;
 }

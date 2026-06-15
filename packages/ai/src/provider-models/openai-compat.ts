@@ -1414,64 +1414,79 @@ export function cloudflareAiGatewayModelManagerOptions(
 // ---------------------------------------------------------------------------
 // 20. Xiaomi
 // ---------------------------------------------------------------------------
+// 20. Xiaomi
+// ---------------------------------------------------------------------------
+/** Region codes for Xiaomi Token Plan clusters exposed as separate login providers. */
+export type XiaomiTokenPlanRegion = "sgp" | "ams" | "cn";
 
+/** Configures Xiaomi standard or regional Token Plan OpenAI-compatible model discovery. */
 export interface XiaomiModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
+	providerId?: Provider;
+	tokenPlanRegion?: XiaomiTokenPlanRegion;
 }
+const XIAOMI_TOKEN_PLAN_BASE_URLS: Record<XiaomiTokenPlanRegion, string> = {
+	sgp: "https://token-plan-sgp.xiaomimimo.com/v1",
+	ams: "https://token-plan-ams.xiaomimimo.com/v1",
+	cn: "https://token-plan-cn.xiaomimimo.com/v1",
+};
 
+const XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS = [
+	XIAOMI_TOKEN_PLAN_BASE_URLS.sgp,
+	XIAOMI_TOKEN_PLAN_BASE_URLS.ams,
+	XIAOMI_TOKEN_PLAN_BASE_URLS.cn,
+];
+
+/** Builds a Xiaomi model manager, preserving Token Plan region provider ids during discovery. */
 export function xiaomiModelManagerOptions(
 	config?: XiaomiModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	// Xiaomi splits API keys across two backends: standard `sk-` keys hit
-	// api.xiaomimimo.com; "token plan" `tp-` keys hit either the SG or EU
-	// token-plan host. Try SGP first; if discovery fails, retry AMS.
-	const TOKEN_PLAN_SGP_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1";
-	const TOKEN_PLAN_AMS_BASE_URL = "https://token-plan-ams.xiaomimimo.com/v1";
-	const defaultBaseUrl = apiKey?.startsWith("tp-") ? TOKEN_PLAN_SGP_BASE_URL : "https://api.xiaomimimo.com/v1";
-	// Token-plan keys always use the TP baseUrl; config?.baseUrl (from catalog)
+	const providerId = config?.providerId ?? "xiaomi";
+	const tokenPlanBaseUrls = config?.tokenPlanRegion
+		? [XIAOMI_TOKEN_PLAN_BASE_URLS[config.tokenPlanRegion]]
+		: XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS;
+	const XIAOMI_STANDARD_BASE_URL = "https://api.xiaomimimo.com/v1";
+	const isTokenPlanProvider = config?.tokenPlanRegion !== undefined || providerId.startsWith("xiaomi-token-plan-");
+	const isTokenPlanKey = isTokenPlanProvider || apiKey?.startsWith("tp-");
+	// Token-plan keys always use a TP cluster; config?.baseUrl (from catalog)
 	// would incorrectly pin to the standard endpoint (api.xiaomimimo.com).
-	const baseUrl = apiKey?.startsWith("tp-") ? defaultBaseUrl : (config?.baseUrl ?? defaultBaseUrl);
+	const baseUrl = isTokenPlanKey ? tokenPlanBaseUrls[0] : (config?.baseUrl ?? XIAOMI_STANDARD_BASE_URL);
 	const references = createBundledReferenceMap<"openai-completions">("xiaomi");
+	const fetchModels = (url: string) =>
+		fetchOpenAICompatibleModels({
+			api: "openai-completions",
+			provider: providerId,
+			baseUrl: url,
+			apiKey,
+			filterModel: (_entry, model) => !model.id.includes("-tts"),
+			mapModel: (entry, defaults) => {
+				const reference = references.get(defaults.id);
+				const model = mapWithBundledReference(entry, defaults, reference);
+				return {
+					...model,
+					api: "openai-completions",
+					provider: providerId,
+					baseUrl: defaults.baseUrl,
+					name: toModelName(entry.display_name, model.name),
+				};
+			},
+			fetch: config?.fetch,
+		});
 	return {
-		providerId: "xiaomi",
+		providerId,
 		...(apiKey && {
 			fetchDynamicModels: async () => {
-				const sgpResult = await fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "xiaomi",
-					baseUrl,
-					apiKey,
-					filterModel: (_entry, model) => !model.id.includes("-tts"),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						const model = mapWithBundledReference(entry, defaults, reference);
-						return {
-							...model,
-							name: toModelName(entry.display_name, model.name),
-						};
-					},
-				});
-				if (sgpResult || !apiKey?.startsWith("tp-")) {
-					return sgpResult;
+				if (!isTokenPlanKey) {
+					return fetchModels(baseUrl);
 				}
-				// Token-plan discovery failed with SGP; retry with AMS
-				return fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "xiaomi",
-					baseUrl: TOKEN_PLAN_AMS_BASE_URL,
-					apiKey,
-					filterModel: (_entry, model) => !model.id.includes("-tts"),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						const model = mapWithBundledReference(entry, defaults, reference);
-						return {
-							...model,
-							name: toModelName(entry.display_name, model.name),
-						};
-					},
-				});
+				for (const url of tokenPlanBaseUrls) {
+					const result = await fetchModels(url);
+					if (result) return result;
+				}
+				return null;
 			},
 		}),
 	};
@@ -2166,9 +2181,13 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 	// --- zAI ---
 	anthropicMessagesDescriptor("zai-coding-plan", "zai", "https://api.z.ai/api/anthropic"),
 	// --- Xiaomi ---
-	anthropicMessagesDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/anthropic", {
+	openAiCompletionsDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/v1", {
 		defaultContextWindow: 262144,
 		defaultMaxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			thinkingFormat: "zai",
+		},
 	}),
 	// --- MiniMax Coding Plan ---
 	openAiCompletionsDescriptor("minimax-coding-plan", "minimax-code", "https://api.minimax.io/v1", {
