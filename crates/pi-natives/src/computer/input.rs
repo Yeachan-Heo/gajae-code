@@ -130,6 +130,13 @@ impl<S: EventSink> InputController<S> {
 		!self.held_buttons.is_empty()
 	}
 
+	/// Consume the controller and return the underlying sink (e.g. to inspect
+	/// recorded events in tests).
+	#[must_use]
+	pub fn into_sink(self) -> S {
+		self.sink
+	}
+
 	fn press(&mut self, at: LogicalPoint, button: MouseButton) {
 		self.sink.mouse_button(at, button, true);
 		if !self.held_buttons.contains(&button) {

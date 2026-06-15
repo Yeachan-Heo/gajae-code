@@ -24,6 +24,7 @@
 #[cfg(target_os = "macos")]
 pub mod capture;
 pub mod coords;
+pub mod executor;
 #[cfg(target_os = "macos")]
 pub mod hotkey;
 pub mod input;
