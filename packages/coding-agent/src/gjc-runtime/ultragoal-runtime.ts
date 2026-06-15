@@ -867,7 +867,10 @@ function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 }
 
 function isComputerChangePath(row: UltragoalChangeSetPath): boolean {
-	return categorizeComputerChangePath(row.path) !== "other" || (row.oldPath ? categorizeComputerChangePath(row.oldPath) !== "other" : false);
+	return (
+		categorizeComputerChangePath(row.path) !== "other" ||
+		(row.oldPath ? categorizeComputerChangePath(row.oldPath) !== "other" : false)
+	);
 }
 
 function isDocsOnlyStaticComputerChangeSet(changeSet: UltragoalChangeSet | undefined): boolean {
@@ -888,7 +891,8 @@ function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | u
 function executorQaDeclaresComputerTouching(executorQa: JsonObject): boolean {
 	if (executorQa.computerTouching === true) return true;
 	const surfaces = Array.isArray(executorQa.surfaces) ? executorQa.surfaces : [];
-	if (surfaces.some(value => typeof value === "string" && COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(value)))) return true;
+	if (surfaces.some(value => typeof value === "string" && COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(value))))
+		return true;
 	const surfaceRows = Array.isArray(executorQa.surfaceEvidence) ? executorQa.surfaceEvidence : [];
 	return surfaceRows.some(row => {
 		const object = qualityGateObject(row);
@@ -913,7 +917,12 @@ export function normalizeSurfaceToken(value: string): string {
 
 export function surfaceFamily(value: string): SurfaceFamily {
 	const normalized = normalizeSurfaceToken(value);
-	if (["computer", "computer-use", "desktop-input", "native-input", "native", "desktop", "tui"].some(word => normalized.includes(word))) return "native";
+	if (
+		["computer", "computer-use", "desktop-input", "native-input", "native", "desktop", "tui"].some(word =>
+			normalized.includes(word),
+		)
+	)
+		return "native";
 	if (["gui", "web", "browser", "ui", "visual"].some(word => normalized.includes(word))) return "web";
 	if (["cli", "terminal", "command"].some(word => normalized.includes(word))) return "cli";
 	if (["api", "package", "library", "sdk"].some(word => normalized.includes(word))) return "api-package";
@@ -1955,12 +1964,19 @@ async function validateMandatoryComputerAdversarialCases(
 	}
 	for (const caseId of MANDATORY_COMPUTER_CASE_IDS) {
 		const row = adversarialCases.get(caseId);
-		if (!row) throw new Error(`COMPUTER_REDTEAM_CASE_MISSING: qualityGate executorQa.adversarialCases must include ${caseId}`);
+		if (!row)
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_MISSING: qualityGate executorQa.adversarialCases must include ${caseId}`,
+			);
 		if (optionalStatusField(row, `executorQa.adversarialCases.${caseId}`) === NOT_APPLICABLE_STATUS) {
-			throw new Error(`COMPUTER_REDTEAM_CASE_NOT_APPLICABLE: mandatory computer adversarial case ${caseId} must not be not_applicable`);
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_NOT_APPLICABLE: mandatory computer adversarial case ${caseId} must not be not_applicable`,
+			);
 		}
 		if (!linkedCaseIds.has(caseId)) {
-			throw new Error(`COMPUTER_REDTEAM_CASE_UNLINKED: mandatory computer adversarial case ${caseId} must be linked from contractCoverage.adversarialCaseRefs`);
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_UNLINKED: mandatory computer adversarial case ${caseId} must be linked from contractCoverage.adversarialCaseRefs`,
+			);
 		}
 		const artifactIds = requireStringLinks(row.artifactRefs, `executorQa.adversarialCases.${caseId}.artifactRefs`);
 		let hasValidLiveNativeProof = false;
@@ -1969,27 +1985,51 @@ async function validateMandatoryComputerAdversarialCases(
 		let sawMetadataOnly = false;
 		for (const artifactId of artifactIds) {
 			const artifact = artifactRefs.get(artifactId);
-			if (!artifact) throw new Error(`qualityGate executorQa.adversarialCases.${caseId}.artifactRefs references unknown id ${artifactId}`);
+			if (!artifact)
+				throw new Error(
+					`qualityGate executorQa.adversarialCases.${caseId}.artifactRefs references unknown id ${artifactId}`,
+				);
 			const fieldName = `executorQa.artifactRefs.${artifactId}`;
 			if (artifact.inlineEvidence !== undefined && !nonEmptyString(artifact.path)) sawInlineOnly = true;
-			if ((artifact.verifiedReceipt !== undefined || artifact.receipt !== undefined) && !nonEmptyString(artifact.path)) sawReceiptOnly = true;
-			if (!nonEmptyString(artifact.path) && artifact.inlineEvidence === undefined && artifact.verifiedReceipt === undefined && artifact.receipt === undefined) sawMetadataOnly = true;
+			if (
+				(artifact.verifiedReceipt !== undefined || artifact.receipt !== undefined) &&
+				!nonEmptyString(artifact.path)
+			)
+				sawReceiptOnly = true;
+			if (
+				!nonEmptyString(artifact.path) &&
+				artifact.inlineEvidence === undefined &&
+				artifact.verifiedReceipt === undefined &&
+				artifact.receipt === undefined
+			)
+				sawMetadataOnly = true;
 			try {
 				await validateArtifactProof(cwd, artifact, fieldName, { surfaceFamily: "native", live: true });
-				if (await validateStructuralArtifact(cwd, artifact, fieldName, { surfaceFamily: "native", live: true })) hasValidLiveNativeProof = true;
+				if (await validateStructuralArtifact(cwd, artifact, fieldName, { surfaceFamily: "native", live: true }))
+					hasValidLiveNativeProof = true;
 			} catch {
 				// Preserve the explicit computer red-team error taxonomy below.
 			}
 		}
 		if (!hasValidLiveNativeProof) {
-			if (sawInlineOnly) throw new Error(`COMPUTER_REDTEAM_INLINE_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`);
-			if (sawReceiptOnly) throw new Error(`COMPUTER_REDTEAM_RECEIPT_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`);
-			if (sawMetadataOnly) throw new Error(`COMPUTER_REDTEAM_ARTIFACT_METADATA_ONLY: mandatory computer adversarial case ${caseId} requires durable live structural native proof`);
-			throw new Error(`COMPUTER_REDTEAM_ARTIFACT_MISSING: mandatory computer adversarial case ${caseId} requires at least one valid live structural native proof artifact`);
+			if (sawInlineOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_INLINE_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`,
+				);
+			if (sawReceiptOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_RECEIPT_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`,
+				);
+			if (sawMetadataOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_ARTIFACT_METADATA_ONLY: mandatory computer adversarial case ${caseId} requires durable live structural native proof`,
+				);
+			throw new Error(
+				`COMPUTER_REDTEAM_ARTIFACT_MISSING: mandatory computer adversarial case ${caseId} requires at least one valid live structural native proof artifact`,
+			);
 		}
 	}
 }
-
 
 function validateContractCoverage(
 	executorQa: JsonObject,
@@ -2069,7 +2109,10 @@ async function validateExecutorQaRedTeamEvidence(
 	executorQa: JsonObject,
 	options: { changeSet?: UltragoalChangeSet } = {},
 ): Promise<void> {
-	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa, { mode: "checkpoint", changeSet: options.changeSet });
+	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa, {
+		mode: "checkpoint",
+		changeSet: options.changeSet,
+	});
 }
 
 export async function validateExecutorQaRedTeamEvidenceForReview(
@@ -2080,7 +2123,11 @@ export async function validateExecutorQaRedTeamEvidenceForReview(
 	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa as JsonObject, options);
 }
 
-async function validateCompletionQualityGate(cwd: string, gate: JsonObject, options: { changeSet?: UltragoalChangeSet } = {}): Promise<void> {
+async function validateCompletionQualityGate(
+	cwd: string,
+	gate: JsonObject,
+	options: { changeSet?: UltragoalChangeSet } = {},
+): Promise<void> {
 	const codeReview = qualityGateObject(gate.codeReview);
 	if (codeReview) {
 		throw new Error(
@@ -2136,7 +2183,11 @@ async function validateCompletionQualityGate(cwd: string, gate: JsonObject, opti
 	requireEmptyBlockers(iteration.blockers, "iteration.blockers");
 }
 
-async function readRequiredCompletionQualityGate(cwd: string, value: string | undefined, options: { changeSet?: UltragoalChangeSet } = {}): Promise<unknown> {
+async function readRequiredCompletionQualityGate(
+	cwd: string,
+	value: string | undefined,
+	options: { changeSet?: UltragoalChangeSet } = {},
+): Promise<unknown> {
 	if (!value?.trim()) {
 		throw new Error(
 			"complete checkpoints require --quality-gate-json with architectReview, executorQa, and iteration evidence",
@@ -2869,7 +2920,12 @@ function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 		const pathValue = status === "renamed" || status === "copied" ? parts[2] : parts[1];
 		if (!pathValue) continue;
 		const oldPath = status === "renamed" || status === "copied" ? parts[1] : undefined;
-		rows.push({ path: normalizeRepoPath(pathValue), oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined, status, category: categorizeComputerChangePath(pathValue) });
+		rows.push({
+			path: normalizeRepoPath(pathValue),
+			oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined,
+			status,
+			category: categorizeComputerChangePath(pathValue),
+		});
 	}
 	return rows;
 }
@@ -2899,7 +2955,11 @@ async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeS
 		baseRef,
 		mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
 		headRef: "HEAD",
-		paths: mergeChangeSetPaths([parseGitNameStatus(committed.stdout), parseGitNameStatus(unstaged.stdout), parseGitNameStatus(staged.stdout)]),
+		paths: mergeChangeSetPaths([
+			parseGitNameStatus(committed.stdout),
+			parseGitNameStatus(unstaged.stdout),
+			parseGitNameStatus(staged.stdout),
+		]),
 		rawDiffStat: stat.stdout,
 		trusted: true,
 	};
@@ -2913,7 +2973,12 @@ function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 		if (!match) continue;
 		const oldPath = normalizeRepoPath(match[1]!);
 		const newPath = normalizeRepoPath(match[2]!);
-		paths.push({ path: newPath, oldPath: oldPath === newPath ? undefined : oldPath, status: oldPath === newPath ? "modified" : "renamed", category: categorizeComputerChangePath(newPath) });
+		paths.push({
+			path: newPath,
+			oldPath: oldPath === newPath ? undefined : oldPath,
+			status: oldPath === newPath ? "modified" : "renamed",
+			category: categorizeComputerChangePath(newPath),
+		});
 	}
 	return paths;
 }
@@ -2921,11 +2986,31 @@ function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);
 	if (kind === "spec") return { source: "review-spec", paths: [], trusted: true };
-	if (kind === "pr" && typeof source.diff === "string") return { source: "review-pr", paths: parseUnifiedDiffPaths(source.diff), rawDiffStat: source.diff, trusted: true };
+	if (kind === "pr" && typeof source.diff === "string")
+		return {
+			source: "review-pr",
+			paths: parseUnifiedDiffPaths(source.diff),
+			rawDiffStat: source.diff,
+			trusted: true,
+		};
 	const local = qualityGateObject(source.local);
 	if (kind === "pr" && local) return changeSetFromReviewSource(local);
-	if (kind === "worktree") return { source: "review-worktree", paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")), rawDiffStat: String(source.diffStat ?? ""), trusted: true };
-	if (kind === "branch" || kind === "pr-fallback") return { source: "review-branch", baseRef: nonEmptyString(source.base) ?? undefined, headRef: "HEAD", paths: parseGitNameStatus(String(source.nameStatus ?? "")), rawDiffStat: String(source.diffStat ?? ""), trusted: true };
+	if (kind === "worktree")
+		return {
+			source: "review-worktree",
+			paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
+			rawDiffStat: String(source.diffStat ?? ""),
+			trusted: true,
+		};
+	if (kind === "branch" || kind === "pr-fallback")
+		return {
+			source: "review-branch",
+			baseRef: nonEmptyString(source.base) ?? undefined,
+			headRef: "HEAD",
+			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
+			rawDiffStat: String(source.diffStat ?? ""),
+			trusted: true,
+		};
 	return undefined;
 }
 
@@ -2937,7 +3022,12 @@ async function localDiffSource(cwd: string, sourceKind: string, branch?: string)
 			spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
 		]);
-		return { kind: "worktree", status: status.stdout, diffStat: diff.stdout, nameStatus: `${unstaged.stdout}\n${staged.stdout}` };
+		return {
+			kind: "worktree",
+			status: status.stdout,
+			diffStat: diff.stdout,
+			nameStatus: `${unstaged.stdout}\n${staged.stdout}`,
+		};
 	}
 	const base = await resolveGitBase(cwd, branch);
 	const [diff, nameStatus] = await Promise.all([

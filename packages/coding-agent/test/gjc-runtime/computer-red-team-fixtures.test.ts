@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 
-import { createUltragoalPlan, runNativeUltragoalCommand, startNextUltragoalGoal } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import {
+	createUltragoalPlan,
+	runNativeUltragoalCommand,
+	startNextUltragoalGoal,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
 const tempRoots: string[] = [];
 
@@ -20,7 +24,11 @@ afterEach(async () => {
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
 	if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stdout}${stderr}`);
 }
 
@@ -80,7 +88,11 @@ function syntheticPng(): Buffer {
 
 let activeObjective = "";
 async function seedPlan(root: string): Promise<void> {
-	const created = await createUltragoalPlan({ cwd: root, brief: "@goal computer gate fixture", gjcObjective: "fixture" });
+	const created = await createUltragoalPlan({
+		cwd: root,
+		brief: "@goal computer gate fixture",
+		gjcObjective: "fixture",
+	});
 	await runGit(root, ["add", ".gjc/ultragoal/goals.json", ".gjc/ultragoal/ledger.jsonl"]);
 	await runGit(root, ["commit", "-m", "plan"]);
 	activeObjective = created.gjcObjective;
@@ -88,7 +100,15 @@ async function seedPlan(root: string): Promise<void> {
 }
 
 function goalSnapshot(): string {
-	return JSON.stringify({ goal: { threadId: "test-thread", objective: activeObjective, status: "active", createdAt: Date.now(), updatedAt: Date.now() } });
+	return JSON.stringify({
+		goal: {
+			threadId: "test-thread",
+			objective: activeObjective,
+			status: "active",
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		},
+	});
 }
 
 function artifact(kind = "native screenshot"): Record<string, unknown> {
@@ -105,16 +125,25 @@ const CASES = [
 	"blast-radius",
 ];
 
-function executorQa(overrides: { cases?: Record<string, unknown>[]; artifacts?: Record<string, unknown>[]; computerTouching?: boolean; surface?: string } = {}): Record<string, unknown> {
-	const cases = overrides.cases ?? CASES.map(id => ({
-		id,
-		status: "passed",
-		contractRef: "computer-safety",
-		scenario: `${id} adversarial scenario exercises the computer safety boundary`,
-		expectedBehavior: "fail closed before unsafe desktop input can continue",
-		verdict: "passed",
-		artifactRefs: ["case-proof"],
-	}));
+function executorQa(
+	overrides: {
+		cases?: Record<string, unknown>[];
+		artifacts?: Record<string, unknown>[];
+		computerTouching?: boolean;
+		surface?: string;
+	} = {},
+): Record<string, unknown> {
+	const cases =
+		overrides.cases ??
+		CASES.map(id => ({
+			id,
+			status: "passed",
+			contractRef: "computer-safety",
+			scenario: `${id} adversarial scenario exercises the computer safety boundary`,
+			expectedBehavior: "fail closed before unsafe desktop input can continue",
+			verdict: "passed",
+			artifactRefs: ["case-proof"],
+		}));
 	return {
 		status: "passed",
 		e2eStatus: "passed",
@@ -124,25 +153,32 @@ function executorQa(overrides: { cases?: Record<string, unknown>[]; artifacts?: 
 		redTeamCommands: ["bun test fixture"],
 		changedPaths: overrides.computerTouching === true ? ["crates/pi-natives/src/computer/executor.rs"] : undefined,
 		computerTouching: overrides.computerTouching,
-		artifactRefs: overrides.artifacts ?? [artifact("native screenshot"), { ...artifact("native screenshot"), id: "case-proof" }],
-		surfaceEvidence: [{
-			id: "surface-native",
-			contractRef: "computer-safety",
-			surface: overrides.surface ?? "native",
-			status: "passed",
-			invocation: "native fixture invocation",
-			verdict: "passed",
-			artifactRefs: ["surface-proof"],
-		}],
+		artifactRefs: overrides.artifacts ?? [
+			artifact("native screenshot"),
+			{ ...artifact("native screenshot"), id: "case-proof" },
+		],
+		surfaceEvidence: [
+			{
+				id: "surface-native",
+				contractRef: "computer-safety",
+				surface: overrides.surface ?? "native",
+				status: "passed",
+				invocation: "native fixture invocation",
+				verdict: "passed",
+				artifactRefs: ["surface-proof"],
+			},
+		],
 		adversarialCases: cases,
-		contractCoverage: [{
-			id: "coverage",
-			contractRef: "computer-safety",
-			status: "covered",
-			obligation: "all mandatory computer red-team cases are covered",
-			surfaceEvidenceRefs: ["surface-native"],
-			adversarialCaseRefs: cases.map(row => String(row.id)),
-		}],
+		contractCoverage: [
+			{
+				id: "coverage",
+				contractRef: "computer-safety",
+				status: "covered",
+				obligation: "all mandatory computer red-team cases are covered",
+				surfaceEvidenceRefs: ["surface-native"],
+				adversarialCaseRefs: cases.map(row => String(row.id)),
+			},
+		],
 		blockers: [],
 	};
 }
@@ -175,14 +211,22 @@ async function writeQaArtifacts(root: string): Promise<void> {
 }
 
 async function checkpoint(root: string, qa: Record<string, unknown>): Promise<string> {
-	const result = await runNativeUltragoalCommand([
-		"checkpoint",
-		"--goal-id", "G001",
-		"--status", "complete",
-		"--evidence", "fixture complete",
-		"--gjc-goal-json", goalSnapshot(),
-		"--quality-gate-json", qualityGate(qa),
-	], root);
+	const result = await runNativeUltragoalCommand(
+		[
+			"checkpoint",
+			"--goal-id",
+			"G001",
+			"--status",
+			"complete",
+			"--evidence",
+			"fixture complete",
+			"--gjc-goal-json",
+			goalSnapshot(),
+			"--quality-gate-json",
+			qualityGate(qa),
+		],
+		root,
+	);
 	return result.stderr + result.stdout;
 }
 
@@ -207,7 +251,15 @@ describe("computer red-team fixture matrix", () => {
 		await seedPlan(root);
 		await writeQaArtifacts(root);
 		await seedComputerChange(root);
-		const message = await checkpoint(root, executorQa({ computerTouching: true, cases: (executorQa().adversarialCases as Record<string, unknown>[]).filter(row => row.id !== "blast-radius") })).catch(error => String(error));
+		const message = await checkpoint(
+			root,
+			executorQa({
+				computerTouching: true,
+				cases: (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+					row => row.id !== "blast-radius",
+				),
+			}),
+		).catch(error => String(error));
 		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 
@@ -217,7 +269,15 @@ describe("computer red-team fixture matrix", () => {
 		await seedPlan(root);
 		await writeQaArtifacts(root);
 		await seedComputerChange(root);
-		const cases = CASES.map(id => ({ id, status: id === "blast-radius" ? "not_applicable" : "passed", contractRef: "computer-safety", scenario: "scenario text", expectedBehavior: "expected behavior", verdict: "passed", artifactRefs: ["case-proof"] }));
+		const cases = CASES.map(id => ({
+			id,
+			status: id === "blast-radius" ? "not_applicable" : "passed",
+			contractRef: "computer-safety",
+			scenario: "scenario text",
+			expectedBehavior: "expected behavior",
+			verdict: "passed",
+			artifactRefs: ["case-proof"],
+		}));
 		const message = await checkpoint(root, executorQa({ cases })).catch(error => String(error));
 		expect(message).toContain("not_applicable");
 	});
@@ -228,7 +288,21 @@ describe("computer red-team fixture matrix", () => {
 		await seedPlan(root);
 		await seedComputerChange(root);
 		await writeQaArtifacts(root);
-		const message = await checkpoint(root, executorQa({ computerTouching: true, artifacts: [artifact("native screenshot"), { id: "case-proof", kind: "native metadata", description: "inline only", inlineEvidence: "inline proof is not durable live structural evidence" }] })).catch(error => String(error));
+		const message = await checkpoint(
+			root,
+			executorQa({
+				computerTouching: true,
+				artifacts: [
+					artifact("native screenshot"),
+					{
+						id: "case-proof",
+						kind: "native metadata",
+						description: "inline only",
+						inlineEvidence: "inline proof is not durable live structural evidence",
+					},
+				],
+			}),
+		).catch(error => String(error));
 		expect(message).toContain("COMPUTER_REDTEAM_INLINE_ONLY");
 	});
 
