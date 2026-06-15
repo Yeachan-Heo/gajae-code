@@ -70637,9 +70637,9 @@
 		"mimo-v2-flash": {
 			"id": "mimo-v2-flash",
 			"name": "MiMo-V2-Flash",
-			"api": "anthropic-messages",
+			"api": "openai-completions",
 			"provider": "xiaomi",
-			"baseUrl": "https://api.xiaomimimo.com/anthropic",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
 			"reasoning": true,
 			"input": [
 				"text"
@@ -70652,18 +70652,29 @@
 			},
 			"contextWindow": 262144,
 			"maxTokens": 65536,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
 			}
 		},
 		"mimo-v2-omni": {
 			"id": "mimo-v2-omni",
 			"name": "MiMo-V2-Omni",
-			"api": "anthropic-messages",
+			"api": "openai-completions",
 			"provider": "xiaomi",
-			"baseUrl": "https://api.xiaomimimo.com/anthropic",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -70677,18 +70688,29 @@
 			},
 			"contextWindow": 262144,
 			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
 			}
 		},
 		"mimo-v2-pro": {
 			"id": "mimo-v2-pro",
 			"name": "MiMo-V2-Pro",
-			"api": "anthropic-messages",
+			"api": "openai-completions",
 			"provider": "xiaomi",
-			"baseUrl": "https://api.xiaomimimo.com/anthropic",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
 			"reasoning": true,
 			"input": [
 				"text"
@@ -70701,18 +70723,29 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
 			}
 		},
 		"mimo-v2.5": {
 			"id": "mimo-v2.5",
 			"name": "MiMo-V2.5",
-			"api": "anthropic-messages",
+			"api": "openai-completions",
 			"provider": "xiaomi",
-			"baseUrl": "https://api.xiaomimimo.com/anthropic",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -70726,18 +70759,29 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
 			}
 		},
 		"mimo-v2.5-pro": {
 			"id": "mimo-v2.5-pro",
 			"name": "MiMo-V2.5-Pro",
-			"api": "anthropic-messages",
+			"api": "openai-completions",
 			"provider": "xiaomi",
-			"baseUrl": "https://api.xiaomimimo.com/anthropic",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
 			"reasoning": true,
 			"input": [
 				"text"
@@ -70750,10 +70794,56 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
+			}
+		},
+		"mimo-v2.5-pro-ultraspeed": {
+			"id": "mimo-v2.5-pro-ultraspeed",
+			"name": "MiMo-V2.5-Pro-UltraSpeed",
+			"api": "openai-completions",
+			"provider": "xiaomi",
+			"baseUrl": "https://api.xiaomimimo.com/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 1.305,
+				"output": 2.61,
+				"cacheRead": 0.0108,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"compat": {
+				"supportsStore": false,
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
 			}
 		}
 	},
