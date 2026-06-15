@@ -9,6 +9,7 @@
 ### Fixed
 
 - Allowed `openai-codex-responses` custom backends to use opaque `apiKey` bearer tokens by omitting `chatgpt-account-id` when the token does not expose a Codex account id.
+- Fixed OpenAI code websocket continuations to treat codex-lb's `codex_previous_response_stale` response failures as expired `previous_response_id` anchors and retry with full context instead of surfacing the transient failure.
 
 ## [0.5.2] - 2026-06-15
 
