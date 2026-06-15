@@ -408,6 +408,33 @@ describe("openai-codex streaming", () => {
 		expect(Object.keys(capturedHeaders ?? {}).filter(key => key.toLowerCase() === "openai-beta")).toHaveLength(1);
 	});
 
+	it("passes opaque apiKey tokens through to custom Codex-compatible backends", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = "sk-custom-proxy-test";
+		const sse = createCompletedCodexSse("Hello proxy");
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Headers | undefined;
+		global.fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			capturedUrl = typeof input === "string" ? input : input.toString();
+			capturedHeaders = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("http://127.0.0.1:2455/backend-api/codex"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: token },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(capturedUrl).toBe("http://127.0.0.1:2455/backend-api/codex/responses");
+		expect(capturedHeaders?.get("Authorization")).toBe(`Bearer ${token}`);
+		expect(capturedHeaders?.has("chatgpt-account-id")).toBe(false);
+		expect(capturedHeaders?.get("OpenAI-Beta")).toBe("responses=experimental");
+	});
+
 	it("streams SSE responses into AssistantMessageEventStream", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

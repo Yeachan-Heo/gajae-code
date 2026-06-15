@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Allowed `openai-codex-responses` custom backends to use opaque `apiKey` bearer tokens by omitting `chatgpt-account-id` when the token does not expose a Codex account id.
+
 ## [0.5.2] - 2026-06-15
 
 ### Changed

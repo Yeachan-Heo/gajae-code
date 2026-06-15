@@ -170,7 +170,7 @@ interface CodexProviderSessionState extends ProviderSessionState {
 
 interface CodexRequestContext {
 	apiKey: string;
-	accountId: string;
+	accountId: string | undefined;
 	baseUrl: string;
 	url: string;
 	requestHeaders: Record<string, string>;
@@ -1801,12 +1801,12 @@ export async function prewarmOpenAICodexResponses(
 function getCodexWebSocketSessionKey(
 	sessionId: string | undefined,
 	model: Model<"openai-codex-responses">,
-	accountId: string,
+	accountId: string | undefined,
 	baseUrl: string,
 ): string | undefined {
 	const promptCacheKey = normalizeOpenAIResponsesPromptCacheKey(sessionId);
 	if (!promptCacheKey) return undefined;
-	return `${accountId}:${baseUrl}:${model.id}:${promptCacheKey}`;
+	return `${accountId ?? "opaque"}:${baseUrl}:${model.id}:${promptCacheKey}`;
 }
 
 function getCodexPublicSessionKey(
@@ -2335,7 +2335,7 @@ async function getOrCreateCodexWebSocketConnection(
 async function openCodexSseEventStream(
 	url: string,
 	requestHeaders: Record<string, string> | undefined,
-	accountId: string,
+	accountId: string | undefined,
 	apiKey: string,
 	sessionId: string | undefined,
 	body: RequestBody,
@@ -2400,7 +2400,7 @@ async function openCodexWebSocketEventStream(
 
 function createCodexHeaders(
 	initHeaders: Record<string, string> | undefined,
-	accountId: string,
+	accountId: string | undefined,
 	accessToken: string,
 	promptCacheKey?: string,
 	transport: CodexTransport = "sse",
@@ -2409,7 +2409,11 @@ function createCodexHeaders(
 	const headers = new Headers(initHeaders ?? {});
 	headers.delete("x-api-key");
 	headers.set("Authorization", `Bearer ${accessToken}`);
-	headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+	if (accountId) {
+		headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+	} else {
+		headers.delete(OPENAI_HEADERS.ACCOUNT_ID);
+	}
 	const betaHeader =
 		transport === "websocket"
 			? OPENAI_HEADER_VALUES.BETA_RESPONSES_WEBSOCKETS_V2
@@ -2482,12 +2486,8 @@ function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
 	return `${normalized}/codex/responses`;
 }
 
-function getAccountId(accessToken: string): string {
-	const accountId = getCodexAccountId(accessToken);
-	if (!accountId) {
-		throw new Error("Failed to extract accountId from token");
-	}
-	return accountId;
+function getAccountId(accessToken: string): string | undefined {
+	return getCodexAccountId(accessToken);
 }
 
 function convertMessages(model: Model<"openai-codex-responses">, context: Context): ResponseInput {
