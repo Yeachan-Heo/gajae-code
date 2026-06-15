@@ -5,6 +5,7 @@
 ### Fixed
 
 - Prevented closed stderr descriptors from crashing shutdown diagnostics while preserving unexpected stderr write failures.
+- Dropped disabled macOS malloc stack logging variables from forwarded spawn environments so child processes do not repeat runtime warnings inherited from debugger-attached shells.
 - Tolerate trailing commas on simple frontmatter scalar lines, avoiding noisy rule-discovery warnings for Cursor-style `.mdc` metadata while preserving strict fallback behavior for genuinely malformed YAML.
 
 ## [0.5.1] - 2026-06-14

@@ -2,6 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir } from "./dirs";
+import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
+
+export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -12,32 +15,6 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  */
 export function isValidEnvName(name: string): boolean {
 	return ENV_NAME_RE.test(name);
-}
-
-/**
- * The only names that are genuinely unsafe to forward to a native `execve`
- * spawn: empty, containing `=` (would corrupt the `KEY=VALUE` framing) or
- * NUL (terminates the C string mid-entry). Windows ships standard variables
- * whose names contain parentheses (e.g. `ProgramFiles(x86)`, `CommonProgramFiles(x86)`)
- * — those MUST survive the scrub so downstream resolvers (Git Bash discovery
- * in `procmgr.ts`, etc.) can still read them.
- */
-export function isSafeEnvName(name: string): boolean {
-	return name.length > 0 && !name.includes("=") && !name.includes("\0");
-}
-
-export function isSafeEnvValue(value: string): boolean {
-	return !value.includes("\0");
-}
-
-export function filterProcessEnv(env: Record<string, string | undefined>): Record<string, string> {
-	const result: Record<string, string> = {};
-	for (const key in env) {
-		const value = env[key];
-		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
-		result[key] = value;
-	}
-	return result;
 }
 
 function stripInlineShellComment(value: string): string {
