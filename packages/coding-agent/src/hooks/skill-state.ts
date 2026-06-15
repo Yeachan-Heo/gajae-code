@@ -4,6 +4,7 @@ import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import { writeJsonAtomic, writeWorkflowEnvelopeAtomic } from "../gjc-runtime/state-writer";
 import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
+import { getUltragoalRunCompletionState, readUltragoalPlan } from "../gjc-runtime/ultragoal-runtime";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
 	readVisibleSkillActiveState as readCanonicalVisibleSkillActiveState,
@@ -481,6 +482,32 @@ function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean
 	return false;
 }
 
+/**
+ * Cross-file coherence guard for a mode-state that claims it releases the Stop
+ * block. `modeStateReleasesStop` trusts a single mode-state file; if any writer
+ * leaves that file stale or incoherent (e.g. `active:false` / a terminal phase
+ * after a `clear` while a new run's goals are still pending), trusting it alone
+ * silently defeats the Stop protection.
+ *
+ * This consults the authoritative durable state the Stop hook can already read
+ * and returns a block reason when that state contradicts the release. It stays
+ * cheap and read-only — ultragoal reads the durable plan; skills without an
+ * independent durable source release as before.
+ */
+async function detectStaleModeStateRelease(skill: GjcWorkflowSkill, cwd: string): Promise<string | null> {
+	if (skill === "ultragoal") {
+		const plan = await readUltragoalPlan(cwd);
+		if (!plan) return null;
+		const runState = getUltragoalRunCompletionState(plan);
+		if (runState.incompleteGoals.length > 0) {
+			return `the durable Ultragoal plan still has incomplete required goals (${runState.incompleteGoals
+				.map(goal => goal.id)
+				.join(", ")}); run \`gjc ultragoal complete-goals\` to continue`;
+		}
+	}
+	return null;
+}
+
 async function readVisibleModeState(
 	cwd: string,
 	skill: GjcWorkflowSkill,
@@ -573,7 +600,25 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			ModeStateSchema,
 		);
 		const handoffRequired = isHandoffRequiredSkill(entry.skill);
-		if (modeStateReleasesStop(modeState, handoffRequired)) continue;
+		if (modeStateReleasesStop(modeState, handoffRequired)) {
+			// A mode-state that claims it releases the Stop block must agree with
+			// authoritative durable state. If a stale/incoherent mode-state would
+			// release while the plan/ledger still shows pending work, block instead
+			// of trusting the single file (see #659).
+			const staleRelease = await detectStaleModeStateRelease(entry.skill, input.cwd);
+			if (!staleRelease) continue;
+			const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(
+				resolvedStateDir,
+				entry.skill,
+				input.sessionId,
+			)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
+			return {
+				decision: "block",
+				reason: coherenceMessage,
+				stopReason: `gjc_skill_${entry.skill.replace(/-/g, "_")}_stale_mode_state`,
+				systemMessage: coherenceMessage,
+			};
+		}
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);
 		if (entry.skill === "ultragoal") {

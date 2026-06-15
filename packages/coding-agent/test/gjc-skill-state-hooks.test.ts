@@ -897,6 +897,110 @@ disabledExtensions:
 		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
 	});
 
+	it("Stop blocks when stale Ultragoal mode-state would release but the plan still has pending goals", async () => {
+		const root = await cwd();
+		// Durable plan with an incomplete required goal (G001 pending).
+		await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-stale-release",
+				threadId: "thread-ultra-stale-release",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// Simulate the #644-style divergence: skill-active-state still lists
+		// ultragoal active, but the mode-state file is stale (active:false +
+		// terminal phase). `modeStateReleasesStop` trusts this file alone, so the
+		// cross-file coherence guard must keep blocking while the plan has
+		// incomplete goals.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-stale-release", "ultragoal-state.json"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-stale-release" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-stale-release",
+			threadId: "thread-ultra-stale-release",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_ultragoal_stale_mode_state",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("G001");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
+	});
+
+	it("Stop blocks when an Ultragoal mode-state sits in a releasing phase but the plan still has pending goals", async () => {
+		const root = await cwd();
+		await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-releasing-phase",
+				threadId: "thread-ultra-releasing-phase",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// active:true but a terminal phase still releases via STOP_RELEASING_PHASES;
+		// the coherence guard must override that release while goals remain.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-releasing-phase", "ultragoal-state.json"),
+			JSON.stringify({ active: true, current_phase: "completed", session_id: "session-ultra-releasing-phase" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-releasing-phase",
+			threadId: "thread-ultra-releasing-phase",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_ultragoal_stale_mode_state",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("G001");
+	});
+
+	it("Stop releases a stale Ultragoal mode-state when no durable plan contradicts it", async () => {
+		const root = await cwd();
+		// No durable ultragoal plan exists, so there is no authoritative source to
+		// contradict the mode-state — the guard must not over-block.
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-no-plan",
+				threadId: "thread-ultra-no-plan",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-no-plan", "ultragoal-state.json"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-no-plan" }),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-no-plan",
+			threadId: "thread-ultra-no-plan",
+		});
+
+		expect(allowed.outputJson).toBeNull();
+	});
+
 	it("UserPromptSubmit blocks Ultragoal completion when later required goals remain", async () => {
 		const root = await cwd();
 		const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
