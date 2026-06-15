@@ -688,6 +688,7 @@ export class SelectorController {
 					...options,
 					sessionId: this.ctx.session.sessionId,
 					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
+					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
 				},
 			);
 			return { component: selector, focus: selector };

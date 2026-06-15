@@ -198,6 +198,7 @@ export class ModelSelectorComponent extends Container {
 	#temporaryOnly: boolean;
 	#currentModel?: Model;
 	#isFastForProvider: (provider?: string) => boolean = () => false;
+	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
@@ -232,6 +233,7 @@ export class ModelSelectorComponent extends Container {
 			initialSearchInput?: string;
 			sessionId?: string;
 			isFastForProvider?: (provider?: string) => boolean;
+			isFastForSubagentProvider?: (provider?: string) => boolean;
 		},
 	) {
 		super();
@@ -246,6 +248,7 @@ export class ModelSelectorComponent extends Container {
 		this.#authSessionId = options?.sessionId;
 		this.#currentModel = _currentModel;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
+		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -919,7 +922,13 @@ export class ModelSelectorComponent extends Container {
 					roleMatched = true;
 					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
 					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
-					const fastSuffix = this.#isFastForProvider(assigned.model.provider) ? ` ${theme.icon.fast}` : "";
+					// Subagent roles (task.agentModelOverrides) run under task.serviceTier, so
+					// their ⚡ must reflect the effective subagent tier, not the main session tier.
+					const roleFast =
+						roleInfo.settingsPath === "task.agentModelOverrides"
+							? this.#isFastForSubagentProvider(assigned.model.provider)
+							: this.#isFastForProvider(assigned.model.provider);
+					const fastSuffix = roleFast ? ` ${theme.icon.fast}` : "";
 					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}${fastSuffix}`);
 				}
 			}

@@ -621,9 +621,13 @@ function createFastSelector(args: {
 	models: Model[];
 	settings: Settings;
 	isFastForProvider: (provider?: string) => boolean;
+	isFastForSubagentProvider?: (provider?: string) => boolean;
 	currentModel?: Model;
 }): ModelSelectorComponent {
 	const { models, settings, isFastForProvider, currentModel } = args;
+	// Subagent roles default to the same predicate as the session unless a test
+	// exercises the session-vs-subagent tier divergence explicitly.
+	const isFastForSubagentProvider = args.isFastForSubagentProvider ?? isFastForProvider;
 	const modelRegistry = {
 		getAll: () => models,
 		getDiscoverableProviders: () => [],
@@ -640,7 +644,7 @@ function createFastSelector(args: {
 		scoped,
 		() => {},
 		() => {},
-		{ isFastForProvider },
+		{ isFastForProvider, isFastForSubagentProvider },
 	);
 }
 
@@ -682,6 +686,35 @@ describe("ModelSelector fast-mode indicator", () => {
 		expect(rendered.indexOf("(low)")).toBeLessThan(rendered.indexOf(iconFast));
 	});
 
+	test("subagent role glyph reflects the subagent tier, not the session tier", async () => {
+		// Regression for #691 round-2 blocker: serviceTier=priority but
+		// task.serviceTier=none. DEFAULT (modelRoles) runs in the main session and is
+		// fast; EXECUTOR (task.agentModelOverrides) runs under the subagent tier and
+		// must show no glyph even with the same anthropic model.
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${model.provider}/${model.id}:low` },
+			"task.agentModelOverrides": { executor: `${model.provider}/${model.id}:high` },
+		});
+		const selector = createFastSelector({
+			models: [model],
+			settings,
+			isFastForProvider: () => true,
+			isFastForSubagentProvider: () => false,
+			currentModel: model,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+		const iconFast = theme.icon.fast;
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain(`DEFAULT (low) ${iconFast}`);
+		expect(rendered).toContain("EXECUTOR (high)");
+		expect(rendered).not.toContain(`EXECUTOR (high) ${iconFast}`);
+		// Only the main-session DEFAULT row lights the glyph.
+		expect(countOccurrences(rendered, iconFast)).toBe(1);
+	});
 	test("AC-2: claude-only renders fast glyph only on anthropic rows in mixed-provider selector", async () => {
 		installTestTheme();
 		const anthropic = getBundledModel("anthropic", "claude-sonnet-4-5");

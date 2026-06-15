@@ -310,6 +310,10 @@ class FakeAgentSession {
 		return false;
 	}
 
+	isFastForSubagentProvider(_provider?: string): boolean {
+		return false;
+	}
+
 	resolveRoleModelWithThinking(_role: string): { model: undefined } {
 		return { model: undefined };
 	}

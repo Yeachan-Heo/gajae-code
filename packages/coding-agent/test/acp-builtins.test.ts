@@ -19,6 +19,7 @@ interface FakeAcpBuiltinSession {
 	setFastMode(enabled: boolean): void;
 	isFastModeEnabled(): boolean;
 	isFastForProvider(provider?: string): boolean;
+	isFastForSubagentProvider(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
@@ -80,6 +81,9 @@ function createRuntime() {
 			return this.fastMode;
 		},
 		isFastForProvider(_provider?: string) {
+			return false;
+		},
+		isFastForSubagentProvider(_provider?: string) {
 			return false;
 		},
 		resolveRoleModelWithThinking(_role: string): { model?: { provider: string; id: string } } {
@@ -228,13 +232,18 @@ describe("ACP builtin slash commands", () => {
 		const session = runtime.session as unknown as {
 			model: { provider: string; id: string } | undefined;
 			isFastForProvider: (provider?: string) => boolean;
+			isFastForSubagentProvider: (provider?: string) => boolean;
 			resolveRoleModelWithThinking: (role: string) => { model?: { provider: string; id: string } };
 			isFastModeEnabled: () => boolean;
 		};
 		session.model = { provider: "anthropic", id: "claude-sonnet-4-5" };
 		session.isFastForProvider = provider => provider === "anthropic";
+		// Subagent roles run under task.serviceTier; here it grants no fast mode, so
+		// the EXECUTOR row must be off even though its anthropic model would be fast
+		// under the main session tier.
+		session.isFastForSubagentProvider = () => false;
 		session.resolveRoleModelWithThinking = role =>
-			role === "executor" ? { model: { provider: "openai", id: "gpt-5" } } : { model: undefined };
+			role === "executor" ? { model: { provider: "anthropic", id: "claude-opus-4-1" } } : { model: undefined };
 		// The status branch must use the provider-aware predicate, never this.
 		session.isFastModeEnabled = () => {
 			throw new Error("/fast status must not call isFastModeEnabled");
@@ -244,7 +253,9 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain(`현재 모델: anthropic/claude-sonnet-4-5 ${theme.icon.fast}`);
-		expect(output[0]).toContain("EXECUTOR: openai/gpt-5 off");
+		// Subagent role uses the subagent tier -> off despite the anthropic model.
+		expect(output[0]).toContain("EXECUTOR: anthropic/claude-opus-4-1 off");
+		expect(output[0]).not.toContain(`EXECUTOR: anthropic/claude-opus-4-1 ${theme.icon.fast}`);
 		expect(output[0]).not.toContain("Fast mode is");
 	});
 	it("keeps /fast on/off/toggle output and state changes unchanged", async () => {

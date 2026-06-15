@@ -24,6 +24,7 @@ function createTuiRuntime() {
 	const session = {
 		model: model("anthropic", "claude-sonnet-4-5"),
 		isFastForProvider: (provider?: string) => provider === "anthropic",
+		isFastForSubagentProvider: (provider?: string) => provider === "anthropic",
 		resolveRoleModelWithThinking: (role: string) => {
 			if (role === "default") return { model: model("anthropic", "claude-sonnet-4-5") };
 			if (role === "executor") return { model: model("openai", "gpt-5") };

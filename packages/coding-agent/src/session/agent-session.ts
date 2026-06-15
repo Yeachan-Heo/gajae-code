@@ -6031,6 +6031,30 @@ export class AgentSession {
 	}
 
 	/**
+	 * Effective service tier applied to task-tool subagent sessions
+	 * (executor/architect/planner/critic). They run under `task.serviceTier`
+	 * unless it is `"inherit"`, in which case they inherit the main session
+	 * tier — mirroring `createSubagentSettings`.
+	 */
+	#subagentServiceTier(): ServiceTier | undefined {
+		const configured = this.settings.get("task.serviceTier");
+		if (configured === "inherit") return this.serviceTier;
+		if (configured === "none") return undefined;
+		return configured;
+	}
+
+	/**
+	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
+	 * against the effective subagent tier (`task.serviceTier`) rather than the
+	 * main session tier. Use this for `task.agentModelOverrides` role rows so the
+	 * ⚡ glyph reflects the tier the subagent actually runs under.
+	 */
+	isFastForSubagentProvider(provider?: string): boolean {
+		if (provider === undefined) return false;
+		return resolveServiceTier(this.#subagentServiceTier(), provider) === "priority";
+	}
+
+	/**
 	 * True when the configured `serviceTier` resolves to `"priority"` for the
 	 * *currently selected model's provider*. Returns false for scoped tiers
 	 * that don't match (e.g. `"openai-only"` on an anthropic model) and when

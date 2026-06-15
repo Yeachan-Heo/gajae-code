@@ -45,10 +45,11 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
 
-function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label: string }> {
+function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label: string; isSubagentRole: boolean }> {
 	return GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => ({
 		id,
 		label: GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase(),
+		isSubagentRole: GJC_MODEL_ASSIGNMENT_TARGETS[id].settingsPath === "task.agentModelOverrides",
 	}));
 }
 
