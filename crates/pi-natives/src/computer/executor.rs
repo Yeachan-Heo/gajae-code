@@ -128,6 +128,26 @@ pub trait DisplayContext {
 	fn current_epoch(&self) -> u64;
 }
 
+#[cfg(target_os = "macos")]
+pub struct MacPermissionGate;
+
+#[cfg(target_os = "macos")]
+impl PermissionGate for MacPermissionGate {
+	fn accessibility_granted(&self) -> bool {
+		crate::computer::permissions::accessibility_granted()
+	}
+}
+
+#[cfg(target_os = "macos")]
+pub struct MacDisplayContext;
+
+#[cfg(target_os = "macos")]
+impl DisplayContext for MacDisplayContext {
+	fn current_epoch(&self) -> u64 {
+		crate::computer::capture::current_display_epoch()
+	}
+}
+
 /// Fail-closed gate run before any side-effecting input.
 fn gate<P: PermissionGate, D: DisplayContext>(
 	action: &InputAction,

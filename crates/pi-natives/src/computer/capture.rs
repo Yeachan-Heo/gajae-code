@@ -15,7 +15,13 @@
 //! Implemented with raw CoreGraphics FFI (no extra crates); the buffer is owned
 //! Rust memory and every Core Graphics handle is released exactly once.
 
-use std::{ffi::c_void, fmt};
+use std::{
+	collections::hash_map::DefaultHasher,
+	ffi::c_void,
+	fmt,
+	hash::{Hash, Hasher},
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::computer::coords::NormalizedDisplay;
 
@@ -56,6 +62,8 @@ unsafe extern "C" {
 	fn CGMainDisplayID() -> CgDirectDisplayId;
 	fn CGDisplayBounds(display: CgDirectDisplayId) -> CgRect;
 	fn CGDisplayCreateImage(display: CgDirectDisplayId) -> CgImageRef;
+	fn CGDisplayPixelsWide(display: CgDirectDisplayId) -> usize;
+	fn CGDisplayPixelsHigh(display: CgDirectDisplayId) -> usize;
 	fn CGImageGetWidth(image: CgImageRef) -> usize;
 	fn CGImageGetHeight(image: CgImageRef) -> usize;
 	fn CGImageRelease(image: CgImageRef);
@@ -100,12 +108,18 @@ impl fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A captured primary-display frame.
 pub struct CapturedFrame {
 	/// Coordinate descriptor for the captured display.
-	pub display: NormalizedDisplay,
+	pub display:       NormalizedDisplay,
 	/// PNG-encoded RGBA image bytes.
-	pub png:     Vec<u8>,
+	pub png:           Vec<u8>,
+	/// Stable hash of the display geometry used for stale-display checks.
+	pub display_epoch: u64,
+	/// Process-local opaque capture id.
+	pub capture_id:    u32,
 }
 
 /// Capture the current primary display as a PNG plus its coordinate descriptor.
@@ -115,13 +129,18 @@ pub struct CapturedFrame {
 /// Screen Recording grant), a bitmap context cannot be created, or PNG encoding
 /// fails.
 pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
-	// SAFETY: both calls are pure Core Graphics queries; `CGMainDisplayID`
-	// returns a valid id for the active primary display and `CGDisplayBounds`
-	// reads geometry for that id.
-	let (display_id, bounds) = unsafe {
+	// SAFETY: pure Core Graphics geometry queries for the active primary display;
+	// no image capture occurs before `CGDisplayCreateImage` below.
+	let (display_id, display) = unsafe {
 		let id = CGMainDisplayID();
-		(id, CGDisplayBounds(id))
+		let bounds = CGDisplayBounds(id);
+		let pixels_wide = CGDisplayPixelsWide(id);
+		let pixels_high = CGDisplayPixelsHigh(id);
+		(id, display_descriptor(pixels_wide, pixels_high, bounds))
 	};
+
+	let display_epoch = display_epoch(&display);
+	let capture_id = next_capture_id();
 
 	// SAFETY: `display_id` is a valid primary-display id. The returned image is
 	// released exactly once below regardless of the `frame_from_image` result.
@@ -130,16 +149,27 @@ pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
 		return Err(CaptureError::CaptureFailed);
 	}
 
-	let result = frame_from_image(image, bounds);
+	let result = frame_from_image(image, display, display_epoch, capture_id);
 
 	// SAFETY: `image` is non-null (checked above) and not used after release.
 	unsafe { CGImageRelease(image) };
 	result
 }
 
+#[must_use]
+pub fn current_display_epoch() -> u64 {
+	let display = current_display_descriptor();
+	display_epoch(&display)
+}
+
 /// Convert a non-null `CGImage` into a [`CapturedFrame`]. Does not release
 /// `image`; the caller owns its lifetime.
-fn frame_from_image(image: CgImageRef, bounds: CgRect) -> Result<CapturedFrame, CaptureError> {
+fn frame_from_image(
+	image: CgImageRef,
+	display: NormalizedDisplay,
+	display_epoch: u64,
+	capture_id: u32,
+) -> Result<CapturedFrame, CaptureError> {
 	// SAFETY: `image` is non-null per the caller's check.
 	let (width, height) = unsafe { (CGImageGetWidth(image), CGImageGetHeight(image)) };
 	if width == 0 || height == 0 {
@@ -189,26 +219,53 @@ fn frame_from_image(image: CgImageRef, bounds: CgRect) -> Result<CapturedFrame, 
 	}
 
 	let png = encode_png(&buffer, width as u32, height as u32)?;
-	let scale_x = derive_scale(width as f64, bounds.size.width);
-	let scale_y = derive_scale(height as f64, bounds.size.height);
 
-	Ok(CapturedFrame {
-		display: NormalizedDisplay::new(
-			width as u32,
-			height as u32,
-			scale_x,
-			scale_y,
-			bounds.origin.x,
-			bounds.origin.y,
-		),
-		png,
-	})
+	Ok(CapturedFrame { display, png, display_epoch, capture_id })
 }
 
 /// Scale = physical pixels / logical points, defaulting to `1.0` when the
 /// logical extent is not positive.
 fn derive_scale(pixels: f64, logical: f64) -> f64 {
 	if logical > 0.0 { pixels / logical } else { 1.0 }
+}
+
+fn current_display_descriptor() -> NormalizedDisplay {
+	// SAFETY: pure Core Graphics geometry queries for the active primary display;
+	// no image capture or Screen Recording permission is involved.
+	unsafe {
+		let display_id = CGMainDisplayID();
+		let bounds = CGDisplayBounds(display_id);
+		display_descriptor(CGDisplayPixelsWide(display_id), CGDisplayPixelsHigh(display_id), bounds)
+	}
+}
+
+fn display_descriptor(width: usize, height: usize, bounds: CgRect) -> NormalizedDisplay {
+	let scale_x = derive_scale(width as f64, bounds.size.width);
+	let scale_y = derive_scale(height as f64, bounds.size.height);
+	NormalizedDisplay::new(
+		width as u32,
+		height as u32,
+		scale_x,
+		scale_y,
+		bounds.origin.x,
+		bounds.origin.y,
+	)
+}
+
+fn display_epoch(display: &NormalizedDisplay) -> u64 {
+	let mut hasher = DefaultHasher::new();
+	display.width_px.hash(&mut hasher);
+	display.height_px.hash(&mut hasher);
+	display.scale_x.to_bits().hash(&mut hasher);
+	display.scale_y.to_bits().hash(&mut hasher);
+	display.origin_x.to_bits().hash(&mut hasher);
+	display.origin_y.to_bits().hash(&mut hasher);
+	hasher.finish()
+}
+
+fn next_capture_id() -> u32 {
+	let id = NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
+	((id - 1) % u64::from(u32::MAX) + 1) as u32
 }
 
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CaptureError> {

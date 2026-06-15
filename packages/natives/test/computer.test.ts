@@ -1,7 +1,27 @@
 import { describe, expect, it } from "bun:test";
-import { computerScreenshot } from "../native/index.js";
+import { ComputerController, computerScreenshot } from "../native/index.js";
 
 const isMacOS = process.platform === "darwin";
+
+describe.if(isMacOS)("ComputerController napi binding", () => {
+	it("exists with expected methods", () => {
+		const controller = new ComputerController();
+		expect(controller).toBeInstanceOf(ComputerController);
+		for (const method of [
+			"screenshot",
+			"click",
+			"doubleClick",
+			"move",
+			"drag",
+			"scroll",
+			"type",
+			"keypress",
+			"wait",
+		]) {
+			expect(typeof controller[method as keyof ComputerController]).toBe("function");
+		}
+	});
+});
 
 // The native `computerScreenshot` binding is macOS-only and captures the real
 // primary display, so it requires the Screen Recording permission. Gate on
@@ -22,6 +42,8 @@ describe.if(isMacOS)("computer screenshot napi binding", () => {
 		expect(shot.scaleX).toBeGreaterThan(0);
 		expect(shot.scaleY).toBeGreaterThan(0);
 		expect(shot.png.byteLength).toBeGreaterThan(0);
+		expect(shot.displayEpoch).toBeGreaterThan(0);
+		expect(shot.captureId).toBeGreaterThan(0);
 
 		// PNG magic number: 89 50 4E 47 0D 0A 1A 0A.
 		const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
