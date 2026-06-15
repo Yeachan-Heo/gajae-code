@@ -680,6 +680,9 @@ export class ExtensionUiController {
 					: undefined,
 			},
 		);
+		// Detach (not dispose) the reusable editor before mounting the transient hook UI, so the
+		// disposing clear() only tears down a prior transient — the editor is re-added intact on close.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.hookSelector);
 		this.ctx.ui.setFocus(this.ctx.hookSelector);
@@ -758,6 +761,9 @@ export class ExtensionUiController {
 				tui: this.ctx.ui,
 			},
 		);
+		// Detach (not dispose) the reusable editor before mounting the transient hook UI, so the
+		// disposing clear() only tears down a prior transient — the editor is re-added intact on close.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.hookInput);
 		this.ctx.ui.setFocus(this.ctx.hookInput);
@@ -806,6 +812,9 @@ export class ExtensionUiController {
 			editorOptions,
 		);
 
+		// Detach (not dispose) the reusable editor before mounting the transient hook UI, so the
+		// disposing clear() only tears down a prior transient — the editor is re-added intact on close.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.hookEditor);
 		this.ctx.ui.setFocus(this.ctx.hookEditor);
@@ -888,6 +897,9 @@ export class ExtensionUiController {
 				});
 				return;
 			}
+			// Detach (not dispose) the reusable editor before mounting the transient hook UI, so the
+			// disposing clear() only tears down a prior transient — the editor is re-added intact on close.
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(component);
 			this.ctx.ui.setFocus(component);
