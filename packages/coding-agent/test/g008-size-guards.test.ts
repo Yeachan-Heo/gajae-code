@@ -30,6 +30,11 @@ describe("edit file size guard (W7 / F19)", () => {
 		const text = await readEditFileText(small, "small.txt");
 		expect(text.length).toBe(32);
 	});
+
+	it("rejects an oversized notebook before the notebook fast-path (F19 not bypassable via .ipynb)", async () => {
+		const bigNb = await writeTmp("big.ipynb", MAX_EDIT_FILE_BYTES + 1024);
+		await expect(readEditFileText(bigNb, "big.ipynb")).rejects.toThrow(/too large to edit safely/i);
+	});
 });
 
 describe("sqlite raw query row cap (W7 / F20)", () => {

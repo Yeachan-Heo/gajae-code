@@ -16,9 +16,8 @@ export const MAX_EDIT_FILE_BYTES = 8 * 1024 * 1024;
 
 export async function readEditFileText(absolutePath: string, path: string): Promise<string> {
 	try {
-		if (isNotebookPath(absolutePath)) return await readEditableNotebookText(absolutePath, path);
 		const file = Bun.file(absolutePath);
-		const size = file.size; // 0 for a missing file; the .text() below then throws ENOENT.
+		const size = file.size; // 0 for a missing file; the read below then throws ENOENT.
 		if (size > MAX_EDIT_FILE_BYTES) {
 			throw new Error(
 				`File too large to edit safely: ${path} is ${size} bytes (limit ${MAX_EDIT_FILE_BYTES}). ` +
@@ -26,6 +25,9 @@ export async function readEditFileText(absolutePath: string, path: string): Prom
 					`split the file, or use a specialized tool.`,
 			);
 		}
+		// Guard BEFORE the notebook fast-path: a >8 MiB .ipynb would otherwise load + JSON-parse
+		// + convert the whole file via readEditableNotebookText, bypassing the F19 freeze guard.
+		if (isNotebookPath(absolutePath)) return await readEditableNotebookText(absolutePath, path);
 		return await file.text();
 	} catch (error) {
 		if (isEnoent(error)) {
