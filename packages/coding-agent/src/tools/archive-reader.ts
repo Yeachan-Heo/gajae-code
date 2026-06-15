@@ -315,7 +315,16 @@ export async function openArchive(filePath: string): Promise<ArchiveReader> {
 		throw new ToolError(`Unsupported archive format: ${filePath}`);
 	}
 
-	const bytes = await Bun.file(filePath).bytes();
+	// F20: cap the compressed archive read so opening a multi-GB archive cannot buffer it
+	// whole into memory. (Zip-bomb expanded-size bounding would need a streaming inflate.)
+	const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
+	const file = Bun.file(filePath);
+	if (file.size > MAX_ARCHIVE_BYTES) {
+		throw new ToolError(
+			`Archive too large to open: ${filePath} is ${file.size} bytes (limit ${MAX_ARCHIVE_BYTES}). Extract a subset with a dedicated tool.`,
+		);
+	}
+	const bytes = await file.bytes();
 	const entries = format === "zip" ? await readZipEntries(bytes) : await readTarEntries(bytes);
 	return new ArchiveReader(format, entries);
 }

@@ -63,7 +63,16 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error(`artifact://${id} not found`);
 		}
 
-		const content = await Bun.file(foundPath).text();
+		// F20: cap the materialized artifact so reading a huge spilled artifact cannot
+		// buffer GBs into memory (the range selector is applied downstream, so without a
+		// cap a `artifact://id:range` over a multi-GB artifact still reads it whole).
+		const MAX_ARTIFACT_READ_BYTES = 16 * 1024 * 1024;
+		const file = Bun.file(foundPath);
+		const fullSize = file.size;
+		const content =
+			fullSize > MAX_ARTIFACT_READ_BYTES
+				? `${await file.slice(0, MAX_ARTIFACT_READ_BYTES).text()}\n\n[Artifact truncated: first ${MAX_ARTIFACT_READ_BYTES} of ${fullSize} bytes shown; use a narrower range or a specialized tool for the full content.]`
+				: await file.text();
 		return {
 			url: url.href,
 			content,
