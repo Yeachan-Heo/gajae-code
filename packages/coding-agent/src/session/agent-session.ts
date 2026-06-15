@@ -7811,7 +7811,12 @@ export class AgentSession {
 	 */
 	#isRetryableError(message: AssistantMessage): boolean {
 		const classification = this.#classifyErrorForRetry(message);
-		return classification === "usage_limit" || classification === "transient" || classification === "unknown";
+		return (
+			classification === "usage_limit" ||
+			classification === "transient" ||
+			classification === "unknown" ||
+			classification === "first_event_timeout"
+		);
 	}
 
 	#isTransientErrorMessage(errorMessage: string): boolean {
@@ -7837,6 +7842,33 @@ export class AgentSession {
 		);
 	}
 
+	#isFirstEventTimeoutErrorMessage(errorMessage: string): boolean {
+		// First-event timeout: the stream watchdog aborted because no event
+		// arrived within the first-event window. Matches the shared lazy-stream
+		// message and the per-provider variants
+		// ("<Provider> stream timed out while waiting for the first event").
+		return /timed?\s*out while waiting for the first event|timeout waiting for first/i.test(errorMessage);
+	}
+
+	/**
+	 * Whether a first-event timeout on the error's provider should fail closed —
+	 * i.e. retry a bounded number of times (capped at retry.maxRetries) and then
+	 * surface, instead of joining the unbounded transient-retry class.
+	 *
+	 * Targets the ollama-chat API, which is exclusively ollama-cloud (local
+	 * Ollama uses the openai-responses API). That remote, queued backend can
+	 * stall before its first token even for tiny prompts; an unbounded
+	 * continuation retry re-issues the full request on every attempt and can
+	 * silently spike upstream usage (#713). First-party providers keep their
+	 * existing unbounded first-event-timeout retry behavior.
+	 */
+	#shouldFailClosedOnFirstEventTimeout(message: AssistantMessage): boolean {
+		// Prefer the active model's API (the model that produced the error);
+		// the errored message's API is a fallback for the rare case where the
+		// session model has already moved on.
+		return this.model?.api === "ollama-chat" || message.api === "ollama-chat";
+	}
+
 	#isTerminalErrorMessage(errorMessage: string): boolean {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
@@ -7858,11 +7890,12 @@ export class AgentSession {
 
 	/**
 	 * Ordered retry classification: overflow (compaction) -> terminal (surface)
-	 * -> usage_limit (rotation) -> transient (retry) -> unknown (retry).
+	 * -> usage_limit (rotation) -> first_event_timeout (bounded retry) ->
+	 * transient (retry) -> unknown (retry).
 	 */
 	#classifyErrorForRetry(
 		message: AssistantMessage,
-	): "none" | "overflow" | "terminal" | "usage_limit" | "transient" | "unknown" {
+	): "none" | "overflow" | "terminal" | "usage_limit" | "first_event_timeout" | "transient" | "unknown" {
 		if (message.stopReason !== "error" || !message.errorMessage) return "none";
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
@@ -7889,6 +7922,13 @@ export class AgentSession {
 		// parsed an incidental quota number such as "400 requests per minute".
 		if (isTerminalHttp4xx && (explicitStatus !== undefined || !/rate.?limit|too many requests/i.test(err))) {
 			return "terminal";
+		}
+		// A first-event timeout on ollama-cloud (the ollama-chat API) must not
+		// join the unbounded transient class: each continuation retry re-issues
+		// the full request to a remote, billable backend, so an unbounded loop
+		// can silently spike usage (#713). Bound it to retry.maxRetries instead.
+		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
+			return "first_event_timeout";
 		}
 		if (this.#isTransientErrorMessage(err)) return "transient";
 		return "unknown";
