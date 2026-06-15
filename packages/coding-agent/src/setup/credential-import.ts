@@ -163,13 +163,17 @@ function parseClaudeCredentials(
 	origin: CredentialOrigin,
 	source: string,
 ): ImportableCredential | SkippedCredential {
-	let parsed: ClaudeCredentialsFile;
+	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw) as ClaudeCredentialsFile;
 	} catch (err) {
 		return { origin, source, reason: sanitizedFailureReason("malformed credential file", err) };
 	}
-	const oauth = parsed.claudeAiOauth;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { origin, source, reason: "unsupported shape (root is not an object)" };
+	}
+	const credentials = parsed as ClaudeCredentialsFile;
+	const oauth = credentials.claudeAiOauth;
 	if (typeof oauth !== "object" || oauth === null) {
 		return { origin, source, reason: "missing claudeAiOauth block (unsupported shape)" };
 	}
@@ -248,13 +252,17 @@ async function defaultClaudeKeychainReader(): Promise<string | null> {
 // ─── Codex discovery ─────────────────────────────────────────────────────────
 
 function parseCodexAuth(raw: string, source: string): ImportableCredential | SkippedCredential {
-	let parsed: CodexAuthFile;
+	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw) as CodexAuthFile;
 	} catch (err) {
 		return { origin: "codex-file", source, reason: sanitizedFailureReason("malformed credential file", err) };
 	}
-	const tokens = parsed.tokens;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { origin: "codex-file", source, reason: "unsupported shape (root is not an object)" };
+	}
+	const auth = parsed as CodexAuthFile;
+	const tokens = auth.tokens;
 	const access = nonEmptyString(tokens?.access_token);
 	const refresh = nonEmptyString(tokens?.refresh_token);
 	if (access && refresh) {
@@ -297,7 +305,7 @@ function parseCodexAuth(raw: string, source: string): ImportableCredential | Ski
 			reason: "incomplete OAuth tokens (missing access_token or refresh_token)",
 		};
 	}
-	const apiKey = nonEmptyString(parsed.OPENAI_API_KEY);
+	const apiKey = nonEmptyString(auth.OPENAI_API_KEY);
 	if (apiKey) {
 		return {
 			provider: "openai-codex",

@@ -165,6 +165,20 @@ describe("discoverExternalCredentials", () => {
 		expect(result.skipped[0]!.reason).toContain("unsupported shape");
 	});
 
+	test.each([
+		["null", null, "unsupported shape (root is not an object)"],
+		["number", 42, "unsupported shape (root is not an object)"],
+		["array", ["x"], "unsupported shape (root is not an object)"],
+		["string", '"x"', "unsupported shape (root is not an object)"],
+	])("Claude %s root is skipped, not thrown", async (_label, body, reason) => {
+		await writeClaude(body);
+		const result = await discover();
+		expect(result.importable).toHaveLength(0);
+		expect(result.skipped).toHaveLength(1);
+		expect(result.skipped[0]!.origin).toBe("claude-code-file");
+		expect(result.skipped[0]!.reason).toBe(reason);
+	});
+
 	test("Codex incomplete OAuth tokens are skipped", async () => {
 		await writeCodex({ tokens: { access_token: CODEX_ACCESS } });
 		const result = await discover();
@@ -177,6 +191,20 @@ describe("discoverExternalCredentials", () => {
 		const result = await discover();
 		expect(result.importable).toHaveLength(0);
 		expect(result.skipped[0]!.reason).toContain("unsupported shape");
+	});
+
+	test.each([
+		["null", null, "unsupported shape (root is not an object)"],
+		["number", 42, "unsupported shape (root is not an object)"],
+		["array", ["x"], "unsupported shape (root is not an object)"],
+		["string", '"x"', "unsupported shape (root is not an object)"],
+	])("Codex %s root is skipped, not thrown", async (_label, body, reason) => {
+		await writeCodex(body);
+		const result = await discover();
+		expect(result.importable).toHaveLength(0);
+		expect(result.skipped).toHaveLength(1);
+		expect(result.skipped[0]!.origin).toBe("codex-file");
+		expect(result.skipped[0]!.reason).toBe(reason);
 	});
 
 	test("macOS keychain is read only when no file exists", async () => {
