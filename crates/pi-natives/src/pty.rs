@@ -27,22 +27,22 @@ use crate::{ps, task};
 #[napi(object)]
 pub struct PtyStartOptions<'env> {
 	/// Command string to execute.
-	pub command: String,
+	pub command:    String,
 	/// Working directory for command execution.
-	pub cwd: Option<String>,
+	pub cwd:        Option<String>,
 	/// Environment variables for this command.
-	pub env: Option<HashMap<String, String>>,
+	pub env:        Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling.
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the operation.
-	pub signal: Option<Unknown<'env>>,
+	pub signal:     Option<Unknown<'env>>,
 	/// PTY column count.
-	pub cols: Option<u16>,
+	pub cols:       Option<u16>,
 	/// PTY row count.
-	pub rows: Option<u16>,
+	pub rows:       Option<u16>,
 	/// Shell binary to use (e.g. "sh", "bash", or an absolute path).
 	/// Defaults to "sh" if not provided.
-	pub shell: Option<String>,
+	pub shell:      Option<String>,
 }
 
 /// Result of a PTY command run.
@@ -59,11 +59,11 @@ pub struct PtyRunResult {
 #[derive(Clone)]
 struct PtyRunConfig {
 	command: String,
-	cwd: Option<String>,
-	env: Option<HashMap<String, String>>,
-	cols: u16,
-	rows: u16,
-	shell: Option<String>,
+	cwd:     Option<String>,
+	env:     Option<HashMap<String, String>>,
+	cols:    u16,
+	rows:    u16,
+	shell:   Option<String>,
 }
 
 enum ReaderEvent {
@@ -101,10 +101,10 @@ impl Drop for PtySessionCore {
 }
 impl Drop for PtySession {
 	fn drop(&mut self) {
-		if let Ok(mut guard) = self.core.lock() {
-			if let Some(core) = guard.take() {
-				let _ = core.control_tx.send(ControlMessage::Kill);
-			}
+		if let Ok(mut guard) = self.core.lock()
+			&& let Some(core) = guard.take()
+		{
+			let _ = core.control_tx.send(ControlMessage::Kill);
 		}
 	}
 }
@@ -139,11 +139,11 @@ impl PtySession {
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let run_config = PtyRunConfig {
 			command: options.command,
-			cwd: options.cwd,
-			env: options.env,
-			cols: options.cols.unwrap_or(120).clamp(20, 400),
-			rows: options.rows.unwrap_or(40).clamp(5, 200),
-			shell: options.shell,
+			cwd:     options.cwd,
+			env:     options.env,
+			cols:    options.cols.unwrap_or(120).clamp(20, 400),
+			rows:    options.rows.unwrap_or(40).clamp(5, 200),
+			shell:   options.shell,
 		};
 		let ct = task::CancelToken::new(options.timeout_ms, options.signal);
 		let core = Arc::clone(&self.core);
@@ -258,13 +258,22 @@ fn reap_terminated_child(
 		std::thread::sleep(Duration::from_millis(10));
 	}
 }
+/// Owned PTY pieces handed back when the setup guard is disarmed:
+/// `(child, master, writer, child_pid, process_group_id)`.
+type DisarmedPty = (
+	Box<dyn Child + Send + Sync>,
+	Box<dyn portable_pty::MasterPty + Send>,
+	Box<dyn Write + Send>,
+	Option<i32>,
+	Option<i32>,
+);
 struct PostSpawnSetupGuard {
-	child: Option<Box<dyn Child + Send + Sync>>,
-	master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-	writer: Option<Box<dyn Write + Send>>,
-	child_pid: Option<i32>,
+	child:            Option<Box<dyn Child + Send + Sync>>,
+	master:           Option<Box<dyn portable_pty::MasterPty + Send>>,
+	writer:           Option<Box<dyn Write + Send>>,
+	child_pid:        Option<i32>,
 	process_group_id: Option<i32>,
-	disarmed: bool,
+	disarmed:         bool,
 }
 
 impl PostSpawnSetupGuard {
@@ -297,7 +306,7 @@ impl PostSpawnSetupGuard {
 			.as_ref()
 	}
 
-	fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
+	fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
 		let writer = self
 			.master()
 			.take_writer()
@@ -316,15 +325,7 @@ impl PostSpawnSetupGuard {
 			.map_err(|err| Error::from_reason(format!("Failed to create PTY reader: {err}")))
 	}
 
-	fn disarm(
-		mut self,
-	) -> (
-		Box<dyn Child + Send + Sync>,
-		Box<dyn portable_pty::MasterPty + Send>,
-		Box<dyn Write + Send>,
-		Option<i32>,
-		Option<i32>,
-	) {
+	fn disarm(mut self) -> DisarmedPty {
 		self.disarmed = true;
 		(
 			self.child.take().expect("setup guard owns PTY child"),
@@ -373,7 +374,7 @@ fn try_send_reader_event(
 	if *dropped_chunks > 0 {
 		match tx.try_send(ReaderEvent::Loss {
 			dropped_chunks: *dropped_chunks,
-			dropped_bytes: *dropped_bytes,
+			dropped_bytes:  *dropped_bytes,
 		}) {
 			Ok(()) => {
 				*dropped_chunks = 0;
@@ -403,7 +404,10 @@ fn send_reader_final_events(
 ) -> bool {
 	if *dropped_chunks > 0 {
 		if tx
-			.send(ReaderEvent::Loss { dropped_chunks: *dropped_chunks, dropped_bytes: *dropped_bytes })
+			.send(ReaderEvent::Loss {
+				dropped_chunks: *dropped_chunks,
+				dropped_bytes:  *dropped_bytes,
+			})
 			.is_err()
 		{
 			return false;
@@ -469,9 +473,9 @@ fn run_pty_sync(
 			let (tx, rx) = mpsc::channel();
 			let handle = std::thread::spawn(move || {
 				let result = pty_system.openpty(PtySize {
-					rows: config.rows,
-					cols: config.cols,
-					pixel_width: 0,
+					rows:         config.rows,
+					cols:         config.cols,
+					pixel_width:  0,
 					pixel_height: 0,
 				});
 				let _ = tx.send(result);
@@ -501,7 +505,12 @@ fn run_pty_sync(
 		unreachable!()
 	} else {
 		pty_system
-			.openpty(PtySize { rows: config.rows, cols: config.cols, pixel_width: 0, pixel_height: 0 })
+			.openpty(PtySize {
+				rows:         config.rows,
+				cols:         config.cols,
+				pixel_width:  0,
+				pixel_height: 0,
+			})
 			.map_err(|err| Error::from_reason(format!("Failed to open PTY: {err}")))?
 	};
 
@@ -880,11 +889,11 @@ mod tests {
 	fn test_config(command: &str) -> PtyRunConfig {
 		PtyRunConfig {
 			command: command.to_string(),
-			cwd: None,
-			env: None,
-			cols: 80,
-			rows: 24,
-			shell: Some("sh".to_string()),
+			cwd:     None,
+			env:     None,
+			cols:    80,
+			rows:    24,
+			shell:   Some("sh".to_string()),
 		}
 	}
 
