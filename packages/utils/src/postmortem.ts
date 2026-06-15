@@ -66,6 +66,14 @@ function runCleanup(reason: Reason): Promise<void> {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
+function safeStderrWrite(message: string): void {
+	try {
+		process.stderr.write(message);
+	} catch {
+		// Stderr may be closed during shutdown; silently drop the message
+	}
+}
+
 function formatFatalError(label: string, err: Error): string {
 	const name = err.name || "Error";
 	const message = err.message || "(no message)";
@@ -86,17 +94,17 @@ if (isMainThread) {
 			inspectorOpened = true;
 			inspector.open(undefined, undefined, false);
 			const url = inspector.url();
-			process.stderr.write(`Inspector opened: ${url}\n`);
+			safeStderrWrite(`Inspector opened: ${url}\n`);
 		})
 		.on("uncaughtException", async err => {
-			process.stderr.write(formatFatalError("Uncaught Exception", err));
+			safeStderrWrite(formatFatalError("Uncaught Exception", err));
 			logger.error("Uncaught exception", { err, stack: err.stack });
 			await runCleanup(Reason.UNCAUGHT_EXCEPTION);
 			process.exit(1);
 		})
 		.on("unhandledRejection", async reason => {
 			const err = reason instanceof Error ? reason : new Error(String(reason));
-			process.stderr.write(formatFatalError("Unhandled Rejection", err));
+			safeStderrWrite(formatFatalError("Unhandled Rejection", err));
 			logger.error("Unhandled rejection", { err, stack: err.stack });
 			await runCleanup(Reason.UNHANDLED_REJECTION);
 			process.exit(1);

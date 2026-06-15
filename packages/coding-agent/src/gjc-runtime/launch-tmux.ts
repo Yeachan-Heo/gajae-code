@@ -125,6 +125,14 @@ function isBunVirtualPath(value: string | undefined): boolean {
 	return value?.startsWith("/$bunfs/") === true;
 }
 
+function safeStderrWrite(message: string): void {
+	try {
+		process.stderr.write(message);
+	} catch {
+		// Stderr may be closed during shutdown; silently drop the message
+	}
+}
+
 function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
 	const detail = stderr?.trim();
 	const suffix = detail ? ` ${detail.slice(0, 240)}` : "";
@@ -280,16 +288,16 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			cleanupCreatedTmuxSession(plan, spawnSync, options);
 			const failure =
 				profile.failures.find(item => item.command.args.includes("@gjc-profile")) ?? profile.failures[0];
-			(context.diagnosticWriter ?? process.stderr.write.bind(process.stderr))(
-				formatTmuxLaunchDiagnostic("profile tagging failed", failure?.stderr),
-			);
+		(context.diagnosticWriter ?? safeStderrWrite)(
+			formatTmuxLaunchDiagnostic("profile tagging failed", failure?.stderr),
+		);
 			return true;
 		}
 	}
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", plan.sessionName], options);
 	if (attached.exitCode === 0) return true;
-	(context.diagnosticWriter ?? process.stderr.write.bind(process.stderr))(
+	(context.diagnosticWriter ?? safeStderrWrite)(
 		formatTmuxLaunchDiagnostic("attach failed", attached.stderr),
 	);
 	return true;
