@@ -489,6 +489,27 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 			.filter(Boolean);
 		expect(indexLines.length).toBe(2);
 	});
+
+	it("collapses concurrent identical writes to a single index.jsonl row (#660 TOCTOU)", async () => {
+		const root = await tempDir();
+		const args = ["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "race-run"];
+
+		// The command-level dedup (findExistingStageArtifact) and the ledger append
+		// are not under one lock, so racing identical writes can both observe an
+		// empty index and both append. The shared appendJsonlIdempotent primitive
+		// serializes the append, so exactly one row survives regardless of the race.
+		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
+		for (const result of results) {
+			expect(result.status).toBe(0);
+		}
+
+		const indexLines = (await fs.readFile(path.join(runDir(root, "race-run"), "index.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		expect(indexLines.length).toBe(1);
+		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
+	});
 });
 
 describe("native gjc ralplan runtime — persisted Planner state", () => {

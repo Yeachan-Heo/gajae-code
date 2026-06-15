@@ -13,7 +13,12 @@ import {
 } from "./ledger-event-renderer";
 import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { migrateWorkflowState } from "./state-migrations";
-import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import {
+	appendJsonlIdempotent,
+	readExistingStateForMutation,
+	writeArtifact,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -439,6 +444,19 @@ interface PersistedArtifact {
 	pendingApprovalPath?: string;
 }
 
+/**
+ * Content-addressed identity for an `index.jsonl` row: a repeated `--write` of the
+ * same `(stage, stage_n)` at identical content (same sha256) is the #638 duplicate
+ * the append must collapse. Rows missing these fields opt out of dedup.
+ */
+function ralplanIndexKey(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	const record = entry as Record<string, unknown>;
+	const { stage, stage_n, sha256 } = record;
+	if (typeof stage !== "string" || typeof stage_n !== "number" || typeof sha256 !== "string") return undefined;
+	return `${stage}\u0000${stage_n}\u0000${sha256}`;
+}
+
 async function persistArtifact(
 	resolved: ResolvedArtifactArgs,
 	cwd: string,
@@ -462,9 +480,10 @@ async function persistArtifact(
 		created_at: createdAt,
 		sha256,
 	};
-	await appendJsonl(path.join(runDir, "index.jsonl"), indexEntry, {
+	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "ralplan" },
+		key: ralplanIndexKey,
 	});
 
 	let pendingApprovalPath: string | undefined;

@@ -483,6 +483,112 @@ export async function appendJsonl(targetPath: string, entry: unknown, options?: 
 	return filePath;
 }
 
+export interface AppendJsonlIdempotentOptions extends StateWriterOptions {
+	/**
+	 * Identity key for an entry. Two entries that produce the same non-`undefined`
+	 * key are duplicates, so only the first is appended. Return `undefined` to opt a
+	 * candidate out of dedup (it is always appended). Use `key` for the common case
+	 * where identity reduces to a single string.
+	 */
+	key?: (entry: unknown) => string | undefined;
+	/**
+	 * Equivalence predicate: return `true` when `existing` already represents
+	 * `candidate`, suppressing the append. Use when identity cannot be reduced to a
+	 * single string key. When both `key` and `equals` are supplied, `equals` wins.
+	 */
+	equals?: (candidate: unknown, existing: unknown) => boolean;
+}
+
+export interface AppendJsonlIdempotentResult {
+	path: string;
+	/** `true` when the entry was written; `false` when an equivalent entry already existed. */
+	appended: boolean;
+	/** The pre-existing entry that suppressed the append, when `appended` is `false`. */
+	duplicate?: unknown;
+}
+
+async function readJsonlEntries(filePath: string): Promise<unknown[]> {
+	let raw: string;
+	try {
+		raw = await fs.readFile(filePath, "utf-8");
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return [];
+		throw error;
+	}
+	const entries: unknown[] = [];
+	for (const line of raw.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			entries.push(JSON.parse(trimmed));
+		} catch {
+			// Best-effort: dedup compares parseable rows only. A corrupt line cannot
+			// be matched, so it never suppresses a new append.
+		}
+	}
+	return entries;
+}
+
+function findJsonlDuplicate(
+	existing: readonly unknown[],
+	candidate: unknown,
+	options: AppendJsonlIdempotentOptions,
+): unknown | undefined {
+	if (options.equals) {
+		const equals = options.equals;
+		return existing.find(item => equals(candidate, item));
+	}
+	const key = options.key;
+	if (!key) return undefined;
+	const candidateKey = key(candidate);
+	if (candidateKey === undefined) return undefined;
+	return existing.find(item => key(item) === candidateKey);
+}
+
+/**
+ * Append `entry` to a JSONL file only when no equivalent entry already exists —
+ * the shared idempotent append primitive (issue #660).
+ *
+ * `appendJsonl` is a pure append with no dedup, so every recurring "duplicate
+ * ledger row" bug (#638, #643, #645) had to be patched with bespoke per-call-site
+ * guards. This primitive centralizes the read-check-append cycle: a caller
+ * declares identity once via `key` or `equals` instead of re-deriving the lookup
+ * at each site.
+ *
+ * The read-then-append is serialized through the same cross-process workflow lock
+ * as `updateJsonAtomic`, so two concurrent idempotent appends cannot both observe
+ * "no duplicate" and both write (the #646 TOCTOU that a plain `appendJsonl`
+ * preceded by a manual existence check is still exposed to).
+ *
+ * Scope note: this dedups the *append* only. Call sites whose idempotency must
+ * also skip a coupled mutation — e.g. the plan/state rewrite in #643/#645 — still
+ * need a whole-operation guard; this primitive is the ledger-level half of that.
+ */
+export async function appendJsonlIdempotent(
+	targetPath: string,
+	entry: unknown,
+	options: AppendJsonlIdempotentOptions,
+): Promise<AppendJsonlIdempotentResult> {
+	if (!options.key && !options.equals) {
+		throw new Error("appendJsonlIdempotent requires a `key` or `equals` option to detect duplicates");
+	}
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const existing = await readJsonlEntries(filePath);
+			const duplicate = findJsonlDuplicate(existing, entry, options);
+			if (duplicate !== undefined) {
+				return { path: filePath, appended: false, duplicate };
+			}
+			await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+			await maybeAudit(filePath, options);
+			return { path: filePath, appended: true };
+		},
+		options.lock,
+	);
+}
+
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
