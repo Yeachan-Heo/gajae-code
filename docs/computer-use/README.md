@@ -78,8 +78,8 @@ manual macOS E2E).
 | napi screenshot binding (`computerScreenshot`) | napi → `packages/natives` → TS, verified live | **done (this PR)** |
 | Native input orchestration (`input`) | `InputController` click/double_click/move/drag/scroll/type/keypress + release_all over an `EventSink` | **done (this PR)** — logic unit-tested; **live cursor-move injection verified** (Accessibility granted) |
 | Central `execute_action` state machine | preflight + supervisor + cancellation + audit + release-all | planned |
-| Kill-switch supervisor + event-tap lifecycle | supervisor, hotkey, abort/release/suspend/snapshot | next — required before click/type are exposed |
-| TS `computer` tool surface | full `ComputerController` + `computer.ts` schema/gating/prompt/renderer | planned |
+| Kill-switch supervisor + global-hotkey event-tap | `supervisor` (fail-closed `input_allowed`, user-only reset) + `hotkey` CGEventTap on a CFRunLoop thread | **done (this PR)** — supervisor unit-tested; **synthetic-hotkey latch verified live** |
+| Supervisor-gated `execute_action` + napi/TS `computer` tool | wire input through `input_allowed` + cancellation; `ComputerController` napi; `computer.ts` schema/gating/prompt/renderer | next |
 | Manual macOS E2E acceptance | TextEdit all-nine + kill-switch drill | planned (requires macOS hardware + granted TCC + human operator) |
 
 The remaining input backend, kill-switch, napi/TS surface, and manual
