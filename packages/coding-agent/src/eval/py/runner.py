@@ -290,6 +290,44 @@ def _emit_status(op: str, **data: Any) -> None:
     _emit({"type": "display", "id": rid, "bundle": bundle})
 
 
+def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+
 @line_magic("pip")
 def _magic_pip(args: str) -> None:
     argv = shlex.split(args) if args else ["--help"]
@@ -300,18 +338,26 @@ def _magic_pip(args: str) -> None:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=(os.name == "posix"),
     )
     installed_packages: list[str] = []
-    assert proc.stdout is not None
-    for raw_line in proc.stdout:
-        sys.stdout.write(raw_line)
-        m = re.search(r"Successfully installed\s+(.+)$", raw_line)
-        if m:
-            for token in m.group(1).split():
-                # Token is name-version; drop the version suffix.
-                pkg = token.rsplit("-", 1)[0]
-                installed_packages.append(pkg.replace("_", "-"))
-    proc.wait()
+    try:
+        assert proc.stdout is not None
+        try:
+            for raw_line in proc.stdout:
+                sys.stdout.write(raw_line)
+                m = re.search(r"Successfully installed\s+(.+)$", raw_line)
+                if m:
+                    for token in m.group(1).split():
+                        # Token is name-version; drop the version suffix.
+                        pkg = token.rsplit("-", 1)[0]
+                        installed_packages.append(pkg.replace("_", "-"))
+        finally:
+            proc.stdout.close()
+        proc.wait()
+    except KeyboardInterrupt:
+        _terminate_process_group(proc)
+        raise
     if installed_packages:
         import importlib
 
@@ -500,11 +546,19 @@ def _run_shell_body(body: str, *, shell_arg: str) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=(os.name == "posix"),
     )
-    assert proc.stdout is not None
-    for raw_line in proc.stdout:
-        sys.stdout.write(raw_line)
-    proc.wait()
+    try:
+        assert proc.stdout is not None
+        try:
+            for raw_line in proc.stdout:
+                sys.stdout.write(raw_line)
+        finally:
+            proc.stdout.close()
+        proc.wait()
+    except KeyboardInterrupt:
+        _terminate_process_group(proc)
+        raise
     return proc.returncode
 
 
