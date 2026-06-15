@@ -96,6 +96,14 @@ When the broker is enabled, the local SQLite credential store is bypassed and al
 
 The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*`. Its own inbound bearer token lives at `<config-dir>/auth-gateway.token` and is managed via `gjc auth-gateway token`.
 
+### Multi-account credential ranking
+
+When more than one OAuth credential is stored for the same provider (e.g. several Anthropic accounts), `AuthStorage` ranks them at session start to pick which one serves the session. This env var selects the ranking strategy; it is fully opt-in and does not change the default.
+
+| Variable                      | Used for                                          | Required when  | Notes / precedence                                                                                                                                                                                                                                                                                            |
+| ----------------------------- | ------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GJC_CREDENTIAL_RANKING_MODE` | Multi-account OAuth credential selection strategy | Never (opt-in) | `balanced` (default) prefers the least-drained account (spreads load, keeps burst headroom). `earliest-reset` prefers the soonest-to-reset non-blocked account (earliest-expiry-first) so perishable tumbling-window quota (e.g. Claude 5h/7d) is drained before reset. Unset/unknown → `balanced`. Only affects session-start ranking; blocked/exhausted accounts still sort last. |
+
 ---
 
 ## 2) Provider-specific runtime configuration

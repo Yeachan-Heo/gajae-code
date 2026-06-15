@@ -415,6 +415,7 @@ function getDefaultAgentDir(): string {
  */
 export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir()): Promise<AuthStorage> {
 	const brokerConfig = await resolveAuthBrokerConfig();
+	const credentialRankingMode = resolveCredentialRankingMode();
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
@@ -425,6 +426,7 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 		const storage = new AuthStorage(store, {
 			configValueResolver: resolveConfigValue,
 			sourceLabel: `broker ${brokerConfig.url}`,
+			credentialRankingMode,
 		});
 		await storage.reload();
 		return storage;
@@ -433,9 +435,23 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 	const storage = await AuthStorage.create(dbPath, {
 		configValueResolver: resolveConfigValue,
 		sourceLabel: `local ${dbPath}`,
+		credentialRankingMode,
 	});
 	await storage.reload();
 	return storage;
+}
+
+/**
+ * Opt-in multi-account credential ranking mode, read from the
+ * `GJC_CREDENTIAL_RANKING_MODE` env var. Unset/unknown → `undefined`, leaving
+ * {@link AuthStorage}'s default (`balanced`) untouched. `earliest-reset`
+ * switches to earliest-expiry-first selection so soon-to-reset tumbling-window
+ * quota is drained before it is lost.
+ */
+function resolveCredentialRankingMode(): "balanced" | "earliest-reset" | undefined {
+	const raw = process.env.GJC_CREDENTIAL_RANKING_MODE?.trim();
+	if (raw === "balanced" || raw === "earliest-reset") return raw;
+	return undefined;
 }
 
 /**

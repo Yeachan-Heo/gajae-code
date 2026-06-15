@@ -590,15 +590,29 @@ export function getRowByRowId(db: Database, table: string, key: string): Record<
 		.get(binding);
 }
 
-export function executeReadQuery(db: Database, sql: string): { columns: string[]; rows: Record<string, unknown>[] } {
+const MAX_RAW_QUERY_ROWS = 1000;
+
+export function executeReadQuery(
+	db: Database,
+	sql: string,
+	maxRows: number = MAX_RAW_QUERY_ROWS,
+): { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } {
 	const statement = db.prepare<SqliteRow, []>(sql);
 	if (statement.paramsCount > 0) {
 		throw new ToolError("SQLite raw queries do not support bound parameters");
 	}
-	return {
-		columns: [...statement.columnNames],
-		rows: statement.all(),
-	};
+	// Stream rows and stop at the cap (F20): a raw `q=SELECT ...` over a huge table
+	// must not materialize every row into memory via statement.all().
+	const rows: Record<string, unknown>[] = [];
+	let truncated = false;
+	for (const row of statement.iterate()) {
+		if (rows.length >= maxRows) {
+			truncated = true;
+			break;
+		}
+		rows.push(row as Record<string, unknown>);
+	}
+	return { columns: [...statement.columnNames], rows, truncated };
 }
 
 export function insertRow(db: Database, table: string, data: Record<string, unknown>): void {

@@ -706,13 +706,16 @@ export class UiHelpers {
 
 	/** Move pending bash components from pending area to chat */
 	flushPendingBashComponents(): void {
+		// Move (detach, not dispose) the live execution components from the pending
+		// area into the chat transcript — they are reused instances, so a disposing
+		// removeChild() would tear them down before re-adding.
 		for (const component of this.ctx.pendingBashComponents) {
-			this.ctx.pendingMessagesContainer.removeChild(component);
+			this.ctx.pendingMessagesContainer.detachChild(component);
 			this.ctx.chatContainer.addChild(component);
 		}
 		this.ctx.pendingBashComponents = [];
 		for (const component of this.ctx.pendingPythonComponents) {
-			this.ctx.pendingMessagesContainer.removeChild(component);
+			this.ctx.pendingMessagesContainer.detachChild(component);
 			this.ctx.chatContainer.addChild(component);
 		}
 		this.ctx.pendingPythonComponents = [];

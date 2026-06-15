@@ -375,6 +375,7 @@ export class ToolExecutionComponent extends Container {
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
 				this.#ui.requestRender();
 			}, 80);
+			this.#spinnerInterval?.unref?.();
 		} else if (!needsSpinner && this.#spinnerInterval) {
 			clearInterval(this.#spinnerInterval);
 			this.#spinnerInterval = undefined;
@@ -392,6 +393,11 @@ export class ToolExecutionComponent extends Container {
 		}
 		this.#editDiffAbort?.abort();
 		this.#editDiffAbort = undefined;
+	}
+
+	override dispose(): void {
+		this.stopAnimation();
+		super.dispose();
 	}
 
 	setExpanded(expanded: boolean): void {

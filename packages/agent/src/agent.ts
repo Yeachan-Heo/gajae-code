@@ -827,7 +827,10 @@ export class Agent {
 	}
 
 	appendMessage(m: AgentMessage) {
-		this.#state.messages = [...this.#state.messages, m];
+		// In-place push (not [...messages, m]): appending M messages over a session of
+		// N is O(N+M), not O(M*N). Consumers read state.messages fresh; run() snapshots
+		// via slice() at the API boundary, so no caller relies on per-append array identity.
+		this.#state.messages.push(m);
 	}
 
 	popMessage(): AgentMessage | undefined {

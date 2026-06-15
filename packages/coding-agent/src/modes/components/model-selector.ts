@@ -210,6 +210,9 @@ export class ModelSelectorComponent extends Container {
 	#tui: TUI;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
+	#currentModel?: Model;
+	#isFastForProvider: (provider?: string) => boolean = () => false;
+	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
@@ -239,7 +242,13 @@ export class ModelSelectorComponent extends Container {
 		scopedModels: ReadonlyArray<ScopedModelItem>,
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
-		options?: { temporaryOnly?: boolean; initialSearchInput?: string; sessionId?: string },
+		options?: {
+			temporaryOnly?: boolean;
+			initialSearchInput?: string;
+			sessionId?: string;
+			isFastForProvider?: (provider?: string) => boolean;
+			isFastForSubagentProvider?: (provider?: string) => boolean;
+		},
 	) {
 		super();
 
@@ -251,6 +260,9 @@ export class ModelSelectorComponent extends Container {
 		this.#onCancelCallback = onCancel;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
+		this.#currentModel = _currentModel;
+		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
+		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -928,14 +940,34 @@ export class ModelSelectorComponent extends Container {
 
 			// Build role badges (inverted: color as background, black text)
 			const roleBadgeTokens: string[] = [];
+			let roleMatched = false;
 			for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 				const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 				const assigned = this.#roles[role];
 				if (roleInfo.tag && assigned && modelsAreEqual(assigned.model, item.model)) {
+					roleMatched = true;
 					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
 					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
-					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}`);
+					// Subagent roles (task.agentModelOverrides) run under task.serviceTier, so
+					// their ⚡ must reflect the effective subagent tier, not the main session tier.
+					const roleFast =
+						roleInfo.settingsPath === "task.agentModelOverrides"
+							? this.#isFastForSubagentProvider(assigned.model.provider)
+							: this.#isFastForProvider(assigned.model.provider);
+					const fastSuffix = roleFast ? ` ${theme.icon.fast}` : "";
+					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}${fastSuffix}`);
 				}
+			}
+			// Active/current non-role row: show the fast glyph on the session's current
+			// model row even when it carries no role badge. Skip when a role token for
+			// this row already rendered the glyph (duplicate-glyph guard).
+			if (
+				!roleMatched &&
+				this.#currentModel !== undefined &&
+				modelsAreEqual(this.#currentModel, item.model) &&
+				this.#isFastForProvider(item.model.provider)
+			) {
+				roleBadgeTokens.push(theme.icon.fast);
 			}
 			const badgeText = roleBadgeTokens.length > 0 ? ` ${roleBadgeTokens.join(" ")}` : "";
 

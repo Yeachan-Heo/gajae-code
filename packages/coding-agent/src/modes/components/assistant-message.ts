@@ -111,8 +111,16 @@ export class AssistantMessageComponent extends Container {
 		const cached = this.#contentBlocksCache.get(content);
 		if (cached?.source === content.text) return cached.component;
 		const trimmed = content.text.trim();
-		const component =
-			renderDeepInterviewAssistantText(trimmed, theme) ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
+		const deepInterview = renderDeepInterviewAssistantText(trimmed, theme);
+		// Reuse the same Markdown instance across streaming chunks (update text in place)
+		// instead of constructing a new one each chunk; combined with the markdown
+		// per-code-block highlight cache, appends no longer re-highlight the whole prefix.
+		if (!deepInterview && cached && cached.component instanceof Markdown) {
+			cached.component.setText(trimmed);
+			cached.source = content.text;
+			return cached.component;
+		}
+		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
 		this.#contentBlocksCache.set(content, { source: content.text, component });
 		return component;
 	}

@@ -166,6 +166,25 @@ function parseBridgeScopes(value: string | undefined): readonly BridgeCommandSco
 	return [...scopes];
 }
 
+// Opt-in endpoint enablement via GJC_BRIDGE_ENDPOINTS (default undefined -> fail closed, backward compatible).
+// Accepts "all" or a comma list of matrix keys.
+export function parseBridgeEndpoints(value: string | undefined): Partial<BridgeEndpointMatrix> | undefined {
+	if (!value?.trim()) return undefined;
+	const allowed = new Set<string>(Object.keys(FAIL_CLOSED_BRIDGE_ENDPOINTS));
+	const matrix: Partial<BridgeEndpointMatrix> = {};
+	if (value.trim().toLowerCase() === "all") {
+		for (const key of allowed) matrix[key as keyof BridgeEndpointMatrix] = true;
+		return matrix;
+	}
+	for (const raw of value.split(",")) {
+		const key = raw.trim();
+		if (!key) continue;
+		if (!allowed.has(key)) throw new Error(`Invalid GJC_BRIDGE_ENDPOINTS entry: ${key}`);
+		matrix[key as keyof BridgeEndpointMatrix] = true;
+	}
+	return matrix;
+}
+
 function hasScope(scopes: readonly BridgeCommandScope[] | undefined, scope: BridgeCommandScope): boolean {
 	return new Set(scopes ?? DEFAULT_BRIDGE_SCOPES).has(scope);
 }
@@ -521,6 +540,7 @@ export async function runBridgeMode(
 		throw new Error(`Invalid GJC_BRIDGE_PORT: ${Bun.env.GJC_BRIDGE_PORT}`);
 	}
 	const commandScopes = parseBridgeScopes(Bun.env.GJC_BRIDGE_SCOPES);
+	const endpointMatrix = parseBridgeEndpoints(Bun.env.GJC_BRIDGE_ENDPOINTS);
 
 	const certPath = Bun.env.GJC_BRIDGE_TLS_CERT;
 	const keyPath = Bun.env.GJC_BRIDGE_TLS_KEY;
@@ -626,6 +646,7 @@ export async function runBridgeMode(
 			hostToolBridge,
 			hostUriBridge,
 			commandScopes,
+			endpointMatrix,
 			unattendedControlPlane,
 			commandDispatcher: command =>
 				dispatchRpcCommand(command, {

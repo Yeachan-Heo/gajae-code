@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +21,7 @@ import type { Model } from "@gajae-code/ai";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { ACP_BOOTSTRAP_RACE_GUARD_MS, AcpAgent, createAcpExtensionUiContext } from "../src/modes/acp/acp-agent";
+import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 import type { PlanModeState } from "../src/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
@@ -305,6 +306,18 @@ class FakeAgentSession {
 		return this.fastMode;
 	}
 
+	isFastForProvider(_provider?: string): boolean {
+		return false;
+	}
+
+	isFastForSubagentProvider(_provider?: string): boolean {
+		return false;
+	}
+
+	resolveRoleModelWithThinking(_role: string): { model: undefined } {
+		return { model: undefined };
+	}
+
 	setForcedToolChoice(toolName: string): void {
 		this.forcedToolChoice = toolName;
 	}
@@ -458,6 +471,10 @@ async function waitForAvailableCommandsUpdate(harness: AgentHarness, sessionId: 
 }
 
 describe("ACP agent", () => {
+	beforeAll(async () => {
+		const installed = await getThemeByName("red-claw");
+		if (installed) setThemeInstance(installed);
+	});
 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {
 		const harness = await createHarness();
 		const first = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -1651,7 +1668,7 @@ describe("ACP agent", () => {
 				update =>
 					update.update.sessionUpdate === "agent_message_chunk" &&
 					update.update.content.type === "text" &&
-					update.update.content.text === "Fast mode is off.",
+					update.update.content.text.includes("Fast 모드 상태"),
 			),
 		).toBe(true);
 

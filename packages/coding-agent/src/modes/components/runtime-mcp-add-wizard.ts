@@ -131,6 +131,11 @@ export class MCPAddWizard extends Container {
 		| null = null;
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
+	#disposed = false;
+	#transitionTimers = new Set<NodeJS.Timeout>();
+	#healthCheckSpinner?: NodeJS.Timeout;
+	#healthCheckTimeout?: NodeJS.Timeout;
+	#asyncGeneration = 0;
 
 	constructor(
 		onComplete: (name: string, config: MCPServerConfig, scope: Scope) => void,
@@ -176,6 +181,39 @@ export class MCPAddWizard extends Container {
 
 		// Render first step
 		this.#renderStep();
+	}
+
+	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#asyncGeneration += 1;
+		for (const timer of this.#transitionTimers) {
+			clearTimeout(timer);
+		}
+		this.#transitionTimers.clear();
+		this.#clearHealthCheckTimers();
+		super.dispose();
+	}
+
+	#scheduleTransition(callback: () => void, delay: number): void {
+		if (this.#disposed) return;
+		const timer = setTimeout(() => {
+			this.#transitionTimers.delete(timer);
+			if (this.#disposed) return;
+			callback();
+		}, delay);
+		this.#transitionTimers.add(timer);
+	}
+
+	#clearHealthCheckTimers(): void {
+		if (this.#healthCheckSpinner) {
+			clearInterval(this.#healthCheckSpinner);
+			this.#healthCheckSpinner = undefined;
+		}
+		if (this.#healthCheckTimeout) {
+			clearTimeout(this.#healthCheckTimeout);
+			this.#healthCheckTimeout = undefined;
+		}
 	}
 
 	#requestRender(): void {
@@ -941,6 +979,8 @@ export class MCPAddWizard extends Container {
 	 * Test connection and automatically detect if auth is needed.
 	 */
 	async #testConnectionAndDetectAuth(): Promise<void> {
+		if (this.#disposed) return;
+		const generation = ++this.#asyncGeneration;
 		const testConfig = this.#buildServerConfig();
 
 		if (!this.#onTestConnectionCallback) {
@@ -954,6 +994,7 @@ export class MCPAddWizard extends Container {
 		try {
 			// Try to connect - timeout is handled by the transport layer (5 seconds)
 			await this.#onTestConnectionCallback(testConfig);
+			if (this.#disposed || generation !== this.#asyncGeneration) return;
 
 			// Success! No auth required
 			this.#contentContainer.clear();
@@ -962,7 +1003,7 @@ export class MCPAddWizard extends Container {
 			this.#contentContainer.addChild(new Text("No authentication required", 0, 0));
 			this.#contentContainer.addChild(new Spacer(1));
 
-			setTimeout(() => {
+			this.#scheduleTransition(() => {
 				this.#state.authMethod = "none";
 				this.#currentStep = "scope";
 				this.#selectedIndex = 0;
@@ -978,10 +1019,12 @@ export class MCPAddWizard extends Container {
 				if (!oauth && this.#state.transport !== "stdio" && this.#state.url) {
 					try {
 						oauth = await discoverOAuthEndpoints(this.#state.url, authResult.authServerUrl);
+						if (this.#disposed || generation !== this.#asyncGeneration) return;
 					} catch {
 						// Ignore discovery failures and fallback to manual auth.
 					}
 				}
+				if (this.#disposed || generation !== this.#asyncGeneration) return;
 
 				if (oauth) {
 					this.#state.oauthAuthUrl = oauth.authorizationUrl;
@@ -1019,7 +1062,7 @@ export class MCPAddWizard extends Container {
 				this.#contentContainer.addChild(new Spacer(1));
 				this.#contentContainer.addChild(new Text(theme.fg("muted", "Adding server anyway..."), 0, 0));
 
-				setTimeout(() => {
+				this.#scheduleTransition(() => {
 					this.#state.authMethod = "none";
 					this.#currentStep = "scope";
 					this.#selectedIndex = 0;
@@ -1107,6 +1150,8 @@ export class MCPAddWizard extends Container {
 	}
 
 	async #launchOAuthFlow(): Promise<void> {
+		if (this.#disposed) return;
+		const generation = ++this.#asyncGeneration;
 		if (!this.#onOAuthCallback) {
 			this.#contentContainer.clear();
 			this.#contentContainer.addChild(new Text(theme.fg("error", "OAuth flow not available"), 0, 0));
@@ -1150,6 +1195,7 @@ export class MCPAddWizard extends Container {
 				this.#state.oauthClientSecret,
 				this.#state.oauthScopes,
 			);
+			if (this.#disposed || generation !== this.#asyncGeneration) return;
 
 			// Store credential ID + any dynamically-registered client credentials,
 			// so the final mcp.json entry persists everything needed for refresh.
@@ -1168,7 +1214,8 @@ export class MCPAddWizard extends Container {
 			this.#contentContainer.addChild(healthText);
 
 			let spinnerIndex = 0;
-			const spinner = setInterval(() => {
+			this.#healthCheckSpinner = setInterval(() => {
+				if (this.#disposed || generation !== this.#asyncGeneration) return;
 				healthText.setText(
 					theme.fg("muted", `${spinnerFrames[spinnerIndex % spinnerFrames.length]} Checking server connection...`),
 				);
@@ -1181,7 +1228,7 @@ export class MCPAddWizard extends Container {
 			if (this.#onTestConnectionCallback) {
 				try {
 					const { promise: timeoutPromise, reject: timeoutReject } = Promise.withResolvers<never>();
-					const timer = setTimeout(
+					this.#healthCheckTimeout = setTimeout(
 						() => timeoutReject(new Error("Health check timed out after 10 seconds")),
 						10_000,
 					);
@@ -1191,15 +1238,19 @@ export class MCPAddWizard extends Container {
 							timeoutPromise,
 						]);
 					} finally {
-						clearTimeout(timer);
+						if (this.#healthCheckTimeout) {
+							clearTimeout(this.#healthCheckTimeout);
+							this.#healthCheckTimeout = undefined;
+						}
 					}
 				} catch (error) {
 					healthPassed = false;
 					healthError = sanitize(error instanceof Error ? error.message : String(error));
 				}
 			}
+			if (this.#disposed || generation !== this.#asyncGeneration) return;
 
-			clearInterval(spinner);
+			this.#clearHealthCheckTimers();
 			if (healthPassed) {
 				healthText.setText(theme.fg("success", "✓ Health check passed"));
 			} else {
@@ -1210,7 +1261,7 @@ export class MCPAddWizard extends Container {
 			this.#requestRender();
 
 			// Move to scope selection after short delay
-			setTimeout(
+			this.#scheduleTransition(
 				() => {
 					this.#currentStep = "scope";
 					this.#selectedIndex = 0;

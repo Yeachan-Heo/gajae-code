@@ -167,10 +167,40 @@ export class EphemeralBlobStore extends BlobStore {
 }
 
 export class MemoryBlobStore extends BlobStore {
+	/**
+	 * Generous byte/count LRU bound (F8). Content-addressed resident blobs are fail-closed
+	 * on miss (callers raise/handle {@link ResidentBlobMissingError}), so evicting the
+	 * least-recently-used entry on an extremely large session is preferable to unbounded
+	 * RAM growth. The caps sit well above normal usage and only trip on pathological sizes.
+	 */
+	static readonly #MAX_BYTES = 64 * 1024 * 1024;
+	static readonly #MAX_COUNT = 4096;
+
 	#blobs = new Map<string, Buffer>();
+	#bytes = 0;
 
 	constructor() {
 		super(":memory:");
+	}
+
+	#store(hash: string, data: Buffer): void {
+		const existing = this.#blobs.get(hash);
+		if (existing) {
+			this.#blobs.delete(hash);
+			this.#bytes -= existing.byteLength;
+		}
+		this.#blobs.set(hash, data);
+		this.#bytes += data.byteLength;
+		while (
+			(this.#bytes > MemoryBlobStore.#MAX_BYTES || this.#blobs.size > MemoryBlobStore.#MAX_COUNT) &&
+			this.#blobs.size > 1
+		) {
+			const oldest = this.#blobs.keys().next().value;
+			if (oldest === undefined) break;
+			const evicted = this.#blobs.get(oldest);
+			this.#blobs.delete(oldest);
+			if (evicted) this.#bytes -= evicted.byteLength;
+		}
 	}
 
 	async put(data: Buffer): Promise<BlobPutResult> {
@@ -179,7 +209,7 @@ export class MemoryBlobStore extends BlobStore {
 
 	putSync(data: Buffer): BlobPutResult {
 		const hash = new Bun.SHA256().update(data).digest("hex");
-		this.#blobs.set(hash, Buffer.from(data));
+		this.#store(hash, Buffer.from(data));
 		return {
 			hash,
 			path: `memory:${hash}`,
@@ -195,7 +225,11 @@ export class MemoryBlobStore extends BlobStore {
 
 	getSync(hash: string): Buffer | null {
 		const data = this.#blobs.get(hash);
-		return data ? Buffer.from(data) : null;
+		if (!data) return null;
+		// Refresh LRU recency on hit so hot blobs survive eviction.
+		this.#blobs.delete(hash);
+		this.#blobs.set(hash, data);
+		return Buffer.from(data);
 	}
 
 	async has(hash: string): Promise<boolean> {

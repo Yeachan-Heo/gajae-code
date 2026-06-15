@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `GJC_CREDENTIAL_RANKING_MODE` env var (`balanced` (default) | `earliest-reset`), wired through `discoverAuthStorage` into `AuthStorage.credentialRankingMode`. `earliest-reset` selects multi-account OAuth credentials earliest-expiry-first so soon-to-reset tumbling-window quota (e.g. Claude 5h/7d) is drained before it is lost at reset; unset/unknown leaves the default `balanced` behavior unchanged.
+
 ### Fixed
 
 - Auto-compaction no longer silently requires OpenAI when the active route is a custom Anthropic-capable provider. The compaction model-candidate selection already prefers the active session model, but its last-resort "largest-context model" fallback scanned the entire bundled catalog across all providers, so a stray OpenAI credential (e.g. an out-of-credit key left in the environment) could be picked when the active provider's compaction credential was unusable — turning OpenAI into an implicit hard dependency. The implicit fallback is now scoped to the active model's provider; cross-provider compaction still works but only when explicitly configured via `modelRoles`. When the active provider cannot compact and no role is configured, compaction now fails with the existing clear, provider-specific credential error instead of reaching for OpenAI (#697).
