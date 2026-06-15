@@ -43,6 +43,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "./sdk";
+import { discoverAndLoadExtensions, loadExtensions } from "./extensibility/extensions";
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
 import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
@@ -51,7 +52,7 @@ import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getNewEntries } from "./utils/changelog";
-import type { EventBus } from "./utils/event-bus";
+import { EventBus } from "./utils/event-bus";
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	if (!settings.get("startup.checkUpdate")) {
@@ -892,6 +893,26 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
+
+	// Activate the extension system for the agent run. The shipped build leaves
+	// `preloadedExtensions` unset, so session/agent lifecycle hooks (e.g. the
+	// cmux status reporter under ~/.gjc/agent/extensions) never load. Discover
+	// native .gjc/.pi extensions (+ CLI -e/--hook paths) and hand them to
+	// createAgentSession. Honors --no-extensions. Failure only warns; it never
+	// blocks startup.
+	try {
+		const extensionEventBus = new EventBus();
+		const cliExtensionPaths = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
+		const preloadedExtensions = parsedArgs.noExtensions
+			? await loadExtensions(cliExtensionPaths, cwd, extensionEventBus)
+			: await discoverAndLoadExtensions(cliExtensionPaths, cwd, extensionEventBus);
+		for (const { path: extPath, error } of preloadedExtensions.errors) {
+			logger.warn("Failed to load extension", { path: extPath, error });
+		}
+		sessionOptions.preloadedExtensions = preloadedExtensions;
+	} catch (error) {
+		logger.warn("Extension discovery failed; continuing without extensions", { error: String(error) });
+	}
 
 	// Handle CLI --api-key as runtime override (not persisted)
 	if (parsedArgs.apiKey) {
