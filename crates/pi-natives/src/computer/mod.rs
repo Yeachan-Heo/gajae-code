@@ -27,6 +27,7 @@ pub mod coords;
 pub mod input;
 #[cfg(target_os = "macos")]
 pub mod permissions;
+pub mod supervisor;
 
 #[cfg(target_os = "macos")]
 pub use capture::{CaptureError, CapturedFrame, capture_primary_display};
@@ -34,3 +35,4 @@ pub use coords::{CoordError, LogicalPoint, NormalizedDisplay};
 pub use input::{EventSink, InputController, InputError, MouseButton};
 #[cfg(target_os = "macos")]
 pub use permissions::{PermissionError, PreflightStatus, TccPermission, preflight};
+pub use supervisor::{Supervisor, SupervisorStatus};
