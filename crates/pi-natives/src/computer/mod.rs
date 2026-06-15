@@ -35,6 +35,61 @@ pub mod supervisor;
 pub use capture::{CaptureError, CapturedFrame, capture_primary_display};
 pub use coords::{CoordError, LogicalPoint, NormalizedDisplay};
 pub use input::{EventSink, InputController, InputError, MouseButton};
+use napi::bindgen_prelude::Uint8Array;
+use napi_derive::napi;
 #[cfg(target_os = "macos")]
 pub use permissions::{PermissionError, PreflightStatus, TccPermission, preflight};
 pub use supervisor::{Supervisor, SupervisorStatus};
+
+/// A captured primary-display screenshot returned to JS.
+///
+/// `width_px`/`height_px` are the physical pixels that define the action
+/// coordinate space (see the coordinate contract); the scale/origin map them to
+/// macOS logical points.
+#[napi(object)]
+pub struct ComputerScreenshot {
+	/// PNG-encoded image bytes.
+	pub png:       Uint8Array,
+	/// Screenshot width in physical pixels.
+	pub width_px:  u32,
+	/// Screenshot height in physical pixels.
+	pub height_px: u32,
+	/// Physical-pixels-per-logical-point along X.
+	pub scale_x:   f64,
+	/// Physical-pixels-per-logical-point along Y.
+	pub scale_y:   f64,
+	/// Logical origin X of the display (points).
+	pub origin_x:  f64,
+	/// Logical origin Y of the display (points).
+	pub origin_y:  f64,
+}
+
+/// Capture the primary display for JS callers (macOS).
+///
+/// Requires the Screen Recording permission. This is the read-only `screenshot`
+/// primitive of the computer-use tool; input primitives land behind the same
+/// surface once the Accessibility gate is satisfied in a granted `gjc` process.
+///
+/// # Errors
+/// Returns an error when capture fails (e.g. Screen Recording not granted).
+#[napi(js_name = "computerScreenshot")]
+pub fn computer_screenshot() -> napi::Result<ComputerScreenshot> {
+	#[cfg(target_os = "macos")]
+	{
+		let frame = capture::capture_primary_display()
+			.map_err(|err| napi::Error::from_reason(format!("{err}")))?;
+		Ok(ComputerScreenshot {
+			png:       Uint8Array::from(frame.png),
+			width_px:  frame.display.width_px,
+			height_px: frame.display.height_px,
+			scale_x:   frame.display.scale_x,
+			scale_y:   frame.display.scale_y,
+			origin_x:  frame.display.origin_x,
+			origin_y:  frame.display.origin_y,
+		})
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		Err(napi::Error::from_reason("computer screenshot capture is only supported on macOS"))
+	}
+}

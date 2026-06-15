@@ -370,9 +370,11 @@ export interface ClipboardImage {
 export declare function computerScreenshot(): ComputerScreenshot
 
 /**
- * A captured primary-display screenshot returned to JS. `width_px`/`height_px`
- * are the physical pixels that define the action coordinate space (see the
- * coordinate contract); the scale/origin map them to macOS logical points.
+ * A captured primary-display screenshot returned to JS.
+ *
+ * `width_px`/`height_px` are the physical pixels that define the action
+ * coordinate space (see the coordinate contract); the scale/origin map them to
+ * macOS logical points.
  */
 export interface ComputerScreenshot {
   /** PNG-encoded image bytes. */
