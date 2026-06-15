@@ -252,7 +252,7 @@ function resolveDeepInterviewLanguagePreference(idea: string): DeepInterviewLang
 			label: "Korean",
 			source: "initial-idea",
 			instruction:
-				"Ask every user-facing deep-interview question in Korean unless the user explicitly requests another language.",
+				"사용자에게 보이는 모든 deep-interview 질문·옵션·공지를 자연스럽고 어법에 맞는 표준 한국어로 작성하세요. 맞춤법과 띄어쓰기를 지키고, 존재하지 않는 단어나 어색한 직역·음역을 만들지 마세요. 코드 식별자, 파일 경로, 명령어, 설정·JSON 키, 라이브러리·API·제품명 같은 기술 용어는 한국어로 번역하지 말고 원문(영문) 그대로 쓰되, 이미 정착된 표준 한국어 용어가 있을 때만 그 용어를 사용하세요. 사용자가 다른 언어를 명시적으로 요청하면 그 언어를 따르세요.",
 		};
 	}
 	return undefined;

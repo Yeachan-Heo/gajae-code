@@ -205,7 +205,7 @@ describe("native gjc deep-interview runtime", () => {
 			label: "Korean",
 			source: "initial-idea",
 		});
-		expect(payload.language.instruction).toContain("Korean");
+		expect(payload.language.instruction).toContain("한국어");
 
 		const state = JSON.parse(
 			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
