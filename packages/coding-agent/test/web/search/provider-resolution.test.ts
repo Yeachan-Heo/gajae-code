@@ -56,6 +56,36 @@ describe("native web-search provider resolution", () => {
 		).resolves.toEqual(["duckduckgo"]);
 	});
 
+	it("does not map provider id openai to hosted codex for local OpenAI-compatible auto contexts", async () => {
+		await expect(
+			ids(
+				{
+					provider: "openai",
+					modelId: "gpt-oss",
+					api: "openai-responses",
+					baseUrl: "http://localhost:11434/v1",
+					webSearch: "auto",
+				},
+				{ auth: ["openai-codex", "codex"] },
+			),
+		).resolves.toEqual(["duckduckgo"]);
+	});
+
+	it("still maps provider id openai to hosted codex for non-local auto contexts", async () => {
+		await expect(
+			ids(
+				{
+					provider: "openai",
+					modelId: "gpt-5",
+					api: "openai-responses",
+					baseUrl: "https://api.openai.com/v1",
+					webSearch: "auto",
+				},
+				{ auth: ["openai-codex", "codex"] },
+			),
+		).resolves.toEqual(["codex", "duckduckgo"]);
+	});
+
 	it("honors forced provider first and dedupes configured fallback plus DuckDuckGo", async () => {
 		await expect(
 			ids(

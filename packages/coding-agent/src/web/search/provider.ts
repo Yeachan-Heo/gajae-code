@@ -232,6 +232,13 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	return undefined;
 }
 
+function canUseDirectProviderMapping(ctx: ActiveSearchModelContext, id: SearchProviderId): boolean {
+	if (ctx.webSearch === "off") return false;
+	if (id !== "codex") return true;
+	if (!isOpenAICompatWire(ctx.api)) return true;
+	return ctx.webSearch === "on" || !isLocalBaseUrl(ctx.baseUrl);
+}
+
 export async function canUseGenericCredentials(
 	authStorage: AuthStorage,
 	ctx: ActiveSearchModelContext | undefined,
@@ -279,7 +286,8 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 		await appendAvailable(chain, preferredProvider, authStorage);
 	} else if (activeModelContext) {
 		const directId = MODEL_PROVIDER_TO_SEARCH[activeModelContext.provider.toLowerCase()];
-		if (activeModelContext.webSearch !== "off" && directId) await appendAvailable(chain, directId, authStorage);
+		if (directId && canUseDirectProviderMapping(activeModelContext, directId))
+			await appendAvailable(chain, directId, authStorage);
 		const inferred = inferNativeProviderFromModel(activeModelContext);
 		if (inferred) await appendAvailable(chain, inferred, authStorage);
 		if (await shouldTryGenericOpenAICompat(authStorage, activeModelContext, sessionId, signal))
