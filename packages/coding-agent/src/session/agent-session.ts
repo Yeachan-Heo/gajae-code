@@ -6018,12 +6018,26 @@ export class AgentSession {
 
 	/**
 	 * True when the configured `serviceTier` resolves to `"priority"` for the
+	 * given model `provider`. Returns false for scoped tiers that don't match
+	 * (e.g. `"openai-only"` on an anthropic provider) and when `provider` is
+	 * undefined. This is the canonical provider-aware fast-mode predicate.
+	 */
+	isFastForProvider(provider?: string): boolean {
+		// Fast mode applies to a concrete model's provider. With no provider
+		// (no model selected) it cannot apply, even under an unscoped `priority`
+		// tier that `resolveServiceTier` would otherwise pass through.
+		if (provider === undefined) return false;
+		return resolveServiceTier(this.serviceTier, provider) === "priority";
+	}
+
+	/**
+	 * True when the configured `serviceTier` resolves to `"priority"` for the
 	 * *currently selected model's provider*. Returns false for scoped tiers
 	 * that don't match (e.g. `"openai-only"` on an anthropic model) and when
 	 * no model is selected.
 	 */
 	isFastModeActive(): boolean {
-		return resolveServiceTier(this.serviceTier, this.model?.provider) === "priority";
+		return this.isFastForProvider(this.model?.provider);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {

@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { Settings } from "../src/config/settings";
+import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
@@ -17,6 +18,8 @@ interface FakeAcpBuiltinSession {
 	toggleFastMode(): boolean;
 	setFastMode(enabled: boolean): void;
 	isFastModeEnabled(): boolean;
+	isFastForProvider(provider?: string): boolean;
+	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
@@ -75,6 +78,12 @@ function createRuntime() {
 		},
 		isFastModeEnabled() {
 			return this.fastMode;
+		},
+		isFastForProvider(_provider?: string) {
+			return false;
+		},
+		resolveRoleModelWithThinking(_role: string): { model?: { provider: string; id: string } } {
+			return { model: undefined };
 		},
 		setForcedToolChoice(toolName: string) {
 			this.forcedToolChoice = toolName;
@@ -196,12 +205,64 @@ function createRuntime() {
 
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
+		const installed = await getThemeByName("red-claw");
+		if (!installed) throw new Error("Failed to load theme for fast status test");
+		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 
 		const result = await executeAcpBuiltinSlashCommand("/fast status", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output).toEqual(["Fast mode is off."]);
+		// No model selected and no roles assigned -> multiline report, active row off.
+		expect(output).toHaveLength(1);
+		expect(output[0]).toContain("Fast 모드 상태");
+		expect(output[0]).toContain("현재 모델: off");
+		expect(output[0]).not.toContain("Fast mode is");
+	});
+
+	it("renders a provider-aware multiline fast status report and never calls isFastModeEnabled", async () => {
+		const installed = await getThemeByName("red-claw");
+		if (!installed) throw new Error("Failed to load theme for fast status test");
+		setThemeInstance(installed);
+		const { output, runtime } = createRuntime();
+		const session = runtime.session as unknown as {
+			model: { provider: string; id: string } | undefined;
+			isFastForProvider: (provider?: string) => boolean;
+			resolveRoleModelWithThinking: (role: string) => { model?: { provider: string; id: string } };
+			isFastModeEnabled: () => boolean;
+		};
+		session.model = { provider: "anthropic", id: "claude-sonnet-4-5" };
+		session.isFastForProvider = provider => provider === "anthropic";
+		session.resolveRoleModelWithThinking = role =>
+			role === "executor" ? { model: { provider: "openai", id: "gpt-5" } } : { model: undefined };
+		// The status branch must use the provider-aware predicate, never this.
+		session.isFastModeEnabled = () => {
+			throw new Error("/fast status must not call isFastModeEnabled");
+		};
+
+		const result = await executeAcpBuiltinSlashCommand("/fast status", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain(`현재 모델: anthropic/claude-sonnet-4-5 ${theme.icon.fast}`);
+		expect(output[0]).toContain("EXECUTOR: openai/gpt-5 off");
+		expect(output[0]).not.toContain("Fast mode is");
+	});
+	it("keeps /fast on/off/toggle output and state changes unchanged", async () => {
+		const { output, runtime } = createRuntime();
+
+		await expect(executeAcpBuiltinSlashCommand("/fast on", runtime)).resolves.toEqual({ consumed: true });
+		expect(runtime.session.fastMode).toBe(true);
+		expect(output).toEqual(["Fast mode enabled."]);
+
+		output.length = 0;
+		await expect(executeAcpBuiltinSlashCommand("/fast off", runtime)).resolves.toEqual({ consumed: true });
+		expect(runtime.session.fastMode).toBe(false);
+		expect(output).toEqual(["Fast mode disabled."]);
+
+		output.length = 0;
+		await expect(executeAcpBuiltinSlashCommand("/fast toggle", runtime)).resolves.toEqual({ consumed: true });
+		expect(runtime.session.fastMode).toBe(true);
+		expect(output).toEqual(["Fast mode enabled."]);
 	});
 
 	it("renders provider usage reports when the session can fetch them", async () => {
