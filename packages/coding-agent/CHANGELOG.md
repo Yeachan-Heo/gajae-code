@@ -6,6 +6,7 @@
 
 - Mapped the retired `codex-standard` model profile name to `codex-medium` during profile activation, **as a fallback only** so a user-defined profile literally named `codex-standard` is never shadowed, letting stale `modelProfile.default: codex-standard` configs reach activation instead of blocking startup after the rebuilt profile catalog.
 - Fixed interactive goal-mode auto-continuation looping `Error: Agent is already processing…` (`AgentBusyError`) while the session is busy. A wedged/orphaned subagent turn — or an in-progress compaction — can leave the session non-idle while the interactive loop is back at `getUserInput()`; the 800 ms continuation timer then fired `prompt()`, threw `AgentBusyError`, surfaced it via `showError`, and re-armed — spamming the error roughly every 800 ms. The continuation now skips and re-arms while `isStreaming`/`isCompacting`, firing only once the session returns to idle.
+- Fixed the built-in `minimax-eco`/`minimax-medium`/`minimax-pro` model profiles 400ing on activation because every role pinned the non-existent `minimax-code/minimax-v3`. All three profiles now pin `minimax-code/minimax-m3`, the canonical `minimax-code` default already present in the bundled models catalog (#656).
 
 ### Added
 
