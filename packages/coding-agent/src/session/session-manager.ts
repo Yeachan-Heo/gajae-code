@@ -889,8 +889,27 @@ async function resolvePersistedBlobRefs(value: unknown, blobStore: BlobStore, ke
 	);
 }
 
+/**
+ * Run async tasks with bounded concurrency so an image-heavy resume never materializes
+ * every blob's base64 simultaneously (F8: avoids the transient OOM spike of an unbounded
+ * Promise.all over all historical images).
+ */
+const BLOB_RESOLVE_CONCURRENCY = 8;
+async function runWithConcurrency(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+	let next = 0;
+	const worker = async (): Promise<void> => {
+		while (next < tasks.length) {
+			const index = next;
+			next += 1;
+			await tasks[index]!();
+		}
+	};
+	const workerCount = Math.max(1, Math.min(limit, tasks.length));
+	await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
+
 async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
-	const promises: Promise<void>[] = [];
+	const tasks: Array<() => Promise<void>> = [];
 
 	for (const entry of entries) {
 		if (entry.type === "session") continue;
@@ -902,22 +921,19 @@ async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobSto
 			contentArray = entry.content;
 		}
 
-		if (contentArray) {
-			for (const block of contentArray) {
-				if (isImageBlock(block) && isBlobRef(block.data)) {
-					promises.push(
-						resolveImageData(blobStore, block.data).then(resolved => {
-							block.data = resolved;
-						}),
-					);
+		tasks.push(async () => {
+			if (contentArray) {
+				for (const block of contentArray) {
+					if (isImageBlock(block) && isBlobRef(block.data)) {
+						block.data = await resolveImageData(blobStore, block.data);
+					}
 				}
 			}
-		}
-
-		promises.push(resolvePersistedBlobRefs(entry, blobStore));
+			await resolvePersistedBlobRefs(entry, blobStore);
+		});
 	}
 
-	await Promise.all(promises);
+	await runWithConcurrency(tasks, BLOB_RESOLVE_CONCURRENCY);
 }
 
 /**
