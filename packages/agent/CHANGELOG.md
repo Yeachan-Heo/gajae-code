@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forwarded local summary, handoff, and branch-summary transport/session options to one-shot model calls so callers can preserve provider session state and WebSocket preferences.
+
 ## [0.5.2] - 2026-06-15
 
 ### Fixed

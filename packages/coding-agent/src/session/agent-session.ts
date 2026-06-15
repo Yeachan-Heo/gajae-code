@@ -6445,6 +6445,9 @@ export class AgentSession {
 				model,
 				apiKey,
 				{
+					...this.#withCompactionTransportOptions({
+						authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.sessionId),
+					}),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -7391,7 +7394,7 @@ export class AgentSession {
 
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
-					...options,
+					...this.#withCompactionTransportOptions(options),
 					metadata: this.agent.metadataForProvider(candidate.provider),
 					convertToLlm,
 					telemetry,
@@ -7405,6 +7408,19 @@ export class AgentSession {
 		}
 
 		throw this.#buildCompactionAuthError();
+	}
+
+	#withCompactionTransportOptions(options?: SummaryOptions): SummaryOptions {
+		const openaiWebsocketSetting = this.settings.get("providers.openaiWebsockets") ?? "off";
+		const preferWebsockets =
+			openaiWebsocketSetting === "on" ? true : openaiWebsocketSetting === "off" ? false : undefined;
+
+		return {
+			...options,
+			sessionId: options?.sessionId ?? this.agent.providerSessionId ?? this.agent.sessionId,
+			providerSessionState: options?.providerSessionState ?? this.#providerSessionState,
+			preferWebsockets: options?.preferWebsockets ?? preferWebsockets,
+		};
 	}
 
 	async #prepareCompactionFromHooks(
@@ -7680,19 +7696,26 @@ export class AgentSession {
 					let attempt = 0;
 					while (true) {
 						try {
-							compactResult = await compact(preparation, candidate, apiKey, undefined, autoCompactionSignal, {
-								promptOverride: compactionPrep.hookPrompt,
-								extraContext: compactionPrep.hookContext,
-								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-								metadata: this.agent.metadataForProvider(candidate.provider),
-								initiatorOverride: "agent",
-								convertToLlm,
-								telemetry,
-								authCredentialType: this.#modelRegistry.getSessionCredentialType(
-									candidate.provider,
-									this.sessionId,
-								),
-							});
+							compactResult = await compact(
+								preparation,
+								candidate,
+								apiKey,
+								undefined,
+								autoCompactionSignal,
+								this.#withCompactionTransportOptions({
+									promptOverride: compactionPrep.hookPrompt,
+									extraContext: compactionPrep.hookContext,
+									remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+									metadata: this.agent.metadataForProvider(candidate.provider),
+									initiatorOverride: "agent",
+									convertToLlm,
+									telemetry,
+									authCredentialType: this.#modelRegistry.getSessionCredentialType(
+										candidate.provider,
+										this.sessionId,
+									),
+								}),
+							);
 							break;
 						} catch (error) {
 							if (autoCompactionSignal.aborted) {
@@ -9488,6 +9511,9 @@ export class AgentSession {
 			}
 			const branchSummarySettings = this.settings.getGroup("branchSummary");
 			const result = await generateBranchSummary(entriesToSummarize, {
+				...this.#withCompactionTransportOptions({
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.sessionId),
+				}),
 				model,
 				apiKey,
 				signal: this.#branchSummaryAbortController.signal,
