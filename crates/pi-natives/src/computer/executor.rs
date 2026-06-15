@@ -166,12 +166,11 @@ fn gate<P: PermissionGate, D: DisplayContext>(
 	if !perms.accessibility_granted() {
 		return Err(ExecError::PermissionRequired);
 	}
-	if action.is_coordinate() {
-		if let Some(expected) = expected_epoch {
-			if display_ctx.current_epoch() != expected {
-				return Err(ExecError::DisplayStale);
-			}
-		}
+	if action.is_coordinate()
+		&& let Some(expected) = expected_epoch
+		&& display_ctx.current_epoch() != expected
+	{
+		return Err(ExecError::DisplayStale);
 	}
 	Ok(())
 }
