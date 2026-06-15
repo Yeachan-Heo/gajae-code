@@ -274,7 +274,7 @@ impl<S: EventSink> InputController<S> {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{MacEventSink, guarded_controller};
+pub use mac::{MacEventSink, current_cursor_position, guarded_controller};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -342,6 +342,9 @@ mod mac {
 		) -> CgEventRef;
 		fn CGEventKeyboardSetUnicodeString(event: CgEventRef, length: usize, string: *const u16);
 		fn CGEventPost(tap: u32, event: CgEventRef);
+		fn CGEventCreate(source: CgEventSourceRef) -> CgEventRef;
+		fn CGEventGetLocation(event: CgEventRef) -> CgPoint;
+		fn CGWarpMouseCursorPosition(new_cursor_position: CgPoint) -> i32;
 		fn CFRelease(cf: *const c_void);
 	}
 
@@ -391,6 +394,12 @@ mod mac {
 
 	impl EventSink for MacEventSink {
 		fn move_cursor(&mut self, to: LogicalPoint) {
+			// `CGWarpMouseCursorPosition` reliably relocates the hardware cursor
+			// (a bare mouseMoved event does not); the moved event then notifies
+			// apps of the hover at the new point.
+			let position = CgPoint { x: to.x, y: to.y };
+			// SAFETY: pure Core Graphics cursor warp to a point; no ownership.
+			unsafe { CGWarpMouseCursorPosition(position) };
 			self.post_mouse(to, MOUSE_MOVED, BTN_LEFT);
 		}
 
@@ -454,6 +463,23 @@ mod mac {
 	pub fn guarded_controller() -> Result<InputController<MacEventSink>, PermissionError> {
 		require_accessibility_for_input()?;
 		Ok(InputController::new(MacEventSink::new()))
+	}
+
+	/// Read the current global cursor position in logical points (top-left
+	/// origin). Used to verify mouse-move injection without clicking.
+	#[must_use]
+	pub fn current_cursor_position() -> LogicalPoint {
+		// SAFETY: `CGEventCreate(null)` returns an event whose location is the
+		// current cursor; it is released after the read.
+		unsafe {
+			let event = CGEventCreate(std::ptr::null_mut());
+			if event.is_null() {
+				return LogicalPoint { x: 0.0, y: 0.0 };
+			}
+			let location = CGEventGetLocation(event);
+			CFRelease(event.cast_const());
+			LogicalPoint { x: location.x, y: location.y }
+		}
 	}
 }
 
@@ -631,5 +657,50 @@ mod tests {
 			let at = self.cursor();
 			self.press(at, button);
 		}
+	}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod live_tests {
+	use super::{MouseButton, current_cursor_position, guarded_controller};
+	use crate::computer::capture::capture_primary_display;
+
+	/// Fires a real cursor move (no clicks/keys) and reads the position back to
+	/// prove the CGEvent input pipeline works end to end. Ignored by default;
+	/// run with `--ignored` on a macOS host with Accessibility granted.
+	#[test]
+	#[ignore = "moves the real cursor; needs macOS + Accessibility granted"]
+	fn cursor_move_lands_near_target() {
+		let frame = capture_primary_display().expect("capture (Screen Recording) should be granted");
+		let display = frame.display;
+		let Ok(mut controller) = guarded_controller() else {
+			panic!("Accessibility must be granted for input injection");
+		};
+
+		// Target the display center — a safe interior point, well away from edges.
+		let target_px = f64::from(display.width_px) / 2.0;
+		let target_py = f64::from(display.height_px) / 2.0;
+		controller
+			.move_to(&display, target_px, target_py)
+			.expect("move_to should succeed");
+
+		let expected = display
+			.to_logical_point(target_px, target_py)
+			.expect("center is in bounds");
+		let pos = current_cursor_position();
+		let dx = (pos.x - expected.x).abs();
+		let dy = (pos.y - expected.y).abs();
+		assert!(
+			dx <= 2.0 && dy <= 2.0,
+			"cursor landed at ({}, {}), expected ~({}, {})",
+			pos.x,
+			pos.y,
+			expected.x,
+			expected.y
+		);
+		assert_eq!(controller.cursor(), expected);
+		// We only moved the cursor; nothing should be held.
+		assert!(!controller.has_held_buttons());
+		let _ = MouseButton::Left; // keep the import meaningful for future click tests
 	}
 }
