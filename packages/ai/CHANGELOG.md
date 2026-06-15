@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `AuthStorageOptions.credentialRankingMode` (`balanced` (default) | `earliest-reset`) for multi-account OAuth credential selection. `earliest-reset` ranks non-blocked credentials earliest-expiry-first — draining the soonest-to-reset account before its perishable tumbling-window quota (e.g. Claude 5h/7d) is lost at reset — keeping the existing drain-rate/used-fraction metrics as tiebreakers. `balanced` is byte-identical to prior behavior, and ranking only runs at session start (or when the session's preferred credential is blocked), so this never thrashes accounts mid-session.
+
 ### Fixed
 
 - Allowed `openai-codex-responses` custom backends to use opaque `apiKey` bearer tokens by omitting `chatgpt-account-id` when the token does not expose a Codex account id.
