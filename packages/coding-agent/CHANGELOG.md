@@ -10,6 +10,8 @@
 
 - Auto-compaction no longer silently requires OpenAI when the active route is a custom Anthropic-capable provider. The compaction model-candidate selection already prefers the active session model, but its last-resort "largest-context model" fallback scanned the entire bundled catalog across all providers, so a stray OpenAI credential (e.g. an out-of-credit key left in the environment) could be picked when the active provider's compaction credential was unusable — turning OpenAI into an implicit hard dependency. The implicit fallback is now scoped to the active model's provider; cross-provider compaction still works but only when explicitly configured via `modelRoles`. When the active provider cannot compact and no role is configured, compaction now fails with the existing clear, provider-specific credential error instead of reaching for OpenAI (#697).
 
+- Interactive sessions no longer orphan the `browser` tool's headless/spawned Chrome (and the Python eval kernel) to PID 1 when killed by a signal. The interactive entry now registers a bounded, idempotent `postmortem` cleanup (`session-subprocess-teardown`) that runs `AgentSession.disposeChildSubprocesses()` on `SIGINT`/`SIGTERM`/`SIGHUP`, force-releasing the session's browser tabs (`kill:true`) and disposing its Python/JS kernels — the teardown the graceful `/quit` (`dispose()`) path already performs but that an external `kill`/terminal-close used to bypass. Headless `disposeBrowserHandle` now also SIGTERM/SIGKILLs the captured Chrome process tree as a fallback when forced, so a wedged renderer can't survive a bounded CDP `close()`; graceful release behavior is unchanged. The teardown is time-boxed (5s) so a stuck subprocess can't hang process exit (#698).
+
 ## [0.5.2] - 2026-06-15
 
 ### Fixed
