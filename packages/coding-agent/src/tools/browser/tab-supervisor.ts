@@ -55,6 +55,8 @@ export interface TabSession {
 	pending: Map<string, PendingRun>;
 	dialogPolicy?: DialogPolicy;
 	kindTag: BrowserKindTag;
+	/** Session that acquired this tab; used for session-scoped teardown (F13). */
+	ownerId?: string;
 }
 
 export interface AcquireTabOptions {
@@ -65,6 +67,8 @@ export interface AcquireTabOptions {
 	signal?: AbortSignal;
 	timeoutMs: number;
 	dialogs?: DialogPolicy;
+	/** Owning session id so dispose can release only this session's tabs (F13). */
+	ownerId?: string;
 }
 
 export interface AcquireTabResult {
@@ -161,6 +165,7 @@ export async function acquireTab(
 		pending: new Map(),
 		dialogPolicy: opts.dialogs,
 		kindTag: browser.kind.kind,
+		ownerId: opts.ownerId,
 	};
 	worker.onMessage(msg => handleTabMessage(tab, msg));
 	tabs.set(name, tab);
@@ -247,6 +252,23 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 
 export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
 	const names = [...tabs.keys()];
+	let count = 0;
+	for (const name of names) {
+		if (await releaseTab(name, opts)) count++;
+	}
+	return count;
+}
+
+/**
+ * Release only the tabs owned by `ownerId` (F13 session-scoped teardown). Tabs acquired
+ * by other sessions (or with no owner) are left untouched. No-op for a null/empty owner.
+ */
+export async function releaseTabsForOwner(
+	ownerId: string | null | undefined,
+	opts: ReleaseTabOptions = {},
+): Promise<number> {
+	if (!ownerId) return 0;
+	const names = [...tabs.entries()].filter(([, tab]) => tab.ownerId === ownerId).map(([name]) => name);
 	let count = 0;
 	for (const name of names) {
 		if (await releaseTab(name, opts)) count++;
