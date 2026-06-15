@@ -400,6 +400,11 @@ async function readPersistedPhase(filePath: string): Promise<string | undefined>
 	try {
 		const existing = await readJsonIfPresent(filePath);
 		if (!isPlainObject(existing)) return undefined;
+		// Only an *active* prior envelope is a transition source. A cleared / handed-off
+		// envelope (`active: false`, terminal phase such as `complete` / `handoff`) is outside
+		// active workflow progression, so reactivation from it (e.g. a fresh kickoff) must not
+		// be reported as an invalid transition.
+		if (existing.active !== true) return undefined;
 		const phase = existing.current_phase;
 		return typeof phase === "string" ? phase : undefined;
 	} catch {
@@ -410,7 +415,7 @@ async function readPersistedPhase(filePath: string): Promise<string | undefined>
 	}
 }
 
-async function reportInvalidWorkflowTransition(args: {
+async function recordInvalidWorkflowTransition(args: {
 	filePath: string;
 	skill: CanonicalGjcWorkflowSkill;
 	fromPhase: string;
@@ -418,10 +423,10 @@ async function reportInvalidWorkflowTransition(args: {
 	options?: StateWriterOptions;
 }): Promise<void> {
 	const { filePath, skill, fromPhase, toPhase, options } = args;
-	process.stderr.write(
-		`WARNING: internal ${skill} write persists invalid phase transition ${fromPhase} -> ${toPhase} to ${filePath}: ` +
-			`no ${skill} manifest edge defines it (not blocked; carry audit.forced / use \`gjc state ... --force\` for intentional jumps)\n`,
-	);
+	// Audit-only diagnostic: a successful sanctioned write must NOT emit to stderr — callers
+	// may treat any stderr output as failure or parse stdout/stderr as machine output. The
+	// `invalid_transition_detected` audit entry is the durable, non-intrusive evidence that an
+	// internal write skipped a manifest edge.
 	const cwd = path.resolve(options?.audit?.cwd ?? options?.cwd ?? process.cwd());
 	try {
 		await appendAuditEntry(cwd, {
@@ -485,12 +490,12 @@ export async function writeWorkflowEnvelopeAtomic(
 				);
 			}
 			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
-			// (caller-supplied `audit.fromPhase`, else the persisted envelope on disk) and flag
-			// edges the manifest does not define. Intentionally NON-blocking — the CLI path
-			// already hard-fails invalid edges before reaching here, and legitimate internal
-			// repairs / ralplan short-mode stage skips move between valid states without a direct
-			// manifest edge. The point is to make such transitions non-silent (audit + stderr),
-			// not to break those flows.
+			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
+			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
+			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
+			// internal repairs / ralplan short-mode stage skips move between valid states without a
+			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
+			// stderr) so such transitions are non-silent without breaking those flows.
 			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
 			if (
 				fromPhase &&
@@ -498,7 +503,7 @@ export async function writeWorkflowEnvelopeAtomic(
 				isKnownWorkflowState(skill, fromPhase) &&
 				!isValidTransition(skill, fromPhase, toPhase)
 			) {
-				await reportInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
 			}
 		}
 	}
