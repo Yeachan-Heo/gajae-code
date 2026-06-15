@@ -253,7 +253,7 @@ describe("ACP builtin slash commands", () => {
 		runtime.session.getAsyncJobSnapshot = () => ({
 			running: [{ id: "j1", type: "bash", status: "running", label: "npm install", startTime: Date.now() - 5000 }],
 			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", startTime: Date.now() - 60_000 }],
-			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+			delivery: { queued: 0, delivering: false, pendingJobIds: [], deadLettered: 0 },
 		});
 
 		const result = await executeAcpBuiltinSlashCommand("/jobs", runtime);
@@ -884,7 +884,7 @@ describe("wave 5 — adapters and polish", () => {
 		runtime.session.getAsyncJobSnapshot = () => ({
 			running: [],
 			recent: [],
-			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+			delivery: { queued: 0, delivering: false, pendingJobIds: [], deadLettered: 0 },
 		});
 		const result = await executeAcpBuiltinSlashCommand("/jobs", runtime);
 		expect(result).toEqual({ consumed: true });
