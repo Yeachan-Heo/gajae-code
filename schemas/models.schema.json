@@ -215,6 +215,14 @@
 						},
 						"additionalProperties": false
 					},
+					"webSearch": {
+						"type": "string",
+						"enum": [
+							"on",
+							"off",
+							"auto"
+						]
+					},
 					"authHeader": {
 						"type": "boolean"
 					},

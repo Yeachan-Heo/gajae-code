@@ -283,7 +283,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 	autoCompactionEscapeHandler?: () => void;
 	retryEscapeHandler?: () => void;
-	retryCountdownTimer?: ReturnType<typeof setInterval>;
+	retryCountdownTimer?: NodeJS.Timeout;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
@@ -709,6 +709,16 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#pendingSubmittedInput) return;
 			if (this.editor.getText().trim().length > 0) return;
 			if ((this.pendingImages?.length ?? 0) > 0) return;
+			// Never fire an autonomous continuation prompt() while the session is
+			// busy. A wedged/orphaned subagent turn can leave isStreaming stuck true;
+			// firing prompt() here throws AgentBusyError, which submitInteractiveInput
+			// surfaces as a red "Error: Agent is already processing…" and then loops
+			// back to getUserInput(), re-arming this timer — an infinite error spam.
+			// Re-arm and only fire once the session returns to idle.
+			if (this.session.isStreaming || this.session.isCompacting) {
+				this.#scheduleGoalContinuation();
+				return;
+			}
 			const latestState = this.session.getGoalModeState();
 			if (!latestState?.enabled || latestState.goal.status !== "active") return;
 			this.#goalContinuationTurnInFlight = true;

@@ -15,7 +15,7 @@ jobs:
   affected:
     name: Affected path validation
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: [self-hosted, Linux, X64, gajae-code-heavy]
     timeout-minutes: 30
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
@@ -68,7 +68,7 @@ jobs:
   gjc-state-gates:
     name: gjc-state-gates
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: [self-hosted, Linux, X64, gajae-code-fast]
     timeout-minutes: 15
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
@@ -83,11 +83,13 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
-      - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+      - name: Restore bun dependency cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-
       - run: bun install --frozen-lockfile
       - name: Run GJC state gates
         run: bun scripts/ci-gjc-state-gates.ts

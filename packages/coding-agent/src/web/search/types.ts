@@ -20,30 +20,55 @@ export type SearchProviderId =
 	| "parallel"
 	| "kagi"
 	| "synthetic"
-	| "searxng";
+	| "searxng"
+	| "openai-compatible";
 
-export function isSearchProviderId(value: string): value is SearchProviderId {
-	return [
-		"duckduckgo",
-		"exa",
-		"brave",
-		"jina",
-		"kimi",
-		"zai",
-		"anthropic",
-		"perplexity",
-		"gemini",
-		"codex",
-		"tavily",
-		"parallel",
-		"kagi",
-		"synthetic",
-		"searxng",
-	].includes(value);
+export type WebSearchMode = "on" | "off" | "auto";
+
+export interface ActiveSearchModelContext {
+	provider: string;
+	modelId: string;
+	wireModelId?: string;
+	api: string;
+	baseUrl?: string;
+	headers?: Record<string, string>;
+	webSearch?: WebSearchMode;
 }
 
-export function isSearchProviderPreference(value: string): value is SearchProviderId | "auto" {
-	return value === "auto" || isSearchProviderId(value);
+export const CONFIGURABLE_SEARCH_PROVIDER_IDS = [
+	"duckduckgo",
+	"exa",
+	"brave",
+	"jina",
+	"kimi",
+	"zai",
+	"anthropic",
+	"perplexity",
+	"gemini",
+	"codex",
+	"tavily",
+	"parallel",
+	"kagi",
+	"synthetic",
+	"searxng",
+] as const satisfies readonly SearchProviderId[];
+
+const SEARCH_PROVIDER_IDS = [...CONFIGURABLE_SEARCH_PROVIDER_IDS, "openai-compatible"] as const;
+
+export function isSearchProviderId(value: string): value is SearchProviderId {
+	return (SEARCH_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+export function isConfigurableSearchProviderId(
+	value: string,
+): value is (typeof CONFIGURABLE_SEARCH_PROVIDER_IDS)[number] {
+	return (CONFIGURABLE_SEARCH_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+export function isSearchProviderPreference(
+	value: string,
+): value is (typeof CONFIGURABLE_SEARCH_PROVIDER_IDS)[number] | "auto" {
+	return value === "auto" || isConfigurableSearchProviderId(value);
 }
 
 /** Source returned by search (all providers) */

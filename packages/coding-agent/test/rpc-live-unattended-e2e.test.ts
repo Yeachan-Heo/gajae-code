@@ -91,7 +91,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("RPC live unattended lifecycle 
 			const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
 			const remainingMs = () => Math.max(0, deadlineAt - Date.now());
 			const withDeadline = async <T>(p: Promise<T>, label: string): Promise<T> => {
-				let timer: ReturnType<typeof setTimeout> | undefined;
+				let timer: NodeJS.Timeout | undefined;
 				const guard = new Promise<never>((_, reject) => {
 					timer = setTimeout(() => reject(new Error(`overall deadline exceeded at: ${label}`)), remainingMs());
 				});

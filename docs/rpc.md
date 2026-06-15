@@ -709,6 +709,10 @@ stdin:
 { "type": "extension_ui_response", "id": "ui_7", "value": "feature/rpc-host" }
 ```
 
+## OpenClaw / Hermes host integrations
+
+For OpenClaw- or Hermes-style hosts, keep MCP servers and skills on the host side and expose the selected capabilities through RPC host tools. Do not import GJC runtime MCP internals directly; those package paths are intentionally quarantined. See [OpenClaw / Hermes RPC integration notes](./openclaw-hermes-rpc-integration.md).
+
 ## Notes on `RpcClient` helper
 
 `src/modes/rpc/rpc-client.ts` is a convenience wrapper, not the protocol definition.

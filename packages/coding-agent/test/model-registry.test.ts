@@ -1309,6 +1309,10 @@ describe("ModelRegistry", () => {
 			const glm = registry.find("glm-proxy", "glm-4.6");
 
 			expect(minimax?.api).toBe("openai-completions");
+			// #614: preset-onboarded models inherit the bundled canonical display
+			// name (MiniMax-M3) while preserving the lowercase machine id.
+			expect(minimax?.id).toBe("minimax-m3");
+			expect(minimax?.name).toBe("MiniMax-M3");
 			expect(minimax?.baseUrl).toBe("https://api.minimax.io/v1");
 			expect(getOpenAICompat(minimax)?.supportsStore).toBe(false);
 			expect(getOpenAICompat(minimax)?.reasoningContentField).toBe("reasoning_content");
@@ -1316,6 +1320,26 @@ describe("ModelRegistry", () => {
 			expect(glm?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 			expect(getOpenAICompat(glm)?.thinkingFormat).toBe("zai");
 			expect(getOpenAICompat(glm)?.supportsReasoningEffort).toBe(false);
+		});
+
+		test("#614: custom provider referencing a bundled model id inherits canonical display name", () => {
+			// A user-defined provider whose name does not match a bundled provider but
+			// references a bundled model id (e.g. the documented `minimax-custom` proxy
+			// with `id: minimax-m3` and no explicit name). It must surface the canonical
+			// `MiniMax-M3` display casing while keeping the lowercase machine id.
+			writeRawModelsJson({
+				"minimax-custom": {
+					baseUrl: "https://api.minimax.io/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "minimax-m3" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("minimax-custom", "minimax-m3");
+			expect(model?.id).toBe("minimax-m3");
+			expect(model?.name).toBe("MiniMax-M3");
 		});
 
 		test("same-id replacement uses configured compat without bundled compat leak", () => {

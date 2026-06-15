@@ -106,9 +106,9 @@ async function withFakeTimers<T>(
 		const timer: FakeTimer = { id: nextId, at: now + Math.max(0, Number(delay ?? 0)), callback, cleared: false };
 		nextId += 1;
 		timers.push(timer);
-		return timer.id as unknown as ReturnType<typeof setTimeout>;
+		return timer.id as unknown as NodeJS.Timeout;
 	}) as typeof setTimeout;
-	globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+	globalThis.clearTimeout = ((handle?: NodeJS.Timeout) => {
 		const id = Number(handle);
 		for (const timer of timers) {
 			if (timer.id === id) timer.cleared = true;

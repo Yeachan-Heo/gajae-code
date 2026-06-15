@@ -54,6 +54,8 @@ export function getExtraHelpText(): string {
   gjc session                  - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
+  GJC_TMUX_PROFILE            - Apply GJC tmux scroll/mouse/clipboard profile to --tmux sessions (set 0/off to skip)
+  GJC_MOUSE                   - Mouse-wheel scroll in --tmux sessions (set 0/off to let the host terminal scroll)
 
   For complete environment variable reference, see:
   docs/environment-variables.md

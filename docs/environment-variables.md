@@ -224,6 +224,33 @@ providers:
 | `GJC_RUNTIME_BINARY` | Private runtime bridge binary for `gjc ralplan`, `gjc deep-interview`, and `gjc state` |
 | `GJC_LEGACY_RUNTIME_BINARY` | Legacy fallback bridge binary name |
 
+### Interactive `--tmux` startup and scroll/mouse profile
+
+`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. When GJC creates that session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
+
+- `mouse on` — enables mouse-wheel scrolling into tmux copy-mode (history/scrollback).
+- `set-clipboard on` and a readable copy-mode `mode-style`.
+- GJC ownership/identity tags (`@gjc-profile`, branch/project markers).
+
+This profile is applied on macOS, Linux, and WSL (Linux) alike; only native Windows (`win32`) skips the tmux launch. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched — add `set -g mouse on` to your own `~/.tmux.conf`, or relaunch with `gjc --tmux` to get the managed profile.
+
+| Variable | Behavior |
+| --- | --- |
+| `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |
+| `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup |
+| `GJC_TMUX_COMMAND` | tmux binary/command override for every GJC tmux flow (`GJC_TEAM_TMUX_COMMAND` is honored as a team-path alias) |
+| `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
+| `GJC_MOUSE` | Set `0`/`false`/`off` to skip `mouse on`, leaving wheel scrolling to the host terminal instead of tmux copy-mode |
+
+#### WSL / Windows Terminal scrolling
+
+On WSL with Windows Terminal, scrolling behaves differently depending on whether tmux owns the mouse:
+
+- **With the GJC profile (default):** the mouse wheel enters tmux copy-mode and scrolls the pane's scrollback. Keyboard fallback: `Ctrl-b [` to enter copy-mode, then `PgUp`/arrows; `q` to exit.
+- **Without tmux mouse capture (`GJC_MOUSE=off`, or running outside `gjc --tmux`):** Windows Terminal handles the wheel and scrolls its own native scrollback.
+
+If the wheel does not scroll inside `gjc --tmux` on WSL, confirm the session is GJC-managed (`gjc session list`) so the `mouse on` profile is actually applied; sessions you launched yourself do not receive it. Set `GJC_MOUSE=off` if you prefer Windows Terminal's native scrollback over tmux copy-mode.
+
 ### Team tmux backend, dry-run, and state paths
 
 `gjc team ...` starts tmux worker panes from the current tmux-backed leader session. Start that leader with `gjc --tmux` first; `gjc team` intentionally does not create or attach the leader session itself.
@@ -307,7 +334,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 
 | Variable             | Behavior                                                                                                          |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `GJC_CACHE_RETENTION` | If `long`, enables long retention where supported (`anthropic`, `openai-responses`, Bedrock retention resolution) |
+| `GJC_CACHE_RETENTION` | If `long`, enables long retention where supported (`anthropic`, `openai-responses`, Bedrock retention resolution); any other value forces `short`. The Anthropic provider already defaults to `long` (1h) when unset, so this is mainly an opt-out (`short`) or a way to extend long retention to other providers. |
 
 ---
 

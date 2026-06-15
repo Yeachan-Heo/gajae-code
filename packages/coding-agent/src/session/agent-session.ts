@@ -240,6 +240,7 @@ import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
+import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -1186,6 +1187,7 @@ export class AgentSession {
 				};
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
+		this.#setGuardedAgentTools(this.agent.state.tools);
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming,
 			injectStreaming: message => this.agent.followUp(message),
@@ -3690,6 +3692,16 @@ export class AgentSession {
 		}) as T;
 	}
 
+	#prepareToolForExecution<T extends AgentTool>(tool: T): T {
+		return this.#wrapToolForDeepInterviewMutationGuard(
+			this.#wrapToolForAcpPermission(guardToolForUltragoalAsk(tool, () => this.sessionManager.getCwd())),
+		);
+	}
+
+	#setGuardedAgentTools(tools: AgentTool[]): void {
+		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+	}
+
 	async #applyActiveToolsByName(
 		toolNames: string[],
 		options?: { persistMCPSelection?: boolean; previousSelectedMCPToolNames?: string[] },
@@ -3701,7 +3713,7 @@ export class AgentSession {
 		for (const name of toolNames) {
 			const tool = this.#toolRegistry.get(name);
 			if (tool) {
-				tools.push(this.#wrapToolForDeepInterviewMutationGuard(this.#wrapToolForAcpPermission(tool)));
+				tools.push(tool);
 				validToolNames.push(name);
 			}
 		}
@@ -3718,7 +3730,7 @@ export class AgentSession {
 				this.#selectedDiscoveredToolNames.delete(name);
 			}
 		}
-		this.agent.setTools(tools);
+		this.#setGuardedAgentTools(tools);
 
 		// Active tool set changed → discoverable tool list (which excludes already-active tools)
 		// is now stale. Invalidate before any prompt-template hook reads the discovery list.
@@ -3975,6 +3987,9 @@ export class AgentSession {
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {
 			throw new Error("RPC host tool names must be unique");
+		}
+		if (uniqueToolNames.has("ask")) {
+			throw new Error('RPC host tool "ask" is reserved and cannot be supplied by the host');
 		}
 
 		for (const name of uniqueToolNames) {
@@ -4303,11 +4318,8 @@ export class AgentSession {
 		this.#toolRegistry.set(finalTool.name, finalTool);
 
 		if (!this.getActiveToolNames().includes(finalTool.name)) {
-			const activeTools = [
-				...this.agent.state.tools,
-				this.#wrapToolForDeepInterviewMutationGuard(this.#wrapToolForAcpPermission(finalTool)),
-			];
-			this.agent.setTools(activeTools);
+			const activeTools = [...this.agent.state.tools, finalTool];
+			this.#setGuardedAgentTools(activeTools);
 			this.#invalidateDiscoveryCaches();
 			void this.refreshBaseSystemPrompt().catch(error => {
 				logger.warn("Failed to refresh system prompt after workflow gate ask tool registration", {
@@ -4339,9 +4351,8 @@ export class AgentSession {
 		const activeToolNames = this.getActiveToolNames();
 		const activeTools = activeToolNames
 			.map(name => this.#toolRegistry.get(name))
-			.filter((tool): tool is AgentTool => tool !== undefined)
-			.map(tool => this.#wrapToolForAcpPermission(tool));
-		this.agent.setTools(activeTools);
+			.filter((tool): tool is AgentTool => tool !== undefined);
+		this.#setGuardedAgentTools(activeTools);
 	}
 
 	getCheckpointState(): CheckpointState | undefined {
@@ -9174,7 +9185,7 @@ export class AgentSession {
 					error: String(mcpError),
 				});
 				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.agent.setTools(previousTools);
+				this.#setGuardedAgentTools(previousTools);
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
 			}

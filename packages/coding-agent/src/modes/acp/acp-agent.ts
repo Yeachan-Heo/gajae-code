@@ -43,7 +43,8 @@ import {
 	type Usage,
 } from "@agentclientprotocol/sdk";
 import type { AssistantMessage, Model } from "@gajae-code/ai";
-import { logger, VERSION } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
+import packageJson from "../../../package.json" with { type: "json" };
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -98,6 +99,7 @@ const SESSION_PAGE_SIZE = 50;
  * wait past this guard without hard-coding the literal.
  */
 export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
+const CODING_AGENT_VERSION: string = packageJson.version;
 const ACP_CANCEL_CLEANUP_TIMEOUT_MS = 5_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
@@ -414,7 +416,7 @@ export class AcpAgent implements Agent {
 			agentInfo: {
 				name: "gajae-code",
 				title: "Gajae Code",
-				version: VERSION,
+				version: CODING_AGENT_VERSION,
 			},
 			authMethods,
 			agentCapabilities: {

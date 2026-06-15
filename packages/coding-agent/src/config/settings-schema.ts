@@ -2,6 +2,7 @@ import type { Effort } from "@gajae-code/ai/model-thinking";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
+import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
 
@@ -164,6 +165,7 @@ interface EnumDef<T extends readonly string[]> {
 interface ArrayDef<T> {
 	type: "array";
 	default: T[];
+	items?: { enum: readonly string[] };
 	ui?: UiBase;
 }
 
@@ -809,6 +811,55 @@ export const SETTINGS_SCHEMA = {
 				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
 			options: [
 				{ value: "none", label: "None", description: "Omit service_tier parameter" },
+				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
+				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
+				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
+				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{
+					value: "priority",
+					label: "Priority",
+					description: "Priority on every supported provider (OpenAI `service_tier`, Anthropic fast mode)",
+				},
+				{
+					value: "openai-only",
+					label: "Priority (OpenAI only)",
+					description: "Priority on OpenAI/OpenAI-Codex requests; ignored elsewhere",
+				},
+				{
+					value: "claude-only",
+					label: "Priority (Claude only)",
+					description: "Anthropic fast mode on direct Claude requests; ignored elsewhere (incl. Bedrock/Vertex)",
+				},
+			],
+		},
+	},
+
+	"task.serviceTier": {
+		type: "enum",
+		values: [
+			"inherit",
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"openai-only",
+			"claude-only",
+		] as const,
+		default: "inherit",
+		ui: {
+			tab: "tasks",
+			label: "Subagent Service Tier",
+			description:
+				'Service tier applied to task-tool subagents only. "inherit" copies the main session tier; any explicit value overrides it for subagents without touching the main session.',
+			options: [
+				{
+					value: "inherit",
+					label: "Inherit",
+					description: "Use the main session's service tier (default)",
+				},
+				{ value: "none", label: "None", description: "Omit service_tier for subagents" },
 				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
@@ -2066,6 +2117,17 @@ export const SETTINGS_SCHEMA = {
 		type: "boolean",
 		default: true,
 		ui: { tab: "tools", label: "Web Search", description: "Enable the web_search tool for web searching" },
+	},
+
+	"web_search.fallback": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		items: { enum: CONFIGURABLE_SEARCH_PROVIDER_IDS },
+		ui: {
+			tab: "tools",
+			label: "Web Search Fallback",
+			description: "Ordered fallback web search providers after the active model native provider",
+		},
 	},
 
 	"browser.enabled": {

@@ -13,7 +13,12 @@ import {
 } from "./ledger-event-renderer";
 import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { migrateWorkflowState } from "./state-migrations";
-import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import {
+	appendJsonlIdempotent,
+	readExistingStateForMutation,
+	writeArtifact,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -186,7 +191,37 @@ async function readActiveRunId(cwd: string, sessionId: string | undefined): Prom
 	return candidate;
 }
 
-async function persistActiveRunId(cwd: string, sessionId: string | undefined, runId: string): Promise<void> {
+/**
+ * Run-state phases that an artifact write must never reopen. Once ralplan has
+ * reached a terminal/handed-off phase, a stray `--write` must not regress
+ * `current_phase` back to a stage — that would silently re-arm a chain guard or
+ * undo Stop semantics. Every other phase advances to track the stage just
+ * persisted so run-state stays coherent with the active ralplan stage.
+ */
+const PHASE_LOCK = new Set([
+	"final",
+	"handoff",
+	"complete",
+	"completed",
+	"failed",
+	"cancelled",
+	"canceled",
+	"inactive",
+]);
+
+/** Phase that keeps run-state coherent with the stage just written, preserving locked phases. */
+function advanceCurrentPhase(existingPhase: unknown, stage: RalplanStage): string {
+	const current = typeof existingPhase === "string" ? existingPhase.trim() : "";
+	if (current && PHASE_LOCK.has(current)) return current;
+	return stage;
+}
+
+async function persistActiveRunId(
+	cwd: string,
+	sessionId: string | undefined,
+	runId: string,
+	stage: RalplanStage,
+): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
@@ -197,11 +232,25 @@ async function persistActiveRunId(cwd: string, sessionId: string | undefined, ru
 	}
 	let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 
-	if (existing.run_id === runId && existing.version === WORKFLOW_STATE_VERSION) return;
+	// A new run_id is a fresh run, not a stray write on the prior run: never inherit a
+	// previous run's terminal/locked phase (which would start the new run already
+	// "complete"/"handoff" and disarm the Stop hook). PHASE_LOCK only guards same-run writes.
+	const isNewRun = existing.run_id !== runId;
+	const nextPhase = isNewRun ? stage : advanceCurrentPhase(existing.current_phase, stage);
+	if (
+		existing.run_id === runId &&
+		existing.version === WORKFLOW_STATE_VERSION &&
+		existing.current_phase === nextPhase &&
+		(existing.active === true || PHASE_LOCK.has(nextPhase))
+	) {
+		return;
+	}
 	existing.run_id = runId;
 	if (typeof existing.skill !== "string") existing.skill = "ralplan";
-	if (typeof existing.active !== "boolean") existing.active = true;
-	if (typeof existing.current_phase !== "string") existing.current_phase = "planner";
+	// A successful persist means ralplan is actively writing this run's artifacts, so always
+	// re-assert active. Fallback-only init left active:false after a clear (#644, sibling of #638).
+	existing.active = true;
+	existing.current_phase = nextPhase;
 	existing = migrateWorkflowState(existing, "ralplan").state;
 	existing.updated_at = new Date().toISOString();
 	await writeWorkflowEnvelopeAtomic(statePath, existing, {
@@ -381,8 +430,6 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const explicitRunId = flagValue(args, "--run-id")?.trim();
 	const runId = explicitRunId || (await readActiveRunId(cwd, sessionId)) || sessionIdRaw || defaultRunId();
 	assertSafePathComponent(runId, "run-id");
-	// Persist the active run id so later writes in the same loop land in the same directory.
-	await persistActiveRunId(cwd, sessionId, runId);
 
 	const artifact = await resolveArtifactContent(rawArtifact, cwd);
 	return { stage: stage as RalplanStage, stageN, runId, artifact, sessionId, json: hasFlag(args, "--json") };
@@ -398,18 +445,34 @@ interface PersistedArtifact {
 	pendingApprovalPath?: string;
 }
 
-async function persistArtifact(resolved: ResolvedArtifactArgs, cwd: string): Promise<PersistedArtifact> {
+/**
+ * Content-addressed identity for an `index.jsonl` row: a repeated `--write` of the
+ * same `(stage, stage_n)` at identical content (same sha256) is the #638 duplicate
+ * the append must collapse. Rows missing these fields opt out of dedup.
+ */
+function ralplanIndexKey(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	const record = entry as Record<string, unknown>;
+	const { stage, stage_n, sha256 } = record;
+	if (typeof stage !== "string" || typeof stage_n !== "number" || typeof sha256 !== "string") return undefined;
+	return `${stage}\u0000${stage_n}\u0000${sha256}`;
+}
+
+async function persistArtifact(
+	resolved: ResolvedArtifactArgs,
+	cwd: string,
+	content: string,
+	sha256: string,
+): Promise<PersistedArtifact> {
 	const runDir = path.join(cwd, ".gjc", "plans", "ralplan", resolved.runId);
 
 	const fileName = `stage-${pad2(resolved.stageN)}-${resolved.stage}.md`;
 	const filePath = path.join(runDir, fileName);
-	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
 	await writeArtifact(filePath, content, {
 		cwd,
 		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
 	});
 
-	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
 	const indexEntry = {
 		stage: resolved.stage,
@@ -418,9 +481,10 @@ async function persistArtifact(resolved: ResolvedArtifactArgs, cwd: string): Pro
 		created_at: createdAt,
 		sha256,
 	};
-	await appendJsonl(path.join(runDir, "index.jsonl"), indexEntry, {
+	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "ralplan" },
+		key: ralplanIndexKey,
 	});
 
 	let pendingApprovalPath: string | undefined;
@@ -441,6 +505,56 @@ async function persistArtifact(resolved: ResolvedArtifactArgs, cwd: string): Pro
 		createdAt,
 		pendingApprovalPath,
 	};
+}
+
+/** The persisted `(stage, stage_n)` artifact recorded in a run's `index.jsonl`. */
+interface ExistingStageArtifact {
+	path: string;
+	sha256: string;
+	createdAt: string;
+}
+
+/**
+ * Find the most recent `index.jsonl` row for a `(stage, stage_n)` pair so a
+ * repeated `--write` can dedupe instead of silently clobbering the artifact and
+ * appending a duplicate ledger row. Best-effort: a missing or unreadable index
+ * yields `undefined`, treated as "no prior artifact". The ledger is the source of
+ * truth for dedup because it is exactly what a duplicate write would corrupt.
+ */
+async function findExistingStageArtifact(
+	cwd: string,
+	runId: string,
+	stage: RalplanStage,
+	stageN: number,
+): Promise<ExistingStageArtifact | undefined> {
+	const indexPath = path.join(cwd, ".gjc", "plans", "ralplan", runId, "index.jsonl");
+	let text: string;
+	try {
+		text = await fs.readFile(indexPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	let match: ExistingStageArtifact | undefined;
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let row: unknown;
+		try {
+			row = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+		const record = row as Record<string, unknown>;
+		if (record.stage !== stage || record.stage_n !== stageN) continue;
+		if (typeof record.path !== "string" || typeof record.sha256 !== "string") continue;
+		match = {
+			path: record.path,
+			sha256: record.sha256,
+			createdAt: typeof record.created_at === "string" ? record.created_at : "",
+		};
+	}
+	return match;
 }
 
 /**
@@ -518,7 +632,26 @@ async function buildRalplanHud(options: {
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	const plannerState = parsePlannerStateArgs(args);
 	const resolved = await resolveArtifactArgs(args, cwd);
-	const persisted = await persistArtifact(resolved, cwd);
+	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
+	const sha256 = createHash("sha256").update(content).digest("hex");
+
+	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
+	// silently clobber the artifact or append a duplicate ledger row. Classify before any
+	// state mutation so a conflict never regresses run-state phase.
+	const existingArtifact = await findExistingStageArtifact(cwd, resolved.runId, resolved.stage, resolved.stageN);
+	if (existingArtifact) {
+		if (existingArtifact.sha256 !== sha256) {
+			throw new RalplanCommandError(
+				2,
+				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
+			);
+		}
+		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd);
+	}
+
+	// Keep run-state `current_phase` coherent with the stage being persisted.
+	await persistActiveRunId(cwd, resolved.sessionId, resolved.runId, resolved.stage);
+	const persisted = await persistArtifact(resolved, cwd, content, sha256);
 	if (plannerState) {
 		await applyPlannerStateUpdate(cwd, resolved.sessionId, plannerState);
 	}
@@ -544,6 +677,35 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	const stdout = resolved.json
 		? `${JSON.stringify(payload, null, 2)}\n`
 		: `Persisted ralplan ${persisted.stage} stage ${persisted.stageN} at ${persisted.path}.\n`;
+	return { status: 0, stdout };
+}
+
+/**
+ * Deterministic no-op receipt for an identical repeated `--write`: report the
+ * already-persisted artifact without rewriting the file, appending a ledger row, or
+ * churning run-state. `deduplicated: true` lets callers distinguish it from a fresh write.
+ */
+function buildDeduplicatedResult(
+	resolved: ResolvedArtifactArgs,
+	existing: ExistingStageArtifact,
+	sha256: string,
+	cwd: string,
+): RalplanCommandResult {
+	const payload: Record<string, unknown> = {
+		run_id: resolved.runId,
+		path: existing.path,
+		stage: resolved.stage,
+		stage_n: resolved.stageN,
+		sha256,
+		created_at: existing.createdAt,
+		deduplicated: true,
+	};
+	if (resolved.stage === "final") {
+		payload.pending_approval_path = path.join(cwd, ".gjc", "plans", "ralplan", resolved.runId, "pending-approval.md");
+	}
+	const stdout = resolved.json
+		? `${JSON.stringify(payload, null, 2)}\n`
+		: `ralplan ${resolved.stage} stage ${resolved.stageN} already persisted at ${existing.path} (identical content; no changes written).\n`;
 	return { status: 0, stdout };
 }
 

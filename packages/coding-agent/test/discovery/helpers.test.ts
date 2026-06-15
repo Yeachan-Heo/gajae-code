@@ -99,6 +99,46 @@ Body content`;
 		expect(result.body).toBe("Body content");
 	});
 
+	test("parses Cursor-style scalar values with trailing commas", () => {
+		const content = `---
+alwaysApply: true
+name: "tanstack-query-and-data-fetching",
+description: "Next.js + Clerk + Supabase + GPT API + Vercel 환경에서 tanstack-query 사용 규칙",
+---
+Body content`;
+
+		const result = parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" });
+		expect(result.frontmatter).toEqual({
+			alwaysApply: true,
+			name: "tanstack-query-and-data-fetching",
+			description: "Next.js + Clerk + Supabase + GPT API + Vercel 환경에서 tanstack-query 사용 규칙",
+		});
+		expect(result.body).toBe("Body content");
+	});
+
+	test("does not coerce malformed flow collections with trailing commas", () => {
+		const content = `---
+items: [one, two,
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter/,
+		);
+	});
+
+	test("does not coerce malformed block scalars with trailing commas", () => {
+		const content = `---
+description: |,
+  Body text
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter/,
+		);
+	});
+
 	test("handles missing frontmatter", () => {
 		const content = "Just body content";
 		const result = parse(content);

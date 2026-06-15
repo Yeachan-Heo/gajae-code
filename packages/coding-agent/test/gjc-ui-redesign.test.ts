@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { TEMPLATE } from "../src/export/html/template.generated";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
+import { defaultThemes } from "../src/modes/theme/defaults";
 import blueCrabTheme from "../src/modes/theme/defaults/blue-crab.json" with { type: "json" };
 import redClawTheme from "../src/modes/theme/defaults/red-claw.json" with { type: "json" };
 import * as themeModule from "../src/modes/theme/theme";
@@ -47,12 +48,72 @@ describe("GJC red-claw redesign defaults", () => {
 		expect(new Set([colors.accent, colors.error, colors.warning, colors.toolDiffRemoved]).size).toBe(4);
 	});
 
-	it("exposes only red-claw and blue-crab as bundled selectable themes", async () => {
+	it("exposes bundled selectable themes while preserving red-claw and blue-crab defaults", async () => {
 		const themes = await themeModule.getAvailableThemes();
 
-		expect(themes).toEqual(["blue-crab", "red-claw"]);
+		expect(themes).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
+		expect(Object.keys(defaultThemes).sort()).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
 		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
+	});
+
+	it("validates every bundled built-in theme against the schema-required token set", async () => {
+		for (const [key, themeJson] of Object.entries(defaultThemes)) {
+			// Registered map key must equal the theme's declared name.
+			expect((themeJson as { name: string }).name, key).toBe(key);
+
+			const colorKeys = Object.keys((themeJson as { colors: Record<string, unknown> }).colors);
+			for (const token of themeModule.THEME_COLOR_KEYS) {
+				expect(colorKeys, `${key} missing required token ${token}`).toContain(token);
+			}
+
+			// Var references resolve without missing/circular errors.
+			const resolved = await themeModule.getResolvedThemeColors(key);
+			expect(Object.keys(resolved).length, key).toBeGreaterThan(0);
+		}
+	});
+
+	it("keeps migration themes dark-classified with distinct semantic tokens and no dead link token", async () => {
+		for (const name of ["claude-code", "codex", "opencode"] as const) {
+			const themeJson = defaultThemes[name] as {
+				colors: Record<string, unknown>;
+				symbols?: { overrides?: Record<string, unknown> };
+			};
+			// Do not carry the legacy non-schema `link` token into migration themes.
+			expect(Object.keys(themeJson.colors), `${name} has dead link token`).not.toContain("link");
+
+			// Migration themes keep GJC's symbol identity: preset only, no crab/source-tool overrides.
+			expect(themeJson.symbols?.overrides, `${name} must not override GJC symbols`).toBeUndefined();
+
+			expect(themeModule.isLightTheme(name), `${name} should classify as dark`).toBe(false);
+
+			const colors = await themeModule.getResolvedThemeColors(name);
+			expect(
+				new Set([colors.accent, colors.error, colors.warning, colors.toolDiffRemoved]).size,
+				`${name} semantic tokens must be distinct`,
+			).toBe(4);
+		}
+	});
+
+	it("uses concrete hex for codex semantic, background, status, and diff tokens", async () => {
+		const colors = await themeModule.getResolvedThemeColors("codex");
+		const hex = /^#[0-9a-fA-F]{6}$/;
+		for (const token of [
+			"accent",
+			"error",
+			"warning",
+			"toolDiffRemoved",
+			"toolDiffAdded",
+			"userMessageBg",
+			"selectedBg",
+			"customMessageBg",
+			"toolPendingBg",
+			"toolSuccessBg",
+			"toolErrorBg",
+			"statusLineBg",
+		]) {
+			expect(colors[token], `codex ${token} must be concrete hex`).toMatch(hex);
+		}
 	});
 
 	it("keeps blue-crab coastal tokens separate from semantic warning/error/diff tokens", async () => {

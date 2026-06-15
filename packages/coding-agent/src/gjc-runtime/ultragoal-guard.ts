@@ -32,6 +32,16 @@ export interface UltragoalGuardDiagnostic {
 	goalId?: string;
 }
 
+export interface UltragoalAskBlockDiagnostic {
+	active: boolean;
+	reason: string;
+	source: "absent" | "durable_state" | "durable_state_unreadable" | "ledger" | "goals_json";
+	goalsPath?: string;
+	ledgerPath?: string;
+	goalIds?: string[];
+	message: string;
+}
+
 export interface CurrentGoalLike {
 	objective: string;
 	status?: string;
@@ -68,6 +78,48 @@ async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
 		}
 		throw error;
 	}
+}
+
+function isEnoent(error: unknown): boolean {
+	return (
+		typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT"
+	);
+}
+
+function activeAskDiagnostic(input: {
+	reason: string;
+	source: UltragoalAskBlockDiagnostic["source"];
+	goalsPath?: string;
+	ledgerPath?: string;
+	goalIds?: string[];
+}): UltragoalAskBlockDiagnostic {
+	return {
+		active: true,
+		reason: input.reason,
+		source: input.source,
+		goalsPath: input.goalsPath,
+		ledgerPath: input.ledgerPath,
+		goalIds: input.goalIds,
+		message: `${input.reason} Use \`gjc ultragoal record-review-blockers\` instead of asking the user.`,
+	};
+}
+
+function inactiveAskDiagnostic(input: {
+	reason: string;
+	source: UltragoalAskBlockDiagnostic["source"];
+	goalsPath?: string;
+	ledgerPath?: string;
+	goalIds?: string[];
+}): UltragoalAskBlockDiagnostic {
+	return {
+		active: false,
+		reason: input.reason,
+		source: input.source,
+		goalsPath: input.goalsPath,
+		ledgerPath: input.ledgerPath,
+		goalIds: input.goalIds,
+		message: input.reason,
+	};
 }
 
 function requiredGoals(plan: UltragoalPlan): UltragoalGoal[] {
@@ -276,6 +328,109 @@ export async function readUltragoalVerificationState(input: {
 		};
 	}
 	return receiptDiagnostic;
+}
+
+export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBlockDiagnostic> {
+	const paths = getUltragoalPaths(cwd);
+	try {
+		await fs.stat(paths.dir);
+	} catch (error) {
+		if (isEnoent(error)) {
+			return inactiveAskDiagnostic({
+				reason: "No durable .gjc/ultragoal state exists.",
+				source: "absent",
+				goalsPath: paths.goalsPath,
+				ledgerPath: paths.ledgerPath,
+			});
+		}
+		return activeAskDiagnostic({
+			reason: `Durable .gjc/ultragoal state is present but unreadable: ${error instanceof Error ? error.message : String(error)}`,
+			source: "durable_state_unreadable",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+		});
+	}
+
+	let plan: UltragoalPlan | null;
+	let ledger: UltragoalLedgerEvent[];
+	try {
+		plan = await readUltragoalPlan(cwd);
+		ledger = await readUltragoalLedger(cwd);
+	} catch (error) {
+		return activeAskDiagnostic({
+			reason: `Unable to read durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,
+			source: "durable_state_unreadable",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+		});
+	}
+	if (!plan) {
+		return activeAskDiagnostic({
+			reason: "Durable .gjc/ultragoal state exists but goals.json is missing or empty.",
+			source: "durable_state_unreadable",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+		});
+	}
+
+	if (plan.goals.some(goal => goal.status === "review_blocked")) {
+		const goalIds = plan.goals.filter(goal => goal.status === "review_blocked").map(goal => goal.id);
+		return activeAskDiagnostic({
+			reason: `Ultragoal has recorded review blockers: ${goalIds.join(", ")}.`,
+			source: "goals_json",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+			goalIds,
+		});
+	}
+
+	const runState = getUltragoalRunCompletionState(plan);
+	if (runState.incompleteGoals.length > 0) {
+		const goalIds = runState.incompleteGoals.map(goal => goal.id);
+		return activeAskDiagnostic({
+			reason: `Ultragoal has incomplete required goals: ${goalIds.join(", ")}.`,
+			source: "goals_json",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+			goalIds,
+		});
+	}
+
+	const finalReceiptGoal = [...requiredGoals(plan)]
+		.reverse()
+		.find(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+	if (!finalReceiptGoal) {
+		return activeAskDiagnostic({
+			reason: "Ultragoal aggregate completion is missing a final aggregate receipt.",
+			source: "durable_state",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+			goalIds: requiredGoals(plan).map(goal => goal.id),
+		});
+	}
+
+	const diagnostic = validateCompletionReceipt({
+		plan,
+		ledger,
+		goal: finalReceiptGoal,
+		receiptKind: "final-aggregate",
+	});
+	if (diagnostic.state !== "active_verified_complete") {
+		return activeAskDiagnostic({
+			reason: diagnostic.message,
+			source: diagnostic.state === "active_dirty_quality_gate" ? "ledger" : "durable_state",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+			goalIds: diagnostic.goalId ? [diagnostic.goalId] : undefined,
+		});
+	}
+	return inactiveAskDiagnostic({
+		reason: "Ultragoal run is verified complete.",
+		source: "durable_state",
+		goalsPath: paths.goalsPath,
+		ledgerPath: paths.ledgerPath,
+		goalIds: [finalReceiptGoal.id],
+	});
 }
 
 export async function assertCanCompleteCurrentGoal(input: {

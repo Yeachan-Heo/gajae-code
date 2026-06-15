@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type FileLockOptions, withFileLock } from "../config/file-lock";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
 	type AuditEntry,
@@ -80,6 +82,12 @@ export interface StateWriterOptions {
 	cwd?: string;
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
+	/**
+	 * Cross-process lock tuning for read-modify-write paths that route through
+	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
+	 * `withFileLock` defaults.
+	 */
+	lock?: FileLockOptions;
 }
 
 export interface DeleteIfOwnedOptions extends StateWriterOptions {
@@ -113,7 +121,7 @@ export interface GenericHardPruneTarget {
 export interface GenericHardPruneSelectorContext {
 	path: string;
 	category: WriterCategory | string;
-	stat: Awaited<ReturnType<typeof fs.stat>>;
+	stat: Stats;
 	readJson: () => Promise<unknown>;
 }
 
@@ -388,6 +396,57 @@ export async function writeJsonAtomic(
 	return filePath;
 }
 
+async function readPersistedPhase(filePath: string): Promise<string | undefined> {
+	try {
+		const existing = await readJsonIfPresent(filePath);
+		if (!isPlainObject(existing)) return undefined;
+		// Only an *active* prior envelope is a transition source. A cleared / handed-off
+		// envelope (`active: false`, terminal phase such as `complete` / `handoff`) is outside
+		// active workflow progression, so reactivation from it (e.g. a fresh kickoff) must not
+		// be reported as an invalid transition.
+		if (existing.active !== true) return undefined;
+		const phase = existing.current_phase;
+		return typeof phase === "string" ? phase : undefined;
+	} catch {
+		// Best-effort diagnostic read: a corrupt/unreadable prior envelope simply yields no
+		// `from` phase, so the transition invariant degrades to a no-op rather than failing
+		// the sanctioned write it is observing.
+		return undefined;
+	}
+}
+
+async function recordInvalidWorkflowTransition(args: {
+	filePath: string;
+	skill: CanonicalGjcWorkflowSkill;
+	fromPhase: string;
+	toPhase: string;
+	options?: StateWriterOptions;
+}): Promise<void> {
+	const { filePath, skill, fromPhase, toPhase, options } = args;
+	// Audit-only diagnostic: a successful sanctioned write must NOT emit to stderr — callers
+	// may treat any stderr output as failure or parse stdout/stderr as machine output. The
+	// `invalid_transition_detected` audit entry is the durable, non-intrusive evidence that an
+	// internal write skipped a manifest edge.
+	const cwd = path.resolve(options?.audit?.cwd ?? options?.cwd ?? process.cwd());
+	try {
+		await appendAuditEntry(cwd, {
+			ts: new Date().toISOString(),
+			skill,
+			category: "state",
+			verb: "invalid_transition_detected",
+			owner: options?.audit?.owner ?? "gjc-runtime",
+			mutation_id: options?.audit?.mutationId ?? `${skill}:invalid-transition:${new Date().toISOString()}`,
+			from_phase: fromPhase,
+			to_phase: toPhase,
+			forced: false,
+			paths: [filePath],
+		});
+	} catch {
+		// Audit logging is best-effort diagnostics; never fail a sanctioned write because the
+		// audit append failed (e.g. cwd is not a writable project root).
+	}
+}
+
 export async function writeWorkflowEnvelopeAtomic(
 	targetPath: string,
 	value: unknown,
@@ -404,6 +463,50 @@ export async function writeWorkflowEnvelopeAtomic(
 				.join("; ")}`,
 		);
 	}
+	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
+	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
+	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
+	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
+	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
+	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
+	//
+	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
+	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
+	// sentinel that is not a per-skill manifest state) leave the transition graph and are
+	// intentionally exempt.
+	if (options?.audit?.forced !== true && parsed.data.active === true) {
+		const toPhase = parsed.data.current_phase.trim();
+		if (toPhase) {
+			// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
+			// module load, and active-state -> state-writer -> workflow-manifest -> active-state
+			// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
+			const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
+			const skill = parsed.data.skill;
+			// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
+			// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
+			if (!isKnownWorkflowState(skill, toPhase)) {
+				throw new Error(
+					`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
+				);
+			}
+			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
+			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
+			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
+			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
+			// internal repairs / ralplan short-mode stage skips move between valid states without a
+			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
+			// stderr) so such transitions are non-silent without breaking those flows.
+			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
+			if (
+				fromPhase &&
+				fromPhase !== toPhase &&
+				isKnownWorkflowState(skill, fromPhase) &&
+				!isValidTransition(skill, fromPhase, toPhase)
+			) {
+				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+			}
+		}
+	}
 	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -416,17 +519,55 @@ export async function writeTextAtomic(targetPath: string, text: string, options?
 	return filePath;
 }
 
+/**
+ * Serialize a read-modify-write (or any multi-step mutation) against concurrent
+ * writers of the same `.gjc/**` target. Uses the cross-process directory lock
+ * from `withFileLock`, keyed on the resolved file path, so separate CLI/agent
+ * processes (e.g. team-mode workers) cannot interleave one writer's read with
+ * another writer's write and silently drop the first mutation (issue #646).
+ *
+ * The lock is advisory: it only protects callers that route through it, so every
+ * read-modify-write of a given file MUST acquire this lock for the same resolved
+ * path. `atomicWrite`'s temp-file + rename crash-atomicity is preserved; this
+ * layers concurrency-atomicity on top without weakening it.
+ */
+export async function withWorkflowStateLock<T>(
+	targetPath: string,
+	fn: () => Promise<T>,
+	options?: StateWriterOptions,
+): Promise<T> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+}
+
+async function lockResolvedWorkflowTarget<T>(
+	filePath: string,
+	fn: () => Promise<T>,
+	lockOptions?: FileLockOptions,
+): Promise<T> {
+	// `withFileLock` creates the lock dir next to the target with a non-recursive
+	// mkdir, so the parent directory must exist before the lock is acquired.
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	return withFileLock(filePath, fn, lockOptions);
+}
+
 export async function updateJsonAtomic<T = unknown>(
 	targetPath: string,
 	mutator: (current: T | undefined) => T | Promise<T>,
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = (await readJsonIfPresent(filePath)) as T | undefined;
-	const next = await mutator(current);
-	await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
-	await maybeAudit(filePath, options);
-	return filePath;
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = (await readJsonIfPresent(filePath)) as T | undefined;
+			const next = await mutator(current);
+			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
+			await maybeAudit(filePath, options);
+			return filePath;
+		},
+		options?.lock,
+	);
 }
 
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
@@ -435,6 +576,112 @@ export async function appendJsonl(targetPath: string, entry: unknown, options?: 
 	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
 	await maybeAudit(filePath, options);
 	return filePath;
+}
+
+export interface AppendJsonlIdempotentOptions extends StateWriterOptions {
+	/**
+	 * Identity key for an entry. Two entries that produce the same non-`undefined`
+	 * key are duplicates, so only the first is appended. Return `undefined` to opt a
+	 * candidate out of dedup (it is always appended). Use `key` for the common case
+	 * where identity reduces to a single string.
+	 */
+	key?: (entry: unknown) => string | undefined;
+	/**
+	 * Equivalence predicate: return `true` when `existing` already represents
+	 * `candidate`, suppressing the append. Use when identity cannot be reduced to a
+	 * single string key. When both `key` and `equals` are supplied, `equals` wins.
+	 */
+	equals?: (candidate: unknown, existing: unknown) => boolean;
+}
+
+export interface AppendJsonlIdempotentResult {
+	path: string;
+	/** `true` when the entry was written; `false` when an equivalent entry already existed. */
+	appended: boolean;
+	/** The pre-existing entry that suppressed the append, when `appended` is `false`. */
+	duplicate?: unknown;
+}
+
+async function readJsonlEntries(filePath: string): Promise<unknown[]> {
+	let raw: string;
+	try {
+		raw = await fs.readFile(filePath, "utf-8");
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return [];
+		throw error;
+	}
+	const entries: unknown[] = [];
+	for (const line of raw.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			entries.push(JSON.parse(trimmed));
+		} catch {
+			// Best-effort: dedup compares parseable rows only. A corrupt line cannot
+			// be matched, so it never suppresses a new append.
+		}
+	}
+	return entries;
+}
+
+function findJsonlDuplicate(
+	existing: readonly unknown[],
+	candidate: unknown,
+	options: AppendJsonlIdempotentOptions,
+): unknown | undefined {
+	if (options.equals) {
+		const equals = options.equals;
+		return existing.find(item => equals(candidate, item));
+	}
+	const key = options.key;
+	if (!key) return undefined;
+	const candidateKey = key(candidate);
+	if (candidateKey === undefined) return undefined;
+	return existing.find(item => key(item) === candidateKey);
+}
+
+/**
+ * Append `entry` to a JSONL file only when no equivalent entry already exists —
+ * the shared idempotent append primitive (issue #660).
+ *
+ * `appendJsonl` is a pure append with no dedup, so every recurring "duplicate
+ * ledger row" bug (#638, #643, #645) had to be patched with bespoke per-call-site
+ * guards. This primitive centralizes the read-check-append cycle: a caller
+ * declares identity once via `key` or `equals` instead of re-deriving the lookup
+ * at each site.
+ *
+ * The read-then-append is serialized through the same cross-process workflow lock
+ * as `updateJsonAtomic`, so two concurrent idempotent appends cannot both observe
+ * "no duplicate" and both write (the #646 TOCTOU that a plain `appendJsonl`
+ * preceded by a manual existence check is still exposed to).
+ *
+ * Scope note: this dedups the *append* only. Call sites whose idempotency must
+ * also skip a coupled mutation — e.g. the plan/state rewrite in #643/#645 — still
+ * need a whole-operation guard; this primitive is the ledger-level half of that.
+ */
+export async function appendJsonlIdempotent(
+	targetPath: string,
+	entry: unknown,
+	options: AppendJsonlIdempotentOptions,
+): Promise<AppendJsonlIdempotentResult> {
+	if (!options.key && !options.equals) {
+		throw new Error("appendJsonlIdempotent requires a `key` or `equals` option to detect duplicates");
+	}
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const existing = await readJsonlEntries(filePath);
+			const duplicate = findJsonlDuplicate(existing, entry, options);
+			if (duplicate !== undefined) {
+				return { path: filePath, appended: false, duplicate };
+			}
+			await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+			await maybeAudit(filePath, options);
+			return { path: filePath, appended: true };
+		},
+		options.lock,
+	);
 }
 
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
@@ -639,7 +886,7 @@ export async function hardPrune(
 	const removed: string[] = [];
 	for (const target of targets) {
 		const filePath = resolveGjcTarget(target.path, cwd);
-		let stat: Awaited<ReturnType<typeof fs.stat>>;
+		let stat: Stats;
 		try {
 			stat = await fs.stat(filePath);
 		} catch (error) {

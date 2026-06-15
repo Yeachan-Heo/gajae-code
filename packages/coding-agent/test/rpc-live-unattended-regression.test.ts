@@ -80,6 +80,7 @@ describe("live RPC unattended dispatch wiring", () => {
 			runId: "run-live",
 			sessionId: "sess-live",
 			emitFrame: () => undefined,
+			providerSupportsTokenCostMetrics: true,
 		});
 		cp.negotiate(declaration);
 		const res = await dispatchRpcCommand(
@@ -98,6 +99,7 @@ describe("live RPC unattended dispatch wiring", () => {
 			runId: "run-live",
 			sessionId: "sess-live",
 			emitFrame: () => undefined,
+			providerSupportsTokenCostMetrics: true,
 		});
 		cp.negotiate(declaration);
 		expect((await dispatchRpcCommand({ id: "1", type: "bash", command: "pwd" }, context(session, cp))).success).toBe(
@@ -120,6 +122,7 @@ describe("live RPC unattended dispatch wiring", () => {
 			runId: "run-live",
 			sessionId: "sess-live",
 			emitFrame: gate => emitted.push(gate),
+			providerSupportsTokenCostMetrics: true,
 		});
 		cp.negotiate(declaration);
 		const answerPromise = cp.emitGate(approvalGate({ summary: "ship?" }));

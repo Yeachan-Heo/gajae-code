@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -45,17 +45,57 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<{ pid: num
 	return info;
 }
 
-/** @internal */
-export async function removeFileLockDirForGc(lockDir: string): Promise<void> {
-	await fs.rm(lockDir, { recursive: true, force: true });
+/** Owner identity stamped into a `<file>.lock/info` record. */
+export interface FileLockOwnerToken {
+	pid: number;
+	timestamp: number;
 }
 
-function isProcessAlive(pid: number): boolean {
+/** Outcome of a guarded GC removal attempt (`removeFileLockDirForGc`). */
+export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
+
+/**
+ * @internal
+ * Fail-closed removal of a dead lock dir for GC. Re-reads the on-disk owner
+ * token as close to the unlink as possible and only deletes the dir when it
+ * STILL holds the exact `{pid, timestamp}` identity the caller observed dead.
+ *
+ * Closes the prune-time TOCTOU window (#606): between GC's dead re-read/probe
+ * and the unlink, a live process can reclaim a stale lock at the same path
+ * (`acquireLock` rms the stale dir, then re-`mkdir`s and rewrites `info` with a
+ * fresh pid+timestamp). Deleting by path alone would reap that LIVE lock. Any
+ * mismatch (`owner_changed`) or absent/unreadable info (`missing` — e.g. a
+ * fresh acquirer between `mkdir` and `writeLockInfo`) refuses the delete and
+ * leaves the dir intact. POSIX has no atomic compare-and-delete for a
+ * directory, so the residual read->unlink window cannot be fully eliminated,
+ * but the reclaim-after-stale scenario the issue describes is now guarded.
+ */
+export async function removeFileLockDirForGc(
+	lockDir: string,
+	expected: FileLockOwnerToken,
+): Promise<FileLockGcRemoval> {
+	const current = await readLockInfo(lockDir);
+	if (!current) return "missing";
+	if (current.pid !== expected.pid || current.timestamp !== expected.timestamp) {
+		return "owner_changed";
+	}
+	await fs.rm(lockDir, { recursive: true, force: true });
+	return "removed";
+}
+
+type OwnerLiveness = "alive" | "dead" | "unknown";
+
+function ownerLiveness(pid: number): OwnerLiveness {
+	if (!Number.isFinite(pid) || pid <= 0) return "unknown";
 	try {
 		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
+		return "alive";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return "dead";
+		// EPERM means the process exists but we may not signal it; treat as alive.
+		// Anything else is indeterminate.
+		return code === "EPERM" ? "alive" : "unknown";
 	}
 }
 
@@ -63,11 +103,13 @@ async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> 
 	const info = await readLockInfo(lockPath);
 	if (!info) return true;
 
-	if (!isProcessAlive(info.pid)) return true;
-
-	if (Date.now() - info.timestamp > staleMs) return true;
-
-	return false;
+	// Never reap a live owner by elapsed time: a long legitimate critical section must
+	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
+	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
+	const liveness = ownerLiveness(info.pid);
+	if (liveness === "dead") return true;
+	if (liveness === "alive") return false;
+	return Date.now() - info.timestamp > staleMs;
 }
 
 async function tryAcquireLock(lockPath: string): Promise<boolean> {

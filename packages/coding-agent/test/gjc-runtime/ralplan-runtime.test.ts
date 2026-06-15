@@ -351,6 +351,167 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 	});
 });
 
+describe("native gjc ralplan runtime — run-state phase coherence", () => {
+	const readPhase = async (root: string): Promise<string> => {
+		const raw = await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8");
+		return (JSON.parse(raw) as { current_phase?: string }).current_phase ?? "";
+	};
+
+	it("advances current_phase to track each stage written after seeding", async () => {
+		const root = await tempDir();
+		const handoff = await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const runId = (JSON.parse(handoff.stdout ?? "{}") as { run_id: string }).run_id;
+		expect(await readPhase(root)).toBe("planner");
+
+		for (const [stage, stageN] of [
+			["planner", "1"],
+			["architect", "2"],
+			["critic", "3"],
+			["revision", "4"],
+			["adr", "5"],
+		] as const) {
+			const result = await runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", stageN, "--artifact", `# ${stage}`, "--run-id", runId],
+				root,
+			);
+			expect(result.status).toBe(0);
+			expect(await readPhase(root)).toBe(stage);
+		}
+	});
+
+	it("advances current_phase to final on the final stage write", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const runId = (
+			JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8")) as {
+				run_id: string;
+			}
+		).run_id;
+		await runNativeRalplanCommand(
+			["--write", "--stage", "adr", "--stage_n", "5", "--artifact", "# adr", "--run-id", runId],
+			root,
+		);
+		expect(await readPhase(root)).toBe("adr");
+		await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "6", "--artifact", "# final", "--run-id", runId],
+			root,
+		);
+		expect(await readPhase(root)).toBe("final");
+	});
+
+	it("does not regress a handed-off run-state phase on a stray --write (chain guard intact)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({
+				skill: "ralplan",
+				active: true,
+				current_phase: "handoff",
+				run_id: "locked-run",
+				version: 2,
+			}),
+			"utf-8",
+		);
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "locked-run"],
+			root,
+		);
+		expect(result.status).toBe(0);
+		expect(await readPhase(root)).toBe("handoff");
+	});
+});
+
+describe("native gjc ralplan runtime — duplicate --write guard", () => {
+	const runDir = (root: string, runId: string) => path.join(root, ".gjc", "plans", "ralplan", runId);
+
+	it("treats an identical repeated write as a deterministic no-op", async () => {
+		const root = await tempDir();
+		const args = ["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "dup-run"];
+		const first = await runNativeRalplanCommand([...args, "--json"], root);
+		expect(first.status).toBe(0);
+		expect((JSON.parse(first.stdout ?? "{}") as { deduplicated?: boolean }).deduplicated).toBeUndefined();
+
+		const second = await runNativeRalplanCommand([...args, "--json"], root);
+		expect(second.status).toBe(0);
+		const payload = JSON.parse(second.stdout ?? "{}") as { deduplicated?: boolean; sha256: string };
+		expect(payload.deduplicated).toBe(true);
+		expect(payload.sha256).toBe((JSON.parse(first.stdout ?? "{}") as { sha256: string }).sha256);
+
+		const indexLines = (await fs.readFile(path.join(runDir(root, "dup-run"), "index.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		expect(indexLines.length).toBe(1);
+		const content = await fs.readFile(path.join(runDir(root, "dup-run"), "stage-01-planner.md"), "utf-8");
+		expect(content).toBe("# Plan\n");
+	});
+
+	it("refuses to clobber an existing (stage, stage_n) with different content", async () => {
+		const root = await tempDir();
+		const first = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "v1", "--run-id", "conflict-run"],
+			root,
+		);
+		expect(first.status).toBe(0);
+
+		const second = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "v2", "--run-id", "conflict-run"],
+			root,
+		);
+		expect(second.status).toBe(2);
+		expect(second.stderr).toContain("refusing to overwrite ralplan planner stage 1");
+
+		const indexLines = (await fs.readFile(path.join(runDir(root, "conflict-run"), "index.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		expect(indexLines.length).toBe(1);
+		const content = await fs.readFile(path.join(runDir(root, "conflict-run"), "stage-01-planner.md"), "utf-8");
+		expect(content).toBe("v1\n");
+	});
+
+	it("allows the same stage at a new stage_n (revision passes are not duplicates)", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "first", "--run-id", "multi-pass"],
+			root,
+		);
+		const second = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "4", "--artifact", "second", "--run-id", "multi-pass"],
+			root,
+		);
+		expect(second.status).toBe(0);
+		const indexLines = (await fs.readFile(path.join(runDir(root, "multi-pass"), "index.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		expect(indexLines.length).toBe(2);
+	});
+
+	it("collapses concurrent identical writes to a single index.jsonl row (#660 TOCTOU)", async () => {
+		const root = await tempDir();
+		const args = ["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "race-run"];
+
+		// The command-level dedup (findExistingStageArtifact) and the ledger append
+		// are not under one lock, so racing identical writes can both observe an
+		// empty index and both append. The shared appendJsonlIdempotent primitive
+		// serializes the append, so exactly one row survives regardless of the race.
+		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
+		for (const result of results) {
+			expect(result.status).toBe(0);
+		}
+
+		const indexLines = (await fs.readFile(path.join(runDir(root, "race-run"), "index.jsonl"), "utf-8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		expect(indexLines.length).toBe(1);
+		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
+	});
+});
+
 describe("native gjc ralplan runtime — persisted Planner state", () => {
 	const statePath = (root: string) => path.join(root, ".gjc", "state", "ralplan-state.json");
 
@@ -687,5 +848,94 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 		);
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("missing value for --planner-id");
+	});
+});
+
+describe("native gjc ralplan runtime — post-clear re-activation (#644)", () => {
+	const readState = async (root: string): Promise<{ active?: unknown; current_phase?: unknown; run_id?: unknown }> => {
+		const raw = await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8");
+		return JSON.parse(raw);
+	};
+
+	it("re-asserts active:true and resets phase out of terminal lock when a new run_id is written after a clear", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const seeded = await readState(root);
+		expect(seeded.active).toBe(true);
+
+		// Simulate `gjc state ralplan clear`: active -> false, phase -> complete.
+		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+
+		// A subsequent --write with a NEW run_id starts a fresh run and must re-arm the skill.
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "new-run-after-clear"],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.run_id).toBe("new-run-after-clear");
+		expect(after.active).toBe(true);
+		expect(after.current_phase).toBe("planner");
+	});
+
+	it("re-asserts active:true on a same-run continuation write at the current phase", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({
+				skill: "ralplan",
+				active: false,
+				current_phase: "planner",
+				run_id: "same-run-continuation",
+				version: 2,
+			}),
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"same-run-continuation",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.run_id).toBe("same-run-continuation");
+		expect(after.active).toBe(true);
+		expect(after.current_phase).toBe("planner");
+	});
+
+	it("does not re-arm a cleared run on a stray same-run-id --write (demote-on-clear preserved)", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const seeded = await readState(root);
+		const seededRunId = seeded.run_id as string;
+
+		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+
+		// A stray --write reusing the SAME (cleared) run_id must not silently re-arm a finished run.
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", seededRunId],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.active).toBe(false);
+		expect(after.current_phase).toBe("complete");
 	});
 });

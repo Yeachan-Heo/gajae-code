@@ -32,13 +32,20 @@ import {
 import type { InteractiveModeContext } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
+import { discoverExternalCredentials, formatDiscoverySummary, importCredentials } from "../../setup/credential-import";
 import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
-import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
+import {
+	isConfigurableSearchProviderId,
+	isSearchProviderPreference,
+	setPreferredImageProvider,
+	setPreferredSearchProvider,
+	setSearchFallbackProviders,
+} from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
@@ -128,6 +135,8 @@ export class SelectorController {
 						this.showCustomProviderWizard();
 					} else if (action === "oauth-login") {
 						void this.showOAuthSelector("login");
+					} else if (action === "import-credentials") {
+						void this.#handleCredentialImport();
 					} else {
 						this.ctx.showStatus(formatProviderOnboardingCommandGuide());
 					}
@@ -139,6 +148,69 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	async #handleCredentialImport(): Promise<void> {
+		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI credentials…");
+		const result = await discoverExternalCredentials();
+		const summaryLines = formatDiscoverySummary(result);
+
+		if (result.importable.length === 0) {
+			this.ctx.chatContainer.addChild(new Spacer(1));
+			for (const line of summaryLines) {
+				this.ctx.chatContainer.addChild(new Text(theme.fg("dim", line), 1, 0));
+			}
+			this.ctx.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						"No importable Claude/Codex credentials found. Use /login or add a custom provider.",
+					),
+					1,
+					0,
+				),
+			);
+			this.ctx.ui.requestRender();
+			return;
+		}
+
+		const confirmed = await this.ctx.showHookConfirm(
+			`Import ${result.importable.length} credential(s)?`,
+			summaryLines.join("\n"),
+		);
+		if (!confirmed) {
+			this.ctx.showStatus("Credential import cancelled.");
+			return;
+		}
+
+		const summary = await importCredentials(result.importable, (provider, credential) =>
+			this.ctx.session.modelRegistry.authStorage.upsertCredential(provider, credential),
+		);
+		await this.ctx.session.modelRegistry.refresh();
+
+		this.ctx.chatContainer.addChild(new Spacer(1));
+		for (const credential of summary.imported) {
+			this.ctx.chatContainer.addChild(
+				new Text(
+					theme.fg("success", `${theme.status.success} Imported ${credential.provider} (${credential.source})`),
+					1,
+					0,
+				),
+			);
+		}
+		for (const failure of summary.failed) {
+			this.ctx.chatContainer.addChild(
+				new Text(
+					theme.fg("error", `${theme.status.error} Failed ${failure.credential.provider}: ${failure.error}`),
+					1,
+					0,
+				),
+			);
+		}
+		if (summary.imported.length > 0) {
+			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
+		}
+		this.ctx.ui.requestRender();
 	}
 
 	showCustomProviderWizard(): void {
@@ -505,6 +577,13 @@ export class SelectorController {
 			case "providers.webSearch":
 				if (typeof value === "string" && isSearchProviderPreference(value)) {
 					setPreferredSearchProvider(value);
+				}
+				break;
+			case "web_search.fallback":
+				if (Array.isArray(value)) {
+					setSearchFallbackProviders(
+						value.filter(item => typeof item === "string" && isConfigurableSearchProviderId(item)),
+					);
 				}
 				break;
 			case "providers.image":

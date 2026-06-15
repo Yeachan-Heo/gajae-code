@@ -233,4 +233,123 @@ describe("gjc mcp-serve coordinator", () => {
 			});
 		});
 	});
+
+	it("runs a generic controller lifecycle smoke without provider credentials or local config", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const artifact = path.join(root, "result.txt");
+			await Bun.write(artifact, "generic controller evidence");
+			const env = {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_PROFILE: "generic-controller",
+				GJC_COORDINATOR_MCP_REPO: "repo-a",
+			};
+			const server = await createCoordinatorMcpServer({
+				env,
+				services: {
+					startSession: input => ({
+						name: "generic-controller-session",
+						cwd: input.cwd,
+						createdAt: "now",
+					}),
+				},
+			});
+
+			const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+			expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+				...COORDINATOR_MCP_TOOL_NAMES,
+			]);
+			for (const tool of listed.result.tools as Array<{ name: string; inputSchema: { type?: string } }>) {
+				expect(tool.inputSchema.type).toBe("object");
+			}
+
+			const deniedStart = await server.callTool("gjc_coordinator_start_session", { cwd: root });
+			expect(deniedStart).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
+
+			const started = await server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				allow_mutation: true,
+			});
+			expect(started).toMatchObject({
+				ok: true,
+				session: { session_id: "generic-controller-session", cwd: root },
+				session_state: { state: "ready_for_input" },
+			});
+
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "generic-controller-session",
+				prompt: "Run a mocked generic controller task.",
+				allow_mutation: true,
+			});
+			expect(sent).toMatchObject({
+				ok: true,
+				session_id: "generic-controller-session",
+				status: "active",
+			});
+			const turnId = String(sent.turn_id);
+
+			const activeConflict = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "generic-controller-session",
+				prompt: "Second prompt should be protected.",
+				allow_mutation: true,
+			});
+			expect(activeConflict).toMatchObject({ ok: false, reason: "active_turn_exists", active_turn_id: turnId });
+
+			const queued = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "generic-controller-session",
+				prompt: "Queued follow-up.",
+				queue: true,
+				allow_mutation: true,
+			});
+			expect(queued).toMatchObject({ ok: true, status: "queued", queued: true, active_turn_id: turnId });
+
+			const questionDir = path.join(stateRoot, "generic-controller", "repo-a", "questions");
+			await fs.mkdir(questionDir, { recursive: true });
+			await Bun.write(
+				path.join(questionDir, "question-1.json"),
+				JSON.stringify({
+					question_id: "question-1",
+					session_id: "generic-controller-session",
+					turn_id: turnId,
+					status: "pending",
+				}),
+			);
+			const questionAnswer = await server.callTool("gjc_coordinator_submit_question_answer", {
+				session_id: "generic-controller-session",
+				turn_id: turnId,
+				question_id: "question-1",
+				answer: { decision: "approve" },
+				allow_mutation: true,
+			});
+			expect(questionAnswer).toMatchObject({ ok: true, question: { status: "answered" } });
+
+			const reported = await server.callTool("gjc_coordinator_report_status", {
+				session_id: "generic-controller-session",
+				turn_id: turnId,
+				status: "completed",
+				summary: "Mocked lifecycle completed.",
+				evidence_paths: [artifact],
+				allow_mutation: true,
+			});
+			expect(reported).toMatchObject({
+				ok: true,
+				turn: { status: "completed", final_response: { text: "Mocked lifecycle completed." } },
+				promoted_turn: { status: "active" },
+			});
+
+			const readTurn = await server.callTool("gjc_coordinator_read_turn", {
+				session_id: "generic-controller-session",
+				turn_id: turnId,
+			});
+			expect(readTurn).toMatchObject({ ok: true, turn: { status: "completed" } });
+
+			const reports = await server.callTool("gjc_coordinator_read_coordination_status");
+			expect(reports.ok).toBe(true);
+			expect((reports.reports as Array<{ status?: string }>).some(report => report.status === "completed")).toBe(
+				true,
+			);
+		});
+	});
 });

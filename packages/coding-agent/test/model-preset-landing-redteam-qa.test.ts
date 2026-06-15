@@ -66,6 +66,18 @@ const noSuffixProfile: ModelProfileDefinition = {
 	modelMapping: { default: "provider-a/default" },
 	source: "user",
 };
+const codexMedium: ModelProfileDefinition = {
+	name: "codex-medium",
+	requiredProviders: ["openai-codex"],
+	modelMapping: { default: "openai-codex/gpt-5.5:medium" },
+	source: "builtin",
+};
+const codexPro: ModelProfileDefinition = {
+	name: "codex-pro",
+	requiredProviders: ["openai-codex"],
+	modelMapping: { default: "openai-codex/gpt-5.5:high" },
+	source: "builtin",
+};
 
 let testTheme = await getThemeByName("red-claw");
 function installTestTheme(): void {
@@ -125,6 +137,16 @@ async function rendered(selector: ModelSelectorComponent): Promise<string> {
 	await Bun.sleep(10);
 	installTestTheme();
 	return normalizeRenderedText(selector.render(260).join("\n"));
+}
+
+// Returns the label of the row the navigation cursor (❯) currently sits on,
+// with ANSI/whitespace normalized. Used to assert exact cursor placement after
+// preset list navigation.
+function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
+	installTestTheme();
+	const lines = selector.render(260).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+	const cursorLine = lines.find(line => line.includes("❯"));
+	return cursorLine?.replace("❯", "").replace(/\s+/g, " ").trim();
 }
 
 describe("preset landing adversarial QA", () => {
@@ -262,5 +284,38 @@ describe("preset landing adversarial QA", () => {
 		text = normalizeRenderedText(suffixless.render(260).join("\n"));
 		expect(text).toContain("DEFAULT: provider-a/default");
 		expect(text).not.toContain("DEFAULT: provider-a/default:");
+	});
+
+	test("#688 Down crossing a group boundary lands on the destination group header", async () => {
+		// Regression: pressing Down off the last profile of the expanded group used
+		// to clamp the cursor by numeric index after the source group collapsed,
+		// overshooting past the destination group header onto its first profile.
+		const selector = createSelector();
+		await rendered(selector);
+		selector.handleInput("\x1b[B"); // CODEX header -> Codex Eco profile
+		selector.handleInput("\x1b[B"); // cross boundary into MINIMAX group
+		const label = cursorRowLabel(selector);
+		expect(label).toContain("MINIMAX");
+		expect(label).not.toContain("MiniMax Medium");
+	});
+
+	test("#688 Down from a multi-profile group does not skip the destination header onto Browse", async () => {
+		// With several profiles in the source group, the old numeric clamp could
+		// overshoot the destination group entirely (header + only profile) and land
+		// on the trailing Browse row.
+		const selector = createSelector({ profiles: [codexEco, codexMedium, codexPro, minimax] });
+		await rendered(selector);
+		selector.handleInput("\x1b[B"); // Codex Eco
+		selector.handleInput("\x1b[B"); // Codex Medium
+		selector.handleInput("\x1b[B"); // Codex Pro (last profile of CODEX)
+		selector.handleInput("\x1b[B"); // cross boundary into MINIMAX group
+		const headerLabel = cursorRowLabel(selector);
+		expect(headerLabel).toContain("MINIMAX");
+		expect(headerLabel).not.toContain("Browse all models");
+		expect(headerLabel).not.toContain("MiniMax Medium");
+
+		// Navigation continues correctly through the destination group.
+		selector.handleInput("\x1b[B"); // MINIMAX header -> MiniMax Medium profile
+		expect(cursorRowLabel(selector)).toContain("MiniMax Medium");
 	});
 });

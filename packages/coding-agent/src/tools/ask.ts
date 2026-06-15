@@ -26,7 +26,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
-import { prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import {
 	formatDeepInterviewSelectorPrompt,
@@ -43,6 +43,7 @@ import { renderStatusLine } from "../tui";
 import type { ToolSession } from ".";
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
+import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
 // =============================================================================
 // Types
@@ -501,7 +502,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				{ sessionId },
 			);
 		} catch (error) {
-			console.warn(
+			logger.warn(
 				`ask: deep-interview round recording failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
@@ -514,6 +515,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
+		await assertUltragoalAskAllowed(this.session.cwd);
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		const canUseWorkflowGate = gateEmitter?.isUnattended() === true;
 

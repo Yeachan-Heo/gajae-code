@@ -48,11 +48,31 @@ function fakeAuth(opts: { oauth?: string[]; auth?: string[] } = {}): AuthStorage
 	return {
 		hasOAuth: (provider: string) => oauth.has(provider),
 		hasAuth: (provider: string) => auth.has(provider),
+		getApiKey: (provider: string) => (auth.has(provider) ? `${provider}-key` : undefined),
 	} as unknown as AuthStorage;
 }
 
-async function chainIds(...args: Parameters<typeof resolveProviderChain>): Promise<string[]> {
-	const providers = await resolveProviderChain(...args);
+async function chainIds(
+	authStorage: AuthStorage,
+	preferredProvider: any = "auto",
+	activeModelProvider?: string,
+): Promise<string[]> {
+	const activeModelContext = activeModelProvider
+		? {
+				provider: activeModelProvider,
+				modelId: "test",
+				api:
+					activeModelProvider.includes("google") || activeModelProvider === "gemini"
+						? "google-generative-ai"
+						: activeModelProvider === "anthropic"
+							? "anthropic-messages"
+							: activeModelProvider.includes("kimi")
+								? "anthropic-messages"
+								: "openai-responses",
+				baseUrl: "https://api.example.com",
+			}
+		: undefined;
+	const providers = await resolveProviderChain({ authStorage, preferredProvider, activeModelContext });
 	return providers.map(p => p.id);
 }
 
@@ -214,6 +234,7 @@ describe("resolveProviderChain — active-model-gated resolution", () => {
 		expect(await chainIds(fakeAuth({ oauth: ["openai-codex"] }), "auto", "openai")).toEqual(["codex", "duckduckgo"]);
 		expect(await chainIds(fakeAuth({ oauth: ["openai-codex"] }), "auto", "openai-codex")).toEqual([
 			"codex",
+			"openai-compatible",
 			"duckduckgo",
 		]);
 		expect(await chainIds(fakeAuth({ oauth: ["google-gemini-cli"] }), "auto", "google-gemini-cli")).toEqual([

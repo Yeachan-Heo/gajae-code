@@ -154,6 +154,20 @@ interface PresetBrowseRow {
 
 type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetBrowseRow;
 
+// Stable logical identity for a preset landing row, independent of its current
+// list position. Used to relocate the cursor after the expanded group changes so
+// navigation does not silently overshoot the destination group header/profiles.
+function presetRowIdentity(row: PresetLandingRow): string {
+	switch (row.kind) {
+		case "group":
+			return `group:${row.groupId}`;
+		case "profile":
+			return `profile:${row.groupId}:${row.profile.name}`;
+		case "browse":
+			return "browse";
+	}
+}
+
 const PROFILE_ROLE_PREVIEW_ORDER: GjcModelAssignmentTargetId[] = [
 	"default",
 	"executor",
@@ -739,6 +753,18 @@ export class ModelSelectorComponent extends Container {
 		if (selected?.kind === "group") this.#expandedPresetProviderId = selected.groupId;
 		if (selected?.kind === "profile") this.#expandedPresetProviderId = selected.groupId;
 		const rows = this.#getPresetRows();
+		// Expanding/collapsing a group shifts row positions. Relocate the cursor by
+		// the selected row's logical identity so crossing a provider group boundary
+		// keeps it on the same logical row instead of overshooting into the
+		// destination group's profiles (or off the end of the list).
+		if (selected) {
+			const targetIdentity = presetRowIdentity(selected);
+			const relocated = rows.findIndex(row => presetRowIdentity(row) === targetIdentity);
+			if (relocated >= 0) {
+				this.#presetCursor = relocated;
+				return;
+			}
+		}
 		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, rows.length - 1));
 	}
 

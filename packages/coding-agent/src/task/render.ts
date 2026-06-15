@@ -525,6 +525,10 @@ function renderAgentProgress(
 	expanded: boolean,
 	theme: Theme,
 	spinnerFrame?: number,
+	/** When true, omit wall-clock-derived displays (current-tool elapsed, retry
+	 * countdown) so the output is a pure function of `progress` — required when the
+	 * caller caches these lines (the `subagent` await panel). */
+	staticTime = false,
 ): string[] {
 	const lines: string[] = [];
 	const prefix = isLast ? theme.fg("dim", theme.tree.last) : theme.fg("dim", theme.tree.branch);
@@ -587,7 +591,7 @@ function renderAgentProgress(
 			if (toolDetail) {
 				toolLine += `: ${theme.fg("dim", truncateToWidth(replaceTabs(toolDetail), 40))}`;
 			}
-			if (progress.currentToolStartMs) {
+			if (!staticTime && progress.currentToolStartMs) {
 				const elapsed = Date.now() - progress.currentToolStartMs;
 				if (elapsed > 5000) {
 					toolLine += `${theme.sep.dot}${theme.fg("warning", formatDuration(elapsed))}`;
@@ -610,12 +614,17 @@ function renderAgentProgress(
 	// long until the next attempt. Without this, the parent UI would just
 	// keep spinning while a child sleeps on a 3-hour provider rate-limit.
 	if (progress.retryState && progress.status === "running") {
-		const remainingMs = Math.max(0, progress.retryState.startedAtMs + progress.retryState.delayMs - Date.now());
-		const waitLabel = remainingMs > 0 ? `in ${formatDuration(remainingMs)}` : "now";
 		const attemptLabel = progress.retryState.unbounded
 			? `attempt ${progress.retryState.attempt}`
 			: `${progress.retryState.attempt}/${progress.retryState.maxAttempts}`;
-		const summary = `retrying ${attemptLabel} ${waitLabel}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
+		// `staticTime` omits the wall-clock countdown so a cached await body stays a
+		// pure function of its key (the producer already drops time-only churn).
+		let waitLabel = "";
+		if (!staticTime) {
+			const remainingMs = Math.max(0, progress.retryState.startedAtMs + progress.retryState.delayMs - Date.now());
+			waitLabel = remainingMs > 0 ? ` in ${formatDuration(remainingMs)}` : " now";
+		}
+		const summary = `retrying ${attemptLabel}${waitLabel}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
@@ -687,7 +696,7 @@ function renderAgentProgress(
 	const inflight = progress.inflightTaskDetails;
 	if (completedTaskCalls.length > 0 || inflight) {
 		const snapshots = inflight ? [...completedTaskCalls, inflight] : completedTaskCalls;
-		const nestedLines = renderNestedTaskTree(snapshots, expanded, theme, spinnerFrame);
+		const nestedLines = renderNestedTaskTree(snapshots, expanded, theme, spinnerFrame, staticTime);
 		for (const line of nestedLines) {
 			lines.push(`${continuePrefix}${line}`);
 		}
@@ -712,8 +721,9 @@ export function renderSubagentLiveProgress(
 	expanded: boolean,
 	theme: Theme,
 	spinnerFrame?: number,
+	staticTime = false,
 ): string[] {
-	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame);
+	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame, staticTime);
 }
 
 /**
@@ -1051,6 +1061,7 @@ function renderNestedTaskTree(
 	expanded: boolean,
 	theme: Theme,
 	spinnerFrame?: number,
+	staticTime = false,
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
@@ -1066,7 +1077,7 @@ function renderNestedTaskTree(
 		if (inflight && inflight.length > 0) {
 			inflight.forEach((prog, index) => {
 				const isLast = index === inflight.length - 1;
-				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame));
+				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame, staticTime));
 			});
 		}
 	}

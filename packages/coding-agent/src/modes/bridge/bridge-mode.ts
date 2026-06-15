@@ -29,7 +29,7 @@ import {
 import { UiRequestBroker } from "../shared/agent-wire/ui-request-broker";
 import type { BridgeUiResult } from "../shared/agent-wire/ui-result";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
-import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
+import { modelSupportsTokenCostMetrics, UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
 import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { assertSafeBridgeBind, isBridgeTokenAuthorized } from "./auth";
 import { type BridgePermissionRequestPayload, createBridgeClientBridge } from "./bridge-client-bridge";
@@ -599,6 +599,7 @@ export async function runBridgeMode(
 		emitFrame: gate => eventStream.publish(toBridgeWorkflowGateFrame(gate, sequencer)),
 		store: gateStore,
 		audit: recordAudit,
+		providerSupportsTokenCostMetrics: modelSupportsTokenCostMetrics(session.model),
 		getUsageSnapshot: () => {
 			const stats = session.getSessionStats();
 			return { tokens: stats.tokens.total, costUsd: stats.cost };

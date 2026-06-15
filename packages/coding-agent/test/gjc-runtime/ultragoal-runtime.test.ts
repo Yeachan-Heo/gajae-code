@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { deflateSync } from "node:zlib";
+
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	assertCanCompleteCurrentGoal,
@@ -16,6 +18,8 @@ import {
 	readUltragoalPlan,
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
+	validateExecutorQaRedTeamEvidenceForReview,
+	waitForReplayProcessWithTimeout,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
@@ -126,6 +130,257 @@ function passingQualityGate(): string {
 	});
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
+	let crc = index;
+	for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+	return crc >>> 0;
+});
+
+function pngCrc32(bytes: Buffer): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) crc = PNG_CRC_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
+	const length = Buffer.alloc(4);
+	length.writeUInt32BE(data.length, 0);
+	const typeBytes = Buffer.from(type, "ascii");
+	const crc = Buffer.alloc(4);
+	crc.writeUInt32BE(pngCrc32(Buffer.concat([typeBytes, data])), 0);
+	return Buffer.concat([length, typeBytes, data, crc]);
+}
+
+function syntheticPng(width: number, height: number, mode: "gradient" | "solid"): Buffer {
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 2;
+	const raw = Buffer.alloc((width * 3 + 1) * height);
+	for (let y = 0; y < height; y++) {
+		const row = y * (width * 3 + 1);
+		raw[row] = 0;
+		for (let x = 0; x < width; x++) {
+			const pixel = row + 1 + x * 3;
+			const value = mode === "gradient" ? (x * 3 + y * 5) % 256 : 7;
+			raw[pixel] = value;
+			raw[pixel + 1] = mode === "gradient" ? (x * 7 + y * 11) % 256 : 7;
+			raw[pixel + 2] = mode === "gradient" ? (x * 13 + y * 17) % 256 : 7;
+		}
+	}
+	const idat = pngChunk("IDAT", deflateSync(raw));
+	const padding = idat.length < 4096 ? pngChunk("tEXt", Buffer.alloc(4096 - idat.length, 0)) : Buffer.alloc(0);
+	return Buffer.concat([PNG_SIGNATURE, pngChunk("IHDR", ihdr), idat, padding, pngChunk("IEND")]);
+}
+
+function fakeUnsupportedImage(kind: "gif" | "bmp" | "webp"): Buffer {
+	const bytes = Buffer.alloc(4096, 31);
+	if (kind === "gif") {
+		bytes.write("GIF89a", 0, "ascii");
+		bytes.writeUInt16LE(320, 6);
+		bytes.writeUInt16LE(180, 8);
+	} else if (kind === "bmp") {
+		bytes.write("BM", 0, "ascii");
+		bytes.writeUInt32LE(40, 14);
+		bytes.writeInt32LE(320, 18);
+		bytes.writeInt32LE(180, 22);
+	} else {
+		bytes.write("RIFF", 0, "ascii");
+		bytes.write("WEBP", 8, "ascii");
+		bytes.write("VP8X", 12, "ascii");
+		bytes.writeUIntLE(319, 24, 3);
+		bytes.writeUIntLE(179, 27, 3);
+	}
+	return bytes;
+}
+
+function fakeHeaderOnlyJpeg(): Buffer {
+	const sof = Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0xb4, 0x01, 0x40, 0x03, 0x01, 0x11, 0x00]);
+	return Buffer.concat([Buffer.from([0xff, 0xd8]), sof, Buffer.from([0xff, 0xd9]), Buffer.alloc(4096, 23)]);
+}
+
+function validAutomationTranscript(surface = "gui/web"): Record<string, unknown> {
+	return {
+		schemaVersion: 1,
+		surface,
+		tool: "browser",
+		actions: [
+			{ timestamp: 1000, type: "goto", url: "http://127.0.0.1:3000" },
+			{ timestamp: 1001, type: "click", selector: "button.submit" },
+			{ timestamp: 1002, type: "assert", selector: "text/Success" },
+		],
+		assertions: [{ timestamp: 1003, selector: "text/Success", status: "passed" }],
+	};
+}
+
+async function writeStructuralArtifacts(root: string): Promise<void> {
+	await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+	await Bun.write(path.join(root, "artifacts", "browser-run.json"), JSON.stringify(validAutomationTranscript()));
+	await Bun.write(path.join(root, "artifacts", "gui-screenshot.png"), syntheticPng(320, 180, "gradient"));
+	await Bun.write(path.join(root, "artifacts", "blank-screenshot.png"), syntheticPng(320, 180, "solid"));
+	await Bun.write(path.join(root, "artifacts", "tiny-screenshot.png"), syntheticPng(1, 1, "gradient"));
+	await Bun.write(
+		path.join(root, "artifacts", "garbage-screenshot.png"),
+		Buffer.concat([PNG_SIGNATURE, Buffer.alloc(4096, 17)]),
+	);
+	await Bun.write(path.join(root, "artifacts", "fake-screenshot.gif"), fakeUnsupportedImage("gif"));
+	await Bun.write(path.join(root, "artifacts", "fake-screenshot.bmp"), fakeUnsupportedImage("bmp"));
+	await Bun.write(path.join(root, "artifacts", "fake-screenshot.webp"), fakeUnsupportedImage("webp"));
+	await Bun.write(path.join(root, "artifacts", "fake-screenshot.jpg"), fakeHeaderOnlyJpeg());
+	await Bun.write(path.join(root, "artifacts", "adversarial-report.txt"), "adversarial boundary evidence");
+	await Bun.write(
+		path.join(root, "artifacts", "pty-capture.txt"),
+		`${"\x1b[?1049h\x1b[2J\x1b[H"}Native terminal rendered successful flow\r${"\x1b[H"}${"x".repeat(520)}`,
+	);
+	await Bun.write(
+		path.join(root, "artifacts", "plain-pty.txt"),
+		`Plain terminal log without control codes ${"x".repeat(520)}`,
+	);
+}
+
+function executorQaWithSurface(surface: string, artifactRefs: Record<string, unknown>[]): Record<string, unknown> {
+	const artifactIds = artifactRefs.map(ref => String(ref.id));
+	return {
+		status: "passed",
+		e2eStatus: "passed",
+		redTeamStatus: "passed",
+		evidence: "executor built and ran e2e plus red-team QA suite",
+		e2eCommands: ["red-team surface check"],
+		redTeamCommands: ["red-team artifact check"],
+		artifactRefs: [
+			...artifactRefs,
+			{
+				id: "adversarial-report",
+				kind: "failure-mode-test",
+				path: "artifacts/adversarial-report.txt",
+				description: "Adversarial boundary and failure-mode test output",
+			},
+		],
+		contractCoverage: [
+			{
+				id: "contract-goal",
+				contractRef: "approved-plan:goal",
+				obligation: "The completed story satisfies the approved user-facing contract",
+				status: "covered",
+				surfaceEvidenceRefs: ["surface-live"],
+				adversarialCaseRefs: ["case-invalid-input"],
+			},
+		],
+		surfaceEvidence: [
+			{
+				id: "surface-live",
+				surface,
+				contractRef: "approved-plan:goal",
+				invocation: "Exercise the user-facing surface and verify the result",
+				verdict: "passed",
+				artifactRefs: artifactIds,
+			},
+		],
+		adversarialCases: [
+			{
+				id: "case-invalid-input",
+				contractRef: "approved-plan:goal",
+				scenario: "Submit invalid or boundary input through the user-facing surface",
+				expectedBehavior: "The implementation rejects or handles the case according to the approved contract",
+				verdict: "passed",
+				artifactRefs: ["adversarial-report"],
+			},
+		],
+		blockers: [],
+	};
+}
+
+function cliReplayArtifact(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		id: "cli-replay",
+		kind: "cli-replay",
+		description: "Runtime argv replay for CLI surface",
+		replay: {
+			schemaVersion: 1,
+			kind: "cli-replay",
+			replaySafe: true,
+			command: ["bun", "-e", 'console.log("ultragoal-cli-ok")'],
+			recordedStdout: "ultragoal-cli-ok\n",
+			...overrides,
+		},
+	};
+}
+
+function cliExecutorQa(artifactRefs: Record<string, unknown>[]): Record<string, unknown> {
+	return executorQaWithSurface("cli", artifactRefs);
+}
+
+async function expectRejectedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<string> {
+	const created = await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
+	await startNextUltragoalGoal({ cwd: root });
+	const result = await runNativeUltragoalCommand(
+		[
+			"checkpoint",
+			"--goal-id",
+			"G001",
+			"--status",
+			"complete",
+			"--evidence",
+			"focused CLI replay gate check",
+			"--gjc-goal-json",
+			goalSnapshot(created.gjcObjective),
+			"--quality-gate-json",
+			JSON.stringify({ ...JSON.parse(passingQualityGate()), executorQa }),
+		],
+		root,
+	);
+	expect(result.status).toBe(1);
+	return result.stderr ?? "";
+}
+
+async function expectAcceptedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<void> {
+	const created = await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
+	await startNextUltragoalGoal({ cwd: root });
+	const result = await runNativeUltragoalCommand(
+		[
+			"checkpoint",
+			"--goal-id",
+			"G001",
+			"--status",
+			"complete",
+			"--evidence",
+			"focused CLI replay gate check",
+			"--gjc-goal-json",
+			goalSnapshot(created.gjcObjective),
+			"--quality-gate-json",
+			JSON.stringify({ ...JSON.parse(passingQualityGate()), executorQa }),
+		],
+		root,
+	);
+	expect(result.status).toBe(0);
+}
+function webExecutorQa(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return executorQaWithSurface(
+		"gui/web",
+		[
+			{
+				id: "browser-run",
+				kind: "browser-automation",
+				path: "artifacts/browser-run.json",
+				description: "Browser automation transcript that invokes the approved user-facing flow",
+			},
+			{
+				id: "gui-screenshot",
+				kind: "screenshot",
+				path: "artifacts/gui-screenshot.png",
+				description: "Screenshot evidence for the GUI/web surface verdict",
+			},
+		].map(ref => ({ ...ref, ...((overrides[ref.id] as Record<string, unknown> | undefined) ?? {}) })),
+	);
+}
+
+async function passingLiveQualityGate(root: string): Promise<string> {
+	await writeStructuralArtifacts(root);
+	return passingQualityGate();
+}
+
 function goalSnapshot(objective: string, status = "active", updatedAt: number | string = Date.now()): string {
 	return JSON.stringify({
 		goal: {
@@ -226,6 +481,15 @@ function mutateQualityGate(mutator: (gate: Record<string, Record<string, unknown
 	return JSON.stringify(gate);
 }
 
+async function mutateLiveQualityGate(
+	root: string,
+	mutator: (gate: Record<string, Record<string, unknown>>) => void,
+): Promise<string> {
+	const gate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, Record<string, unknown>>;
+	mutator(gate);
+	return JSON.stringify(gate);
+}
+
 async function expectRejectedCompleteGate(
 	root: string,
 	created: { gjcObjective: string },
@@ -284,6 +548,202 @@ async function expectRejectedSteering(root: string, args: string[], kind: string
 	expect(rejection).toMatchObject({ event: "steering_rejected", kind });
 	return result.stderr ?? "";
 }
+
+describe("ultragoal CLI replay validation", () => {
+	it("accepts replaySafe allowlisted bun -e argv replay with matching stdout", async () => {
+		const root = await tempDir();
+		await expectAcceptedExecutorQa(root, cliExecutorQa([cliReplayArtifact()]));
+	});
+
+	it("rejects string commands and unallowlisted argv commands", async () => {
+		const stringRoot = await tempDir();
+		const stringError = await expectRejectedExecutorQa(
+			stringRoot,
+			cliExecutorQa([cliReplayArtifact({ command: 'bun -e "console.log(1)"' })]),
+		);
+		expect(stringError).toContain("argv string array");
+
+		const unallowlistedRoot = await tempDir();
+		const unallowlistedError = await expectRejectedExecutorQa(
+			unallowlistedRoot,
+			cliExecutorQa([cliReplayArtifact({ command: ["bun", "install"] })]),
+		);
+		expect(unallowlistedError).toContain("allowlist");
+	});
+
+	it("rejects execution-affecting env and git side-effect flags", async () => {
+		const envRoot = await tempDir();
+		const envError = await expectRejectedExecutorQa(
+			envRoot,
+			cliExecutorQa([cliReplayArtifact({ env: { NODE_OPTIONS: "--require ./evil.js" } })]),
+		);
+		expect(envError).toContain("env.NODE_OPTIONS");
+		expect(envError).toContain("safe environment allowlist");
+
+		const gitRoot = await tempDir();
+		const gitError = await expectRejectedExecutorQa(
+			gitRoot,
+			cliExecutorQa([
+				cliReplayArtifact({
+					command: ["git", "diff", "--output=artifact.txt"],
+					recordedStdout: "",
+				}),
+			]),
+		);
+		expect(gitError).toContain("allowlist");
+	});
+
+	it("rejects path-qualified or case-spoofed replay executables", async () => {
+		const root = await tempDir();
+		for (const command of [
+			["./git", "status"],
+			["/tmp/npm", "--version"],
+			["scripts/node", "--version"],
+			["GIT", "status"],
+		]) {
+			const error = await expectRejectedExecutorQa(
+				root,
+				cliExecutorQa([cliReplayArtifact({ command, recordedStdout: "" })]),
+			);
+			expect(error).toContain("allowlist");
+		}
+	});
+
+	it("kills SIGTERM-ignoring CLI replay processes during timeout escalation", async () => {
+		let killedWith: string | undefined;
+		let exit!: (code: number) => void;
+		const exited = new Promise<number>(resolve => {
+			exit = resolve;
+		});
+		const fakeProcess = {
+			exited,
+			kill(signal?: number | NodeJS.Signals) {
+				killedWith = typeof signal === "string" ? signal : undefined;
+				if (signal === "SIGKILL") exit(137);
+			},
+		};
+		await expect(waitForReplayProcessWithTimeout(fakeProcess, 1, 1)).rejects.toThrow("timeout");
+		expect(killedWith).toBe("SIGKILL");
+	});
+
+	it("rejects stdout mismatches", async () => {
+		const root = await tempDir();
+		const error = await expectRejectedExecutorQa(
+			root,
+			cliExecutorQa([cliReplayArtifact({ recordedStdout: "wrong\n" })]),
+		);
+		expect(error).toContain("stdout did not match");
+	});
+
+	it("accepts audited replayExempt with structurally-valid fallback and rejects invalid exemptions", async () => {
+		const acceptedRoot = await tempDir();
+		await writeStructuralArtifacts(acceptedRoot);
+		await expectAcceptedExecutorQa(
+			acceptedRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Unsafe CLI replay exemption with fallback",
+					replay: {
+						schemaVersion: 1,
+						kind: "cli-replay",
+						replayExempt: {
+							reasonCode: "requires_network",
+							reason:
+								"Command depends on a live external service and cannot be deterministically replayed in the gate.",
+							approvedBy: "executor-qa",
+							fallbackArtifactRefs: ["pty-capture"],
+						},
+					},
+				},
+				{
+					id: "pty-capture",
+					kind: "pty-capture",
+					path: "artifacts/pty-capture.txt",
+					description: "Structurally-valid terminal fallback capture",
+				},
+			]),
+		);
+
+		const missingReasonRoot = await tempDir();
+		await writeStructuralArtifacts(missingReasonRoot);
+		const missingReasonError = await expectRejectedExecutorQa(
+			missingReasonRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Invalid CLI replay exemption",
+					replay: {
+						schemaVersion: 1,
+						kind: "cli-replay",
+						replayExempt: {
+							reasonCode: "requires_network",
+							approvedBy: "executor-qa",
+							fallbackArtifactRefs: ["pty-capture"],
+						},
+					},
+				},
+				{
+					id: "pty-capture",
+					kind: "pty-capture",
+					path: "artifacts/pty-capture.txt",
+					description: "Structurally-valid terminal fallback capture",
+				},
+			]),
+		);
+		expect(missingReasonError).toContain("reason");
+
+		const invalidFallbackRoot = await tempDir();
+		await writeStructuralArtifacts(invalidFallbackRoot);
+		const invalidFallbackError = await expectRejectedExecutorQa(
+			invalidFallbackRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Invalid fallback CLI replay exemption",
+					replay: {
+						schemaVersion: 1,
+						kind: "cli-replay",
+						replayExempt: {
+							reasonCode: "requires_network",
+							reason:
+								"Command depends on a live external service and cannot be deterministically replayed in the gate.",
+							approvedBy: "executor-qa",
+							fallbackArtifactRefs: ["plain-pty"],
+						},
+					},
+				},
+				{
+					id: "plain-pty",
+					kind: "pty-capture",
+					path: "artifacts/plain-pty.txt",
+					description: "Invalid plain terminal fallback capture",
+				},
+			]),
+		);
+		expect(invalidFallbackError).toContain("control sequences");
+	});
+
+	it("honors substring regex and not_substring invariants instead of full stdout equality", async () => {
+		const root = await tempDir();
+		await expectAcceptedExecutorQa(
+			root,
+			cliExecutorQa([
+				cliReplayArtifact({
+					recordedStdout: "intentionally different\n",
+					invariants: [
+						{ type: "substring", value: "ultragoal-cli-ok" },
+						{ type: "regex", value: "ULTRAGOAL-CLI-OK", flags: "i" },
+						{ type: "not_substring", value: "should-not-appear" },
+					],
+				}),
+			]),
+		);
+	});
+});
 
 describe("native GJC ultragoal runtime", () => {
 	it("reports missing status from a fresh repo", async () => {
@@ -369,7 +829,7 @@ describe("native GJC ultragoal runtime", () => {
 				"--gjc-goal-json",
 				goalSnapshot(created.gjcObjective),
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 				"--json",
 			],
 			root,
@@ -787,7 +1247,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 		const status = await getUltragoalStatus(root);
 		const diagnostic = validateCompletionReceipt({
@@ -808,6 +1268,54 @@ describe("native GJC ultragoal runtime", () => {
 		});
 	});
 
+	it("dedups duplicate checkpoint ledger entries for an unchanged status and evidence (#645)", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const goalsPath = path.join(root, ".gjc", "ultragoal", "goals.json");
+		const countCheckpoints = async (): Promise<number> =>
+			(await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed").length;
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		const goalsAfterFirst = await Bun.file(goalsPath).text();
+
+		// Re-checkpoint with identical status + evidence: idempotent — no ledger append, no plan rewrite.
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by obsolete dependency",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFirst);
+
+		// Whitespace-only differences still resolve to the same checkpoint (evidence is trimmed).
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "  blocked by obsolete dependency  ",
+		});
+		expect(await countCheckpoints()).toBe(1);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFirst);
+
+		// A genuine change (new evidence) is still recorded as a fresh checkpoint.
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by a different upstream regression",
+		});
+		expect(await countCheckpoints()).toBe(2);
+	});
+
 	it("accepts full goal get tool result snapshots with millisecond timestamps", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
@@ -819,7 +1327,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalToolSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 
 		expect(plan.goals[0]?.status).toBe("complete");
@@ -837,7 +1345,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalSnapshot(created.gjcObjective, "active", new Date().toISOString()),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 
 		expect(plan.goals[0]?.status).toBe("complete");
@@ -857,7 +1365,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalSnapshot(storyObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 
 		expect(plan.goals[0]?.status).toBe("complete");
@@ -887,7 +1395,7 @@ describe("native GJC ultragoal runtime", () => {
 				"--gjc-goal-json",
 				goalSnapshot(created.gjcObjective),
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 			],
 			root,
 		);
@@ -926,7 +1434,7 @@ describe("native GJC ultragoal runtime", () => {
 				"--gjc-goal-json",
 				goalSnapshot(created.gjcObjective),
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 				"--json",
 			],
 			root,
@@ -955,7 +1463,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 		const goal = plan.goals[0];
 		if (!goal) throw new Error("missing goal");
@@ -981,7 +1489,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "tests passed",
 			gjcGoalJson: goalSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 		const ledger = await readUltragoalLedger(root);
 		const checkpointEvent = ledger.find(event => event.event === "goal_checkpointed");
@@ -1143,10 +1651,10 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const missingMatrix = mutateQualityGate(gate => {
+		const missingMatrix = await mutateLiveQualityGate(root, gate => {
 			delete gate.executorQa!.contractCoverage;
 		});
-		const emptyMatrix = mutateQualityGate(gate => {
+		const emptyMatrix = await mutateLiveQualityGate(root, gate => {
 			gate.executorQa!.surfaceEvidence = [];
 		});
 
@@ -1161,7 +1669,7 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const descriptionOnlyCoverage = mutateQualityGate(gate => {
+		const descriptionOnlyCoverage = await mutateLiveQualityGate(root, gate => {
 			const coverage = gate.executorQa!.contractCoverage as Array<Record<string, unknown>>;
 			coverage[0]!.description = coverage[0]!.obligation;
 			delete coverage[0]!.obligation;
@@ -1177,7 +1685,7 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const allNotApplicableCoverage = mutateQualityGate(gate => {
+		const allNotApplicableCoverage = await mutateLiveQualityGate(root, gate => {
 			gate.executorQa!.contractCoverage = [
 				{
 					id: "contract-goal",
@@ -1199,7 +1707,7 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const missingArtifact = mutateQualityGate(gate => {
+		const missingArtifact = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
 			delete refs[0]!.inlineEvidence;
 			refs[0]!.path = "artifacts/missing-browser-run.json";
@@ -1207,8 +1715,8 @@ describe("native GJC ultragoal runtime", () => {
 
 		const artifactError = await expectRejectedCompleteGate(root, created, missingArtifact);
 
-		expect(artifactError).toContain("executorQa.artifactRefs[0]");
-		expect(artifactError).toContain("existing non-empty artifact path");
+		expect(artifactError).toContain("executorQa.artifactRefs.browser-run");
+		expect(artifactError).toContain("automation transcript path must resolve to an existing file");
 	});
 
 	it("rejects empty red-team evidence artifacts before mutation", async () => {
@@ -1217,7 +1725,7 @@ describe("native GJC ultragoal runtime", () => {
 		await startNextUltragoalGoal({ cwd: root });
 		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
 		await Bun.write(path.join(root, "artifacts", "empty-browser-run.json"), "");
-		const emptyArtifact = mutateQualityGate(gate => {
+		const emptyArtifact = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
 			delete refs[0]!.inlineEvidence;
 			refs[0]!.path = "artifacts/empty-browser-run.json";
@@ -1225,45 +1733,243 @@ describe("native GJC ultragoal runtime", () => {
 
 		const artifactError = await expectRejectedCompleteGate(root, created, emptyArtifact);
 
-		expect(artifactError).toContain("executorQa.artifactRefs[0]");
-		expect(artifactError).toContain("existing non-empty artifact path");
+		expect(artifactError).toContain("executorQa.artifactRefs.browser-run");
+		expect(artifactError).toContain("automation transcript must be valid JSON");
 	});
 
-	it("accepts substantive inline evidence, non-empty artifacts, and typed verified receipt references", async () => {
+	it("rejects live GUI inlineEvidence-only artifact proof before mutation", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
-		await Bun.write(
-			path.join(root, "artifacts", "gui-screenshot.txt"),
-			"approved screenshot artifact contains visible success-state verification",
-		);
-		const mixedProof = mutateQualityGate(gate => {
+
+		const artifactError = await expectRejectedCompleteGate(root, created, passingQualityGate());
+
+		expect(artifactError).toContain("executorQa.artifactRefs.browser-run");
+		expect(artifactError).toContain("inlineEvidence and typed verifiedReceipt do not prove live surfaces");
+	});
+
+	it("rejects live GUI typed receipt-only artifact proof before mutation", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const receiptOnlyGate = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
-			refs[0] = {
-				id: "browser-run",
-				kind: "browser-automation",
-				description: "Browser automation inline proof",
-				inlineEvidence:
-					"Browser automation completed the approved flow, asserted the result, and recorded the runtime state transitions.",
-			};
-			refs[1] = {
-				id: "gui-screenshot",
-				kind: "screenshot",
-				path: "artifacts/gui-screenshot.txt",
-				description: "Existing non-empty screenshot artifact",
-			};
-			refs[2] = {
-				id: "adversarial-report",
-				kind: "failure-mode-test",
-				description: "Typed verified receipt from adversarial runner",
-				verifiedReceipt: {
-					type: "red-team-adversarial-run",
-					id: "receipt-adversarial-001",
-					status: "verified",
-				},
-			};
+			delete refs[0]!.inlineEvidence;
+			delete refs[0]!.path;
+			refs[0]!.verifiedReceipt = { type: "browser-run", id: "receipt-browser-001", status: "verified" };
+			delete refs[1]!.path;
 		});
+
+		const artifactError = await expectRejectedCompleteGate(root, created, receiptOnlyGate);
+
+		expect(artifactError).toContain("executorQa.artifactRefs.browser-run");
+		expect(artifactError).toContain("typed verifiedReceipt do not prove live surfaces");
+	});
+
+	it("accepts web surface evidence with valid automation transcript and non-uniform screenshot", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+
+		await validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa());
+	});
+
+	it("rejects blank solid and tiny screenshots for web surface evidence", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+
+		await expect(
+			validateExecutorQaRedTeamEvidenceForReview(
+				root,
+				webExecutorQa({ "gui-screenshot": { path: "artifacts/blank-screenshot.png" } }),
+			),
+		).rejects.toThrow(/non-uniform/);
+		await expect(
+			validateExecutorQaRedTeamEvidenceForReview(
+				root,
+				webExecutorQa({ "gui-screenshot": { path: "artifacts/tiny-screenshot.png" } }),
+			),
+		).rejects.toThrow(/320x180/);
+		await expect(
+			validateExecutorQaRedTeamEvidenceForReview(
+				root,
+				webExecutorQa({ "gui-screenshot": { path: "artifacts/garbage-screenshot.png" } }),
+			),
+		).rejects.toThrow(/decodable/);
+	});
+
+	it("rejects unsupported or undecodable screenshot formats", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		for (const [file, message] of [
+			["artifacts/fake-screenshot.gif", "unsupported/undecodable screenshot format GIF"],
+			["artifacts/fake-screenshot.bmp", "unsupported/undecodable screenshot format BMP"],
+			["artifacts/fake-screenshot.webp", "unsupported/undecodable screenshot format WebP"],
+			["artifacts/fake-screenshot.jpg", "decodable PNG or JPEG"],
+		] as const) {
+			await expect(
+				validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa({ "gui-screenshot": { path: file } })),
+			).rejects.toThrow(message);
+		}
+	});
+
+	it("rejects invalid automation transcripts with missing timestamps, non-monotonic timestamps, or empty selectors", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		const transcriptPath = path.join(root, "artifacts", "browser-run.json");
+
+		const missingTimestamp = validAutomationTranscript();
+		delete ((missingTimestamp.actions as Array<Record<string, unknown>>)[1] as Record<string, unknown>).timestamp;
+		await Bun.write(transcriptPath, JSON.stringify(missingTimestamp));
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa())).rejects.toThrow(/timestamp/);
+
+		const nonMonotonic = validAutomationTranscript();
+		((nonMonotonic.actions as Array<Record<string, unknown>>)[2] as Record<string, unknown>).timestamp = 999;
+		await Bun.write(transcriptPath, JSON.stringify(nonMonotonic));
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa())).rejects.toThrow(/monotonic/);
+
+		const emptySelector = validAutomationTranscript();
+		((emptySelector.actions as Array<Record<string, unknown>>)[1] as Record<string, unknown>).selector = " ";
+		await Bun.write(transcriptPath, JSON.stringify(emptySelector));
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa())).rejects.toThrow(/selector/);
+	});
+
+	it("recognizes native desktop and tui surfaces with screenshot, pty, or automation transcript artifacts", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+		await Bun.write(
+			path.join(root, "artifacts", "native-run.json"),
+			JSON.stringify(validAutomationTranscript("native/desktop")),
+		);
+
+		await validateExecutorQaRedTeamEvidenceForReview(
+			root,
+			executorQaWithSurface("native", [
+				{
+					id: "native-screenshot",
+					kind: "screenshot",
+					path: "artifacts/gui-screenshot.png",
+					description: "Native app screenshot evidence",
+				},
+			]),
+		);
+		await validateExecutorQaRedTeamEvidenceForReview(
+			root,
+			executorQaWithSurface("desktop", [
+				{
+					id: "desktop-pty",
+					kind: "pty-capture",
+					path: "artifacts/pty-capture.txt",
+					description: "Desktop terminal PTY capture evidence",
+				},
+			]),
+		);
+		await validateExecutorQaRedTeamEvidenceForReview(
+			root,
+			executorQaWithSurface("tui", [
+				{
+					id: "tui-automation",
+					kind: "app-automation-transcript",
+					path: "artifacts/native-run.json",
+					description: "TUI app automation transcript evidence",
+				},
+			]),
+		);
+	});
+
+	it("rejects invalid native pty captures without terminal control codes", async () => {
+		const root = await tempDir();
+		await writeStructuralArtifacts(root);
+
+		await expect(
+			validateExecutorQaRedTeamEvidenceForReview(
+				root,
+				executorQaWithSurface("tui", [
+					{
+						id: "plain-pty",
+						kind: "pty-capture",
+						path: "artifacts/plain-pty.txt",
+						description: "Plain terminal log without control sequences",
+					},
+				]),
+			),
+		).rejects.toThrow(/terminal control sequences/);
+	});
+
+	it("accepts non-live typed receipt or artifact proof but rejects bare inline-only proof", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
+		await Bun.write(path.join(root, "artifacts", "api-output.txt"), "api package consumer test output");
+		const receiptExecutorQa = JSON.parse(passingQualityGate()).executorQa as Record<string, unknown>;
+		receiptExecutorQa.artifactRefs = [
+			{
+				id: "api-receipt",
+				kind: "api-package-test-report",
+				description: "API package verified receipt",
+				verifiedReceipt: { type: "api-package", id: "receipt-api-001", status: "verified" },
+			},
+		];
+		receiptExecutorQa.surfaceEvidence = [
+			{
+				id: "surface-api",
+				surface: "api/package",
+				contractRef: "approved-plan:goal",
+				invocation: "Run package consumer verification",
+				verdict: "passed",
+				artifactRefs: ["api-receipt"],
+			},
+		];
+		receiptExecutorQa.adversarialCases = [
+			{
+				id: "case-api",
+				contractRef: "approved-plan:goal",
+				scenario: "Exercise invalid API input",
+				expectedBehavior: "The package returns the documented validation error",
+				verdict: "passed",
+				artifactRefs: ["api-receipt"],
+			},
+		];
+		receiptExecutorQa.contractCoverage = [
+			{
+				id: "contract-api",
+				contractRef: "approved-plan:goal",
+				obligation: "The API/package contract is covered",
+				status: "covered",
+				surfaceEvidenceRefs: ["surface-api"],
+				adversarialCaseRefs: ["case-api"],
+			},
+		];
+		await validateExecutorQaRedTeamEvidenceForReview(root, receiptExecutorQa);
+
+		const artifactExecutorQa = JSON.parse(JSON.stringify(receiptExecutorQa)) as Record<string, unknown>;
+		artifactExecutorQa.artifactRefs = [
+			{
+				id: "api-receipt",
+				kind: "api-package-test-report",
+				description: "API package artifact output",
+				path: "artifacts/api-output.txt",
+			},
+		];
+		await validateExecutorQaRedTeamEvidenceForReview(root, artifactExecutorQa);
+
+		const inlineExecutorQa = JSON.parse(JSON.stringify(receiptExecutorQa)) as Record<string, unknown>;
+		inlineExecutorQa.artifactRefs = [
+			{
+				id: "api-receipt",
+				kind: "api-package-test-report",
+				description: "API package inline-only report",
+				inlineEvidence: "API package consumer verification passed with documented behavior and edge cases.",
+			},
+		];
+		await expect(validateExecutorQaRedTeamEvidenceForReview(root, inlineExecutorQa)).rejects.toThrow(
+			/inlineEvidence alone is not sufficient/,
+		);
+	});
+
+	it("accepts live artifact files as proof for completed checkpoints", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const mixedProof = await passingLiveQualityGate(root);
 
 		const plan = await checkpointUltragoalGoal({
 			cwd: root,
@@ -1281,16 +1987,17 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const degenerateReceipt = mutateQualityGate(gate => {
+		const degenerateReceipt = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
 			delete refs[0]!.inlineEvidence;
 			delete refs[0]!.path;
 			refs[0]!.verifiedReceipt = { status: "verified" };
+			delete refs[1]!.path;
 		});
 
 		const receiptError = await expectRejectedCompleteGate(root, created, degenerateReceipt);
 
-		expect(receiptError).toContain("executorQa.artifactRefs[0]");
+		expect(receiptError).toContain("executorQa.artifactRefs.browser-run");
 		expect(receiptError).toContain("typed verifiedReceipt");
 	});
 
@@ -1298,15 +2005,15 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const missingArtifactMetadata = mutateQualityGate(gate => {
+		const missingArtifactMetadata = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
 			delete refs[0]!.kind;
 		});
-		const missingSurfaceArtifact = mutateQualityGate(gate => {
+		const missingSurfaceArtifact = await mutateLiveQualityGate(root, gate => {
 			const surfaceEvidence = gate.executorQa!.surfaceEvidence as Array<Record<string, unknown>>;
 			surfaceEvidence[0]!.artifactRefs = ["missing-artifact"];
 		});
-		const missingCoverageLink = mutateQualityGate(gate => {
+		const missingCoverageLink = await mutateLiveQualityGate(root, gate => {
 			const coverage = gate.executorQa!.contractCoverage as Array<Record<string, unknown>>;
 			coverage[0]!.surfaceEvidenceRefs = ["missing-surface"];
 		});
@@ -1324,7 +2031,7 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const notApplicableWithoutReason = mutateQualityGate(gate => {
+		const notApplicableWithoutReason = await mutateLiveQualityGate(root, gate => {
 			const surfaceEvidence = gate.executorQa!.surfaceEvidence as Array<Record<string, unknown>>;
 			surfaceEvidence[0] = {
 				id: "surface-gui",
@@ -1333,11 +2040,11 @@ describe("native GJC ultragoal runtime", () => {
 				status: "not_applicable",
 			};
 		});
-		const adversarialNotApplicable = mutateQualityGate(gate => {
+		const adversarialNotApplicable = await mutateLiveQualityGate(root, gate => {
 			const cases = gate.executorQa!.adversarialCases as Array<Record<string, unknown>>;
 			cases[0]!.status = "not_applicable";
 		});
-		const guiWithCliOnlyArtifact = mutateQualityGate(gate => {
+		const guiWithCliOnlyArtifact = await mutateLiveQualityGate(root, gate => {
 			const refs = gate.executorQa!.artifactRefs as Array<Record<string, unknown>>;
 			refs[0]!.kind = "cli-log";
 			refs[1]!.kind = "terminal-transcript";
@@ -1356,11 +2063,11 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const failedSurfaceVerdict = mutateQualityGate(gate => {
+		const failedSurfaceVerdict = await mutateLiveQualityGate(root, gate => {
 			const surfaceEvidence = gate.executorQa!.surfaceEvidence as Array<Record<string, unknown>>;
 			surfaceEvidence[0]!.verdict = "failed";
 		});
-		const failedAdversarialResult = mutateQualityGate(gate => {
+		const failedAdversarialResult = await mutateLiveQualityGate(root, gate => {
 			const cases = gate.executorQa!.adversarialCases as Array<Record<string, unknown>>;
 			delete cases[0]!.verdict;
 			cases[0]!.result = "failed";
@@ -1377,12 +2084,12 @@ describe("native GJC ultragoal runtime", () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
-		const passedStatusFailedSurface = mutateQualityGate(gate => {
+		const passedStatusFailedSurface = await mutateLiveQualityGate(root, gate => {
 			const surfaceEvidence = gate.executorQa!.surfaceEvidence as Array<Record<string, unknown>>;
 			surfaceEvidence[0]!.status = "passed";
 			surfaceEvidence[0]!.verdict = "failed";
 		});
-		const passedStatusFailedAdversarial = mutateQualityGate(gate => {
+		const passedStatusFailedAdversarial = await mutateLiveQualityGate(root, gate => {
 			const cases = gate.executorQa!.adversarialCases as Array<Record<string, unknown>>;
 			cases[0]!.status = "passed";
 			cases[0]!.result = "failed";
@@ -1432,7 +2139,7 @@ describe("native GJC ultragoal runtime", () => {
 				"--evidence",
 				"tests passed",
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 			],
 			root,
 		);
@@ -1485,7 +2192,7 @@ describe("native GJC ultragoal runtime", () => {
 			"--evidence",
 			"tests passed",
 			"--quality-gate-json",
-			passingQualityGate(),
+			await passingLiveQualityGate(root),
 			"--gjc-goal-json",
 		];
 
@@ -1597,7 +2304,7 @@ describe("native GJC ultragoal runtime", () => {
 			status: "complete",
 			evidence: "fixed regression and reran full verification",
 			gjcGoalJson: goalSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 		const status = await getUltragoalStatus(root);
 
@@ -1921,7 +2628,7 @@ describe("ultragoal @goal decomposition", () => {
 				"--gjc-goal-json",
 				goalSnapshot(created.gjcObjective),
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 			],
 			root,
 		);
@@ -1980,7 +2687,7 @@ describe("ultragoal @goal decomposition", () => {
 				"--gjc-goal-json",
 				goalSnapshot(created.gjcObjective),
 				"--quality-gate-json",
-				passingQualityGate(),
+				await passingLiveQualityGate(root),
 			],
 			root,
 		);
@@ -2014,7 +2721,7 @@ describe("ultragoal @goal decomposition", () => {
 			status: "complete",
 			evidence: "first story verified",
 			gjcGoalJson: goalSnapshot(created.gjcObjective),
-			qualityGateJson: passingQualityGate(),
+			qualityGateJson: await passingLiveQualityGate(root),
 		});
 
 		const second = await startNextUltragoalGoal({ cwd: root });
@@ -2168,7 +2875,7 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 					"--gjc-goal-json",
 					goalSnapshot(created.gjcObjective),
 					"--quality-gate-json",
-					passingQualityGate(),
+					await passingLiveQualityGate(root),
 				],
 				root,
 			);

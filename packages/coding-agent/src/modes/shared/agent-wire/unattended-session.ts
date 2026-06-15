@@ -14,6 +14,7 @@
  * Also implements the dispatch-facing {@link RpcUnattendedControlPlane} so the
  * RPC server can route `negotiate_unattended` + `workflow_gate_response` here.
  */
+import type { Model } from "@gajae-code/ai";
 import type {
 	RpcCommand,
 	RpcUnattendedAccepted,
@@ -37,6 +38,20 @@ import { type GateStore, MemoryGateStore, type OpenGateInput, WorkflowGateBroker
  * and scope-checked but must NOT charge the tool-call budget (issue 04).
  */
 const CHARGED_COMMAND_TYPES = new Set<RpcCommand["type"]>(["bash", "prompt", "steer", "follow_up", "abort_and_prompt"]);
+
+/**
+ * Derive an explicit `providerSupportsTokenCostMetrics` capability from the
+ * active model so unattended negotiation fails closed when token/cost usage
+ * cannot be accounted for (#606). Callers that omit a model — or whose model is
+ * configured to suppress streaming usage (`compat.supportsUsageInStreaming:
+ * false`) — get `false`, which the controller refuses with
+ * `unsupported_budget_metric`.
+ */
+export function modelSupportsTokenCostMetrics(model: Model | undefined): boolean {
+	if (!model) return false;
+	const compat = model.compat as { supportsUsageInStreaming?: boolean } | undefined;
+	return compat?.supportsUsageInStreaming !== false;
+}
 
 /** Minimal surface a skill runtime / ask tool uses to emit a gate and await its answer. */
 export interface WorkflowGateEmitter {
@@ -92,7 +107,7 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 					this.#rejectAllPending(new Error(`unattended run aborted: ${reason}`));
 				},
 			},
-			providerSupportsTokenCostMetrics: this.opts.providerSupportsTokenCostMetrics ?? true,
+			providerSupportsTokenCostMetrics: this.opts.providerSupportsTokenCostMetrics,
 		});
 		this.#controller = controller;
 		this.#broker = new WorkflowGateBroker(this.opts.runId, this.opts.store ?? new MemoryGateStore(), {

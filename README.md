@@ -136,16 +136,17 @@ And four bundled role agents:
 
 No sprawling default skill zoo: GJC improves by making this small method better.
 
-## Works beside your existing agent
+## Works beside your existing agent or bot
 
-| Tool        | Recommended GJC command                        | Boundary                                               |
-| ----------- | ---------------------------------------------- | ------------------------------------------------------ |
-| Codex CLI   | `gjc --tmux --worktree <name>` or `gjc`        | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
-| Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension.           |
-| OpenCode    | `gjc` or `gjc --tmux`                          | External-runner workflow only today.                   |
-| Claw Code   | `gjc --tmux --worktree <name>`                 | GJC does not install into or replace Claw Code.        |
+| Tool or bot | Recommended GJC command | Boundary |
+| ----------- | ----------------------- | -------- |
+| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
+| Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
+| OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
+| Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
+| External controller / bot | `gjc mcp-serve coordinator` plus `gjc setup hermes` for compatible config, or `gjc --mode rpc` for a subprocess worker | Any MCP/RPC-capable bot drives GJC through the generic coordinator/RPC contract, not scrollback scraping. |
 
-For remote-control protocol details, see [`docs/bridge.md`](docs/bridge.md). For the Gajae Remote thin phone steering wheel design (v0), see [`docs/gajae-remote.md`](docs/gajae-remote.md).
+For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across MCP, RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md). For the remote operator surfaces roadmap, see [`docs/gajae-remote.md`](docs/gajae-remote.md) (web steering wheel) and [`docs/telegram-remote.md`](docs/telegram-remote.md) (Telegram lifecycle button).
 
 ## Configuration
 
@@ -163,18 +164,40 @@ retry:
 
 ## TUI identity
 
-The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Explicit user theme settings still win.
+The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win.
 
 ## Development
 
-Install dependencies and local defaults:
+Install dependencies, build native bindings, and set up local defaults:
 
 ```sh
 bun install
+bun run build:native
 bun run install:defaults
 ```
 
-Run the CLI from source:
+The `.node` binary for `@gajae-code/natives` is gitignored and required before any CLI invocation (`install:defaults`, `dev:link`, tests).
+
+### Canonical: build and link the dev `gjc`
+
+To make the global `gjc` command run **this checkout's TypeScript source** (hot to every edit, with skills/natives working), link it onto your `PATH`:
+
+```sh
+bun install
+bun run dev:link
+```
+
+`dev:link` symlinks `gjc` → `packages/coding-agent/src/cli.ts` into `~/.local/bin` (override with `GJC_DEV_LINK_DIR`), replaces that managed target, warns and fails if another `gjc` still shadows it earlier on `PATH`, and runs `--smoke-test` to confirm `@gajae-code/natives` loads. Use `bun run install:dev` for the full bootstrap (install + link + `setup defaults`).
+
+Check at any time whether your `gjc` has drifted (wrong source, or a compiled binary that can't load skills):
+
+```sh
+bun run dev:doctor
+```
+
+> Do **not** use the compiled binary for day-to-day development. `bun --cwd=packages/coding-agent run build` produces a standalone `dist/gjc`, but a `bun build --compile` binary cannot dynamically load `@gajae-code/natives`, so skills fail with `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc'`. Running from source via `dev:link` avoids this. Build the binary only when validating a release.
+
+Run the CLI from source directly without linking:
 
 ```sh
 bun packages/coding-agent/src/cli.ts --help
@@ -204,7 +227,7 @@ Thanks to the people and agents helping shape the early Gajae-Code releases, inc
 
 ## Inspirations and lineage
 
-Gajae-Code's default TUI identity is the crustacean pair: red-claw for dark appearance and blue-crab for light appearance. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
+Gajae-Code's default TUI identity is the crustacean pair: red-claw for dark appearance and blue-crab for light appearance. It also bundles `claude-code`, `codex`, and `opencode` migration themes whose palettes are inspired by those tools so users moving from them get a familiar look. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
 
 ## License
 

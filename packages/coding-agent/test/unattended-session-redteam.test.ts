@@ -23,6 +23,7 @@ function makePlane(opts: { providerSupportsTokenCostMetrics?: boolean } = {}) {
 	const plane = new UnattendedSessionControlPlane({
 		runId: "redteam-run",
 		emitFrame: gate => emitted.push(gate),
+		providerSupportsTokenCostMetrics: true,
 		...opts,
 	});
 	return { plane, emitted };

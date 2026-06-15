@@ -198,7 +198,7 @@ Built-in profiles are grouped by provider mix and tier:
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Combos: `opus-codex` (Claude main agent with Codex support roles), `codex-opencodego` (Codex orchestrator/architect with OpenCode Go workers)
 
-The `eco` tier favors cheaper/faster defaults, `medium` matches normal production defaults, and `pro` raises reasoning for architect, critic, and planner roles. Effort suffixes are clamped to each model's supported thinking range at preview and activation time (for example `codex-eco`'s executor `:minimal` resolves to effective `low` on `gpt-5.5`). Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-v3`). User-defined profiles override built-ins by exact profile name.
+The `eco` tier favors cheaper/faster defaults, `medium` matches normal production defaults, and `pro` raises reasoning for architect, critic, and planner roles. Effort suffixes are clamped to each model's supported thinking range at preview and activation time (for example `codex-eco`'s executor `:minimal` resolves to effective `low` on `gpt-5.5`). Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
 
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
@@ -246,7 +246,7 @@ providers:
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
-- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
+- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` (`ttl: "1h"`) because the ~5m default is too fragile for long-running subagent workflows. The 1h marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and incapable models fall back to the default ephemeral (~5m) breakpoint. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
 

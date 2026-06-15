@@ -1525,9 +1525,49 @@
       },
       {
         "appliesToVerbs": [
+          "review"
+        ],
+        "name": "pr",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review"
+        ],
+        "name": "branch",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review"
+        ],
+        "name": "spec",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review"
+        ],
+        "name": "executor-qa-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review"
+        ],
+        "enumValues": [
+          "review-only",
+          "review-start"
+        ],
+        "name": "mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
           "status",
           "create-goals",
           "complete-goals",
+          "review",
           "checkpoint",
           "record-review-blockers",
           "steer"
@@ -1597,6 +1637,10 @@
       },
       {
         "name": "checkpoint",
+        "surface": "command-positional"
+      },
+      {
+        "name": "review",
         "surface": "command-positional"
       },
       {

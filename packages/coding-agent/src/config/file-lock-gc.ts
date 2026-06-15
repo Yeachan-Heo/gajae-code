@@ -2,6 +2,7 @@
  * GC adapter for config file-locks (`<file>.lock` dirs holding `{pid, timestamp}`).
  */
 
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir, isEnoent } from "@gajae-code/utils";
@@ -92,7 +93,7 @@ async function walkForLockDirs(
 		return;
 	}
 
-	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	let stat: Stats;
 	try {
 		stat = await fs.lstat(dir);
 	} catch (error) {
@@ -171,8 +172,19 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 			return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 		}
 
+		// Fail-closed owner-token guard (#606): we observed `info` (pid+timestamp)
+		// dead, but a fresh owner can reclaim a stale lock dir at this same path
+		// between the probe above and the unlink below. Pass the exact owner token
+		// so removal re-verifies the on-disk identity under the unlink and refuses
+		// to delete a recreated LIVE lock (TOCTOU).
 		try {
-			await removeFileLockDirForGc(lockDir);
+			const removal = await removeFileLockDirForGc(lockDir, info);
+			if (removal === "owner_changed") {
+				return { removed: false, skipped: "file_lock_owner_changed_before_delete" };
+			}
+			if (removal === "missing") {
+				return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
+			}
 			return { removed: true };
 		} catch (error) {
 			return { removed: false, error: errorMessage(error) };

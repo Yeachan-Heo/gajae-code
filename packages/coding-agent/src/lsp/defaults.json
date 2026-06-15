@@ -4,6 +4,7 @@
 		"args": [],
 		"fileTypes": [".rs"],
 		"rootMarkers": ["Cargo.toml", "rust-analyzer.toml"],
+		"warmupTimeoutMs": 30000,
 		"initOptions": {},
 		"settings": {
 			"rust-analyzer": {

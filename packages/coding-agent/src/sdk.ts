@@ -115,6 +115,7 @@ import {
 	FindTool,
 	getSearchTools,
 	HIDDEN_TOOLS,
+	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
 	type LspStartupServerInfo,
 	loadSshTool,
@@ -124,6 +125,7 @@ import {
 	SearchTool,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
+	setSearchFallbackProviders,
 	type Tool,
 	type ToolSession,
 	WebSearchTool,
@@ -133,6 +135,7 @@ import {
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { guardToolForUltragoalAsk } from "./tools/ultragoal-ask-guard";
 import { EventBus } from "./utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "./utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -864,6 +867,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const webSearchProvider = settings.get("providers.webSearch");
 	if (typeof webSearchProvider === "string" && isSearchProviderPreference(webSearchProvider)) {
 		setPreferredSearchProvider(webSearchProvider);
+	}
+	const webSearchFallback = settings.get("web_search.fallback");
+	if (Array.isArray(webSearchFallback)) {
+		setSearchFallbackProviders(
+			webSearchFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
+		);
 	}
 
 	const imageProvider = settings.get("providers.image");
@@ -1806,7 +1815,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const initialTools = initialToolNames
 			.map(name => toolRegistry.get(name))
-			.filter((tool): tool is AgentTool => tool !== undefined);
+			.filter((tool): tool is AgentTool => tool !== undefined)
+			// AgentSession tool wrapping is not installed until after Agent construction.
+			.map(tool => guardToolForUltragoalAsk(tool, () => sessionManager.getCwd()));
 
 		const openaiWebsocketSetting = settings.get("providers.openaiWebsockets") ?? "off";
 		const preferOpenAICodexWebsockets =

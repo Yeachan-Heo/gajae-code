@@ -253,33 +253,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "minimax-eco",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-v3:low",
-			executor: "minimax-code/minimax-v3:minimal",
-			planner: "minimax-code/minimax-v3:low",
-			critic: "minimax-code/minimax-v3:medium",
-			architect: "minimax-code/minimax-v3:high",
+			default: "minimax-code/minimax-m3:low",
+			executor: "minimax-code/minimax-m3:minimal",
+			planner: "minimax-code/minimax-m3:low",
+			critic: "minimax-code/minimax-m3:medium",
+			architect: "minimax-code/minimax-m3:high",
 		},
 	},
 	{
 		name: "minimax-medium",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-v3:medium",
-			executor: "minimax-code/minimax-v3:low",
-			planner: "minimax-code/minimax-v3:medium",
-			critic: "minimax-code/minimax-v3:high",
-			architect: "minimax-code/minimax-v3:xhigh",
+			default: "minimax-code/minimax-m3:medium",
+			executor: "minimax-code/minimax-m3:low",
+			planner: "minimax-code/minimax-m3:medium",
+			critic: "minimax-code/minimax-m3:high",
+			architect: "minimax-code/minimax-m3:xhigh",
 		},
 	},
 	{
 		name: "minimax-pro",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-v3:xhigh",
-			executor: "minimax-code/minimax-v3:medium",
-			planner: "minimax-code/minimax-v3:high",
-			critic: "minimax-code/minimax-v3:xhigh",
-			architect: "minimax-code/minimax-v3:xhigh",
+			default: "minimax-code/minimax-m3:xhigh",
+			executor: "minimax-code/minimax-m3:medium",
+			planner: "minimax-code/minimax-m3:high",
+			critic: "minimax-code/minimax-m3:xhigh",
+			architect: "minimax-code/minimax-m3:xhigh",
 		},
 	},
 	{
@@ -361,7 +361,7 @@ describe("built-in model profile catalog", () => {
 		}
 		expect(missing).toEqual([]);
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.["kimi-k2.7-code"]).toBeDefined();
-		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-v3"]).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
 	});
 
 	test("plain minimax provider does not appear in catalog or recommendations", () => {
@@ -410,6 +410,23 @@ describe("built-in model profile catalog", () => {
 			planner: "grok-build/grok-composer-2.5-fast",
 			critic: "grok-build/grok-composer-2.5-fast",
 		});
+	});
+
+	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {
+		const minimaxProfiles = BUILTIN_MODEL_PROFILES.filter(profile =>
+			profile.requiredProviders.includes("minimax-code"),
+		);
+		expect(minimaxProfiles.map(profile => profile.name)).toEqual(["minimax-eco", "minimax-medium", "minimax-pro"]);
+		for (const profile of minimaxProfiles) {
+			for (const role of roles) {
+				const selector = profile.modelMapping[role];
+				expect(selector).toBeDefined();
+				const parsed = parseModelString(selector ?? "");
+				expect(parsed?.provider).toBe("minimax-code");
+				expect(parsed?.id).toBe("minimax-m3");
+			}
+		}
+		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-v3");
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {

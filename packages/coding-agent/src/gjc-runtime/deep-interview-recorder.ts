@@ -388,6 +388,34 @@ export async function appendOrMergeDeepInterviewRound(
 	return { action: result.action, record: result.record };
 }
 
+/**
+ * The chronological scored predecessor of the round currently being scored: the
+ * scored round with the greatest `round` strictly less than `currentRound`, with
+ * the same durable key excluded. Selecting by `round` (not array position) ensures
+ * an out-of-order re-score of an earlier round compares against its true prior, never
+ * a later ("future") scored round that happens to sit later in the array.
+ *
+ * Fail-safe: if `currentRound` is not a finite number, or a candidate's `round` is
+ * not finite, that comparison is treated as non-matching, so no prior is selected
+ * rather than risking a spurious comparison against an unrelated round.
+ */
+function latestPriorScoredRound(
+	rounds: readonly DeepInterviewRoundRecord[],
+	currentKey: string,
+	currentRound: number,
+): DeepInterviewRoundRecord | undefined {
+	if (!Number.isFinite(currentRound)) return undefined;
+	let prior: DeepInterviewRoundRecord | undefined;
+	for (const candidate of rounds) {
+		if (candidate.lifecycle !== "scored") continue;
+		if (candidate.round_key === currentKey) continue;
+		if (!Number.isFinite(candidate.round)) continue;
+		if (!(candidate.round < currentRound)) continue;
+		if (prior === undefined || candidate.round > prior.round) prior = candidate;
+	}
+	return prior;
+}
+
 /** Merge scoring output into the same round record, transitioning to `scored`. */
 export async function enrichDeepInterviewRoundScoring(
 	cwd: string,
@@ -399,6 +427,18 @@ export async function enrichDeepInterviewRoundScoring(
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
 	const { rounds: nextRounds, record } = enrichRoundWithScoring(rounds, { ...input, interviewId });
+	// Fail closed: a scored transition that violates the bidirectional invariant
+	// (an active trigger that improves the affected dimension or fails to raise
+	// overall ambiguity, or a disputed/unresolved trigger lacking a rationale) must
+	// never be persisted — storing it lets the interview falsely converge. Validate
+	// against the most recent prior scored round before writing any durable state.
+	const prior = latestPriorScoredRound(rounds, record.round_key, record.round);
+	const validation = validateDeepInterviewScoredTransition(prior, record);
+	if (!validation.ok) {
+		throw new Error(
+			`deep-interview scored transition for round ${record.round} is invalid and was refused: ${validation.violations.join("; ")}`,
+		);
+	}
 	(envelope.state as Record<string, unknown>).rounds = nextRounds;
 	(envelope.state as Record<string, unknown>).current_ambiguity = input.ambiguity;
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview score-round");

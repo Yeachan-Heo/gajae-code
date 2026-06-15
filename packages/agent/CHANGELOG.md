@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed compaction token estimation in Bun standalone binaries by loading the native tokenizer through the sibling native entrypoint instead of package-name dynamic resolution.
+
 ## [0.5.1] - 2026-06-14
 
 - Version aligned with the 0.5.1 monorepo release; no functional changes in this package.

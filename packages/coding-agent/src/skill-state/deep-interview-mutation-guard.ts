@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
+import { logger } from "@gajae-code/utils";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/local-protocol";
@@ -78,7 +79,7 @@ function modeStatePath(cwd: string, skill: string, sessionId?: string): string {
 }
 
 function warnInvalidModeState(filePath: string, error: string): void {
-	console.warn(`gjc skill-state: invalid mode-state at ${filePath}: ${error}`);
+	logger.warn(`gjc skill-state: invalid mode-state at ${filePath}: ${error}`);
 }
 
 async function readValidatedModeState(filePath: string): Promise<ModeState | null> {

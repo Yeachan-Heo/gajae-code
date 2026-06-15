@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
@@ -70,9 +71,15 @@ describe("GJC native skill-state hooks", () => {
 				artifactRefs: [
 					{
 						id: "cli-run",
-						kind: "test-report",
+						kind: "cli-replay",
 						description: "CLI verification transcript",
-						inlineEvidence: "The CLI test report verified the approved flow and recorded the passing result.",
+						replay: {
+							schemaVersion: 1,
+							kind: "cli-replay",
+							replaySafe: true,
+							command: ["bun", "-e", 'console.log("ultragoal-cli-ok")'],
+							recordedStdout: "ultragoal-cli-ok\n",
+						},
 					},
 					{
 						id: "adversarial",
@@ -212,7 +219,7 @@ describe("GJC native skill-state hooks", () => {
 		const stateDir = path.join(root, "custom-state");
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), "{");
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
@@ -264,7 +271,7 @@ describe("GJC native skill-state hooks", () => {
 			}),
 		);
 		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "team-state.json"), "{");
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{
@@ -299,7 +306,7 @@ describe("GJC native skill-state hooks", () => {
 			path.join(stateDir, "sessions", "session-invalid", "team-state.json"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{
@@ -326,7 +333,7 @@ describe("GJC native skill-state hooks", () => {
 			path.join(stateDir, "ultragoal-state.json"),
 			JSON.stringify({ active: true, current_phase: 7, objective: "ship" }),
 		);
-		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
 				{
@@ -747,6 +754,145 @@ disabledExtensions:
 		expect(allowed.outputJson).toBeNull();
 	});
 
+	it("Stop forces deep-interview crystallization when an ordinary stop would terminalize without a spec", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-uncrystallized",
+				threadId: "thread-di-uncrystallized",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// The agent declares the interview complete (active:true + a releasing
+		// phase) but never crystallized a spec. The ordinary stop path must block
+		// and force the crystallize/handoff path instead of letting the distilled
+		// interview state vanish as a generic stopped task (#674).
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-uncrystallized", "deep-interview-state.json"),
+			JSON.stringify({ active: true, current_phase: "complete", session_id: "session-di-uncrystallized" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-uncrystallized",
+			threadId: "thread-di-uncrystallized",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_deep_interview_uncrystallized",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("crystalliz");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("gjc deep-interview --write");
+	});
+
+	it("Stop releases a deep-interview that reached a terminal phase with a crystallized spec", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-crystallized",
+				threadId: "thread-di-crystallized",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// A persisted final spec is the crystallization evidence; once it exists
+		// on disk the run may terminalize through the ordinary stop path.
+		const specPath = path.join(root, ".gjc", "specs", "deep-interview-sample.md");
+		await Bun.write(specPath, "# Final deep-interview spec\n");
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-crystallized", "deep-interview-state.json"),
+			JSON.stringify({
+				active: true,
+				current_phase: "complete",
+				session_id: "session-di-crystallized",
+				spec_path: specPath,
+			}),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-crystallized",
+			threadId: "thread-di-crystallized",
+		});
+		expect(allowed.outputJson).toBeNull();
+	});
+
+	it("Stop keeps blocking deep-interview when its mode-state names a spec that no longer exists", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-stale-spec",
+				threadId: "thread-di-stale-spec",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// A spec_path that does not resolve to a real file is not crystallization;
+		// the guard must still force a real crystallize/handoff before stopping.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-stale-spec", "deep-interview-state.json"),
+			JSON.stringify({
+				active: true,
+				current_phase: "completed",
+				session_id: "session-di-stale-spec",
+				spec_path: path.join(root, ".gjc", "specs", "deep-interview-missing.md"),
+			}),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-stale-spec",
+			threadId: "thread-di-stale-spec",
+		});
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_deep_interview_uncrystallized",
+		});
+	});
+
+	it("Stop preserves explicit deep-interview abort/cancel without forcing crystallization", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-cancelled",
+				threadId: "thread-di-cancelled",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// An explicit abort/cancel is a legitimate terminal even without a spec:
+		// the crystallization guard must not override deliberate cancellation.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-cancelled", "deep-interview-state.json"),
+			JSON.stringify({ active: true, current_phase: "cancelled", session_id: "session-di-cancelled" }),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-cancelled",
+			threadId: "thread-di-cancelled",
+		});
+		expect(allowed.outputJson).toBeNull();
+	});
+
 	it("UserPromptSubmit reminds active Ultragoal sessions to use ultragoal steer", async () => {
 		const root = await cwd();
 		await dispatchGjcNativeSkillHook(
@@ -888,6 +1034,110 @@ disabledExtensions:
 		expect(blocked.outputJson).toMatchObject({ decision: "block" });
 		expect(String(blocked.outputJson?.reason ?? "")).toContain("G002");
 		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
+	});
+
+	it("Stop blocks when stale Ultragoal mode-state would release but the plan still has pending goals", async () => {
+		const root = await cwd();
+		// Durable plan with an incomplete required goal (G001 pending).
+		await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-stale-release",
+				threadId: "thread-ultra-stale-release",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// Simulate the #644-style divergence: skill-active-state still lists
+		// ultragoal active, but the mode-state file is stale (active:false +
+		// terminal phase). `modeStateReleasesStop` trusts this file alone, so the
+		// cross-file coherence guard must keep blocking while the plan has
+		// incomplete goals.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-stale-release", "ultragoal-state.json"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-stale-release" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-stale-release",
+			threadId: "thread-ultra-stale-release",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_ultragoal_stale_mode_state",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("G001");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
+	});
+
+	it("Stop blocks when an Ultragoal mode-state sits in a releasing phase but the plan still has pending goals", async () => {
+		const root = await cwd();
+		await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-releasing-phase",
+				threadId: "thread-ultra-releasing-phase",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// active:true but a terminal phase still releases via STOP_RELEASING_PHASES;
+		// the coherence guard must override that release while goals remain.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-releasing-phase", "ultragoal-state.json"),
+			JSON.stringify({ active: true, current_phase: "completed", session_id: "session-ultra-releasing-phase" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-releasing-phase",
+			threadId: "thread-ultra-releasing-phase",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_ultragoal_stale_mode_state",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("G001");
+	});
+
+	it("Stop releases a stale Ultragoal mode-state when no durable plan contradicts it", async () => {
+		const root = await cwd();
+		// No durable ultragoal plan exists, so there is no authoritative source to
+		// contradict the mode-state — the guard must not over-block.
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultragoal plan this",
+				cwd: root,
+				sessionId: "session-ultra-no-plan",
+				threadId: "thread-ultra-no-plan",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-ultra-no-plan", "ultragoal-state.json"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-no-plan" }),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-ultra-no-plan",
+			threadId: "thread-ultra-no-plan",
+		});
+
+		expect(allowed.outputJson).toBeNull();
 	});
 
 	it("UserPromptSubmit blocks Ultragoal completion when later required goals remain", async () => {

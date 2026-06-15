@@ -16,12 +16,14 @@ export default class Ultragoal extends Command {
 	static delegateHelp = true;
 
 	async run(): Promise<void> {
+		const isReviewStart = this.argv.includes("review") && this.argv.includes("review-start");
 		const shouldActivateGoalMode = isUltragoalCreateGoalsInvocation(this.argv);
 		const result = await runNativeUltragoalCommand(this.argv);
 		if (result.stdout) process.stdout.write(result.stdout);
 		if (result.stderr) process.stderr.write(result.stderr);
 		process.exitCode = result.status;
-		if (result.status !== 0 || !shouldActivateGoalMode) return;
+		if (result.status !== 0 || (!shouldActivateGoalMode && !isReviewStart)) return;
+		if (isReviewStart && !result.createdReviewPlan && (result.reviewBlockerGoalIds?.length ?? 0) === 0) return;
 
 		const cwd = process.cwd();
 		const { objective, goalsPath } = await readUltragoalGjcObjective(cwd);

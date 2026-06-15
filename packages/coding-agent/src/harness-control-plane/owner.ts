@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeRpcOutboundFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
 import { ControlServer, type EndpointRequest } from "./control-endpoint";
@@ -106,7 +107,7 @@ export class RuntimeOwner {
 	#server: ControlServer;
 	#cursor = 0;
 	#leaseEpoch = 0;
-	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
@@ -199,7 +200,7 @@ export class RuntimeOwner {
 		await this.#emit("info", "rpc_activity", { coalescedFrames });
 	}
 
-	async #emitMapped(mapped: NonNullable<ReturnType<typeof observeRpcOutboundFrame>>): Promise<void> {
+	async #emitMapped(mapped: AgentWireOwnerObservation): Promise<void> {
 		if (mapped.kind === "rpc_agent_completed") {
 			const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 			if (

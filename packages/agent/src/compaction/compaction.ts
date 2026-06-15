@@ -5,6 +5,7 @@
  * and after compaction the session is reloaded.
  */
 
+import { createRequire } from "node:module";
 import {
 	type AssistantMessage,
 	Effort,
@@ -13,7 +14,7 @@ import {
 	type Model,
 	type Usage,
 } from "@gajae-code/ai";
-import { logger, prompt } from "@gajae-code/utils";
+import { isCompiledBinary, logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
 import type { CompactionEntry, SessionEntry } from "./entries";
@@ -265,23 +266,44 @@ export function resolveThresholdTokens(
  * matching what providers typically bill for inline images.
  */
 const IMAGE_TOKEN_ESTIMATE = 1200;
+const SOURCE_NATIVE_TOKENIZER_ENTRYPOINT = "../../../natives/native/index.js";
+const COMPILED_NATIVE_TOKENIZER_ENTRYPOINT = "/$bunfs/root/packages/natives/native/index.js";
+
+const requireFromCompaction = createRequire(import.meta.url);
+
+interface NativeTokenizerModule {
+	countTokens(input: string | string[], encoding?: unknown): number;
+}
 
 /**
  * Lazily-required native `countTokens`. `@gajae-code/natives` dlopens a ~39MB
  * addon; importing it at module scope would put that cost on every cold path
  * that touches compaction exports (status line, print mode, context report).
- * Deferring the require to the first context-changing call keeps the trivial
- * `-p` / display paths native-free.
+ * Deferring the require to the first context-changing call keeps display paths
+ * native-free.
+ *
+ * Do not resolve this via a package-name dynamic require of
+ * `@gajae-code/natives`: Bun standalone binaries cannot satisfy those from
+ * `$bunfs`. The sibling-package source path is stable for workspace and
+ * package-install layouts:
+ *
+ * - workspace: `packages/agent` -> `packages/natives`
+ * - npm/bun install: `node_modules/@gajae-code/agent-core` ->
+ *   `node_modules/@gajae-code/natives`
+ *
+ * Bun rewrites `createRequire(import.meta.url)` to the compiled executable
+ * root (`/$bunfs/root/gjc-*`) in standalone binaries, so compiled mode uses the
+ * absolute bunfs module path emitted by the binary build scripts.
  */
 let cachedNativeCountTokens: ((input: string | string[], encoding?: unknown) => number) | null = null;
 
+function nativeTokenizerEntrypoint(): string {
+	return isCompiledBinary() ? COMPILED_NATIVE_TOKENIZER_ENTRYPOINT : SOURCE_NATIVE_TOKENIZER_ENTRYPOINT;
+}
+
 function nativeCountTokens(fragments: string[]): number {
 	if (!cachedNativeCountTokens) {
-		const { createRequire } = require("node:module") as typeof import("node:module");
-		const requireFromHere = createRequire(import.meta.url);
-		const natives = requireFromHere("@gajae-code/natives") as {
-			countTokens: (input: string | string[], encoding?: unknown) => number;
-		};
+		const natives = requireFromCompaction(nativeTokenizerEntrypoint()) as NativeTokenizerModule;
 		cachedNativeCountTokens = natives.countTokens;
 	}
 	return cachedNativeCountTokens(fragments);

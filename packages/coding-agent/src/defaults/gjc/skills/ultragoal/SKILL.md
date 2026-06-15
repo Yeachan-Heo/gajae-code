@@ -191,10 +191,10 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
    - code-side: maintainability, tests, integration points, and unsafe shortcuts.
 5. Delegate an `executor` QA/red-team lane to build and run the e2e/read-teaming QA suite appropriate for the story. This lane must try to break the change, not just confirm the happy path. It must start from the approved plan/spec/acceptance criteria, then user-facing contracts, and only then implementation code as supporting evidence. Plan/code mismatches are blockers, not items to paper over with implementation intent.
 6. The executor QA/red-team lane must prove evidence by the real surface under test:
-   - GUI/web surfaces require browser automation plus a screenshot or image verdict.
-   - CLI surfaces require logs or terminal transcripts from real invocation.
-   - API/package surfaces require external consumer or black-box tests through the public interface.
-   - Algorithm/math surfaces require boundary, property, adversarial, and failure-mode cases.
+   - GUI/web surfaces require a valid automation transcript plus a non-uniform screenshot. Bare `inlineEvidence` text or typed receipts never prove live GUI/web execution.
+   - CLI surfaces require runtime argv replay: `replaySafe: true`, an allowlisted argv `command`, and replayed normalized stdout matching `recordedStdout`; unsafe commands require audited `replayExempt` metadata plus a structurally valid fallback artifact.
+   - Native/desktop/tui surfaces require a structurally valid screenshot, PTY capture with terminal control codes, or app-automation transcript.
+   - API/package/algorithm/math surfaces require a real artifact file or typed receipt. Bare `inlineEvidence` text alone is not sufficient for any surface.
 7. The executor QA/red-team lane must report a matrix using `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`. Not-applicable rows are allowed only in `contractCoverage` and `surfaceEvidence`; each `status: "not_applicable"` row requires `contractRef` plus `reason`. `adversarialCases` rows cannot be not-applicable.
 8. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
 9. If any lane finds an issue, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
@@ -203,6 +203,8 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
    ```
 10. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
 11. Only after the loop is clean, checkpoint the story as complete with a structured quality gate and a fresh active `goal({"op":"get"})` snapshot. The checkpoint creates a receipt; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before `goal({"op":"complete"})` is allowed.
+
+While an Ultragoal run is active, the `ask` tool is blocked for all agents. Record unresolved review decisions as durable blockers with `gjc ultragoal record-review-blockers` instead of prompting interactively.
 
 The native `checkpoint --status complete` command rejects missing or shallow gates. `--quality-gate-json` must include:
 
@@ -229,13 +231,19 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
         "id": "browser-run",
         "kind": "browser-automation",
         "path": "artifacts/browser-run.json",
-        "description": "browser automation transcript invoking the approved user-facing flow"
+        "description": "valid automation transcript with actions, monotonic timestamps, and selectors"
       },
       {
         "id": "gui-screenshot",
         "kind": "screenshot",
         "path": "artifacts/gui-screenshot.png",
-        "description": "screenshot or image-verdict evidence for the GUI/web result"
+        "description": "non-uniform screenshot evidence for the GUI/web result"
+      },
+      {
+        "id": "cli-replay",
+        "kind": "command-replay",
+        "path": "artifacts/cli-replay.json",
+        "description": "artifact file containing argv-only CLI replay JSON: schemaVersion 1, kind cli-replay, replaySafe true, allowlisted command, recordedStdout"
       },
       {
         "id": "adversarial-report",
@@ -265,15 +273,23 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
       {
         "id": "surface-gui",
         "contractRef": "user-facing surface or public interface under test",
-        "surface": "gui|web|cli|api|package|algorithm|math",
+        "surface": "gui|web|cli|api|package|algorithm|math|native|desktop|tui",
         "invocation": "real browser action, CLI command, API/package consumer call, or algorithm/property check",
         "verdict": "passed",
         "artifactRefs": ["browser-run", "gui-screenshot"]
       },
       {
+        "id": "surface-cli",
+        "contractRef": "CLI or command-line interface under test",
+        "surface": "cli",
+        "invocation": "argv replay executed by the Ultragoal runtime",
+        "verdict": "passed",
+        "artifactRefs": ["cli-replay"]
+      },
+      {
         "id": "surface-out-of-scope",
         "contractRef": "surface intentionally outside this story",
-        "surface": "gui|web|cli|api|package|algorithm|math",
+        "surface": "gui|web|cli|api|package|algorithm|math|native|desktop|tui",
         "status": "not_applicable",
         "reason": "why this surface does not apply to the current story"
       }
@@ -299,6 +315,12 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
   }
 }
 ```
+
+For CLI replay artifacts, the JSON at `path` must be an object like `{"schemaVersion":1,"kind":"cli-replay","replaySafe":true,"command":["bun","-e","console.log(\"ultragoal-cli-ok\")"],"recordedStdout":"ultragoal-cli-ok\n"}`. Use `replayExempt` only for audited unsafe/non-deterministic invocations, with a substantive reason, approver, and same-surface fallback artifacts.
+
+## Review mode
+
+`gjc ultragoal review` runs the same hardened gate against an already implemented PR, branch, or worktree. Use `--pr <number>` for a PR, `--branch <ref>` for a branch diff, omit both for the current worktree, and pass `--spec <path>` when a real contract exists. `--mode review-only` emits the verdict/findings without creating fix work; `--mode review-start` records review blockers for follow-up. Review mode validates the same `executorQa` shape and live-surface artifacts as `checkpoint --status complete`. A thin or derived-only contract can never clean-pass: the verdict is capped at `inconclusive: weak-contract` until a supplied spec or equivalent strong acceptance criteria are available.
 
 Receipts are freshness-scoped:
 - Per-goal receipts remain fresh for their target goal unless that goal, its blocker metadata, or its supersession metadata changes.

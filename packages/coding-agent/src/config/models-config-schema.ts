@@ -218,6 +218,7 @@ const ProviderConfigSchema = z
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),
 		compat: OpenAICompatSchema.optional(),
+		webSearch: z.enum(["on", "off", "auto"]).optional(),
 		authHeader: z.boolean().optional(),
 		auth: ProviderAuthSchema.optional(),
 		discovery: ProviderDiscoverySchema.optional(),

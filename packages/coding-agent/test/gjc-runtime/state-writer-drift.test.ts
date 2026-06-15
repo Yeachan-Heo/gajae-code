@@ -31,6 +31,18 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
 }
 
+async function readAuditEntries(root: string): Promise<Array<Record<string, unknown>>> {
+	try {
+		const raw = await fs.readFile(path.join(root, ".gjc", "state", "audit.jsonl"), "utf-8");
+		return raw
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+	} catch {
+		return [];
+	}
+}
+
 async function expectPersistedEnvelope(filePath: string): Promise<void> {
 	const value = await readJson(filePath);
 	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(value);
@@ -242,5 +254,205 @@ describe("workflow state writer drift guard", () => {
 				{ cwd: root, receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test incomplete" } },
 			),
 		).rejects.toThrow(/invalid workflow state envelope/);
+	});
+
+	it("rejects an unknown manifest phase on an internal envelope write (#658)", async () => {
+		const root = await tempDir();
+		await expect(
+			writeWorkflowEnvelopeAtomic(
+				path.join(root, ".gjc", "state", "ralplan-state.json"),
+				{
+					skill: "ralplan",
+					version: WORKFLOW_STATE_VERSION,
+					active: true,
+					current_phase: "bogus-phase",
+					updated_at: "2026-01-01T00:00:00.000Z",
+				},
+				{
+					cwd: root,
+					receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test unknown phase" },
+				},
+			),
+		).rejects.toThrow(/unknown ralplan phase "bogus-phase"/);
+	});
+
+	it("allows a valid manifest phase with no direct transition edge (#658 preserves skips)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		// planner -> final has no manifest edge; short-mode skips persist a valid state
+		// directly, so the invariant must accept it (it only rejects non-manifest phases).
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "final",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			},
+			{ cwd: root, receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test skip" } },
+		);
+		await expectPersistedEnvelope(statePath);
+		const persisted = await readJson(statePath);
+		expect(persisted.current_phase).toBe("final");
+	});
+
+	it("lets a forced write bypass the unknown-phase invariant (#658 preserves forced writes)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "bogus-phase",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			},
+			{
+				cwd: root,
+				receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test forced bypass" },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", forced: true },
+			},
+		);
+		await expectPersistedEnvelope(statePath);
+		const persisted = await readJson(statePath);
+		expect(persisted.current_phase).toBe("bogus-phase");
+	});
+
+	it("flags an invalid phase transition on an internal write but still persists it (#658 transition invariant)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const base = {
+			skill: "ralplan" as const,
+			version: WORKFLOW_STATE_VERSION,
+			active: true,
+			updated_at: "2026-01-01T00:00:00.000Z",
+		};
+		const opts = {
+			cwd: root,
+			receipt: { cwd: root, skill: "ralplan" as const, owner: "gjc-runtime" as const, command: "test transition" },
+		};
+		// Seed a valid active prior phase, then jump planner -> final (no manifest edge).
+		await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "planner" }, opts);
+
+		// The diagnostic-only path must NOT touch stderr (callers may treat stderr as failure
+		// or parse machine output): capture stderr across the invalid-edge write.
+		const originalWrite = process.stderr.write.bind(process.stderr);
+		let stderrCaptured = "";
+		process.stderr.write = ((chunk: unknown) => {
+			stderrCaptured += typeof chunk === "string" ? chunk : String(chunk);
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "final" }, opts);
+		} finally {
+			process.stderr.write = originalWrite;
+		}
+		expect(stderrCaptured).toBe("");
+
+		// The invalid edge is recorded as audit evidence, not blocked.
+		await expectPersistedEnvelope(statePath);
+		expect((await readJson(statePath)).current_phase).toBe("final");
+		const flagged = (await readAuditEntries(root)).filter(e => e.verb === "invalid_transition_detected");
+		expect(flagged.length).toBe(1);
+		expect(flagged[0]?.from_phase).toBe("planner");
+		expect(flagged[0]?.to_phase).toBe("final");
+	});
+
+	it("does not flag a valid manifest phase transition on an internal write (#658)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const base = {
+			skill: "ralplan" as const,
+			version: WORKFLOW_STATE_VERSION,
+			active: true,
+			updated_at: "2026-01-01T00:00:00.000Z",
+		};
+		const opts = {
+			cwd: root,
+			receipt: { cwd: root, skill: "ralplan" as const, owner: "gjc-runtime" as const, command: "test valid edge" },
+		};
+		await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "planner" }, opts);
+		await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "architect" }, opts);
+
+		expect((await readJson(statePath)).current_phase).toBe("architect");
+		const flagged = (await readAuditEntries(root)).filter(e => e.verb === "invalid_transition_detected");
+		expect(flagged.length).toBe(0);
+	});
+
+	it("lets a forced write bypass the transition invariant (#658)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const base = {
+			skill: "ralplan" as const,
+			version: WORKFLOW_STATE_VERSION,
+			active: true,
+			updated_at: "2026-01-01T00:00:00.000Z",
+		};
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...base, current_phase: "planner" },
+			{
+				cwd: root,
+				receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test forced seed" },
+			},
+		);
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...base, current_phase: "final" },
+			{
+				cwd: root,
+				receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test forced jump" },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", forced: true },
+			},
+		);
+
+		expect((await readJson(statePath)).current_phase).toBe("final");
+		const flagged = (await readAuditEntries(root)).filter(e => e.verb === "invalid_transition_detected");
+		expect(flagged.length).toBe(0);
+	});
+
+	it("does not flag reactivation from an inactive prior envelope (#658)", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "deep-interview-state.json");
+		const opts = {
+			cwd: root,
+			receipt: {
+				cwd: root,
+				skill: "deep-interview" as const,
+				owner: "gjc-runtime" as const,
+				command: "test reactivate",
+			},
+		};
+		// A cleared/terminal prior envelope (active:false, terminal phase) is not a transition
+		// source: a fresh kickoff reactivating to the initial phase must not be flagged even
+		// though `complete -> interviewing` has no manifest edge.
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: false,
+				current_phase: "complete",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			},
+			opts,
+		);
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "interviewing",
+				updated_at: "2026-01-01T00:00:01.000Z",
+			},
+			opts,
+		);
+
+		expect((await readJson(statePath)).current_phase).toBe("interviewing");
+		const flagged = (await readAuditEntries(root)).filter(e => e.verb === "invalid_transition_detected");
+		expect(flagged.length).toBe(0);
 	});
 });

@@ -810,7 +810,7 @@ const colorValueSchema = z.union([
 
 type ColorValue = z.infer<typeof colorValueSchema>;
 
-const THEME_COLOR_KEYS = [
+export const THEME_COLOR_KEYS = [
 	"accent",
 	"border",
 	"borderAccent",
@@ -1648,7 +1648,7 @@ async function loadThemeJson(name: string): Promise<ThemeJson> {
 			errorMessage += `\nMissing required color tokens:\n`;
 			errorMessage += missingColors.map(c => `  - ${c}`).join("\n");
 			errorMessage += `\n\nPlease add these colors to your theme's "colors" object.`;
-			errorMessage += `\nSee the built-in themes (red-claw.json, blue-crab.json) for reference values.`;
+			errorMessage += `\nSee the built-in themes under src/modes/theme/defaults/ for reference values.`;
 		}
 		if (otherErrors.length > 0) {
 			errorMessage += `\n\nOther errors:\n${otherErrors.join("\n")}`;

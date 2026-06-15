@@ -360,4 +360,76 @@ describe("InteractiveMode goal mode integration", () => {
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;
 	});
+	it("does not loop AgentBusyError when a busy/orphaned session triggers goal continuation", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.session.goalRuntime.buildContinuationPrompt()).toBeTruthy();
+
+		// Simulate a wedged/orphaned turn: the interactive loop is back at
+		// getUserInput() but the session still reports busy (isStreaming stuck true).
+		harness.session.agent.state.isStreaming = true;
+
+		const startPending = vi.spyOn(harness.mode, "startPendingSubmission");
+
+		vi.useFakeTimers();
+		try {
+			// getUserInput() arms the 800ms goal-continuation timer.
+			void harness.mode.getUserInput();
+
+			// While the session is busy, the continuation must never fire prompt()
+			// (which throws AgentBusyError and spams "Error: Agent is already
+			// processing…"). Advancing past several 800ms windows must not produce a
+			// single continuation submission.
+			for (let i = 0; i < 5; i++) {
+				vi.advanceTimersByTime(800);
+			}
+			const busyCalls = startPending.mock.calls.filter(call => call[0]?.customType === "goal-continuation");
+			expect(busyCalls.length).toBe(0);
+
+			// Once the session returns to idle, the re-armed continuation fires.
+			harness.session.agent.state.isStreaming = false;
+			vi.advanceTimersByTime(800);
+			const idleCalls = startPending.mock.calls.filter(call => call[0]?.customType === "goal-continuation");
+			expect(idleCalls.length).toBeGreaterThan(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+	it("does not loop AgentBusyError while compaction is in progress", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.session.goalRuntime.buildContinuationPrompt()).toBeTruthy();
+
+		// Compaction keeps the session busy without necessarily setting isStreaming.
+		// The continuation timer can fire mid-compaction; prompt() would then throw
+		// AgentBusyError and loop the same way the orphan-subagent wedge does.
+		let compacting = true;
+		Object.defineProperty(harness.session, "isCompacting", {
+			configurable: true,
+			get: () => compacting,
+		});
+
+		const startPending = vi.spyOn(harness.mode, "startPendingSubmission");
+
+		vi.useFakeTimers();
+		try {
+			void harness.mode.getUserInput();
+
+			for (let i = 0; i < 5; i++) {
+				vi.advanceTimersByTime(800);
+			}
+			const compactingCalls = startPending.mock.calls.filter(call => call[0]?.customType === "goal-continuation");
+			expect(compactingCalls.length).toBe(0);
+
+			// Compaction finished: the re-armed continuation fires.
+			compacting = false;
+			vi.advanceTimersByTime(800);
+			const afterCompactionCalls = startPending.mock.calls.filter(
+				call => call[0]?.customType === "goal-continuation",
+			);
+			expect(afterCompactionCalls.length).toBeGreaterThan(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

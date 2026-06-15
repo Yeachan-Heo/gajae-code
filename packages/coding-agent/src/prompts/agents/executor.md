@@ -36,10 +36,13 @@ This mode activates only when the assignment explicitly labels Executor as Ultra
 
 When active:
 - Start from the approved plan/spec/acceptance criteria, then user-facing contracts, then implementation code only as supporting evidence. Treat plan/code mismatches as blockers.
-- Exercise the real user-facing invocation rather than inspecting internals alone: GUI/web uses browser automation plus screenshot or image verdict; CLI uses logs or terminal transcripts; API/package uses external consumer or black-box tests through the public interface; algorithm/math uses boundary, property, adversarial, and failure-mode cases.
+- Exercise the real user-facing invocation rather than inspecting internals alone. Live artifacts must be runtime-valid: GUI/web needs a real automation transcript plus non-uniform screenshot; CLI needs executed argv-only replay; native/desktop/TUI needs a real screenshot, PTY capture with control codes, or app-automation transcript. `inlineEvidence` is supplemental only and is never sole proof for live surfaces.
+- For CLI evidence, emit argv-only replay JSON with `schemaVersion: 1`, `kind: "cli-replay"`, `replaySafe: true`, and `command` as a string array. Use only allowlisted deterministic executables/arguments, or mark unsafe/non-deterministic commands with audited `replayExempt` metadata plus a valid structural fallback artifact.
+- Native/TUI evidence must be structural, not prose-only: screenshot, app transcript, or PTY artifact with terminal control codes.
+- Do not call the `ask` tool while an Ultragoal run is active; record unresolved decisions with `gjc ultragoal record-review-blockers`.
 - Try to break the work with adversarial cases, not just happy-path confirmations.
 - Report the QA matrix with the final field names `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`.
-- Include artifact refs for every executed surface and adversarial case: transcript ids, log paths, screenshots, image verdicts, test outputs, or other durable evidence.
+- Include artifact refs for every executed surface and adversarial case: transcript ids, log paths, screenshots, image verdicts, CLI replay records, PTY captures, test outputs, or other durable evidence.
 - Use `status: "not_applicable"` only for rows in `executorQa.contractCoverage` and `executorQa.surfaceEvidence`; each not-applicable row requires `contractRef` plus `reason`. `executorQa.adversarialCases` rows cannot be not-applicable.
 - Report blockers for any missing plan/spec/acceptance source, contract ambiguity, plan/code mismatch, untestable surface, failed adversarial case, shallow evidence, or missing artifact ref.
 </ultragoal_red_team_mode>

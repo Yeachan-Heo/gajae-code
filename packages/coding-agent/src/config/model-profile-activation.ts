@@ -11,6 +11,8 @@ import { type GjcModelAssignmentTargetId, isAuthenticated, type ModelRegistry } 
 import { resolveModelRoleValue } from "./model-resolver";
 import type { Settings } from "./settings";
 
+const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
+
 type ModelProfileActivationSession = Pick<AgentSession, "model" | "thinkingLevel" | "sessionId"> & {
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined) => void;
@@ -51,12 +53,22 @@ export function formatModelProfileCredentialError(profileName: string, providers
 	return `Model profile "${profileName}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
 
+function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
+	// A retired-name alias is fallback-only: never shadow a profile that actually
+	// exists under the requested name (e.g. a user-defined `codex-standard`).
+	if (profiles.has(profileName)) return profileName;
+	const replacement = LEGACY_MODEL_PROFILE_ALIASES.get(profileName);
+	return replacement && profiles.has(replacement) ? replacement : profileName;
+}
+
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
-	const profile = options.modelRegistry.getModelProfile(options.profileName);
+	const profiles = options.modelRegistry.getModelProfiles();
+	const profileName = resolveModelProfileName(options.profileName, profiles);
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName);
 	if (!profile) {
-		const available = formatAvailableProfileNames(options.modelRegistry.getModelProfiles());
+		const available = formatAvailableProfileNames(profiles);
 		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
 	}
 
@@ -101,7 +113,7 @@ export async function prepareModelProfileActivation(
 	}
 
 	return {
-		profileName: options.profileName,
+		profileName,
 		session: options.session as PreparedModelProfileActivation["session"],
 		settings: options.settings as PreparedModelProfileActivation["settings"],
 		previousModel: options.session.model,

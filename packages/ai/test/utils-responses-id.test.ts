@@ -113,4 +113,30 @@ describe("resolveCacheRetention", () => {
 
 		expect(resolveCacheRetention()).toBe("short");
 	});
+
+	it("returns the provided fallback when no request value or env override is set", () => {
+		delete Bun.env.GJC_CACHE_RETENTION;
+		delete Bun.env.PI_CACHE_RETENTION;
+
+		expect(resolveCacheRetention()).toBe("short");
+		expect(resolveCacheRetention(undefined, "long")).toBe("long");
+	});
+
+	it("lets an explicit request value win over the fallback", () => {
+		delete Bun.env.GJC_CACHE_RETENTION;
+		delete Bun.env.PI_CACHE_RETENTION;
+
+		expect(resolveCacheRetention("short", "long")).toBe("short");
+		expect(resolveCacheRetention("none", "long")).toBe("none");
+	});
+
+	it("lets env overrides win over the fallback", () => {
+		Bun.env.GJC_CACHE_RETENTION = "short";
+		delete Bun.env.PI_CACHE_RETENTION;
+		expect(resolveCacheRetention(undefined, "long")).toBe("short");
+
+		delete Bun.env.GJC_CACHE_RETENTION;
+		Bun.env.PI_CACHE_RETENTION = "short";
+		expect(resolveCacheRetention(undefined, "long")).toBe("short");
+	});
 });

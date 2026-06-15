@@ -1,5 +1,5 @@
 import type { AuthStorage } from "@gajae-code/ai";
-import type { SearchProviderId, SearchResponse } from "../types";
+import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
 
 /**
  * Shared web search parameters passed to providers.
@@ -50,6 +50,7 @@ export interface SearchParams {
 	 * caller's agent session when available; otherwise omit.
 	 */
 	sessionId?: string;
+	activeModelContext?: ActiveSearchModelContext;
 }
 
 /** Base class for web search providers. */

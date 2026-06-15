@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed the Anthropic provider's default prompt-cache retention to `long` (`ttl: "1h"`) when a request and model omit `cacheRetention`. The previous default (~5m) was too fragile for long-running Codex/Gajae-Code subagent workflows, where the cached prefix was frequently evicted between turns. The 1h `ttl` marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and models without that capability still fall back to the default ephemeral breakpoint (Anthropic services it at ~5m). Explicit request/model `cacheRetention` and the `GJC_CACHE_RETENTION`/`PI_CACHE_RETENTION` env overrides continue to win, and `resolveCacheRetention` now accepts a `fallback` argument (defaulting to `"short"`) so non-Anthropic providers are unaffected.
+
 ## [0.5.1] - 2026-06-14
 
 ### Fixed

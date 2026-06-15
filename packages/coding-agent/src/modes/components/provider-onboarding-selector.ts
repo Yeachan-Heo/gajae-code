@@ -4,7 +4,7 @@ import { matchesSelectCancel } from "../../modes/utils/keybinding-matchers";
 import { formatModelOnboardingGuidance } from "../../setup/model-onboarding-guidance";
 import { DynamicBorder } from "./dynamic-border";
 
-export type ProviderOnboardingAction = "custom-provider-wizard" | "oauth-login" | "api-guide";
+export type ProviderOnboardingAction = "custom-provider-wizard" | "oauth-login" | "import-credentials" | "api-guide";
 
 interface ProviderOnboardingOption {
 	label: string;
@@ -27,6 +27,11 @@ const PROVIDER_ONBOARDING_OPTIONS: ProviderOnboardingOption[] = [
 		label: "Add API-compatible provider",
 		description: "Show the /provider add and gjc setup provider commands.",
 		action: "api-guide",
+	},
+	{
+		label: "Import existing credentials",
+		description: "Detect and import Claude Code / Codex CLI logins already on this machine.",
+		action: "import-credentials",
 	},
 ];
 

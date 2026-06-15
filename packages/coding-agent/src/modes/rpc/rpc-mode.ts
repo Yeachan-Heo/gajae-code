@@ -13,7 +13,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $pickenv, readLines, Snowflake } from "@gajae-code/utils";
+import { $pickenv, logger, readLines, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -27,7 +27,7 @@ import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../shared/agent-
 import { rpcError as error } from "../shared/agent-wire/responses";
 import { registerRpcSession, unregisterRpcSession } from "../shared/agent-wire/session-registry";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
-import { UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
+import { modelSupportsTokenCostMetrics, UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
 import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
@@ -82,6 +82,82 @@ export function shouldEmitRpcTitlesForTest(): boolean {
 
 const shouldEmitRpcTitles = shouldEmitRpcTitlesForTest;
 
+/**
+ * Cancellation commands bypass the ordered serial chain because they must
+ * interrupt in-flight work — they cannot wait behind the very command they are
+ * meant to abort.
+ */
+export const RPC_CANCELLATION_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	"abort",
+	"abort_bash",
+	"abort_retry",
+]);
+
+/**
+ * Safe read-only commands that bypass the ordered serial chain so they never
+ * head-of-line-block behind a long-running ordered command like
+ * `bash`/`compact`/`handoff`/`login` (#606, issue 13 — the partial fix only
+ * fast-laned cancellation).
+ *
+ * Every command listed here has a dispatch handler that is **fully synchronous
+ * and side-effect-free**: on the single-threaded event loop it runs to
+ * completion between the await points of any in-flight ordered command, reading
+ * live state without mutating it. Because such a read performs no causal write,
+ * jumping ahead of an earlier *queued* ordered command is observably harmless —
+ * there is no state change to reorder. Read payloads are additionally
+ * snapshotted inside the handler (e.g. `get_messages` returns a shallow copy of
+ * `session.messages`) so a fast-lane read can never serialize a half-mutated
+ * array that an ordered turn/compaction is rewriting in place.
+ *
+ * Deliberately excluded (kept ordered): every async/long command and every
+ * mutating command. In particular the control-flag setters (`set_thinking_level`,
+ * `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
+ * `set_interrupt_mode`, `set_auto_compaction`, `set_auto_retry`) stay ordered.
+ * Their handlers are synchronous, so fast-laning one ahead of an already-queued
+ * `prompt`/`bash` would apply the new mode *before* that earlier command runs —
+ * the earlier command would then observe the later setter's value, a
+ * causal-order (arrival-order) regression. Mutations therefore stay on the
+ * chain, and new command types default to ordered (fail-safe).
+ */
+export const RPC_SAFE_READ_CONTROL_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	// Pure synchronous reads — snapshot live state at processing time, never mutate.
+	"get_state",
+	"get_session_stats",
+	"get_available_models",
+	"get_branch_messages",
+	"get_last_assistant_text",
+	"get_messages",
+	"get_login_providers",
+]);
+
+/** True when a command may bypass the ordered serial chain and run immediately. */
+export function isFastLaneRpcCommand(type: RpcCommand["type"]): boolean {
+	return RPC_CANCELLATION_COMMANDS.has(type) || RPC_SAFE_READ_CONTROL_COMMANDS.has(type);
+}
+
+/**
+ * Schedules inbound RPC commands: fast-lane commands run immediately while
+ * everything else runs through a serial chain so causal order is preserved. The
+ * read loop never blocks, which is what lets a fast-lane command reach a
+ * long-running ordered command instead of being head-of-line-blocked behind it.
+ */
+export function createRpcCommandScheduler(
+	run: (command: RpcCommand) => Promise<void>,
+	track: (task: Promise<void>) => void,
+): { dispatch: (command: RpcCommand) => void } {
+	let orderedChain: Promise<void> = Promise.resolve();
+	return {
+		dispatch(command: RpcCommand): void {
+			if (isFastLaneRpcCommand(command.type)) {
+				track(run(command));
+				return;
+			}
+			orderedChain = orderedChain.then(() => run(command));
+			track(orderedChain);
+		},
+	};
+}
+
 function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "exceeded" | "aborted" | "info" {
 	if (event.includes("denied")) return "denied";
 	if (event.includes("exceeded")) return "exceeded";
@@ -89,6 +165,43 @@ function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "e
 	if (event.includes("rejected") || event.includes("conflict")) return "rejected";
 	if (event.includes("accepted") || event.includes("negotiated") || event.includes("emitted")) return "accepted";
 	return "info";
+}
+
+export class RpcListenRefusedError extends Error {
+	constructor(socketPath: string) {
+		super(
+			`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
+				"Stop it first or choose a different --listen path.",
+		);
+		this.name = "RpcListenRefusedError";
+	}
+}
+
+/**
+ * Probe whether a unix-domain socket path has a live server accepting
+ * connections. Returns `true` when a connection succeeds (a previous owner is
+ * still alive), and returns `false` only for known missing/stale endpoints
+ * (ENOENT / ECONNREFUSED). Unexpected probe failures fail closed as "alive" so
+ * `--listen` startup refuses to unlink a path it could not safely classify.
+ */
+export async function isUnixSocketAlive(socketPath: string): Promise<boolean> {
+	try {
+		const socket = await Bun.connect({
+			unix: socketPath,
+			socket: { data() {}, open() {}, error() {}, close() {} },
+		});
+		socket.end();
+		return true;
+	} catch (err) {
+		const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+		if (code === "ENOENT" || code === "ECONNREFUSED") return false;
+		logger.warn("RPC --listen socket probe failed closed", {
+			socketPath,
+			code: typeof code === "string" ? code : undefined,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return true;
+	}
 }
 
 export function requestRpcEditor(
@@ -230,6 +343,7 @@ export async function runRpcMode(
 		emitFrame: gate => output(gate),
 		store: gateStore,
 		audit: recordAudit,
+		providerSupportsTokenCostMetrics: modelSupportsTokenCostMetrics(session.model),
 		getUsageSnapshot: () => {
 			const stats = session.getSessionStats();
 			return { tokens: stats.tokens.total, costUsd: stats.cost };
@@ -537,14 +651,13 @@ export async function runRpcMode(
 			unattendedControlPlane,
 		});
 
-	// Cancellation commands must interrupt in-flight work, so they bypass the ordered
-	// queue and run immediately. Everything else runs through a serial chain so causal
-	// order is preserved (e.g. `get_state` after `bash` still observes the bash result)
-	// while the read loop itself never blocks — that is what lets a cancellation command
-	// reach a long-running `bash`/`compact`/`handoff`/`login` instead of being
-	// head-of-line-blocked behind it (issue 13).
-	const CANCELLATION_COMMANDS = new Set<RpcCommand["type"]>(["abort", "abort_bash", "abort_retry"]);
-	let orderedChain: Promise<void> = Promise.resolve();
+	// Fast-lane commands (cancellation + safe read/control, see
+	// isFastLaneRpcCommand) bypass the ordered serial chain and run immediately;
+	// everything else runs through a serial chain so causal order is preserved
+	// (e.g. an ordered `set_model` after `bash` still applies after the bash
+	// result) while the read loop itself never blocks — that is what lets a
+	// fast-lane command reach a long-running `bash`/`compact`/`handoff`/`login`
+	// instead of being head-of-line-blocked behind it (issue 13).
 	const runCommand = async (command: RpcCommand): Promise<void> => {
 		try {
 			output(await handleCommand(command));
@@ -556,14 +669,7 @@ export async function runRpcMode(
 		inFlightCommands.add(task);
 		void task.finally(() => inFlightCommands.delete(task));
 	};
-	const dispatchCommand = (command: RpcCommand): void => {
-		if (CANCELLATION_COMMANDS.has(command.type)) {
-			trackCommand(runCommand(command));
-			return;
-		}
-		orderedChain = orderedChain.then(() => runCommand(command));
-		trackCommand(orderedChain);
-	};
+	const { dispatch: dispatchCommand } = createRpcCommandScheduler(runCommand, trackCommand);
 
 	/**
 	 * Check if shutdown was requested and perform shutdown if so.
@@ -620,6 +726,14 @@ export async function runRpcMode(
 	if (options?.listen) {
 		const socketPath = options.listen;
 		await fs.mkdir(path.dirname(socketPath), { recursive: true }).catch(() => {});
+		// Refuse to clobber a live previous owner: probe the path first and only
+		// unlink a stale endpoint. A second `--listen` on the same path must not
+		// remove the socket another running server is still serving (#606).
+		// Unexpected probe failures are treated as alive, so this also refuses
+		// rather than unlinking a socket path we could not safely classify.
+		if (await isUnixSocketAlive(socketPath)) {
+			throw new RpcListenRefusedError(socketPath);
+		}
 		await fs.rm(socketPath, { force: true }).catch(() => {});
 		await registerRpcSession({
 			sessionId: session.sessionId,

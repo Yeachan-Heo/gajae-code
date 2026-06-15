@@ -977,10 +977,20 @@ export async function runRootCommand(
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
-			const { runRpcMode } = await import("./modes/rpc/rpc-mode");
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, {
-				listen: parsedArgs.rpcListen,
-			});
+			const { RpcListenRefusedError, runRpcMode } = await import("./modes/rpc/rpc-mode");
+			try {
+				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, {
+					listen: parsedArgs.rpcListen,
+				});
+			} catch (error) {
+				if (!(error instanceof RpcListenRefusedError)) throw error;
+				logger.setTransports({ console: true, file: true });
+				logger.error(error.message);
+				await session.dispose();
+				stopThemeWatcher();
+				await postmortem.quit(1);
+				process.exit(1);
+			}
 		} else if (mode === "bridge") {
 			const { runBridgeMode } = await import("./modes/bridge/bridge-mode");
 			await runBridgeMode(session, setToolUIContext);

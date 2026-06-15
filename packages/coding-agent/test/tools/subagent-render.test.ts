@@ -1,9 +1,9 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
 import type { SubagentSnapshot, SubagentToolDetails } from "../../src/tools/subagent";
-import { subagentToolRenderer } from "../../src/tools/subagent-render";
+import { subagentBodyCacheTestHooks, subagentToolRenderer } from "../../src/tools/subagent-render";
 
 let theme: Theme;
 
@@ -270,5 +270,131 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("Model: anthropic/claude-opus-4-8");
 		expect(out).toContain("requested openai-codex/gpt-5.5");
 		expect(out).toContain("fell back");
+	});
+});
+
+describe("subagent await renderer body cache (PR2)", () => {
+	beforeEach(() => {
+		subagentBodyCacheTestHooks.reset();
+	});
+
+	const renderWith = (
+		details: SubagentToolDetails,
+		{
+			expanded = true,
+			width = 160,
+			spinnerFrame = 0,
+		}: { expanded?: boolean; width?: number; spinnerFrame?: number } = {},
+	): string[] => {
+		// A fresh component each call models the built-in renderer recreating the
+		// result component on every partial update.
+		const component = subagentToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "" }], details },
+			{ expanded, isPartial: true, spinnerFrame },
+			theme,
+		);
+		return component.render(width);
+	};
+
+	const live = (id: string, overrides: Partial<AgentProgress> = {}): SubagentToolDetails => ({
+		subagents: [
+			snapshot({
+				id,
+				liveProgressAvailable: true,
+				progress: progress({ id, currentTool: "read", recentOutput: ["scan"], ...overrides }),
+			}),
+		],
+	});
+
+	it("reuses the cached heavy body across component recreation for identical content", () => {
+		renderWith(live("0-A"));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// New component (new renderResult), identical content -> module cache hit.
+		renderWith(live("0-A"));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+	});
+
+	it("does not re-render the heavy body for spinner-only frame changes", () => {
+		const details = live("0-A");
+		renderWith(details, { spinnerFrame: 0 });
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		renderWith(details, { spinnerFrame: 1 });
+		renderWith(details, { spinnerFrame: 2 });
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+	});
+
+	it("re-renders the heavy body when content, width, or expanded changes", () => {
+		renderWith(live("0-A", { currentTool: "read" }));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// Content change.
+		renderWith(live("0-A", { currentTool: "bash" }));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+		// Width change.
+		renderWith(live("0-A", { currentTool: "read" }), { width: 100 });
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(3);
+		// Expanded change.
+		renderWith(live("0-A", { currentTool: "read" }), { expanded: false });
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(4);
+		// Back to the first key -> cache hit, no new render.
+		renderWith(live("0-A", { currentTool: "read" }));
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(4);
+	});
+
+	it("ignores time-only churn in the body cache key", () => {
+		const a: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-A",
+					durationMs: 1_000,
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-A", durationMs: 1_000, currentTool: "read", currentToolStartMs: 1_000 }),
+				}),
+			],
+		};
+		const b: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-A",
+					durationMs: 999_999,
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-A", durationMs: 999_999, currentTool: "read", currentToolStartMs: 2_000 }),
+				}),
+			],
+		};
+		renderWith(a);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// Only time-derived fields differ -> identical signature -> cache hit.
+		renderWith(b);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+	});
+
+	it("invalidates the body cache when the Theme instance changes (no stale ANSI)", async () => {
+		const altTheme = (await getThemeByName("blue-crab"))!;
+		expect(altTheme).toBeDefined();
+		const details = live("0-A");
+		const renderTheme = (t: Theme): string[] =>
+			subagentToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details },
+					{ expanded: true, isPartial: true, spinnerFrame: 0 },
+					t,
+				)
+				.render(160);
+
+		const first = renderTheme(theme);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		// A different Theme instance (distinct object) must re-render the body, even if
+		// the theme name is unchanged — guards against stale themed ANSI/glyph reuse.
+		const second = renderTheme(altTheme);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+		expect(second).not.toEqual(first);
+	});
+
+	it("bounds the cache via LRU eviction", () => {
+		for (let i = 0; i < 140; i++) {
+			renderWith(live(`0-${i}`, { currentTool: `tool-${i}` }));
+		}
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(140);
+		expect(subagentBodyCacheTestHooks.size).toBeLessThanOrEqual(128);
 	});
 });
