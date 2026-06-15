@@ -218,6 +218,20 @@ export class InputController {
 		for (const key of this.ctx.keybindings.getKeys("app.jobs.open")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showJobsOverlay());
 		}
+		for (const key of this.ctx.keybindings.getKeys("app.jobs.expand")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				const panel = this.ctx.activeJobsPanel;
+				if (!panel?.isVisible() || this.ctx.editor.isAutocompleteOpen()) return;
+				panel.onExpandUp();
+			});
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.jobs.collapse")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				const panel = this.ctx.activeJobsPanel;
+				if (!panel?.isVisible() || this.ctx.editor.isAutocompleteOpen()) return;
+				panel.onCollapseDown();
+			});
+		}
 
 		this.ctx.editor.onChange = (text: string) => {
 			const wasBashMode = this.ctx.isBashMode;

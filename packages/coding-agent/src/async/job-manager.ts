@@ -217,6 +217,16 @@ export interface AsyncJobOutputSlice {
 	truncated: boolean;
 }
 
+/** Options for a bounded/incremental output tail read. */
+export interface AsyncJobOutputTailOptions {
+	/** Cap the returned slice to roughly the last N UTF-8 bytes of output. */
+	maxBytes?: number;
+	/** After byte-bounding, keep only the final N newline-separated lines. */
+	maxLines?: number;
+	/** Cursor follow: start from this byte offset (from a prior `nextOffset`). */
+	sinceOffset?: number;
+}
+
 /** Internal: a single chunk of captured stdout/stderr keyed by its byte range. */
 interface AsyncJobOutputChunk {
 	startByte: number;
@@ -906,6 +916,84 @@ export class AsyncJobManager {
 		};
 	}
 
+	/**
+	 * Bounded/incremental tail read of a job's captured output. Unlike
+	 * `readOutputSince(jobId, 0, …)`, this never assembles the whole retained
+	 * buffer: when `maxBytes` is set it only visits chunks overlapping the last
+	 * `maxBytes` bytes, and `maxLines` then keeps only the final lines of that
+	 * already-bounded slice. Intended for the passive panel's expanded live tail,
+	 * polled per visible monitor row.
+	 *
+	 * - `sinceOffset` (cursor follow): start from that byte; if it has fallen
+	 *   behind the retained `startOffset`, the bounded tail is returned with
+	 *   `truncated: true`. When `sinceOffset >= nextOffset` an empty slice is
+	 *   returned (no new bytes).
+	 * - `truncated` is true whenever earlier output exists that the slice omits
+	 *   (retention drop, `maxBytes` clip, or `maxLines` clip).
+	 * - The leading retained chunk is sliced at a UTF-8 codepoint boundary so
+	 *   multibyte characters are never split.
+	 */
+	readOutputTail(
+		jobId: string,
+		options: AsyncJobOutputTailOptions,
+		filter?: AsyncJobFilter,
+	): AsyncJobOutputSlice | undefined {
+		const job = this.#jobs.get(jobId);
+		if (!job) return undefined;
+		if (filter?.ownerId && job.ownerId !== filter.ownerId) return undefined;
+
+		const state = this.#outputState.get(jobId);
+		if (!state) {
+			return { jobId, status: job.status, text: "", startOffset: 0, nextOffset: 0, truncated: false };
+		}
+
+		const maxBytes = options.maxBytes !== undefined ? Math.max(0, Math.floor(options.maxBytes)) : undefined;
+		const maxLines = options.maxLines !== undefined ? Math.max(0, Math.floor(options.maxLines)) : undefined;
+		const requestedFloor =
+			options.sinceOffset !== undefined ? Math.max(0, Math.floor(options.sinceOffset)) : state.startOffset;
+
+		if (options.sinceOffset !== undefined && requestedFloor >= state.nextOffset) {
+			return {
+				jobId,
+				status: job.status,
+				text: "",
+				startOffset: state.startOffset,
+				nextOffset: state.nextOffset,
+				truncated: false,
+			};
+		}
+
+		const retentionTruncated = requestedFloor < state.startOffset;
+		const baseFloor = Math.max(requestedFloor, state.startOffset);
+		let effectiveOffset = baseFloor;
+		if (maxBytes !== undefined) {
+			const tailFloor = state.nextOffset - maxBytes;
+			if (tailFloor > effectiveOffset) effectiveOffset = tailFloor;
+		}
+		let truncated = retentionTruncated || effectiveOffset > baseFloor;
+
+		const parts: string[] = [];
+		for (const chunk of state.chunks) {
+			if (chunk.endByte <= effectiveOffset) continue;
+			if (effectiveOffset > chunk.startByte) {
+				parts.push(sliceTextFromUtf8ByteOffset(chunk.text, effectiveOffset - chunk.startByte));
+				continue;
+			}
+			parts.push(chunk.text);
+		}
+		let text = parts.join("");
+
+		if (maxLines !== undefined) {
+			const trimmed = text.endsWith("\n") ? text.slice(0, -1) : text;
+			const lines = trimmed.length === 0 ? [] : trimmed.split("\n");
+			if (lines.length > maxLines) {
+				truncated = true;
+				text = lines.slice(lines.length - maxLines).join("\n");
+			}
+		}
+
+		return { jobId, status: job.status, text, startOffset: effectiveOffset, nextOffset: state.nextOffset, truncated };
+	}
 	/**
 	 * Register an owner-scoped cleanup callback. Returns an unregister function.
 	 *

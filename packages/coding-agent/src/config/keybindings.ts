@@ -39,6 +39,8 @@ interface AppKeybindings {
 	"app.session.resume": true;
 	"app.session.observe": true;
 	"app.jobs.open": true;
+	"app.jobs.expand": true;
+	"app.jobs.collapse": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
 	"app.session.rename": true;
@@ -154,6 +156,14 @@ export const KEYBINDINGS = {
 	"app.jobs.open": {
 		defaultKeys: "alt+j",
 		description: "Open monitor/cron jobs overlay",
+	},
+	"app.jobs.expand": {
+		defaultKeys: "ctrl+up",
+		description: "Expand the active monitor/cron panel (or scroll up when expanded)",
+	},
+	"app.jobs.collapse": {
+		defaultKeys: "ctrl+down",
+		description: "Collapse the active monitor/cron panel (or scroll down when expanded)",
 	},
 	"app.session.togglePath": {
 		defaultKeys: "ctrl+p",

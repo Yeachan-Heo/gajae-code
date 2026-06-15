@@ -4,46 +4,25 @@
  * Kept free of UI/Component dependencies so the grouping/ordering and
  * detail-formatting logic is unit-testable. The selector controller wires these
  * SelectItem lists into nested SelectLists (list -> detail -> confirm).
+ *
+ * Shared job reference / preview / relative-time helpers live in `jobs-format`
+ * so the passive ActiveJobsPanel and this overlay cannot drift apart; they are
+ * re-exported here for backward compatibility with existing imports.
  */
 import type { SelectItem } from "@gajae-code/tui";
 import type { JobsSnapshot } from "../jobs-observer";
+import {
+	formatRelative,
+	type JobRef,
+	type JobRefKind,
+	PROMPT_PREVIEW_MAX,
+	parseJobRef,
+	previewText,
+} from "./jobs-format";
 
-export type JobRefKind = "monitor" | "cron";
+export { formatRelative, type JobRef, type JobRefKind, parseJobRef };
 
-export interface JobRef {
-	kind: JobRefKind;
-	id: string;
-}
-
-const PROMPT_PREVIEW_MAX = 60;
-
-function preview(text: string, max = PROMPT_PREVIEW_MAX): string {
-	const oneLine = text.replace(/\s+/g, " ").trim();
-	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
-}
-
-/** Compact relative time, e.g. "in 5m", "2m ago", "now". */
-export function formatRelative(targetMs: number | undefined, nowMs = Date.now()): string {
-	if (targetMs === undefined) return "—";
-	const deltaMs = targetMs - nowMs;
-	const abs = Math.abs(deltaMs);
-	const mins = Math.round(abs / 60_000);
-	if (mins < 1) return "now";
-	const unit = mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`;
-	return deltaMs >= 0 ? `in ${unit}` : `${unit} ago`;
-}
-
-/** Parse a list item value back into a job reference. */
-export function parseJobRef(value: string): JobRef | null {
-	const sep = value.indexOf(":");
-	if (sep === -1) return null;
-	const kind = value.slice(0, sep);
-	const id = value.slice(sep + 1);
-	if ((kind === "monitor" || kind === "cron") && id.length > 0) {
-		return { kind, id };
-	}
-	return null;
-}
+const preview = previewText;
 
 /**
  * Build the grouped jobs list: monitors first (newest-first), then crons
@@ -107,3 +86,5 @@ export function buildConfirmItems(actionLabel: string): SelectItem[] {
 		{ value: "yes", label: `Yes, ${actionLabel}` },
 	];
 }
+
+export { PROMPT_PREVIEW_MAX };

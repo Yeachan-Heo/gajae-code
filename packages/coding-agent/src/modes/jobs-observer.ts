@@ -12,7 +12,7 @@
  * until `acknowledgeFailures()` is called (when the overlay opens), so a failed
  * job that evicts before the user looks is not silently lost.
  */
-import type { AsyncJob, AsyncJobManager } from "../async";
+import type { AsyncJob, AsyncJobManager, AsyncJobOutputSlice, AsyncJobOutputTailOptions } from "../async";
 import { deleteCronJobById, listCronSnapshots, onCronChange } from "../tools/cron";
 
 export type JobsWorstState = "none" | "running" | "failed";
@@ -22,6 +22,14 @@ export interface MonitorJobView {
 	label: string;
 	status: AsyncJob["status"];
 	startTime: number;
+	/**
+	 * Wall-clock ms when the monitor left the running state (from
+	 * `AsyncJob.endTime`), or undefined while running. The passive panel uses
+	 * this for deterministic terminal TTL filtering instead of component-local
+	 * observation time, so a job that finished before the panel mounted expires
+	 * on schedule.
+	 */
+	endTime?: number;
 }
 
 export interface CronJobView {
@@ -129,7 +137,13 @@ export class JobsObserver {
 		const activeMonitors = monitorJobs.filter(job => job.status === "running");
 		const cronSnapshots = listCronSnapshots(this.#ownerId);
 		const monitors: MonitorJobView[] = monitorJobs
-			.map(job => ({ id: job.id, label: job.label, status: job.status, startTime: job.startTime }))
+			.map(job => ({
+				id: job.id,
+				label: job.label,
+				status: job.status,
+				startTime: job.startTime,
+				endTime: job.endTime,
+			}))
 			.sort((a, b) => b.startTime - a.startTime);
 		const crons: CronJobView[] = cronSnapshots
 			.map(snapshot => ({
@@ -187,6 +201,16 @@ export class JobsObserver {
 	getMonitorOutput(id: string): string {
 		const slice = this.#manager.readOutputSince(id, 0, this.#ownerId ? { ownerId: this.#ownerId } : undefined);
 		return slice?.text ?? "";
+	}
+
+	/**
+	 * Bounded/incremental tail of a monitor job's output for the passive panel's
+	 * expanded live view. Delegates to the manager's bounded `readOutputTail`
+	 * (owner-scoped) so the panel never assembles the whole retained buffer per
+	 * poll. Returns undefined when the job is absent or owned by another agent.
+	 */
+	getMonitorOutputTail(id: string, options: AsyncJobOutputTailOptions): AsyncJobOutputSlice | undefined {
+		return this.#manager.readOutputTail(id, options, this.#ownerId ? { ownerId: this.#ownerId } : undefined);
 	}
 
 	dispose(): void {

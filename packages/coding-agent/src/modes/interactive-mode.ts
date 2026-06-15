@@ -75,6 +75,7 @@ import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import { ActiveJobsPanelComponent } from "./components/active-jobs-panel";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { CustomEditor } from "./components/custom-editor";
@@ -249,6 +250,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
+	/** Owned slot for the passive monitor/cron panel, between the editor and below-hook widgets. */
+	activeJobsPanelContainer: Container;
+	/** Passive monitor/cron visualization panel (undefined when background jobs are unavailable). */
+	activeJobsPanel?: ActiveJobsPanelComponent;
 	statusLine: StatusLineComponent;
 
 	isInitialized = false;
@@ -402,6 +407,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerAbove.addChild(new Spacer(1));
 		this.hookWidgetContainerBelow = new Container();
+		this.activeJobsPanelContainer = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
 		this.statusLine = new StatusLineComponent(session);
@@ -517,6 +523,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer chrome is rendered by the editor.
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.activeJobsPanelContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setFocus(this.editor);
 
@@ -540,8 +547,18 @@ export class InteractiveMode implements InteractiveModeContext {
 			const jobsObserver = new JobsObserver(jobManager, this.session.getAgentId());
 			this.#jobsObserver = jobsObserver;
 			this.statusLine.setJobs(jobsObserver.getSnapshot());
+			const activeJobsPanel = new ActiveJobsPanelComponent(jobsObserver, {
+				requestRender: () => this.ui.requestRender(),
+			});
+			activeJobsPanel.setMaxRows(this.#computePanelMaxRows());
+			activeJobsPanel.setSnapshot(jobsObserver.getSnapshot());
+			this.activeJobsPanel = activeJobsPanel;
+			this.activeJobsPanelContainer.addChild(activeJobsPanel);
 			jobsObserver.onChange(() => {
-				this.statusLine.setJobs(jobsObserver.getSnapshot());
+				const snapshot = jobsObserver.getSnapshot();
+				this.statusLine.setJobs(snapshot);
+				activeJobsPanel.setMaxRows(this.#computePanelMaxRows());
+				activeJobsPanel.setSnapshot(snapshot);
 				this.ui.requestRender();
 			});
 		}
@@ -867,8 +884,22 @@ export class InteractiveMode implements InteractiveModeContext {
 		return Math.max(EDITOR_MAX_HEIGHT_MIN, Math.min(EDITOR_MAX_HEIGHT_MAX, maxHeight));
 	}
 
+	/**
+	 * Max rows the passive jobs panel may occupy. Bounded by the space left below
+	 * the editor (terminal rows minus the editor's reserved budget and a small
+	 * chrome margin) and hard-capped, so the panel degrades before it can crowd
+	 * the input.
+	 */
+	#computePanelMaxRows(): number {
+		const rows = this.ui.terminal.rows;
+		const terminalRows = Number.isFinite(rows) && rows > 0 ? rows : EDITOR_FALLBACK_ROWS;
+		const available = terminalRows - EDITOR_RESERVED_ROWS - 2;
+		return Math.max(1, Math.min(10, available));
+	}
+
 	#syncEditorMaxHeight(): void {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
+		this.activeJobsPanel?.setMaxRows(this.#computePanelMaxRows());
 	}
 
 	updateEditorChrome(): void {
@@ -1896,6 +1927,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
 		this.statusLine.dispose();
+		this.activeJobsPanel?.dispose();
 		this.#jobsObserver?.dispose();
 		this.editor.dispose();
 		if (this.#resizeHandler) {

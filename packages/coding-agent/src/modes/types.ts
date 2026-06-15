@@ -18,6 +18,7 @@ import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
+import type { ActiveJobsPanelComponent } from "./components/active-jobs-panel";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CustomEditor } from "./components/custom-editor";
@@ -70,6 +71,8 @@ export interface InteractiveModeContext {
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
+	/** Passive monitor/cron visualization panel rendered below the editor. */
+	activeJobsPanel?: ActiveJobsPanelComponent;
 	statusLine: StatusLineComponent;
 
 	// Session access
