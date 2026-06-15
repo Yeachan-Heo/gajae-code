@@ -880,6 +880,44 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(after.current_phase).toBe("planner");
 	});
 
+	it("re-asserts active:true on a same-run continuation write at the current phase", async () => {
+		const root = await tempDir();
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({
+				skill: "ralplan",
+				active: false,
+				current_phase: "planner",
+				run_id: "same-run-continuation",
+				version: 2,
+			}),
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Plan",
+				"--run-id",
+				"same-run-continuation",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const after = await readState(root);
+		expect(after.run_id).toBe("same-run-continuation");
+		expect(after.active).toBe(true);
+		expect(after.current_phase).toBe("planner");
+	});
+
 	it("does not re-arm a cleared run on a stray same-run-id --write (demote-on-clear preserved)", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "task"], root);

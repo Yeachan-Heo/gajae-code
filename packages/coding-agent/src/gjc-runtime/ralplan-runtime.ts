@@ -240,7 +240,8 @@ async function persistActiveRunId(
 	if (
 		existing.run_id === runId &&
 		existing.version === WORKFLOW_STATE_VERSION &&
-		existing.current_phase === nextPhase
+		existing.current_phase === nextPhase &&
+		(existing.active === true || PHASE_LOCK.has(nextPhase))
 	) {
 		return;
 	}
