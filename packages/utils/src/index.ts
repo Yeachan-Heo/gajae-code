@@ -19,6 +19,7 @@ export * as procmgr from "./procmgr";
 export * as prompt from "./prompt";
 export * as ptree from "./ptree";
 export { AbortError, ChildProcess, Exception, NonZeroExitError } from "./ptree";
+export * from "./safe-stderr";
 export * from "./sanitize-text";
 export * from "./snowflake";
 export * from "./stream";

@@ -8,6 +8,7 @@
 import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
 import { logger } from ".";
+import { safeStderrWrite } from "./safe-stderr";
 
 // Cleanup reasons, in order of priority/meaning.
 export enum Reason {
@@ -86,17 +87,17 @@ if (isMainThread) {
 			inspectorOpened = true;
 			inspector.open(undefined, undefined, false);
 			const url = inspector.url();
-			process.stderr.write(`Inspector opened: ${url}\n`);
+			safeStderrWrite(`Inspector opened: ${url}\n`);
 		})
 		.on("uncaughtException", async err => {
-			process.stderr.write(formatFatalError("Uncaught Exception", err));
+			safeStderrWrite(formatFatalError("Uncaught Exception", err));
 			logger.error("Uncaught exception", { err, stack: err.stack });
 			await runCleanup(Reason.UNCAUGHT_EXCEPTION);
 			process.exit(1);
 		})
 		.on("unhandledRejection", async reason => {
 			const err = reason instanceof Error ? reason : new Error(String(reason));
-			process.stderr.write(formatFatalError("Unhandled Rejection", err));
+			safeStderrWrite(formatFatalError("Unhandled Rejection", err));
 			logger.error("Unhandled rejection", { err, stack: err.stack });
 			await runCleanup(Reason.UNHANDLED_REJECTION);
 			process.exit(1);

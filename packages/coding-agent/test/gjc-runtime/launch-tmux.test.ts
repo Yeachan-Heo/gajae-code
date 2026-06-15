@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
 	applyGjcTmuxProfile,
@@ -20,8 +20,19 @@ function args(overrides: Partial<Args> = {}): Args {
 }
 
 const interactiveTty = { stdin: true, stdout: true };
+const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+function stderrError(code: string): Error {
+	const error = new Error(`${code} from stderr`);
+	Object.defineProperty(error, "code", { value: code });
+	return error;
+}
 
 describe("default GJC tmux launch", () => {
+	afterEach(() => {
+		process.stderr.write = originalStderrWrite;
+	});
+
 	it("does not plan tmux for interactive root launch without --tmux", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"] }),
@@ -312,6 +323,34 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
 		expect(diagnostics[0].length).toBeLessThan(320);
+	});
+
+	it("does not throw when the default tmux diagnostic write hits a closed stderr", () => {
+		const writes: string[] = [];
+		process.stderr.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			throw stderrError("EIO");
+		}) satisfies typeof process.stderr.write;
+
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			spawnSync: (_command, spawnArgs) => {
+				if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(writes).toHaveLength(1);
+		expect(writes[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
 	});
 
 	it("falls through to direct launch when tmux is unavailable", () => {

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Prevented `gjc --tmux` partial-launch diagnostics from throwing when stderr is already closed during shutdown.
 - Fixed v0.5.1-style macOS/Linux standalone binaries crashing before the first model request with `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc-*'` when pre-prompt context maintenance invokes the native tokenizer.
 - Mapped the retired `codex-standard` model profile name to `codex-medium` during profile activation, **as a fallback only** so a user-defined profile literally named `codex-standard` is never shadowed, letting stale `modelProfile.default: codex-standard` configs reach activation instead of blocking startup after the rebuilt profile catalog.
 - Fixed interactive goal-mode auto-continuation looping `Error: Agent is already processing…` (`AgentBusyError`) while the session is busy. A wedged/orphaned subagent turn — or an in-progress compaction — can leave the session non-idle while the interactive loop is back at `getUserInput()`; the 800 ms continuation timer then fired `prompt()`, threw `AgentBusyError`, surfaced it via `showError`, and re-armed — spamming the error roughly every 800 ms. The continuation now skips and re-arms while `isStreaming`/`isCompacting`, firing only once the session returns to idle.
