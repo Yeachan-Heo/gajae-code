@@ -83,12 +83,19 @@ export async function removeFileLockDirForGc(
 	return "removed";
 }
 
-function isProcessAlive(pid: number): boolean {
+type OwnerLiveness = "alive" | "dead" | "unknown";
+
+function ownerLiveness(pid: number): OwnerLiveness {
+	if (!Number.isFinite(pid) || pid <= 0) return "unknown";
 	try {
 		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
+		return "alive";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return "dead";
+		// EPERM means the process exists but we may not signal it; treat as alive.
+		// Anything else is indeterminate.
+		return code === "EPERM" ? "alive" : "unknown";
 	}
 }
 
@@ -96,11 +103,13 @@ async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> 
 	const info = await readLockInfo(lockPath);
 	if (!info) return true;
 
-	if (!isProcessAlive(info.pid)) return true;
-
-	if (Date.now() - info.timestamp > staleMs) return true;
-
-	return false;
+	// Never reap a live owner by elapsed time: a long legitimate critical section must
+	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
+	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
+	const liveness = ownerLiveness(info.pid);
+	if (liveness === "dead") return true;
+	if (liveness === "alive") return false;
+	return Date.now() - info.timestamp > staleMs;
 }
 
 async function tryAcquireLock(lockPath: string): Promise<boolean> {

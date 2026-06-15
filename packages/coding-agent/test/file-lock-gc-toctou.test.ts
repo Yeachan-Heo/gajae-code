@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { removeFileLockDirForGc } from "@gajae-code/coding-agent/config/file-lock";
+import { removeFileLockDirForGc, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 
@@ -53,6 +53,55 @@ function deadLockRecord(lockDir: string): GcRecord {
 	};
 }
 
+describe("withFileLock stale owner liveness (#652)", () => {
+	test("does not overlap a live holder that exceeds staleMs", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const events: string[] = [];
+		let waiter: Promise<void> | undefined;
+
+		await withFileLock(
+			lockedFile,
+			async () => {
+				events.push("holder-enter");
+				waiter = withFileLock(
+					lockedFile,
+					async () => {
+						events.push("waiter-enter");
+					},
+					{ staleMs: 1, retries: 50, retryDelayMs: 5 },
+				);
+
+				await Bun.sleep(30);
+				expect(events).toEqual(["holder-enter"]);
+				events.push("holder-exit");
+			},
+			{ staleMs: 1, retries: 1, retryDelayMs: 1 },
+		);
+		await waiter;
+
+		expect(events).toEqual(["holder-enter", "holder-exit", "waiter-enter"]);
+	});
+
+	test("reclaims a stale lock owned by a dead process", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
+
+		let acquired = false;
+		await withFileLock(
+			lockedFile,
+			async () => {
+				acquired = true;
+			},
+			{ staleMs: 1, retries: 3, retryDelayMs: 1 },
+		);
+
+		expect(acquired).toBe(true);
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+});
 describe("removeFileLockDirForGc owner-token guard (#606)", () => {
 	test("removes the dir when the on-disk token matches the expected owner", async () => {
 		const base = await makeTemp();
