@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { logger } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
@@ -187,14 +188,10 @@ export class DapClient {
 		try {
 			// Wait for the socket file to appear (dlv needs to start listening)
 			await waitForCondition(
-				() => {
-					try {
-						Bun.file(socketPath).size;
-						return true;
-					} catch {
-						return false;
-					}
-				},
+				// `Bun.file(path).size` returns 0 for a missing file instead of
+				// throwing, so it can't gate socket readiness. Use an existence
+				// check so the adapter has actually created the listener socket.
+				() => existsSync(socketPath),
 				10_000,
 				proc,
 			);
@@ -655,33 +652,38 @@ async function connectSocket(options: { unix: string }, timeoutMs = 10_000): Pro
 		clearTimeout(timeout);
 		fn();
 	};
-	Bun.connect({
-		unix: options.unix,
-		socket: {
-			open(socket) {
-				settle(() =>
-					resolve({
-						readable,
-						writeSink: socketToSink(socket),
-						socket,
-					}),
-				);
+	try {
+		const socketPromise = Bun.connect({
+			unix: options.unix,
+			socket: {
+				open(socket) {
+					settle(() =>
+						resolve({
+							readable,
+							writeSink: socketToSink(socket),
+							socket,
+						}),
+					);
+				},
+				data(_socket, data) {
+					streamController.enqueue(new Uint8Array(data));
+				},
+				close() {
+					try {
+						streamController.close();
+					} catch {
+						/* already closed */
+					}
+				},
+				error(_socket, err) {
+					settle(() => reject(err));
+				},
 			},
-			data(_socket, data) {
-				streamController.enqueue(new Uint8Array(data));
-			},
-			close() {
-				try {
-					streamController.close();
-				} catch {
-					/* already closed */
-				}
-			},
-			error(_socket, err) {
-				settle(() => reject(err));
-			},
-		},
-	});
+		});
+		void socketPromise.catch(err => settle(() => reject(err)));
+	} catch (err) {
+		settle(() => reject(err));
+	}
 
 	return promise;
 }
