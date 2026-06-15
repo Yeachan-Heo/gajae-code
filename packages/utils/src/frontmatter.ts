@@ -10,9 +10,9 @@ function stripLooseScalarTrailingCommas(metadata: string): string {
 	return metadata
 		.split("\n")
 		.map(line => {
-			const match = line.match(/^(\s*[\w-]+\s*:\s+.+),(\s*)$/);
-			if (!match) return line;
-			return `${match[1]}${match[2]}`;
+			const match = line.match(/^(\s*[\w-]+\s*:\s+)(.+),(\s*)$/);
+			if (!match || /^[[{|>]/.test(match[2].trimStart())) return line;
+			return `${match[1]}${match[2]}${match[3]}`;
 		})
 		.join("\n");
 }

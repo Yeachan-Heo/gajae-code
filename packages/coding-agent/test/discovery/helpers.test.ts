@@ -116,6 +116,29 @@ Body content`;
 		expect(result.body).toBe("Body content");
 	});
 
+	test("does not coerce malformed flow collections with trailing commas", () => {
+		const content = `---
+items: [one, two,
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter/,
+		);
+	});
+
+	test("does not coerce malformed block scalars with trailing commas", () => {
+		const content = `---
+description: |,
+  Body text
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter/,
+		);
+	});
+
 	test("handles missing frontmatter", () => {
 		const content = "Just body content";
 		const result = parse(content);
