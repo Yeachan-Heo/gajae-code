@@ -3,6 +3,7 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
 import type { ToolSession } from "./index";
+import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -99,6 +100,7 @@ export interface ComputerToolDetails {
 	ms?: number;
 	screenshot?: ComputerScreenshotDetails;
 	supervisor?: string;
+	meta?: OutputMeta;
 }
 
 type NativeController = {

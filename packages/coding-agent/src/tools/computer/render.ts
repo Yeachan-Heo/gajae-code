@@ -29,7 +29,7 @@ export function summarizeComputerDetails(
 	theme: Theme,
 ): string {
 	if (!details) return isError ? "Computer action failed" : "Computer action completed";
-	const parts = [details.action];
+	const parts: string[] = [details.action];
 	if (details.x !== undefined && details.y !== undefined) parts.push(`@ ${details.x},${details.y}`);
 	if (details.toX !== undefined && details.toY !== undefined) parts.push(`→ ${details.toX},${details.toY}`);
 	if (details.scrollX !== undefined || details.scrollY !== undefined)

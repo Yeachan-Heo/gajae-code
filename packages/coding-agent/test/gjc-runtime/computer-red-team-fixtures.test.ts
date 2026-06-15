@@ -91,7 +91,6 @@ async function seedPlan(root: string): Promise<void> {
 	const created = await createUltragoalPlan({
 		cwd: root,
 		brief: "@goal computer gate fixture",
-		gjcObjective: "fixture",
 	});
 	await runGit(root, ["add", ".gjc/ultragoal/goals.json", ".gjc/ultragoal/ledger.jsonl"]);
 	await runGit(root, ["commit", "-m", "plan"]);
@@ -227,7 +226,7 @@ async function checkpoint(root: string, qa: Record<string, unknown>): Promise<st
 		],
 		root,
 	);
-	return result.stderr + result.stdout;
+	return (result.stderr ?? "") + (result.stdout ?? "");
 }
 
 async function seedComputerChange(root: string, file = "crates/pi-natives/src/computer/executor.rs"): Promise<void> {
