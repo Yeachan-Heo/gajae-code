@@ -28,6 +28,7 @@ export const __piNativesV0_5_1 = nativeBindings.__piNativesV0_5_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const countTokens = nativeBindings.countTokens;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;

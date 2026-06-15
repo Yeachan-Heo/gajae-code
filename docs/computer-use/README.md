@@ -74,9 +74,11 @@ manual macOS E2E).
 |-------|-------|--------|
 | Coordinate contract + planning docs | `coords` module + unit tests + this doc | **done (this PR)** |
 | Native screen capture (`screenshot`) | `capture` module, primary display, PNG + scale | **done (this PR, verified live)** |
-| Native input backend | `input`, `permissions`, `execute_action` (click/type/drag/scroll/keypress) | planned |
+| TCC preflight (`permissions`) | Accessibility + Screen Recording checks, Settings openers, fail-closed guards | **done (this PR, verified live)** |
+| napi screenshot binding (`computerScreenshot`) | napi → `packages/natives` → TS, verified live | **done (this PR)** |
+| Native input backend | `input`, `execute_action` (click/type/drag/scroll/keypress) | planned (gated on Accessibility in a granted gjc process) |
 | Kill-switch supervisor + event-tap lifecycle | supervisor, hotkey, abort/release/suspend/snapshot | planned |
-| napi bindings + TS `computer` tool surface | `ComputerController`, schema, gating, prompt, renderer | planned |
+| TS `computer` tool surface | full `ComputerController` + `computer.ts` schema/gating/prompt/renderer | planned |
 | Manual macOS E2E acceptance | TextEdit all-nine + kill-switch drill | planned (requires macOS hardware + granted TCC + human operator) |
 
 The remaining input backend, kill-switch, napi/TS surface, and manual

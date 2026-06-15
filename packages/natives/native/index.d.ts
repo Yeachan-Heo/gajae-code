@@ -357,6 +357,40 @@ export interface ClipboardImage {
   mimeType: string
 }
 
+/**
+ * Capture the primary display for JS callers (macOS).
+ *
+ * Requires the Screen Recording permission. This is the read-only `screenshot`
+ * primitive of the computer-use tool; input primitives land behind the same
+ * surface once the Accessibility gate is satisfied in a granted `gjc` process.
+ *
+ * # Errors
+ * Returns an error when capture fails (e.g. Screen Recording not granted).
+ */
+export declare function computerScreenshot(): ComputerScreenshot
+
+/**
+ * A captured primary-display screenshot returned to JS. `width_px`/`height_px`
+ * are the physical pixels that define the action coordinate space (see the
+ * coordinate contract); the scale/origin map them to macOS logical points.
+ */
+export interface ComputerScreenshot {
+  /** PNG-encoded image bytes. */
+  png: Uint8Array
+  /** Screenshot width in physical pixels. */
+  widthPx: number
+  /** Screenshot height in physical pixels. */
+  heightPx: number
+  /** Physical-pixels-per-logical-point along X. */
+  scaleX: number
+  /** Physical-pixels-per-logical-point along Y. */
+  scaleY: number
+  /** Logical origin X of the display (points). */
+  originX: number
+  /** Logical origin Y of the display (points). */
+  originY: number
+}
+
 /** A context line (before or after a match). */
 export interface ContextLine {
   /** 1-indexed line number in the source file. */
