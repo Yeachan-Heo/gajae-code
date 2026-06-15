@@ -8,7 +8,7 @@ describe("parseBridgeEndpoints", () => {
 		expect(parseBridgeEndpoints("   ")).toBeUndefined();
 	});
 
-	it("enables all matrix keys for \"all\" (case-insensitive)", () => {
+	it('enables all matrix keys for "all" (case-insensitive)', () => {
 		expect(parseBridgeEndpoints("all")).toEqual({
 			events: true,
 			commands: true,
