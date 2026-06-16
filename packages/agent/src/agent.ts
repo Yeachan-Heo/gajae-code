@@ -409,6 +409,15 @@ export class Agent {
 	}
 
 	/**
+	 * Whether websocket transport is preferred when the provider implementation
+	 * supports it. Read by maintenance one-shot calls (compaction, handoff,
+	 * branch summary) so they forward the same transport preference as live turns.
+	 */
+	get preferWebsockets(): boolean | undefined {
+		return this.#preferWebsockets;
+	}
+
+	/**
 	 * Static metadata forwarded to every API request when no resolver is installed
 	 * (e.g. `metadata.user_id` for Anthropic session attribution). Setting this
 	 * clears any installed resolver.
