@@ -33,6 +33,28 @@ export interface SearchParams {
 	maxOutputTokens?: number;
 	numSearchResults?: number;
 	temperature?: number;
+	/** xAI-specific search surface. Defaults to web_search when omitted. */
+	xaiSearchMode?: "web" | "x" | "web_and_x";
+	/** xAI web_search domain allow-list (max 5). */
+	allowedDomains?: string[];
+	/** xAI web_search domain deny-list (max 5). */
+	excludedDomains?: string[];
+	/** xAI x_search handle allow-list (max 20). */
+	allowedXHandles?: string[];
+	/** xAI x_search handle deny-list (max 20). */
+	excludedXHandles?: string[];
+	/** xAI x_search lower date bound, ISO8601 date such as YYYY-MM-DD. */
+	fromDate?: string;
+	/** xAI x_search upper date bound, ISO8601 date such as YYYY-MM-DD. */
+	toDate?: string;
+	/** xAI web_search/x_search image understanding. */
+	enableImageUnderstanding?: boolean;
+	/** xAI web_search image search result embedding. */
+	enableImageSearch?: boolean;
+	/** xAI x_search video understanding. */
+	enableVideoUnderstanding?: boolean;
+	/** xAI Responses include=["no_inline_citations"]. */
+	noInlineCitations?: boolean;
 	googleSearch?: Record<string, unknown>;
 	codeExecution?: Record<string, unknown>;
 	urlContext?: Record<string, unknown>;

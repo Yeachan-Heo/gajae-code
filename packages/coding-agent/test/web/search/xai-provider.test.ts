@@ -72,6 +72,65 @@ describe("xAI web search provider", () => {
 		});
 	});
 
+	it("builds web_search filters, image options, and citation controls", () => {
+		const body = buildXaiRequestBody({
+			query: "xAI docs",
+			systemPrompt: "search carefully",
+			model: "grok-test",
+			allowedDomains: ["https://docs.x.ai/developers/tools", "*.x.ai", "docs.x.ai"],
+			enableImageUnderstanding: true,
+			enableImageSearch: true,
+			noInlineCitations: true,
+		});
+
+		expect(body.tools).toEqual([
+			{
+				type: "web_search",
+				filters: { allowed_domains: ["docs.x.ai", "x.ai"] },
+				enable_image_understanding: true,
+				enable_image_search: true,
+			},
+		]);
+		expect(body.include).toEqual(["no_inline_citations"]);
+	});
+
+	it("builds x_search with handles, date range, image understanding, and video understanding", () => {
+		const body = buildXaiRequestBody({
+			query: "xAI on X",
+			systemPrompt: "search X",
+			model: "grok-test",
+			xaiSearchMode: "x",
+			allowedXHandles: ["@xai", "elonmusk", "xai"],
+			fromDate: "2025-10-01",
+			toDate: "2025-10-10",
+			enableImageUnderstanding: true,
+			enableVideoUnderstanding: true,
+		});
+
+		expect(body.tools).toEqual([
+			{
+				type: "x_search",
+				allowed_x_handles: ["xai", "elonmusk"],
+				from_date: "2025-10-01",
+				to_date: "2025-10-10",
+				enable_image_understanding: true,
+				enable_video_understanding: true,
+			},
+		]);
+	});
+
+	it("rejects mutually exclusive xAI filters before fetching", () => {
+		expect(() =>
+			buildXaiRequestBody({
+				query: "conflict",
+				systemPrompt: "search",
+				model: "grok-test",
+				allowedDomains: ["x.ai"],
+				excludedDomains: ["example.com"],
+			}),
+		).toThrow("allowed_domains cannot be set together with excluded_domains");
+	});
+
 	it("sends OAuth bearer auth and parses top-level xAI citations", async () => {
 		process.env.PI_XAI_WEB_SEARCH_MODEL = "grok-test";
 		process.env.XAI_SEARCH_BASE_URL = "https://xai.example/v1/";
@@ -131,6 +190,56 @@ describe("xAI web search provider", () => {
 				snippet: undefined,
 			},
 		]);
+	});
+
+	it("forwards xAI X Search options and parses xAI-specific usage", async () => {
+		let capturedBody: any;
+		using _hook = hookFetch(async (_input, init) => {
+			capturedBody = JSON.parse(String(init?.body));
+			return Response.json({
+				output_text: "X answer",
+				citations: ["https://x.com/xai/status/123"],
+				usage: {
+					server_side_tool_usage_details: {
+						x_search_calls: 3,
+						view_image_calls: 2,
+						image_search_calls: 1,
+						video_understanding_calls: 1,
+					},
+				},
+			});
+		});
+
+		const result = await new XaiProvider().search({
+			query: "xAI on X",
+			systemPrompt: "search X",
+			xaiSearchMode: "x",
+			allowedXHandles: ["@xai"],
+			fromDate: "2025-10-01",
+			toDate: "2025-10-10",
+			enableImageUnderstanding: true,
+			enableVideoUnderstanding: true,
+			noInlineCitations: true,
+			authStorage: auth({ apiKey: "sk-xai" }),
+		});
+
+		expect(capturedBody.tools).toEqual([
+			{
+				type: "x_search",
+				allowed_x_handles: ["xai"],
+				from_date: "2025-10-01",
+				to_date: "2025-10-10",
+				enable_image_understanding: true,
+				enable_video_understanding: true,
+			},
+		]);
+		expect(capturedBody.include).toEqual(["no_inline_citations"]);
+		expect(result.usage).toMatchObject({
+			xSearchRequests: 3,
+			imageUnderstandingRequests: 2,
+			imageSearchRequests: 1,
+			videoUnderstandingRequests: 1,
+		});
 	});
 
 	it("parses url_citation annotations into sources", async () => {

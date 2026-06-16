@@ -2752,7 +2752,7 @@ export const SETTINGS_SCHEMA = {
 				{
 					value: "xai",
 					label: "xAI",
-					description: "xAI Responses web_search (uses xAI OAuth via /login xai or XAI_API_KEY)",
+					description: "xAI Responses web_search/x_search (uses xAI OAuth via /login xai or XAI_API_KEY)",
 				},
 				{
 					value: "gemini",
