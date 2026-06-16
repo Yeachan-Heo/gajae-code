@@ -1,6 +1,6 @@
 import type { TextContent } from "@gajae-code/ai";
 import type { Component } from "@gajae-code/tui";
-import { Box, Container, Markdown, Spacer, Text } from "@gajae-code/tui";
+import { Box, Container, Markdown, Spacer, Text, truncateToWidth } from "@gajae-code/tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import type { CustomMessage, SkillPromptDetails } from "../../session/messages";
 
@@ -39,27 +39,35 @@ export class SkillMessageComponent extends Container {
 		this.addChild(this.#box);
 		this.#box.clear();
 
-		const label = theme.fg("customMessageLabel", theme.bold("[skill]"));
-		this.#box.addChild(new Text(label, 0, 0));
-		this.#box.addChild(new Spacer(1));
-
 		const details = this.message.details;
+		const name = details?.name ?? "unknown";
 		const args = details?.args?.trim();
-		const infoLines = [
-			`Skill: ${details?.name ?? "unknown"}`,
-			args ? `Args: ${args}` : undefined,
+
+		// Single compact line: `[skill] <name>: <args>`. The summary is the
+		// args the user typed; with none, just `[skill] <name>`. Collapsed to
+		// one line — path / line-count / full prompt body are debugging detail
+		// and only render once expanded.
+		const summary = args ? truncateToWidth(args.replace(/\s+/g, " "), 72) : undefined;
+		const header = `${theme.fg("customMessageLabel", theme.bold("[skill]"))} ${theme.fg("customMessageText", name)}`;
+		const headerText = summary ? `${header}${theme.fg("customMessageText", `: ${summary}`)}` : header;
+		this.#box.addChild(new Text(headerText, 0, 0));
+
+		if (!this.#expanded) {
+			return;
+		}
+
+		const detailLines = [
 			details?.path ? `Path: ${details.path}` : undefined,
 			typeof details?.lineCount === "number" ? `Prompt: ${details.lineCount} lines` : undefined,
 		].filter((line): line is string => Boolean(line));
 
-		this.#box.addChild(
-			new Markdown(infoLines.join("\n"), 0, 0, getMarkdownTheme(), {
-				color: (value: string) => theme.fg("customMessageText", value),
-			}),
-		);
-
-		if (!this.#expanded) {
-			return;
+		if (detailLines.length > 0) {
+			this.#box.addChild(new Spacer(1));
+			this.#box.addChild(
+				new Markdown(detailLines.join("\n"), 0, 0, getMarkdownTheme(), {
+					color: (value: string) => theme.fg("customMessageText", value),
+				}),
+			);
 		}
 
 		const text = this.#extractText();
