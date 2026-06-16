@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-16
+
+### Fixed
+
+- Bounded agent context growth, compaction, and token accounting for long-running sessions: `appendMessage` pushes in place instead of rebuilding the array; the append-only context keeps rolling per-message hashes instead of rescanning the full digest; an emergency-compaction floor that cannot be disabled now surfaces its reason; `getSessionStats` is single-pass; and `nativeCountTokens` skips the synchronous ~39 MB BPE tokenizer above a 2 MiB input cap, falling back to the cheap heuristic (#717).
+
 ## [0.5.2] - 2026-06-15
 
 ### Fixed

@@ -226,9 +226,16 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	const publishChanged = paths.some(isReleasePublishPath);
 	const wrapperChanged = paths.some(isUnscopedWrapperPath);
 	const toolingScriptChanged = paths.some(isToolingScriptPath);
-	const needsNativeRuntime = paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace;
+	const deepInterviewOnly = isDeepInterviewOnly(paths);
+	const needsNativeRuntime = !deepInterviewOnly && (paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace);
 	const workflowHarnessOnly = paths.length > 0 && paths.every(isWorkflowHarnessPath);
 	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
+
+	if (deepInterviewOnly) {
+		add(tasks, "deep-interview-definitions", "Deep interview default definition tests", ["bun", "test", "packages/coding-agent/test/default-gjc-definitions.test.ts"]);
+		add(tasks, "deep-interview-runtime", "Deep interview runtime tests", ["bun", "test", "packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts"]);
+		return Array.from(tasks.values());
+	}
 
 	if (needsNativeRuntime) {
 		add(tasks, "native-build", "Build native addon for CLI/test smoke", ["bun", "run", "build:native"]);
@@ -407,6 +414,16 @@ function isInstallPath(changedPath: string): boolean {
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
+}
+
+function isDeepInterviewOnly(paths: readonly string[]): boolean {
+	const allowed = new Set([
+		"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+		"packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts",
+		"packages/coding-agent/test/default-gjc-definitions.test.ts",
+		"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
+	]);
+	return paths.length > 0 && paths.every(changedPath => allowed.has(changedPath));
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {

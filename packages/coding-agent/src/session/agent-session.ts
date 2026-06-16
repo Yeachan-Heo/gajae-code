@@ -550,6 +550,13 @@ function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): strin
 const IRC_REPLY_MAX_BYTES = 4096;
 
 /**
+ * Hard cap for {@link AgentSession.disposeChildSubprocesses}. A `SIGINT`/`SIGTERM` handler
+ * awaits this teardown before exiting, so it must never block longer than this even if a
+ * subprocess (wedged Chrome renderer, stuck Python cell) refuses to settle.
+ */
+const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
+
+/**
  * Collapse degenerate IRC ephemeral replies before they hit the relay.
  * Models occasionally loop on a single line (~16 reports of N-times-repeated
  * replies); compress runs longer than 3 down to one instance + `[…N×]`, then
@@ -3219,6 +3226,36 @@ export class AgentSession {
 			this.#unsubscribeAppendOnly = undefined;
 		}
 		this.#eventListeners = [];
+	}
+
+	/**
+	 * Bounded, best-effort teardown of the subprocess-spawning resources this session
+	 * owns: the browser tool's headless/spawned Chrome and the Python eval kernel + JS VM
+	 * contexts. Unlike {@link dispose}, this touches only child processes and is time-boxed,
+	 * so a top-level `SIGINT`/`SIGTERM`/`SIGHUP` handler can run it without hanging — without
+	 * it, an external kill bypasses `dispose()` and orphans Chrome/Python to PID 1 (#698).
+	 *
+	 * Idempotent: every step is a no-op once the graceful {@link dispose} path has released
+	 * the resources. Never throws; per-step failures are logged and the whole run is capped
+	 * at `timeoutMs` so a wedged subprocess can't stall process exit.
+	 */
+	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
+		const sessionId = this.sessionManager.getSessionId();
+		const kernelOwnerId = this.#evalKernelOwnerId;
+		const work = Promise.allSettled([
+			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
+			// always closes; connected/attached browsers only disconnect — never killed).
+			releaseTabsForOwner(sessionId, { kill: true }).catch((error: unknown) =>
+				logger.warn("signal teardown: releaseTabsForOwner failed", { error }),
+			),
+			disposeKernelSessionsByOwner(kernelOwnerId).catch((error: unknown) =>
+				logger.warn("signal teardown: disposeKernelSessionsByOwner failed", { error }),
+			),
+			disposeVmContextsByOwner(kernelOwnerId).catch((error: unknown) =>
+				logger.warn("signal teardown: disposeVmContextsByOwner failed", { error }),
+			),
+		]);
+		await Promise.race([work, Bun.sleep(timeoutMs)]);
 	}
 
 	#closeAllProviderSessions(reason: string): void {

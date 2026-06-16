@@ -15,7 +15,7 @@
     },
     "packages/agent": {
       "name": "@gajae-code/agent-core",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
         "@gajae-code/natives": "catalog:",
@@ -30,7 +30,7 @@
     },
     "packages/ai": {
       "name": "@gajae-code/ai",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "bin": {
         "pi-ai": "./src/cli.ts",
       },
@@ -48,14 +48,14 @@
     },
     "packages/bridge-client": {
       "name": "@gajae-code/bridge-client",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "devDependencies": {
         "@types/bun": "catalog:",
       },
     },
     "packages/coding-agent": {
       "name": "@gajae-code/coding-agent",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "bin": {
         "gjc": "src/cli.ts",
       },
@@ -90,7 +90,7 @@
     },
     "packages/gajae-code": {
       "name": "gajae-code",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "bin": {
         "gjc": "bin/gjc.js",
       },
@@ -100,7 +100,7 @@
     },
     "packages/natives": {
       "name": "@gajae-code/natives",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "devDependencies": {
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
@@ -115,7 +115,7 @@
     },
     "packages/stats": {
       "name": "@gajae-code/stats",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "bin": {
         "gjc-stats": "./src/index.ts",
       },
@@ -140,7 +140,7 @@
     },
     "packages/tui": {
       "name": "@gajae-code/tui",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
@@ -180,7 +180,7 @@
     },
     "packages/utils": {
       "name": "@gajae-code/utils",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "beautiful-mermaid": "catalog:",
@@ -218,14 +218,14 @@
     "@biomejs/biome": "^2.4.14",
     "@bufbuild/protobuf": "^2.12.0",
     "@bufbuild/protoc-gen-es": "^2.12.0",
-    "@gajae-code/agent-core": "0.5.2",
-    "@gajae-code/ai": "0.5.2",
-    "@gajae-code/bridge-client": "0.5.2",
-    "@gajae-code/coding-agent": "0.5.2",
-    "@gajae-code/natives": "0.5.2",
-    "@gajae-code/stats": "0.5.2",
-    "@gajae-code/tui": "0.5.2",
-    "@gajae-code/utils": "0.5.2",
+    "@gajae-code/agent-core": "0.5.3",
+    "@gajae-code/ai": "0.5.3",
+    "@gajae-code/bridge-client": "0.5.3",
+    "@gajae-code/coding-agent": "0.5.3",
+    "@gajae-code/natives": "0.5.3",
+    "@gajae-code/stats": "0.5.3",
+    "@gajae-code/tui": "0.5.3",
+    "@gajae-code/utils": "0.5.3",
     "@mozilla/readability": "^0.6.0",
     "@napi-rs/cli": "3.6.2",
     "@opentelemetry/api": "^1.9.0",

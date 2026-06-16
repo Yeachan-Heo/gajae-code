@@ -149,6 +149,8 @@ function isIgnoredPath(relativePath: string): boolean {
 	return (
 		relativePath.startsWith(".git/") ||
 		relativePath.startsWith(".gjc/") ||
+		relativePath.startsWith(".worktrees/") ||
+		relativePath.startsWith(".wt/") ||
 		relativePath.startsWith("node_modules/") ||
 		relativePath.includes("/node_modules/") ||
 		relativePath.startsWith("target/") ||
