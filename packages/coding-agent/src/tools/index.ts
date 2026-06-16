@@ -36,7 +36,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
-import { ComputerTool, isComputerCallable } from "./computer";
+import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
 import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
@@ -323,16 +323,19 @@ export interface BuiltinCapabilityCatalogEntry {
 	defaultEnabled: boolean;
 }
 
-export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[] = [
-	{
-		name: "computer",
-		label: "Computer",
-		summary: "Explicitly enabled macOS desktop screenshot and input control; off by default and supervisor-gated.",
-		docsPath: "docs/tools/computer.md",
-		callableBuiltin: false,
-		defaultEnabled: false,
-	},
-] as const;
+export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[] = isComputerLoadablePlatform()
+	? [
+			{
+				name: "computer",
+				label: "Computer",
+				summary:
+					"Explicitly enabled macOS desktop screenshot and input control; off by default and supervisor-gated.",
+				docsPath: "docs/tools/computer.md",
+				callableBuiltin: false,
+				defaultEnabled: false,
+			},
+		]
+	: [];
 
 export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
@@ -352,7 +355,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
-	computer: ComputerTool.createIf,
+	...(isComputerLoadablePlatform() ? { computer: ComputerTool.createIf } : {}),
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: s => TaskTool.create(s),

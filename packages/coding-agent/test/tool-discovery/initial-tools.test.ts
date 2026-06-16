@@ -6,6 +6,7 @@ import type { ToolSession } from "../../src/tools/index";
 import {
 	AskTool,
 	BUILTIN_TOOLS,
+	ComputerTool,
 	computeEssentialBuiltinNames,
 	createTools,
 	DEFAULT_ESSENTIAL_TOOL_NAMES,
@@ -90,6 +91,7 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),
+		new ComputerTool(toolSession),
 		new SshTool(toolSession, [], new Map(), ""),
 		new JobTool(toolSession),
 		new RecipeTool(toolSession, []),

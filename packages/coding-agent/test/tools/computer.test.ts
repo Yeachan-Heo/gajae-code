@@ -6,6 +6,7 @@ import {
 	computerSchema,
 	createTools,
 	isComputerCallable,
+	isComputerLoadablePlatform,
 	setComputerControllerFactoryForTests,
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
@@ -69,10 +70,12 @@ describe("computer tool gating", () => {
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
 		expect(names).not.toContain("computer");
-		expect(BUILTIN_CAPABILITY_CATALOG.find(entry => entry.name === "computer")).toMatchObject({
-			callableBuiltin: false,
-			defaultEnabled: false,
-		});
+		const catalogEntry = BUILTIN_CAPABILITY_CATALOG.find(entry => entry.name === "computer");
+		if (isComputerLoadablePlatform()) {
+			expect(catalogEntry).toMatchObject({ callableBuiltin: false, defaultEnabled: false });
+		} else {
+			expect(catalogEntry).toBeUndefined();
+		}
 		const discoverable = tools.filter(t => t.loadMode === "discoverable").map(t => t.name);
 		expect(discoverable).not.toContain("computer");
 	});
@@ -90,6 +93,12 @@ describe("computer tool gating", () => {
 
 	it("is absent on non-macOS even when settings enable it", () => {
 		expect(isComputerCallable(createSession(Settings.isolated({ "computer.enabled": true })), "linux")).toBe(false);
+	});
+
+	it("is loadable on macOS and Linux but not loaded at all on Windows", () => {
+		expect(isComputerLoadablePlatform("darwin")).toBe(true);
+		expect(isComputerLoadablePlatform("linux")).toBe(true);
+		expect(isComputerLoadablePlatform("win32")).toBe(false);
 	});
 
 	it("returns COMPUTER_DISABLED without constructing native controller when directly invoked while disabled", async () => {

@@ -160,6 +160,14 @@ export function isComputerSupportedPlatform(platform: NodeJS.Platform = process.
 	return platform === "darwin";
 }
 
+/**
+ * Whether the computer capability is loaded/advertised at all on this platform.
+ * macOS is callable; Linux is listable (support planned); Windows is fully absent.
+ */
+export function isComputerLoadablePlatform(platform: NodeJS.Platform = process.platform): boolean {
+	return platform !== "win32";
+}
+
 export function isComputerEnabled(session: Pick<ToolSession, "settings">): boolean {
 	return Boolean(session.settings.get("computer.enabled") || session.settings.get("computer.alwaysOn"));
 }
