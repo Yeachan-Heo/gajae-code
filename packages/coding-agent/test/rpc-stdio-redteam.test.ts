@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { parseSessionEntries } from "@gajae-code/coding-agent";
@@ -268,6 +268,7 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		const alphaCwd = path.join(workspace, "alpha");
 		const betaCwd = path.join(workspace, "beta");
 		await Promise.all([mkdir(alphaCwd, { recursive: true }), mkdir(betaCwd, { recursive: true })]);
+		const [expectedAlphaCwd, expectedBetaCwd] = await Promise.all([realpath(alphaCwd), realpath(betaCwd)]);
 
 		const [alpha, beta] = await Promise.all([
 			driveRpcServer(
@@ -302,8 +303,8 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 
 		const alphaOutput = frameData<{ output: string }>(findResponse(alpha.frames, "bash")).output.trim();
 		const betaOutput = frameData<{ output: string }>(findResponse(beta.frames, "bash")).output.trim();
-		expect(JSON.parse(alphaOutput)).toEqual({ lane: "alpha", cwd: alphaCwd });
-		expect(JSON.parse(betaOutput)).toEqual({ lane: "beta", cwd: betaCwd });
+		expect(JSON.parse(alphaOutput)).toEqual({ lane: "alpha", cwd: expectedAlphaCwd });
+		expect(JSON.parse(betaOutput)).toEqual({ lane: "beta", cwd: expectedBetaCwd });
 	}, 30_000);
 	it("does not head-of-line-block control commands behind a running bash; abort_bash cancels it (issue 13)", async () => {
 		const harness = spawnRpcServer();

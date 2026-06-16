@@ -42,7 +42,7 @@ describe("public memory tool surface", () => {
 
 		const tools = await createTools(
 			createToolSession(Settings.isolated({ "memory.backend": "hindsight", "tools.discoveryMode": "all" })),
-			Object.keys(BUILTIN_TOOLS),
+			["memory", "recall", "retain", "reflect"],
 		);
 		expect(tools.map(tool => tool.name)).not.toEqual(
 			expect.arrayContaining(["memory", "recall", "retain", "reflect"]),

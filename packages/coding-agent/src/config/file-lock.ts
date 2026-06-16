@@ -101,7 +101,15 @@ function ownerLiveness(pid: number): OwnerLiveness {
 
 async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> {
 	const info = await readLockInfo(lockPath);
-	if (!info) return true;
+	if (!info) {
+		try {
+			const stats = await fs.stat(lockPath);
+			return Date.now() - stats.mtimeMs > staleMs;
+		} catch (err) {
+			if (isEnoent(err)) return false;
+			throw err;
+		}
+	}
 
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
