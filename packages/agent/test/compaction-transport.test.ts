@@ -35,6 +35,14 @@ const MODEL: Model = {
 	maxTokens: 32_768,
 };
 
+const CODEX_MODEL: Model = {
+	...MODEL,
+	id: "codex-mock-model",
+	name: "codex-mock-model",
+	api: "openai-codex-responses",
+	provider: "openai",
+};
+
 afterEach(() => {
 	vi.restoreAllMocks();
 });
@@ -208,7 +216,7 @@ describe("split-turn compaction sequencing (#736)", () => {
 		const tracker = spyTrackingConcurrency();
 		const providerSessionState = new Map<string, ProviderSessionState>();
 
-		await compact(splitPreparation(), MODEL, "k", undefined, undefined, {
+		await compact(splitPreparation(), CODEX_MODEL, "k", undefined, undefined, {
 			sessionId: "turn-session-seq",
 			providerSessionState,
 			preferWebsockets: true,
@@ -221,7 +229,7 @@ describe("split-turn compaction sequencing (#736)", () => {
 		const tracker = spyTrackingConcurrency();
 		const providerSessionState = new Map<string, ProviderSessionState>();
 
-		await compact(splitPreparation(), MODEL, "k", undefined, undefined, {
+		await compact(splitPreparation(), CODEX_MODEL, "k", undefined, undefined, {
 			sessionId: "turn-session-env",
 			providerSessionState,
 		});
@@ -233,10 +241,23 @@ describe("split-turn compaction sequencing (#736)", () => {
 		const tracker = spyTrackingConcurrency();
 		const providerSessionState = new Map<string, ProviderSessionState>();
 
-		await compact(splitPreparation(), MODEL, "k", undefined, undefined, {
+		await compact(splitPreparation(), CODEX_MODEL, "k", undefined, undefined, {
 			sessionId: "turn-session-http",
 			providerSessionState,
 			preferWebsockets: false,
+		});
+
+		expect(tracker.peak()).toBe(2);
+	});
+
+	it("runs the two summaries in parallel for non-Codex providers even when transport fields are present", async () => {
+		const tracker = spyTrackingConcurrency();
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		await compact(splitPreparation(), MODEL, "k", undefined, undefined, {
+			sessionId: "turn-session-non-codex",
+			providerSessionState,
+			preferWebsockets: true,
 		});
 
 		expect(tracker.peak()).toBe(2);

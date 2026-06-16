@@ -1193,12 +1193,16 @@ export async function compact(
 
 	// A single active Codex WebSocket session cannot service two concurrent
 	// requests ("websocket request already in progress"). When the maintenance
-	// calls share one provider session and websocket transport is not explicitly
-	// disabled, run the split-turn history and turn-prefix summaries sequentially.
-	// This covers websocket activation from config/env/model defaults too: the
-	// provider can select websockets even when `preferWebsockets` is undefined.
+	// calls use the Codex Responses provider, share one provider session, and
+	// websocket transport is not explicitly disabled, run the split-turn history
+	// and turn-prefix summaries sequentially. This covers websocket activation
+	// from config/env/model defaults too: the provider can select websockets even
+	// when `preferWebsockets` is undefined, while non-Codex providers keep the
+	// previous parallel behavior.
 	const summariesMayShareWebSocketSession = Boolean(
-		summaryOptions.providerSessionState && summaryOptions.preferWebsockets !== false,
+		model.api === "openai-codex-responses" &&
+			summaryOptions.providerSessionState &&
+			summaryOptions.preferWebsockets !== false,
 	);
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
