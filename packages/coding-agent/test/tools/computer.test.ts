@@ -127,39 +127,47 @@ describe("computer tool dispatch", () => {
 		setComputerPlatformForTests(undefined);
 	});
 
-	it("maps snake_case model actions to native controller methods and forwards AbortSignal", async () => {
+	it("maps snake_case model actions to native controller methods positionally", async () => {
 		setComputerPlatformForTests("darwin");
-		const calls: Array<{ method: string; payload: unknown; signal?: AbortSignal }> = [];
+		const calls: Array<{ method: string; args: unknown[] }> = [];
 		setComputerControllerFactoryForTests(() => ({
-			screenshot: (payload, options) => {
-				calls.push({ method: "screenshot", payload, signal: options?.signal });
+			screenshot: () => {
+				calls.push({ method: "screenshot", args: [] });
 				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), captureId: "cap-1" };
 			},
-			doubleClick: (payload, options) => calls.push({ method: "doubleClick", payload, signal: options?.signal }),
-			drag: (payload, options) => calls.push({ method: "drag", payload, signal: options?.signal }),
-			scroll: (payload, options) => calls.push({ method: "scroll", payload, signal: options?.signal }),
+			doubleClick: (...args) => {
+				calls.push({ method: "doubleClick", args });
+			},
+			drag: (...args) => {
+				calls.push({ method: "drag", args });
+			},
+			scroll: (...args) => {
+				calls.push({ method: "scroll", args });
+			},
 		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-		const controller = new AbortController();
-		const shot = await tool.execute("shot", { action: "screenshot", timeout: 2 }, controller.signal);
-		await tool.execute("dbl", { action: "double_click", x: 1, y: 2, button: "right" }, controller.signal);
-		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 }, controller.signal);
-		await tool.execute("scroll", { action: "scroll", x: 1, y: 2, scroll_x: 5, scroll_y: -6 }, controller.signal);
+		const shot = await tool.execute("shot", { action: "screenshot", timeout: 2 });
+		await tool.execute("dbl", { action: "double_click", x: 1, y: 2, button: "right" });
+		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 });
+		await tool.execute("scroll", { action: "scroll", x: 1, y: 2, scroll_x: 5, scroll_y: -6 });
 
 		expect(shot.details?.screenshot).toMatchObject({ widthPx: 20, heightPx: 10, pngBytes: 3, captureId: "cap-1" });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "doubleClick", "drag", "scroll"]);
-		expect(calls[1].payload).toMatchObject({ x: 1, y: 2, button: "right" });
-		expect(calls[2].payload).toMatchObject({ x: 1, y: 2, toX: 3, toY: 4, button: "left" });
-		expect(calls[3].payload).toMatchObject({ x: 1, y: 2, scrollX: 5, scrollY: -6 });
-		expect(calls.every(call => call.signal instanceof AbortSignal)).toBe(true);
+		// Positional native ABI: (expectedEpoch, x, y, ...rest)
+		expect(calls[1].args).toEqual([undefined, 1, 2, "right"]);
+		expect(calls[2].args).toEqual([undefined, 1, 2, 3, 4, "left"]);
+		expect(calls[3].args).toEqual([undefined, 1, 2, 5, -6]);
 	});
 
-	it("maps native COMPUTER_* errors into bounded tool errors", async () => {
+	it("maps native COMPUTER_* errors carried in the message into bounded tool errors", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerControllerFactoryForTests(() => ({
 			click: () => {
-				const error = new Error("supervisor is not live") as Error & { code: string };
-				error.code = "COMPUTER_SUPERVISOR_NOT_LIVE";
+				// Mirror the real NAPI error: stable code in the message, generic .code.
+				const error = new Error("COMPUTER_SUPERVISOR_NOT_LIVE: supervisor is not live") as Error & {
+					code: string;
+				};
+				error.code = "GenericFailure";
 				throw error;
 			},
 		}));

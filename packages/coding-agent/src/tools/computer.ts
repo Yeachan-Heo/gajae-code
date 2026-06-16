@@ -104,15 +104,15 @@ export interface ComputerToolDetails {
 }
 
 type NativeController = {
-	screenshot?: (payload?: unknown, options?: { signal?: AbortSignal }) => Promise<NativeScreenshot> | NativeScreenshot;
-	click?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	doubleClick?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	move?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	drag?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	scroll?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	type?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	keypress?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
-	wait?: (payload: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
+	screenshot?: () => Promise<NativeScreenshot> | NativeScreenshot;
+	click?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
+	doubleClick?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
+	move?: (expectedEpoch: number | undefined, x: number, y: number) => void;
+	drag?: (expectedEpoch: number | undefined, x: number, y: number, toX: number, toY: number, button?: string) => void;
+	scroll?: (expectedEpoch: number | undefined, x: number, y: number, scrollX: number, scrollY: number) => void;
+	type?: (expectedEpoch: number | undefined, text: string) => void;
+	keypress?: (expectedEpoch: number | undefined, keys: string[]) => void;
+	wait?: (expectedEpoch: number | undefined, ms: number) => void;
 };
 
 type NativeScreenshot = {
@@ -228,10 +228,10 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 		try {
 			throwIfAborted(signal);
 			const timeoutSeconds = clampTimeout("computer", params.timeout);
-			const timeoutSignal = timeoutSeconds > 0 ? AbortSignal.timeout(timeoutSeconds * 1000) : undefined;
-			const combinedSignal =
-				signal && timeoutSignal ? AbortSignal.any([signal, timeoutSignal]) : (signal ?? timeoutSignal);
-			const result = await dispatchComputerAction(controllerFactory(), params, combinedSignal);
+			const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
+			// Native ComputerController methods are synchronous and accept no AbortSignal,
+			// so cancellation is honored before dispatch and wait() is bounded by timeoutMs.
+			const result = await dispatchComputerAction(controllerFactory(), params, timeoutMs);
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) details.screenshot = screenshot;
 			details.status = "success";
@@ -248,91 +248,32 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 	}
 }
 
-async function dispatchComputerAction(
+function dispatchComputerAction(
 	controller: NativeController,
 	params: ComputerParams,
-	signal?: AbortSignal,
-): Promise<unknown> {
-	const options = { signal };
+	timeoutMs: number | undefined,
+): Promise<unknown> | unknown {
+	// expectedEpoch is undefined until lossless epoch transport lands (follow-up):
+	// the native gate skips the stale-display check when the epoch is absent.
 	switch (params.action) {
 		case "screenshot":
-			return controller.screenshot?.(
-				{ timeoutMs: secondsToMs(params.timeout), includeScreenshot: params.include_screenshot },
-				options,
-			);
+			return controller.screenshot?.();
 		case "click":
-			return controller.click?.(
-				{
-					x: params.x,
-					y: params.y,
-					button: params.button ?? "left",
-					timeoutMs: secondsToMs(params.timeout),
-					includeScreenshot: params.include_screenshot,
-				},
-				options,
-			);
+			return controller.click?.(undefined, params.x, params.y, params.button ?? "left");
 		case "double_click":
-			return controller.doubleClick?.(
-				{
-					x: params.x,
-					y: params.y,
-					button: params.button ?? "left",
-					timeoutMs: secondsToMs(params.timeout),
-					includeScreenshot: params.include_screenshot,
-				},
-				options,
-			);
+			return controller.doubleClick?.(undefined, params.x, params.y, params.button ?? "left");
 		case "move":
-			return controller.move?.(
-				{
-					x: params.x,
-					y: params.y,
-					button: params.button,
-					timeoutMs: secondsToMs(params.timeout),
-					includeScreenshot: params.include_screenshot,
-				},
-				options,
-			);
+			return controller.move?.(undefined, params.x, params.y);
 		case "drag":
-			return controller.drag?.(
-				{
-					x: params.x,
-					y: params.y,
-					toX: params.to_x,
-					toY: params.to_y,
-					button: params.button ?? "left",
-					timeoutMs: secondsToMs(params.timeout),
-					includeScreenshot: params.include_screenshot,
-				},
-				options,
-			);
+			return controller.drag?.(undefined, params.x, params.y, params.to_x, params.to_y, params.button ?? "left");
 		case "scroll":
-			return controller.scroll?.(
-				{
-					x: params.x,
-					y: params.y,
-					scrollX: params.scroll_x,
-					scrollY: params.scroll_y,
-					timeoutMs: secondsToMs(params.timeout),
-					includeScreenshot: params.include_screenshot,
-				},
-				options,
-			);
+			return controller.scroll?.(undefined, params.x, params.y, params.scroll_x, params.scroll_y);
 		case "type":
-			return controller.type?.(
-				{ text: params.text, timeoutMs: secondsToMs(params.timeout), includeScreenshot: params.include_screenshot },
-				options,
-			);
+			return controller.type?.(undefined, params.text);
 		case "keypress":
-			return controller.keypress?.(
-				{ keys: params.keys, timeoutMs: secondsToMs(params.timeout), includeScreenshot: params.include_screenshot },
-				options,
-			);
+			return controller.keypress?.(undefined, params.keys);
 		case "wait":
-			return controller.wait?.(
-				{ ms: params.ms, timeoutMs: secondsToMs(params.timeout), includeScreenshot: params.include_screenshot },
-				options,
-			);
+			return controller.wait?.(undefined, capWaitMs(params.ms, timeoutMs));
 	}
 }
 
@@ -350,8 +291,11 @@ function detailsFromParams(params: ComputerParams): ComputerToolDetails {
 	return details;
 }
 
-function secondsToMs(seconds: number | undefined): number | undefined {
-	return typeof seconds === "number" ? seconds * 1000 : undefined;
+const MAX_COMPUTER_WAIT_MS = 60_000;
+
+function capWaitMs(ms: number, timeoutMs: number | undefined): number {
+	const ceiling = timeoutMs && timeoutMs > 0 ? timeoutMs : MAX_COMPUTER_WAIT_MS;
+	return Math.min(Math.max(0, ms), ceiling);
 }
 
 function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefined {
@@ -383,15 +327,19 @@ function getPngByteLength(png: NativeScreenshot["png"]): number | undefined {
 }
 
 function mapComputerError(error: unknown): { code: string; message: string } {
-	if (error instanceof Error && error.name === "AbortError") {
+	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
 		return { code: "COMPUTER_CANCELLED", message: "Computer action was cancelled." };
 	}
 	const maybe = error as { code?: unknown; message?: unknown };
-	const rawCode = typeof maybe?.code === "string" ? maybe.code : undefined;
-	const code =
-		rawCode && (NATIVE_ERROR_CODES.has(rawCode) || rawCode.startsWith("COMPUTER_")) ? rawCode : "COMPUTER_ERROR";
 	const message =
 		typeof maybe?.message === "string" && maybe.message.length > 0 ? maybe.message : "Computer action failed.";
+	const rawCode = typeof maybe?.code === "string" ? maybe.code : undefined;
+	const isComputerCode = (value: string | undefined): value is string =>
+		value !== undefined && (NATIVE_ERROR_CODES.has(value) || value.startsWith("COMPUTER_"));
+	// Native NAPI errors carry the stable code in the message ("CODE: reason") with
+	// error.code set to the NAPI status, so fall back to the message prefix.
+	const messageCode = /^(COMPUTER_[A-Z_]+):/.exec(message)?.[1];
+	const code = isComputerCode(rawCode) ? rawCode : (messageCode ?? "COMPUTER_ERROR");
 	return { code, message };
 }
 
