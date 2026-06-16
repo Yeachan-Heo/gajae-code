@@ -1,6 +1,11 @@
-import { describe, expect, it } from "bun:test";
-import { parseSearchArgs } from "../../../src/cli/web-search-cli";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { parseSearchArgs, runSearchCommand } from "../../../src/cli/web-search-cli";
 import Search from "../../../src/commands/web-search";
+import { resetSettingsForTest, Settings } from "../../../src/config/settings";
 
 describe("web search CLI args", () => {
 	it("parses inline xAI search flags", () => {
@@ -58,5 +63,61 @@ describe("web search CLI args", () => {
 		expect(Search.flags["allowed-x-handles"]?.multiple).toBe(true);
 		expect(Search.flags["excluded-x-handle"]?.multiple).toBe(true);
 		expect(Search.flags["excluded-x-handles"]?.multiple).toBe(true);
+	});
+});
+
+const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
+const originalXaiApiKey = process.env.XAI_API_KEY;
+const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+let testAgentDir = "";
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	testAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-web-search-cli-"));
+	setAgentDir(testAgentDir);
+});
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	resetSettingsForTest();
+	if (originalAgentDir) {
+		setAgentDir(originalAgentDir);
+	} else {
+		setAgentDir(fallbackAgentDir);
+		delete process.env.GJC_CODING_AGENT_DIR;
+	}
+	if (originalXaiApiKey === undefined) delete process.env.XAI_API_KEY;
+	else process.env.XAI_API_KEY = originalXaiApiKey;
+	await fs.rm(testAgentDir, { recursive: true, force: true });
+});
+
+describe("web search CLI settings", () => {
+	it("honors the configured web search provider when --provider is omitted", async () => {
+		process.env.XAI_API_KEY = "sk-test-xai";
+		await Settings.init({
+			agentDir: testAgentDir,
+			inMemory: true,
+			overrides: { "providers.webSearch": "xai" },
+		});
+
+		const fetchMock = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+			expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer sk-test-xai");
+			return Response.json({
+				output_text: "answer",
+				citations: ["https://docs.x.ai/developers/tools/web-search"],
+				model: "grok-4.3",
+			});
+		}) as typeof fetch;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+		let output = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+
+		await runSearchCommand({ query: "configured provider", expanded: false });
+
+		expect(fetchSpy).toHaveBeenCalled();
+		expect(Bun.stripANSI(output)).toContain("Provider: xAI");
 	});
 });
