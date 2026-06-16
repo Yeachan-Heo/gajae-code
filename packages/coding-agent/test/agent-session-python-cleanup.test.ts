@@ -83,10 +83,11 @@ const emptyWorkspaceTree = (cwd: string): WorkspaceTree => ({
 	agentsMdFiles: [],
 });
 
-const mockPositiveSleepsImmediate = () => {
+const PYTHON_DISPOSE_WAIT_MS = 3_000;
+const mockLongPythonDisposeSleepsImmediate = () => {
 	const realSleep = Bun.sleep.bind(Bun);
 	return vi.spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
-		if (typeof duration === "number" && duration > 0) {
+		if (typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS) {
 			return Promise.resolve();
 		}
 		return realSleep(duration ?? 0);
@@ -406,7 +407,7 @@ describe("AgentSession python cleanup", () => {
 				toolExecutionSettled = true;
 			});
 		await blockedExecuteStarted.promise;
-		const sleepSpy = mockPositiveSleepsImmediate();
+		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
 		let disposed = false;
 		const disposeSession = session.dispose().then(() => {
@@ -415,7 +416,9 @@ describe("AgentSession python cleanup", () => {
 
 		const [toolResult] = await Promise.all([toolExecution, disposeSession]);
 
-		expect(sleepSpy.mock.calls.some(([duration]) => typeof duration === "number" && duration > 0)).toBe(true);
+		expect(
+			sleepSpy.mock.calls.some(([duration]) => typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS),
+		).toBe(true);
 
 		expect(disposed).toBe(true);
 		expect(toolExecutionSettled).toBe(true);
@@ -438,7 +441,7 @@ describe("AgentSession python cleanup", () => {
 		kernel.abortBlockedExecution = false;
 
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		const sleepSpy = vi.spyOn(Bun, "sleep").mockResolvedValue(undefined);
+		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
@@ -460,7 +463,7 @@ describe("AgentSession python cleanup", () => {
 			firstDisposed = true;
 		});
 		await disposeFirst;
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expect(sleepSpy).toHaveBeenCalledWith(PYTHON_DISPOSE_WAIT_MS);
 
 		expect(firstDisposed).toBe(true);
 		expect(firstExecutionSettled).toBe(false);
@@ -699,10 +702,10 @@ describe("AgentSession python cleanup", () => {
 		const firstExecution = session.executePython("print('first')");
 		await blockedExecutionStarted.promise;
 		const secondExecution = session.executePython("print('second')");
-		const sleepSpy = mockPositiveSleepsImmediate();
+		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
 		await session.dispose();
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expect(sleepSpy).toHaveBeenCalledWith(PYTHON_DISPOSE_WAIT_MS);
 		const [firstResult, secondResult] = await Promise.all([firstExecution, secondExecution]);
 
 		expect(firstResult.cancelled).toBe(true);

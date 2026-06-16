@@ -62,7 +62,7 @@ export interface BashResult {
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 const retiringShellSessions = new Set<Shell>();
-const CANCEL_CLEANUP_WAIT_MS = 1_000;
+const CANCEL_CLEANUP_WAIT_MS = 250;
 
 /** Number of persistent shell sessions currently retained (owner gauge). */
 export function getShellSessionCount(): number {
