@@ -40,6 +40,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 <Execution_Policy>
 - Ask ONE question at a time -- never batch multiple questions
 - Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
+- Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
 - Target the WEAKEST clarity dimension with each question
 - Before Round 1 ambiguity scoring, run a one-time Round 0 topology enumeration gate that confirms the top-level component list and locks it into state
 - Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
@@ -175,6 +176,8 @@ The first line of this announcement MUST be exactly the Phase 0 threshold marker
 > **Project type:** {greenfield|brownfield}
 > **Current ambiguity:** 100% (we haven't started yet)
 
+Before emitting the prose lines in this announcement, apply the `<Execution_Policy>` self-proofread once; keep the required threshold marker and the quoted `{initial_idea}` unchanged.
+
 ## Round 0: Topology Enumeration Gate
 
 Run this gate exactly once after Phase 1 initialization and before any Phase 2 ambiguity scoring. The goal is to lock the **shape** of the user's scope before depth-first Socratic questioning can overfit to the most-described component.
@@ -292,6 +295,8 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 ```
 
 Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present.
+
+After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only; preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
 When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line; if metadata cannot be supplied, the legacy formatted question text remains the fallback.
 
@@ -436,6 +441,8 @@ Round {n} complete.
 
 Apply `language.instruction` when present before showing this progress report so status text, gaps, and next-target phrasing stay in the preserved session language.
 
+Then apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing; preserve only table structure, fixed status labels, scores, weights, component ids, and trigger tokens.
+
 ### Step 2e: Update State
 
 Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/state` directly unless an explicit force override is active.
@@ -486,6 +493,7 @@ When ambiguity ≤ threshold (or hard cap / early exit):
 
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
    - Apply `language.instruction` when present so user-facing prose in the spec preserves the session language; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
+   - Apply the self-proofread once to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/specs/deep-interview-{slug}.md` unchanged.
 2. **Write the final spec through the workflow CLI**: persist the artifact at `.gjc/specs/deep-interview-{slug}.md`
    - Always use this exact final spec path. Do not write temporary working files to the repo root or other ad hoc paths; repos may allowlist `.gjc/` for planning artifacts while protecting product branches.
    - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--json]` for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
@@ -785,6 +793,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 <Final_Checklist>
 - [ ] Phase 0 ran before anything: threshold resolved and first line emitted as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`; state and spec metadata record both `threshold` and `threshold_source`
 - [ ] `language.instruction` preserved across announcements, questions, options, progress reports, and spec prose when present
+- [ ] User-facing natural-language prose, including generated prose clauses/cells inside round lines or tables, was silently self-proofread once according to `language.instruction`, while code/paths/commands/keys/table or round structure/fixed labels/status tokens/quotes/threshold markers/fixed paths remained unchanged
 - [ ] Oversized initial context/history summarized before scoring, question generation, spec generation, or handoff
 - [ ] Round 0 topology gate completed before scoring; `topology.confirmed_at` persisted
 - [ ] Ambiguity scored and displayed every round, naming the weakest component/dimension target (rotating across active components when N > 1)
