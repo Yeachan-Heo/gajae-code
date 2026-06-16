@@ -223,26 +223,26 @@ describe("searchCodex model selection", () => {
 
 	it("uses the built-in default model when PI_CODEX_WEB_SEARCH_MODEL is unset", async () => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
-		using _hook = mockCodexFetch("gpt-5.4");
+		using _hook = mockCodexFetch("gpt-5.5");
 
 		const result = await searchCodex(makeSearchParams("default codex model"));
 
 		expect(capturedRequest).not.toBeNull();
 		expect(capturedRequest?.url).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(capturedRequest?.body?.model).toBe("gpt-5.4");
-		expect(result.model).toBe("gpt-5.4");
+		expect(capturedRequest?.body?.model).toBe("gpt-5.5");
+		expect(result.model).toBe("gpt-5.5");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
 
 	it("falls back to the default model when PI_CODEX_WEB_SEARCH_MODEL is blank", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "   ";
-		using _hook = mockCodexFetch("gpt-5.4");
+		using _hook = mockCodexFetch("gpt-5.5");
 
 		const result = await searchCodex(makeSearchParams("blank codex model"));
 
 		expect(capturedRequest).not.toBeNull();
-		expect(capturedRequest?.body?.model).toBe("gpt-5.4");
-		expect(result.model).toBe("gpt-5.4");
+		expect(capturedRequest?.body?.model).toBe("gpt-5.5");
+		expect(result.model).toBe("gpt-5.5");
 	});
 	it("retries the next bundled default when Codex rejects a model for ChatGPT accounts", async () => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
@@ -258,17 +258,17 @@ describe("searchCodex model selection", () => {
 
 			const requestedModel = capturedRequest.body?.model;
 			if (calls === 1) {
-				expect(requestedModel).toBe("gpt-5.4");
+				expect(requestedModel).toBe("gpt-5.5");
 				return new Response(
 					JSON.stringify({
-						detail: "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+						detail: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
 					}),
 					{ status: 400, headers: { "Content-Type": "application/json" } },
 				);
 			}
 
-			expect(requestedModel).toBe("gpt-5-codex");
-			return new Response(makeSseResponse("gpt-5-codex"), {
+			expect(requestedModel).toBe("gpt-5.4");
+			return new Response(makeSseResponse("gpt-5.4"), {
 				status: 200,
 				headers: { "Content-Type": "text/event-stream" },
 			});
@@ -277,7 +277,7 @@ describe("searchCodex model selection", () => {
 		const result = await searchCodex(makeSearchParams("retry unsupported default"));
 
 		expect(calls).toBe(2);
-		expect(result.model).toBe("gpt-5-codex");
+		expect(result.model).toBe("gpt-5.4");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
 

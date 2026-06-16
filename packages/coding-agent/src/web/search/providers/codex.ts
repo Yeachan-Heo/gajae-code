@@ -19,8 +19,9 @@ import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
-const FALLBACK_MODEL = "gpt-5.4";
+const FALLBACK_MODEL = "gpt-5.5";
 const DEFAULT_MODEL_PREFERENCES = [
+	"gpt-5.5",
 	"gpt-5.4",
 	"gpt-5-codex",
 	"gpt-5",
@@ -453,12 +454,12 @@ async function callCodexSearch(
  * Executes a web search using OpenAI code provider's built-in web search tool.
  *
  * Default-model behavior:
- * - If `PI_OPENAI_CODE_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
+ * - If `PI_CODEX_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
  *   upstream error verbatim.
- * - Otherwise prefer ChatGPT-account-safe bundled defaults (GPT-5.4, GPT-5
- *   OpenAI code backend, GPT-5, …) and retry the next candidate only when OpenAI code backend returns the
+ * - Otherwise prefer ChatGPT-account-safe bundled defaults (GPT-5.5, GPT-5.4,
+ *   GPT-5 code backend, …) and retry the next candidate only when OpenAI code backend returns the
  *   known 400 "model is not supported" family. This avoids selecting
- *   `gpt-5-OpenAI code backend-mini` first on ChatGPT accounts, which OpenAI rejects.
+ *   `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI rejects.
  */
 export async function searchCodex(params: SearchParams): Promise<SearchResponse> {
 	const auth = await findCodexAuth(params.authStorage, params.sessionId, params.signal);
