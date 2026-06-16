@@ -5,7 +5,9 @@ import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry"
 import type { ToolSession } from "../../src/tools/index";
 import {
 	AskTool,
+	BUILTIN_CAPABILITY_CATALOG,
 	BUILTIN_TOOLS,
+	ComputerTool,
 	computeEssentialBuiltinNames,
 	createTools,
 	DEFAULT_ESSENTIAL_TOOL_NAMES,
@@ -90,12 +92,20 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),
+		new ComputerTool(toolSession),
 		new SshTool(toolSession, [], new Map(), ""),
 		new JobTool(toolSession),
 		new RecipeTool(toolSession, []),
 		new IrcTool(toolSession),
 	]) {
 		metadata.set(tool.name, { loadMode: tool.loadMode, summary: tool.summary });
+	}
+	// `computer` is a public built-in factory but intentionally returns null on
+	// non-macOS/disabled sessions. Keep this registry-shape assertion independent
+	// from platform gating by reading its static capability metadata.
+	const computerCapability = BUILTIN_CAPABILITY_CATALOG.find(entry => entry.name === "computer");
+	if (computerCapability) {
+		metadata.set("computer", { loadMode: "discoverable", summary: computerCapability.summary });
 	}
 	return metadata;
 }

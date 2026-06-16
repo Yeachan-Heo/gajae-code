@@ -801,13 +801,128 @@ function evidenceKindMatches(kind: string, words: string[]): boolean {
 
 type SurfaceFamily = "web" | "cli" | "native" | "api-package" | "algorithm-math" | "unknown";
 
+type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
+type UltragoalChangeCategory =
+	| "code"
+	| "generated-binding"
+	| "tool"
+	| "settings-registry"
+	| "prompt-doc-behavior"
+	| "docs-static"
+	| "other";
+interface UltragoalChangeSetPath extends JsonObject {
+	path: string;
+	status: UltragoalChangeStatus;
+	oldPath?: string;
+	category?: UltragoalChangeCategory;
+}
+interface UltragoalChangeSet extends JsonObject {
+	source: "checkpoint-git" | "review-pr" | "review-branch" | "review-worktree" | "review-spec";
+	baseRef?: string;
+	headRef?: string;
+	mergeBase?: string;
+	paths: UltragoalChangeSetPath[];
+	rawDiffStat?: string;
+	trusted: true;
+}
+
+const COMPUTER_SURFACE_TOKENS = new Set(["computer", "computer-use", "desktop-input", "native-input"]);
+const MANDATORY_COMPUTER_CASE_IDS = [
+	"kill-switch-bypass",
+	"suspended-enforcement",
+	"permission-revoked",
+	"display-stale",
+	"out-of-bounds-drift",
+	"runaway-loop-halt",
+	"blast-radius",
+] as const;
+
+function normalizeRepoPath(value: string): string {
+	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
+}
+
+function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
+	const normalized = normalizeRepoPath(value);
+	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
+	if (/^packages\/natives\/native\/index\.(?:d\.ts|js)$/.test(normalized)) return "generated-binding";
+	if (
+		normalized === "packages/coding-agent/src/tools/computer.ts" ||
+		normalized.startsWith("packages/coding-agent/src/tools/computer/")
+	)
+		return "tool";
+	if (
+		normalized === "packages/coding-agent/src/tools/index.ts" ||
+		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
+		normalized === "packages/coding-agent/src/config/settings-schema.ts"
+	)
+		return "settings-registry";
+	if (
+		normalized === "packages/coding-agent/src/prompts/tools/computer.md" ||
+		normalized === "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md" ||
+		normalized === "packages/coding-agent/src/prompts/agents/executor.md"
+	)
+		return "prompt-doc-behavior";
+	if (normalized === "docs/tools/computer.md" || normalized === "docs/computer-use/README.md") return "docs-static";
+	return "other";
+}
+
+function isComputerChangePath(row: UltragoalChangeSetPath): boolean {
+	return (
+		categorizeComputerChangePath(row.path) !== "other" ||
+		(row.oldPath ? categorizeComputerChangePath(row.oldPath) !== "other" : false)
+	);
+}
+
+function isDocsOnlyStaticComputerChangeSet(changeSet: UltragoalChangeSet | undefined): boolean {
+	if (!changeSet || changeSet.paths.length === 0) return false;
+	return changeSet.paths.every(row => {
+		const category = row.category ?? categorizeComputerChangePath(row.path);
+		const oldCategory = row.oldPath ? categorizeComputerChangePath(row.oldPath) : category;
+		return category === "docs-static" && oldCategory === "docs-static";
+	});
+}
+
+function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
+	if (!changeSet || !changeSet.trusted) return false;
+	if (isDocsOnlyStaticComputerChangeSet(changeSet)) return false;
+	return changeSet.paths.some(isComputerChangePath);
+}
+
+function executorQaDeclaresComputerTouching(executorQa: JsonObject): boolean {
+	if (executorQa.computerTouching === true) return true;
+	const surfaces = Array.isArray(executorQa.surfaces) ? executorQa.surfaces : [];
+	if (surfaces.some(value => typeof value === "string" && COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(value))))
+		return true;
+	const surfaceRows = Array.isArray(executorQa.surfaceEvidence) ? executorQa.surfaceEvidence : [];
+	return surfaceRows.some(row => {
+		const object = qualityGateObject(row);
+		const surface = object ? nonEmptyString(object.surface) : null;
+		return surface ? COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(surface)) : false;
+	});
+}
+
+function requiresComputerRedTeamSuite(executorQa: JsonObject, changeSet: UltragoalChangeSet | undefined): boolean {
+	if (trustedChangeSetRequiresComputerSuite(changeSet)) return true;
+	const declaredPaths = Array.isArray(executorQa.changedPaths) ? executorQa.changedPaths : [];
+	return declaredPaths.some(value => typeof value === "string" && categorizeComputerChangePath(value) !== "other");
+}
+
+function normalizeAdversarialCaseId(value: string): string {
+	return normalizeSurfaceToken(value).replace(/\s+/g, "-");
+}
+
 export function normalizeSurfaceToken(value: string): string {
 	return value.toLowerCase().replaceAll("_", "-").trim();
 }
 
 export function surfaceFamily(value: string): SurfaceFamily {
 	const normalized = normalizeSurfaceToken(value);
-	if (["native", "desktop", "tui"].some(word => normalized.includes(word))) return "native";
+	if (
+		["computer", "computer-use", "desktop-input", "native-input", "native", "desktop", "tui"].some(word =>
+			normalized.includes(word),
+		)
+	)
+		return "native";
 	if (["gui", "web", "browser", "ui", "visual"].some(word => normalized.includes(word))) return "web";
 	if (["cli", "terminal", "command"].some(word => normalized.includes(word))) return "cli";
 	if (["api", "package", "library", "sdk"].some(word => normalized.includes(word))) return "api-package";
@@ -1836,12 +1951,92 @@ function validateAdversarialCases(
 	return idMap;
 }
 
+async function validateMandatoryComputerAdversarialCases(
+	cwd: string,
+	contractCoverage: JsonObject[],
+	adversarialCases: Map<string, JsonObject>,
+	artifactRefs: Map<string, JsonObject>,
+): Promise<void> {
+	const linkedCaseIds = new Set<string>();
+	for (const [index, row] of contractCoverage.entries()) {
+		const ids = optionalStringLinks(row, "adversarialCaseRefs", `executorQa.contractCoverage[${index}]`);
+		for (const id of ids ?? []) linkedCaseIds.add(normalizeAdversarialCaseId(id));
+	}
+	for (const caseId of MANDATORY_COMPUTER_CASE_IDS) {
+		const row = adversarialCases.get(caseId);
+		if (!row)
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_MISSING: qualityGate executorQa.adversarialCases must include ${caseId}`,
+			);
+		if (optionalStatusField(row, `executorQa.adversarialCases.${caseId}`) === NOT_APPLICABLE_STATUS) {
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_NOT_APPLICABLE: mandatory computer adversarial case ${caseId} must not be not_applicable`,
+			);
+		}
+		if (!linkedCaseIds.has(caseId)) {
+			throw new Error(
+				`COMPUTER_REDTEAM_CASE_UNLINKED: mandatory computer adversarial case ${caseId} must be linked from contractCoverage.adversarialCaseRefs`,
+			);
+		}
+		const artifactIds = requireStringLinks(row.artifactRefs, `executorQa.adversarialCases.${caseId}.artifactRefs`);
+		let hasValidLiveNativeProof = false;
+		let sawInlineOnly = false;
+		let sawReceiptOnly = false;
+		let sawMetadataOnly = false;
+		for (const artifactId of artifactIds) {
+			const artifact = artifactRefs.get(artifactId);
+			if (!artifact)
+				throw new Error(
+					`qualityGate executorQa.adversarialCases.${caseId}.artifactRefs references unknown id ${artifactId}`,
+				);
+			const fieldName = `executorQa.artifactRefs.${artifactId}`;
+			if (artifact.inlineEvidence !== undefined && !nonEmptyString(artifact.path)) sawInlineOnly = true;
+			if (
+				(artifact.verifiedReceipt !== undefined || artifact.receipt !== undefined) &&
+				!nonEmptyString(artifact.path)
+			)
+				sawReceiptOnly = true;
+			if (
+				!nonEmptyString(artifact.path) &&
+				artifact.inlineEvidence === undefined &&
+				artifact.verifiedReceipt === undefined &&
+				artifact.receipt === undefined
+			)
+				sawMetadataOnly = true;
+			try {
+				await validateArtifactProof(cwd, artifact, fieldName, { surfaceFamily: "native", live: true });
+				if (await validateStructuralArtifact(cwd, artifact, fieldName, { surfaceFamily: "native", live: true }))
+					hasValidLiveNativeProof = true;
+			} catch {
+				// Preserve the explicit computer red-team error taxonomy below.
+			}
+		}
+		if (!hasValidLiveNativeProof) {
+			if (sawInlineOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_INLINE_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`,
+				);
+			if (sawReceiptOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_RECEIPT_ONLY: mandatory computer adversarial case ${caseId} requires live structural native proof`,
+				);
+			if (sawMetadataOnly)
+				throw new Error(
+					`COMPUTER_REDTEAM_ARTIFACT_METADATA_ONLY: mandatory computer adversarial case ${caseId} requires durable live structural native proof`,
+				);
+			throw new Error(
+				`COMPUTER_REDTEAM_ARTIFACT_MISSING: mandatory computer adversarial case ${caseId} requires at least one valid live structural native proof artifact`,
+			);
+		}
+	}
+}
+
 function validateContractCoverage(
 	executorQa: JsonObject,
 	surfaceEvidence: Map<string, JsonObject>,
 	adversarialCases: Map<string, JsonObject>,
 	artifactRefs: Map<string, JsonObject>,
-): void {
+): JsonObject[] {
 	const rows = requireObjectArray(executorQa.contractCoverage, "executorQa.contractCoverage");
 	buildRowIdMap(rows, "executorQa.contractCoverage");
 	let hasSuccessfulContractCoverage = false;
@@ -1892,32 +2087,47 @@ function validateContractCoverage(
 			"qualityGate executorQa.contractCoverage must include at least one row with status covered, passed, or verified",
 		);
 	}
+	return rows;
 }
 
 async function validateExecutorQaRedTeamEvidenceInternal(
 	cwd: string,
 	executorQa: JsonObject,
-	_options: { mode?: "checkpoint" | "review" } = {},
+	options: { mode?: "checkpoint" | "review"; changeSet?: UltragoalChangeSet } = {},
 ): Promise<void> {
 	const artifactRefs = await validateArtifactRefs(cwd, executorQa);
 	const surfaceEvidence = await validateSurfaceEvidence(cwd, executorQa, artifactRefs);
 	const adversarialCases = validateAdversarialCases(executorQa, artifactRefs);
-	validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
+	const contractCoverage = validateContractCoverage(executorQa, surfaceEvidence, adversarialCases, artifactRefs);
+	if (requiresComputerRedTeamSuite(executorQa, options.changeSet)) {
+		await validateMandatoryComputerAdversarialCases(cwd, contractCoverage, adversarialCases, artifactRefs);
+	}
 }
 
-async function validateExecutorQaRedTeamEvidence(cwd: string, executorQa: JsonObject): Promise<void> {
-	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa, { mode: "checkpoint" });
+async function validateExecutorQaRedTeamEvidence(
+	cwd: string,
+	executorQa: JsonObject,
+	options: { changeSet?: UltragoalChangeSet } = {},
+): Promise<void> {
+	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa, {
+		mode: "checkpoint",
+		changeSet: options.changeSet,
+	});
 }
 
 export async function validateExecutorQaRedTeamEvidenceForReview(
 	cwd: string,
 	executorQa: Record<string, unknown>,
-	options: { mode?: "review" } = {},
+	options: { mode?: "review"; changeSet?: UltragoalChangeSet } = {},
 ): Promise<void> {
 	await validateExecutorQaRedTeamEvidenceInternal(cwd, executorQa as JsonObject, options);
 }
 
-async function validateCompletionQualityGate(cwd: string, gate: JsonObject): Promise<void> {
+async function validateCompletionQualityGate(
+	cwd: string,
+	gate: JsonObject,
+	options: { changeSet?: UltragoalChangeSet } = {},
+): Promise<void> {
 	const codeReview = qualityGateObject(gate.codeReview);
 	if (codeReview) {
 		throw new Error(
@@ -1962,7 +2172,7 @@ async function validateCompletionQualityGate(cwd: string, gate: JsonObject): Pro
 	}
 	requireNonEmptyString(executorQa.evidence, "executorQa.evidence");
 	requireEmptyBlockers(executorQa.blockers, "executorQa.blockers");
-	await validateExecutorQaRedTeamEvidence(cwd, executorQa);
+	await validateExecutorQaRedTeamEvidence(cwd, executorQa, { changeSet: options.changeSet });
 	if (iteration.status !== PASSED_STATUS || iteration.fullRerun !== true) {
 		throw new Error("qualityGate iteration must be passed with fullRerun true");
 	}
@@ -1973,7 +2183,11 @@ async function validateCompletionQualityGate(cwd: string, gate: JsonObject): Pro
 	requireEmptyBlockers(iteration.blockers, "iteration.blockers");
 }
 
-async function readRequiredCompletionQualityGate(cwd: string, value: string | undefined): Promise<unknown> {
+async function readRequiredCompletionQualityGate(
+	cwd: string,
+	value: string | undefined,
+	options: { changeSet?: UltragoalChangeSet } = {},
+): Promise<unknown> {
 	if (!value?.trim()) {
 		throw new Error(
 			"complete checkpoints require --quality-gate-json with architectReview, executorQa, and iteration evidence",
@@ -1982,7 +2196,7 @@ async function readRequiredCompletionQualityGate(cwd: string, value: string | un
 	const gate = await readStructuredValue(cwd, value);
 	const gateObject = qualityGateObject(gate);
 	if (!gateObject) throw new Error("qualityGate must be a JSON object");
-	await validateCompletionQualityGate(cwd, gateObject);
+	await validateCompletionQualityGate(cwd, gateObject, { changeSet: options.changeSet });
 	return gate;
 }
 
@@ -2085,9 +2299,10 @@ export async function checkpointUltragoalGoal(input: {
 		// instead of silently dropping it.
 		return plan;
 	}
+	const changeSet = input.status === "complete" ? await computeCheckpointChangeSet(input.cwd) : undefined;
 	const qualityGateJson =
 		input.status === "complete"
-			? await readRequiredCompletionQualityGate(input.cwd, input.qualityGateJson)
+			? await readRequiredCompletionQualityGate(input.cwd, input.qualityGateJson, { changeSet })
 			: input.qualityGateJson
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
@@ -2686,20 +2901,140 @@ async function resolveGitBase(cwd: string, branch?: string): Promise<string> {
 	}
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", "origin/main"], { cwd, timeoutMs: 3000 });
 	if (mergeBase.ok && mergeBase.stdout.trim()) return mergeBase.stdout.trim();
-	return "HEAD";
+	return "HEAD~1";
+}
+
+function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
+	const rows: UltragoalChangeSetPath[] = [];
+	for (const line of output.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const parts = trimmed.split(/\s+/);
+		const statusCode = parts[0] ?? "";
+		let status: UltragoalChangeStatus = "unknown";
+		if (statusCode.startsWith("A")) status = "added";
+		else if (statusCode.startsWith("M")) status = "modified";
+		else if (statusCode.startsWith("D")) status = "deleted";
+		else if (statusCode.startsWith("R")) status = "renamed";
+		else if (statusCode.startsWith("C")) status = "copied";
+		const pathValue = status === "renamed" || status === "copied" ? parts[2] : parts[1];
+		if (!pathValue) continue;
+		const oldPath = status === "renamed" || status === "copied" ? parts[1] : undefined;
+		rows.push({
+			path: normalizeRepoPath(pathValue),
+			oldPath: oldPath ? normalizeRepoPath(oldPath) : undefined,
+			status,
+			category: categorizeComputerChangePath(pathValue),
+		});
+	}
+	return rows;
+}
+
+function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
+	const byKey = new Map<string, UltragoalChangeSetPath>();
+	for (const row of groups.flat()) byKey.set(`${row.oldPath ?? ""}\u0000${row.path}`, row);
+	return [...byKey.values()];
+}
+
+async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
+	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
+	if (!inGit.ok || inGit.stdout.trim() !== "true") return undefined;
+	if (!(await Bun.file(path.join(cwd, ".git")).exists())) return undefined;
+	const baseRef = await resolveGitBase(cwd);
+	const base = baseRef;
+	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
+	const [committed, unstaged, staged, stat] = await Promise.all([
+		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+	]);
+	if (!committed.ok && !unstaged.ok && !staged.ok) return undefined;
+	return {
+		source: "checkpoint-git",
+		baseRef,
+		mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
+		headRef: "HEAD",
+		paths: mergeChangeSetPaths([
+			parseGitNameStatus(committed.stdout),
+			parseGitNameStatus(unstaged.stdout),
+			parseGitNameStatus(staged.stdout),
+		]),
+		rawDiffStat: stat.stdout,
+		trusted: true,
+	};
+}
+
+function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
+	const paths: UltragoalChangeSetPath[] = [];
+	for (const line of diff.split("\n")) {
+		if (!line.startsWith("diff --git ")) continue;
+		const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+		if (!match) continue;
+		const oldPath = normalizeRepoPath(match[1]!);
+		const newPath = normalizeRepoPath(match[2]!);
+		paths.push({
+			path: newPath,
+			oldPath: oldPath === newPath ? undefined : oldPath,
+			status: oldPath === newPath ? "modified" : "renamed",
+			category: categorizeComputerChangePath(newPath),
+		});
+	}
+	return paths;
+}
+
+function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
+	const kind = nonEmptyString(source.kind);
+	if (kind === "spec") return { source: "review-spec", paths: [], trusted: true };
+	if (kind === "pr" && typeof source.diff === "string")
+		return {
+			source: "review-pr",
+			paths: parseUnifiedDiffPaths(source.diff),
+			rawDiffStat: source.diff,
+			trusted: true,
+		};
+	const local = qualityGateObject(source.local);
+	if (kind === "pr" && local) return changeSetFromReviewSource(local);
+	if (kind === "worktree")
+		return {
+			source: "review-worktree",
+			paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
+			rawDiffStat: String(source.diffStat ?? ""),
+			trusted: true,
+		};
+	if (kind === "branch" || kind === "pr-fallback")
+		return {
+			source: "review-branch",
+			baseRef: nonEmptyString(source.base) ?? undefined,
+			headRef: "HEAD",
+			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
+			rawDiffStat: String(source.diffStat ?? ""),
+			trusted: true,
+		};
+	return undefined;
 }
 
 async function localDiffSource(cwd: string, sourceKind: string, branch?: string): Promise<JsonObject> {
 	if (sourceKind === "worktree") {
-		const [status, diff] = await Promise.all([
+		const [status, diff, unstaged, staged] = await Promise.all([
 			spawnText(["git", "status", "--short"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--stat"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
 		]);
-		return { kind: "worktree", status: status.stdout, diffStat: diff.stdout };
+		return {
+			kind: "worktree",
+			status: status.stdout,
+			diffStat: diff.stdout,
+			nameStatus: `${unstaged.stdout}\n${staged.stdout}`,
+		};
 	}
 	const base = await resolveGitBase(cwd, branch);
-	const diff = await spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 });
-	return { kind: sourceKind, base, branch, diffStat: diff.stdout };
+	const [diff, nameStatus] = await Promise.all([
+		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+	]);
+	return { kind: sourceKind, base, branch, diffStat: diff.stdout, nameStatus: nameStatus.stdout };
 }
 
 async function resolveReviewSource(
@@ -2813,13 +3148,14 @@ export async function runUltragoalReview(cwd: string, args: readonly string[]): 
 	const mode = parseReviewMode(flagValue(args, "--mode"));
 	const specPath = flagValue(args, "--spec");
 	const { contractStrength, source } = await resolveReviewSource(cwd, args, specPath);
+	const changeSet = changeSetFromReviewSource(source);
 	const executorQa = await readOptionalExecutorQa(
 		cwd,
 		flagValue(args, "--executor-qa-json") ?? flagValue(args, "--executor-qa"),
 	);
 	const findings: UltragoalReviewFinding[] = [];
 	try {
-		await validateExecutorQaRedTeamEvidenceForReview(cwd, executorQa, { mode: "review" });
+		await validateExecutorQaRedTeamEvidenceForReview(cwd, executorQa, { mode: "review", changeSet });
 	} catch (error) {
 		findings.push(findingFromError(error));
 	}

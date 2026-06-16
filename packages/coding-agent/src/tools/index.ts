@@ -36,6 +36,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
 import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
@@ -73,6 +74,7 @@ export * from "./bash";
 export * from "./browser";
 export * from "./calculator";
 export * from "./checkpoint";
+export * from "./computer";
 export * from "./cron";
 export * from "./debug";
 export * from "./eval";
@@ -312,6 +314,29 @@ export function computeEssentialBuiltinNames(settings: Settings): string[] {
  * Hindsight memory helpers are intentionally excluded: memory is a private backend
  * integration, not a public gajae-code tool surface.
  */
+export interface BuiltinCapabilityCatalogEntry {
+	name: string;
+	label: string;
+	summary: string;
+	docsPath: string;
+	callableBuiltin: boolean;
+	defaultEnabled: boolean;
+}
+
+export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[] = isComputerLoadablePlatform()
+	? [
+			{
+				name: "computer",
+				label: "Computer",
+				summary:
+					"Explicitly enabled macOS desktop screenshot and input control; off by default and supervisor-gated.",
+				docsPath: "docs/tools/computer.md",
+				callableBuiltin: false,
+				defaultEnabled: false,
+			},
+		]
+	: [];
+
 export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
 	bash: s => new BashTool(s),
@@ -330,6 +355,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
+	...(isComputerLoadablePlatform() ? { computer: ComputerTool.createIf } : {}),
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: s => TaskTool.create(s),
@@ -504,6 +530,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "calc") return session.settings.get("calc.enabled");
 		if (name === "skill") return session.settings.get("skill.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
+		if (name === "computer") return isComputerCallable(session);
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "irc") {
 			if (!session.settings.get("irc.enabled")) return false;

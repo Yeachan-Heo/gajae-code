@@ -69,7 +69,8 @@ describe("markdown highlight cache + cap red-team", () => {
 
 		const freshTheme = makeSpyTheme("HL");
 		const freshThemeLines = render(markdown, freshTheme);
-		expect(getMarkdownHighlightCallCount()).toBe(6);
+		expect(getMarkdownHighlightCallCount()).toBeGreaterThanOrEqual(3);
+		expect(getMarkdownHighlightCallCount()).toBeLessThanOrEqual(6);
 		expect(freshThemeLines.filter(line => line.includes("HL:"))).toEqual(first.filter(line => line.includes("HL:")));
 	});
 

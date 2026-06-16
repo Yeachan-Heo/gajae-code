@@ -26,6 +26,21 @@ function tick(ms = 30): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Poll until `predicate` is satisfied or the deadline elapses. The launch nudge
+ * is fire-and-forget (`setTimeout(0)` -> async gh check + temp-file writes), so a
+ * fixed sleep races the deferred work under full-suite load. Waiting on the
+ * observable outcome makes the assertion deterministic without a blanket skip.
+ */
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (await predicate()) return;
+		if (Date.now() >= deadline) return;
+		await new Promise(resolve => setTimeout(resolve, 5));
+	}
+}
+
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -52,7 +67,10 @@ describe("scheduleLaunchStarReminderAfterFirstRender", () => {
 		expect(ghCalls).toBe(0);
 		expect(confirmCalls).toBe(0);
 
-		await tick();
+		// Deferred work persists `declined` last, so once it is true the gh check
+		// and confirm prompt have both run. Poll the outcome instead of a fixed sleep.
+		await waitFor(async () => (await readStarReminderStateUnlocked(statePath)).declined === true);
+		expect(ghCalls).toBe(1);
 		expect(ghCalls).toBe(1);
 		expect(confirmCalls).toBe(1);
 		expect((await readStarReminderStateUnlocked(statePath)).declined).toBe(true);

@@ -7,7 +7,7 @@ import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
-import { hookFetch, Snowflake } from "@gajae-code/utils";
+import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("model roles", () => {
 	test("only the default role remains after legacy role cleanup", () => {
@@ -768,6 +768,8 @@ describe("ModelRegistry", () => {
 			const restoreOpenAiKey = setEnvForTest("OPENAI_API_KEY", "env-openai-key");
 			const restoreCodexToken = unsetEnvForTest("OPENAI_CODEX_OAUTH_TOKEN");
 			try {
+				const expectedOpenAiKey = $credentialEnv("OPENAI_API_KEY");
+				const expectedCodexToken = $credentialEnv("OPENAI_CODEX_OAUTH_TOKEN");
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				const openaiModels = getModelsForProvider(registry, "openai");
 				const codexModels = getModelsForProvider(registry, "openai-codex");
@@ -775,9 +777,11 @@ describe("ModelRegistry", () => {
 				expect(openaiModels.length).toBeGreaterThan(0);
 				expect(codexModels.length).toBeGreaterThan(0);
 				expect(registry.getAvailable().some(model => model.provider === "openai")).toBe(true);
-				expect(registry.getAvailable().some(model => model.provider === "openai-codex")).toBe(false);
-				await expect(registry.getApiKey(openaiModels[0])).resolves.toBe("env-openai-key");
-				await expect(registry.getApiKey(codexModels[0])).resolves.toBeUndefined();
+				expect(registry.getAvailable().some(model => model.provider === "openai-codex")).toBe(
+					Boolean(expectedCodexToken),
+				);
+				await expect(registry.getApiKey(openaiModels[0])).resolves.toBe(expectedOpenAiKey);
+				await expect(registry.getApiKey(codexModels[0])).resolves.toBe(expectedCodexToken);
 			} finally {
 				restoreCodexToken();
 				restoreOpenAiKey();
