@@ -152,7 +152,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 	},
 	{
 		name: "mimo-medium",
-		requiredProviders: ["xiaomi"],
+		requiredProviders: ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"],
 		mapping: {
 			default: "xiaomi/mimo-v2.5-pro:medium",
 			executor: "xiaomi/mimo-v2.5-pro:low",
@@ -163,7 +163,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 	},
 	{
 		name: "mimo-pro",
-		requiredProviders: ["xiaomi"],
+		requiredProviders: ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"],
 		mapping: {
 			default: "xiaomi/mimo-v2.5-pro:xhigh",
 			executor: "xiaomi/mimo-v2.5-pro:medium",

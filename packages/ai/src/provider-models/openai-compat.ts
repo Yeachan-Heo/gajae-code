@@ -1414,8 +1414,6 @@ export function cloudflareAiGatewayModelManagerOptions(
 // ---------------------------------------------------------------------------
 // 20. Xiaomi
 // ---------------------------------------------------------------------------
-// 20. Xiaomi
-// ---------------------------------------------------------------------------
 /** Region codes for Xiaomi Token Plan clusters exposed as separate login providers. */
 export type XiaomiTokenPlanRegion = "sgp" | "ams" | "cn";
 
@@ -1455,6 +1453,13 @@ export function xiaomiModelManagerOptions(
 	// would incorrectly pin to the standard endpoint (api.xiaomimimo.com).
 	const baseUrl = isTokenPlanKey ? tokenPlanBaseUrls[0] : (config?.baseUrl ?? XIAOMI_STANDARD_BASE_URL);
 	const references = createBundledReferenceMap<"openai-completions">("xiaomi");
+	const throwOnAuthFetch: typeof globalThis.fetch = async (url, init) => {
+		const response = await (config?.fetch ?? globalThis.fetch)(url, init);
+		if (response.status === 401 || response.status === 403) {
+			throw new Error(`Authentication failed (${response.status}) for ${url}`);
+		}
+		return response;
+	};
 	const fetchModels = (url: string) =>
 		fetchOpenAICompatibleModels({
 			api: "openai-completions",
@@ -1473,7 +1478,7 @@ export function xiaomiModelManagerOptions(
 					name: toModelName(entry.display_name, model.name),
 				};
 			},
-			fetch: config?.fetch,
+			fetch: throwOnAuthFetch,
 		});
 	return {
 		providerId,
@@ -1483,8 +1488,15 @@ export function xiaomiModelManagerOptions(
 					return fetchModels(baseUrl);
 				}
 				for (const url of tokenPlanBaseUrls) {
-					const result = await fetchModels(url);
-					if (result) return result;
+					try {
+						const result = await fetchModels(url);
+						if (result) return result;
+					} catch (error) {
+						// Auth errors (401/403) should fail fast, not retry other regions
+						const message = error instanceof Error ? error.message : String(error);
+						if (message.includes("Authentication failed")) throw error;
+						// Network/timeout errors: try next URL
+					}
 				}
 				return null;
 			},
@@ -2182,6 +2194,30 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 	anthropicMessagesDescriptor("zai-coding-plan", "zai", "https://api.z.ai/api/anthropic"),
 	// --- Xiaomi ---
 	openAiCompletionsDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/v1", {
+		defaultContextWindow: 262144,
+		defaultMaxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			thinkingFormat: "zai",
+		},
+	}),
+	openAiCompletionsDescriptor("xiaomi", "xiaomi-token-plan-sgp", "https://token-plan-sgp.xiaomimimo.com/v1", {
+		defaultContextWindow: 262144,
+		defaultMaxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			thinkingFormat: "zai",
+		},
+	}),
+	openAiCompletionsDescriptor("xiaomi", "xiaomi-token-plan-ams", "https://token-plan-ams.xiaomimimo.com/v1", {
+		defaultContextWindow: 262144,
+		defaultMaxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			thinkingFormat: "zai",
+		},
+	}),
+	openAiCompletionsDescriptor("xiaomi", "xiaomi-token-plan-cn", "https://token-plan-cn.xiaomimimo.com/v1", {
 		defaultContextWindow: 262144,
 		defaultMaxTokens: 8192,
 		compat: {

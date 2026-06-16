@@ -108,6 +108,9 @@ export async function prepareModelProfileActivation(
 	}
 
 	const allProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+
 	const missingProviders: string[] = [];
 	const authenticatedProviders: string[] = [];
 	for (const provider of allProviders) {
@@ -118,8 +121,21 @@ export async function prepareModelProfileActivation(
 			authenticatedProviders.push(provider);
 		}
 	}
-	// Allow profile activation when at least one provider is authenticated.
-	// Fallback chain handles runtime provider selection.
+
+	// Check strict (non-alternative) providers — all must be authenticated.
+	const strictMissing = missingProviders.filter(p => !alternativeSet.has(p));
+	if (strictMissing.length > 0) {
+		throw new Error(formatModelProfileCredentialError(options.profileName, strictMissing));
+	}
+
+	// Check alternative groups — at least one provider per group must be authenticated.
+	for (const group of alternativeGroups) {
+		const groupAuthenticated = group.some(p => authenticatedProviders.includes(p));
+		if (!groupAuthenticated) {
+			throw new Error(formatModelProfileCredentialError(options.profileName, [...group]));
+		}
+	}
+
 	if (authenticatedProviders.length === 0) {
 		throw new Error(formatModelProfileCredentialError(options.profileName, missingProviders));
 	}
@@ -127,8 +143,10 @@ export async function prepareModelProfileActivation(
 	const availableModels = options.modelRegistry.getAll();
 	let bindings = resolveProfileBindings(profile);
 	// Rewrite selectors to use an authenticated provider when the original
-	// provider is not logged in (e.g. xiaomi → xiaomi-token-plan-sgp).
-	if (missingProviders.length > 0) {
+	// provider is not logged in, but only for alternative provider groups
+	// (e.g. xiaomi → xiaomi-token-plan-sgp). Strict providers are already
+	// validated above, so missing providers here are all alternative-group members.
+	if (missingProviders.length > 0 && alternativeGroups.length > 0) {
 		bindings = rewriteBindingsProviders(bindings, authenticatedProviders);
 	}
 	const resolvedDefault = bindings.defaultSelector
