@@ -50,6 +50,9 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			model("provider-a", "default"),
 			model("provider-b", "executor"),
 			model("provider-a", "architect"),
+			model("provider-c", "default"),
+			model("provider-c", "executor"),
+			model("provider-c", "architect"),
 			model("openai-codex", "gpt-5.4"),
 			model("openai-codex", "gpt-5.1-codex-max"),
 			model("openai-codex", "gpt-5.2-codex"),
@@ -109,6 +112,35 @@ describe("model profile activation", () => {
 		});
 	});
 
+	test("alternative selector rewrite stays within matching provider group", async () => {
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({
+				missingProviders: ["provider-a"],
+				profiles: [
+					{
+						name: "mixed-profile",
+						requiredProviders: ["provider-a", "provider-b", "provider-c"],
+						alternativeProviderGroups: [["provider-a", "provider-c"]],
+						modelMapping: {
+							default: "provider-a/default:high",
+							executor: "provider-a/executor",
+							architect: "provider-b/executor",
+						},
+						source: "user",
+					},
+				],
+			}),
+			settings: Settings.isolated(),
+			profileName: "mixed-profile",
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("provider-c");
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "provider-c/executor",
+			architect: "provider-b/executor",
+		});
+	});
 	test("builtin codex-eco executor selector clamps from catalog minimal to prepared low", async () => {
 		const registry = fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] });
 		const catalog = BUILTIN_MODEL_PROFILES.find(profile => profile.name === "codex-eco");
@@ -273,30 +305,28 @@ function stubXiaomiRegistry(
 > {
 	const profiles = mergeModelProfiles();
 	const xiaomiProviders = ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"];
-	const models = xiaomiProviders.flatMap(provider => [
-		{ id: `${provider}/mimo-v2.5-pro`, provider, api: "openai-completions" },
-	]);
+	const models = xiaomiProviders.map(provider => ({
+		id: "mimo-v2.5-pro",
+		provider,
+		api: "openai-completions",
+	}));
 	return {
 		getModelProfiles: () => profiles,
 		getModelProfile: name => profiles.get(name) ?? undefined,
 		getAvailableModelProfileNames: () => [...profiles.keys()],
-		getApiKeyForProvider: async (provider: string) => {
-			if (authenticatedProviders.includes(provider)) {
-				return { type: "api_key" as const, key: "test-key" };
-			}
-			return undefined;
-		},
+		getApiKeyForProvider: async (provider: string) =>
+			authenticatedProviders.includes(provider) ? "test-key" : undefined,
 		getAll: () => models as never[],
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
-		getCanonicalId: (id: string) => id,
+		getCanonicalId: (item: Model) => item.id,
 	};
 }
 
 function stubXiaomiSession() {
 	return {
 		model: undefined,
-		thinkingLevel: "medium" as const,
+		thinkingLevel: ThinkingLevel.Medium,
 		sessionId: "test-session",
 		setModelTemporary: async () => {},
 		setActiveModelProfile: () => {},
@@ -305,15 +335,7 @@ function stubXiaomiSession() {
 }
 
 function stubXiaomiSettings() {
-	const overrides: Record<string, unknown> = {};
-	return {
-		get: (key: string) => overrides[key],
-		override: (key: string, value: unknown) => {
-			overrides[key] = value;
-		},
-		set: (_key: string, _value: unknown) => {},
-		flush: async () => {},
-	};
+	return Settings.isolated();
 }
 
 describe("model-profile-activation: xiaomi token-plan regions", () => {

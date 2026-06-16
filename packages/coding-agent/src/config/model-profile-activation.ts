@@ -62,35 +62,43 @@ function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<stri
 }
 
 /**
- * Rewrite model selectors to use an authenticated provider when the original
- * provider in the selector is not authenticated.  This allows profiles with
- * multiple fallback providers (e.g. xiaomi / xiaomi-token-plan-sgp) to work
- * when only one of them is logged in.
+ * Rewrite a selector only within the selector provider's own alternative group.
+ * Strict providers are never rewritten, and authenticated alternative providers
+ * keep their original selectors.
  */
-function rewriteSelectorProvider(selector: string, authenticatedProviders: readonly string[]): string {
+function rewriteSelectorProvider(
+	selector: string,
+	authenticatedProviders: ReadonlySet<string>,
+	alternativeGroups: readonly (readonly string[])[],
+): string {
 	const slash = selector.indexOf("/");
 	if (slash < 0) return selector;
+
 	const provider = selector.substring(0, slash);
-	if (authenticatedProviders.includes(provider)) return selector;
-	// Pick the first authenticated provider as replacement
-	const replacement = authenticatedProviders[0];
+	if (authenticatedProviders.has(provider)) return selector;
+
+	const group = alternativeGroups.find(candidates => candidates.includes(provider));
+	if (!group) return selector;
+
+	const replacement = group.find(candidate => authenticatedProviders.has(candidate));
 	if (!replacement) return selector;
+
 	return replacement + selector.substring(slash);
 }
 
 function rewriteBindingsProviders(
 	bindings: { defaultSelector?: string; agentModelOverrides: Record<string, string> },
-	authenticatedProviders: readonly string[],
+	authenticatedProviders: ReadonlySet<string>,
+	alternativeGroups: readonly (readonly string[])[],
 ): { defaultSelector?: string; agentModelOverrides: Record<string, string> } {
-	if (authenticatedProviders.length === 0) return bindings;
 	return {
 		defaultSelector: bindings.defaultSelector
-			? rewriteSelectorProvider(bindings.defaultSelector, authenticatedProviders)
+			? rewriteSelectorProvider(bindings.defaultSelector, authenticatedProviders, alternativeGroups)
 			: undefined,
 		agentModelOverrides: Object.fromEntries(
 			Object.entries(bindings.agentModelOverrides).map(([role, sel]) => [
 				role,
-				rewriteSelectorProvider(sel, authenticatedProviders),
+				rewriteSelectorProvider(sel, authenticatedProviders, alternativeGroups),
 			]),
 		),
 	};
@@ -142,12 +150,8 @@ export async function prepareModelProfileActivation(
 
 	const availableModels = options.modelRegistry.getAll();
 	let bindings = resolveProfileBindings(profile);
-	// Rewrite selectors to use an authenticated provider when the original
-	// provider is not logged in, but only for alternative provider groups
-	// (e.g. xiaomi → xiaomi-token-plan-sgp). Strict providers are already
-	// validated above, so missing providers here are all alternative-group members.
 	if (missingProviders.length > 0 && alternativeGroups.length > 0) {
-		bindings = rewriteBindingsProviders(bindings, authenticatedProviders);
+		bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
 	}
 	const resolvedDefault = bindings.defaultSelector
 		? resolveModelRoleValue(bindings.defaultSelector, availableModels, {
