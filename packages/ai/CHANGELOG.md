@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Made the "No API key for provider" error from `stream`/`complete` actionable for OpenCode Go/Zen subscription providers in headless runs (#755). The subscription is itself an API key (`OPENCODE_API_KEY`, created at https://opencode.ai/auth), not a separate OAuth/session token; the new `formatProviderCredentialHint` helper (composed into `formatMissingApiKeyError`) names the env var GJC reads, warns that a project `.env` is intentionally ignored for provider credentials, and points OpenCode users at the one-time interactive `gjc auth-broker login <provider>` credential capture to run before headless/print mode. No auth behavior changed.
+
 ## [0.5.3] - 2026-06-16
 
 ### Added
