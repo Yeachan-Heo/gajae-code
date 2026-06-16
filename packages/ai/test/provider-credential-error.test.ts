@@ -66,6 +66,11 @@ describe("streamSimple missing credentials", () => {
 			id: "deepseek-v4-flash",
 			name: "DeepSeek V4 Flash",
 			baseUrl: "https://opencode.ai/zen/go/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 65_536,
 		};
 		const context: Context = {
 			messages: [{ role: "user", content: "hi", timestamp: 0 }],
