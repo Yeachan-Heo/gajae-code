@@ -166,6 +166,16 @@ retry:
 
 The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win.
 
+### Theme quick pick
+
+| Theme | Visual feel | Pick it when |
+| --- | --- | --- |
+| `red-claw` | Default dark GJC identity with warm red accents. | You want the native GJC look and strong status contrast. |
+| `blue-crab` | Light-friendly blue palette for bright terminals. | Your terminal or OS appearance is light and you want readable defaults. |
+| `claude-code` | Claude Code-inspired dark palette. | You are migrating from Claude Code and want familiar visual muscle memory. |
+| `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | You want a Codex-like dark workspace. |
+| `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | You want the closest bundled match for OpenCode muscle memory. |
+
 ## Development
 
 Install dependencies, build native bindings, and set up local defaults:
