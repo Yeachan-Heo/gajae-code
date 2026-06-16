@@ -72,13 +72,19 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(lines.join("\n")).not.toContain("›");
 	});
 
-	it("renders one blank row immediately above the composer", () => {
-		const rendered = mode.ui.render(48).map(line => stripVTControlCharacters(line));
-		const composerIndex = rendered.findIndex(line => line.startsWith("┌") && line.endsWith("┐"));
+	it("renders one blank row immediately above the composer", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
 
-		expect(composerIndex).toBeGreaterThan(0);
-		expect(rendered[composerIndex - 1]).toBe("");
-		expect(rendered.slice(0, composerIndex - 1).some(line => line.trim().length > 0)).toBe(true);
+		await mode.init();
+
+		const editorIndex = mode.ui.children.indexOf(mode.editorContainer);
+		const spacer = mode.ui.children[editorIndex - 2];
+		const hookContainer = mode.ui.children[editorIndex - 1];
+
+		expect(editorIndex).toBeGreaterThan(1);
+		expect(hookContainer).toBe(mode.hookWidgetContainerAbove);
+		expect(spacer?.render(48)).toEqual([""]);
+		expect(mode.hookWidgetContainerAbove.render(48)).toEqual([""]);
 	});
 
 	it("keeps closed square composer chrome for one-line, multiline, and narrow prompts", () => {
