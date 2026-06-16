@@ -1,10 +1,27 @@
 import { describe, expect, it } from "bun:test";
-import { ComputerController, computerScreenshot } from "../native/index.js";
 
 const isMacOS = process.platform === "darwin";
 
+type NativeComputerModule = {
+	ComputerController: new () => Record<string, unknown>;
+	computerScreenshot: () => {
+		widthPx: number;
+		heightPx: number;
+		scaleX: number;
+		scaleY: number;
+		png: Uint8Array;
+		displayEpoch: number;
+		captureId: number;
+	};
+};
+
+async function loadNativeComputerModule(): Promise<NativeComputerModule> {
+	return (await import("../native/index.js")) as unknown as NativeComputerModule;
+}
+
 describe.if(isMacOS)("ComputerController napi binding", () => {
-	it("exists with expected methods", () => {
+	it("exists with expected methods", async () => {
+		const { ComputerController } = await loadNativeComputerModule();
 		const controller = new ComputerController();
 		expect(controller).toBeInstanceOf(ComputerController);
 		for (const method of [
@@ -18,7 +35,7 @@ describe.if(isMacOS)("ComputerController napi binding", () => {
 			"keypress",
 			"wait",
 		]) {
-			expect(typeof controller[method as keyof ComputerController]).toBe("function");
+			expect(typeof controller[method]).toBe("function");
 		}
 	});
 });
@@ -27,8 +44,9 @@ describe.if(isMacOS)("ComputerController napi binding", () => {
 // primary display, so it requires the Screen Recording permission. Gate on
 // platform and skip gracefully when capture is unavailable in the environment.
 describe.if(isMacOS)("computer screenshot napi binding", () => {
-	it("returns a decodable PNG whose dimensions match the descriptor", () => {
-		let shot: ReturnType<typeof computerScreenshot>;
+	it("returns a decodable PNG whose dimensions match the descriptor", async () => {
+		const { computerScreenshot } = await loadNativeComputerModule();
+		let shot: ReturnType<NativeComputerModule["computerScreenshot"]>;
 		try {
 			shot = computerScreenshot();
 		} catch (err) {
