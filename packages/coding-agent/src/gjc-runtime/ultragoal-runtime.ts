@@ -1362,7 +1362,7 @@ const CLI_REPLAY_MAX_OUTPUT_BYTES = 1024 * 1024;
 const CLI_REPLAY_DEFAULT_TIMEOUT_MS = 10_000;
 const CLI_REPLAY_MIN_TIMEOUT_MS = 1_000;
 const CLI_REPLAY_MAX_TIMEOUT_MS = 30_000;
-const CLI_REPLAY_EXEMPT_REASON_CODES = new Set([
+const CLI_REPLAY_EXEMPT_REASON_CODES = [
 	"unsafe_side_effect",
 	"requires_credentials",
 	"requires_network",
@@ -1370,8 +1370,10 @@ const CLI_REPLAY_EXEMPT_REASON_CODES = new Set([
 	"destructive",
 	"interactive_only",
 	"platform_unavailable",
-]);
+] as const;
+const CLI_REPLAY_EXEMPT_REASON_CODE_SET = new Set<string>(CLI_REPLAY_EXEMPT_REASON_CODES);
 const CLI_REPLAY_ENV_BASE: Record<string, string> = { CI: "1", NO_COLOR: "1", GJC_ULTRAGOAL_REPLAY: "1" };
+const CLI_REPLAY_EXEMPT_REASON_CODE_LIST = CLI_REPLAY_EXEMPT_REASON_CODES.join(", ");
 const CLI_REPLAY_SAFE_ENV_NAMES = new Set(["LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
 const CLI_REPLAY_DANGEROUS_ENV_NAME_PATTERN =
 	/^(?:NODE_OPTIONS|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_PAGER|PATH|LD_PRELOAD|LD_LIBRARY_PATH)$|^(?:GIT_CONFIG|DYLD_|BUN_|NPM_CONFIG_)|(?:^|_)OPTIONS$|PRELOAD$/;
@@ -1683,8 +1685,10 @@ async function validateReplayExemptFallback(
 	const exempt = qualityGateObject(record.replayExempt);
 	if (!exempt) return false;
 	const reasonCode = requiredStringField(exempt, "reasonCode", `${fieldName}.replayExempt`);
-	if (!CLI_REPLAY_EXEMPT_REASON_CODES.has(reasonCode))
-		throw new Error(`qualityGate ${fieldName}.replayExempt.reasonCode is not recognized`);
+	if (!CLI_REPLAY_EXEMPT_REASON_CODE_SET.has(reasonCode))
+		throw new Error(
+			`qualityGate ${fieldName}.replayExempt.reasonCode must be one of: ${CLI_REPLAY_EXEMPT_REASON_CODE_LIST}`,
+		);
 	const reason = requiredStringField(exempt, "reason", `${fieldName}.replayExempt`);
 	if (!isSubstantiveEvidence(reason) || reason.length < 30)
 		throw new Error(`qualityGate ${fieldName}.replayExempt.reason must be audited and substantive`);
