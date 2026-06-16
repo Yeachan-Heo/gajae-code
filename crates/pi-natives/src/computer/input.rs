@@ -711,6 +711,16 @@ mod live_tests {
 		let _ = MouseButton::Left; // keep the import meaningful for future click tests
 	}
 
+	/// Durable output directory for G005 live-acceptance artifacts. Override
+	/// with `COMPUTER_USE_ACCEPTANCE_DIR`; defaults to
+	/// `<repo-root>/.gjc/ultragoal/artifacts/g005`.
+	fn acceptance_artifacts_dir() -> std::path::PathBuf {
+		if let Ok(dir) = std::env::var("COMPUTER_USE_ACCEPTANCE_DIR") {
+			return std::path::PathBuf::from(dir);
+		}
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.gjc/ultragoal/artifacts/g005")
+	}
+
 	/// G005 acceptance drill: drives all nine primitives through the gated
 	/// execute_input path against the focused frontmost app, then waits for a
 	/// human kill-switch press and proves input is blocked afterward.
@@ -735,7 +745,13 @@ mod live_tests {
 		let cx = f64::from(display.width_px) * 0.5;
 		let cy = f64::from(display.height_px) * 0.42;
 
-		let mut act = |action: InputAction| {
+		// Persist the pre-input frame as durable live-proof (primitive 1).
+		let artifacts = acceptance_artifacts_dir();
+		std::fs::create_dir_all(&artifacts).expect("create acceptance artifacts dir");
+		std::fs::write(artifacts.join("g005-before.png"), &frame.png)
+			.expect("write before screenshot");
+
+		let act = |action: InputAction| {
 			// Stand in for the listener's periodic heartbeat so input_allowed stays fresh.
 			Supervisor::global().heartbeat();
 			let mut controller = guarded_controller().expect("Accessibility granted");
@@ -769,8 +785,8 @@ mod live_tests {
 		act(InputAction::Scroll { x: cx, y: cy, scroll_x: 0.0, scroll_y: -120.0 }); // 8 scroll
 		act(InputAction::Wait { ms: 300 }); // 9 wait
 
-		println!(">>> KILL-SWITCH DRILL: press Control+Option+Command+Escape now (within ~10s) <<<");
-		for _ in 0..50 {
+		println!(">>> KILL-SWITCH DRILL: press Control+Option+Command+Escape now (within ~60s) <<<");
+		for _ in 0..300 {
 			if Supervisor::global().is_suspended() {
 				break;
 			}
@@ -794,6 +810,45 @@ mod live_tests {
 			&cancel,
 		);
 		assert!(blocked.is_err(), "input must be blocked while suspended");
+
+		// Capture + persist the post-kill-switch frame and a transcript so the
+		// G004 mandatory computer red-team suite has durable native proof on disk.
+		let after = capture_primary_display().expect("Screen Recording granted");
+		std::fs::write(artifacts.join("g005-after-killswitch.png"), &after.png)
+			.expect("write post-kill-switch screenshot");
+		let manifest = serde_json::json!({
+			"schemaVersion": 1,
+			"kind": "computer-use-acceptance",
+			"surface": "native",
+			"hotkey": "Control+Option+Command+Escape",
+			"display": {
+				"widthPx": display.width_px,
+				"heightPx": display.height_px,
+				"epoch": frame.display_epoch
+			},
+			"primitives": [
+				"screenshot",
+				"move",
+				"click",
+				"type",
+				"keypress",
+				"double_click",
+				"drag",
+				"scroll",
+				"wait"
+			],
+			"killSwitch": { "latched": true, "blockedFurtherInput": true },
+			"artifacts": {
+				"before": "g005-before.png",
+				"afterKillSwitch": "g005-after-killswitch.png"
+			}
+		});
+		std::fs::write(
+			artifacts.join("g005-manifest.json"),
+			serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+		)
+		.expect("write acceptance manifest");
+		println!("G005 artifacts written to {}", artifacts.display());
 		Supervisor::global().reset();
 		println!(
 			"G005 PASS: all nine primitives executed; kill-switch latched and blocked further input."
