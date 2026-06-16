@@ -340,7 +340,9 @@ mod mac {
 			units: u32,
 			wheel_count: u32,
 			wheel1: i32,
-			wheel2: i32,
+			// `CGEventCreateScrollWheelEvent` is C-variadic (wheel1, ...); wheel2/wheel3
+			// are passed as varargs. Declaring fixed-arity is ABI-unsound on arm64.
+			...
 		) -> CgEventRef;
 		fn CGEventCreateKeyboardEvent(
 			source: CgEventSourceRef,
