@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-16
+
 ### Added
 
 - Added opt-in `AuthStorageOptions.credentialRankingMode` (`balanced` (default) | `earliest-reset`) for multi-account OAuth credential selection. `earliest-reset` ranks non-blocked credentials earliest-expiry-first — draining the soonest-to-reset account before its perishable tumbling-window quota (e.g. Claude 5h/7d) is lost at reset — keeping the existing drain-rate/used-fraction metrics as tiebreakers. `balanced` is byte-identical to prior behavior, and ranking only runs at session start (or when the session's preferred credential is blocked), so this never thrashes accounts mid-session.
@@ -10,6 +12,7 @@
 
 - Allowed `openai-codex-responses` custom backends to use opaque `apiKey` bearer tokens by omitting `chatgpt-account-id` when the token does not expose a Codex account id.
 - Fixed OpenAI code websocket continuations to treat codex-lb's `codex_previous_response_stale` response failures as expired `previous_response_id` anchors and retry with full context instead of surfacing the transient failure.
+- Bounded the Cursor provider's conversation cache with an LRU(64) + 1h TTL and added `disposeCursorConversation`, so long-running sessions no longer retain Cursor conversation state without limit (#717).
 
 ## [0.5.2] - 2026-06-15
 

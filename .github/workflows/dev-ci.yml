@@ -64,12 +64,15 @@ jobs:
         if: steps.flags.outputs.relevant == 'true'
         run: bun scripts/ci-dev-affected.ts
 
-  # Branch protection must add the always-present `gjc-state-gates` status as required.
-  gjc-state-gates:
-    name: gjc-state-gates
+  gjc-state-gates-matrix:
+    name: gjc-state-gates / ${{ matrix.group }}
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, Linux, X64, gajae-code-fast]
-    timeout-minutes: 15
+    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [static, runtime, integrity, read]
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -91,5 +94,19 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-
       - run: bun install --frozen-lockfile
-      - name: Run GJC state gates
-        run: bun scripts/ci-gjc-state-gates.ts
+      - name: Run GJC state gate shard
+        run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}
+
+  # Branch protection must keep requiring this stable aggregate status.
+  gjc-state-gates:
+    name: gjc-state-gates
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: [gjc-state-gates-matrix]
+    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate GJC state gate shards
+        run: |
+          result='${{ needs.gjc-state-gates-matrix.result }}'
+          echo "gjc-state-gates shard result: $result"
+          test "$result" = success

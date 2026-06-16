@@ -72,5 +72,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_5_2")]
+#[napi(js_name = "__piNativesV0_5_3")]
 pub const fn pi_natives_version_sentinel() {}

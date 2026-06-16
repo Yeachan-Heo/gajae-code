@@ -57,6 +57,22 @@ describe("planTasks command shape (issue #622)", () => {
 	});
 });
 
+	describe("deep-interview selector narrowing", () => {
+		test("deep-interview-only changes avoid native/full workspace validation", () => {
+			const tasks = planForPaths([
+				"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+				"packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts",
+				"packages/coding-agent/test/default-gjc-definitions.test.ts",
+				"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
+			]);
+			expect(tasks.map(task => task.key)).toEqual([
+				"deep-interview-definitions",
+				"deep-interview-runtime",
+			]);
+			expect(tasks.some(task => task.key.includes("native") || task.key === "root-test")).toBe(false);
+		});
+	});
+
 describe("runCommand executes package scripts in the target cwd (issue #622)", () => {
 	const tempDirs: string[] = [];
 

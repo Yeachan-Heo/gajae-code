@@ -26,6 +26,13 @@ export interface BrowserHandle {
 
 const browsers = new Map<string, BrowserHandle>();
 
+/**
+ * Upper bound on the CDP `browser.close()` round-trip during a forced (signal-path)
+ * teardown before we fall back to killing the Chrome process tree. Only applies when
+ * `kill` is set; graceful release still awaits close() unbounded.
+ */
+const HEADLESS_FORCE_CLOSE_GRACE_MS = 1_500;
+
 function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
@@ -164,13 +171,22 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
 
 async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
 	if (handle.kind.kind === "headless") {
+		// Capture the launched Chrome process before close() so a forced (signal-path)
+		// teardown can SIGTERM/SIGKILL the tree even if the CDP close hangs on a wedged
+		// renderer. Otherwise the headless Chrome reparents to PID 1 (#698).
+		const proc = handle.browser.process();
 		if (handle.browser.connected) {
 			try {
-				await handle.browser.close();
+				const closing = handle.browser.close();
+				// Graceful release waits for close() to finish (it also removes the
+				// puppeteer_dev_chrome_profile-* temp dir). Forced release bounds it so
+				// the kill fallback below still runs within the signal handler's budget.
+				await (opts.kill ? Promise.race([closing, Bun.sleep(HEADLESS_FORCE_CLOSE_GRACE_MS)]) : closing);
 			} catch (err) {
 				logger.debug("Failed to close headless browser", { error: (err as Error).message });
 			}
 		}
+		if (opts.kill && proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid);
 		return;
 	}
 	if (handle.kind.kind === "connected") {
