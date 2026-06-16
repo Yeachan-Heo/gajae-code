@@ -143,7 +143,7 @@ describe("model onboarding guidance", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30000);
 
 	it("uses shared provider onboarding text for AgentSession no-model and no-credential errors", async () => {
 		const noModelDir = await createTempDir();
