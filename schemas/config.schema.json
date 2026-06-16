@@ -452,6 +452,135 @@
 			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
 			"default": "none"
 		},
+		"task": {
+			"type": "object",
+			"properties": {
+				"serviceTier": {
+					"type": "string",
+					"enum": [
+						"inherit",
+						"none",
+						"auto",
+						"default",
+						"flex",
+						"scale",
+						"priority",
+						"openai-only",
+						"claude-only"
+					],
+					"description": "Service tier applied to task-tool subagents only. \"inherit\" copies the main session tier; any explicit value overrides it for subagents without touching the main session.",
+					"default": "inherit"
+				},
+				"isolation": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"none",
+								"auto",
+								"apfs",
+								"btrfs",
+								"zfs",
+								"reflink",
+								"overlayfs",
+								"projfs",
+								"block-clone",
+								"rcopy"
+							],
+							"description": "Isolation backend for subagents. \"auto\" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).",
+							"default": "none"
+						},
+						"merge": {
+							"type": "string",
+							"enum": [
+								"patch",
+								"branch"
+							],
+							"description": "How isolated task changes are integrated (patch apply or branch merge)",
+							"default": "patch"
+						},
+						"commits": {
+							"type": "string",
+							"enum": [
+								"generic",
+								"ai"
+							],
+							"description": "Commit message style for nested repo changes (generic or AI-generated)",
+							"default": "generic"
+						}
+					},
+					"additionalProperties": false
+				},
+				"eager": {
+					"type": "boolean",
+					"description": "Encourage the agent to delegate work to subagents unless changes are trivial",
+					"default": false
+				},
+				"simple": {
+					"type": "string",
+					"enum": [
+						"default",
+						"schema-free",
+						"independent"
+					],
+					"description": "How much shared structure the task tool accepts (default, schema-free, or independent)",
+					"default": "default"
+				},
+				"maxConcurrency": {
+					"type": "number",
+					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
+					"default": 8
+				},
+				"enableLsp": {
+					"type": "boolean",
+					"description": "Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
+					"default": false
+				},
+				"forkContext": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
+							"default": false
+						},
+						"maxMessages": {
+							"type": "number",
+							"description": "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
+							"default": 50
+						},
+						"maxTokens": {
+							"type": "number",
+							"description": "Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
+							"default": 0
+						}
+					},
+					"additionalProperties": false
+				},
+				"maxRecursionDepth": {
+					"type": "number",
+					"description": "How many levels deep subagents can spawn their own subagents",
+					"default": 2
+				},
+				"maxRuntimeMs": {
+					"type": "number",
+					"description": "Hard wall-clock limit per subagent (ms). 0 disables it. Defense-in-depth against provider-side stream hangs that escape the inference-layer watchdog; triggers a normal subagent abort with a 'timed out' reason.",
+					"default": 0
+				},
+				"disabledAgents": {
+					"type": "array",
+					"items": true,
+					"default": []
+				},
+				"agentModelOverrides": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
 		"retry": {
 			"type": "object",
 			"properties": {
@@ -1628,119 +1757,6 @@
 					"default": [
 						"interactive"
 					]
-				}
-			},
-			"additionalProperties": false
-		},
-		"task": {
-			"type": "object",
-			"properties": {
-				"isolation": {
-					"type": "object",
-					"properties": {
-						"mode": {
-							"type": "string",
-							"enum": [
-								"none",
-								"auto",
-								"apfs",
-								"btrfs",
-								"zfs",
-								"reflink",
-								"overlayfs",
-								"projfs",
-								"block-clone",
-								"rcopy"
-							],
-							"description": "Isolation backend for subagents. \"auto\" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).",
-							"default": "none"
-						},
-						"merge": {
-							"type": "string",
-							"enum": [
-								"patch",
-								"branch"
-							],
-							"description": "How isolated task changes are integrated (patch apply or branch merge)",
-							"default": "patch"
-						},
-						"commits": {
-							"type": "string",
-							"enum": [
-								"generic",
-								"ai"
-							],
-							"description": "Commit message style for nested repo changes (generic or AI-generated)",
-							"default": "generic"
-						}
-					},
-					"additionalProperties": false
-				},
-				"eager": {
-					"type": "boolean",
-					"description": "Encourage the agent to delegate work to subagents unless changes are trivial",
-					"default": false
-				},
-				"simple": {
-					"type": "string",
-					"enum": [
-						"default",
-						"schema-free",
-						"independent"
-					],
-					"description": "How much shared structure the task tool accepts (default, schema-free, or independent)",
-					"default": "default"
-				},
-				"maxConcurrency": {
-					"type": "number",
-					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
-					"default": 8
-				},
-				"enableLsp": {
-					"type": "boolean",
-					"description": "Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
-					"default": false
-				},
-				"forkContext": {
-					"type": "object",
-					"properties": {
-						"enabled": {
-							"type": "boolean",
-							"description": "Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
-							"default": false
-						},
-						"maxMessages": {
-							"type": "number",
-							"description": "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
-							"default": 50
-						},
-						"maxTokens": {
-							"type": "number",
-							"description": "Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
-							"default": 0
-						}
-					},
-					"additionalProperties": false
-				},
-				"maxRecursionDepth": {
-					"type": "number",
-					"description": "How many levels deep subagents can spawn their own subagents",
-					"default": 2
-				},
-				"maxRuntimeMs": {
-					"type": "number",
-					"description": "Hard wall-clock limit per subagent (ms). 0 disables it. Defense-in-depth against provider-side stream hangs that escape the inference-layer watchdog; triggers a normal subagent abort with a 'timed out' reason.",
-					"default": 0
-				},
-				"disabledAgents": {
-					"type": "array",
-					"items": true,
-					"default": []
-				},
-				"agentModelOverrides": {
-					"type": "object",
-					"additionalProperties": true,
-					"default": {}
 				}
 			},
 			"additionalProperties": false

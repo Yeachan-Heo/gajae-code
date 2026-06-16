@@ -104,6 +104,11 @@ export interface HelperStat {
 	meanMs: number;
 }
 
+export interface LineCountGauge {
+	last: number;
+	max: number;
+}
+
 export interface RenderMetricsSnapshot {
 	enabled: boolean;
 	renderCount: number;
@@ -118,6 +123,7 @@ export interface RenderMetricsSnapshot {
 	ownerGauges: Record<string, number>;
 	timerGauges: Record<string, number>;
 	helperStats: Record<string, HelperStat>;
+	lineCounts: Record<string, LineCountGauge>;
 }
 
 function emptyDurationStats(): DurationStats {
@@ -153,6 +159,7 @@ export class RenderMetrics {
 	#ownerGauges = new Map<string, number>();
 	#timerGauges = new Map<string, number>();
 	#helpers = new Map<string, { count: number; totalMs: number }>();
+	#lineGauges = new Map<string, LineCountGauge>();
 	#rssReturn: number | null = null;
 	#heapBaseline: number | null = null;
 	#heapReturn: number | null = null;
@@ -192,6 +199,7 @@ export class RenderMetrics {
 		this.#ownerGauges.clear();
 		this.#timerGauges.clear();
 		this.#helpers.clear();
+		this.#lineGauges.clear();
 		this.#rssReturn = null;
 		this.#heapBaseline = null;
 		this.#heapReturn = null;
@@ -278,6 +286,16 @@ export class RenderMetrics {
 		this.#helpers.set(retained, cur);
 	}
 
+	/** Record a per-render line-count gauge (e.g. "rendered", "normalized", "diffed"). */
+	recordLineCount(name: string, value: number): void {
+		if (!this.#enabled) return;
+		const retained = retainedLabel(this.#lineGauges, name);
+		const cur = this.#lineGauges.get(retained) ?? { last: 0, max: 0 };
+		cur.last = value;
+		if (value > cur.max) cur.max = value;
+		this.#lineGauges.set(retained, cur);
+	}
+
 	/**
 	 * Force a GC when the runtime exposes one and sample RSS as the post-run
 	 * "return" value used by the memory-leak gate. Callers should drop large
@@ -319,6 +337,14 @@ export class RenderMetrics {
 		return out;
 	}
 
+	#lineCountStats(): Record<string, LineCountGauge> {
+		const out: Record<string, LineCountGauge> = {};
+		for (const [name, v] of this.#lineGauges) {
+			out[name] = { last: v.last, max: v.max };
+		}
+		return out;
+	}
+
 	snapshot(): RenderMetricsSnapshot {
 		return {
 			enabled: this.#enabled,
@@ -347,6 +373,7 @@ export class RenderMetrics {
 			ownerGauges: Object.fromEntries(this.#ownerGauges),
 			timerGauges: Object.fromEntries(this.#timerGauges),
 			helperStats: this.#helperStats(),
+			lineCounts: this.#lineCountStats(),
 		};
 	}
 }

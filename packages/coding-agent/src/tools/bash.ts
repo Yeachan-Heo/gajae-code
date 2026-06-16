@@ -37,8 +37,13 @@ export const BASH_DEFAULT_PREVIEW_LINES = 10;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 
-async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
+export async function saveBashOriginalArtifactForTests(
+	session: ToolSession,
+	originalText: string,
+): Promise<string | undefined> {
 	try {
+		const manager = session.getArtifactManager?.();
+		if (manager) return await manager.save(originalText, "bash-original");
 		const alloc = await session.allocateOutputArtifact?.("bash-original");
 		if (!alloc?.path || !alloc.id) return undefined;
 		await Bun.write(alloc.path, originalText);
@@ -375,6 +380,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						env: options.resolvedEnv,
 						artifactPath,
 						artifactId,
+						oneShot: true,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							latestText = tailBuffer.text();
@@ -387,7 +393,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// path above.
 							manager.appendOutput(jobId, chunk);
 						},
-						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
 					});
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -675,6 +681,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						env: prepared.resolvedEnv,
 						artifactPath,
 						artifactId,
+						oneShot: true,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -688,7 +695,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							cursorOffset = slice.nextOffset;
 							dispatchLines(slice.text);
 						},
-						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
 					});
 					flushTrailingLine();
 					this.#buildResultText(result, prepared.timeoutSec, result.output || "(no output)");
@@ -996,7 +1003,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
 				});
 		if (result.cancelled) {
 			if (signal?.aborted) {

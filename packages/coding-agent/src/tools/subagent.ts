@@ -4,7 +4,7 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
-import type { AgentProgress, AgentSource } from "../task/types";
+import type { AgentProgress, AgentSource, TaskToolDetails } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
@@ -330,12 +330,21 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		);
 		const watchedJobIds = runningJobs.map(job => job.id);
 		manager.watchJobs(watchedJobIds);
-		const progressTimer = onUpdate
-			? setInterval(() => {
-					onUpdate(this.#progressResult(manager, records, true));
-				}, 500)
-			: undefined;
-		onUpdate?.(this.#progressResult(manager, records, true));
+		let lastEmittedSignature: string | undefined;
+		const emitIfChanged = (force: boolean): void => {
+			if (!onUpdate) return;
+			const result = this.#progressResult(manager, records, true);
+			const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
+			if (!force && signature === lastEmittedSignature) return;
+			lastEmittedSignature = signature;
+			onUpdate(result);
+		};
+		const progressTimer = onUpdate ? setInterval(() => emitIfChanged(false), 500) : undefined;
+		// Initial emission so the panel appears immediately; later idle ticks are
+		// gated on a value-based rendered-state signature so unchanged progress no
+		// longer rebuilds the renderer component or mutates transcript lines above
+		// the viewport (the source of the await-panel repaint storms).
+		emitIfChanged(true);
 
 		let timedOut = false;
 		try {
@@ -719,4 +728,135 @@ function previewJobOutput(
 	const normalized = replaceTabs(source.text);
 	const preview = truncateToWidth(normalized, width, Ellipsis.Unicode);
 	return { type: source.type, preview, truncated: preview !== normalized };
+}
+
+/**
+ * Canonical, value-based rendered-state signature for the `subagent` await panel.
+ *
+ * Producer-side await gating compares this signature against the last emitted one
+ * and only fires `onUpdate` when the *rendered* state actually changed. Unchanged
+ * idle ticks therefore stop rebuilding the renderer component and stop mutating
+ * transcript lines above the viewport, which is what triggers TUI full-redraw
+ * storms (`tui.ts` `firstChanged < viewportTop`).
+ *
+ * It is deliberately value-based, never object identity: `AsyncJobManager.record-
+ * SubagentProgress` stores a `structuredClone` but `getSubagentProgress` returns
+ * the retained object by reference, so identity comparison would be both noisy and
+ * unsafe.
+ *
+ * Time-derived fields are intentionally excluded so the panel does not churn while
+ * idle: raw durations (`durationMs`), current-tool elapsed (`currentToolStartMs`),
+ * and retry countdowns (`retryState.startedAtMs`) are omitted. Idle duration and
+ * countdown ticking is sacrificed by design; every real transition still changes
+ * the signature.
+ */
+export function subagentAwaitRenderedStateSignature(subagents: readonly SubagentSnapshot[]): string {
+	return JSON.stringify(subagents.map(canonicalizeSnapshotForSignature));
+}
+
+function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
+	return {
+		id: snapshot.id,
+		jobId: snapshot.jobId,
+		status: snapshot.status,
+		label: snapshot.label,
+		agent: snapshot.agent,
+		agentSource: snapshot.agentSource,
+		description: snapshot.description ?? null,
+		assignment: snapshot.assignment ?? null,
+		resultText: snapshot.resultText ?? null,
+		errorText: snapshot.errorText ?? null,
+		resultPreview: snapshot.resultPreview ?? null,
+		outputRef: snapshot.outputRef ?? null,
+		truncated: snapshot.truncated ?? false,
+		guidance: snapshot.guidance ?? null,
+		liveProgressAvailable: snapshot.liveProgressAvailable ?? null,
+		effectiveModel: snapshot.effectiveModel ?? null,
+		requestedModel: snapshot.requestedModel ?? null,
+		modelFellBack: snapshot.modelFellBack ?? false,
+		// durationMs intentionally excluded (time-derived; would defeat idle gating).
+		progress: snapshot.progress ? canonicalizeProgressForSignature(snapshot.progress) : null,
+	};
+}
+
+function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
+	return {
+		id: progress.id,
+		agent: progress.agent,
+		agentSource: progress.agentSource,
+		status: progress.status,
+		task: progress.task,
+		assignment: progress.assignment ?? null,
+		description: progress.description ?? null,
+		lastIntent: progress.lastIntent ?? null,
+		currentTool: progress.currentTool ?? null,
+		currentToolArgs: progress.currentToolArgs ?? null,
+		// currentToolStartMs intentionally excluded (only drives elapsed rendering).
+		recentTools: progress.recentTools.map(tool => ({ tool: tool.tool, args: tool.args })),
+		recentOutput: progress.recentOutput,
+		toolCount: progress.toolCount,
+		tokens: progress.tokens,
+		contextTokens: progress.contextTokens ?? null,
+		contextWindow: progress.contextWindow ?? null,
+		cost: progress.cost,
+		modelOverride: progress.modelOverride ?? null,
+		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
+		// durationMs intentionally excluded (time-derived).
+		extractedToolData: progress.extractedToolData
+			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)
+			: null,
+		retryState: progress.retryState
+			? {
+					attempt: progress.retryState.attempt,
+					maxAttempts: progress.retryState.maxAttempts,
+					unbounded: progress.retryState.unbounded ?? false,
+					delayMs: progress.retryState.delayMs,
+					errorMessage: progress.retryState.errorMessage,
+					// startedAtMs intentionally excluded (drives countdown only).
+				}
+			: null,
+		retryFailure: progress.retryFailure ?? null,
+		inflightTaskDetails: progress.inflightTaskDetails
+			? canonicalizeTaskDetailsForSignature(progress.inflightTaskDetails)
+			: null,
+	};
+}
+
+/**
+ * Nested `task` data (`extractedToolData.task` and `inflightTaskDetails`) is the
+ * one place the await signature reaches into a live, ticking structure: nested
+ * `AgentProgress` carries the same time-derived fields excluded above, and
+ * `TaskToolDetails` adds `totalDurationMs` / per-result `durationMs`. Signing it
+ * wholesale would defeat idle gating whenever an awaited subagent is itself inside
+ * a live `task` call, so these helpers canonicalize the rendered, non-time subset
+ * recursively (mutually recursive with `canonicalizeProgressForSignature`).
+ */
+function canonicalizeExtractedToolDataForSignature(data: Record<string, unknown[]>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(data)) {
+		// Only the `task` key holds time-ticking `TaskToolDetails`; other handler
+		// data (yield/report_finding/generic) is stable and passes through as-is.
+		out[key] = key === "task" ? (data[key] as TaskToolDetails[]).map(canonicalizeTaskDetailsForSignature) : data[key];
+	}
+	return out;
+}
+
+function canonicalizeTaskDetailsForSignature(details: TaskToolDetails): unknown {
+	// `extractedToolData` is an untyped boundary (`Record<string, unknown[]>`), so
+	// guard each field instead of trusting the `TaskToolDetails` cast.
+	return {
+		// totalDurationMs intentionally excluded (time-derived).
+		results: Array.isArray(details.results) ? details.results.map(canonicalizeTaskResultForSignature) : null,
+		progress: Array.isArray(details.progress) ? details.progress.map(canonicalizeProgressForSignature) : null,
+		async: details.async
+			? { state: details.async.state, jobId: details.async.jobId, type: details.async.type }
+			: null,
+	};
+}
+
+function canonicalizeTaskResultForSignature(result: TaskToolDetails["results"][number]): unknown {
+	// Completed results do not tick, but drop `durationMs` so the only time-derived
+	// field in the receipt can never reintroduce idle churn.
+	const { durationMs: _durationMs, ...rest } = result;
+	return rest;
 }

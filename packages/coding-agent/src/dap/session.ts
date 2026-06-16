@@ -1,7 +1,8 @@
 import * as path from "node:path";
 import * as timers from "node:timers/promises";
-import { logger, ptree, untilAborted } from "@gajae-code/utils";
+import { logger, untilAborted } from "@gajae-code/utils";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
+import { type OwnedProcess, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { DapClient } from "./client";
 import type {
 	DapAttachArguments,
@@ -63,6 +64,24 @@ import type {
 	DapWriteMemoryResponse,
 } from "./types";
 
+function drainStream(stream: ReadableStream<Uint8Array> | null | undefined): void {
+	if (!stream) return;
+	void (async () => {
+		try {
+			const reader = stream.getReader();
+			try {
+				while (!(await reader.read()).done) {
+					// drain only
+				}
+			} finally {
+				reader.releaseLock();
+			}
+		} catch {
+			// Process stream closed or was already consumed.
+		}
+	})();
+}
+
 interface DapSession {
 	id: string;
 	adapter: DapResolvedAdapter;
@@ -87,6 +106,7 @@ interface DapSession {
 	initializedSeen: boolean;
 	needsConfigurationDone: boolean;
 	configurationDoneSent: boolean;
+	runInTerminalProcesses: Set<OwnedProcess>;
 }
 
 export interface DapOutputSnapshot {
@@ -948,6 +968,7 @@ export class DapSessionManager {
 			initializedSeen: false,
 			needsConfigurationDone: false,
 			configurationDoneSent: false,
+			runInTerminalProcesses: new Set(),
 		};
 		client.onReverseRequest("runInTerminal", async rawArgs => {
 			const args = (rawArgs ?? {}) as DapRunInTerminalArguments;
@@ -957,17 +978,21 @@ export class DapSessionManager {
 			const env = Object.fromEntries(
 				Object.entries(args.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
 			);
-			const proc = ptree.spawn(args.args, {
+			const owner = spawnOwnedProcess(args.args, {
 				cwd: args.cwd ?? session.cwd,
-				stdin: "pipe",
+				stdin: "ignore",
 				env: {
 					...Bun.env,
 					...NON_INTERACTIVE_ENV,
 					...env,
 				},
-				detached: true,
+				name: `dap:${session.id}:runInTerminal`,
 			});
-			return { processId: proc.pid } satisfies DapRunInTerminalResponse;
+			drainStream(owner.child.stdout);
+			drainStream(owner.child.stderr);
+			session.runInTerminalProcesses.add(owner);
+			owner.exited.finally(() => session.runInTerminalProcesses.delete(owner));
+			return { processId: owner.pid } satisfies DapRunInTerminalResponse;
 		});
 		client.onReverseRequest("startDebugging", async rawArgs => {
 			const startArgs = (rawArgs ?? {}) as Partial<DapStartDebuggingArguments>;
@@ -1294,12 +1319,24 @@ export class DapSessionManager {
 		return session;
 	}
 
-	#disposeSession(session: DapSession) {
+	async #disposeSession(session: DapSession) {
 		if (this.#activeSessionId === session.id) {
 			this.#activeSessionId = null;
 		}
 		this.#sessions.delete(session.id);
-		void session.client.dispose().catch(() => {});
+		await this.#disposeRunInTerminalProcesses(session);
+		await session.client.dispose().catch(() => {});
+	}
+
+	async #disposeRunInTerminalProcesses(session: DapSession): Promise<void> {
+		const owners = [...session.runInTerminalProcesses];
+		session.runInTerminalProcesses.clear();
+		await Promise.allSettled(
+			owners.map(async owner => {
+				await owner.dispose();
+				await owner.awaitExit({ timeoutMs: 1_000 });
+			}),
+		);
 	}
 }
 

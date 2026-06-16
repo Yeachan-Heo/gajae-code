@@ -141,7 +141,8 @@ describe("Anthropic request fingerprint alignment", () => {
 
 		expect(payload.system).toEqual([
 			{ type: "text", text: "stable system" },
-			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral" } },
+			// Canonical Anthropic API + long-cache-capable model defaults to 1h retention.
+			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral", ttl: "1h" } },
 		]);
 	});
 

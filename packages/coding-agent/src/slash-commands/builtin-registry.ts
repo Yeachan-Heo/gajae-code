@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
+import { Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import {
@@ -13,6 +14,8 @@ import {
 import { extractExplicitThinkingSelector, formatModelSelectorValue, parseModelPattern } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
+import { DynamicBorder } from "../modes/components/dynamic-border";
+import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
@@ -23,6 +26,7 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { buildContextReportText } from "./helpers/context-report";
+import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
@@ -40,6 +44,14 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
+
+function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label: string; isSubagentRole: boolean }> {
+	return GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => ({
+		id,
+		label: GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase(),
+		isSubagentRole: GJC_MODEL_ASSIGNMENT_TARGETS[id].settingsPath === "task.agentModelOverrides",
+	}));
+}
 
 function parseProviderSetupSlashArgs(args: string): {
 	preset?: string;
@@ -357,7 +369,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (arg === "status") {
-				await runtime.output(`Fast mode is ${runtime.session.isFastModeEnabled() ? "on" : "off"}.`);
+				await runtime.output(
+					buildFastStatusReport({
+						session: runtime.session,
+						roleTargets: fastStatusRoleTargets(),
+						iconFast: theme.icon.fast,
+					}),
+				);
 				return commandConsumed();
 			}
 			return usage("Usage: /fast [on|off|status]", runtime);
@@ -386,8 +404,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (arg === "status") {
-				const enabled = runtime.ctx.session.isFastModeEnabled();
-				runtime.ctx.showStatus(`Fast mode is ${enabled ? "on" : "off"}.`);
+				const report = buildFastStatusReport({
+					session: runtime.ctx.session,
+					roleTargets: fastStatusRoleTargets(),
+					iconFast: theme.icon.fast,
+					formatInactive: text => theme.fg("dim", text),
+				});
+				runtime.ctx.chatContainer.addChild(new Spacer(1));
+				runtime.ctx.chatContainer.addChild(new DynamicBorder());
+				runtime.ctx.chatContainer.addChild(new Text(report, 1, 0));
+				runtime.ctx.chatContainer.addChild(new DynamicBorder());
+				runtime.ctx.ui.requestRender();
 				runtime.ctx.editor.setText("");
 				return;
 			}

@@ -12,7 +12,7 @@ import { Text } from "@gajae-code/tui";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { renderSubagentLiveProgress } from "../task/render";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine } from "../tui";
+import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
 	formatDuration,
 	formatStatusIcon,
@@ -21,11 +21,86 @@ import {
 	type ToolUIStatus,
 	truncateToWidth,
 } from "./render-utils";
-import type { SubagentSnapshot, SubagentToolDetails } from "./subagent";
+import { type SubagentSnapshot, type SubagentToolDetails, subagentAwaitRenderedStateSignature } from "./subagent";
 
 const PREVIEW_LINES_COLLAPSED = 1;
 const PREVIEW_LINES_EXPANDED = 4;
 const PREVIEW_LINE_WIDTH = 80;
+
+/**
+ * Bounded, content-addressed cache for each subagent's heavy body lines (the
+ * indented receipt fields + `renderSubagentLiveProgress` -> `renderAgentProgress`
+ * output). It is module-level so it survives the built-in renderer recreating the
+ * result component on every partial update (`tool-execution.ts` clears the content
+ * box and re-invokes `renderResult`), which a per-component `let cached` cannot.
+ *
+ * The cached body is a PURE function of its key: the per-subagent rendered-state
+ * signature (reused from the producer; excludes time-derived churn), expanded
+ * state, width, and the actual Theme instance identity. `spinnerFrame` and all
+ * wall-clock displays are deliberately kept OUT of the cached body — the animated
+ * spinner and the fresh duration live in the cheap per-subagent status line, and
+ * `renderSubagentLiveProgress` is invoked with `staticTime` so current-tool elapsed
+ * and retry countdowns are never baked into cached lines.
+ */
+const SUBAGENT_BODY_CACHE_MAX = 128;
+const subagentBodyCache = new Map<bigint, string[]>();
+let subagentBodyRenderCount = 0;
+
+// Stable identity per Theme instance so a theme change (preview, symbol preset,
+// color-blind reload, custom-theme reload, or in-memory swap) never reuses stale
+// ANSI/glyph strings — distinct Theme objects get distinct ids even when the theme
+// name is unchanged (e.g. the "<in-memory>" name).
+const themeIdentity = new WeakMap<Theme, number>();
+let nextThemeId = 1;
+function themeIdentityId(theme: Theme): number {
+	let id = themeIdentity.get(theme);
+	if (id === undefined) {
+		id = nextThemeId++;
+		themeIdentity.set(theme, id);
+	}
+	return id;
+}
+
+/** Test-only seam (PR3 deterministic cache-hit assertions). */
+export const subagentBodyCacheTestHooks = {
+	get bodyRenders(): number {
+		return subagentBodyRenderCount;
+	},
+	get size(): number {
+		return subagentBodyCache.size;
+	},
+	reset(): void {
+		subagentBodyRenderCount = 0;
+		subagentBodyCache.clear();
+	},
+};
+
+function renderCachedSubagentBody(
+	snapshot: SubagentSnapshot,
+	signature: string,
+	expanded: boolean,
+	width: number,
+	theme: Theme,
+): string[] {
+	const key = new Hasher().str(signature).bool(expanded).u32(width).u32(themeIdentityId(theme)).digest();
+	const hit = subagentBodyCache.get(key);
+	if (hit) {
+		// Refresh LRU recency.
+		subagentBodyCache.delete(key);
+		subagentBodyCache.set(key, hit);
+		return hit;
+	}
+	const lines = renderSubagentSnapshotBody(snapshot, expanded, theme).map(line =>
+		line.length > 0 ? truncateToWidth(line, width, Ellipsis.Omit) : "",
+	);
+	subagentBodyRenderCount += 1;
+	subagentBodyCache.set(key, lines);
+	if (subagentBodyCache.size > SUBAGENT_BODY_CACHE_MAX) {
+		const oldest = subagentBodyCache.keys().next().value;
+		if (oldest !== undefined) subagentBodyCache.delete(oldest);
+	}
+	return lines;
+}
 
 function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
 	switch (status) {
@@ -44,13 +119,10 @@ function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
 	}
 }
 
-function renderSubagentSnapshot(
-	snapshot: SubagentSnapshot,
-	expanded: boolean,
-	theme: Theme,
-	spinnerFrame: number | undefined,
-): string[] {
-	const lines: string[] = [];
+// Cheap, dynamic per-subagent status line: the spinner may animate and the duration
+// is the snapshot's own (fresh) value, so this line is rebuilt every frame and is
+// NOT part of the cached body.
+function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spinnerFrame: number | undefined): string {
 	const icon = formatStatusIcon(
 		statusIconKind(snapshot.status),
 		theme,
@@ -59,7 +131,14 @@ function renderSubagentSnapshot(
 	const id = theme.fg("muted", snapshot.id);
 	const status = theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
-	lines.push(`${icon} ${id} ${status} ${duration}`);
+	return `${icon} ${id} ${status} ${duration}`;
+}
+
+// Heavy, cacheable per-subagent body: a pure function of (snapshot content, expanded,
+// theme). No spinner frame and no wall-clock displays leak in (live progress uses
+// `staticTime`), so the module body cache can never serve stale or frozen-ticking lines.
+function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolean, theme: Theme): string[] {
+	const lines: string[] = [];
 
 	// Static receipt fields (parity with the markdown content for non-await actions).
 	if (snapshot.jobId !== snapshot.id) lines.push(`  ${theme.fg("dim", `Job: ${snapshot.jobId}`)}`);
@@ -82,13 +161,13 @@ function renderSubagentSnapshot(
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
 	}
 
-	// Defense in depth: the producer only attaches `progress` when a live
-	// producer exists (subagent.ts #liveProgressFields), but the renderer
-	// also honors an explicit `liveProgressAvailable: false` so stale retained
-	// progress can never resurrect a live panel (AC5).
+	// Defense in depth: the producer only attaches `progress` when a live producer
+	// exists (subagent.ts #liveProgressFields), but the renderer also honors an
+	// explicit `liveProgressAvailable: false` so stale retained progress can never
+	// resurrect a live panel (AC5). `staticTime` keeps wall-clock displays out of
+	// these cached lines.
 	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
-		// Live streaming panel (full task-panel parity), indented under the header.
-		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, spinnerFrame)) {
+		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, true)) {
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
@@ -133,14 +212,17 @@ export const subagentToolRenderer = {
 
 		const runningCount = subagents.filter(s => s.status === "running").length;
 
-		let cached: RenderCache | undefined;
+		// Each snapshot's rendered-state signature is constant for this component
+		// instance, so compute them at most once; the heavy per-subagent bodies are
+		// cached module-side and keyed by that signature.
+		let snapshotSignatures: string[] | undefined;
 		return {
 			render(width: number): string[] {
 				const expanded = options.expanded;
-				const spinnerFrame = options.spinnerFrame ?? 0;
-				const key = new Hasher().bool(expanded).u32(width).u32(spinnerFrame).digest();
-				if (cached?.key === key) return cached.lines;
 
+				// Cheap dynamic header: may animate with `spinnerFrame` and is rebuilt
+				// every frame, but it is a single status line plus an optional hint, so
+				// it is never gated by the heavy body cache.
 				const header = renderStatusLine(
 					{
 						icon: runningCount > 0 ? "info" : "success",
@@ -153,23 +235,31 @@ export const subagentToolRenderer = {
 					},
 					theme,
 				);
-
-				const lines: string[] = [header];
+				const out: string[] = [truncateToWidth(header, width, Ellipsis.Omit)];
 				// Discoverability: the inline panel is a bounded preview; the session
 				// observer (ctrl+s) streams the full per-subagent message history.
 				if (runningCount > 0) {
-					lines.push(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`);
-				}
-				for (const snapshot of subagents) {
-					lines.push(...renderSubagentSnapshot(snapshot, expanded, theme, options.spinnerFrame));
+					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
 				}
 
-				const out = lines.map(l => (l.length > 0 ? truncateToWidth(l, width, Ellipsis.Omit) : ""));
-				cached = { key, lines: out };
+				snapshotSignatures ??= subagents.map(snapshot => subagentAwaitRenderedStateSignature([snapshot]));
+				subagents.forEach((snapshot, index) => {
+					// Fresh per-subagent status line (cheap), then the cached heavy body.
+					out.push(
+						truncateToWidth(
+							renderSubagentStatusLine(snapshot, theme, options.spinnerFrame),
+							width,
+							Ellipsis.Omit,
+						),
+					);
+					out.push(...renderCachedSubagentBody(snapshot, snapshotSignatures![index]!, expanded, width, theme));
+				});
 				return out;
 			},
 			invalidate() {
-				cached = undefined;
+				// The heavy body cache is content-addressed (keyed by the rendered-state
+				// signature, width, expanded, and theme), so there is no instance-local
+				// state to clear here.
 			},
 		};
 	},

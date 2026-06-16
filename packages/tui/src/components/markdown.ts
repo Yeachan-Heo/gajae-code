@@ -43,6 +43,24 @@ const renderCache = new LRUCache<string, { source: string; lines: string[] }>({ 
 const PARSE_CACHE_MAX = 128;
 const parseCache = new LRUCache<string, { source: string; tokens: Token[] }>({ max: PARSE_CACHE_MAX });
 
+// Per-code-block highlight cache (F3): keyed by theme + lang + code so streaming
+// appends only highlight new/changed blocks instead of re-highlighting the whole
+// prefix on every chunk. Bounded LRU; cleared on theme change via clearRenderCache().
+const HIGHLIGHT_CACHE_MAX = 512;
+const highlightCache = new LRUCache<string, string[]>({ max: HIGHLIGHT_CACHE_MAX });
+// F18: cap synchronous (Rust FFI) syntax highlighting so a single huge fenced block
+// cannot stall the UI thread; oversized blocks render plain with a sanitized marker.
+const MAX_HIGHLIGHT_BYTES = 200_000;
+const MAX_HIGHLIGHT_LINES = 2000;
+let highlightCallCount = 0;
+/** Test/diagnostic seam: number of synchronous highlight invocations since the last reset. */
+export function getMarkdownHighlightCallCount(): number {
+	return highlightCallCount;
+}
+export function resetMarkdownHighlightCallCount(): void {
+	highlightCallCount = 0;
+}
+
 // Full-content 64-bit wyhash over every byte (no lossy sampling). Cache hits
 // additionally verify entry.source against the normalized text, so even a
 // hash collision can never return another message's render.
@@ -58,6 +76,7 @@ function wrapTextIfNeeded(line: string, width: number): string[] {
 export function clearRenderCache(): void {
 	renderCache.clear();
 	parseCache.clear();
+	highlightCache.clear();
 }
 
 // Stable numeric IDs for structural theme/style objects (no ID field on type).
@@ -184,6 +203,47 @@ export class Markdown implements Component {
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
+	}
+
+	#exceedsHighlightCap(code: string): boolean {
+		let newlines = 0;
+		for (let i = 0; i < code.length; i++) {
+			if (code.charCodeAt(i) === 10) newlines += 1;
+		}
+		if (newlines + 1 > MAX_HIGHLIGHT_LINES) return true;
+		// UTF-8 byte length (not UTF-16 code-unit count) so a non-ASCII block cannot
+		// exceed the advertised byte cap and still reach the synchronous highlighter.
+		return Buffer.byteLength(code, "utf8") > MAX_HIGHLIGHT_BYTES;
+	}
+
+	#highlightCodeBlock(code: string, lang: string): string[] | null {
+		if (!this.#theme.highlightCode) return null;
+		if (this.#exceedsHighlightCap(code)) return null;
+		const key = `${objectId(this.#theme)}\x00${lang}\x00${code}`;
+		const cached = highlightCache.get(key);
+		if (cached) return cached;
+		highlightCallCount += 1;
+		const result = this.#theme.highlightCode(code, lang || undefined);
+		highlightCache.set(key, result);
+		return result;
+	}
+
+	#emitCodeBlock(lines: string[], code: string, lang: string, codeIndent: string): void {
+		lines.push(this.#theme.codeBlockBorder(`\`\`\`${lang}`));
+		const highlighted = this.#highlightCodeBlock(code, lang);
+		if (highlighted) {
+			for (const hlLine of highlighted) {
+				lines.push(`${codeIndent}${hlLine}`);
+			}
+		} else {
+			if (this.#theme.highlightCode && this.#exceedsHighlightCap(code)) {
+				lines.push(`${codeIndent}${this.#theme.codeBlock("[syntax highlighting skipped: code block too large]")}`);
+			}
+			for (const codeLine of code.split("\n")) {
+				lines.push(`${codeIndent}${this.#theme.codeBlock(codeLine)}`);
+			}
+		}
+		lines.push(this.#theme.codeBlockBorder("```"));
 	}
 
 	render(width: number): string[] {
@@ -442,20 +502,7 @@ export class Markdown implements Component {
 				}
 
 				const codeIndent = padding(this.#codeBlockIndent);
-				lines.push(this.#theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.#theme.highlightCode) {
-					const highlightedLines = this.#theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
-						lines.push(`${codeIndent}${hlLine}`);
-					}
-				} else {
-					// Split code by newlines and style each line
-					const codeLines = token.text.split("\n");
-					for (const codeLine of codeLines) {
-						lines.push(`${codeIndent}${this.#theme.codeBlock(codeLine)}`);
-					}
-				}
-				lines.push(this.#theme.codeBlockBorder("```"));
+				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}
@@ -725,19 +772,7 @@ export class Markdown implements Component {
 			} else if (token.type === "code") {
 				// Code block in list item
 				const codeIndent = padding(this.#codeBlockIndent);
-				lines.push(this.#theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.#theme.highlightCode) {
-					const highlightedLines = this.#theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
-						lines.push(`${codeIndent}${hlLine}`);
-					}
-				} else {
-					const codeLines = token.text.split("\n");
-					for (const codeLine of codeLines) {
-						lines.push(`${codeIndent}${this.#theme.codeBlock(codeLine)}`);
-					}
-				}
-				lines.push(this.#theme.codeBlockBorder("```"));
+				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
 			} else {
 				// Other token types - try to render as inline
 				const text = this.#renderInlineTokens([token], styleContext);

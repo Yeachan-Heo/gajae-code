@@ -12,6 +12,11 @@ interface ActiveRun {
 	pendingTools: Map<string, PendingTool>;
 }
 
+function rejectPendingTools(active: ActiveRun, error: Error): void {
+	for (const pending of active.pendingTools.values()) pending.reject(error);
+	active.pendingTools.clear();
+}
+
 function errorPayload(error: unknown): RunErrorPayload {
 	if (error instanceof Error) {
 		return {
@@ -99,7 +104,8 @@ export class WorkerCore {
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
 		const runtime = this.#ensureRuntime(snapshot);
 		runtime.setCwd(snapshot.cwd);
-		this.#active = { runId, pendingTools: new Map() };
+		const active: ActiveRun = { runId, pendingTools: new Map() };
+		this.#active = active;
 		try {
 			const value = await runtime.run(code, filename);
 			runtime.displayValue(value);
@@ -107,7 +113,8 @@ export class WorkerCore {
 		} catch (error) {
 			this.#transport.send({ type: "result", runId, ok: false, error: errorPayload(error) });
 		} finally {
-			this.#active = null;
+			rejectPendingTools(active, new ToolError("JS run ended"));
+			if (this.#active === active) this.#active = null;
 		}
 	}
 
@@ -132,10 +139,7 @@ export class WorkerCore {
 	#close(): void {
 		const active = this.#active;
 		if (active) {
-			for (const pending of active.pendingTools.values()) {
-				pending.reject(new ToolError("JS worker closed"));
-			}
-			active.pendingTools.clear();
+			rejectPendingTools(active, new ToolError("JS worker closed"));
 		}
 		this.#active = null;
 		this.#runtime = null;

@@ -1,4 +1,5 @@
 import { isCompiledBinary, logger, Snowflake } from "@gajae-code/utils";
+import { registerResourceOwner } from "../../runtime/process-lifecycle";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
@@ -43,22 +44,66 @@ interface PendingRun {
 	settled: boolean;
 }
 
+interface ReadyDeferred {
+	promise: Promise<JsSession>;
+	resolve(session: JsSession): void;
+	reject(error: Error): void;
+}
+
+interface QueueDeferred {
+	promise: Promise<void>;
+	resolve(): void;
+	reject(error: Error): void;
+}
+
 interface JsSession {
 	sessionKey: string;
-	worker: WorkerHandle;
-	state: "alive" | "dead";
+	worker?: WorkerHandle;
+	state: "starting" | "alive" | "dead";
+	ownerId?: string;
 	pending: Map<string, PendingRun>;
 	queue: Promise<void>;
+	queuedWaiters: Set<(error: Error) => void>;
+	queueTail: QueueDeferred;
+	controllers: Set<AbortController>;
+	runSignal?: AbortSignal;
+	ready: ReadyDeferred;
+	unsubscribe?: () => void;
+	unregistered?: () => void;
 }
 
 const sessions = new Map<string, JsSession>();
+const sessionWaiters = new Map<string, Set<(error: Error) => void>>();
+let vmResourceCleanupRegistered = false;
+
+function ensureVmResourceCleanup(): void {
+	if (vmResourceCleanupRegistered) return;
+	vmResourceCleanupRegistered = true;
+	registerResourceOwner("js-vm-contexts", async () => {
+		try {
+			await disposeAllVmContexts();
+		} finally {
+			vmResourceCleanupRegistered = false;
+		}
+	});
+}
 const READY_TIMEOUT_MS_DEFAULT = 5_000;
+
+function getSessionWaiters(sessionKey: string): Set<(error: Error) => void> {
+	let waiters = sessionWaiters.get(sessionKey);
+	if (!waiters) {
+		waiters = new Set();
+		sessionWaiters.set(sessionKey, waiters);
+	}
+	return waiters;
+}
 
 export async function executeInVmContext(options: {
 	sessionKey: string;
 	sessionId: string;
 	cwd: string;
 	session: ToolSession;
+	ownerId?: string;
 	reset?: boolean;
 	code: string;
 	filename: string;
@@ -68,19 +113,44 @@ export async function executeInVmContext(options: {
 	if (options.reset) {
 		await resetVmContext(options.sessionKey);
 	}
-	const session = await acquireSession(
-		options.sessionKey,
-		{ cwd: options.cwd, sessionId: options.sessionId },
-		options.timeoutMs,
-	);
-	return await runQueued(session, () => runOnce(session, options));
+	const waiters = getSessionWaiters(options.sessionKey);
+	const { promise: contextResetPromise, reject: rejectContextReset } = Promise.withResolvers<never>();
+	contextResetPromise.catch(() => undefined);
+	waiters.add(rejectContextReset);
+	const runPromise = (async (): Promise<{ value: unknown }> => {
+		const session = await acquireSession(
+			options.sessionKey,
+			{ cwd: options.cwd, sessionId: options.sessionId },
+			options.ownerId,
+			options.timeoutMs,
+		);
+		return await runQueued(session, () => runOnce(session, options));
+	})();
+	try {
+		return await Promise.race([runPromise, contextResetPromise]);
+	} finally {
+		waiters.delete(rejectContextReset);
+	}
 }
 
 export async function resetVmContext(sessionKey: string): Promise<void> {
 	const session = sessions.get(sessionKey);
 	if (!session) return;
 	sessions.delete(sessionKey);
+	const waiters = sessionWaiters.get(sessionKey);
+	if (waiters) for (const reject of [...waiters]) reject(new ToolError("JS context reset"));
 	await killSession(session, new ToolError("JS context reset"));
+}
+
+export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
+	const owned = [...sessions.entries()].filter(
+		([sessionKey, session]) =>
+			session.ownerId === ownerId || sessionKey === ownerId || sessionKey === `js:${ownerId}`,
+	);
+	for (const [sessionKey, session] of owned) {
+		if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+	}
+	await Promise.all(owned.map(([, session]) => killSession(session, new ToolError("JS context disposed"))));
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
@@ -89,19 +159,38 @@ export async function disposeAllVmContexts(): Promise<void> {
 	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"))));
 }
 
+export function liveVmContextCount(): number {
+	return [...sessions.values()].filter(session => session.state !== "dead").length;
+}
+
 async function runQueued<T>(session: JsSession, work: () => Promise<T>): Promise<T> {
+	if (session.state !== "alive") throw new ToolError("JS worker is not alive");
 	const previous = session.queue;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	session.queue = promise;
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	const queueController = new AbortController();
+	const queueItem: QueueDeferred = { promise, resolve, reject };
+	const rejectWaiter = (error: Error): void => queueItem.reject(error);
+	session.queuedWaiters.add(rejectWaiter);
+	session.controllers.add(queueController);
+	session.queueTail = queueItem;
+	session.queue = (async () => {
+		await previous.catch(() => undefined);
+		await queueItem.promise;
+	})().catch(() => undefined);
 	try {
-		await previous;
-	} catch {
-		// Previous run's failure must not poison this one.
-	}
-	try {
-		return await work();
+		await Promise.race([previous.catch(() => undefined), queueItem.promise, abortPromise(queueController.signal)]);
+		if (session.runSignal?.aborted) throw reasonToError(session.runSignal.reason, "JS worker is not alive");
+		if (session.state !== "alive") throw new ToolError("JS worker is not alive");
+		session.queuedWaiters.delete(rejectWaiter);
+		return await Promise.race([
+			work(),
+			queueItem.promise.then(() => new Promise<never>(() => {})),
+			abortPromise(queueController.signal),
+		]);
 	} finally {
-		resolve();
+		session.queuedWaiters.delete(rejectWaiter);
+		session.controllers.delete(queueController);
+		queueItem.resolve();
 	}
 }
 
@@ -118,6 +207,7 @@ async function runOnce(
 ): Promise<{ value: unknown }> {
 	const runId = `r-${Snowflake.next()}`;
 	const { promise, resolve, reject } = Promise.withResolvers<{ value: unknown }>();
+	const sessionSignal = session.runSignal;
 	const pending: PendingRun = {
 		runId,
 		runState: options.runState,
@@ -145,13 +235,19 @@ async function runOnce(
 	}
 
 	try {
-		session.worker.send({
-			type: "run",
-			runId,
-			code: options.code,
-			filename: options.filename,
-			snapshot: { cwd: options.cwd, sessionId: options.sessionId },
-		});
+		if (sessionSignal?.aborted) throw reasonToError(sessionSignal.reason, "JS worker is not alive");
+		if (
+			!safeSend(session, {
+				type: "run",
+				runId,
+				code: options.code,
+				filename: options.filename,
+				snapshot: { cwd: options.cwd, sessionId: options.sessionId },
+			})
+		) {
+			settleRunWithError(session, pending, new ToolError("JS worker send failed"));
+			return await promise;
+		}
 		return await promise;
 	} finally {
 		options.runState.signal?.removeEventListener("abort", onAbort);
@@ -159,46 +255,76 @@ async function runOnce(
 	}
 }
 
-async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, timeoutMs?: number): Promise<JsSession> {
+async function acquireSession(
+	sessionKey: string,
+	snapshot: SessionSnapshot,
+	ownerId: string | undefined,
+	timeoutMs?: number,
+): Promise<JsSession> {
+	ensureVmResourceCleanup();
 	const existing = sessions.get(sessionKey);
-	if (existing && existing.state === "alive") return existing;
+	if (existing && existing.state !== "dead") return await existing.ready.promise;
 
-	const worker = await spawnJsWorker();
+	const { promise: ready, resolve: resolveSession, reject: rejectSession } = Promise.withResolvers<JsSession>();
+	ready.catch(() => undefined);
 	const session: JsSession = {
 		sessionKey,
-		worker,
-		state: "alive",
+		state: "starting",
+		ownerId,
 		pending: new Map(),
 		queue: Promise.resolve(),
+		queuedWaiters: new Set(),
+		queueTail: settledQueueDeferred(),
+		controllers: new Set(),
+		ready: { promise: ready, resolve: resolveSession, reject: rejectSession },
 	};
-	const { promise: readyPromise, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>();
-	let resolved = false;
-	const unsubscribe = worker.onMessage(msg => {
-		if (!resolved && msg.type === "ready") {
-			resolved = true;
-			resolveReady();
-			return;
-		}
-		if (!resolved && msg.type === "init-failed") {
-			resolved = true;
-			rejectReady(errorFromPayload(msg.error));
-			return;
-		}
-		handleSessionMessage(session, msg);
-	});
+	sessions.set(sessionKey, session);
+
+	let worker: WorkerHandle | undefined;
 	try {
-		// Cold-start can exceed 5s on slow hosts. Let the caller's per-cell timeout dominate so
-		// users can grant more headroom when they raise `timeout` on a cell.
+		worker = await spawnJsWorker();
+		const current = sessions.get(sessionKey);
+		if (current !== session) {
+			await worker.terminate().catch(() => undefined);
+			return (
+				(await current?.ready.promise) ?? Promise.reject(new ToolError("JS context replaced during initialization"))
+			);
+		}
+		session.worker = worker;
+		const { promise: readyPromise, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>();
+		let resolved = false;
+		session.unsubscribe = worker.onMessage(msg => {
+			if (!resolved && msg.type === "ready") {
+				resolved = true;
+				resolveReady();
+				return;
+			}
+			if (!resolved && msg.type === "init-failed") {
+				resolved = true;
+				rejectReady(errorFromPayload(msg.error));
+				return;
+			}
+			handleSessionMessage(session, msg);
+		});
 		const readyTimeoutMs = Math.max(READY_TIMEOUT_MS_DEFAULT, timeoutMs ?? 0);
 		await raceWithTimeout(readyPromise, readyTimeoutMs, "Timed out initializing JS eval worker");
+		if (sessions.get(sessionKey) !== session) {
+			await killSession(session, new ToolError("JS context replaced during initialization"));
+			return (
+				(await sessions.get(sessionKey)?.ready.promise) ??
+				Promise.reject(new ToolError("JS context replaced during initialization"))
+			);
+		}
+		worker.send({ type: "init", snapshot });
+		session.state = "alive";
+		session.ready.resolve(session);
+		return session;
 	} catch (error) {
-		unsubscribe();
-		await worker.terminate().catch(() => undefined);
+		if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+		await killSession(session, error instanceof Error ? error : new Error(String(error)));
+		session.ready.reject(error instanceof Error ? error : new Error(String(error)));
 		throw error;
 	}
-	worker.send({ type: "init", snapshot });
-	sessions.set(sessionKey, session);
-	return session;
 }
 
 function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
@@ -276,22 +402,54 @@ async function killSessionFor(session: JsSession, error: Error): Promise<void> {
 async function killSession(session: JsSession, error: Error): Promise<void> {
 	if (session.state === "dead") return;
 	session.state = "dead";
-	for (const pending of session.pending.values()) {
-		if (pending.settled) continue;
-		pending.settled = true;
-		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
-		pending.reject(error);
-	}
+	const unsubscribe = session.unsubscribe;
+	session.unsubscribe = undefined;
+	unsubscribe?.();
+	session.ready.reject(error);
+	session.queueTail.reject(error);
+	for (const controller of [...session.controllers]) controller.abort(error);
+	session.controllers.clear();
+	session.runSignal = AbortSignal.abort(error);
+	for (const reject of [...session.queuedWaiters]) reject(error);
+	session.queuedWaiters.clear();
+	for (const pending of [...session.pending.values()]) settleRunWithError(session, pending, error);
 	session.pending.clear();
-	await session.worker.terminate().catch(() => undefined);
+	void session.worker?.terminate().catch(() => undefined);
 }
 
-function safeSend(session: JsSession, msg: WorkerInbound): void {
-	if (session.state !== "alive") return;
+function settleRunWithError(session: JsSession, pending: PendingRun, error: Error): void {
+	if (pending.settled) return;
+	pending.settled = true;
+	for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+	pending.toolCalls.clear();
+	session.pending.delete(pending.runId);
+	pending.reject(error);
+}
+
+function settledQueueDeferred(): QueueDeferred {
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	resolve();
+	return { promise, resolve, reject };
+}
+
+function abortPromise(signal: AbortSignal): Promise<never> {
+	if (signal.aborted) return Promise.reject(reasonToError(signal.reason, "JS worker is not alive"));
+	const { promise, reject } = Promise.withResolvers<never>();
+	const onAbort = (): void => reject(reasonToError(signal.reason, "JS worker is not alive"));
+	signal.addEventListener("abort", onAbort, { once: true });
+	promise.finally(() => signal.removeEventListener("abort", onAbort)).catch(() => undefined);
+	return promise;
+}
+
+function safeSend(session: JsSession, msg: WorkerInbound): boolean {
+	if (session.state !== "alive") return false;
 	try {
-		session.worker.send(msg);
+		session.worker?.send(msg);
+		return true;
 	} catch (err) {
 		logger.debug("js worker send failed", { error: err instanceof Error ? err.message : String(err) });
+		void killSessionFor(session, err instanceof Error ? err : new Error(String(err)));
+		return false;
 	}
 }
 
@@ -352,10 +510,15 @@ async function spawnJsWorker(): Promise<WorkerHandle> {
 			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
 		return wrapBunWorker(worker);
 	} catch (err) {
-		logger.warn("Bun Worker spawn failed; using inline JS eval worker (no sync-loop guard)", {
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return spawnInlineWorker();
+		if (process.env.GAJAE_CODE_JS_EVAL_INLINE_WORKER === "1") {
+			logger.warn("Bun Worker spawn failed; using test-only inline JS eval worker", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return spawnInlineWorker();
+		}
+		throw new ToolError(
+			`JS eval worker is unavailable and inline fallback is disabled because it cannot interrupt synchronous user code: ${err instanceof Error ? err.message : String(err)}`,
+		);
 	}
 }
 

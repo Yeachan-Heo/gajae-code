@@ -23,6 +23,7 @@ export default {
 			deadlineMs: opts.deadlineMs,
 			signal: opts.signal,
 			sessionId: namespaceSessionId(opts.sessionId),
+			ownerId: opts.kernelOwnerId,
 			sessionFile: opts.sessionFile,
 			reset: opts.reset,
 			artifactPath: opts.artifactPath,

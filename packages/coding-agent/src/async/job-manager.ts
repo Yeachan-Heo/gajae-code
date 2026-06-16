@@ -7,6 +7,11 @@ const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
 const MONITOR_TOMBSTONE_TTL_MS = 5 * 60_000;
+const DEFAULT_MAX_DELIVERY_QUEUE = 100;
+const DELIVERY_MAX_TEXT_BYTES = 64 * 1024;
+const DELIVERY_PREVIEW_HEAD_BYTES = 32 * 1024;
+const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
+const DELIVERY_MAX_ATTEMPTS = 3;
 
 export interface AsyncJob {
 	id: string;
@@ -128,9 +133,16 @@ export interface AsyncJobManagerOptions {
 	retentionMs?: number;
 }
 
+export interface AsyncJobDisposeDiagnostics {
+	stuckJobIds: string[];
+	deliveriesDrained: boolean;
+}
+
 interface AsyncJobDelivery {
 	jobId: string;
 	text: string;
+	originalBytes?: number;
+	truncated?: boolean;
 	attempt: number;
 	nextAttemptAt: number;
 	lastError?: string;
@@ -143,6 +155,7 @@ export interface AsyncJobDeliveryState {
 	delivering: boolean;
 	nextRetryAt?: number;
 	pendingJobIds: string[];
+	deadLettered: number;
 }
 
 export interface AsyncJobLifecycleCleanup {
@@ -196,6 +209,32 @@ function sliceTextFromUtf8ByteOffset(text: string, offsetBytes: number): string 
 		codeUnitIndex += char.length;
 	}
 	return text.slice(codeUnitIndex);
+}
+
+function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string {
+	if (offsetBytes <= 0) return text;
+	let consumedBytes = 0;
+	let codeUnitIndex = 0;
+	for (const char of text) {
+		const charBytes = Buffer.byteLength(char, "utf8");
+		consumedBytes += charBytes;
+		codeUnitIndex += char.length;
+		if (consumedBytes >= offsetBytes) break;
+	}
+	return text.slice(codeUnitIndex);
+}
+
+function sliceTextToUtf8ByteLength(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	let consumedBytes = 0;
+	let codeUnitIndex = 0;
+	for (const char of text) {
+		const charBytes = Buffer.byteLength(char, "utf8");
+		if (consumedBytes + charBytes > maxBytes) break;
+		consumedBytes += charBytes;
+		codeUnitIndex += char.length;
+	}
+	return text.slice(0, codeUnitIndex);
 }
 
 /**
@@ -277,6 +316,8 @@ export class AsyncJobManager {
 	#resumeSeq = 0;
 	#resumeRunner?: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
 	readonly #resumeDescriptors = new Map<string, ResumeDescriptor>();
+	readonly #deadLetteredDeliveries = new Map<string, AsyncJobDelivery>();
+	#lastDisposeDiagnostics: AsyncJobDisposeDiagnostics = { stuckJobIds: [], deliveriesDrained: true };
 	/**
 	 * Change listeners notified on any mutation that can alter the live job set
 	 * (register, terminal/eviction transitions, dispose). Used by the status-line
@@ -381,7 +422,7 @@ export class AsyncJobManager {
 
 				if (job.status === "cancelled") {
 					job.resultText = outcome.kind === "completed" ? outcome.text : outcome.note;
-					this.#runLifecycle(id, "terminal");
+					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
 					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
@@ -403,20 +444,20 @@ export class AsyncJobManager {
 				this.#freezeEndTime(job);
 				job.resultText = outcome.text;
 				this.#enqueueDelivery(id, outcome.text);
-				this.#runLifecycle(id, "terminal");
+				this.#runLifecycle(id, "terminal", job);
 				this.#scheduleEviction(id);
 				this.#markRecordTerminal(id, "completed");
 				this.#drainResumeQueue();
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
-					this.#runLifecycle(id, "terminal");
+					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
 					this.#markRecordTerminal(id, "cancelled");
 					this.#drainResumeQueue();
 					return;
 				}
-				this.#runLifecycle(id, "terminal");
+				this.#runLifecycle(id, "terminal", job);
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				this.#freezeEndTime(job);
@@ -471,14 +512,14 @@ export class AsyncJobManager {
 		job.endTime ??= Date.now();
 	}
 
-	#runLifecycle(jobId: string, phase: "cancel" | "terminal" | "evict"): void {
+	#runLifecycle(jobId: string, phase: "cancel" | "terminal" | "evict", jobOverride?: AsyncJob): void {
+		const lifecycle = this.#lifecycles.get(jobId);
+		const job = jobOverride ?? this.#jobs.get(jobId);
+		if (!lifecycle || !job) return;
 		const fired = this.#lifecyclePhases.get(jobId) ?? new Set<"cancel" | "terminal" | "evict">();
 		if (fired.has(phase)) return;
 		fired.add(phase);
 		this.#lifecyclePhases.set(jobId, fired);
-		const lifecycle = this.#lifecycles.get(jobId);
-		const job = this.#jobs.get(jobId);
-		if (!lifecycle || !job) return;
 		try {
 			if (phase === "cancel") lifecycle.onCancel?.(job);
 			else if (phase === "terminal") lifecycle.onTerminal?.(job);
@@ -647,6 +688,16 @@ export class AsyncJobManager {
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
 		}
+	}
+
+	#purgeTerminalSubagentStateForJob(jobId: string): void {
+		const rec = this.#recordByJobId(jobId);
+		if (!rec) return;
+		if (rec.status === "paused" || rec.status === "queued") return;
+		this.#liveHandles.delete(rec.subagentId);
+		this.#subagentProgress.delete(rec.subagentId);
+		this.#resumeDescriptors.delete(rec.subagentId);
+		this.#subagentRecords.delete(rec.subagentId);
 	}
 
 	#markRecordTerminal(jobId: string, status: "completed" | "failed" | "cancelled"): void {
@@ -967,6 +1018,10 @@ export class AsyncJobManager {
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
+		const ownerId = filter?.ownerId;
+		const deadLettered = Array.from(this.#deadLetteredDeliveries.values()).filter(
+			delivery => !ownerId || delivery.ownerId === ownerId,
+		).length;
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
 			return Math.min(next, delivery.nextAttemptAt);
@@ -977,6 +1032,7 @@ export class AsyncJobManager {
 			delivering: inFlightDeliveries.length > 0 || (this.#deliveryLoop !== undefined && deliveries.length > 0),
 			nextRetryAt,
 			pendingJobIds: deliveries.concat(inFlightDeliveries).map(delivery => delivery.jobId),
+			deadLettered,
 		};
 	}
 
@@ -1033,6 +1089,29 @@ export class AsyncJobManager {
 			job.abortController.abort();
 			this.#scheduleEviction(job.id);
 		}
+	}
+
+	getLastDisposeDiagnostics(): AsyncJobDisposeDiagnostics {
+		return { ...this.#lastDisposeDiagnostics, stuckJobIds: [...this.#lastDisposeDiagnostics.stuckJobIds] };
+	}
+
+	async #waitForAllWithDeadline(timeoutMs: number): Promise<{ completed: boolean; stuckJobIds: string[] }> {
+		const jobs = Array.from(this.#jobs.values());
+		if (jobs.length === 0) return { completed: true, stuckJobIds: [] };
+		let timedOut = false;
+		await Promise.race([
+			Promise.allSettled(jobs.map(job => job.promise)),
+			Bun.sleep(Math.max(0, timeoutMs)).then(() => {
+				timedOut = true;
+			}),
+		]);
+		if (!timedOut) return { completed: true, stuckJobIds: [] };
+		return {
+			completed: false,
+			stuckJobIds: Array.from(this.#jobs.values())
+				.filter(job => job.status === "running" || job.status === "cancelled")
+				.map(job => job.id),
+		};
 	}
 
 	async waitForAll(): Promise<void> {
@@ -1102,12 +1181,18 @@ export class AsyncJobManager {
 			}
 		}
 		this.#monitorTombstones.clear();
-		await this.waitForAll();
-		const drained = await this.drainDeliveries({ timeoutMs: options?.timeoutMs ?? 3_000 });
+		const timeoutMs = options?.timeoutMs ?? 3_000;
+		const waitResult = await this.#waitForAllWithDeadline(timeoutMs);
+		const drained = waitResult.completed ? await this.drainDeliveries({ timeoutMs }) : false;
+		this.#lastDisposeDiagnostics = { stuckJobIds: waitResult.stuckJobIds, deliveriesDrained: drained };
+		if (waitResult.stuckJobIds.length > 0) {
+			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
+		}
 		this.#clearEvictionTimers();
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
+		this.#deadLetteredDeliveries.clear();
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
 		this.#outputState.clear();
@@ -1119,7 +1204,7 @@ export class AsyncJobManager {
 		this.#resumeQueue.length = 0;
 		this.#notifyChange();
 		this.#changeListeners.clear();
-		return drained;
+		return drained && waitResult.completed;
 	}
 
 	#resolveJobId(preferredId?: string): string {
@@ -1148,16 +1233,10 @@ export class AsyncJobManager {
 	}
 
 	#scheduleEviction(jobId: string): void {
+		if (this.#disposed) return;
 		this.#notifyChange();
 		if (this.#retentionMs <= 0) {
-			this.#recordMonitorTombstone(jobId);
-			this.#runLifecycle(jobId, "evict");
-			this.#jobs.delete(jobId);
-			this.#lifecycles.delete(jobId);
-			this.#lifecyclePhases.delete(jobId);
-			this.#suppressedDeliveries.delete(jobId);
-			this.#watchedJobs.delete(jobId);
-			this.#outputState.delete(jobId);
+			this.#evictJob(jobId);
 			return;
 		}
 		const existing = this.#evictionTimers.get(jobId);
@@ -1166,18 +1245,23 @@ export class AsyncJobManager {
 		}
 		const timer = setTimeout(() => {
 			this.#evictionTimers.delete(jobId);
-			this.#recordMonitorTombstone(jobId);
-			this.#runLifecycle(jobId, "evict");
-			this.#jobs.delete(jobId);
-			this.#lifecycles.delete(jobId);
-			this.#lifecyclePhases.delete(jobId);
-			this.#suppressedDeliveries.delete(jobId);
-			this.#watchedJobs.delete(jobId);
-			this.#outputState.delete(jobId);
+			this.#evictJob(jobId);
 			this.#notifyChange();
 		}, this.#retentionMs);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
+	}
+
+	#evictJob(jobId: string): void {
+		this.#recordMonitorTombstone(jobId);
+		this.#runLifecycle(jobId, "evict");
+		this.#purgeTerminalSubagentStateForJob(jobId);
+		this.#jobs.delete(jobId);
+		this.#lifecycles.delete(jobId);
+		this.#lifecyclePhases.delete(jobId);
+		this.#suppressedDeliveries.delete(jobId);
+		this.#watchedJobs.delete(jobId);
+		this.#outputState.delete(jobId);
 	}
 
 	#clearEvictionTimers(): void {
@@ -1245,17 +1329,38 @@ export class AsyncJobManager {
 		if (this.isDeliverySuppressed(jobId)) {
 			return;
 		}
+		const deliveryText = this.#boundedDeliveryText(text);
 		this.#deliveries.push({
 			jobId,
-			text,
+			text: deliveryText.text,
+			originalBytes: deliveryText.originalBytes,
+			truncated: deliveryText.truncated,
 			attempt: 0,
 			nextAttemptAt: Date.now(),
 			ownerId: this.#jobs.get(jobId)?.ownerId,
 		});
+		while (this.#deliveries.length > DEFAULT_MAX_DELIVERY_QUEUE) {
+			const dropped = this.#deliveries.shift();
+			if (dropped) this.#deadLetteredDeliveries.set(dropped.jobId, dropped);
+		}
 		this.#ensureDeliveryLoop();
 	}
 
+	#boundedDeliveryText(text: string): { text: string; originalBytes?: number; truncated?: boolean } {
+		const bytes = Buffer.byteLength(text, "utf8");
+		if (bytes <= DELIVERY_MAX_TEXT_BYTES) return { text };
+		const head = sliceTextToUtf8ByteLength(text, DELIVERY_PREVIEW_HEAD_BYTES);
+		const tailStart = Math.max(0, bytes - DELIVERY_PREVIEW_TAIL_BYTES);
+		const tail = sliceTextAfterUtf8ByteOffset(text, tailStart);
+		return {
+			text: `${head}\n\n[async delivery output truncated from ${bytes} bytes]\n\n${tail}`,
+			originalBytes: bytes,
+			truncated: true,
+		};
+	}
+
 	#ensureDeliveryLoop(): void {
+		if (this.#disposed) return;
 		if (this.#deliveryLoop) {
 			return;
 		}
@@ -1266,7 +1371,7 @@ export class AsyncJobManager {
 			})
 			.finally(() => {
 				this.#deliveryLoop = undefined;
-				if (this.#deliveries.length > 0) {
+				if (!this.#disposed && this.#deliveries.length > 0) {
 					this.#ensureDeliveryLoop();
 				}
 			});
@@ -1304,20 +1409,29 @@ export class AsyncJobManager {
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
-				delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
-				if (!this.isDeliverySuppressed(delivery.jobId)) {
-					this.#deliveries.push(delivery);
+				if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
+					this.#deadLetteredDeliveries.set(delivery.jobId, delivery);
+					logger.warn("Async job completion delivery reached retry cap", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						error: delivery.lastError,
+					});
+				} else {
+					delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
+					if (!this.isDeliverySuppressed(delivery.jobId)) {
+						this.#deliveries.push(delivery);
+					}
+					logger.warn("Async job completion delivery failed", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						nextRetryAt: delivery.nextAttemptAt,
+						error: delivery.lastError,
+					});
 				}
-				logger.warn("Async job completion delivery failed", {
-					jobId: delivery.jobId,
-					attempt: delivery.attempt,
-					nextRetryAt: delivery.nextAttemptAt,
-					error: delivery.lastError,
-				});
 			} finally {
 				const index = this.#inFlightDeliveries.indexOf(delivery);
 				if (index !== -1) this.#inFlightDeliveries.splice(index, 1);
-				if (this.#deliveries.length > 0) this.#ensureDeliveryLoop();
+				if (!this.#disposed && this.#deliveries.length > 0) this.#ensureDeliveryLoop();
 			}
 		})();
 		delivery.promise = promise;

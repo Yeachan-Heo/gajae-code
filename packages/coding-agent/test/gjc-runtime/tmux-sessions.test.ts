@@ -27,9 +27,9 @@ describe("GJC tmux session management", () => {
 			spawnResult(
 				0,
 				[
-					"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\tfeature/demo\tfeature-demo\t/repo-a",
-					"unrelated\t2\t1\t1770000060\t\troot\t3\t\t",
-					"gajae_code\t1\t1\t1770000120\t\troot\t1\t\t",
+					"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a",
+					"unrelated\t2\t1\t1770000060\t\troot\t3\t23456\t\t",
+					"gajae_code\t1\t1\t1770000120\t\troot\t1\t34567\t\t",
 				].join("\n"),
 			),
 		);
@@ -39,6 +39,7 @@ describe("GJC tmux session management", () => {
 		expect(sessions.map(session => session.name)).toEqual(["gajae_code_abc"]);
 		expect(sessions[0].attached).toBe(false);
 		expect(sessions[0].panes).toBe(2);
+		expect(sessions[0].panePids).toEqual([12345]);
 		expect(sessions[0].bindings).toBe("root");
 		expect(sessions[0].createdAt).toBe("2026-02-02T02:40:00.000Z");
 		expect(sessions[0].branch).toBe("feature/demo");
@@ -48,7 +49,7 @@ describe("GJC tmux session management", () => {
 				"tmux-test",
 				"list-sessions",
 				"-F",
-				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}",
+				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}",
 			],
 			expect.any(Object),
 		);
@@ -66,7 +67,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\n");
+				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
 			return spawnResult(0, "");
@@ -84,7 +85,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\n");
+				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "\n");
 			return spawnResult(0, "");
@@ -102,7 +103,7 @@ describe("GJC tmux session management", () => {
 				// The bare `#{session_name}` probe sees the session (psmux ls shows it)...
 				if (format === "#{session_name}") return spawnResult(0, "psmux_session\n");
 				// ...but the full format does not round-trip @gjc-profile, so the profile column is empty.
-				return spawnResult(0, "psmux_session\t1\t0\t1770000000\t\troot\t0\t\t\t\n");
+				return spawnResult(0, "psmux_session\t1\t0\t1770000000\t\troot\t0\t\t\t\t\n");
 			}
 			return spawnResult(0, "");
 		});
@@ -131,7 +132,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\n");
+				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
 			return spawnResult(0, "");

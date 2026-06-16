@@ -213,6 +213,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 
 		const result = await untilAborted(signal, () =>
 			acquireTab(name, browser, {
+				ownerId: this.session.getSessionId?.() ?? undefined,
 				url: params.url,
 				waitUntil: params.wait_until,
 				viewport: params.viewport
@@ -381,11 +382,44 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	return false;
 }
 
+/** Max chars of a browser return value surfaced into the tool result (F22). */
+const MAX_BROWSER_RETURN_CHARS = 256 * 1024;
+
+const BROWSER_RETURN_BUDGET_EXCEEDED = Symbol("browser-return-budget-exceeded");
+
+/** Hard-cap any surfaced browser return string at the byte/char limit with a notice. */
+function capBrowserReturn(text: string): string {
+	if (text.length <= MAX_BROWSER_RETURN_CHARS) return text;
+	return `${text.slice(0, MAX_BROWSER_RETURN_CHARS)}\n\n[Browser return value truncated: ${text.length} chars exceeds the ${MAX_BROWSER_RETURN_CHARS}-char cap.]`;
+}
+
 function stringifyReturnValue(value: unknown): string {
-	if (typeof value === "string") return value;
+	if (typeof value === "string") return capBrowserReturn(value);
+	// F22: bound the serialization itself — the replacer tracks running size and aborts early so a
+	// huge object/array cannot build megabytes before truncation — AND hard-cap the final string,
+	// since pretty-print structural overhead (indent/braces/commas) is not counted by the budget.
+	let budget = MAX_BROWSER_RETURN_CHARS;
 	try {
-		return JSON.stringify(value, null, 2) ?? String(value);
-	} catch {
-		return String(value);
+		const text = JSON.stringify(
+			value,
+			(_key, val) => {
+				if (typeof val === "string") budget -= val.length + 4;
+				else if (typeof val === "number" || typeof val === "boolean") budget -= 8;
+				else budget -= 2;
+				if (budget < 0) throw BROWSER_RETURN_BUDGET_EXCEEDED;
+				return val;
+			},
+			2,
+		);
+		return text === undefined ? capBrowserReturn(String(value)) : capBrowserReturn(text);
+	} catch (error) {
+		if (error === BROWSER_RETURN_BUDGET_EXCEEDED) {
+			return `[Browser return value too large to serialize (exceeds the ${MAX_BROWSER_RETURN_CHARS}-char cap). Return a smaller or summarized value from the page script.]`;
+		}
+		try {
+			return capBrowserReturn(String(value));
+		} catch {
+			return "[unserializable browser return value]";
+		}
 	}
 }

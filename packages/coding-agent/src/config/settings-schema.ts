@@ -834,6 +834,55 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.serviceTier": {
+		type: "enum",
+		values: [
+			"inherit",
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"openai-only",
+			"claude-only",
+		] as const,
+		default: "inherit",
+		ui: {
+			tab: "tasks",
+			label: "Subagent Service Tier",
+			description:
+				'Service tier applied to task-tool subagents only. "inherit" copies the main session tier; any explicit value overrides it for subagents without touching the main session.',
+			options: [
+				{
+					value: "inherit",
+					label: "Inherit",
+					description: "Use the main session's service tier (default)",
+				},
+				{ value: "none", label: "None", description: "Omit service_tier for subagents" },
+				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
+				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
+				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
+				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{
+					value: "priority",
+					label: "Priority",
+					description: "Priority on every supported provider (OpenAI `service_tier`, Anthropic fast mode)",
+				},
+				{
+					value: "openai-only",
+					label: "Priority (OpenAI only)",
+					description: "Priority on OpenAI/OpenAI-Codex requests; ignored elsewhere",
+				},
+				{
+					value: "claude-only",
+					label: "Priority (Claude only)",
+					description: "Anthropic fast mode on direct Claude requests; ignored elsewhere (incl. Bedrock/Vertex)",
+				},
+			],
+		},
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 

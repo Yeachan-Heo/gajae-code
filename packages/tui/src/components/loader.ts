@@ -78,6 +78,10 @@ export class Loader extends Text {
 		}
 	}
 
+	dispose(): void {
+		this.stop();
+	}
+
 	setMessage(message: string) {
 		this.message = message;
 		this.#updateDisplay();

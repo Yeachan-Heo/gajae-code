@@ -153,14 +153,24 @@ export function getOpenAIResponsesHistoryItems(
 
 /**
  * Resolve cache retention preference.
- * Defaults to "short" and uses GJC_CACHE_RETENTION, with PI_CACHE_RETENTION as a legacy fallback.
+ *
+ * Resolution order: explicit request value → `GJC_CACHE_RETENTION` →
+ * legacy `PI_CACHE_RETENTION` → `fallback`. Both env vars act as explicit
+ * opt-in (`"long"`) or opt-out (any other value) so a provider-specific
+ * `fallback` only applies when nothing else is configured. `fallback`
+ * defaults to `"short"` to preserve the historical behaviour for callers
+ * that don't pass one.
  */
-export function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
+export function resolveCacheRetention(
+	cacheRetention?: CacheRetention,
+	fallback: CacheRetention = "short",
+): CacheRetention {
 	if (cacheRetention) return cacheRetention;
 	if ($env.GJC_CACHE_RETENTION === "long") return "long";
 	if ($env.GJC_CACHE_RETENTION !== undefined) return "short";
 	if ($env.PI_CACHE_RETENTION === "long") return "long";
-	return "short";
+	if ($env.PI_CACHE_RETENTION !== undefined) return "short";
+	return fallback;
 }
 
 export function isAnthropicOAuthToken(key: string): boolean {

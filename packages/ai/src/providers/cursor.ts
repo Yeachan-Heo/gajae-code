@@ -136,6 +136,38 @@ export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 
+// F15: bound the module-global conversation caches so long-lived / many-session use cannot
+// grow them without limit. LRU by conversation count + TTL on idle conversations.
+const CURSOR_MAX_CONVERSATIONS = 64;
+const CURSOR_CONVERSATION_TTL_MS = 60 * 60 * 1000;
+const conversationLastAccess = new Map<string, number>();
+
+/** Drop all cached state + blob bytes for a conversation (F15 bound + session-teardown hook). */
+export function disposeCursorConversation(conversationId: string): void {
+	conversationStateCache.delete(conversationId);
+	conversationBlobStores.delete(conversationId);
+	conversationLastAccess.delete(conversationId);
+}
+
+/** Refresh recency for a conversation and evict TTL-stale / LRU-overflow entries (F15). */
+function touchCursorConversation(conversationId: string): void {
+	const now = Date.now();
+	for (const [id, ts] of conversationLastAccess) {
+		if (id !== conversationId && now - ts > CURSOR_CONVERSATION_TTL_MS) disposeCursorConversation(id);
+	}
+	conversationLastAccess.set(conversationId, now);
+	const state = conversationStateCache.get(conversationId);
+	if (state !== undefined) {
+		conversationStateCache.delete(conversationId);
+		conversationStateCache.set(conversationId, state);
+	}
+	while (conversationStateCache.size > CURSOR_MAX_CONVERSATIONS) {
+		const oldest = conversationStateCache.keys().next().value;
+		if (oldest === undefined || oldest === conversationId) break;
+		disposeCursorConversation(oldest);
+	}
+}
+
 export interface CursorOptions extends StreamOptions {
 	customSystemPrompt?: string;
 	conversationId?: string;
@@ -349,6 +381,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				conversationState: cachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
+			touchCursorConversation(conversationId);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
@@ -405,6 +438,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
 				conversationStateCache.set(conversationId, checkpoint);
+				touchCursorConversation(conversationId);
 			};
 
 			let resolveH2: (() => void) | undefined;

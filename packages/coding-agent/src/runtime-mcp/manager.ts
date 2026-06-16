@@ -58,6 +58,19 @@ type TrackedPromise<T> = {
 };
 
 const STARTUP_TIMEOUT_MS = 250;
+const STARTUP_TIMEOUT_GRACE_MS = 250;
+const MAX_STARTUP_TIMEOUT_MS = 1_500;
+
+function resolveStartupTimeoutMs(configs: MCPServerConfig[]): number {
+	const configuredTimeouts = configs
+		.map(config => config.timeout)
+		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
+	if (configuredTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
+	return Math.min(
+		MAX_STARTUP_TIMEOUT_MS,
+		Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS),
+	);
+}
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
@@ -74,8 +87,20 @@ function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	return tracked;
 }
 
-function delay(ms: number): Promise<void> {
-	return Bun.sleep(ms);
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) return Bun.sleep(ms);
+	if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Aborted"));
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal.reason ?? new Error("Aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 /**
@@ -166,10 +191,26 @@ export class MCPManager {
 	#pendingResourceRefresh = new Map<string, { connection: MCPServerConnection; promise: Promise<void> }>();
 	#pendingReconnections = new Map<string, Promise<MCPServerConnection | null>>();
 	#disconnectEpochs = new Map<string, number>();
+	#reconnectBackoffs = new Map<string, AbortController>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
+
+	#isCurrentConnection(
+		name: string,
+		_config: MCPServerConfig,
+		globalEpoch: number,
+		disconnectEpoch: number,
+		connection: MCPServerConnection,
+	): boolean {
+		return (
+			this.#serverConfigs.has(name) &&
+			this.#epoch === globalEpoch &&
+			(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
+			this.#connections.get(name) === connection
+		);
+	}
 
 	constructor(
 		private cwd: string,
@@ -305,6 +346,8 @@ export class MCPManager {
 			tracked: TrackedPromise<ToolLoadResult>;
 			toolsPromise: Promise<ToolLoadResult>;
 			connectionAbort: AbortController;
+			connectionEpoch: number;
+			disconnectEpoch: number;
 		};
 
 		const errors = new Map<string, string>();
@@ -312,6 +355,7 @@ export class MCPManager {
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
+		let shouldPublishToolSnapshot = true;
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
@@ -352,6 +396,7 @@ export class MCPManager {
 			this.#serverConfigs.set(name, config);
 
 			const connectionEpoch = this.#epoch;
+			const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 			const connectionAbort = new AbortController();
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
@@ -375,7 +420,10 @@ export class MCPManager {
 						connection._source = sources[name];
 					}
 					const stillPending = this.#pendingConnections.get(name) === connectionPromise;
-					const stillCurrent = this.#epoch === connectionEpoch && this.#serverConfigs.get(name) === config;
+					const stillCurrent =
+						this.#epoch === connectionEpoch &&
+						(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
+						this.#serverConfigs.get(name) === config;
 					if (stillPending) {
 						this.#pendingConnections.delete(name);
 						this.#pendingConnectionControllers.delete(name);
@@ -419,24 +467,45 @@ export class MCPManager {
 			this.#pendingConnections.set(name, connectionPromise);
 
 			const toolsPromise = connectionPromise.then(async connection => {
-				const serverTools = await listTools(connection);
+				let serverTools: Awaited<ReturnType<typeof listTools>>;
+				try {
+					serverTools = await listTools(connection);
+				} catch (error) {
+					connection.transport.onClose = undefined;
+					if (this.#connections.get(name) === connection) this.#connections.delete(name);
+					void connection.transport.close().catch(() => {});
+					throw error;
+				}
+				if (!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)) {
+					connection.transport.onClose = undefined;
+					await connection.transport.close().catch(() => {});
+					throw new Error(`Server "${name}" was disconnected during tool loading`);
+				}
 				return { connection, serverTools };
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
 
 			const tracked = trackPromise(toolsPromise);
-			connectionTasks.push({ name, config, tracked, toolsPromise, connectionAbort });
+			connectionTasks.push({
+				name,
+				config,
+				tracked,
+				toolsPromise,
+				connectionAbort,
+				connectionEpoch,
+				disconnectEpoch,
+			});
 
 			void toolsPromise
 				.then(async ({ connection, serverTools }) => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
+					if (!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)) return;
 					this.#pendingToolLoads.delete(name);
 					const reconnect = () => this.reconnectServer(name);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					this.#onToolsChanged?.(this.#tools);
 					void this.toolCache?.set(name, config, serverTools);
-
 					await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -454,9 +523,10 @@ export class MCPManager {
 		}
 
 		if (connectionTasks.length > 0) {
+			const startupTimeoutMs = resolveStartupTimeoutMs(connectionTasks.map(task => task.config));
 			await Promise.race([
 				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)),
-				delay(STARTUP_TIMEOUT_MS),
+				delay(startupTimeoutMs),
 			]);
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
@@ -498,6 +568,13 @@ export class MCPManager {
 					const value = task.tracked.value;
 					if (!value) continue;
 					const { connection, serverTools } = value;
+					if (this.#pendingToolLoads.has(name) && this.#pendingToolLoads.get(name) !== task.toolsPromise) continue;
+					if (
+						!this.#isCurrentConnection(name, task.config, task.connectionEpoch, task.disconnectEpoch, connection)
+					) {
+						shouldPublishToolSnapshot = false;
+						continue;
+					}
 					connectedServers.add(name);
 					const reconnect = () => this.reconnectServer(name);
 					allTools.push(...MCPTool.fromTools(connection, serverTools, reconnect));
@@ -506,6 +583,9 @@ export class MCPManager {
 						task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason);
 					errors.set(name, message);
 					reportedErrors.add(name);
+					if ((this.#disconnectEpochs.get(name) ?? 0) !== task.disconnectEpoch) {
+						shouldPublishToolSnapshot = false;
+					}
 				} else {
 					const cached = cachedTools.get(name);
 					if (cached) {
@@ -524,7 +604,7 @@ export class MCPManager {
 		sortMCPToolsByName(allTools);
 
 		// Update cached tools
-		this.#tools = allTools;
+		if (shouldPublishToolSnapshot) this.#tools = allTools;
 		allowBackgroundLogging = true;
 
 		return {
@@ -692,6 +772,8 @@ export class MCPManager {
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
 		this.#pendingConnectionControllers.delete(name);
+		this.#reconnectBackoffs.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
+		this.#reconnectBackoffs.delete(name);
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
@@ -742,6 +824,10 @@ export class MCPManager {
 		this.#pendingConnectionControllers.clear();
 		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();
+		for (const controller of this.#reconnectBackoffs.values()) {
+			controller.abort(new Error("MCP manager disconnected"));
+		}
+		this.#reconnectBackoffs.clear();
 		this.#pendingReconnections.clear();
 		this.#pendingResourceRefresh.clear();
 		this.#sources.clear();
@@ -764,7 +850,9 @@ export class MCPManager {
 
 		const attempt = this.#doReconnect(name);
 		this.#pendingReconnections.set(name, attempt);
-		return attempt.finally(() => this.#pendingReconnections.delete(name));
+		return attempt.finally(() => {
+			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
+		});
 	}
 
 	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
@@ -777,59 +865,72 @@ export class MCPManager {
 
 		// Close the old transport without removing tools or notifying consumers.
 		// Tools stay available (stale) while we establish the new connection.
-		// Fire-and-forget: don't await the close — HttpTransport.close() sends a
-		// DELETE with config.timeout (30s default), and blocking here delays the
-		// reconnect loop by that amount on every server restart.
-		const reconnectEpoch = this.#epoch;
+		const reconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 		if (oldConnection) {
 			// Detach onClose to prevent re-entrant reconnect from the close itself
 			oldConnection.transport.onClose = undefined;
-			void oldConnection.transport.close().catch(() => {});
+			const closePromise = oldConnection.transport.close().catch(() => {});
+			if (oldConnection.transport.closeBeforeReconnect) {
+				await closePromise;
+			} else {
+				// Fire-and-forget: don't await HTTP/SSE close — HttpTransport.close()
+				// sends a DELETE with config.timeout (30s default), and blocking here
+				// delays the reconnect loop by that amount on every server restart.
+				void closePromise;
+			}
 			this.#connections.delete(name);
 		}
 		this.#pendingConnections.delete(name);
+		const backoffAbort = new AbortController();
+		this.#reconnectBackoffs.set(name, backoffAbort);
 		this.#pendingToolLoads.delete(name);
 
-		// Retry with backoff — the server may still be starting up.
-		const delays = [500, 1000, 2000, 4000];
-		for (let attempt = 0; attempt <= delays.length; attempt++) {
-			if (this.#epoch !== reconnectEpoch) {
-				logger.debug("MCP reconnect aborted before attempt after configuration changed", {
-					path: `mcp:${name}`,
-					storedEpoch: reconnectEpoch,
-					currentEpoch: this.#epoch,
-				});
-				return null;
-			}
-			try {
-				const connection = await this.#connectAndWireServer(name, config, source, reconnectEpoch);
-				logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
-				return connection;
-			} catch (error) {
-				if (this.#epoch !== reconnectEpoch) {
-					logger.debug("MCP reconnect aborted after configuration changed", {
+		try {
+			// Retry with backoff — the server may still be starting up.
+			const delays = [500, 1000, 2000, 4000];
+			for (let attempt = 0; attempt <= delays.length; attempt++) {
+				if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+					logger.debug("MCP reconnect aborted before attempt after server disconnected", {
 						path: `mcp:${name}`,
 						storedEpoch: reconnectEpoch,
-						currentEpoch: this.#epoch,
+						currentEpoch: this.#disconnectEpochs.get(name) ?? 0,
 					});
 					return null;
 				}
+				try {
+					const connection = await this.#connectAndWireServer(name, config, source, this.#epoch, reconnectEpoch);
+					logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
+					return connection;
+				} catch (error) {
+					if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+						logger.debug("MCP reconnect aborted after server disconnected", {
+							path: `mcp:${name}`,
+							storedEpoch: reconnectEpoch,
+							currentEpoch: this.#disconnectEpochs.get(name) ?? 0,
+						});
+						return null;
+					}
 
-				const msg = error instanceof Error ? error.message : String(error);
-				if (attempt < delays.length) {
-					logger.debug("MCP reconnect attempt failed, retrying", {
-						path: `mcp:${name}`,
-						attempt: attempt + 1,
-						error: msg,
-					});
-					await Bun.sleep(delays[attempt]);
-				} else {
-					logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
-					// Don't remove stale tools — keep them in the registry so they
-					// remain selected. Calls will fail with MCP errors, which
-					// triggers the tool-level reconnect, or the user can run
-					// /mcp reconnect <name> manually.
+					const msg = error instanceof Error ? error.message : String(error);
+					if (attempt < delays.length) {
+						logger.debug("MCP reconnect attempt failed, retrying", {
+							path: `mcp:${name}`,
+							attempt: attempt + 1,
+							error: msg,
+						});
+						await delay(delays[attempt], backoffAbort.signal).catch(() => undefined);
+					} else {
+						logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
+						// Don't remove stale tools — keep them in the registry so they
+						// remain selected. Calls will fail with MCP errors, which
+						// triggers the tool-level reconnect, or the user can run
+						// /mcp reconnect <name> manually.
+					}
 				}
+			}
+		} finally {
+			if (this.#reconnectBackoffs.get(name) === backoffAbort) {
+				this.#reconnectBackoffs.delete(name);
 			}
 		}
 		return null;
@@ -840,7 +941,8 @@ export class MCPManager {
 		name: string,
 		config: MCPServerConfig,
 		source: SourceMeta | undefined,
-		reconnectEpoch: number,
+		globalEpoch: number,
+		disconnectEpoch: number,
 	): Promise<MCPServerConnection> {
 		const resolvedConfig = await this.#resolveAuthConfig(config);
 		const connectionAbort = new AbortController();
@@ -867,7 +969,11 @@ export class MCPManager {
 
 		// Bail out if the server was disconnected or the manager was reset
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
-		if (!this.#serverConfigs.has(name) || this.#epoch !== reconnectEpoch) {
+		if (
+			!this.#serverConfigs.has(name) ||
+			this.#epoch !== globalEpoch ||
+			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch
+		) {
 			await connection.transport.close().catch(() => {});
 			throw new Error(`Server "${name}" was disconnected during reconnection`);
 		}
@@ -890,6 +996,11 @@ export class MCPManager {
 		};
 		try {
 			const serverTools = await listTools(connection);
+			if (!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection)) {
+				connection.transport.onClose = undefined;
+				await connection.transport.close().catch(() => {});
+				throw new Error(`Server "${name}" was disconnected during tool loading`);
+			}
 			const reconnect = () => this.reconnectServer(name);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);
@@ -901,7 +1012,7 @@ export class MCPManager {
 			// Clean up the connection to avoid zombie transports
 			connection.transport.onClose = undefined;
 			await connection.transport.close().catch(() => {});
-			this.#connections.delete(name);
+			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 			throw error;
 		}
 	}
@@ -941,12 +1052,15 @@ export class MCPManager {
 	async refreshServerTools(name: string): Promise<void> {
 		const connection = this.#connections.get(name);
 		if (!connection) return;
+		const globalEpoch = this.#epoch;
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 
 		// Clear cached tools
 		connection.tools = undefined;
 
 		// Reload tools
 		const serverTools = await listTools(connection);
+		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 		void this.toolCache?.set(name, connection.config, serverTools);

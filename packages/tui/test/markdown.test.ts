@@ -1210,12 +1210,14 @@ describe("Module-level LRU render cache", () => {
 			},
 		};
 
-		for (let i = 0; i < 300; i++) {
+		// Exceed BOTH the L2 render cache (256) and the per-code-block highlight cache
+		// (512) so message 0 is evicted from each and a re-render must re-highlight it.
+		for (let i = 0; i < 600; i++) {
 			new Markdown(`message ${i}\n\n\`\`\`js\nconst value = ${i};\n\`\`\``, 0, 0, themeWithSpy).render(80);
 		}
 
 		new Markdown("message 0\n\n```js\nconst value = 0;\n```", 0, 0, themeWithSpy).render(80);
-		expect(highlightCallCount).toBe(301);
+		expect(highlightCallCount).toBe(601);
 	});
 
 	it("never serves another message's render on content-key collision attempts", () => {

@@ -117,6 +117,14 @@ Critical safety checks in `TUI`:
 
 These constraints are runtime guards plus component conventions; renderers should still return width-safe lines rather than rely on truncation.
 
+## Virtual viewport (opt-in, `PI_TUI_VIRTUAL_VIEWPORT`)
+
+By default `#doRender` normalizes/truncates and diffs the full rendered transcript every frame (`O(total lines)`), which becomes a per-frame cost on very long sessions / weak hardware.
+
+Setting `PI_TUI_VIRTUAL_VIEWPORT=1` enables an opt-in fast path: when the terminal width is unchanged and the off-screen raw prefix is unchanged from the previous frame (compared by raw value equality per line, which short-circuits to a fast reference check when components return stable string instances for unchanged lines), the previous frame's normalized prefix is reused and only the visible window (terminal rows + a small overscan) is re-normalized, with the differential diff starting at the window boundary. Output is byte-identical to the default path (reused entries are deterministic normalizations of identical raw lines), so it is a pure performance toggle.
+
+The flag defaults to **off** because it changes a core render path; enable it to reduce per-frame normalize/diff cost on huge transcripts. Any width change, off-screen edit, forced render (`requestRender(true)`), or first frame transparently falls back to the full path. `PI_TUI_METRICS` exposes `lineCounts` gauges (`rendered`, `normalized`, `measured`, `diffed`, and `offscreenScan`) to observe the bound.
+
 ## Resize handling
 
 Resize events are event-driven from `ProcessTerminal` to `TUI.requestRender()`.

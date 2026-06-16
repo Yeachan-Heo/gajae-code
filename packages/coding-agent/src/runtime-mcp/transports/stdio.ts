@@ -5,7 +5,8 @@
  * Messages are newline-delimited JSON.
  */
 
-import { getProjectDir, ptree, readJsonl, Snowflake } from "@gajae-code/utils";
+import { getProjectDir, readJsonl, Snowflake } from "@gajae-code/utils";
+import { type OwnedProcess, spawnOwnedProcess } from "../../runtime/process-lifecycle";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -24,7 +25,7 @@ import { toJsonRpcError } from "../../runtime-mcp/types";
 const CLOSE_WAIT_MS = 1_000;
 
 export class StdioTransport implements MCPTransport {
-	#process: ptree.ChildProcess<"pipe"> | null = null;
+	#process: OwnedProcess | null = null;
 	#pendingRequests = new Map<
 		string | number,
 		{
@@ -34,6 +35,8 @@ export class StdioTransport implements MCPTransport {
 	>();
 	#connected = false;
 	#readLoop: Promise<void> | null = null;
+	#stderrLoop: Promise<void> | null = null;
+	#closePromise: Promise<void> | null = null;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -46,10 +49,17 @@ export class StdioTransport implements MCPTransport {
 		return this.#connected;
 	}
 
+	get closeBeforeReconnect(): true {
+		return true;
+	}
+
 	/**
 	 * Start the subprocess and begin reading.
 	 */
 	async connect(): Promise<void> {
+		if (this.#closePromise) {
+			throw new Error("Transport is closing");
+		}
 		if (this.#connected) return;
 
 		const args = this.config.args ?? [];
@@ -58,11 +68,12 @@ export class StdioTransport implements MCPTransport {
 			...this.config.env,
 		};
 
-		this.#process = ptree.spawn([this.config.command, ...args], {
+		this.#process = spawnOwnedProcess([this.config.command, ...args], {
 			cwd: this.config.cwd ?? getProjectDir(),
 			env,
 			stdin: "pipe",
-			stderr: "full",
+			gracefulMs: CLOSE_WAIT_MS,
+			name: `mcp-stdio:${this.config.command}`,
 		});
 
 		this.#connected = true;
@@ -71,13 +82,13 @@ export class StdioTransport implements MCPTransport {
 		this.#readLoop = this.#startReadLoop();
 
 		// Log stderr for debugging
-		this.#startStderrLoop();
+		this.#stderrLoop = this.#startStderrLoop();
 	}
 
 	async #startReadLoop(): Promise<void> {
-		if (!this.#process?.stdout) return;
+		if (!this.#process?.child.stdout) return;
 		try {
-			for await (const line of readJsonl(this.#process.stdout)) {
+			for await (const line of readJsonl(this.#process.child.stdout)) {
 				if (!this.#connected) break;
 				try {
 					this.#handleMessage(line as JsonRpcMessage);
@@ -95,9 +106,9 @@ export class StdioTransport implements MCPTransport {
 	}
 
 	async #startStderrLoop(): Promise<void> {
-		if (!this.#process?.stderr) return;
+		if (!this.#process?.child.stderr) return;
 
-		const reader = this.#process.stderr.getReader();
+		const reader = this.#process.child.stderr.getReader();
 		const decoder = new TextDecoder();
 
 		try {
@@ -168,26 +179,23 @@ export class StdioTransport implements MCPTransport {
 		}
 	}
 
+	#getStdin(): Bun.FileSink | null {
+		const stdin = this.#process?.child.stdin;
+		return typeof stdin === "object" && stdin !== null ? stdin : null;
+	}
+
 	#sendResponse(id: string | number, result?: unknown, error?: JsonRpcError): void {
-		if (!this.#connected || !this.#process?.stdin) return;
+		const stdin = this.#getStdin();
+		if (!this.#connected || !stdin) return;
 		const response = error
 			? { jsonrpc: "2.0" as const, id, error }
 			: { jsonrpc: "2.0" as const, id, result: result ?? {} };
-		this.#process.stdin.write(`${JSON.stringify(response)}\n`);
-		this.#process.stdin.flush();
+		stdin.write(`${JSON.stringify(response)}\n`);
+		stdin.flush();
 	}
 
 	#handleClose(): void {
-		if (!this.#connected) return;
-		this.#connected = false;
-
-		// Reject all pending requests
-		for (const [, pending] of this.#pendingRequests) {
-			pending.reject(new Error("Transport closed"));
-		}
-		this.#pendingRequests.clear();
-
-		this.onClose?.();
+		void this.#closeInternal(true);
 	}
 
 	async request<T = unknown>(
@@ -195,7 +203,8 @@ export class StdioTransport implements MCPTransport {
 		params?: Record<string, unknown>,
 		options?: MCPRequestOptions,
 	): Promise<T> {
-		if (!this.#connected || !this.#process?.stdin) {
+		const stdin = this.#getStdin();
+		if (!this.#connected || !stdin) {
 			throw new Error("Transport not connected");
 		}
 
@@ -261,8 +270,8 @@ export class StdioTransport implements MCPTransport {
 		const message = `${JSON.stringify(request)}\n`;
 		try {
 			// Bun's FileSink has write() method directly
-			this.#process.stdin.write(message);
-			this.#process.stdin.flush();
+			stdin.write(message);
+			stdin.flush();
 		} catch (error: unknown) {
 			cleanup();
 			reject(error instanceof Error ? error : new Error(String(error)));
@@ -272,7 +281,8 @@ export class StdioTransport implements MCPTransport {
 	}
 
 	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
-		if (!this.#connected || !this.#process?.stdin) {
+		const stdin = this.#getStdin();
+		if (!this.#connected || !stdin) {
 			throw new Error("Transport not connected");
 		}
 
@@ -284,35 +294,51 @@ export class StdioTransport implements MCPTransport {
 
 		const message = `${JSON.stringify(notification)}\n`;
 		// Bun's FileSink has write() method directly
-		this.#process.stdin.write(message);
-		this.#process.stdin.flush();
+		stdin.write(message);
+		stdin.flush();
 	}
 
 	async close(): Promise<void> {
-		if (!this.#connected) return;
+		await this.#closeInternal(false);
+	}
+
+	#closeInternal(fromReadLoop: boolean): Promise<void> {
+		if (this.#closePromise) return this.#closePromise;
+		this.#closePromise = this.#finishClose(fromReadLoop).finally(() => {
+			this.#closePromise = null;
+		});
+		return this.#closePromise;
+	}
+
+	async #finishClose(fromReadLoop: boolean): Promise<void> {
+		const wasConnected = this.#connected;
 		this.#connected = false;
 
-		// Reject pending requests
 		for (const [, pending] of this.#pendingRequests) {
 			pending.reject(new Error("Transport closed"));
 		}
 		this.#pendingRequests.clear();
 
-		// Terminate the subprocess tree and keep the handle until exit is observed.
+		const stdin = this.#getStdin();
 		const process = this.#process;
+		this.#process = null;
 		if (process) {
-			process.kill();
-			await Promise.race([process.exited.catch(() => {}), Bun.sleep(CLOSE_WAIT_MS)]);
-			this.#process = null;
+			stdin?.end();
+			await process.dispose().catch(() => {});
+			await process.awaitExit({ timeoutMs: CLOSE_WAIT_MS }).catch(() => ({ exited: false, code: null }));
 		}
 
-		// Wait for read loop to finish
-		if (this.#readLoop) {
+		if (!fromReadLoop && this.#readLoop) {
 			await this.#readLoop.catch(() => {});
-			this.#readLoop = null;
+		}
+		this.#readLoop = null;
+
+		if (this.#stderrLoop) {
+			await this.#stderrLoop.catch(() => {});
+			this.#stderrLoop = null;
 		}
 
-		this.onClose?.();
+		if (wasConnected) this.onClose?.();
 	}
 }
 

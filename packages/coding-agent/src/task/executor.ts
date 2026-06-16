@@ -482,10 +482,16 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
-function createSubagentSettings(baseSettings: Settings): Settings {
+export function createSubagentSettings(baseSettings: Settings): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
+	}
+	// Subagent-scoped service-tier override: "inherit" keeps the snapshotted main
+	// session tier; any explicit value applies only to subagent sessions.
+	const taskServiceTier = baseSettings.get("task.serviceTier");
+	if (taskServiceTier !== "inherit") {
+		snapshot.serviceTier = taskServiceTier;
 	}
 	return Settings.isolated({
 		...snapshot,

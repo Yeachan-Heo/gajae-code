@@ -1537,6 +1537,11 @@ impl TerminationTargets {
 		self.pgids.is_empty() && self.processes.is_empty()
 	}
 
+	/// First recorded process group id, if any.
+	pub fn first_pgid(&self) -> Option<i32> {
+		self.pgids.first().copied()
+	}
+
 	/// Send `signal` to every recorded target. Failures are swallowed:
 	/// targets routinely exit between collection and signalling, and
 	/// the caller's policy is "best effort".

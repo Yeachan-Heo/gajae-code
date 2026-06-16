@@ -15,6 +15,7 @@ function sanitizeOutputChunk(rawChunk: string): string {
 export const DEFAULT_MAX_LINES = 3000;
 export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
 export const DEFAULT_MAX_COLUMN = 1024; // Max chars per grep match line
+export const DEFAULT_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 
 const NL = "\n";
 
@@ -41,6 +42,8 @@ export interface OutputSummary {
 	columnTruncatedLines?: number;
 	/** Artifact ID for internal URL access (artifact://<id>) when truncated */
 	artifactId?: string;
+	/** Bytes omitted from artifact storage after the artifact hard cap was reached. */
+	artifactTruncatedBytes?: number;
 }
 
 export interface OutputSinkOptions {
@@ -61,6 +64,8 @@ export interface OutputSinkOptions {
 	 * writes still respect the budget. Default 0 = no per-line cap.
 	 */
 	maxColumns?: number;
+	/** Hard cap for artifact writes/pending replay. Default DEFAULT_ARTIFACT_MAX_BYTES. */
+	artifactMaxBytes?: number;
 	onChunk?: (chunk: string) => void;
 	/** Minimum ms between onChunk calls. 0 = every chunk (default). */
 	chunkThrottleMs?: number;
@@ -668,6 +673,9 @@ export class OutputSink {
 	#sawData = false;
 	#truncated = false;
 	#lastChunkTime = 0;
+	#artifactBytes = 0;
+	#artifactTruncatedBytes = 0;
+	#artifactTruncationNoticeWritten = false;
 
 	// Per-line column cap streaming state (persists across `push` calls so a
 	// long line split across chunks still trips the same trigger).
@@ -697,6 +705,7 @@ export class OutputSink {
 	readonly #onRawChunk?: (chunk: string) => void;
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
+	readonly #artifactMaxBytes: number;
 
 	constructor(options?: OutputSinkOptions) {
 		const {
@@ -708,6 +717,7 @@ export class OutputSink {
 			onChunk,
 			chunkThrottleMs = 0,
 			onRawChunk,
+			artifactMaxBytes = DEFAULT_ARTIFACT_MAX_BYTES,
 		} = options ?? {};
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
@@ -717,6 +727,7 @@ export class OutputSink {
 		this.#onChunk = onChunk;
 		this.#onRawChunk = onRawChunk;
 		this.#chunkThrottleMs = chunkThrottleMs;
+		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
 	}
 
 	#headText(): string {
@@ -907,6 +918,40 @@ export class OutputSink {
 		}
 	}
 
+	#artifactTruncationNotice(droppedBytes: number): string {
+		return `\n[artifact truncated after ${this.#artifactBytes} bytes; omitted at least ${droppedBytes} bytes]\n`;
+	}
+
+	#capArtifactChunk(chunk: string, bytes: number): { chunk: string; bytes: number } | null {
+		if (bytes === 0) return null;
+		if (this.#artifactMaxBytes <= 0 || this.#artifactBytes >= this.#artifactMaxBytes) {
+			this.#artifactTruncatedBytes += bytes;
+			return null;
+		}
+		const room = this.#artifactMaxBytes - this.#artifactBytes;
+		if (bytes <= room) {
+			return { chunk, bytes };
+		}
+		const kept = truncateHeadBytes(chunk, room);
+		this.#artifactTruncatedBytes += bytes - kept.bytes;
+		return kept.bytes > 0 ? { chunk: kept.text, bytes: kept.bytes } : null;
+	}
+
+	#writeArtifactTruncationNotice(): void {
+		if (this.#artifactTruncatedBytes <= 0 || this.#artifactTruncationNoticeWritten) return;
+		const notice = this.#artifactTruncationNotice(this.#artifactTruncatedBytes);
+		try {
+			if (this.#fileReady && this.#file) {
+				this.#file.sink.write(notice);
+			} else {
+				this.#queuePendingFileWrite(notice, Buffer.byteLength(notice, "utf-8"));
+			}
+			this.#artifactTruncationNoticeWritten = true;
+		} catch {
+			/* ignore */
+		}
+	}
+
 	#queuePendingFileWrite(chunk: string, bytes = Buffer.byteLength(chunk, "utf-8")): void {
 		if (!this.#pendingFileWrites) this.#pendingFileWrites = [chunk];
 		else this.#pendingFileWrites.push(chunk);
@@ -915,14 +960,17 @@ export class OutputSink {
 	}
 
 	#enqueueFileWrite(chunk: string, bytes: number): void {
+		const capped = this.#capArtifactChunk(chunk, bytes);
+		if (!capped) return;
+		this.#artifactBytes += capped.bytes;
 		if (!this.#fileReady || !this.#file) {
-			this.#queuePendingFileWrite(chunk, bytes);
+			this.#queuePendingFileWrite(capped.chunk, capped.bytes);
 			if (this.#willOverflow(bytes) || this.#pendingFileWriteBytes > this.#spillThreshold) this.#createFileSink();
 			return;
 		}
 
 		try {
-			this.#file.sink.write(chunk);
+			this.#file.sink.write(capped.chunk);
 		} catch {
 			try {
 				void this.#file.sink.end();
@@ -931,7 +979,7 @@ export class OutputSink {
 			}
 			this.#file = undefined;
 			this.#fileReady = false;
-			this.#queuePendingFileWrite(chunk, bytes);
+			this.#queuePendingFileWrite(capped.chunk, capped.bytes);
 			this.#createFileSink();
 		}
 	}
@@ -1019,6 +1067,8 @@ export class OutputSink {
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
 		let artifactId: string | undefined;
+		if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
+		this.#writeArtifactTruncationNotice();
 		if (this.#file) {
 			artifactId = this.#file.artifactId;
 			await this.#file.sink.end();
@@ -1095,6 +1145,7 @@ export class OutputSink {
 			elidedLines,
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
+			artifactTruncatedBytes: this.#artifactTruncatedBytes > 0 ? this.#artifactTruncatedBytes : undefined,
 			artifactId,
 		};
 	}

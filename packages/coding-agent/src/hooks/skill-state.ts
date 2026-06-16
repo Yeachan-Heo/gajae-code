@@ -508,6 +508,59 @@ async function detectStaleModeStateRelease(skill: GjcWorkflowSkill, cwd: string)
 	return null;
 }
 
+/**
+ * Deep-interview terminal phases that represent an explicit abort/cancel rather
+ * than an ordinary stop. These are legitimate terminals even without a
+ * crystallized spec, so they must NOT be forced through crystallization.
+ */
+const DEEP_INTERVIEW_ABORT_PHASES = new Set(["failed", "cancelled", "canceled"]);
+
+/**
+ * A deep-interview run is "crystallized" once it has persisted a final spec.
+ * `persistDeepInterviewSpec` records the spec path in the mode-state and writes
+ * the artifact under `.gjc/specs/`, so a crystallized state carries a
+ * `spec_path` that still resolves to a real file. A bare `spec_path` with no
+ * backing file (deleted/stale/fabricated) does not count as crystallized.
+ */
+async function deepInterviewSpecCrystallized(state: ModeState, cwd: string): Promise<boolean> {
+	const raw = state.spec_path;
+	const specPath = typeof raw === "string" ? raw.trim() : "";
+	if (!specPath) return false;
+	const resolved = path.isAbsolute(specPath) ? specPath : path.resolve(cwd, specPath);
+	try {
+		return await Bun.file(resolved).exists();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Deep-interview-scoped terminalization guard (#674). An ordinary stop must not
+ * let a deep-interview run disappear as a generic stopped task while the user
+ * still needs the distilled interview state: when its mode-state would release
+ * the Stop block it must have actually crystallized the interview into a
+ * persisted spec/handoff. Explicit abort/cancel phases and the `active:false`
+ * demotion/clear outcome (the handoff/chain result) remain legitimate terminals.
+ * Returns a public-safe diagnostic that forces crystallization, or null to
+ * release. Scoped to deep-interview only — other workflows are untouched.
+ */
+async function detectUncrystallizedDeepInterviewStop(
+	skill: GjcWorkflowSkill,
+	state: ModeState | null,
+	cwd: string,
+): Promise<string | null> {
+	if (skill !== "deep-interview") return null;
+	// active:false is the demotion/clear outcome (chain handoff or explicit
+	// clear already terminalized the run); a missing state blocks upstream.
+	if (state?.active !== true) return null;
+	const phase = String(state.current_phase ?? "")
+		.trim()
+		.toLowerCase();
+	if (DEEP_INTERVIEW_ABORT_PHASES.has(phase)) return null;
+	if (await deepInterviewSpecCrystallized(state, cwd)) return null;
+	return `the deep-interview run reached a terminal phase ("${phase || "unknown"}") without crystallizing a usable spec/handoff. Run \`gjc deep-interview --write --stage final\` (optionally \`--handoff ralplan\`) to persist the distilled interview spec, hand off through the deep-interview policy, or explicitly cancel/clear the interview before stopping`;
+}
+
 async function readVisibleModeState(
 	cwd: string,
 	skill: GjcWorkflowSkill,
@@ -606,18 +659,38 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			// release while the plan/ledger still shows pending work, block instead
 			// of trusting the single file (see #659).
 			const staleRelease = await detectStaleModeStateRelease(entry.skill, input.cwd);
-			if (!staleRelease) continue;
-			const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(
-				resolvedStateDir,
-				entry.skill,
-				input.sessionId,
-			)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
-			return {
-				decision: "block",
-				reason: coherenceMessage,
-				stopReason: `gjc_skill_${entry.skill.replace(/-/g, "_")}_stale_mode_state`,
-				systemMessage: coherenceMessage,
-			};
+			if (staleRelease) {
+				const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(
+					resolvedStateDir,
+					entry.skill,
+					input.sessionId,
+				)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
+				return {
+					decision: "block",
+					reason: coherenceMessage,
+					stopReason: `gjc_skill_${entry.skill.replace(/-/g, "_")}_stale_mode_state`,
+					systemMessage: coherenceMessage,
+				};
+			}
+			// Deep-interview must not terminalize through an ordinary stop without
+			// crystallizing its distilled interview state into a spec/handoff
+			// (explicit abort/cancel and the active:false demotion are preserved
+			// as legitimate terminals). See #674.
+			const uncrystallized = await detectUncrystallizedDeepInterviewStop(entry.skill, modeState, input.cwd);
+			if (uncrystallized) {
+				const crystallizeMessage = `GJC deep-interview must crystallize before stopping (${modeStatePath(
+					resolvedStateDir,
+					entry.skill,
+					input.sessionId,
+				)}): ${uncrystallized}.`;
+				return {
+					decision: "block",
+					reason: crystallizeMessage,
+					stopReason: "gjc_skill_deep_interview_uncrystallized",
+					systemMessage: crystallizeMessage,
+				};
+			}
+			continue;
 		}
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);

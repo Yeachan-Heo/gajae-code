@@ -5,7 +5,10 @@ use std::{
 	fs,
 	io::{self, Write},
 	str,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicI32, AtomicUsize, Ordering},
+	},
 	time::Duration,
 };
 
@@ -39,22 +42,56 @@ struct ShellSessionCore {
 	shell: BrushShell,
 }
 
+#[derive(Default)]
+struct ShellAbortInner {
+	generation: usize,
+	tokens:     HashMap<usize, AbortToken>,
+	active:     HashSet<usize>,
+	pending:    bool,
+}
+
 #[derive(Clone, Default)]
-struct ShellAbortState(Arc<TokioMutex<Option<AbortToken>>>);
+struct ShellAbortState(Arc<TokioMutex<ShellAbortInner>>);
 
 impl ShellAbortState {
-	async fn set(&self, abort_token: AbortToken) {
-		*self.0.lock().await = Some(abort_token);
+	async fn publish(&self, abort_token: AbortToken) -> usize {
+		let mut inner = self.0.lock().await;
+		inner.generation = inner.generation.wrapping_add(1);
+		let generation = inner.generation;
+		inner.tokens.insert(generation, abort_token);
+		generation
 	}
 
-	async fn clear(&self) {
-		*self.0.lock().await = None;
+	async fn activate(&self, generation: usize) {
+		let mut inner = self.0.lock().await;
+		if inner.tokens.contains_key(&generation) {
+			inner.active.insert(generation);
+		}
+		if inner.pending {
+			if let Some(abort_token) = inner.tokens.get(&generation).cloned() {
+				abort_token.abort(AbortReason::Signal);
+			}
+			inner.pending = false;
+		}
+	}
+
+	async fn clear(&self, generation: usize) {
+		let mut inner = self.0.lock().await;
+		inner.tokens.remove(&generation);
+		inner.active.remove(&generation);
 	}
 
 	async fn abort(&self) {
-		let abort_token = self.0.lock().await.clone();
-		if let Some(abort_token) = abort_token {
-			abort_token.abort(AbortReason::Signal);
+		let mut inner = self.0.lock().await;
+		if inner.active.is_empty() {
+			inner.pending = true;
+			return;
+		}
+		let active = inner.active.clone();
+		for generation in active {
+			if let Some(abort_token) = inner.tokens.get(&generation).cloned() {
+				abort_token.abort(AbortReason::Signal);
+			}
 		}
 	}
 }
@@ -99,10 +136,16 @@ pub struct MinimizerResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellRunResult {
-	pub exit_code: Option<i32>,
-	pub cancelled: bool,
-	pub timed_out: bool,
-	pub minimized: Option<MinimizerResult>,
+	pub exit_code:              Option<i32>,
+	pub cancelled:              bool,
+	pub timed_out:              bool,
+	pub minimized:              Option<MinimizerResult>,
+	pub output_truncated:       bool,
+	pub output_truncated_bytes: u64,
+	pub stdout_truncated:       bool,
+	pub stdout_truncated_bytes: u64,
+	pub stderr_truncated:       bool,
+	pub stderr_truncated_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -240,22 +283,23 @@ async fn run_shell_session(
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
-	let baseline_descendants = process::current_descendant_pids();
+	let abort_generation = abort_state.publish(ct.emplace_abort_token()).await;
 
 	let mut run_task = tokio::spawn({
 		let session = session.clone();
-		let abort_state = abort_state.clone();
 		let tokio_cancel = tokio_cancel.clone();
-		let at = ct.emplace_abort_token();
+		let run_abort_state = abort_state.clone();
 		async move {
 			let mut session_guard = session.lock().await;
+			run_abort_state.activate(abort_generation).await;
 
 			let session = match &mut *session_guard {
 				Some(session) => session,
 				None => session_guard.insert(create_session(&config).await?),
 			};
-			abort_state.set(at).await;
-			run_shell_command(session, &run_config, on_chunk, tokio_cancel).await
+			let result = run_shell_command(session, &run_config, on_chunk, tokio_cancel).await;
+			run_abort_state.clear(abort_generation).await;
+			result
 		}
 	});
 
@@ -263,13 +307,14 @@ async fn run_shell_session(
 		res = &mut run_task => res,
 		reason = ct.wait() => {
 			tokio_cancel.cancel();
-			terminate_new_descendants(&baseline_descendants).await;
+			// Per-command cancellation handles descendant termination after the
+			// serialized session lock is acquired; do not use a queued run baseline.
 			let graceful = time::timeout(Duration::from_secs(2), &mut run_task).await;
 			if graceful.is_err() {
 				run_task.abort();
 				let _ = run_task.await;
 			}
-			abort_state.clear().await;
+			abort_state.clear(abort_generation).await;
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
 			// holding task finishes.
@@ -281,23 +326,35 @@ async fn run_shell_session(
 				cancelled: matches!(reason, AbortReason::Signal),
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
+				output_truncated: false,
+				output_truncated_bytes: 0,
+				stdout_truncated: false,
+				stdout_truncated_bytes: 0,
+				stderr_truncated: false,
+				stderr_truncated_bytes: 0,
 			});
 		}
 	};
 	let res =
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	abort_state.clear().await;
+	abort_state.clear(abort_generation).await;
 
 	let keepalive = res.as_ref().is_ok_and(|pair| session_keepalive(&pair.0));
 	if !keepalive {
 		*session.lock().await = None;
 	}
-	let (exec, minimized) = res?;
+	let (exec, minimized, truncation) = res?;
 	Ok(ShellRunResult {
 		exit_code: Some(exit_code(&exec)),
 		cancelled: false,
 		timed_out: false,
 		minimized,
+		output_truncated: truncation.output_truncated,
+		output_truncated_bytes: truncation.output_truncated_bytes,
+		stdout_truncated: truncation.stdout_truncated,
+		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
+		stderr_truncated: truncation.stderr_truncated,
+		stderr_truncated_bytes: truncation.stderr_truncated_bytes,
 	})
 }
 
@@ -322,7 +379,7 @@ async fn run_shell_oneshot(
 		result = &mut task => result,
 		reason = ct.wait() => {
 			tokio_cancel.cancel();
-			terminate_new_descendants(&baseline_descendants).await;
+			terminate_new_descendants(&baseline_descendants, 0).await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -333,18 +390,30 @@ async fn run_shell_oneshot(
 				cancelled: matches!(reason, AbortReason::Signal),
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
+				output_truncated: false,
+				output_truncated_bytes: 0,
+				stdout_truncated: false,
+				stdout_truncated_bytes: 0,
+				stderr_truncated: false,
+				stderr_truncated_bytes: 0,
 			});
 		},
 	};
 
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	let (exec, minimized) = res?;
+	let (exec, minimized, truncation) = res?;
 	Ok(ShellExecuteResult {
 		exit_code: Some(exit_code(&exec)),
 		cancelled: false,
 		timed_out: false,
 		minimized,
+		output_truncated: truncation.output_truncated,
+		output_truncated_bytes: truncation.output_truncated_bytes,
+		stdout_truncated: truncation.stdout_truncated,
+		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
+		stderr_truncated: truncation.stderr_truncated,
+		stderr_truncated_bytes: truncation.stderr_truncated_bytes,
 	})
 }
 
@@ -369,7 +438,7 @@ async fn run_shell_oneshot_streams(
 		result = &mut task => result,
 		reason = ct.wait() => {
 			tokio_cancel.cancel();
-			terminate_new_descendants(&baseline_descendants).await;
+			terminate_new_descendants(&baseline_descendants, 0).await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -380,18 +449,30 @@ async fn run_shell_oneshot_streams(
 				cancelled: matches!(reason, AbortReason::Signal),
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
+				output_truncated: false,
+				output_truncated_bytes: 0,
+				stdout_truncated: false,
+				stdout_truncated_bytes: 0,
+				stderr_truncated: false,
+				stderr_truncated_bytes: 0,
 			});
 		},
 	};
 
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	let exec = res?;
+	let (exec, truncation) = res?;
 	Ok(ShellExecuteResult {
-		exit_code: Some(exit_code(&exec)),
-		cancelled: false,
-		timed_out: false,
-		minimized: None,
+		exit_code:              Some(exit_code(&exec)),
+		cancelled:              false,
+		timed_out:              false,
+		minimized:              None,
+		output_truncated:       truncation.output_truncated,
+		output_truncated_bytes: truncation.output_truncated_bytes,
+		stdout_truncated:       truncation.stdout_truncated,
+		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
+		stderr_truncated:       truncation.stderr_truncated,
+		stderr_truncated_bytes: truncation.stderr_truncated_bytes,
 	})
 }
 
@@ -575,7 +656,7 @@ async fn run_shell_command(
 	options: &ShellRunConfig,
 	on_chunk: Option<mpsc::UnboundedSender<String>>,
 	cancel_token: CancellationToken,
-) -> Result<(ExecutionResult, Option<MinimizerResult>)> {
+) -> Result<(ExecutionResult, Option<MinimizerResult>, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
 		session
 			.shell
@@ -613,6 +694,7 @@ async fn run_shell_command(
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
 	let baseline_descendants = process::current_descendant_pids();
+	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 	// Stream every raw chunk to the caller live, regardless of whether
@@ -621,8 +703,10 @@ async fn run_shell_command(
 	// so the caller can swap their accumulated buffer for the minimized
 	// version without losing intermediate progress updates.
 	let reader_callback = on_chunk;
+	let output_budget = OutputBudget::new(OutputBudget::DEFAULT_LIMIT);
 	let mut reader_handle = tokio::spawn({
 		let reader_cancel = reader_cancel.clone();
+		let output_budget = output_budget.clone();
 		async move {
 			if should_minimize {
 				let output = read_output_buffered(
@@ -631,11 +715,19 @@ async fn run_shell_command(
 					reader_cancel,
 					activity_tx,
 					max_capture_bytes,
+					output_budget,
 				)
 				.await;
 				Result::<OutputRead>::Ok(OutputRead::Buffered(output))
 			} else {
-				Box::pin(read_output(reader_file, reader_callback, reader_cancel, activity_tx)).await;
+				Box::pin(read_output(
+					reader_file,
+					reader_callback,
+					reader_cancel,
+					activity_tx,
+					output_budget,
+				))
+				.await;
 				Result::<OutputRead>::Ok(OutputRead::Streaming)
 			}
 		}
@@ -648,12 +740,16 @@ async fn run_shell_command(
 			reader_cancel.cancel();
 		}
 	});
+	let pgid_probe =
+		tokio::spawn(capture_new_process_group(baseline_descendants.clone(), command_pgid.clone()));
 	let process_cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let baseline_descendants = baseline_descendants.clone();
+		let command_pgid = command_pgid.clone();
 		async move {
 			cancel_token.cancelled().await;
-			terminate_new_descendants(&baseline_descendants).await;
+			terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst))
+				.await;
 		}
 	});
 	let source_info = SourceInfo::from("pi-natives:command");
@@ -661,17 +757,18 @@ async fn run_shell_command(
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	pgid_probe.abort();
+	let _ = pgid_probe.await;
 
+	let mut cleanup_error = None;
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&session.shell);
+		terminate_background_jobs(&session.shell).await;
 	}
 
-	if env_scope_pushed {
-		session
-			.shell
-			.env_mut()
-			.pop_scope(EnvironmentScope::Command)
-			.map_err(|err| Error::msg(format!("Failed to pop env scope: {err}")))?;
+	if env_scope_pushed
+		&& let Err(err) = session.shell.env_mut().pop_scope(EnvironmentScope::Command)
+	{
+		cleanup_error = Some(Error::msg(format!("Failed to pop env scope: {err}")));
 	}
 
 	drop(params);
@@ -709,17 +806,13 @@ async fn run_shell_command(
 	}
 
 	if !reader_finished {
-		reader_cancel.cancel();
-		if let Ok(res) = time::timeout(READER_SHUTDOWN_TIMEOUT, &mut reader_handle).await {
-			if let Ok(output) = res
-				&& let Ok(output) = output
-			{
-				reader_output = Some(output);
-			}
-		} else {
-			reader_handle.abort();
-			let _ = reader_handle.await;
-		}
+		reader_output = shutdown_reader_task(
+			&reader_cancel,
+			&mut reader_handle,
+			reader_finished,
+			READER_SHUTDOWN_TIMEOUT,
+		)
+		.await;
 	}
 	cancel_bridge.abort();
 	let _ = cancel_bridge.await;
@@ -735,6 +828,9 @@ async fn run_shell_command(
 		let _ = process_cancel_bridge.await;
 	}
 
+	if let Some(err) = cleanup_error {
+		return Err(err);
+	}
 	let result = result.map_err(|err| Error::msg(format!("Shell execution failed: {err}")))?;
 	let mut minimized_out: Option<MinimizerResult> = None;
 	if let Some(OutputRead::Buffered(output)) = reader_output
@@ -762,7 +858,12 @@ async fn run_shell_command(
 			});
 		}
 	}
-	Ok((result, minimized_out))
+	let truncated_bytes = output_budget.truncated_bytes();
+	Ok((result, minimized_out, OutputTruncation {
+		output_truncated: truncated_bytes > 0,
+		output_truncated_bytes: truncated_bytes,
+		..Default::default()
+	}))
 }
 
 async fn run_shell_command_streams(
@@ -770,7 +871,7 @@ async fn run_shell_command_streams(
 	options: &ShellRunConfig,
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
-) -> Result<ExecutionResult> {
+) -> Result<(ExecutionResult, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
 		session
 			.shell
@@ -793,21 +894,26 @@ async fn run_shell_command_streams(
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
 	let baseline_descendants = process::current_descendant_pids();
+	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 
 	let StreamSinks { stdout: stdout_sink, stderr: stderr_sink } = streams;
+	let stdout_budget = OutputBudget::new(OutputBudget::DEFAULT_LIMIT);
+	let stderr_budget = OutputBudget::new(OutputBudget::DEFAULT_LIMIT);
 	let mut stdout_handle = tokio::spawn(Box::pin(read_output_bytes(
 		stdout_reader,
 		stdout_sink,
 		reader_cancel.clone(),
 		activity_tx.clone(),
+		stdout_budget.clone(),
 	)));
 	let mut stderr_handle = tokio::spawn(Box::pin(read_output_bytes(
 		stderr_reader,
 		stderr_sink,
 		reader_cancel.clone(),
 		activity_tx,
+		stderr_budget.clone(),
 	)));
 
 	let cancel_bridge = tokio::spawn({
@@ -818,12 +924,16 @@ async fn run_shell_command_streams(
 			reader_cancel.cancel();
 		}
 	});
+	let pgid_probe =
+		tokio::spawn(capture_new_process_group(baseline_descendants.clone(), command_pgid.clone()));
 	let process_cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let baseline_descendants = baseline_descendants.clone();
+		let command_pgid = command_pgid.clone();
 		async move {
 			cancel_token.cancelled().await;
-			terminate_new_descendants(&baseline_descendants).await;
+			terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst))
+				.await;
 		}
 	});
 	let source_info = SourceInfo::from("pi-shell:streams");
@@ -831,17 +941,18 @@ async fn run_shell_command_streams(
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	pgid_probe.abort();
+	let _ = pgid_probe.await;
 
+	let mut cleanup_error = None;
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&session.shell);
+		terminate_background_jobs(&session.shell).await;
 	}
 
-	if env_scope_pushed {
-		session
-			.shell
-			.env_mut()
-			.pop_scope(EnvironmentScope::Command)
-			.map_err(|err| Error::msg(format!("Failed to pop env scope: {err}")))?;
+	if env_scope_pushed
+		&& let Err(err) = session.shell.env_mut().pop_scope(EnvironmentScope::Command)
+	{
+		cleanup_error = Some(Error::msg(format!("Failed to pop env scope: {err}")));
 	}
 
 	drop(params);
@@ -879,25 +990,20 @@ async fn run_shell_command_streams(
 		}
 	}
 
-	if !stdout_finished || !stderr_finished {
-		reader_cancel.cancel();
-	}
-	if !stdout_finished
-		&& time::timeout(READER_SHUTDOWN_TIMEOUT, &mut stdout_handle)
-			.await
-			.is_err()
-	{
-		stdout_handle.abort();
-		let _ = stdout_handle.await;
-	}
-	if !stderr_finished
-		&& time::timeout(READER_SHUTDOWN_TIMEOUT, &mut stderr_handle)
-			.await
-			.is_err()
-	{
-		stderr_handle.abort();
-		let _ = stderr_handle.await;
-	}
+	shutdown_reader_unit_task(
+		&reader_cancel,
+		&mut stdout_handle,
+		stdout_finished,
+		READER_SHUTDOWN_TIMEOUT,
+	)
+	.await;
+	shutdown_reader_unit_task(
+		&reader_cancel,
+		&mut stderr_handle,
+		stderr_finished,
+		READER_SHUTDOWN_TIMEOUT,
+	)
+	.await;
 	cancel_bridge.abort();
 	let _ = cancel_bridge.await;
 	if cancel_token.is_cancelled() {
@@ -909,8 +1015,19 @@ async fn run_shell_command_streams(
 		let _ = process_cancel_bridge.await;
 	}
 
+	if let Some(err) = cleanup_error {
+		return Err(err);
+	}
 	let result = result.map_err(|err| Error::msg(format!("Shell execution failed: {err}")))?;
-	Ok(result)
+	let stdout_truncated_bytes = stdout_budget.truncated_bytes();
+	let stderr_truncated_bytes = stderr_budget.truncated_bytes();
+	Ok((result, OutputTruncation {
+		stdout_truncated: stdout_truncated_bytes > 0,
+		stdout_truncated_bytes,
+		stderr_truncated: stderr_truncated_bytes > 0,
+		stderr_truncated_bytes,
+		..Default::default()
+	}))
 }
 
 async fn read_output_bytes(
@@ -918,6 +1035,7 @@ async fn read_output_bytes(
 	sink: Option<mpsc::UnboundedSender<Bytes>>,
 	cancel_token: CancellationToken,
 	activity: mpsc::Sender<()>,
+	budget: OutputBudget,
 ) {
 	const BUF: usize = 65536;
 
@@ -962,11 +1080,20 @@ async fn read_output_bytes(
 		};
 		let _ = activity.try_send(());
 		buf.truncate(n);
-		if let Some(sink) = sink.as_ref()
-			&& sink.send(Bytes::from(buf)).is_err()
-		{
-			// Receiver dropped — stop forwarding and let the pipe close.
-			break;
+		if let Some(sink) = sink.as_ref() {
+			let allowed = budget
+				.remaining
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+					Some(remaining.saturating_sub(buf.len()))
+				})
+				.unwrap_or(0)
+				.min(buf.len());
+			if allowed > 0 && sink.send(Bytes::copy_from_slice(&buf[..allowed])).is_err() {
+				break;
+			}
+			if allowed < buf.len() {
+				budget.mark_truncated(buf.len() - allowed);
+			}
 		}
 	}
 }
@@ -974,12 +1101,30 @@ async fn read_output_bytes(
 // Rescan-and-signal loop for cancellation. Each pass picks up descendants
 // spawned during the previous wave's grace period, then exits as soon as no
 // targets remain so unrelated later commands are not swept into old cancels.
-async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(baseline: &HashSet<i32, S>) {
+async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
+	baseline: HashSet<i32, S>,
+	command_pgid: Arc<AtomicI32>,
+) {
+	for _ in 0..100 {
+		let mut targets = process::TerminationTargets::new();
+		process::add_new_descendants(&mut targets, &baseline);
+		if let Some(pgid) = targets.first_pgid() {
+			command_pgid.store(pgid, Ordering::SeqCst);
+			return;
+		}
+		time::sleep(Duration::from_millis(5)).await;
+	}
+}
+
+async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(
+	baseline: &HashSet<i32, S>,
+	command_pgid: i32,
+) {
 	const WAVES: u32 = 3;
 	for wave in 0..WAVES {
 		let mut targets = process::TerminationTargets::new();
 		process::add_new_descendants(&mut targets, baseline);
-		if targets.is_empty() {
+		if targets.is_empty() && command_pgid <= 0 {
 			return;
 		}
 		let signal = if wave == 0 {
@@ -987,6 +1132,9 @@ async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(baseline: &
 		} else {
 			process::KILL_SIGNAL
 		};
+		if command_pgid > 0 {
+			let _ = process::kill_process_group(command_pgid, signal);
+		}
 		targets.signal(signal);
 		if wave + 1 < WAVES {
 			let pause = if wave == 0 {
@@ -998,7 +1146,7 @@ async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(baseline: &
 		}
 	}
 }
-fn terminate_background_jobs(shell: &BrushShell) {
+async fn terminate_background_jobs(shell: &BrushShell) {
 	let mut targets = process::TerminationTargets::new();
 	for job in &shell.jobs().jobs {
 		if let Some(pgid) = job.process_group_id() {
@@ -1009,19 +1157,12 @@ fn terminate_background_jobs(shell: &BrushShell) {
 		}
 	}
 	if targets.is_empty() {
-		// Pure descendant cleanup is handled by `process_cancel_bridge` while
-		// the cancel was still in flight. Here we only signal brush's own
-		// job-tracked targets — pgids of background-group leaders that may have
-		// already exited (so the descendant walk would no longer find them as
-		// new descendants, but their group still holds live grandchildren).
 		return;
 	}
 
 	targets.signal(process::TERM_SIGNAL);
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
-		targets.signal(process::KILL_SIGNAL);
-	});
+	time::sleep(Duration::from_millis(150)).await;
+	targets.signal(process::KILL_SIGNAL);
 }
 
 /// Apply per-command environment variables onto a freshly pushed
@@ -1154,11 +1295,84 @@ struct BufferedOutput {
 	exceeded: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputTruncation {
+	output_truncated:       bool,
+	output_truncated_bytes: u64,
+	stdout_truncated:       bool,
+	stdout_truncated_bytes: u64,
+	stderr_truncated:       bool,
+	stderr_truncated_bytes: u64,
+}
+
+#[derive(Clone)]
+struct OutputBudget {
+	remaining: Arc<AtomicUsize>,
+	truncated: Arc<AtomicUsize>,
+}
+
+impl OutputBudget {
+	const DEFAULT_LIMIT: usize = 8 * 1024 * 1024;
+
+	fn new(limit: usize) -> Self {
+		Self {
+			remaining: Arc::new(AtomicUsize::new(limit)),
+			truncated: Arc::new(AtomicUsize::new(0)),
+		}
+	}
+
+	fn mark_truncated(&self, bytes: usize) {
+		self.truncated.fetch_add(bytes, Ordering::SeqCst);
+	}
+
+	fn truncated_bytes(&self) -> u64 {
+		u64::try_from(self.truncated.load(Ordering::SeqCst)).unwrap_or(u64::MAX)
+	}
+}
+
+async fn shutdown_reader_task<T>(
+	reader_cancel: &CancellationToken,
+	reader_handle: &mut tokio::task::JoinHandle<Result<T>>,
+	reader_finished: bool,
+	timeout: Duration,
+) -> Option<T> {
+	if reader_finished {
+		return None;
+	}
+	reader_cancel.cancel();
+	match time::timeout(timeout, &mut *reader_handle).await {
+		Ok(Ok(Ok(output))) => Some(output),
+		Ok(_) => None,
+		Err(_) => {
+			reader_handle.abort();
+			let _ = reader_handle.await;
+			None
+		},
+	}
+}
+
+async fn shutdown_reader_unit_task(
+	reader_cancel: &CancellationToken,
+	reader_handle: &mut tokio::task::JoinHandle<()>,
+	reader_finished: bool,
+	timeout: Duration,
+) {
+	if reader_finished {
+		return;
+	}
+	reader_cancel.cancel();
+	if time::timeout(timeout, &mut *reader_handle).await.is_err() {
+		reader_handle.abort();
+		let _ = reader_handle.await;
+	}
+}
+
 async fn read_output(
 	reader: fs::File,
 	on_chunk: Option<mpsc::UnboundedSender<String>>,
 	cancel_token: CancellationToken,
 	activity: mpsc::Sender<()>,
+	budget: OutputBudget,
 ) {
 	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
@@ -1215,7 +1429,7 @@ async fn read_output(
 			let pending = &buf[..it];
 			match str::from_utf8(pending) {
 				Ok(text) => {
-					emit_chunk(text, on_chunk.as_ref());
+					emit_chunk(text, on_chunk.as_ref(), &budget);
 					it = 0;
 					break;
 				},
@@ -1224,7 +1438,7 @@ async fn read_output(
 					if p > 0 {
 						// SAFETY: [..p] is guaranteed valid UTF-8 by valid_up_to().
 						let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-						emit_chunk(text, on_chunk.as_ref());
+						emit_chunk(text, on_chunk.as_ref(), &budget);
 						// copy p..it to the beginning of the buffer
 						buf.copy_within(p..it, 0);
 						it -= p;
@@ -1233,7 +1447,7 @@ async fn read_output(
 					match err.error_len() {
 						Some(p) => {
 							// Invalid byte sequence: emit replacement and drop those bytes.
-							emit_chunk(REPLACEMENT, on_chunk.as_ref());
+							emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
 							// copy p..it to the beginning of the buffer
 							buf.copy_within(p..it, 0);
 							it -= p;
@@ -1254,10 +1468,10 @@ async fn read_output(
 	for chunk in buf[..it].utf8_chunks() {
 		let valid = chunk.valid();
 		if !valid.is_empty() {
-			emit_chunk(valid, on_chunk.as_ref());
+			emit_chunk(valid, on_chunk.as_ref(), &budget);
 		}
 		if !chunk.invalid().is_empty() {
-			emit_chunk(REPLACEMENT, on_chunk.as_ref());
+			emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
 		}
 	}
 }
@@ -1268,6 +1482,7 @@ async fn read_output_buffered(
 	cancel_token: CancellationToken,
 	activity: mpsc::Sender<()>,
 	max_capture_bytes: usize,
+	budget: OutputBudget,
 ) -> BufferedOutput {
 	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
@@ -1341,7 +1556,7 @@ async fn read_output_buffered(
 			while !pending.is_empty() {
 				match str::from_utf8(&pending) {
 					Ok(text) => {
-						emit_chunk(text, Some(cb));
+						emit_chunk(text, Some(cb), &budget);
 						pending.clear();
 						break;
 					},
@@ -1350,12 +1565,12 @@ async fn read_output_buffered(
 						if p > 0 {
 							// SAFETY: [..p] is valid UTF-8 per valid_up_to().
 							let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-							emit_chunk(text, Some(cb));
+							emit_chunk(text, Some(cb), &budget);
 							pending.drain(..p);
 						}
 						match err.error_len() {
 							Some(skip) => {
-								emit_chunk(REPLACEMENT, Some(cb));
+								emit_chunk(REPLACEMENT, Some(cb), &budget);
 								pending.drain(..skip);
 							},
 							None => break,
@@ -1371,10 +1586,10 @@ async fn read_output_buffered(
 		for chunk in pending.utf8_chunks() {
 			let valid = chunk.valid();
 			if !valid.is_empty() {
-				emit_chunk(valid, Some(cb));
+				emit_chunk(valid, Some(cb), &budget);
 			}
 			if !chunk.invalid().is_empty() {
-				emit_chunk(REPLACEMENT, Some(cb));
+				emit_chunk(REPLACEMENT, Some(cb), &budget);
 			}
 		}
 	}
@@ -1422,9 +1637,32 @@ fn read_nonblocking<T: std::os::fd::AsRawFd>(file: &T, buf: &mut [u8]) -> io::Re
 	}
 }
 
-fn emit_chunk(text: &str, callback: Option<&mpsc::UnboundedSender<String>>) {
+fn emit_chunk(text: &str, callback: Option<&mpsc::UnboundedSender<String>>, budget: &OutputBudget) {
+	if text.is_empty() {
+		return;
+	}
 	if let Some(callback) = callback {
-		let _ = callback.send(text.to_string());
+		let allowed = budget
+			.remaining
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				Some(remaining.saturating_sub(text.len()))
+			})
+			.unwrap_or(0)
+			.min(text.len());
+		if allowed == 0 {
+			budget.mark_truncated(text.len());
+			return;
+		}
+		let mut end = allowed;
+		while !text.is_char_boundary(end) {
+			end -= 1;
+		}
+		if end > 0 && callback.send(text[..end].to_string()).is_err() {
+			return;
+		}
+		if end < text.len() {
+			budget.mark_truncated(text.len() - end);
+		}
 	}
 }
 
@@ -1540,23 +1778,33 @@ impl builtins::Command for TimeoutCommand {
 			}
 
 			let cancel_token = context.cancel_token();
+			let baseline_descendants = process::current_descendant_pids();
+			let command_pgid = Arc::new(AtomicI32::new(0));
+			let pgid_probe = tokio::spawn(capture_new_process_group(
+				baseline_descendants.clone(),
+				command_pgid.clone(),
+			));
 			let source_info = SourceInfo::from("pi-natives:timeout");
 			let run_future = context
 				.shell
 				.run_string(command_line, &source_info, &params);
 			tokio::pin!(run_future);
 
-			if let Some(cancel_token) = cancel_token {
+			let result = if let Some(cancel_token) = cancel_token {
 				tokio::select! {
 					result = &mut run_future => result,
 					() = time::sleep(timeout) => {
 						child_cancel.cancel();
-						// Wait briefly for the child to exit after cancellation.
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
 						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
 						Ok(ExecutionResult::new(124))
 					},
 					() = cancel_token.cancelled() => {
 						child_cancel.cancel();
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
 						Ok(ExecutionExitCode::Interrupted.into())
 					},
 				}
@@ -1565,12 +1813,16 @@ impl builtins::Command for TimeoutCommand {
 					result = &mut run_future => result,
 					() = time::sleep(timeout) => {
 						child_cancel.cancel();
-						// Wait briefly for the child to exit after cancellation.
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
 						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
 						Ok(ExecutionResult::new(124))
 					},
 				}
-			}
+			};
+			pgid_probe.abort();
+			let _ = pgid_probe.await;
+			result
 		}
 	}
 }
@@ -1615,6 +1867,9 @@ fn quote_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(unix)]
+	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 
 	/// Truth-table coverage for `brush_core::commands::child_session_action`.
 	///
@@ -1694,6 +1949,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn embedded_external_command_runs_in_its_own_session() {
 		use std::io::Read as _;
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 
 		// SAFETY: `getsid(0)` only queries the current process session; the return
 		// value is checked.
@@ -1802,7 +2058,8 @@ mod tests {
 		let mut cancel_token = CancelToken::default();
 		let abort_token = cancel_token.emplace_abort_token();
 
-		abort_state.set(abort_token).await;
+		let generation = abort_state.publish(abort_token).await;
+		abort_state.activate(generation).await;
 		abort_state.abort().await;
 
 		let reason = time::timeout(Duration::from_millis(100), cancel_token.wait())
@@ -1811,13 +2068,430 @@ mod tests {
 		assert!(matches!(reason, AbortReason::Signal));
 	}
 
+	#[tokio::test]
+	async fn abort_state_latches_abort_before_token_publication() {
+		let abort_state = ShellAbortState::default();
+		let mut cancel_token = CancelToken::default();
+
+		abort_state.abort().await;
+		let abort_token = cancel_token.emplace_abort_token();
+		let generation = abort_state.publish(abort_token).await;
+		abort_state.activate(generation).await;
+
+		let reason = time::timeout(Duration::from_millis(100), cancel_token.wait())
+			.await
+			.expect("latched abort should signal token after publication");
+		assert!(matches!(reason, AbortReason::Signal));
+	}
+
+	#[tokio::test]
+	async fn abort_state_latches_abort_after_stale_generation_cleared() {
+		let abort_state = ShellAbortState::default();
+		let mut stale_cancel = CancelToken::default();
+		let stale_abort = stale_cancel.emplace_abort_token();
+		let stale_generation = abort_state.publish(stale_abort).await;
+		abort_state.activate(stale_generation).await;
+		abort_state.clear(stale_generation).await;
+
+		abort_state.abort().await;
+
+		let mut next_cancel = CancelToken::default();
+		let next_abort = next_cancel.emplace_abort_token();
+		let next_generation = abort_state.publish(next_abort).await;
+		abort_state.activate(next_generation).await;
+
+		let reason = time::timeout(Duration::from_millis(100), next_cancel.wait())
+			.await
+			.expect("handoff-window abort should latch for the next active token");
+		assert!(matches!(reason, AbortReason::Signal));
+		assert!(
+			time::timeout(Duration::from_millis(20), stale_cancel.wait())
+				.await
+				.is_err(),
+			"stale generation should already be cleared, not signalled again"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn shell_abort_before_run_token_publication_interrupts_command() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		shell.abort().await;
+
+		let started = std::time::Instant::now();
+		let result = time::timeout(
+			Duration::from_secs(2),
+			shell.run(
+				ShellRunOptions { command: "/bin/sh -c 'sleep 5'".to_string(), ..Default::default() },
+				None,
+				CancelToken::default(),
+			),
+		)
+		.await
+		.expect("latched abort should interrupt instead of hanging")
+		.expect("shell run should return cancellation result");
+
+		assert!(result.cancelled, "latched Shell::abort should surface as cancellation");
+		assert_eq!(result.exit_code, None);
+		assert!(started.elapsed() < Duration::from_secs(2), "command was not interrupted promptly");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn overlapping_shell_abort_interrupts_active_run_not_queued_run() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Arc::new(Shell::new(None));
+		let (first_tx, mut first_rx) = mpsc::unbounded_channel::<String>();
+		let (second_tx, mut second_rx) = mpsc::unbounded_channel::<String>();
+
+		let first = tokio::spawn({
+			let shell = shell.clone();
+			async move {
+				shell
+					.run(
+						ShellRunOptions {
+							command: "printf first-started; sleep 5".to_string(),
+							..Default::default()
+						},
+						Some(first_tx),
+						CancelToken::default(),
+					)
+					.await
+			}
+		});
+
+		// Output may arrive in multiple chunks: the reader emits whatever bytes
+		// are decodable per pipe read, so a logical marker can be split across
+		// chunks (e.g. a lone "f"). Accumulate until the full marker is present.
+		let mut first_seen = String::new();
+		while !first_seen.starts_with("first-started") {
+			let chunk = time::timeout(Duration::from_secs(2), first_rx.recv())
+				.await
+				.expect("first command should emit startup marker")
+				.expect("first output channel should remain open");
+			first_seen.push_str(&chunk);
+		}
+		assert!(first_seen.starts_with("first-started"), "unexpected first output: {first_seen:?}");
+
+		let second = tokio::spawn({
+			let shell = shell.clone();
+			async move {
+				shell
+					.run(
+						ShellRunOptions {
+							command: "printf second-ran".to_string(),
+							..Default::default()
+						},
+						Some(second_tx),
+						CancelToken::default(),
+					)
+					.await
+			}
+		});
+		time::sleep(Duration::from_millis(50)).await;
+
+		shell.abort().await;
+
+		let first_result = time::timeout(Duration::from_secs(2), first)
+			.await
+			.expect("active run should finish promptly after abort")
+			.expect("active run task should not panic")
+			.expect("active run should return a result");
+		assert!(first_result.cancelled, "abort should target the active first run");
+		assert_eq!(first_result.exit_code, None);
+
+		let second_result = time::timeout(Duration::from_secs(2), second)
+			.await
+			.expect("queued run should finish after active run releases session")
+			.expect("queued run task should not panic")
+			.expect("queued run should return a result");
+		assert!(!second_result.cancelled, "queued run must not steal the abort target");
+		assert_eq!(second_result.exit_code, Some(0));
+
+		// The queued run's `printf second-ran` output can likewise be split
+		// across chunks; accumulate until the full marker is received.
+		let mut second_seen = String::new();
+		while second_seen != "second-ran" {
+			let chunk = time::timeout(Duration::from_secs(2), second_rx.recv())
+				.await
+				.expect("second command should emit after active abort")
+				.expect("second output channel should remain open");
+			second_seen.push_str(&chunk);
+		}
+		assert_eq!(second_seen, "second-ran");
+	}
+
+	#[tokio::test]
+	async fn output_budget_caps_streaming_chunks() {
+		let budget = OutputBudget::new(5);
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+		emit_chunk("hello", Some(&tx), &budget);
+		emit_chunk("world", Some(&tx), &budget);
+		drop(tx);
+
+		let mut received = String::new();
+		while let Some(chunk) = rx.recv().await {
+			received.push_str(&chunk);
+		}
+		assert_eq!(received, "hello");
+		assert_eq!(budget.truncated_bytes(), 5);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn very_large_stdout_caps_output_and_surfaces_truncation() {
+		let (reader, mut writer) = pipe_to_files("large-output").expect("pipe should be created");
+		let budget = OutputBudget::new(1024);
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (activity_tx, _activity_rx) = mpsc::channel(1);
+		let handle = tokio::spawn(read_output(
+			reader,
+			Some(tx),
+			CancellationToken::new(),
+			activity_tx,
+			budget.clone(),
+		));
+
+		let writer_handle = tokio::task::spawn_blocking(move || {
+			let chunk = vec![b'x'; OutputBudget::DEFAULT_LIMIT + 4096];
+			writer
+				.write_all(&chunk)
+				.expect("large write should succeed");
+		});
+		writer_handle.await.expect("writer task should not panic");
+
+		let mut received = String::new();
+		while let Some(chunk) = rx.recv().await {
+			received.push_str(&chunk);
+		}
+		time::timeout(Duration::from_secs(2), handle)
+			.await
+			.expect("reader should finish after writer closes")
+			.expect("reader task should not panic");
+
+		assert_eq!(received.len(), 1024, "streamed output must stop exactly at the budget cap");
+		assert!(
+			budget.truncated_bytes() > 0,
+			"budget truncation must be observable, not silent loss"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_reports_text_truncation() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions {
+				command: format!(
+					"python3 -c 'import sys; sys.stdout.write(\"x\" * {})'",
+					OutputBudget::DEFAULT_LIMIT + 4096
+				),
+				..Default::default()
+			},
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("execute_shell should succeed");
+
+		let mut received = 0usize;
+		while let Some(chunk) = rx.recv().await {
+			received += chunk.len();
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.output_truncated);
+		assert!(result.output_truncated_bytes > 0);
+		assert_eq!(received, OutputBudget::DEFAULT_LIMIT);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_streams_reports_raw_truncation() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+		let result = execute_shell_streams(
+			ShellExecuteOptions {
+				command: format!(
+					"python3 -c 'import sys; sys.stdout.buffer.write(b\"x\" * {})'",
+					OutputBudget::DEFAULT_LIMIT + 4096
+				),
+				..Default::default()
+			},
+			StreamSinks { stdout: Some(tx), stderr: None },
+			CancelToken::default(),
+		)
+		.await
+		.expect("execute_shell_streams should succeed");
+
+		let mut received = 0usize;
+		while let Some(chunk) = rx.recv().await {
+			received += chunk.len();
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.stdout_truncated);
+		assert!(result.stdout_truncated_bytes > 0);
+		assert!(!result.stderr_truncated);
+		assert_eq!(received, OutputBudget::DEFAULT_LIMIT);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let sibling = std::process::Command::new("/bin/sh")
+			.arg("-c")
+			.arg("sleep 5")
+			.spawn()
+			.expect("spawn unrelated sibling");
+		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let command = "timeout 0.2 perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; \
+		               print qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . \
+		               qq(\\n); $| = 1; sleep 30; exit 0; } print qq(parent=$$ child=$pid pgid=) . \
+		               getpgrp() . qq(\\n); $| = 1; sleep 30;'";
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("timeout command should execute");
+
+		let mut output = String::new();
+		while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(50), rx.recv()).await {
+			output.push_str(&chunk);
+		}
+		let grandchild_pid = parse_marker_pid(&output, "grandchild=")
+			.expect("grandchild marker should be emitted before timeout");
+		assert_eq!(result.exit_code, Some(124), "output={output:?}");
+
+		for _ in 0..50 {
+			let grandchild_dead = process::Process::from_pid(grandchild_pid)
+				.is_none_or(|process| process.status() != process::ProcessStatus::Running);
+			let sibling_alive = process::Process::from_pid(sibling_pid)
+				.is_some_and(|process| process.status() == process::ProcessStatus::Running);
+			if grandchild_dead && sibling_alive {
+				let _ = process::Process::from_pid(sibling_pid)
+					.expect("sibling should still be alive")
+					.kill_tree(Some(process::KILL_SIGNAL));
+				return;
+			}
+			time::sleep(Duration::from_millis(20)).await;
+		}
+		let _ = process::Process::from_pid(sibling_pid)
+			.expect("sibling should still be alive")
+			.kill_tree(Some(process::KILL_SIGNAL));
+		panic!(
+			"timeout left reparented grandchild {grandchild_pid} alive or killed sibling; \
+			 output={output:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let sibling = std::process::Command::new("/bin/sh")
+			.arg("-c")
+			.arg("sleep 5")
+			.spawn()
+			.expect("spawn unrelated sibling");
+		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		let cancel = CancelToken::default();
+		let abort = cancel.clone().emplace_abort_token();
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let command = "perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; print \
+		               qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . qq(\\n); $| = \
+		               1; sleep 30; exit 0; } print qq(parent=$$ child=$pid pgid=) . getpgrp() . \
+		               qq(\\n); exit 0;'; sleep 30";
+		let run = tokio::spawn(execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			cancel,
+		));
+
+		let mut output = String::new();
+		let grandchild_pid = time::timeout(Duration::from_secs(5), async {
+			loop {
+				let chunk = rx.recv().await.expect("output channel should stay open");
+				output.push_str(&chunk);
+				if let Some(pid) = parse_marker_pid(&output, "grandchild=") {
+					return pid;
+				}
+			}
+		})
+		.await
+		.expect("grandchild pid marker");
+		let command_pgid = process::Process::from_pid(grandchild_pid)
+			.and_then(|process| process.group_id())
+			.expect("grandchild pgid should be visible");
+
+		for _ in 0..50 {
+			if process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid()) == Some(1)
+			{
+				break;
+			}
+			time::sleep(Duration::from_millis(20)).await;
+		}
+		assert_eq!(
+			process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid()),
+			Some(1),
+			"grandchild should reparent away from shell before cancellation; output={output:?}",
+		);
+
+		abort.abort(AbortReason::Signal);
+		terminate_new_descendants(&process::current_descendant_pids(), command_pgid).await;
+		time::sleep(Duration::from_millis(500)).await;
+		run.abort();
+		let _ = run.await;
+
+		for _ in 0..50 {
+			let grandchild_dead = process::Process::from_pid(grandchild_pid)
+				.is_none_or(|process| process.status() != process::ProcessStatus::Running);
+			let sibling_alive = process::Process::from_pid(sibling_pid)
+				.is_some_and(|process| process.status() == process::ProcessStatus::Running);
+			if grandchild_dead && sibling_alive {
+				let _ = process::Process::from_pid(sibling_pid)
+					.expect("sibling should still be alive")
+					.kill_tree(Some(process::KILL_SIGNAL));
+				return;
+			}
+			time::sleep(Duration::from_millis(20)).await;
+		}
+		let _ = process::Process::from_pid(sibling_pid)
+			.expect("sibling should still be alive")
+			.kill_tree(Some(process::KILL_SIGNAL));
+		panic!("reparented grandchild {grandchild_pid} survived cancellation");
+	}
+
+	#[cfg(unix)]
+	fn parse_marker_pid(output: &str, marker: &str) -> Option<i32> {
+		let start = output.find(marker)? + marker.len();
+		let rest = &output[start..];
+		let end = rest
+			.find(|ch: char| !ch.is_ascii_digit())
+			.unwrap_or(rest.len());
+		rest[..end].parse().ok()
+	}
+
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn read_output_stops_when_cancelled_before_pipe_eof() {
 		let (reader, _writer) = pipe_to_files("test").expect("test pipe should be created");
 		let cancel = CancellationToken::new();
 		let (activity_tx, _activity_rx) = mpsc::channel(1);
-		let handle = tokio::spawn(read_output(reader, None, cancel.clone(), activity_tx));
+		let handle = tokio::spawn(read_output(
+			reader,
+			None,
+			cancel.clone(),
+			activity_tx,
+			OutputBudget::new(usize::MAX),
+		));
 
 		time::sleep(Duration::from_millis(10)).await;
 		cancel.cancel();
@@ -1826,6 +2500,77 @@ mod tests {
 			.await
 			.expect("reader task should stop after cancellation")
 			.expect("reader task should not panic");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn env_scope_pop_error_cleanup_cancels_reader_and_bridges() {
+		let (reader, writer) = pipe_to_files("env-pop-error").expect("pipe should be created");
+		let stdout_file = OpenFile::from(writer.try_clone().expect("clone writer"));
+		let stderr_file = OpenFile::from(writer);
+		let reader_cancel = CancellationToken::new();
+		let command_cancel = CancellationToken::new();
+		let (activity_tx, _activity_rx) = mpsc::channel::<()>(1);
+		let mut reader_handle = tokio::spawn(read_output(
+			reader,
+			None,
+			reader_cancel.clone(),
+			activity_tx,
+			OutputBudget::new(usize::MAX),
+		));
+		let cancel_bridge = tokio::spawn({
+			let command_cancel = command_cancel.clone();
+			let reader_cancel = reader_cancel.clone();
+			async move {
+				command_cancel.cancelled().await;
+				reader_cancel.cancel();
+			}
+		});
+		let process_cancel_bridge = tokio::spawn({
+			let command_cancel = command_cancel.clone();
+			async move {
+				command_cancel.cancelled().await;
+			}
+		});
+
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+		let mut env = HashMap::new();
+		env.insert("U3_POP_ERROR".to_string(), "1".to_string());
+		assert!(apply_command_env(&mut session.shell, Some(&env)).expect("push command env"));
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
+		params.set_fd(OpenFiles::STDERR_FD, stderr_file);
+		params.set_cancel_token(command_cancel.clone());
+		let source_info = SourceInfo::from("pi-natives:env-pop-error-test");
+		let exec = session
+			.shell
+			.run_string("printf done", &source_info, &params)
+			.await
+			.expect("command should run before forced cleanup error");
+		assert!(matches!(exec.exit_code, ExecutionExitCode::Success));
+
+		session.shell.env_mut().push_scope(EnvironmentScope::Local);
+		let cleanup_error = session.shell.env_mut().pop_scope(EnvironmentScope::Command);
+		assert!(cleanup_error.is_err(), "forced local scope should make command pop fail");
+		drop(params);
+
+		reader_cancel.cancel();
+		time::timeout(Duration::from_secs(2), &mut reader_handle)
+			.await
+			.expect("reader must stop even when env cleanup errors")
+			.expect("reader task should not panic");
+		command_cancel.cancel();
+		time::timeout(Duration::from_secs(2), cancel_bridge)
+			.await
+			.expect("reader cancel bridge should not leak")
+			.expect("reader cancel bridge should not panic");
+		time::timeout(Duration::from_secs(2), process_cancel_bridge)
+			.await
+			.expect("process cancel bridge should not leak")
+			.expect("process cancel bridge should not panic");
 	}
 
 	#[cfg(unix)]

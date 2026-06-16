@@ -1270,19 +1270,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 				case "raw": {
 					const result = executeReadQuery(db, selector.sql);
+					const table = renderTable(result.columns, result.rows, {
+						totalCount: result.rows.length,
+						offset: 0,
+						limit: result.rows.length || DEFAULT_MAX_LINES,
+						table: "query",
+						dbPath: resolvedSqlitePath.absolutePath,
+					});
+					const body = result.truncated
+						? `${table}\n\n[Output truncated to the first ${result.rows.length} rows; add a LIMIT clause to the query to bound or page the result.]`
+						: table;
 					return toolResult<ReadToolDetails>(details)
-						.text(
-							prependSuffixResolutionNotice(
-								renderTable(result.columns, result.rows, {
-									totalCount: result.rows.length,
-									offset: 0,
-									limit: result.rows.length || DEFAULT_MAX_LINES,
-									table: "query",
-									dbPath: resolvedSqlitePath.absolutePath,
-								}),
-								resolvedSqlitePath.suffixResolution,
-							),
-						)
+						.text(prependSuffixResolutionNotice(body, resolvedSqlitePath.suffixResolution))
 						.sourcePath(resolvedSqlitePath.absolutePath)
 						.done();
 				}

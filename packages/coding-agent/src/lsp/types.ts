@@ -1,5 +1,6 @@
 import type { ptree } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { OwnedProcess } from "../runtime/process-lifecycle";
 
 // =============================================================================
 // Tool Schema
@@ -399,6 +400,7 @@ export interface LspClient {
 	cwd: string;
 	config: ServerConfig;
 	proc: ptree.ChildProcess<"pipe">;
+	owner?: OwnedProcess;
 	requestId: number;
 	diagnostics: Map<string, PublishedDiagnostics>;
 	diagnosticsVersion: number;

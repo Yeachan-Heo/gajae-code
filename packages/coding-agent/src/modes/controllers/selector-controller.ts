@@ -684,7 +684,12 @@ export class SelectorController {
 					done();
 					this.ctx.ui.requestRender();
 				},
-				{ ...options, sessionId: this.ctx.session.sessionId },
+				{
+					...options,
+					sessionId: this.ctx.session.sessionId,
+					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
+					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
+				},
 			);
 			return { component: selector, focus: selector };
 		});

@@ -99,6 +99,7 @@ export class HttpTransport implements MCPTransport {
 		}
 
 		if (response.status === 405 || !response.ok || !response.body) {
+			await response.body?.cancel().catch(() => {});
 			this.#sseConnection = this.#sseConnection === sseConnection ? null : this.#sseConnection;
 			return;
 		}
@@ -209,8 +210,6 @@ export class HttpTransport implements MCPTransport {
 				signal: operationSignal,
 			});
 
-			clearTimeout(timeoutId);
-
 			// Check for session ID in response
 			const newSessionId = response.headers.get("Mcp-Session-Id");
 			if (newSessionId) {
@@ -247,7 +246,6 @@ export class HttpTransport implements MCPTransport {
 
 			return result.result as T;
 		} catch (error) {
-			clearTimeout(timeoutId);
 			if (error instanceof Error && error.name === "AbortError") {
 				if (options?.signal?.aborted) {
 					throw error;
@@ -255,6 +253,8 @@ export class HttpTransport implements MCPTransport {
 				throw new Error(`Request timeout after ${timeout}ms`);
 			}
 			throw error;
+		} finally {
+			clearTimeout(timeoutId);
 		}
 	}
 
@@ -273,12 +273,12 @@ export class HttpTransport implements MCPTransport {
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
 		let captured = false;
 
-		// Drain the SSE stream from a single iterator. We resolve the deferred
-		// promise as soon as the matching response arrives, then keep iterating
-		// in the background to pick up piggybacked notifications/requests.
-		// Re-reading `response.body` after `for await` breaks would lock the
-		// stream a second time and surface as "ReadableStream already has a
-		// controller", so we must not exit the loop early.
+		// Drain this per-request SSE response from a single iterator. Once the
+		// matching response arrives, resolve/reject and abort the reader so the
+		// response body is cancelled instead of lingering in the background.
+		// Re-reading `response.body` would lock the stream a second time and surface
+		// as "ReadableStream already has a controller", so the iterator owns the
+		// stream until it is aborted, completes, or errors.
 		const drainController = abortController;
 		this.#streamControllers.add(drainController);
 		const drain = async (): Promise<void> => {
@@ -293,13 +293,13 @@ export class HttpTransport implements MCPTransport {
 							("result" in message || "error" in message)
 						) {
 							captured = true;
-							clearTimeout(timeoutId);
+							drainController.abort();
 							if (message.error) {
 								reject(new Error(`MCP error ${message.error.code}: ${message.error.message}`));
 							} else {
 								resolve(message.result as T);
 							}
-							continue;
+							return;
 						}
 						if (!this.#connected) continue;
 						this.#dispatchSSEMessage(message);
@@ -322,6 +322,7 @@ export class HttpTransport implements MCPTransport {
 			} finally {
 				clearTimeout(timeoutId);
 				this.#streamControllers.delete(drainController);
+				await response.body?.cancel().catch(() => {});
 			}
 		};
 

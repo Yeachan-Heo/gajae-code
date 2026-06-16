@@ -225,6 +225,9 @@ export interface MCPTransport {
 	/** Close the transport */
 	close(): Promise<void>;
 
+	/** Whether close must finish before reconnect can safely spawn a replacement. */
+	readonly closeBeforeReconnect?: boolean;
+
 	/** Whether the transport is connected */
 	readonly connected: boolean;
 

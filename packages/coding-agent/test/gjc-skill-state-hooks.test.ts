@@ -754,6 +754,145 @@ disabledExtensions:
 		expect(allowed.outputJson).toBeNull();
 	});
 
+	it("Stop forces deep-interview crystallization when an ordinary stop would terminalize without a spec", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-uncrystallized",
+				threadId: "thread-di-uncrystallized",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// The agent declares the interview complete (active:true + a releasing
+		// phase) but never crystallized a spec. The ordinary stop path must block
+		// and force the crystallize/handoff path instead of letting the distilled
+		// interview state vanish as a generic stopped task (#674).
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-uncrystallized", "deep-interview-state.json"),
+			JSON.stringify({ active: true, current_phase: "complete", session_id: "session-di-uncrystallized" }),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-uncrystallized",
+			threadId: "thread-di-uncrystallized",
+		});
+
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_deep_interview_uncrystallized",
+		});
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("crystalliz");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("gjc deep-interview --write");
+	});
+
+	it("Stop releases a deep-interview that reached a terminal phase with a crystallized spec", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-crystallized",
+				threadId: "thread-di-crystallized",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// A persisted final spec is the crystallization evidence; once it exists
+		// on disk the run may terminalize through the ordinary stop path.
+		const specPath = path.join(root, ".gjc", "specs", "deep-interview-sample.md");
+		await Bun.write(specPath, "# Final deep-interview spec\n");
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-crystallized", "deep-interview-state.json"),
+			JSON.stringify({
+				active: true,
+				current_phase: "complete",
+				session_id: "session-di-crystallized",
+				spec_path: specPath,
+			}),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-crystallized",
+			threadId: "thread-di-crystallized",
+		});
+		expect(allowed.outputJson).toBeNull();
+	});
+
+	it("Stop keeps blocking deep-interview when its mode-state names a spec that no longer exists", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-stale-spec",
+				threadId: "thread-di-stale-spec",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// A spec_path that does not resolve to a real file is not crystallization;
+		// the guard must still force a real crystallize/handoff before stopping.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-stale-spec", "deep-interview-state.json"),
+			JSON.stringify({
+				active: true,
+				current_phase: "completed",
+				session_id: "session-di-stale-spec",
+				spec_path: path.join(root, ".gjc", "specs", "deep-interview-missing.md"),
+			}),
+		);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-stale-spec",
+			threadId: "thread-di-stale-spec",
+		});
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_deep_interview_uncrystallized",
+		});
+	});
+
+	it("Stop preserves explicit deep-interview abort/cancel without forcing crystallization", async () => {
+		const root = await cwd();
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: "session-di-cancelled",
+				threadId: "thread-di-cancelled",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		// An explicit abort/cancel is a legitimate terminal even without a spec:
+		// the crystallization guard must not override deliberate cancellation.
+		await Bun.write(
+			path.join(root, ".gjc", "state", "sessions", "session-di-cancelled", "deep-interview-state.json"),
+			JSON.stringify({ active: true, current_phase: "cancelled", session_id: "session-di-cancelled" }),
+		);
+
+		const allowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: "session-di-cancelled",
+			threadId: "thread-di-cancelled",
+		});
+		expect(allowed.outputJson).toBeNull();
+	});
+
 	it("UserPromptSubmit reminds active Ultragoal sessions to use ultragoal steer", async () => {
 		const root = await cwd();
 		await dispatchGjcNativeSkillHook(

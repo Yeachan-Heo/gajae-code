@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `AuthStorageOptions.credentialRankingMode` (`balanced` (default) | `earliest-reset`) for multi-account OAuth credential selection. `earliest-reset` ranks non-blocked credentials earliest-expiry-first — draining the soonest-to-reset account before its perishable tumbling-window quota (e.g. Claude 5h/7d) is lost at reset — keeping the existing drain-rate/used-fraction metrics as tiebreakers. `balanced` is byte-identical to prior behavior, and ranking only runs at session start (or when the session's preferred credential is blocked), so this never thrashes accounts mid-session.
+
+### Fixed
+
+- Allowed `openai-codex-responses` custom backends to use opaque `apiKey` bearer tokens by omitting `chatgpt-account-id` when the token does not expose a Codex account id.
+- Fixed OpenAI code websocket continuations to treat codex-lb's `codex_previous_response_stale` response failures as expired `previous_response_id` anchors and retry with full context instead of surfacing the transient failure.
+
+## [0.5.2] - 2026-06-15
+
+### Changed
+
+- Changed the Anthropic provider's default prompt-cache retention to `long` (`ttl: "1h"`) when a request and model omit `cacheRetention`. The previous default (~5m) was too fragile for long-running Codex/Gajae-Code subagent workflows, where the cached prefix was frequently evicted between turns. The 1h `ttl` marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and models without that capability still fall back to the default ephemeral breakpoint (Anthropic services it at ~5m). Explicit request/model `cacheRetention` and the `GJC_CACHE_RETENTION`/`PI_CACHE_RETENTION` env overrides continue to win, and `resolveCacheRetention` now accepts a `fallback` argument (defaulting to `"short"`) so non-Anthropic providers are unaffected.
+
 ## [0.5.1] - 2026-06-14
 
 ### Fixed

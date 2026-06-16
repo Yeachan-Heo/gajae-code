@@ -19,6 +19,8 @@ use pi_shell::{
 };
 
 use crate::task;
+const SHELL_CALLBACK_QUEUE_CAPACITY: usize = 1024;
+const SHELL_LOSS_MARKER_PREFIX: &str = "\n[Shell output truncated: ";
 
 /// N-API opt-in handle for the minimizer.
 #[napi(object)]
@@ -272,6 +274,10 @@ pub fn execute_shell<'env>(
 	})
 }
 
+fn shell_loss_marker(dropped_chunks: usize, dropped_bytes: usize) -> String {
+	format!("{SHELL_LOSS_MARKER_PREFIX}{dropped_chunks} chunks / {dropped_bytes} bytes dropped]\n")
+}
+
 fn bridge_chunks(
 	on_chunk: Option<ThreadsafeFunction<String>>,
 ) -> (Option<mpsc::UnboundedSender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
@@ -279,10 +285,48 @@ fn bridge_chunks(
 		return (None, None);
 	};
 	let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+	let (bounded_tx, mut bounded_rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);
 	let handle = napi::tokio::spawn(async move {
-		while let Some(chunk) = rx.recv().await {
-			on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+		let forwarder = napi::tokio::spawn(async move {
+			let mut dropped_chunks = 0usize;
+			let mut dropped_bytes = 0usize;
+			// The upstream pi_shell sender is unbounded; this bridge re-bounds it and
+			// marks dropped output at the N-API callback boundary instead of silently
+			// losing it, so truncation is always observable to the caller.
+			while let Some(chunk) = rx.recv().await {
+				if dropped_chunks > 0 {
+					match bounded_tx.try_send(shell_loss_marker(dropped_chunks, dropped_bytes)) {
+						Ok(()) => {
+							dropped_chunks = 0;
+							dropped_bytes = 0;
+						},
+						Err(mpsc::error::TrySendError::Full(_)) => {},
+						Err(mpsc::error::TrySendError::Closed(_)) => break,
+					}
+				}
+				let chunk_len = chunk.len();
+				match bounded_tx.try_send(chunk) {
+					Ok(()) => {},
+					Err(mpsc::error::TrySendError::Full(_)) => {
+						dropped_chunks = dropped_chunks.saturating_add(1);
+						dropped_bytes = dropped_bytes.saturating_add(chunk_len);
+					},
+					Err(mpsc::error::TrySendError::Closed(_)) => break,
+				}
+			}
+			if dropped_chunks > 0 {
+				let _ = bounded_tx
+					.send(shell_loss_marker(dropped_chunks, dropped_bytes))
+					.await;
+			}
+		});
+		while let Some(chunk) = bounded_rx.recv().await {
+			if on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking) != napi::Status::Ok {
+				forwarder.abort();
+				break;
+			}
 		}
+		let _ = forwarder.await;
 	});
 	(Some(tx), Some(handle))
 }
@@ -321,9 +365,11 @@ mod tests {
 		ShellRunOptions as CoreShellRunOptions,
 		cancel::{AbortReason, CancelToken},
 	};
-	use tokio::{sync::mpsc, time};
+	use tokio::{sync::mpsc, task::yield_now, time};
 
-	use super::CoreShell;
+	use super::{
+		CoreShell, SHELL_CALLBACK_QUEUE_CAPACITY, SHELL_LOSS_MARKER_PREFIX, shell_loss_marker,
+	};
 
 	mod child_session_action_tests {
 		use pi_shell::{ChildSessionAction, child_session_action};
@@ -432,5 +478,34 @@ mod tests {
 			.expect("shell task should not panic")
 			.expect("shell run should return");
 		assert!(result.cancelled);
+	}
+
+	#[tokio::test]
+	async fn final_shell_loss_marker_is_delivered_when_callback_queue_is_full() {
+		let (tx, mut rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);
+		for i in 0..SHELL_CALLBACK_QUEUE_CAPACITY {
+			tx.try_send(format!("chunk-{i}"))
+				.expect("queue fill should succeed");
+		}
+		let final_sender = tokio::spawn(async move {
+			tx.send(shell_loss_marker(1, "dropped-tail".len()))
+				.await
+				.expect("receiver should remain open");
+		});
+
+		yield_now().await;
+		assert!(!final_sender.is_finished(), "final marker send should wait for capacity");
+
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+			if output.contains(SHELL_LOSS_MARKER_PREFIX) {
+				break;
+			}
+		}
+		final_sender.await.expect("final sender should not panic");
+
+		assert!(output.contains(SHELL_LOSS_MARKER_PREFIX));
+		assert!(output.contains("1 chunks / 12 bytes dropped"));
 	}
 }

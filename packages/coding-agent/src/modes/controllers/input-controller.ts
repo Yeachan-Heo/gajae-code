@@ -887,6 +887,11 @@ export class InputController {
 		this.ctx.session.agent.hideThinkingSummary = this.ctx.hideThinkingBlock;
 
 		// Rebuild chat from session messages
+		// Detach the live streaming component before the disposing clear() so the
+		// component we re-add below is not torn down (detach != dispose).
+		if (this.ctx.streamingComponent) {
+			this.ctx.chatContainer.detachChild(this.ctx.streamingComponent);
+		}
 		this.ctx.chatContainer.clear();
 		this.ctx.rebuildChatFromMessages();
 

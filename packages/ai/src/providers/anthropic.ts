@@ -353,10 +353,19 @@ function getCacheControl(
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
 ): { retention: CacheRetention; cacheControl?: AnthropicCacheControl } {
-	const retention = resolveCacheRetention(cacheRetention);
+	// Default Anthropic prompt caching to long (1h) retention. The provider
+	// default of ~5m is too fragile for long-running Codex/Gajae-Code subagent
+	// workflows, where the prefix is frequently evicted between turns. Explicit
+	// request/model `cacheRetention` and the GJC_CACHE_RETENTION /
+	// PI_CACHE_RETENTION env overrides still win.
+	const retention = resolveCacheRetention(cacheRetention, "long");
 	if (retention === "none") {
 		return { retention };
 	}
+	// `ttl: "1h"` is only honoured on the canonical Anthropic API for models
+	// that advertise long-cache support. Everywhere else (proxies, gateways,
+	// models without the capability) we fall back to the default ephemeral
+	// breakpoint, which Anthropic services at the standard ~5m TTL.
 	const ttl =
 		retention === "long" && isAnthropicApiBaseUrl(baseUrl) && getAnthropicCompat(model).supportsLongCacheRetention
 			? "1h"

@@ -1,6 +1,9 @@
-import { logger, ptree } from "@gajae-code/utils";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import { logger } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
+import { type OwnedProcess, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError } from "../tools/tool-errors";
 import type {
 	DapCapabilities,
@@ -69,10 +72,21 @@ function toErrorMessage(value: unknown): string {
 	return String(value);
 }
 
+async function drainReadable(readable: ReadableStream<Uint8Array>): Promise<void> {
+	const reader = readable.getReader();
+	try {
+		while (!(await reader.read()).done) {}
+	} catch {
+		/* drain best-effort */
+	} finally {
+		reader.releaseLock();
+	}
+}
 export class DapClient {
 	readonly adapter: DapResolvedAdapter;
 	readonly cwd: string;
 	readonly proc: DapClientState["proc"];
+	readonly #owner: OwnedProcess;
 	/** ReadableStream of DAP bytes — from proc.stdout (stdio) or a socket (socket mode). */
 	readonly #readable: ReadableStream<Uint8Array>;
 	/** Write sink — proc.stdin (stdio) or a socket (socket mode). */
@@ -93,14 +107,15 @@ export class DapClient {
 	constructor(
 		adapter: DapResolvedAdapter,
 		cwd: string,
-		proc: DapClientState["proc"],
+		owner: OwnedProcess,
 		options?: { readable?: ReadableStream<Uint8Array>; writeSink?: DapWriteSink; socket?: { end(): void } },
 	) {
 		this.adapter = adapter;
 		this.cwd = cwd;
-		this.proc = proc;
-		this.#readable = options?.readable ?? (proc.stdout as ReadableStream<Uint8Array>);
-		this.#writeSink = options?.writeSink ?? proc.stdin;
+		this.proc = owner.child as DapClientState["proc"];
+		this.#owner = owner;
+		this.#readable = options?.readable ?? (this.proc.stdout as ReadableStream<Uint8Array>);
+		this.#writeSink = options?.writeSink ?? this.proc.stdin;
 		this.#socket = options?.socket;
 	}
 
@@ -116,13 +131,14 @@ export class DapClient {
 			...Bun.env,
 			...NON_INTERACTIVE_ENV,
 		};
-		const proc = ptree.spawn([adapter.resolvedCommand, ...adapter.args], {
+		const owner = spawnOwnedProcess([adapter.resolvedCommand, ...adapter.args], {
 			cwd,
 			stdin: "pipe",
 			env,
-			detached: true,
+			name: `dap:${adapter.name}`,
 		});
-		const client = new DapClient(adapter, cwd, proc);
+		const client = new DapClient(adapter, cwd, owner);
+		const proc = owner.child as DapClientState["proc"];
 		proc.exited.then(() => {
 			client.#handleProcessExit();
 		});
@@ -159,32 +175,40 @@ export class DapClient {
 		env: Record<string, string | undefined>;
 	}): Promise<DapClient> {
 		const socketPath = `/tmp/dap-${adapter.name}-${Date.now()}-${Math.random().toString(36).slice(2)}.sock`;
-		const proc = ptree.spawn([adapter.resolvedCommand, ...adapter.args, `--listen=unix:${socketPath}`], {
+		const owner = spawnOwnedProcess([adapter.resolvedCommand, ...adapter.args, `--listen=unix:${socketPath}`], {
 			cwd,
 			stdin: "pipe",
 			env,
-			detached: true,
+			name: `dap:${adapter.name}:unix-socket`,
 		});
+		const proc = owner.child as DapClientState["proc"];
+		void drainReadable(proc.stdout);
+		let transport: SocketTransport | undefined;
 
-		// Wait for the socket file to appear (dlv needs to start listening)
-		await waitForCondition(
-			() => {
-				try {
-					Bun.file(socketPath).size;
-					return true;
-				} catch {
-					return false;
-				}
-			},
-			10_000,
-			proc,
-		);
+		try {
+			// Wait for the socket file to appear (dlv needs to start listening)
+			await waitForCondition(
+				// `Bun.file(path).size` returns 0 for a missing file instead of
+				// throwing, so it can't gate socket readiness. Use an existence
+				// check so the adapter has actually created the listener socket.
+				() => existsSync(socketPath),
+				10_000,
+				proc,
+			);
 
-		const { readable, writeSink, socket } = await connectSocket({ unix: socketPath });
-		const client = new DapClient(adapter, cwd, proc, { readable, writeSink, socket });
-		proc.exited.then(() => client.#handleProcessExit());
-		void client.#startMessageReader();
-		return client;
+			transport = await connectSocket({ unix: socketPath }, 10_000);
+			const client = new DapClient(adapter, cwd, owner, transport);
+			proc.exited.then(() => client.#handleProcessExit());
+			void client.#startMessageReader();
+			return client;
+		} catch (err) {
+			transport?.socket.end();
+			await owner.dispose();
+			await owner.awaitExit({ timeoutMs: 1_000 });
+			throw err;
+		} finally {
+			await fs.unlink(socketPath).catch(() => undefined);
+		}
 	}
 
 	/** macOS/other: listen on a random TCP port, spawn adapter with --client-addr, accept connection. */
@@ -214,12 +238,14 @@ export class DapClient {
 		});
 
 		const port = server.port;
-		const proc = ptree.spawn([adapter.resolvedCommand, ...adapter.args, `--client-addr=127.0.0.1:${port}`], {
+		const owner = spawnOwnedProcess([adapter.resolvedCommand, ...adapter.args, `--client-addr=127.0.0.1:${port}`], {
 			cwd,
 			stdin: "pipe",
 			env,
-			detached: true,
+			name: `dap:${adapter.name}:client-addr`,
 		});
+		const proc = owner.child as DapClientState["proc"];
+		void drainReadable(proc.stdout);
 
 		// Wait for dlv to connect (with timeout)
 		let rawSocket: Bun.Socket<undefined>;
@@ -230,13 +256,17 @@ export class DapClient {
 		);
 		try {
 			rawSocket = await Promise.race([connPromise, timeoutPromise]);
+		} catch (err) {
+			await owner.dispose();
+			await owner.awaitExit({ timeoutMs: 1_000 });
+			throw err;
 		} finally {
 			clearTimeout(connectTimeout);
 			server.stop();
 		}
 
 		const { readable, writeSink, socket } = wrapBunSocket(rawSocket);
-		const client = new DapClient(adapter, cwd, proc, { readable, writeSink, socket });
+		const client = new DapClient(adapter, cwd, owner, { readable, writeSink, socket });
 		proc.exited.then(() => client.#handleProcessExit());
 		void client.#startMessageReader();
 		return client;
@@ -414,14 +444,14 @@ export class DapClient {
 			/* socket may already be closed */
 		}
 		try {
-			this.proc.kill();
+			await this.#owner.dispose();
+			await this.#owner.awaitExit({ timeoutMs: 1_000 });
 		} catch (error) {
-			logger.debug("Failed to kill DAP adapter", {
+			logger.debug("Failed to dispose DAP adapter", {
 				adapter: this.adapter.name,
 				error: toErrorMessage(error),
 			});
 		}
-		await this.proc.exited.catch(() => {});
 	}
 
 	async #startMessageReader(): Promise<void> {
@@ -604,8 +634,8 @@ function socketToSink(socket: Bun.Socket<undefined>): DapWriteSink {
 }
 
 /** Connect to a unix domain socket and return DAP transport streams. */
-async function connectSocket(options: { unix: string }): Promise<SocketTransport> {
-	const { promise, resolve } = Promise.withResolvers<SocketTransport>();
+async function connectSocket(options: { unix: string }, timeoutMs = 10_000): Promise<SocketTransport> {
+	const { promise, resolve, reject } = Promise.withResolvers<SocketTransport>();
 	let streamController: ReadableStreamDefaultController<Uint8Array>;
 
 	const readable = new ReadableStream<Uint8Array>({
@@ -614,35 +644,46 @@ async function connectSocket(options: { unix: string }): Promise<SocketTransport
 		},
 	});
 
-	Bun.connect({
-		unix: options.unix,
-		socket: {
-			open(socket) {
-				resolve({
-					readable,
-					writeSink: socketToSink(socket),
-					socket,
-				});
+	const timeout = setTimeout(() => reject(new Error(`Socket connect timed out after ${timeoutMs}ms`)), timeoutMs);
+	let settled = false;
+	const settle = (fn: () => void) => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		fn();
+	};
+	try {
+		const socketPromise = Bun.connect({
+			unix: options.unix,
+			socket: {
+				open(socket) {
+					settle(() =>
+						resolve({
+							readable,
+							writeSink: socketToSink(socket),
+							socket,
+						}),
+					);
+				},
+				data(_socket, data) {
+					streamController.enqueue(new Uint8Array(data));
+				},
+				close() {
+					try {
+						streamController.close();
+					} catch {
+						/* already closed */
+					}
+				},
+				error(_socket, err) {
+					settle(() => reject(err));
+				},
 			},
-			data(_socket, data) {
-				streamController.enqueue(new Uint8Array(data));
-			},
-			close() {
-				try {
-					streamController.close();
-				} catch {
-					/* already closed */
-				}
-			},
-			error(_socket, err) {
-				try {
-					streamController.error(err);
-				} catch {
-					/* already closed */
-				}
-			},
-		},
-	});
+		});
+		void socketPromise.catch(err => settle(() => reject(err)));
+	} catch (err) {
+		settle(() => reject(err));
+	}
 
 	return promise;
 }

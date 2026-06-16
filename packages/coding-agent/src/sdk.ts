@@ -52,6 +52,7 @@ import { resolveConfigValue } from "./config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "./defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
+import { disposeAllVmContexts, disposeVmContextsByOwner } from "./eval/js/context-manager";
 import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
 import { TtsrManager } from "./export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "./extensibility/custom-commands";
@@ -414,6 +415,7 @@ function getDefaultAgentDir(): string {
  */
 export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir()): Promise<AuthStorage> {
 	const brokerConfig = await resolveAuthBrokerConfig();
+	const credentialRankingMode = resolveCredentialRankingMode();
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
@@ -424,6 +426,7 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 		const storage = new AuthStorage(store, {
 			configValueResolver: resolveConfigValue,
 			sourceLabel: `broker ${brokerConfig.url}`,
+			credentialRankingMode,
 		});
 		await storage.reload();
 		return storage;
@@ -432,9 +435,23 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 	const storage = await AuthStorage.create(dbPath, {
 		configValueResolver: resolveConfigValue,
 		sourceLabel: `local ${dbPath}`,
+		credentialRankingMode,
 	});
 	await storage.reload();
 	return storage;
+}
+
+/**
+ * Opt-in multi-account credential ranking mode, read from the
+ * `GJC_CREDENTIAL_RANKING_MODE` env var. Unset/unknown → `undefined`, leaving
+ * {@link AuthStorage}'s default (`balanced`) untouched. `earliest-reset`
+ * switches to earliest-expiry-first selection so soon-to-reset tumbling-window
+ * quota is drained before it is lost.
+ */
+function resolveCredentialRankingMode(): "balanced" | "earliest-reset" | undefined {
+	const raw = process.env.GJC_CREDENTIAL_RANKING_MODE?.trim();
+	if (raw === "balanced" || raw === "earliest-reset") return raw;
+	return undefined;
 }
 
 /**
@@ -568,6 +585,14 @@ function registerPythonCleanup(): void {
 	if (pythonCleanupRegistered) return;
 	pythonCleanupRegistered = true;
 	postmortem.register("python-cleanup", disposeAllKernelSessions);
+}
+
+let jsVmCleanupRegistered = false;
+
+function registerJsVmCleanup(): void {
+	if (jsVmCleanupRegistered) return;
+	jsVmCleanupRegistered = true;
+	postmortem.register("js-vm-cleanup", disposeAllVmContexts);
 }
 
 /**
@@ -806,6 +831,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	registerSshCleanup();
 	registerPythonCleanup();
+	registerJsVmCleanup();
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
@@ -2200,6 +2226,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
+				await disposeVmContextsByOwner(evalKernelOwnerId);
 			}
 		} catch (cleanupError) {
 			logger.warn("Failed to clean up createAgentSession resources after startup error", {

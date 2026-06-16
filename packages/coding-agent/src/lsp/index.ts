@@ -19,6 +19,7 @@ import {
 	sendNotification,
 	sendRequest,
 	setIdleTimeout,
+	shutdownClient,
 	syncContent,
 	WARMUP_TIMEOUT_MS,
 	waitForProjectLoaded,
@@ -400,7 +401,7 @@ async function reloadServer(client: LspClient, serverName: string, signal?: Abor
 		}
 	}
 	if (output.startsWith("Restarted")) {
-		client.proc.kill();
+		await shutdownClient(client.name);
 	}
 	return output;
 }

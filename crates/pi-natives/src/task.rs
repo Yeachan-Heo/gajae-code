@@ -27,7 +27,10 @@
 //! }
 //! ```
 
-use std::future::Future;
+use std::{
+	future::Future,
+	panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use napi::{Env, Error, Result, Task, bindgen_prelude::*};
 use pi_shell::cancel as core_cancel;
@@ -88,9 +91,21 @@ impl CancelToken {
 	/// Create a new cancel token from optional timeout and abort signal.
 	pub fn new(timeout_ms: Option<u32>, signal: Option<Unknown>) -> Self {
 		let mut result = Self { core: core_cancel::CancelToken::new(timeout_ms) };
-		if let Some(signal) = signal.and_then(|value| AbortSignal::from_unknown(value).ok()) {
+		if let Some(signal) = signal {
+			let object = Object::from_raw(signal.value().env, signal.value().value);
+			let aborted = object
+				.get_named_property::<bool>("aborted")
+				.unwrap_or(false);
 			let abort_token = result.emplace_abort_token();
-			signal.on_abort(move || abort_token.abort(AbortReason::Signal));
+			if let Ok(signal) = AbortSignal::from_unknown(signal) {
+				if aborted {
+					abort_token.abort(AbortReason::Signal);
+				} else {
+					signal.on_abort(move || abort_token.abort(AbortReason::Signal));
+				}
+			} else {
+				abort_token.abort(AbortReason::Unknown);
+			}
 		}
 		result
 	}
@@ -168,15 +183,32 @@ where
 
 	fn compute(&mut self) -> Result<Self::Output> {
 		let _guard = profile_region(self.tag);
+		self.cancel_token.heartbeat()?;
 		let work = self
 			.work
 			.take()
 			.ok_or_else(|| Error::from_reason("BlockingTask: work already consumed"))?;
-		work(self.cancel_token.clone())
+		match catch_unwind(AssertUnwindSafe(|| work(self.cancel_token.clone()))) {
+			Ok(result) => result,
+			Err(payload) => Err(Error::from_reason(format!(
+				"BlockingTask panic: {}",
+				panic_payload_message(payload.as_ref())
+			))),
+		}
 	}
 
 	fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
 		Ok(output)
+	}
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(message) = payload.downcast_ref::<&str>() {
+		(*message).to_owned()
+	} else if let Some(message) = payload.downcast_ref::<String>() {
+		message.clone()
+	} else {
+		"unknown panic payload".to_owned()
 	}
 }
 
@@ -255,4 +287,135 @@ where
 		let _guard = profile_region(tag);
 		work.await
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	};
+
+	use napi::Task;
+
+	use super::*;
+
+	#[test]
+	fn blocking_compute_catches_non_string_panic_as_error() {
+		let mut task = Blocking {
+			tag:          "test_non_string_panic",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| -> Result<String> { std::panic::panic_any(42) })),
+		};
+
+		let result = task.compute();
+
+		let err = result.expect_err("non-string panic should be converted into a napi error");
+		assert!(
+			err.reason.contains("BlockingTask panic"),
+			"panic should be converted to a napi error, got: {}",
+			err.reason
+		);
+		assert!(
+			err.reason.contains("unknown panic payload"),
+			"non-string panic payload should be reported without unwinding, got: {}",
+			err.reason
+		);
+	}
+
+	#[test]
+	fn blocking_compute_catches_panic_as_error() {
+		let mut task = Blocking {
+			tag:          "test_panic",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
+		};
+
+		let result = task.compute();
+
+		let err = result.expect_err("panic should be converted into a napi error");
+		assert!(
+			err.reason.contains("native boom"),
+			"panic payload should be preserved, got: {}",
+			err.reason
+		);
+	}
+
+	#[test]
+	fn blocking_compute_catches_string_panic_payload_as_error() {
+		let mut task = Blocking {
+			tag:          "test_string_panic",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| -> Result<String> {
+				std::panic::panic_any(String::from("owned native boom"))
+			})),
+		};
+
+		let result = task.compute();
+
+		let err = result.expect_err("String panic should be converted into a napi error");
+		assert!(
+			err.reason.contains("owned native boom"),
+			"String panic payload should be preserved, got: {}",
+			err.reason
+		);
+	}
+
+	#[test]
+	fn blocking_compute_rejects_pre_cancelled_token_without_running_work() {
+		let mut cancel_token = CancelToken::default();
+		let abort_token = cancel_token.emplace_abort_token();
+		abort_token.abort(AbortReason::User);
+		let work_ran = Arc::new(AtomicBool::new(false));
+		let work_ran_in_task = Arc::clone(&work_ran);
+		let mut task = Blocking {
+			tag: "test_cancelled",
+			cancel_token,
+			work: Some(Box::new(move |_| -> Result<String> {
+				work_ran_in_task.store(true, Ordering::SeqCst);
+				Ok("ran".to_owned())
+			})),
+		};
+
+		let result = task.compute();
+
+		let err = result.expect_err("pre-cancelled task should return cancellation error");
+		assert!(
+			err.reason.contains("Aborted: User"),
+			"cancellation reason should be preserved, got: {}",
+			err.reason
+		);
+		assert!(!work_ran.load(Ordering::SeqCst), "work closure must not run after pre-cancellation");
+	}
+
+	#[test]
+	fn blocking_compute_observes_token_cancelled_by_heartbeat_mid_work() {
+		let mut cancel_token = CancelToken::default();
+		let abort_token = cancel_token.emplace_abort_token();
+		let work_started = Arc::new(AtomicBool::new(false));
+		let work_started_in_task = Arc::clone(&work_started);
+		let mut task = Blocking {
+			tag: "test_mid_work_cancelled",
+			cancel_token,
+			work: Some(Box::new(move |token| -> Result<String> {
+				work_started_in_task.store(true, Ordering::SeqCst);
+				abort_token.abort(AbortReason::User);
+				token.heartbeat()?;
+				Ok("missed cancellation".to_owned())
+			})),
+		};
+
+		let result = task.compute();
+
+		let err = result.expect_err("heartbeat should observe mid-work cancellation");
+		assert!(
+			work_started.load(Ordering::SeqCst),
+			"work closure should start before mid-work cancellation"
+		);
+		assert!(
+			err.reason.contains("Aborted: User"),
+			"heartbeat cancellation reason should be preserved, got: {}",
+			err.reason
+		);
+	}
 }

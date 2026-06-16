@@ -32,6 +32,8 @@ export interface BashExecutorOptions {
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/** Execute without retaining a native Shell in the persistent session registry. */
+	oneShot?: boolean;
 	/**
 	 * Invoked when the native minimizer rewrote the command's output, giving
 	 * the caller a chance to persist the lossless original capture (typically
@@ -59,6 +61,8 @@ export interface BashResult {
 
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
+const retiringShellSessions = new Set<Shell>();
+const CANCEL_CLEANUP_WAIT_MS = 250;
 
 /** Number of persistent shell sessions currently retained (owner gauge). */
 export function getShellSessionCount(): number {
@@ -76,10 +80,14 @@ export async function disposeAllShellSessions(): Promise<void> {
 	// Snapshot and drop strong references up front so concurrent callers cannot
 	// reuse a session that is being torn down, then await every native abort so
 	// shutdown/signal cleanup does not return before resources are released.
-	const sessions = [...shellSessions.values()];
+	// Include retiring shells whose JS call returned after bounded abort cleanup
+	// while the native run is still unwinding; they are no longer reusable but
+	// remain owned until their run promise settles.
+	const sessions = new Set([...shellSessions.values(), ...retiringShellSessions]);
 	shellSessions.clear();
+	retiringShellSessions.clear();
 	brokenShellSessions.clear();
-	await Promise.allSettled(sessions.map(session => session.abort()));
+	await Promise.allSettled([...sessions].map(session => session.abort()));
 }
 
 postmortem.register("bash-executor:shell-sessions", () => disposeAllShellSessions());
@@ -151,14 +159,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 	}
 
+	const usePersistentShell = options?.oneShot !== true;
 	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
-	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
-	if (persistentSessionBroken) {
-		shellSessions.delete(sessionKey);
-	}
+	const persistentSessionBroken = usePersistentShell && brokenShellSessions.has(sessionKey);
 
-	let shellSession = persistentSessionBroken ? undefined : shellSessions.get(sessionKey);
-	if (!shellSession && !persistentSessionBroken) {
+	let shellSession = persistentSessionBroken || !usePersistentShell ? undefined : shellSessions.get(sessionKey);
+	if (!shellSession && !persistentSessionBroken && usePersistentShell) {
 		shellSession = new Shell({
 			sessionEnv: shellEnv,
 			snapshotPath: snapshotPath ?? undefined,
@@ -172,15 +178,28 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		if (!runAbortController.signal.aborted) {
 			runAbortController.abort();
 		}
-		if (shellSession) {
-			// Native abort is async; fire-and-forget because the caller races the command separately.
-			void shellSession.abort();
+		if (shellSession && !abortPromise) {
+			abortPromise = shellSession.abort();
 		}
 	};
 	const abortDeferred = Promise.withResolvers<"abort">();
+	let abortPromise: Promise<unknown> | undefined;
 	const abortHandler = () => {
 		abortCurrentExecution();
 		abortDeferred.resolve("abort");
+	};
+	const awaitAbortCleanup = async (runPromise: Promise<unknown>): Promise<boolean> => {
+		const settled = await Promise.race([
+			runPromise.then(
+				() => true,
+				() => true,
+			),
+			Bun.sleep(CANCEL_CLEANUP_WAIT_MS).then(() => false),
+		]);
+		if (abortPromise) {
+			await Promise.race([abortPromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
+		}
+		return settled;
 	};
 	if (userSignal) {
 		userSignal.addEventListener("abort", abortHandler, { once: true });
@@ -198,6 +217,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 
 	let resetSession = false;
+	let runSettled = false;
 
 	try {
 		const runPromise = shellSession
@@ -243,8 +263,24 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			acceptingChunks = false;
 			if (shellSession) {
 				resetSession = true;
+				retiringShellSessions.add(shellSession);
 				brokenShellSessions.add(sessionKey);
-				void runPromise.finally(() => brokenShellSessions.delete(sessionKey)).catch(() => undefined);
+				shellSessions.delete(sessionKey);
+				runSettled = await awaitAbortCleanup(runPromise);
+				if (runSettled) {
+					brokenShellSessions.delete(sessionKey);
+					retiringShellSessions.delete(shellSession);
+				} else {
+					void runPromise
+						.finally(() => {
+							brokenShellSessions.delete(sessionKey);
+							retiringShellSessions.delete(shellSession);
+							if (shellSessions.get(sessionKey) === shellSession) {
+								shellSessions.delete(sessionKey);
+							}
+						})
+						.catch(() => undefined);
+				}
 			} else {
 				void runPromise.catch(() => undefined);
 			}
@@ -337,7 +373,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		if (userSignal) {
 			userSignal.removeEventListener("abort", abortHandler);
 		}
-		if (resetSession) {
+		if (resetSession && runSettled && shellSessions.get(sessionKey) === shellSession) {
 			shellSessions.delete(sessionKey);
 		}
 	}

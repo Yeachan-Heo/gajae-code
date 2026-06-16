@@ -10,6 +10,7 @@ export interface JsExecutorOptions {
 	onChunk?: (chunk: string) => Promise<void> | void;
 	signal?: AbortSignal;
 	sessionId: string;
+	ownerId?: string;
 	reset?: boolean;
 	sessionFile?: string;
 	artifactPath?: string;
@@ -68,6 +69,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		await executeInVmContext({
 			sessionKey: options.sessionId,
 			sessionId: options.sessionId,
+			ownerId: options.ownerId,
 			cwd: options.cwd ?? options.session.cwd,
 			session: options.session,
 			reset: options.reset,

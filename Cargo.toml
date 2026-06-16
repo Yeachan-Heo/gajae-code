@@ -4,7 +4,7 @@ exclude = ["crates/brush-core-vendored", "crates/brush-builtins-vendored"]
 resolver = "3"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 authors = ["Yeachan-Heo"]
@@ -24,6 +24,11 @@ panic = "abort"
 
 [profile.ci]
 inherits = "release"
+# Override release's panic = "abort": the pi-natives blocking-task catch_unwind
+# guard (crates/pi-natives/src/task.rs) only converts panics to napi::Error when
+# the shipped profile unwinds. `panic` is a profile-root-only setting and cannot
+# be scoped per-package, so it is set on every profile build-native.ts ships.
+panic = "unwind"
 lto = "thin"
 codegen-units = 16
 debug = "line-tables-only"
@@ -32,6 +37,7 @@ split-debuginfo = "off"
 
 [profile.local]
 inherits = "release"
+panic = "unwind" # keep the pi-natives catch_unwind guard effective (see [profile.ci])
 lto = "thin"
 codegen-units = 16
 incremental = true

@@ -265,9 +265,9 @@ dependencies = [
 
 [[package]]
 name = "bon"
-version = "3.9.2"
+version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2f04f6fef12d70d42a77b1433c9e0f065238479a6cefc4f5bab105e9873a3c3"
+checksum = "a602c73c7b0148ec6d12af6fd5cc7a46e2eacc8878271a999abac56eed12f561"
 dependencies = [
  "bon-macros",
  "rustversion",
@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "bon-macros"
-version = "3.9.2"
+version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d0bd4c2f75335ad98052a37efb54f428b492f64340257143b3429c8a508fa7b"
+checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
  "darling 0.23.0",
  "ident_case",
@@ -1825,9 +1825,9 @@ dependencies = [
 
 [[package]]
 name = "napi"
-version = "3.9.1"
+version = "3.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad513ff22558f1830b595ea6eb4091da48145d09a222ce157e781896f78be0b9"
+checksum = "26d3c7dd60231116a47854321c9ac8df6f13435d11aa3a59d8533a76e07a3730"
 dependencies = [
  "bitflags 2.13.0",
  "ctor",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "brush-builtins",

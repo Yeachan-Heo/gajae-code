@@ -408,6 +408,33 @@ describe("openai-codex streaming", () => {
 		expect(Object.keys(capturedHeaders ?? {}).filter(key => key.toLowerCase() === "openai-beta")).toHaveLength(1);
 	});
 
+	it("passes opaque apiKey tokens through to custom Codex-compatible backends", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = "sk-custom-proxy-test";
+		const sse = createCompletedCodexSse("Hello proxy");
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Headers | undefined;
+		global.fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			capturedUrl = typeof input === "string" ? input : input.toString();
+			capturedHeaders = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("http://127.0.0.1:2455/backend-api/codex"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: token },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(capturedUrl).toBe("http://127.0.0.1:2455/backend-api/codex/responses");
+		expect(capturedHeaders?.get("Authorization")).toBe(`Bearer ${token}`);
+		expect(capturedHeaders?.has("chatgpt-account-id")).toBe(false);
+		expect(capturedHeaders?.get("OpenAI-Beta")).toBe("responses=experimental");
+	});
+
 	it("streams SSE responses into AssistantMessageEventStream", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -1682,6 +1709,108 @@ describe("openai-codex streaming", () => {
 			lastDeltaInputItems: undefined,
 			lastPreviousResponseId: undefined,
 		});
+	});
+
+	it("retries websocket continuations when codex-lb masks stale previous_response_id", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-lb-stale-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class MaskedPreviousResponseMissingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "response.failed",
+						response: {
+							id: "resp_masked_failure",
+							status: "failed",
+							error: {
+								type: "server_error",
+								code: "codex_previous_response_stale",
+								message: "Upstream previous response anchor expired; retry without previous_response_id.",
+							},
+						},
+					});
+					return;
+				}
+
+				if (requestIndex === 3) {
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_3",
+						responseId: "resp_3",
+						text: "Second answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = MaskedPreviousResponseMissingWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "ws-masked-expired-previous-response-session",
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "ws-masked-expired-previous-response-session",
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		const retryInput = sentRequests[2]?.input;
+		expect(Array.isArray(retryInput)).toBe(true);
+		expect(JSON.stringify(retryInput)).toContain("First question");
+		expect(JSON.stringify(retryInput)).toContain("Second question");
 	});
 
 	it("uses low Codex text verbosity by default while preserving explicit overrides", async () => {

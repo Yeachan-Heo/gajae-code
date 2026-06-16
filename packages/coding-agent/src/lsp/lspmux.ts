@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, $which, logger } from "@gajae-code/utils";
 import { TOML } from "bun";
+import { spawnOwnedProcess } from "../runtime/process-lifecycle";
 
 /**
  * lspmux integration for LSP server multiplexing.
@@ -101,19 +102,24 @@ async function parseConfig(): Promise<LspmuxConfig | null> {
  */
 async function checkServerRunning(binaryPath: string): Promise<boolean> {
 	try {
-		const proc = Bun.spawn([binaryPath, "status"], {
-			stdout: "pipe",
-			stderr: "pipe",
-			windowsHide: true,
+		const owner = spawnOwnedProcess([binaryPath, "status"], {
+			stdin: "ignore",
+			name: "lspmux:status",
 		});
+		const proc = owner.child;
+		drainStream(proc.stdout);
+		drainStream(proc.stderr);
 
-		const exited = await Promise.race([
-			proc.exited,
-			new Promise<null>(resolve => setTimeout(() => resolve(null), LIVENESS_TIMEOUT_MS)),
-		]);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<null>(resolve => {
+			timer = setTimeout(() => resolve(null), LIVENESS_TIMEOUT_MS);
+		});
+		const exited = await Promise.race([proc.exited, timeout]);
+		if (timer) clearTimeout(timer);
 
 		if (exited === null) {
-			proc.kill();
+			await owner.dispose();
+			await owner.awaitExit({ timeoutMs: 1_000 });
 			return false;
 		}
 
@@ -121,6 +127,24 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+function drainStream(stream: ReadableStream<Uint8Array> | null | undefined): void {
+	if (!stream) return;
+	void (async () => {
+		try {
+			const reader = stream.getReader();
+			try {
+				while (!(await reader.read()).done) {
+					// drain only
+				}
+			} finally {
+				reader.releaseLock();
+			}
+		} catch {
+			// Process stream closed or already consumed.
+		}
+	})();
 }
 
 /**

@@ -1,5 +1,6 @@
-import { isEnoent, logger, ptree, untilAborted } from "@gajae-code/utils";
+import { isEnoent, logger, untilAborted } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
+import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
@@ -19,8 +20,10 @@ import { detectLanguageId, fileToUri } from "./utils";
 // =============================================================================
 
 const clients = new Map<string, LspClient>();
+const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
 
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
@@ -65,6 +68,32 @@ export function isIdleCheckerActiveForTests(): boolean {
 	return idleCheckInterval !== null;
 }
 
+function rejectPendingRequests(client: LspClient, error: Error): void {
+	for (const pending of client.pendingRequests.values()) {
+		pending.reject(error);
+	}
+	client.pendingRequests.clear();
+}
+
+function deleteCachedClient(key: string, client: LspClient): void {
+	if (clients.get(key) === client) {
+		clients.delete(key);
+	}
+}
+
+function deleteClientLock(key: string, clientPromise: Promise<LspClient>): void {
+	if (clientLocks.get(key) === clientPromise) {
+		clientLocks.delete(key);
+	}
+}
+
+function evictDeadCachedClient(key: string, client: LspClient): void {
+	if (client.proc.exitCode === null && !client.proc.killed && !client.owner?.disposed && !killedClients.has(client))
+		return;
+	deleteCachedClient(key, client);
+	client.resolveProjectLoaded();
+	rejectPendingRequests(client, new Error("LSP server exited"));
+}
 // =============================================================================
 // Client Capabilities
 // =============================================================================
@@ -432,8 +461,11 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 	// Check if client already exists
 	const existingClient = clients.get(key);
 	if (existingClient) {
-		existingClient.lastActivity = Date.now();
-		return existingClient;
+		evictDeadCachedClient(key, existingClient);
+		if (clients.has(key)) {
+			existingClient.lastActivity = Date.now();
+			return existingClient;
+		}
 	}
 
 	// Check if another coroutine is already creating this client
@@ -443,7 +475,8 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 	}
 
 	// Create new client with lock
-	const clientPromise = (async () => {
+	let clientPromise!: Promise<LspClient>;
+	clientPromise = (async () => {
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
@@ -452,11 +485,13 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			? await getLspmuxCommand(baseCommand, baseArgs)
 			: { command: baseCommand, args: baseArgs };
 
-		const proc = ptree.spawn([command, ...args], {
+		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
 			stdin: "pipe",
 			env: env ? { ...Bun.env, ...env } : undefined,
+			name: `lsp:${config.command}`,
 		});
+		const proc = owner.child;
 
 		let resolveProjectLoaded!: () => void;
 		const projectLoaded = new Promise<void>(resolve => {
@@ -474,6 +509,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			name: key,
 			cwd,
 			proc,
+			owner,
 			config,
 			requestId: 0,
 			diagnostics: new Map(),
@@ -488,12 +524,17 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			projectLoaded,
 			resolveProjectLoaded,
 		};
+		const originalKill = proc.kill.bind(proc);
+		proc.kill = (...args: Parameters<typeof proc.kill>) => {
+			killedClients.add(client);
+			return originalKill(...args);
+		};
 		clients.set(key, client);
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(async () => {
-			clients.delete(key);
-			clientLocks.delete(key);
+			deleteCachedClient(key, client);
+			deleteClientLock(key, clientPromise);
 			client.resolveProjectLoaded();
 
 			// Reject any pending requests — the server is gone, they will never complete.
@@ -564,12 +605,12 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			return client;
 		} catch (err) {
 			// Clean up on initialization failure
-			clients.delete(key);
-			clientLocks.delete(key);
-			proc.kill();
+			deleteCachedClient(key, client);
+			deleteClientLock(key, clientPromise);
+			await shutdownClientInstance(client);
 			throw err;
 		} finally {
-			clientLocks.delete(key);
+			deleteClientLock(key, clientPromise);
 		}
 	})();
 
@@ -645,12 +686,7 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
  */
 export async function waitForProjectLoaded(client: LspClient, signal?: AbortSignal): Promise<void> {
 	if (signal?.aborted) return;
-	await Promise.race([
-		client.projectLoaded,
-		...(signal
-			? [new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))]
-			: []),
-	]);
+	await untilAborted(signal, client.projectLoaded);
 }
 
 /**
@@ -793,16 +829,12 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
  */
 async function shutdownClientInstance(client: LspClient): Promise<void> {
 	const err = new Error("LSP client shutdown");
-	for (const pending of Array.from(client.pendingRequests.values())) {
-		pending.reject(err);
-	}
-	client.pendingRequests.clear();
+	rejectPendingRequests(client, err);
 
-	const timeout = Bun.sleep(5_000);
-	const shutdown = sendRequest(client, "shutdown", null).catch(() => {});
-	await Promise.race([shutdown, timeout]);
-	client.proc.kill();
-	await Promise.race([client.proc.exited.catch(() => {}), Bun.sleep(1_000)]);
+	const shutdown = sendRequest(client, "shutdown", null, undefined, 5_000).catch(() => {});
+	await Promise.race([shutdown, Bun.sleep(5_000)]);
+	await client.owner?.dispose();
+	await client.owner?.awaitExit({ timeoutMs: 1_000 });
 }
 
 export async function shutdownClient(key: string): Promise<void> {
@@ -958,6 +990,12 @@ export function getActiveClients(): LspServerStatus[] {
 if (typeof process !== "undefined") {
 	process.on("beforeExit", () => {
 		void shutdownAll();
+	});
+	process.on("exit", () => {
+		lspCleanupOwner();
+		for (const client of clients.values()) {
+			client.proc.kill();
+		}
 	});
 	process.on("SIGINT", () => {
 		void (async () => {

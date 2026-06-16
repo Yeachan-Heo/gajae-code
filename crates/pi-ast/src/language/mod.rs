@@ -1183,7 +1183,7 @@ pub const KNOWN_LONG_TAIL_ALIASES: &[&str] = &[
 mod tests {
 	use std::path::Path;
 
-	use ast_grep_core::{Language, matcher::KindMatcher, tree_sitter::LanguageExt};
+	use ast_grep_core::{matcher::KindMatcher, tree_sitter::LanguageExt};
 
 	use super::SupportLang;
 

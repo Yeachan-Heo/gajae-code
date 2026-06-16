@@ -108,7 +108,18 @@ interface PythonSession {
 	queue: Promise<void>;
 }
 
-const sessions = new Map<string, PythonSession>();
+interface InitializingPythonSession {
+	sessionId: string;
+	promise: Promise<PythonSession>;
+}
+
+const sessions = new Map<string, PythonSession | InitializingPythonSession>();
+
+function isInitializingSession(
+	session: PythonSession | InitializingPythonSession,
+): session is InitializingPythonSession {
+	return "promise" in session;
+}
 
 // ---------------------------------------------------------------------------
 // Cancellation plumbing
@@ -288,20 +299,48 @@ function attachOwner(session: PythonSession, sessionId: string, ownerId: string 
 async function acquireSession(sessionId: string, cwd: string, options: PythonExecutorOptions): Promise<PythonSession> {
 	const existing = sessions.get(sessionId);
 	if (existing) {
-		attachOwner(existing, sessionId, options.kernelOwnerId);
-		return existing;
+		const session = isInitializingSession(existing)
+			? await waitForPromiseWithCancellation(existing.promise, options)
+			: existing;
+		attachOwner(session, sessionId, options.kernelOwnerId);
+		return session;
 	}
-	const kernel = await startKernel(cwd, options);
-	const session: PythonSession = {
+
+	const initializing: InitializingPythonSession = {
 		sessionId,
-		kernel,
-		ownerIds: new Set(),
-		hasFallbackOwner: false,
-		queue: Promise.resolve(),
+		promise: Promise.resolve().then(async () => {
+			const kernel = await startKernel(cwd, options);
+			const current = sessions.get(sessionId);
+			if (current !== initializing) {
+				await kernel.shutdown().catch(() => undefined);
+				const winner = current
+					? isInitializingSession(current)
+						? await waitForPromiseWithCancellation(current.promise, options)
+						: current
+					: undefined;
+				if (winner) return winner;
+				throw new PythonExecutionCancelledError(false);
+			}
+			const session: PythonSession = {
+				sessionId,
+				kernel,
+				ownerIds: new Set(),
+				hasFallbackOwner: false,
+				queue: Promise.resolve(),
+			};
+			sessions.set(sessionId, session);
+			return session;
+		}),
 	};
-	attachOwner(session, sessionId, options.kernelOwnerId);
-	sessions.set(sessionId, session);
-	return session;
+	sessions.set(sessionId, initializing);
+	try {
+		const session = await waitForPromiseWithCancellation(initializing.promise, options);
+		attachOwner(session, sessionId, options.kernelOwnerId);
+		return session;
+	} catch (err) {
+		if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
+		throw err;
+	}
 }
 
 async function replaceSessionKernel(
@@ -330,7 +369,8 @@ async function resetSession(sessionId: string): Promise<void> {
 	const existing = sessions.get(sessionId);
 	if (!existing) return;
 	sessions.delete(sessionId);
-	await existing.kernel.shutdown().catch(() => undefined);
+	const session = isInitializingSession(existing) ? await existing.promise.catch(() => undefined) : existing;
+	await session?.kernel.shutdown().catch(() => undefined);
 }
 
 async function runQueued<T>(
@@ -363,11 +403,20 @@ export async function disposeAllKernelSessions(): Promise<void> {
 	for (const [id, session] of all) {
 		if (sessions.get(id) === session) sessions.delete(id);
 	}
-	const results = await Promise.allSettled(all.map(([, session]) => session.kernel.shutdown()));
-	for (let i = 0; i < all.length; i += 1) {
-		const [id, session] = all[i];
+	const resolved = await Promise.all(
+		all.map(
+			async ([id, entry]) =>
+				[id, isInitializingSession(entry) ? await entry.promise.catch(() => undefined) : entry] as const,
+		),
+	);
+	const shutdownTargets = resolved.filter(
+		(entry): entry is readonly [string, PythonSession] => entry[1] !== undefined,
+	);
+	const results = await Promise.allSettled(shutdownTargets.map(([, session]) => session.kernel.shutdown()));
+	for (let i = 0; i < shutdownTargets.length; i += 1) {
+		const [id, session] = shutdownTargets[i];
 		const result = results[i];
-		if (result.status === "fulfilled" && result.value?.confirmed !== false) continue;
+		if (result.status === "fulfilled" && result.value.confirmed) continue;
 		const reason = result.status === "rejected" ? result.reason : "not confirmed";
 		logger.warn("Python kernel shutdown not confirmed", { sessionId: id, reason });
 		if (!sessions.has(id)) sessions.set(id, session);
@@ -377,7 +426,7 @@ export async function disposeAllKernelSessions(): Promise<void> {
 export async function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 	const toShutdown: PythonSession[] = [];
 	for (const session of [...sessions.values()]) {
-		if (!session.ownerIds.has(ownerId)) continue;
+		if (isInitializingSession(session) || !session.ownerIds.has(ownerId)) continue;
 		if (session.ownerIds.size === 1) {
 			toShutdown.push(session);
 			continue;
@@ -391,7 +440,7 @@ export async function disposeKernelSessionsByOwner(ownerId: string): Promise<voi
 	for (let i = 0; i < toShutdown.length; i += 1) {
 		const session = toShutdown[i];
 		const result = results[i];
-		if (result.status === "fulfilled" && result.value?.confirmed !== false) {
+		if (result.status === "fulfilled" && result.value.confirmed) {
 			session.ownerIds.delete(ownerId);
 			continue;
 		}

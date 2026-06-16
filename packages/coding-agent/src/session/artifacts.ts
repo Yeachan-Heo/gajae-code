@@ -7,6 +7,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
+export interface ArtifactSaveOptions {
+	maxBytes?: number;
+}
+
 /**
  * Manages artifact storage for a session.
  *
@@ -94,9 +99,19 @@ export class ArtifactManager {
 	 * @param toolType Tool name for file extension (e.g., "bash", "read")
 	 * @returns Artifact ID (numeric string)
 	 */
-	async save(content: string, toolType: string): Promise<string> {
+	async save(content: string, toolType: string, options: ArtifactSaveOptions = {}): Promise<string> {
 		const { id, path } = await this.allocatePath(toolType);
-		await Bun.write(path, content);
+		const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES);
+		const contentBytes = Buffer.byteLength(content, "utf-8");
+		if (contentBytes > maxBytes) {
+			const truncated = truncateHeadBytes(content, maxBytes);
+			await Bun.write(
+				path,
+				`${truncated.text}\n[artifact truncated after ${truncated.bytes} bytes; omitted at least ${contentBytes - truncated.bytes} bytes]\n`,
+			);
+		} else {
+			await Bun.write(path, content);
+		}
 		return id;
 	}
 

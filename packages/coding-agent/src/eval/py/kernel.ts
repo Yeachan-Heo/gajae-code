@@ -3,8 +3,9 @@
  *
  * Speaks NDJSON with `runner.py` over stdin/stdout. One subprocess per kernel
  * instance; sessions reuse a single subprocess across executions. Cancellation
- * is `kill("SIGINT")` which raises a real `KeyboardInterrupt` inside user
- * code. Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
+ * sends SIGINT to the runner process group, which raises a real
+ * `KeyboardInterrupt` inside user code and any foreground magic subprocess.
+ * Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
  * timeout.
  */
 import * as fs from "node:fs";
@@ -173,6 +174,7 @@ interface PendingExecution {
 	kernelKilled: boolean;
 	settled: boolean;
 	escalationTimer?: NodeJS.Timeout;
+	finalize?: () => void;
 }
 
 export class PythonKernel {
@@ -227,6 +229,9 @@ export class PythonKernel {
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			// Run as its own session/process-group leader so SIGINT/SIGTERM can be
+			// delivered to the whole runner tree (incl. foreground magic subprocesses).
+			detached: true,
 		});
 		kernel.#proc = proc;
 		kernel.#stdin = proc.stdin;
@@ -377,10 +382,30 @@ export class PythonKernel {
 
 	async interrupt(): Promise<void> {
 		if (!this.#proc || this.#disposed) return;
+		this.#signalProcessGroup("SIGINT");
+	}
+
+	#signalProcessGroup(signal: NodeJS.Signals): void {
+		const proc = this.#proc;
+		if (!proc) return;
 		try {
-			this.#proc.kill("SIGINT");
+			if (process.platform !== "win32") {
+				process.kill(-proc.pid, signal);
+				return;
+			}
 		} catch (err) {
-			logger.warn("Failed to interrupt python runner", { error: err instanceof Error ? err.message : String(err) });
+			logger.warn("Failed to signal python runner process group", {
+				signal,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		try {
+			proc.kill(signal);
+		} catch (err) {
+			logger.warn("Failed to signal python runner", {
+				signal,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 	}
 
@@ -412,24 +437,16 @@ export class PythonKernel {
 
 		const exited = this.#waitForExitWithTimeout(timeoutMs);
 		let result = await exited;
-		if (!result) {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* ignore */
-			}
+		if (result === null) {
+			this.#signalProcessGroup("SIGTERM");
 			result = await this.#waitForExitWithTimeout(timeoutMs);
 		}
-		if (!result) {
-			try {
-				proc.kill("SIGKILL");
-			} catch {
-				/* ignore */
-			}
+		if (result === null) {
+			this.#signalProcessGroup("SIGKILL");
 			result = await this.#waitForExitWithTimeout(timeoutMs);
 		}
 
-		const confirmed = !!result;
+		const confirmed = result !== null;
 		this.#shutdownConfirmed = confirmed;
 		this.#disposed = true;
 		return { confirmed };
@@ -441,17 +458,21 @@ export class PythonKernel {
 		this.#pending.clear();
 		const kernelKilledDefault = options?.kernelKilled ?? false;
 		for (const entry of pending) {
+			entry.cancelled = true;
+			entry.status = "error";
+			entry.kernelKilled = entry.kernelKilled || kernelKilledDefault;
+			entry.finalize?.();
 			if (entry.settled) continue;
 			entry.settled = true;
 			void entry.options?.onChunk?.(`[kernel] ${reason}\n`);
 			entry.resolve({
-				status: "error",
-				cancelled: true,
+				status: entry.status,
+				cancelled: entry.cancelled,
 				timedOut: entry.timedOut,
 				stdinRequested: entry.stdinRequested,
 				executionCount: entry.executionCount,
 				error: entry.error,
-				kernelKilled: entry.kernelKilled || kernelKilledDefault,
+				kernelKilled: entry.kernelKilled,
 			});
 		}
 	}
@@ -655,11 +676,14 @@ export class PythonKernel {
 	#waitForExitWithTimeout(timeoutMs: number): Promise<number | null> {
 		if (!this.#exitedPromise) return Promise.resolve(0);
 		const exitedPromise = this.#exitedPromise;
-		const timeout = new Promise<null>(resolve => {
+		return new Promise(resolve => {
 			const timer = setTimeout(() => resolve(null), Math.max(0, timeoutMs));
 			timer.unref?.();
+			exitedPromise.then(code => {
+				clearTimeout(timer);
+				resolve(code);
+			});
 		});
-		return Promise.race([exitedPromise.then(code => code as number | null), timeout]);
 	}
 }
 
