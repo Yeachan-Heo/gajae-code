@@ -1,6 +1,16 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
+
+beforeAll(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true, cwd: process.cwd() });
+});
+
+afterAll(() => {
+	resetSettingsForTest();
+});
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -61,6 +71,7 @@ function createContext(): {
 		prompt: ReturnType<typeof vi.fn>;
 		requestRender: ReturnType<typeof vi.fn>;
 		startPendingSubmission: ReturnType<typeof vi.fn>;
+		clearEditor: ReturnType<typeof vi.fn>;
 	};
 } {
 	let editorText = "";
@@ -94,6 +105,10 @@ function createContext(): {
 	};
 
 	let ctx!: InteractiveModeContext;
+	const clearEditor = vi.fn(() => {
+		editor.setText("");
+		ctx.pendingImages = [];
+	});
 	const ensureLoadingAnimation = vi.fn(() => {
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
 	});
@@ -130,6 +145,9 @@ function createContext(): {
 			getKeys: () => [],
 		} as unknown as InteractiveModeContext["keybindings"],
 		pendingImages: [],
+		lastEscapeTime: 0,
+		lastComposerClearEscapeTime: 0,
+		clearEditor,
 		isBashMode: false,
 		isPythonMode: false,
 		optimisticUserMessageSignature: undefined,
@@ -174,6 +192,7 @@ function createContext(): {
 			prompt,
 			requestRender,
 			startPendingSubmission,
+			clearEditor,
 		},
 	};
 }
@@ -361,5 +380,159 @@ describe("InputController escape behavior", () => {
 		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
 		expect(editor.getText()).toBe("stop after this");
 		expect(editor.shouldBypassAutocompleteOnEscape?.()).toBe(false);
+	});
+	it("double Esc clears a composed draft without aborting an active stream", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft message");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("single Esc with a composed draft neither clears nor aborts", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft message");
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft message");
+	});
+
+	it("double Esc clears a composed draft without aborting a running bash command", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isBashRunning: boolean }).isBashRunning = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(spies.abortBash).not.toHaveBeenCalled();
+	});
+
+	it("double Esc clears a composed draft without aborting a running eval", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isEvalRunning: boolean }).isEvalRunning = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(spies.abortEval).not.toHaveBeenCalled();
+	});
+
+	it("clears pending images along with the composed text on double Esc", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.pendingImages = [{} as InteractiveModeContext["pendingImages"][number]];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(ctx.pendingImages).toHaveLength(0);
+	});
+
+	it("keeps aborting an active stream on a single Esc when the composer is empty", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+	});
+
+	it("bash input mode still exits and clears on Esc without using the double-Esc clear path", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.isBashMode = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("!ls");
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+		expect(ctx.isBashMode).toBe(false);
+	});
+
+	it("re-arms instead of clearing when the second Esc falls outside the 500ms window", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft");
+		editor.onEscape?.();
+		ctx.lastComposerClearEscapeTime = Date.now() - 1000;
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft");
+	});
+	it("treats a whitespace-only composer as empty and still aborts an active stream", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("   ");
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+	});
+
+	it("does not let an empty-composer Esc satisfy the composer-clear second press for a later draft", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		// First Esc on an empty composer arms the empty-composer tree/branch timer.
+		editor.onEscape?.();
+		// User then types a draft and presses Esc once within 500ms.
+		editor.setText("draft message");
+		editor.onEscape?.();
+
+		// The first Esc on the draft must stay silent (no cross-contamination).
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft message");
+	});
+
+	it("does not let a composer-text Esc satisfy the empty-composer double-Esc after the draft is removed", () => {
+		const { ctx, editor } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		// First Esc with a draft arms the composer-clear timer.
+		editor.setText("draft message");
+		editor.onEscape?.();
+		// User clears the draft manually, then presses Esc once within 500ms.
+		editor.setText("");
+		editor.onEscape?.();
+
+		// The empty-composer double-Esc action must not fire on this single empty Esc.
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
 	});
 });

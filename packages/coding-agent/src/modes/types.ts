@@ -116,6 +116,7 @@ export interface InteractiveModeContext {
 	locallySubmittedUserSignatures: Set<string>;
 	lastSigintTime: number;
 	lastEscapeTime: number;
+	lastComposerClearEscapeTime: number;
 	shutdownRequested: boolean;
 	hookSelector: HookSelectorComponent | undefined;
 	hookInput: HookInputComponent | undefined;

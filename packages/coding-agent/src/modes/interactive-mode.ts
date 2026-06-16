@@ -292,6 +292,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingSubmissionDispose: (() => void) | undefined;
 	lastSigintTime = 0;
 	lastEscapeTime = 0;
+	lastComposerClearEscapeTime = 0;
 	shutdownRequested = false;
 	#isShuttingDown = false;
 	hookSelector: HookSelectorComponent | undefined = undefined;

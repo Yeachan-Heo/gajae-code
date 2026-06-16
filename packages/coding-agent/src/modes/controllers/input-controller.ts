@@ -84,6 +84,20 @@ export class InputController {
 				}
 				this.#steerConsumePending = false;
 			}
+			// Normal input state with user-typed text: Esc must not interrupt a
+			// running task (streaming turn, bash/eval). A double Esc within the
+			// 500ms window clears the composer instead. Bash/Python input modes
+			// keep their own Esc handling in the chain below.
+			if (!this.ctx.isBashMode && !this.ctx.isPythonMode && this.ctx.editor.getText().trim()) {
+				const now = Date.now();
+				if (now - this.ctx.lastComposerClearEscapeTime < 500) {
+					this.ctx.clearEditor();
+					this.ctx.lastComposerClearEscapeTime = 0;
+				} else {
+					this.ctx.lastComposerClearEscapeTime = now;
+				}
+				return;
+			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
