@@ -61,6 +61,41 @@ function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<stri
 	return replacement && profiles.has(replacement) ? replacement : profileName;
 }
 
+/**
+ * Rewrite model selectors to use an authenticated provider when the original
+ * provider in the selector is not authenticated.  This allows profiles with
+ * multiple fallback providers (e.g. xiaomi / xiaomi-token-plan-sgp) to work
+ * when only one of them is logged in.
+ */
+function rewriteSelectorProvider(selector: string, authenticatedProviders: readonly string[]): string {
+	const slash = selector.indexOf("/");
+	if (slash < 0) return selector;
+	const provider = selector.substring(0, slash);
+	if (authenticatedProviders.includes(provider)) return selector;
+	// Pick the first authenticated provider as replacement
+	const replacement = authenticatedProviders[0];
+	if (!replacement) return selector;
+	return replacement + selector.substring(slash);
+}
+
+function rewriteBindingsProviders(
+	bindings: { defaultSelector?: string; agentModelOverrides: Record<string, string> },
+	authenticatedProviders: readonly string[],
+): { defaultSelector?: string; agentModelOverrides: Record<string, string> } {
+	if (authenticatedProviders.length === 0) return bindings;
+	return {
+		defaultSelector: bindings.defaultSelector
+			? rewriteSelectorProvider(bindings.defaultSelector, authenticatedProviders)
+			: undefined,
+		agentModelOverrides: Object.fromEntries(
+			Object.entries(bindings.agentModelOverrides).map(([role, sel]) => [
+				role,
+				rewriteSelectorProvider(sel, authenticatedProviders),
+			]),
+		),
+	};
+}
+
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
@@ -72,19 +107,30 @@ export async function prepareModelProfileActivation(
 		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
 	}
 
+	const allProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
 	const missingProviders: string[] = [];
-	for (const provider of aggregateModelProfileRequiredProviders(profile.requiredProviders, profile)) {
+	const authenticatedProviders: string[] = [];
+	for (const provider of allProviders) {
 		const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.session.sessionId);
 		if (!isAuthenticated(apiKey)) {
 			missingProviders.push(provider);
+		} else {
+			authenticatedProviders.push(provider);
 		}
 	}
-	if (missingProviders.length > 0) {
+	// Allow profile activation when at least one provider is authenticated.
+	// Fallback chain handles runtime provider selection.
+	if (authenticatedProviders.length === 0) {
 		throw new Error(formatModelProfileCredentialError(options.profileName, missingProviders));
 	}
 
 	const availableModels = options.modelRegistry.getAll();
-	const bindings = resolveProfileBindings(profile);
+	let bindings = resolveProfileBindings(profile);
+	// Rewrite selectors to use an authenticated provider when the original
+	// provider is not logged in (e.g. xiaomi → xiaomi-token-plan-sgp).
+	if (missingProviders.length > 0) {
+		bindings = rewriteBindingsProviders(bindings, authenticatedProviders);
+	}
 	const resolvedDefault = bindings.defaultSelector
 		? resolveModelRoleValue(bindings.defaultSelector, availableModels, {
 				settings: options.settings as Settings,
