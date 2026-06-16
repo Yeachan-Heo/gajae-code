@@ -4,6 +4,13 @@ import { MCPManager } from "../src/runtime-mcp/manager";
 import { HttpTransport } from "../src/runtime-mcp/transports/http";
 import type { MCPServerConfig, MCPServerConnection, MCPTransport } from "../src/runtime-mcp/types";
 
+// `mock.module` is process-global in Bun and is NOT reverted by `mock.restore()`.
+// Capture the real client exports now — before any test mocks them — so afterEach
+// can restore them. Without this, the stubbed connectToServer/listTools below leak
+// into later test files (e.g. runtime-mcp/*), where real connections then hang until
+// the startup race trips, surfacing as "MCP server connection timed out during startup".
+const realClientModule = { ...mcpClient };
+
 function makeConnection(name: string, close: () => Promise<void> = async () => {}): MCPServerConnection {
 	return {
 		name,
@@ -23,6 +30,7 @@ function makeConnection(name: string, close: () => Promise<void> = async () => {
 
 describe("MCP lifecycle cleanup", () => {
 	afterEach(() => {
+		mock.module("../src/runtime-mcp/client", () => realClientModule);
 		mock.restore();
 		MCPManager.resetForTests();
 	});

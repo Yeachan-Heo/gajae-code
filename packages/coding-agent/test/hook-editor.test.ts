@@ -42,6 +42,7 @@ type TestContext = InteractiveModeContext & {
 		children: unknown[];
 		clear: () => void;
 		addChild: (child: unknown) => void;
+		detachChild: (child: unknown) => void;
 	};
 };
 
@@ -54,6 +55,12 @@ function createControllerContext() {
 		},
 		addChild(child: unknown) {
 			this.children.push(child);
+		},
+		detachChild(child: unknown) {
+			const index = this.children.indexOf(child);
+			if (index !== -1) {
+				this.children.splice(index, 1);
+			}
 		},
 	};
 	const ui = {
