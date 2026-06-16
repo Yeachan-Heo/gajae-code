@@ -145,7 +145,7 @@ describe("AsyncJobManager red-team invariants", () => {
 		}
 	});
 
-	test("terminal eviction purges subagent records and resume descriptors while preserving paused records", async () => {
+	test("terminal eviction purges live terminal state while preserving durable resume descriptors", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0, maxRunningJobs: 2 });
 
 		const terminalJobId = manager.register(
@@ -161,8 +161,8 @@ describe("AsyncJobManager red-team invariants", () => {
 
 		await manager.waitForAll();
 		expect(manager.getJob(terminalJobId)).toBeUndefined();
-		expect(manager.getSubagentRecord("terminal-sub")).toBeUndefined();
-		expect(manager.getResumeDescriptor("terminal-sub")).toBeUndefined();
+		expect(manager.getSubagentRecord("terminal-sub")?.resumable).toBe(true);
+		expect(manager.getResumeDescriptor("terminal-sub")).toEqual(descriptor("terminal-sub"));
 		expect(manager.getLiveHandle("terminal-sub")).toBeUndefined();
 		expect(manager.getSubagentProgress("terminal-sub")).toBeUndefined();
 

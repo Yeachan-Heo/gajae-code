@@ -171,6 +171,41 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
+	test("resume rehydrates from a retained descriptor when the in-memory record is gone", async () => {
+		const { manager, completions } = makeManager();
+		manager.registerResumeDescriptor({
+			subagentId: "A",
+			ownerId: "owner-1",
+			data: { sessionFile: "/tmp/A.jsonl", marker: "fallback-metadata" },
+		});
+		let seenDescriptor: unknown;
+		manager.setResumeRunner((subagentId, message, descriptor) => {
+			seenDescriptor = descriptor?.data;
+			return manager.register(
+				"task",
+				subagentId,
+				async (): Promise<SubagentRunOutcome> => ({ kind: "completed", text: `rehydrated:${message}` }),
+				{
+					id: "A-rehydrated",
+					ownerId: "owner-1",
+					metadata: { subagent: { id: "A", agent: "planner", agentSource: "bundled" } },
+				},
+			);
+		});
+
+		const res = manager.resumeSubagent("A", { ownerId: "owner-1" }, "revision pass 3");
+		expect(res.ok).toBe(true);
+		expect(res.reason).toBeUndefined();
+		expect(res.jobId).toBe("A-rehydrated");
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(seenDescriptor).toEqual({ sessionFile: "/tmp/A.jsonl", marker: "fallback-metadata" });
+		expect(manager.getSubagentRecord("A", { ownerId: "owner-1" })?.status).toBe("completed");
+		expect(completions[0]?.text).toBe("rehydrated:revision pass 3");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
 	test("resume queues when at the concurrency limit and drains FIFO (AC6)", async () => {
 		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
 		installResumeRunner(manager);

@@ -141,7 +141,7 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		expect(attempts).toBeLessThanOrEqual(120 * 3);
 	});
 
-	test("terminal eviction purges subagent records while paused records remain resumable", async () => {
+	test("terminal eviction purges live terminal state while retaining durable resume metadata", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0, maxRunningJobs: 2 });
 
 		const terminalJobId = manager.register("task", "terminal", async () => "done", { id: "terminal-job" });
@@ -154,8 +154,8 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		manager.recordSubagentProgress("terminal-sub", { currentTool: "test" } as never);
 
 		await manager.waitForAll();
-		expect(manager.getSubagentRecord("terminal-sub")).toBeUndefined();
-		expect(manager.getResumeDescriptor("terminal-sub")).toBeUndefined();
+		expect(manager.getSubagentRecord("terminal-sub")?.resumable).toBe(true);
+		expect(manager.getResumeDescriptor("terminal-sub")).toEqual(resumeDescriptor("terminal-sub"));
 		expect(manager.getLiveHandle("terminal-sub")).toBeUndefined();
 		expect(manager.getSubagentProgress("terminal-sub")).toBeUndefined();
 
