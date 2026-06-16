@@ -151,12 +151,21 @@ function createNativeComputerController(): NativeController {
 }
 
 let controllerFactory: ComputerControllerFactory = createNativeComputerController;
+let platformOverrideForTests: NodeJS.Platform | undefined;
 
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ?? createNativeComputerController;
 }
 
-export function isComputerSupportedPlatform(platform: NodeJS.Platform = process.platform): boolean {
+export function setComputerPlatformForTests(platform: NodeJS.Platform | undefined): void {
+	platformOverrideForTests = platform;
+}
+
+function currentComputerPlatform(): NodeJS.Platform {
+	return platformOverrideForTests ?? process.platform;
+}
+
+export function isComputerSupportedPlatform(platform: NodeJS.Platform = currentComputerPlatform()): boolean {
 	return platform === "darwin";
 }
 
@@ -174,7 +183,7 @@ export function isComputerEnabled(session: Pick<ToolSession, "settings">): boole
 
 export function isComputerCallable(
 	session: Pick<ToolSession, "settings">,
-	platform: NodeJS.Platform = process.platform,
+	platform: NodeJS.Platform = currentComputerPlatform(),
 ): boolean {
 	return isComputerSupportedPlatform(platform) && isComputerEnabled(session);
 }

@@ -8,6 +8,7 @@ import {
 	isComputerCallable,
 	isComputerLoadablePlatform,
 	setComputerControllerFactoryForTests,
+	setComputerPlatformForTests,
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
 import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";
@@ -63,7 +64,10 @@ describe("computer tool schema", () => {
 });
 
 describe("computer tool gating", () => {
-	afterEach(() => setComputerControllerFactoryForTests(undefined));
+	afterEach(() => {
+		setComputerControllerFactoryForTests(undefined);
+		setComputerPlatformForTests(undefined);
+	});
 
 	it("is metadata-only by default and not callable/discoverable", async () => {
 		const session = createSession(Settings.isolated({ "tools.discoveryMode": "all" }));
@@ -81,6 +85,7 @@ describe("computer tool gating", () => {
 	});
 
 	it("is callable with per-session enable or alwaysOn on macOS", async () => {
+		setComputerPlatformForTests("darwin");
 		const enabledNames = (await createTools(createSession(Settings.isolated({ "computer.enabled": true })))).map(
 			t => t.name,
 		);
@@ -117,9 +122,13 @@ describe("computer tool gating", () => {
 });
 
 describe("computer tool dispatch", () => {
-	afterEach(() => setComputerControllerFactoryForTests(undefined));
+	afterEach(() => {
+		setComputerControllerFactoryForTests(undefined);
+		setComputerPlatformForTests(undefined);
+	});
 
 	it("maps snake_case model actions to native controller methods and forwards AbortSignal", async () => {
+		setComputerPlatformForTests("darwin");
 		const calls: Array<{ method: string; payload: unknown; signal?: AbortSignal }> = [];
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: (payload, options) => {
@@ -146,6 +155,7 @@ describe("computer tool dispatch", () => {
 	});
 
 	it("maps native COMPUTER_* errors into bounded tool errors", async () => {
+		setComputerPlatformForTests("darwin");
 		setComputerControllerFactoryForTests(() => ({
 			click: () => {
 				const error = new Error("supervisor is not live") as Error & { code: string };
