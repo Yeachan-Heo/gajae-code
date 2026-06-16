@@ -1,13 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
+	formatModelProfileCredentialError,
 	prepareModelProfileActivation,
 } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
-import { BUILTIN_MODEL_PROFILES } from "../src/config/model-profiles";
+import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
+import type { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
@@ -249,5 +251,158 @@ describe("model profile activation", () => {
 			executor: "explicit/executor",
 			architect: "provider-a/architect",
 		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Xiaomi Token Plan region activation tests
+// ---------------------------------------------------------------------------
+
+function stubXiaomiRegistry(
+	authenticatedProviders: string[],
+): Pick<
+	ModelRegistry,
+	| "getModelProfile"
+	| "getModelProfiles"
+	| "getAvailableModelProfileNames"
+	| "getApiKeyForProvider"
+	| "getAll"
+	| "resolveCanonicalModel"
+	| "getCanonicalVariants"
+	| "getCanonicalId"
+> {
+	const profiles = mergeModelProfiles();
+	const xiaomiProviders = ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"];
+	const models = xiaomiProviders.flatMap(provider => [
+		{ id: `${provider}/mimo-v2.5-pro`, provider, api: "openai-completions" },
+	]);
+	return {
+		getModelProfiles: () => profiles,
+		getModelProfile: name => profiles.get(name) ?? undefined,
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		getApiKeyForProvider: async (provider: string) => {
+			if (authenticatedProviders.includes(provider)) {
+				return { type: "api_key" as const, key: "test-key" };
+			}
+			return undefined;
+		},
+		getAll: () => models as never[],
+		resolveCanonicalModel: () => undefined,
+		getCanonicalVariants: () => [],
+		getCanonicalId: (id: string) => id,
+	};
+}
+
+function stubXiaomiSession() {
+	return {
+		model: undefined,
+		thinkingLevel: "medium" as const,
+		sessionId: "test-session",
+		setModelTemporary: async () => {},
+		setActiveModelProfile: () => {},
+		getActiveModelProfile: () => undefined,
+	};
+}
+
+function stubXiaomiSettings() {
+	const overrides: Record<string, unknown> = {};
+	return {
+		get: (key: string) => overrides[key],
+		override: (key: string, value: unknown) => {
+			overrides[key] = value;
+		},
+		set: (_key: string, _value: unknown) => {},
+		flush: async () => {},
+	};
+}
+
+describe("model-profile-activation: xiaomi token-plan regions", () => {
+	it("mimo-pro includes all four xiaomi providers in requiredProviders", () => {
+		const profiles = mergeModelProfiles();
+		const mimoPro = profiles.get("mimo-pro");
+		expect(mimoPro).toBeDefined();
+		const providers = mimoPro!.requiredProviders;
+		expect(providers).toContain("xiaomi");
+		expect(providers).toContain("xiaomi-token-plan-sgp");
+		expect(providers).toContain("xiaomi-token-plan-ams");
+		expect(providers).toContain("xiaomi-token-plan-cn");
+	});
+
+	it("mimo-medium includes all four xiaomi providers in requiredProviders", () => {
+		const profiles = mergeModelProfiles();
+		const mimoMedium = profiles.get("mimo-medium");
+		expect(mimoMedium).toBeDefined();
+		const providers = mimoMedium!.requiredProviders;
+		expect(providers).toContain("xiaomi");
+		expect(providers).toContain("xiaomi-token-plan-sgp");
+		expect(providers).toContain("xiaomi-token-plan-ams");
+		expect(providers).toContain("xiaomi-token-plan-cn");
+	});
+
+	it("mimo-eco only requires xiaomi (no token-plan fallback)", () => {
+		const profiles = mergeModelProfiles();
+		const mimoEco = profiles.get("mimo-eco");
+		expect(mimoEco).toBeDefined();
+		expect(mimoEco!.requiredProviders).toEqual(["xiaomi"]);
+	});
+
+	it("activation succeeds with only xiaomi-token-plan-sgp", async () => {
+		const registry = stubXiaomiRegistry(["xiaomi-token-plan-sgp"]);
+		const session = stubXiaomiSession();
+		const settings = stubXiaomiSettings();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings,
+			profileName: "mimo-pro",
+		});
+		expect(prepared.profileName).toBe("mimo-pro");
+	});
+
+	it("activation succeeds with only xiaomi-token-plan-ams", async () => {
+		const registry = stubXiaomiRegistry(["xiaomi-token-plan-ams"]);
+		const session = stubXiaomiSession();
+		const settings = stubXiaomiSettings();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings,
+			profileName: "mimo-pro",
+		});
+		expect(prepared.profileName).toBe("mimo-pro");
+	});
+
+	it("activation succeeds with only xiaomi-token-plan-cn", async () => {
+		const registry = stubXiaomiRegistry(["xiaomi-token-plan-cn"]);
+		const session = stubXiaomiSession();
+		const settings = stubXiaomiSettings();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings,
+			profileName: "mimo-pro",
+		});
+		expect(prepared.profileName).toBe("mimo-pro");
+	});
+
+	it("activation fails with no xiaomi credentials", async () => {
+		const registry = stubXiaomiRegistry([]);
+		const session = stubXiaomiSession();
+		const settings = stubXiaomiSettings();
+		await expect(
+			prepareModelProfileActivation({
+				session,
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings,
+				profileName: "mimo-pro",
+			}),
+		).rejects.toThrow(
+			formatModelProfileCredentialError("mimo-pro", [
+				"xiaomi",
+				"xiaomi-token-plan-sgp",
+				"xiaomi-token-plan-ams",
+				"xiaomi-token-plan-cn",
+			]),
+		);
 	});
 });

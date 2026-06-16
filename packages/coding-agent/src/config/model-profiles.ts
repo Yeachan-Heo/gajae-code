@@ -138,14 +138,14 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "xiaomi/mimo-v2.5-pro:medium",
 		architect: "xiaomi/mimo-v2.5-pro:high",
 	}),
-	profile("mimo-medium", ["xiaomi", "xiaomi-token-plan-sgp"], {
+	profile("mimo-medium", ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"], {
 		default: "xiaomi/mimo-v2.5-pro:medium",
 		executor: "xiaomi/mimo-v2.5-pro:low",
 		planner: "xiaomi/mimo-v2.5-pro:medium",
 		critic: "xiaomi/mimo-v2.5-pro:high",
 		architect: "xiaomi/mimo-v2.5-pro:xhigh",
 	}),
-	profile("mimo-pro", ["xiaomi", "xiaomi-token-plan-sgp"], {
+	profile("mimo-pro", ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"], {
 		default: "xiaomi/mimo-v2.5-pro:xhigh",
 		executor: "xiaomi/mimo-v2.5-pro:medium",
 		planner: "xiaomi/mimo-v2.5-pro:high",
