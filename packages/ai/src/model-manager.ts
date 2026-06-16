@@ -323,7 +323,7 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 	// (issue #489). Keep the existing api, and only take the dynamic baseUrl
 	// when the api matches (same transport, same URL shape).
 	const baseUrl = existingModel.api === dynamicModel.api ? dynamicModel.baseUrl : existingModel.baseUrl;
-	return enrichModelThinking({
+	const merged = enrichModelThinking({
 		...existingModel,
 		...dynamicModel,
 		api: existingModel.api,
@@ -343,6 +343,9 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 		compat: dynamicModel.compat ?? existingModel.compat,
 		contextPromotionTarget: dynamicModel.contextPromotionTarget ?? existingModel.contextPromotionTarget,
 	});
+	const policyModels = [merged as Model<Api>];
+	applyGeneratedModelPolicies(policyModels);
+	return policyModels[0] as Model<TApi>;
 }
 
 function preferDiscoveryCost(discoveryCost: number, fallbackCost: number): number {
