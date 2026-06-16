@@ -229,13 +229,16 @@ async function resolveConfiguredAmbiguityThreshold(
 	return await readSettingsAmbiguityThreshold(userSettings);
 }
 
+function deepInterviewLanguageInstruction(label: string, reason: string): string {
+	return `Ask every user-facing deep-interview question, option label, and announcement in ${label} ${reason}. Write natural, grammatically correct, native-quality ${label}, follow that language's spelling and spacing conventions, and never invent, calque, or transliterate non-standard words. Keep code identifiers, file paths, commands, settings/JSON keys, and library/API/product names in their original form rather than translating them, using a translated term only when a well-established standard one already exists. Default to English when no language is detected or explicitly requested.`;
+}
+
 function englishLanguagePreference(): DeepInterviewLanguagePreference {
 	return {
 		code: "en",
 		label: "English",
 		source: "explicit-user-request",
-		instruction:
-			"Ask every user-facing deep-interview question in English because the user explicitly requested English.",
+		instruction: deepInterviewLanguageInstruction("English", "because the user explicitly requested English"),
 	};
 }
 
@@ -251,8 +254,10 @@ function resolveDeepInterviewLanguagePreference(idea: string): DeepInterviewLang
 			code: "ko",
 			label: "Korean",
 			source: "initial-idea",
-			instruction:
-				"Ask every user-facing deep-interview question in Korean unless the user explicitly requests another language.",
+			instruction: deepInterviewLanguageInstruction(
+				"Korean",
+				"to match the user's session language detected from the initial idea",
+			),
 		};
 	}
 	return undefined;

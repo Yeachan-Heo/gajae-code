@@ -39,7 +39,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 
 <Execution_Policy>
 - Ask ONE question at a time -- never batch multiple questions
-- Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; for example Korean initial ideas must receive Korean deep-interview questions unless the user explicitly requests another language
+- Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; for example Korean initial ideas must receive Korean deep-interview questions unless the user explicitly requests another language. This is general across any detected/requested language (English remains the default): render the preserved language naturally and grammatically (correct spelling/spacing), never invent/calque/transliterate non-standard words, and keep code identifiers, file paths, commands, settings/JSON keys, and library/API/technical terms in their original form rather than translating them
 - Target the WEAKEST clarity dimension with each question
 - Before Round 1 ambiguity scoring, run a one-time Round 0 topology enumeration gate that confirms the top-level component list and locks it into state
 - Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
@@ -283,7 +283,7 @@ Auto-research must never add a public skill entrypoint, never be slash-command/d
 
 ### Step 2b: Ask the Question
 
-Use the `ask` tool with the generated question. Before rendering the prompt/options, apply `language.instruction` from state when present so the entire user-facing question remains in the preserved session language. Present it clearly with the current ambiguity context:
+Use the `ask` tool with the generated question. Before rendering the prompt/options, apply `language.instruction` from state when present so the entire user-facing question remains in the preserved session language -- phrased in natural, grammatical native text, never with invented/transliterated non-words, and keeping code identifiers, file paths, commands, settings/JSON keys, and library/API/technical terms in their original form. Present it clearly with the current ambiguity context:
 
 ```
 Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} | Why now: {one_sentence_targeting_rationale} | Ambiguity: {score}%

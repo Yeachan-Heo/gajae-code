@@ -206,6 +206,7 @@ describe("native gjc deep-interview runtime", () => {
 			source: "initial-idea",
 		});
 		expect(payload.language.instruction).toContain("Korean");
+		expect(payload.language.instruction).toContain("original form");
 
 		const state = JSON.parse(
 			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
@@ -225,6 +226,7 @@ describe("native gjc deep-interview runtime", () => {
 			source: "explicit-user-request",
 		});
 		expect(payload.language.instruction).toContain("explicitly requested English");
+		expect(payload.language.instruction).toContain("original form");
 	});
 
 	it("defaults to the SKILL.md default threshold (0.05) when no resolution flag or settings exist", async () => {
