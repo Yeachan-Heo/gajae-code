@@ -7,6 +7,12 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+// Keys for tasks that compile the @gajae-code/natives addon. They run once in
+// the dedicated dev-ci native-build job (not as matrix shards) and publish the
+// built `.node` files as an artifact the runtime-dependent shards download.
+// Declared here (before the top-level `await main()`) so it is initialized for
+// every CLI mode despite top-level await halting later module statements.
+const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-linux-x64"]);
 
 export interface PackageManifest {
 	name?: string;
@@ -30,12 +36,39 @@ export interface Task {
 	cwd?: string;
 }
 
+// Machine-readable descriptor for one planned task, emitted by `--matrix-json`
+// so dev-ci can fan the plan out across runners. `native`/`rust` declare the
+// per-task setup a single shard needs (prebuilt native addon / Rust toolchain);
+// `nativeBuild` marks the addon-compilation tasks that run once in the dedicated
+// native-build job rather than as shards.
+export interface TaskMatrixEntry {
+	key: string;
+	description: string;
+	command: readonly string[];
+	cwd?: string;
+	native: boolean;
+	rust: boolean;
+	nativeBuild: boolean;
+}
+
 async function main(): Promise<void> {
 	const dryRun = process.argv.includes("--dry-run");
-	const emitFlags = process.argv.includes("--emit-flags");
 
-	if (emitFlags) {
+	if (process.argv.includes("--emit-flags")) {
 		await emitAffectedFlags();
+		return;
+	}
+	if (process.argv.includes("--matrix-json")) {
+		await emitMatrix();
+		return;
+	}
+	if (process.argv.includes("--native-build")) {
+		await runNativeBuild();
+		return;
+	}
+	const taskArg = process.argv.find(arg => arg.startsWith("--task="));
+	if (taskArg) {
+		await runSingleTask(taskArg.slice("--task=".length));
 		return;
 	}
 	const changedPaths = await getChangedPaths();
@@ -86,6 +119,115 @@ async function emitAffectedFlags(): Promise<void> {
 	}
 	if (process.env.GITHUB_OUTPUT) {
 		await fs.appendFile(process.env.GITHUB_OUTPUT, `rust=${rust}\nnative=${native}\n`);
+	}
+}
+
+function isNativeBuildKey(key: string): boolean {
+	return NATIVE_BUILD_KEYS.has(key);
+}
+
+// Tasks that load the @gajae-code/natives addon at runtime and therefore need a
+// prebuilt `.node` present in `packages/natives/native/`. By construction (see
+// planTasks) every such task only appears in a plan that also includes a native
+// build task, so the shard can always download the artifact built once upstream.
+function taskNeedsNative(key: string): boolean {
+	return key === "root-test" || key === "cli-smoke" || key === "wrapper-version" || key.startsWith("test:");
+}
+
+// Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
+function taskNeedsRust(key: string): boolean {
+	return key === "rust-check" || key === "rust-test";
+}
+
+// Build the machine-readable descriptor list for the current changed-path plan.
+// `cwd` is emitted repo-relative so the JSON stays portable across runners.
+export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
+	return tasks.map(task => ({
+		key: task.key,
+		description: task.description,
+		command: task.command,
+		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
+		native: taskNeedsNative(task.key),
+		rust: taskNeedsRust(task.key),
+		nativeBuild: isNativeBuildKey(task.key),
+	}));
+}
+
+// `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
+// by tests and for debugging). Under GitHub Actions it also appends the dev-ci
+// planner outputs: `matrix` (the shard include list, excluding native-build
+// tasks), `has_tasks`, `has_native`, and the resolved `changed_paths` so every
+// downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
+// instead of re-resolving the base ref on each runner.
+async function emitMatrix(): Promise<void> {
+	const paths = await getChangedPaths();
+	const packages = await getWorkspacePackages();
+	const tasks = planTasks(paths, packages);
+	const entries = describeTasks(tasks);
+
+	console.log(JSON.stringify(entries));
+
+	const githubOutput = process.env.GITHUB_OUTPUT;
+	if (!githubOutput) {
+		return;
+	}
+	const shards = entries
+		.filter(entry => !entry.nativeBuild)
+		.map(entry => ({ key: entry.key, description: entry.description, native: entry.native, rust: entry.rust }));
+	const hasNative = entries.some(entry => entry.nativeBuild);
+	const lines = [
+		`matrix=${JSON.stringify({ include: shards })}`,
+		`has_tasks=${shards.length > 0}`,
+		`has_native=${hasNative}`,
+		"changed_paths<<__GJC_PATHS_EOF__",
+		...paths,
+		"__GJC_PATHS_EOF__",
+		"",
+	];
+	await fs.appendFile(githubOutput, lines.join("\n"));
+}
+
+// `--native-build` runs every native build task in the current plan exactly
+// once. The dedicated dev-ci native-build job uses it so the expensive native
+// compile happens a single time per run instead of on each runtime shard.
+async function runNativeBuild(): Promise<void> {
+	const paths = await getChangedPaths();
+	const packages = await getWorkspacePackages();
+	const tasks = planTasks(paths, packages).filter(task => isNativeBuildKey(task.key));
+	if (tasks.length === 0) {
+		console.log("ci-dev-affected: no native build tasks in plan; nothing to build.");
+		return;
+	}
+	for (const task of tasks) {
+		console.log(`\n::group::${task.description}`);
+		const exitCode = await runCommand(task.command, task.cwd ?? repoRoot);
+		console.log("::endgroup::");
+		if (exitCode !== 0) {
+			process.exit(exitCode);
+		}
+	}
+}
+
+// `--task=<key>` runs exactly one planned task selected by key. Matrix shards
+// use this to execute their single assigned task. An unknown key is a hard
+// error so plan drift between the planner and a shard fails loudly instead of
+// silently skipping validation.
+async function runSingleTask(key: string): Promise<void> {
+	const paths = await getChangedPaths();
+	const packages = await getWorkspacePackages();
+	const tasks = planTasks(paths, packages);
+	const task = tasks.find(candidate => candidate.key === key);
+	if (!task) {
+		const known = tasks.map(candidate => candidate.key).join(", ") || "(none)";
+		console.error(`ci-dev-affected: task '${key}' is not in the current plan. Planned tasks: ${known}`);
+		process.exit(1);
+		return;
+	}
+	console.log(`\n::group::${task.description}`);
+	const exitCode = await runCommand(task.command, task.cwd ?? repoRoot);
+	console.log("::endgroup::");
+	if (exitCode !== 0) {
+		process.exit(exitCode);
 	}
 }
 

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { packageScriptCommand, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, packageScriptCommand, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
 
 const packages: WorkspacePackage[] = [
 	{
@@ -130,5 +130,122 @@ describe("runCommand executes package scripts in the target cwd (issue #622)", (
 		expect(exitCode).toBe(0); // false green
 		expect(await Bun.file(markerPath).exists()).toBe(false); // script never ran
 		expect(output).toContain("Usage: bun run"); // it only printed help
+	});
+});
+
+describe("describeTasks matrix emission", () => {
+	test("package test task needs native, native build task is flagged, check does not", () => {
+		const entries = describeTasks(planForPaths(["packages/example/src/index.ts"]));
+		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
+		const pkgTest = entries.find(entry => entry.key === "test:@gajae-code/example");
+		const pkgCheck = entries.find(entry => entry.key === "check:@gajae-code/example");
+
+		expect(nativeBuild?.nativeBuild).toBe(true);
+		expect(nativeBuild?.native).toBe(false);
+		expect(pkgTest?.native).toBe(true);
+		expect(pkgTest?.nativeBuild).toBe(false);
+		expect(pkgCheck?.native).toBe(false);
+		expect(pkgCheck?.nativeBuild).toBe(false);
+
+		// Every descriptor carries the serialized command plus boolean setup flags.
+		for (const entry of entries) {
+			expect(Array.isArray(entry.command)).toBe(true);
+			expect(typeof entry.native).toBe("boolean");
+			expect(typeof entry.rust).toBe("boolean");
+			expect(typeof entry.nativeBuild).toBe("boolean");
+		}
+	});
+
+	test("rust tasks are flagged rust and need no native addon", () => {
+		const entries = describeTasks(planTasks(["crates/pi-natives/src/lib.rs"], packages));
+		const check = entries.find(entry => entry.key === "rust-check");
+		const runTest = entries.find(entry => entry.key === "rust-test");
+
+		expect(check?.rust).toBe(true);
+		expect(check?.native).toBe(false);
+		expect(runTest?.rust).toBe(true);
+		expect(entries.every(entry => !entry.nativeBuild)).toBe(true);
+	});
+
+	test("cwd is emitted repo-relative for package-scoped tasks", () => {
+		const entries = describeTasks(planForPaths(["packages/example/src/index.ts"]));
+		const pkgCheck = entries.find(entry => entry.key === "check:@gajae-code/example");
+		expect(pkgCheck?.cwd).toBe("packages/example");
+	});
+});
+
+describe("--matrix-json and --task CLI fan-out", () => {
+	const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
+	const repoRoot = path.join(import.meta.dir, "..");
+	const tempDirs: string[] = [];
+
+	afterAll(async () => {
+		await Promise.all(tempDirs.map(dir => fs.rm(dir, { recursive: true, force: true })));
+	});
+
+	async function runScript(
+		args: readonly string[],
+		changedPaths: string,
+		extraEnv: Record<string, string> = {},
+	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		const proc = Bun.spawn(["bun", scriptPath, ...args], {
+			cwd: repoRoot,
+			env: { ...process.env, CI_DEV_CHANGED_PATHS: changedPaths, ...extraEnv },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		return { stdout, stderr, exitCode };
+	}
+
+	test("--matrix-json emits JSON descriptors and GitHub planner outputs", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-matrix-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "crates/pi-natives/src/lib.rs", {
+			GITHUB_OUTPUT: outputFile,
+		});
+		expect(exitCode).toBe(0);
+
+		const entries = JSON.parse(stdout.trim());
+		expect(entries.some((entry: { key: string; rust: boolean; native: boolean }) => entry.key === "rust-check" && entry.rust === true && entry.native === false)).toBe(true);
+
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_tasks=true");
+		expect(output).toContain("has_native=false");
+		expect(output).toContain("changed_paths<<");
+
+		const matrixLine = output.split("\n").find(line => line.startsWith("matrix="));
+		expect(matrixLine).toBeDefined();
+		const matrix = JSON.parse((matrixLine as string).slice("matrix=".length));
+		expect(matrix.include.some((shard: { key: string }) => shard.key === "rust-check")).toBe(true);
+		// Native build tasks never appear as shards.
+		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
+	});
+
+	test("--task runs exactly the selected planned task", async () => {
+		const { stdout, exitCode } = await runScript(["--task=affected-dry-run"], "scripts/ci-dev-affected.ts");
+		expect(exitCode).toBe(0);
+		// The selected task's group header proves the right single task was chosen,
+		// and the nested --dry-run output proves it actually executed.
+		expect(stdout).toContain("Affected CI selector self-check");
+		expect(stdout).toContain("Dev affected-path CI");
+	});
+
+	test("--task fails loudly on a key absent from the current plan", async () => {
+		const { stderr, exitCode } = await runScript(["--task=does-not-exist"], "docs/readme.md");
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("not in the current plan");
+	});
+
+	test("--native-build is a no-op when the plan has no native build task", async () => {
+		const { stdout, exitCode } = await runScript(["--native-build"], "docs/readme.md");
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("no native build tasks in plan");
 	});
 });
