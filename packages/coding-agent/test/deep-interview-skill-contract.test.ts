@@ -68,7 +68,9 @@ describe("deep-interview self-proofread output rule", () => {
 	it("references the self-proofread at the four emission points", () => {
 		expect(skill).toContain("Before emitting the prose lines in this announcement, apply the");
 		expect(skill).toContain("apply the self-proofread once to new prose only");
-		expect(skill).toContain("apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing");
+		expect(skill).toContain(
+			"apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing",
+		);
 		expect(skill).toContain("Apply the self-proofread once to newly generated spec prose before persistence");
 	});
 
