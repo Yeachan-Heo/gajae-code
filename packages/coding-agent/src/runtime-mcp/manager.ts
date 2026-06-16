@@ -58,6 +58,19 @@ type TrackedPromise<T> = {
 };
 
 const STARTUP_TIMEOUT_MS = 250;
+const STARTUP_TIMEOUT_GRACE_MS = 250;
+const MAX_STARTUP_TIMEOUT_MS = 1_500;
+
+function resolveStartupTimeoutMs(configs: MCPServerConfig[]): number {
+	const configuredTimeouts = configs
+		.map(config => config.timeout)
+		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
+	if (configuredTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
+	return Math.min(
+		MAX_STARTUP_TIMEOUT_MS,
+		Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS),
+	);
+}
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
@@ -510,9 +523,10 @@ export class MCPManager {
 		}
 
 		if (connectionTasks.length > 0) {
+			const startupTimeoutMs = resolveStartupTimeoutMs(connectionTasks.map(task => task.config));
 			await Promise.race([
 				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)),
-				delay(STARTUP_TIMEOUT_MS),
+				delay(startupTimeoutMs),
 			]);
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();

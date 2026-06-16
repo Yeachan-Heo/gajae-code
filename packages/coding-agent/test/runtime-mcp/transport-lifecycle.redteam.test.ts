@@ -105,7 +105,11 @@ setInterval(()=>{},1000);
 		const connection = manager.getConnection("red");
 		expect(connection).toBeDefined();
 		connection!.transport.onClose?.();
-		await waitFor(async () => (await readPidList(pidFile)).length >= 2, 3_500);
+		await waitFor(async () => {
+			const serverPids = await readPidList(pidFile);
+			const childPids = await readPidList(childPidFile);
+			return serverPids.length >= 2 && childPids.length >= 2;
+		}, 3_500);
 		const serverPids = await readPidList(pidFile);
 		const childPids = await readPidList(childPidFile);
 		expect(serverPids.length).toBeGreaterThanOrEqual(2);

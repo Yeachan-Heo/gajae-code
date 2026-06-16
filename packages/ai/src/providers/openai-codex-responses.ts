@@ -96,6 +96,7 @@ const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
 const CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS = 15000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
+const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
@@ -1475,7 +1476,11 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 }
 
 function isCodexPreviousResponseNotFound(error: unknown): boolean {
-	return error instanceof CodexProviderStreamError && error.code === "previous_response_not_found";
+	return (
+		error instanceof CodexProviderStreamError &&
+		typeof error.code === "string" &&
+		CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)
+	);
 }
 
 async function tryRecoverCodexPreviousResponseNotFound(
@@ -2669,6 +2674,22 @@ function getString(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
 
+function getCodexEventError(rawEvent: Record<string, unknown>): Record<string, unknown> | null {
+	const response = asRecord(rawEvent.response);
+	return asRecord(rawEvent.error) ?? (response ? asRecord(response.error) : null);
+}
+
+function getCodexEventErrorCode(rawEvent: Record<string, unknown>): string {
+	const error = getCodexEventError(rawEvent);
+	return getString(error?.code) ?? getString(error?.type) ?? getString(rawEvent.code) ?? "";
+}
+
+function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
+	const response = asRecord(rawEvent.response);
+	const error = getCodexEventError(rawEvent);
+	return getString(error?.message) ?? getString(rawEvent.message) ?? getString(response?.message) ?? "";
+}
+
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
 	readonly code?: string;
@@ -2682,19 +2703,17 @@ class CodexProviderStreamError extends Error {
 }
 
 function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolean {
-	const response = asRecord(rawEvent.response);
-	const error = asRecord(rawEvent.error) ?? (response ? asRecord(response.error) : null);
-	const code = getString(error?.code) ?? getString(error?.type) ?? getString(rawEvent.code);
+	const code = getCodexEventErrorCode(rawEvent);
 	if (code && CODEX_RETRYABLE_EVENT_CODES.has(code.toLowerCase())) {
 		return true;
 	}
-	const message = getString(error?.message) ?? getString(rawEvent.message) ?? getString(response?.message);
+	const message = getCodexEventErrorMessage(rawEvent);
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
 }
 
 function createCodexProviderStreamError(rawEvent: Record<string, unknown>): CodexProviderStreamError {
-	const code = getString(rawEvent.code) ?? "";
-	const message = getString(rawEvent.message) ?? "";
+	const code = getCodexEventErrorCode(rawEvent);
+	const message = getCodexEventErrorMessage(rawEvent);
 	const formattedMessage =
 		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
