@@ -1,6 +1,6 @@
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
-import type { Api, Model, Provider } from "../../types";
+import type { Api, FetchImpl, Model, Provider } from "../../types";
 
 const MODELS_PATH = "/models";
 
@@ -81,7 +81,9 @@ export interface FetchOpenAICompatibleModelsOptions<TApi extends Api> {
 	/** Optional AbortSignal for request cancellation. */
 	signal?: AbortSignal;
 	/** Optional fetch implementation override for testing/custom runtimes. */
-	fetch?: typeof globalThis.fetch;
+	fetch?: FetchImpl;
+	/** Optional HTTP status predicate for provider-specific hard failures. */
+	throwOnStatus?: (response: Response) => Error | undefined;
 	/**
 	 * Optional post-normalization filter.
 	 * Return false to skip a model.
@@ -133,6 +135,10 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	}
 
 	if (!response.ok) {
+		const hardFailure = options.throwOnStatus?.(response);
+		if (hardFailure) {
+			throw hardFailure;
+		}
 		return null;
 	}
 

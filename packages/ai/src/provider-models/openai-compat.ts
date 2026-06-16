@@ -2,7 +2,7 @@ import { $env, $inheritedEnv } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
 import { Effort } from "../model-thinking";
 import { getBundledModels } from "../models";
-import type { Api, Model, ThinkingConfig } from "../types";
+import type { Api, FetchImpl, Model, Provider, ThinkingConfig } from "../types";
 import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
 import {
 	fetchOpenAICompatibleModels,
@@ -1437,28 +1437,35 @@ const XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS = [
 	XIAOMI_TOKEN_PLAN_BASE_URLS.cn,
 ];
 
+function inferXiaomiTokenPlanRegion(providerId: Provider): XiaomiTokenPlanRegion | undefined {
+	if (providerId === "xiaomi-token-plan-sgp") return "sgp";
+	if (providerId === "xiaomi-token-plan-ams") return "ams";
+	if (providerId === "xiaomi-token-plan-cn") return "cn";
+	return undefined;
+}
+
 /** Builds a Xiaomi model manager, preserving Token Plan region provider ids during discovery. */
 export function xiaomiModelManagerOptions(
 	config?: XiaomiModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const providerId = config?.providerId ?? "xiaomi";
-	const tokenPlanBaseUrls = config?.tokenPlanRegion
-		? [XIAOMI_TOKEN_PLAN_BASE_URLS[config.tokenPlanRegion]]
+	const tokenPlanRegion = config?.tokenPlanRegion ?? inferXiaomiTokenPlanRegion(providerId);
+	const tokenPlanBaseUrls = tokenPlanRegion
+		? [XIAOMI_TOKEN_PLAN_BASE_URLS[tokenPlanRegion]]
 		: XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS;
 	const XIAOMI_STANDARD_BASE_URL = "https://api.xiaomimimo.com/v1";
-	const isTokenPlanProvider = config?.tokenPlanRegion !== undefined || providerId.startsWith("xiaomi-token-plan-");
+	const isTokenPlanProvider = tokenPlanRegion !== undefined || providerId.startsWith("xiaomi-token-plan-");
 	const isTokenPlanKey = isTokenPlanProvider || apiKey?.startsWith("tp-");
 	// Token-plan keys always use a TP cluster; config?.baseUrl (from catalog)
 	// would incorrectly pin to the standard endpoint (api.xiaomimimo.com).
 	const baseUrl = isTokenPlanKey ? tokenPlanBaseUrls[0] : (config?.baseUrl ?? XIAOMI_STANDARD_BASE_URL);
 	const references = createBundledReferenceMap<"openai-completions">("xiaomi");
-	const throwOnAuthFetch: typeof globalThis.fetch = async (url, init) => {
-		const response = await (config?.fetch ?? globalThis.fetch)(url, init);
+	const throwOnAuthStatus = (response: Response): Error | undefined => {
 		if (response.status === 401 || response.status === 403) {
-			throw new Error(`Authentication failed (${response.status}) for ${url}`);
+			return new Error(`Authentication failed (${response.status}) for ${response.url}`);
 		}
-		return response;
+		return undefined;
 	};
 	const fetchModels = (url: string) =>
 		fetchOpenAICompatibleModels({
@@ -1478,7 +1485,8 @@ export function xiaomiModelManagerOptions(
 					name: toModelName(entry.display_name, model.name),
 				};
 			},
-			fetch: throwOnAuthFetch,
+			fetch: config?.fetch,
+			throwOnStatus: throwOnAuthStatus,
 		});
 	return {
 		providerId,
