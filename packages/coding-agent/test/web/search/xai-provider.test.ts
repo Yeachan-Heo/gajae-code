@@ -16,13 +16,28 @@ function restoreEnv() {
 	else process.env.XAI_SEARCH_BASE_URL = originalBaseUrl;
 }
 
-function auth(options: { key?: string; oauth?: boolean } = {}): AuthStorage {
+function auth(options: { apiKey?: string; oauthToken?: string } = {}): AuthStorage {
+	const credentialTypeBySession = new Map<string, "api_key" | "oauth">();
 	return {
-		hasAuth: (provider: string) => provider === "xai" && Boolean(options.key),
-		hasOAuth: (provider: string) => provider === "xai" && Boolean(options.oauth),
-		getApiKey: (provider: string) => (provider === "xai" ? options.key : undefined),
-		getOAuthAccess: (provider: string) =>
-			provider === "xai" && options.oauth && options.key ? { accessToken: options.key } : undefined,
+		hasAuth: (provider: string) => provider === "xai" && Boolean(options.apiKey ?? options.oauthToken),
+		hasOAuth: (provider: string) => provider === "xai" && Boolean(options.oauthToken),
+		getApiKey: (provider: string, sessionId?: string) => {
+			if (provider !== "xai") return undefined;
+			if (options.apiKey) {
+				if (sessionId) credentialTypeBySession.set(sessionId, "api_key");
+				return options.apiKey;
+			}
+			if (options.oauthToken) {
+				if (sessionId) credentialTypeBySession.set(sessionId, "oauth");
+				return options.oauthToken;
+			}
+			return undefined;
+		},
+		getOAuthAccess: vi.fn(() => {
+			throw new Error("xAI search auth mode detection must not resolve OAuth twice");
+		}),
+		getSessionCredentialType: (provider: string, sessionId?: string) =>
+			provider === "xai" && sessionId ? credentialTypeBySession.get(sessionId) : undefined,
 	} as unknown as AuthStorage;
 }
 
@@ -90,7 +105,8 @@ describe("xAI web search provider", () => {
 			system_prompt: "use web search",
 			max_output_tokens: 300,
 			temperature: 0,
-			authStorage: auth({ key: "oauth-token", oauth: true }),
+			authStorage: auth({ oauthToken: "oauth-token" }),
+			sessionId: "session-oauth",
 		});
 
 		expect(capturedUrl).toBe("https://xai.example/v1/responses");
@@ -143,7 +159,7 @@ describe("xAI web search provider", () => {
 			}),
 		);
 
-		const result = await searchXai({ query: "citations", authStorage: auth({ key: "sk-xai" }) });
+		const result = await searchXai({ query: "citations", authStorage: auth({ apiKey: "sk-xai" }) });
 		expect(result.answer).toBe("Annotated answer");
 		expect(result.authMode).toBe("api_key");
 		expect(result.sources).toEqual([
@@ -157,7 +173,7 @@ describe("xAI web search provider", () => {
 
 	it("throws 424 when xAI returns no grounded citations", async () => {
 		using _hook = hookFetch(async () => Response.json({ output_text: "plain answer" }));
-		await expect(searchXai({ query: "plain", authStorage: auth({ key: "sk-xai" }) })).rejects.toMatchObject({
+		await expect(searchXai({ query: "plain", authStorage: auth({ apiKey: "sk-xai" }) })).rejects.toMatchObject({
 			provider: "xai",
 			status: 424,
 		});
@@ -172,8 +188,28 @@ describe("xAI web search provider", () => {
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
+	it("does not resolve OAuth again when an API key credential wins", async () => {
+		let authorization = "";
+		using _hook = hookFetch(async (_input, init) => {
+			authorization = (init?.headers as Record<string, string>).Authorization;
+			return Response.json({
+				output_text: "answer",
+				citations: ["https://docs.x.ai/developers/tools/web-search"],
+			});
+		});
+
+		const result = await searchXai({
+			query: "auth precedence",
+			authStorage: auth({ apiKey: "sk-xai", oauthToken: "oauth-token" }),
+			sessionId: "session-with-both",
+		});
+
+		expect(authorization).toBe("Bearer sk-xai");
+		expect(result.authMode).toBe("api_key");
+	});
+
 	it("reports availability from unified xAI auth storage", () => {
-		expect(new XaiProvider().isAvailable(auth({ key: "sk-xai" }))).toBe(true);
+		expect(new XaiProvider().isAvailable(auth({ apiKey: "sk-xai" }))).toBe(true);
 		expect(new XaiProvider().isAvailable(auth())).toBe(false);
 	});
 });

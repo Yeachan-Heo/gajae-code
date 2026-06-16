@@ -63,12 +63,11 @@ async function resolveXaiAuth(
 	});
 	if (!bearer) return null;
 
-	if (authStorage.hasOAuth("xai")) {
-		const oauth = await authStorage.getOAuthAccess("xai", sessionId, { signal });
-		if (oauth?.accessToken === bearer) return { bearer, mode: "oauth" };
-	}
-
-	return { bearer, mode: "api_key" };
+	// getApiKey records the selected credential type for session-scoped calls.
+	// Do not call getOAuthAccess here: when an API-key credential wins, resolving
+	// OAuth solely for labelling would refresh/record the wrong credential.
+	const selectedType = authStorage.getSessionCredentialType("xai", sessionId);
+	return { bearer, mode: selectedType === "oauth" ? "oauth" : "api_key" };
 }
 
 export function buildXaiRequestBody(params: {
