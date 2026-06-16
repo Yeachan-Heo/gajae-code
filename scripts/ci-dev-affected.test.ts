@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, packageScriptCommand, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, packageScriptCommand, planTargetedTasks, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
 
 const packages: WorkspacePackage[] = [
 	{
@@ -190,7 +190,10 @@ describe("--matrix-json and --task CLI fan-out", () => {
 	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 		const proc = Bun.spawn(["bun", scriptPath, ...args], {
 			cwd: repoRoot,
-			env: { ...process.env, CI_DEV_CHANGED_PATHS: changedPaths, ...extraEnv },
+			// Default to push (broad) mode so these CLI cases stay deterministic
+			// regardless of the GITHUB_EVENT_NAME of the CI run executing them;
+			// PR-mode behavior is asserted via planTargetedTasks unit tests.
+			env: { ...process.env, GITHUB_EVENT_NAME: "push", CI_DEV_CHANGED_PATHS: changedPaths, ...extraEnv },
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -247,5 +250,88 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const { stdout, exitCode } = await runScript(["--native-build"], "docs/readme.md");
 		expect(exitCode).toBe(0);
 		expect(stdout).toContain("no native build tasks in plan");
+	});
+});
+
+describe("planTargetedTasks PR-mode targeting", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const testFiles = [
+		"packages/coding-agent/test/edit/foo.test.ts",
+		"packages/coding-agent/test/edit/bar.test.ts",
+		"packages/coding-agent/test/cli.test.ts",
+	];
+
+	function targeted(paths: readonly string[]) {
+		return planTargetedTasks(paths, targetingPackages, testFiles);
+	}
+
+	test("a single coding-agent test change runs only that test, not the whole package suite", () => {
+		const tasks = targeted(["packages/coding-agent/test/edit/foo.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
+		// No broad package-wide test, and no other coding-agent test file.
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
+		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
+		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
+	});
+
+	test("a source file with a directly-named test maps to exactly that test", () => {
+		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+	});
+
+	test("a source file with no mapped test runs the owning package check, not its test suite", () => {
+		const tasks = targeted(["packages/coding-agent/src/edit/unmapped.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("cli-smoke"); // coding-agent runtime smoke
+		expect(keys.some(key => key.startsWith("test:"))).toBe(false);
+	});
+
+	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {
+		const tasks = targeted([".github/workflows/dev-ci.yml"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "yaml-parse"]);
+	});
+
+	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
+		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+	});
+
+	test("docs/changelog-only changes plan nothing expensive", () => {
+		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	});
+
+	test("native-consuming test files pull in a single native build task", () => {
+		const tasks = targeted(["packages/coding-agent/test/cli.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/cli.test.ts");
+		// ensureNativeBuild adds exactly one native build task (built once, shared).
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
+	});
+});
+
+describe("push-mode broad planning still runs the fuller suite", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+
+	test("push mode plans the package-wide test for a coding-agent change", () => {
+		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
+		const keys = tasks.map(task => task.key);
+		// Broad planner keeps the package-wide test (the post-merge fuller suite).
+		expect(keys).toContain("test:@gajae-code/coding-agent");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 	});
 });
