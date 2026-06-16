@@ -119,6 +119,48 @@ describe("xAI web search provider", () => {
 		]);
 	});
 
+	it("auto-selects web_and_x when web and X options are mixed", () => {
+		const body = buildXaiRequestBody({
+			query: "xAI docs and X",
+			systemPrompt: "search both",
+			model: "grok-test",
+			allowedDomains: ["docs.x.ai"],
+			allowedXHandles: ["@xai"],
+		});
+
+		expect(body.tools).toEqual([
+			{
+				type: "web_search",
+				filters: { allowed_domains: ["docs.x.ai"] },
+			},
+			{
+				type: "x_search",
+				allowed_x_handles: ["xai"],
+			},
+		]);
+	});
+
+	it("rejects mode-incompatible xAI options and overlarge lists", () => {
+		expect(() =>
+			buildXaiRequestBody({
+				query: "bad mode",
+				systemPrompt: "search",
+				model: "grok-test",
+				xaiSearchMode: "x",
+				allowedDomains: ["docs.x.ai"],
+			}),
+		).toThrow("Web Search options require xai_search_mode='web' or 'web_and_x'");
+
+		expect(() =>
+			buildXaiRequestBody({
+				query: "too many handles",
+				systemPrompt: "search",
+				model: "grok-test",
+				allowedXHandles: Array.from({ length: 21 }, (_, index) => `handle${index}`),
+			}),
+		).toThrow("allowed_x_handles supports at most 20 entries");
+	});
+
 	it("rejects mutually exclusive xAI filters before fetching", () => {
 		expect(() =>
 			buildXaiRequestBody({
@@ -204,7 +246,7 @@ describe("xAI web search provider", () => {
 						x_search_calls: 3,
 						view_image_calls: 2,
 						image_search_calls: 1,
-						video_understanding_calls: 1,
+						SERVER_SIDE_TOOL_VIEW_X_VIDEO: 1,
 					},
 				},
 			});
@@ -315,6 +357,25 @@ describe("xAI web search provider", () => {
 
 		expect(authorization).toBe("Bearer sk-xai");
 		expect(result.authMode).toBe("api_key");
+	});
+
+	it("reports OAuth auth mode without a caller session id", async () => {
+		let authorization = "";
+		using _hook = hookFetch(async (_input, init) => {
+			authorization = (init?.headers as Record<string, string>).Authorization;
+			return Response.json({
+				output_text: "answer",
+				citations: ["https://docs.x.ai/developers/tools/web-search"],
+			});
+		});
+
+		const result = await searchXai({
+			query: "oauth mode",
+			authStorage: auth({ oauthToken: "oauth-token" }),
+		});
+
+		expect(authorization).toBe("Bearer oauth-token");
+		expect(result.authMode).toBe("oauth");
 	});
 
 	it("reports availability from unified xAI auth storage", () => {

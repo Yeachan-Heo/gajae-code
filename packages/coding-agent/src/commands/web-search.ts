@@ -9,6 +9,22 @@ const PROVIDERS: Array<string> = ["auto", ...SEARCH_PROVIDER_ORDER];
 
 const RECENCY: NonNullable<SearchCommandArgs["recency"]>[] = ["day", "week", "month", "year"];
 
+type ListFlagValue = string | string[] | undefined;
+
+function appendCsv(existing: string[] | undefined, raw: ListFlagValue): string[] | undefined {
+	const rawValues = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw];
+	const values = rawValues
+		.flatMap(value => value.split(","))
+		.map(value => value.trim())
+		.filter(Boolean);
+	if (values.length === 0) return existing;
+	return [...(existing ?? []), ...values];
+}
+
+function combineCsv(...values: ListFlagValue[]): string[] | undefined {
+	return values.reduce<string[] | undefined>((acc, value) => appendCsv(acc, value), undefined);
+}
+
 export default class Search extends Command {
 	static description = "Test web search providers";
 
@@ -23,10 +39,38 @@ export default class Search extends Command {
 		recency: Flags.string({ description: "Recency filter", options: RECENCY }),
 		limit: Flags.integer({ char: "l", description: "Max results to return" }),
 		"xai-mode": Flags.string({ description: "xAI mode", options: ["web", "x", "web_and_x"] }),
-		"allowed-domains": Flags.string({ description: "xAI web_search allowed domains, comma-separated" }),
-		"excluded-domains": Flags.string({ description: "xAI web_search excluded domains, comma-separated" }),
-		"allowed-x-handles": Flags.string({ description: "xAI x_search allowed handles, comma-separated" }),
-		"excluded-x-handles": Flags.string({ description: "xAI x_search excluded handles, comma-separated" }),
+		"allowed-domain": Flags.string({
+			description: "xAI web_search allowed domains, comma-separated",
+			multiple: true,
+		}),
+		"allowed-domains": Flags.string({
+			description: "xAI web_search allowed domains, comma-separated",
+			multiple: true,
+		}),
+		"excluded-domain": Flags.string({
+			description: "xAI web_search excluded domains, comma-separated",
+			multiple: true,
+		}),
+		"excluded-domains": Flags.string({
+			description: "xAI web_search excluded domains, comma-separated",
+			multiple: true,
+		}),
+		"allowed-x-handle": Flags.string({
+			description: "xAI x_search allowed handles, comma-separated",
+			multiple: true,
+		}),
+		"allowed-x-handles": Flags.string({
+			description: "xAI x_search allowed handles, comma-separated",
+			multiple: true,
+		}),
+		"excluded-x-handle": Flags.string({
+			description: "xAI x_search excluded handles, comma-separated",
+			multiple: true,
+		}),
+		"excluded-x-handles": Flags.string({
+			description: "xAI x_search excluded handles, comma-separated",
+			multiple: true,
+		}),
 		"from-date": Flags.string({ description: "xAI x_search start date (ISO8601)" }),
 		"to-date": Flags.string({ description: "xAI x_search end date (ISO8601)" }),
 		"image-understanding": Flags.boolean({ description: "Enable xAI image understanding" }),
@@ -47,13 +91,10 @@ export default class Search extends Command {
 			limit: flags.limit,
 			expanded: !flags.compact,
 			xaiSearchMode: flags["xai-mode"] as SearchCommandArgs["xaiSearchMode"],
-			allowedDomains: typeof flags["allowed-domains"] === "string" ? flags["allowed-domains"].split(",") : undefined,
-			excludedDomains:
-				typeof flags["excluded-domains"] === "string" ? flags["excluded-domains"].split(",") : undefined,
-			allowedXHandles:
-				typeof flags["allowed-x-handles"] === "string" ? flags["allowed-x-handles"].split(",") : undefined,
-			excludedXHandles:
-				typeof flags["excluded-x-handles"] === "string" ? flags["excluded-x-handles"].split(",") : undefined,
+			allowedDomains: combineCsv(flags["allowed-domain"], flags["allowed-domains"]),
+			excludedDomains: combineCsv(flags["excluded-domain"], flags["excluded-domains"]),
+			allowedXHandles: combineCsv(flags["allowed-x-handle"], flags["allowed-x-handles"]),
+			excludedXHandles: combineCsv(flags["excluded-x-handle"], flags["excluded-x-handles"]),
 			fromDate: flags["from-date"],
 			toDate: flags["to-date"],
 			enableImageUnderstanding: flags["image-understanding"],

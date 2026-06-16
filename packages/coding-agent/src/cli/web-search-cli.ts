@@ -210,10 +210,10 @@ ${chalk.bold("Options:")}
   --provider <name>   Provider: ${PROVIDERS.join(", ")}
   --recency <value>   Recency filter: ${RECENCY_OPTIONS.join(", ")}
   --xai-mode <mode>   xAI mode: web, x, web_and_x
-  --allowed-domain d  xAI web_search domain allow-list (comma-separated, repeatable)
-  --excluded-domain d xAI web_search domain deny-list (comma-separated, repeatable)
-  --allowed-x-handle h xAI x_search handle allow-list (comma-separated, repeatable)
-  --excluded-x-handle h xAI x_search handle deny-list (comma-separated, repeatable)
+  --allowed-domain(s) d xAI web_search domain allow-list (comma-separated, repeatable)
+  --excluded-domain(s) d xAI web_search domain deny-list (comma-separated, repeatable)
+  --allowed-x-handle(s) h xAI x_search handle allow-list (comma-separated, repeatable)
+  --excluded-x-handle(s) h xAI x_search handle deny-list (comma-separated, repeatable)
   --from-date <date>  xAI x_search start date (ISO8601)
   --to-date <date>    xAI x_search end date (ISO8601)
   --image-understanding Enable xAI image understanding

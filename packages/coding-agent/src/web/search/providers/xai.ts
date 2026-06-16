@@ -85,7 +85,8 @@ async function resolveXaiAuth(
 	model: string,
 	signal: AbortSignal | undefined,
 ): Promise<XaiAuth | null> {
-	const bearer = await authStorage.getApiKey("xai", sessionId, {
+	const credentialSessionId = sessionId ?? `xai-search:${crypto.randomUUID()}`;
+	const bearer = await authStorage.getApiKey("xai", credentialSessionId, {
 		baseUrl: getBaseUrl(),
 		modelId: model,
 		signal,
@@ -95,7 +96,7 @@ async function resolveXaiAuth(
 	// getApiKey records the selected credential type for session-scoped calls.
 	// Do not call getOAuthAccess here: when an API-key credential wins, resolving
 	// OAuth solely for labelling would refresh/record the wrong credential.
-	const selectedType = authStorage.getSessionCredentialType("xai", sessionId);
+	const selectedType = authStorage.getSessionCredentialType("xai", credentialSessionId);
 	return { bearer, mode: selectedType === "oauth" ? "oauth" : "api_key" };
 }
 
@@ -390,7 +391,12 @@ function parseUsage(json: any): SearchUsage | undefined {
 		xSearchRequests: positiveUsage(toolUsage, "x_search_calls", "SERVER_SIDE_TOOL_X_SEARCH"),
 		imageSearchRequests: positiveUsage(toolUsage, "image_search_calls", "SERVER_SIDE_TOOL_IMAGE_SEARCH"),
 		imageUnderstandingRequests: positiveUsage(toolUsage, "view_image_calls", "SERVER_SIDE_TOOL_VIEW_IMAGE"),
-		videoUnderstandingRequests: positiveUsage(toolUsage, "video_understanding_calls", "SERVER_SIDE_TOOL_VIEW_VIDEO"),
+		videoUnderstandingRequests: positiveUsage(
+			toolUsage,
+			"video_understanding_calls",
+			"SERVER_SIDE_TOOL_VIEW_VIDEO",
+			"SERVER_SIDE_TOOL_VIEW_X_VIDEO",
+		),
 	};
 
 	return Object.values(parsed).some(value => value !== undefined) ? parsed : undefined;
