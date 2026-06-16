@@ -188,6 +188,16 @@ function looksOpenAIFamilyModelId(ctx: ActiveSearchModelContext): boolean {
 	return looksHostedModelId(ctx.wireModelId) || looksHostedModelId(ctx.modelId);
 }
 
+function looksXaiModelId(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	const id = modelId.toLowerCase();
+	return id.startsWith("grok-") || id.startsWith("x-ai/grok-") || id.startsWith("xai/grok-");
+}
+
+function looksXaiFamilyModelId(ctx: ActiveSearchModelContext): boolean {
+	return looksXaiModelId(ctx.wireModelId) || looksXaiModelId(ctx.modelId);
+}
+
 export function isLocalBaseUrl(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return false;
 	let url: URL;
@@ -229,6 +239,7 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	if (modelId.startsWith("claude-") && isAnthropicWire(ctx.api)) return "anthropic";
 	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api)) return "gemini";
+	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api)) return "xai";
 	if (looksOpenAIFamilyModelId(ctx) && isOpenAICompatWire(ctx.api)) {
 		if (ctx.webSearch === "on" || !isLocalBaseUrl(ctx.baseUrl)) return "codex";
 	}

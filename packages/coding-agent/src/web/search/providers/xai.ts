@@ -451,7 +451,12 @@ export async function searchXai(params: XaiSearchParams): Promise<SearchResponse
 		throw new SearchProviderError("xai", `xAI search API error (${response.status}): ${text}`, response.status);
 	}
 
-	const json = text ? JSON.parse(text) : {};
+	let json: any;
+	try {
+		json = text ? JSON.parse(text) : {};
+	} catch {
+		throw new SearchProviderError("xai", "xAI search API returned invalid JSON", 502);
+	}
 	const citations = parseXaiCitations(json);
 	if (citations.length === 0) {
 		throw new SearchProviderError("xai", "xAI web search returned no citations", 424);

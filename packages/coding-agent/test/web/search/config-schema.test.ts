@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { ModelsConfigSchema } from "../../../src/config/models-config-schema";
 import { SETTINGS_SCHEMA } from "../../../src/config/settings-schema";
-import { isConfigurableSearchProviderId, isSearchProviderPreference } from "../../../src/web/search/types";
+import {
+	CONFIGURABLE_SEARCH_PROVIDER_IDS,
+	isConfigurableSearchProviderId,
+	isSearchProviderId,
+	isSearchProviderPreference,
+} from "../../../src/web/search/types";
 
 describe("web search config schema", () => {
 	it("accepts provider webSearch mode enum and rejects invalid modes", () => {
@@ -21,6 +26,9 @@ describe("web search config schema", () => {
 		expect(isSearchProviderPreference("openai-compatible")).toBe(false);
 		expect(isConfigurableSearchProviderId("xai")).toBe(true);
 		expect(isSearchProviderPreference("xai")).toBe(true);
+		expect(CONFIGURABLE_SEARCH_PROVIDER_IDS).toContain("xai");
+		expect(isSearchProviderId("xai")).toBe(true);
+		expect(isSearchProviderId("openai-compatible")).toBe(true);
 	});
 
 	it("accepts xAI as a selectable web search provider", () => {
