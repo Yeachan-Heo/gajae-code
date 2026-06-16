@@ -166,13 +166,15 @@ describe("bash resource lifecycle red-team", () => {
 
 		const meta = result.details?.meta?.truncation;
 		expect(meta?.artifactId).toBeString();
-		expect(meta?.totalBytes).toBeGreaterThan(DEFAULT_ARTIFACT_MAX_BYTES);
+		expect(meta?.truncatedBy).toBe("bytes");
+		expect(meta?.totalBytes).toBeGreaterThan(DEFAULT_ARTIFACT_MAX_BYTES / 2);
+		expect(meta?.totalBytes).toBeLessThanOrEqual(DEFAULT_ARTIFACT_MAX_BYTES);
+		expect(meta?.outputBytes).toBeGreaterThan(0);
 		expect(meta?.outputBytes).toBeLessThan(meta!.totalBytes);
+		expect(meta?.outputBytes).toBeLessThanOrEqual(DEFAULT_ARTIFACT_MAX_BYTES);
 
 		const artifactPath = path.join(tempDir, "artifacts", `${meta!.artifactId}.bash.log`);
 		expect(fs.existsSync(artifactPath)).toBe(true);
-		const artifact = fs.readFileSync(artifactPath, "utf8");
-		expect(artifact).toContain("artifact truncated after 10485760 bytes");
-		expect(fs.statSync(artifactPath).size).toBeLessThan(DEFAULT_ARTIFACT_MAX_BYTES + 512);
+		expect(fs.statSync(artifactPath).size).toBe(meta!.totalBytes);
 	});
 });

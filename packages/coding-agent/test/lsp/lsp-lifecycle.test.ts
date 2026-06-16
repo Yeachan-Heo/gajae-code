@@ -114,7 +114,7 @@ describe("LSP lifecycle behavior", () => {
 			const runner = path.join(cwd, "probe.ts");
 			await Bun.write(
 				runner,
-				`import { detectLspmux } from ${JSON.stringify(path.resolve("packages/coding-agent/src/lsp/lspmux.ts"))};\nimport { liveOwnedProcessCount, disposeAllOwnedProcesses } from ${JSON.stringify(path.resolve("packages/coding-agent/src/runtime/process-lifecycle.ts"))};\nconst before = liveOwnedProcessCount();\nconst state = await detectLspmux();\nconst after = liveOwnedProcessCount();\nawait disposeAllOwnedProcesses();\nconsole.log(JSON.stringify({ state, before, after }));\n`,
+				`import { detectLspmux } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/lsp/lspmux.ts"))};\nimport { liveOwnedProcessCount, disposeAllOwnedProcesses } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/runtime/process-lifecycle.ts"))};\nconst before = liveOwnedProcessCount();\nconst state = await detectLspmux();\nconst after = liveOwnedProcessCount();\nawait disposeAllOwnedProcesses();\nconsole.log(JSON.stringify({ state, before, after }));\n`,
 			);
 			const proc = Bun.spawn([BUN, runner], {
 				cwd: path.resolve("."),

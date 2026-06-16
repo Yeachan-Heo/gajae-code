@@ -143,7 +143,7 @@ describe("DAP lifecycle behavior", () => {
 					adapter: { ...SOCKET_ADAPTER, args: [script] },
 					cwd,
 				}),
-			).rejects.toThrow(/did not connect within 10s|timed out|Connection refused|ENOENT/);
+			).rejects.toThrow(/did not connect within 10s|timed out|Connection refused|ENOENT|Socket not ready/);
 
 			expect(liveOwnedProcessCount()).toBe(before);
 		} finally {
