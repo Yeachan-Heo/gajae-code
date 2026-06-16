@@ -1,5 +1,5 @@
 import { readModelCache, writeModelCache } from "./model-cache";
-import { enrichModelThinking } from "./model-thinking";
+import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
 import { isRecord } from "./utils";
@@ -90,6 +90,7 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 		}
 		out.push(enrichModelThinking(item as Model<TApi>));
 	}
+	applyGeneratedModelPolicies(out as Model<Api>[]);
 	return out;
 }
 
