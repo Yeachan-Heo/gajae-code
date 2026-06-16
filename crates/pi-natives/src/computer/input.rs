@@ -710,4 +710,93 @@ mod live_tests {
 		assert!(!controller.has_held_buttons());
 		let _ = MouseButton::Left; // keep the import meaningful for future click tests
 	}
+
+	/// G005 acceptance drill: drives all nine primitives through the gated
+	/// execute_input path against the focused frontmost app, then waits for a
+	/// human kill-switch press and proves input is blocked afterward.
+	#[test]
+	#[ignore = "live G005: drives the focused app + needs a human hotkey press"]
+	fn all_nine_acceptance_drill() {
+		use std::{thread::sleep, time::Duration};
+
+		use crate::computer::{
+			capture::capture_primary_display,
+			executor::{InputAction, MacDisplayContext, MacPermissionGate, execute_input},
+			hotkey,
+			supervisor::Supervisor,
+		};
+
+		assert!(hotkey::start(), "kill-switch hotkey listener must be live");
+		let frame = capture_primary_display().expect("Screen Recording granted"); // primitive 1: screenshot
+		let display = frame.display;
+		let perms = MacPermissionGate;
+		let dctx = MacDisplayContext;
+		let cancel = || false;
+		let cx = f64::from(display.width_px) * 0.5;
+		let cy = f64::from(display.height_px) * 0.42;
+
+		let mut act = |action: InputAction| {
+			// Stand in for the listener's periodic heartbeat so input_allowed stays fresh.
+			Supervisor::global().heartbeat();
+			let mut controller = guarded_controller().expect("Accessibility granted");
+			execute_input(
+				&action,
+				Supervisor::global(),
+				&perms,
+				&dctx,
+				None,
+				&display,
+				&mut controller,
+				&cancel,
+			)
+			.expect("gated action should succeed");
+			sleep(Duration::from_millis(350));
+		};
+
+		act(InputAction::Move { x: cx, y: cy }); // 2 move
+		act(InputAction::Click { x: cx, y: cy, button: MouseButton::Left }); // 3 click (focus body)
+		act(InputAction::Type { text: "COMPUTER_USE_E2E gajae ".to_string() }); // 4 type
+		act(InputAction::Keypress { keys: vec!["return".to_string()] }); // 5 keypress
+		act(InputAction::Type { text: "line two alpha beta gamma delta epsilon".to_string() });
+		act(InputAction::DoubleClick { x: cx, y: cy, button: MouseButton::Left }); // 6 double_click
+		act(InputAction::Drag {
+			x:      cx - 120.0,
+			y:      cy,
+			to_x:   cx + 120.0,
+			to_y:   cy,
+			button: MouseButton::Left,
+		}); // 7 drag
+		act(InputAction::Scroll { x: cx, y: cy, scroll_x: 0.0, scroll_y: -120.0 }); // 8 scroll
+		act(InputAction::Wait { ms: 300 }); // 9 wait
+
+		println!(">>> KILL-SWITCH DRILL: press Control+Option+Command+Escape now (within ~10s) <<<");
+		for _ in 0..50 {
+			if Supervisor::global().is_suspended() {
+				break;
+			}
+			sleep(Duration::from_millis(200));
+		}
+		assert!(
+			Supervisor::global().is_suspended(),
+			"kill-switch should latch after you press the hotkey"
+		);
+
+		// Prove input is blocked after the kill-switch, until a user-only reset.
+		let mut controller = guarded_controller().expect("Accessibility granted");
+		let blocked = execute_input(
+			&InputAction::Move { x: cx, y: cy },
+			Supervisor::global(),
+			&perms,
+			&dctx,
+			None,
+			&display,
+			&mut controller,
+			&cancel,
+		);
+		assert!(blocked.is_err(), "input must be blocked while suspended");
+		Supervisor::global().reset();
+		println!(
+			"G005 PASS: all nine primitives executed; kill-switch latched and blocked further input."
+		);
+	}
 }
