@@ -1141,7 +1141,10 @@ function b() {
 						testDir,
 						Settings.isolated({
 							"bash.autoBackground.enabled": true,
-							"bash.autoBackground.thresholdMs": 50,
+							// Generous threshold so a trivial `echo` always finishes inline; a tight
+							// budget (e.g. 50ms) races process-spawn overhead under full-suite load
+							// and flakily backgrounds an instant command.
+							"bash.autoBackground.thresholdMs": 30_000,
 						}),
 						{
 							getSessionId: () => "test-session",

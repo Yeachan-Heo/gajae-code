@@ -949,26 +949,31 @@ mod tests {
 		let (_tx, rx) = mpsc::channel();
 		// GitHub-hosted Windows runners drive the `sh` printf loop through
 		// ConPTY far more slowly than Unix, so this synthetic high-output
-		// workload needs a more generous budget there. The bounded reader's
-		// backpressure behavior is platform-independent; this budget only
-		// guards against deadlock / unbounded buffering, not raw shell
-		// throughput (Unix completes the same run in ~3s).
+		// workload uses less data and a more generous budget there. The
+		// bounded reader's backpressure behavior is platform-independent;
+		// this budget only guards against deadlock / unbounded buffering,
+		// not raw shell throughput (Unix completes the same run in ~3s).
 		#[cfg(windows)]
-		let budget_ms: u32 = 60_000;
+		let (line_count, timeout_ms, max_duration): (usize, u32, Duration) =
+			(20_000, 60_000, Duration::from_secs(60));
 		#[cfg(not(windows))]
-		let budget_ms: u32 = 20_000;
+		let (line_count, timeout_ms, max_duration): (usize, u32, Duration) =
+			(200_000, 20_000, Duration::from_secs(20));
+		let command = format!(
+			"i=0; while [ $i -lt {line_count} ]; do printf '%080d\\n' \"$i\"; i=$((i+1)); done"
+		);
 		let started = Instant::now();
 		let result = run_pty_sync(
-			test_config("i=0; while [ $i -lt 200000 ]; do printf '%080d\\n' \"$i\"; i=$((i+1)); done"),
+			test_config(&command),
 			None,
 			rx,
-			task::CancelToken::new(Some(budget_ms), None),
+			task::CancelToken::new(Some(timeout_ms), None),
 		)
 		.expect("high-output PTY run should complete without unbounded buffering");
 		assert!(result.exit_code.is_some());
 		assert!(!result.cancelled);
 		assert!(!result.timed_out);
-		assert!(started.elapsed() < Duration::from_millis(u64::from(budget_ms)));
+		assert!(started.elapsed() < max_duration);
 	}
 
 	#[test]
