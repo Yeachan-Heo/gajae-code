@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
+import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
 const tempRoots: string[] = [];
 
@@ -107,6 +108,87 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		const chips = entry?.hud?.chips ?? [];
 		expect(chips.some(c => c.label === "stage" && c.value === "planner")).toBe(true);
 		expect(chips.some(c => c.label === "iter" && c.value === "1")).toBe(true);
+	});
+
+	it("visible HUD prefers canonical final over a stale active-state snapshot", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
+		await runNativeRalplanCommand(
+			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
+			root,
+		);
+		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8")) as {
+			active_skills?: Array<{
+				skill: string;
+				phase?: string;
+				hud?: { chips?: Array<{ label: string; value?: string }> };
+			}>;
+		};
+		await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "6", "--artifact", "# final", "--run-id", runId],
+			root,
+		);
+		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
+		await fs.writeFile(
+			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			`${JSON.stringify(
+				{
+					skill: "ralplan",
+					active: true,
+					phase: "revision",
+					hud: { version: 1, chips: [{ label: "stage", value: "revision" }] },
+				},
+				null,
+				2,
+			)}\n`,
+			"utf-8",
+		);
+
+		const visible = await readVisibleSkillActiveState(root);
+		const entry = visible?.active_skills?.find(item => item.skill === "ralplan");
+		expect(entry?.phase).toBe("final");
+		expect(entry?.hud?.chips?.some(chip => chip.label === "stage" && chip.value === "final")).toBe(true);
+	});
+
+	it("visible HUD prefers canonical inactive handoff over stale active entries", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
+		await runNativeRalplanCommand(
+			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
+			root,
+		);
+		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
+		await fs.writeFile(
+			statePath,
+			`${JSON.stringify({ skill: "ralplan", active: false, current_phase: "handoff", run_id: runId, version: 2 }, null, 2)}\n`,
+			"utf-8",
+		);
+		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
+		await fs.writeFile(
+			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			`${JSON.stringify(
+				{
+					skill: "ralplan",
+					active: true,
+					phase: "revision",
+					hud: { version: 1, chips: [{ label: "stage", value: "revision" }] },
+				},
+				null,
+				2,
+			)}\n`,
+			"utf-8",
+		);
+
+		const visible = await readVisibleSkillActiveState(root);
+		const entry = visible?.active_skills?.find(item => item.skill === "ralplan");
+		expect(entry?.phase).toBe("handoff");
+		expect(entry?.hud?.chips?.some(chip => chip.label === "stage" && chip.value === "handoff")).toBe(true);
 	});
 
 	it("rejects unknown --architect kinds with exit 2", async () => {
@@ -420,6 +502,81 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 		);
 		expect(result.status).toBe(0);
 		expect(await readPhase(root)).toBe("handoff");
+	});
+
+	it("doctor reports active-state phase drift from canonical final", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
+		await runNativeRalplanCommand(
+			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
+			root,
+		);
+		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
+		await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "6", "--artifact", "# final", "--run-id", runId],
+			root,
+		);
+		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
+		await fs.writeFile(
+			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			`${JSON.stringify({ skill: "ralplan", active: true, phase: "revision" }, null, 2)}\n`,
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(["doctor", "--json"], root);
+		expect(result.status).toBe(1);
+		const parsed = JSON.parse(result.stdout ?? "{}") as {
+			problems?: Array<{ type: string; skill?: string; path: string; message: string }>;
+		};
+		const driftProblems = (parsed.problems ?? []).filter(
+			problem =>
+				problem.type === "stale_active_state" &&
+				problem.skill === "ralplan" &&
+				problem.message.includes("differs from canonical mode-state phase final"),
+		);
+		expect(driftProblems.some(problem => problem.path.endsWith(path.join("active", "ralplan.json")))).toBe(true);
+		expect(driftProblems.some(problem => problem.path.endsWith("skill-active-state.json"))).toBe(true);
+	});
+
+	it("doctor reports drift from canonical inactive handoff", async () => {
+		const root = await tempDir();
+		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
+		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
+		await runNativeRalplanCommand(
+			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
+			root,
+		);
+		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
+		await fs.writeFile(
+			statePath,
+			`${JSON.stringify({ skill: "ralplan", active: false, current_phase: "handoff", run_id: runId, version: 2 }, null, 2)}\n`,
+			"utf-8",
+		);
+		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
+		await fs.writeFile(
+			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			`${JSON.stringify({ skill: "ralplan", active: true, phase: "revision" }, null, 2)}\n`,
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(["doctor", "--json"], root);
+		expect(result.status).toBe(1);
+		const parsed = JSON.parse(result.stdout ?? "{}") as {
+			problems?: Array<{ type: string; skill?: string; path: string; message: string }>;
+		};
+		const driftProblems = (parsed.problems ?? []).filter(
+			problem =>
+				problem.type === "stale_active_state" &&
+				problem.skill === "ralplan" &&
+				problem.message.includes("differs from canonical mode-state phase handoff"),
+		);
+		expect(driftProblems.some(problem => problem.path.endsWith(path.join("active", "ralplan.json")))).toBe(true);
+		expect(driftProblems.some(problem => problem.path.endsWith("skill-active-state.json"))).toBe(true);
 	});
 });
 

@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import {
 	type ActiveSessionScope,
+	readActiveEntries,
 	rebuildActiveSnapshot,
 	removeActiveEntry,
 	writeActiveEntry,
@@ -416,6 +417,62 @@ function rawActiveEntries(state: SkillActiveState | null): SkillActiveEntry[] {
 	return out;
 }
 
+async function readModeStatePhase(
+	cwd: string,
+	sessionId: string | undefined,
+	skill: CanonicalGjcWorkflowSkill,
+): Promise<string | undefined> {
+	const stateDir = path.join(cwd, ".gjc", "state");
+	const normalizedSessionId = safeString(sessionId).trim();
+	const filePath = normalizedSessionId
+		? path.join(stateDir, "sessions", encodePathSegment(normalizedSessionId), `${skill}-state.json`)
+		: path.join(stateDir, `${skill}-state.json`);
+	try {
+		const parsed = JSON.parse(await Bun.file(filePath).text());
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const record = parsed as Record<string, unknown>;
+		const phase = safeString(record.current_phase).trim();
+		if (!phase) return undefined;
+		if (record.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+		return phase;
+	} catch {
+		return undefined;
+	}
+}
+
+const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
+	"final",
+	"handoff",
+	"complete",
+	"completed",
+	"failed",
+	"cancelled",
+	"canceled",
+	"inactive",
+]);
+
+function withCanonicalRalplanPhase(entry: SkillActiveEntry, canonicalPhase: string | undefined): SkillActiveEntry {
+	if (
+		entry.skill !== "ralplan" ||
+		!canonicalPhase ||
+		!RALPLAN_CANONICAL_PHASE_OVERRIDES.has(canonicalPhase) ||
+		entry.phase === canonicalPhase
+	) {
+		return entry;
+	}
+	const hud = entry.hud
+		? {
+				...entry.hud,
+				chips: entry.hud.chips?.map(chip => (chip.label === "stage" ? { ...chip, value: canonicalPhase } : chip)),
+			}
+		: undefined;
+	return {
+		...entry,
+		phase: canonicalPhase,
+		...(hud ? { hud } : {}),
+	};
+}
+
 function filterRootEntriesForSession(entries: SkillActiveEntry[], sessionId?: string): SkillActiveEntry[] {
 	const normalizedSessionId = safeString(sessionId).trim();
 	if (!normalizedSessionId) return entries;
@@ -538,19 +595,32 @@ export function collapsePlanningPipeline(entries: readonly SkillActiveEntry[]): 
 	return entries.filter(entry => !PLANNING_PIPELINE_SKILLS.has(entry.skill) || entry === current);
 }
 
-function mergeVisibleEntries(
+async function mergeVisibleEntries(
+	cwd: string,
 	sessionState: SkillActiveState | null,
 	rootState: SkillActiveState | null,
 	sessionId?: string,
-): SkillActiveEntry[] {
+): Promise<SkillActiveEntry[]> {
 	// Use the raw (active + inactive) rows so a handoff demotion stays visible
 	// long enough to supersede a stale same-skill row before the active filter.
-	const rootEntries = filterRootEntriesForSession(rawActiveEntries(rootState), sessionId);
+	// Per-skill files in active/<skill>.json are authoritative and are merged
+	// after the derived snapshot cache, so a stale skill-active-state.json row
+	// cannot override the latest entry file.
+	const rootEntries = filterRootEntriesForSession(
+		[...rawActiveEntries(rootState), ...(await readActiveEntries(cwd))],
+		sessionId,
+	);
 	const merged = new Map(rootEntries.map(entry => [entryKey(entry), entry]));
-	for (const entry of rawActiveEntries(sessionState)) {
+	const sessionEntries = sessionId
+		? [...rawActiveEntries(sessionState), ...(await readActiveEntries(cwd, { sessionId }))]
+		: rawActiveEntries(sessionState);
+	for (const entry of sessionEntries) {
 		merged.set(entryKey(entry), entry);
 	}
-	return dedupeVisibleBySkill([...merged.values()], sessionId).filter(entry => entry.active !== false);
+	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
+	return dedupeVisibleBySkill([...merged.values()], sessionId)
+		.filter(entry => entry.active !== false)
+		.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
 }
 
 export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveState | null> {
@@ -559,7 +629,7 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 		readRawActiveStateForHandoff(rootPath, false),
 		sessionPath ? readRawActiveStateForHandoff(sessionPath, false) : Promise.resolve(null),
 	]);
-	const activeSkills = mergeVisibleEntries(sessionState, rootState, sessionId);
+	const activeSkills = await mergeVisibleEntries(cwd, sessionState, rootState, sessionId);
 	if (activeSkills.length === 0) return null;
 	const primary = activeSkills[0];
 	return {
@@ -622,7 +692,9 @@ async function activeSubskillsForExistingEntry(
 		readRawActiveStateForHandoff(rootPath, false),
 		sessionPath ? readRawActiveStateForHandoff(sessionPath, false) : Promise.resolve(null),
 	]);
-	const existing = mergeVisibleEntries(sessionState, rootState, sessionId).find(entry => entry.skill === skill);
+	const existing = (await mergeVisibleEntries(cwd, sessionState, rootState, sessionId)).find(
+		entry => entry.skill === skill,
+	);
 	return existing?.active_subskills;
 }
 

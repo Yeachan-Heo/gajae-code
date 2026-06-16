@@ -13,6 +13,7 @@ import {
 } from "./ledger-event-renderer";
 import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { migrateWorkflowState } from "./state-migrations";
+import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonlIdempotent,
 	readExistingStateForMutation,
@@ -102,6 +103,10 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 
 export function isRalplanArtifactWriteInvocation(args: readonly string[]): boolean {
 	return hasFlag(args, "--write");
+}
+
+function isRalplanDoctorInvocation(args: readonly string[]): boolean {
+	return args[0] === "doctor";
 }
 
 function assertSafePathComponent(value: string, label: string): void {
@@ -854,10 +859,15 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	return { status: 0, stdout };
 }
 
+async function handleDoctor(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
+	return await runNativeStateCommand(["doctor", "--skill", "ralplan", ...args.slice(1)], cwd);
+}
+
 /* -------------------------------- entry --------------------------------- */
 
 export async function runNativeRalplanCommand(args: string[], cwd = process.cwd()): Promise<RalplanCommandResult> {
 	try {
+		if (isRalplanDoctorInvocation(args)) return await handleDoctor(args, cwd);
 		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd);
 		return await handleConsensusHandoff(args, cwd);
 	} catch (error) {

@@ -700,13 +700,9 @@ export class CronDeleteTool implements AgentTool<typeof cronDeleteSchema, CronDe
 	): Promise<AgentToolResult<CronDeleteToolDetails>> {
 		const ownerId = this.session.getAgentId?.() ?? undefined;
 		const deleted = deleteRecord(ownerId, params.id);
+		const text = deleted ? `Cancelled ${params.id}` : `No scheduled task '${params.id}' found; nothing to cancel.`;
 		return {
-			content: [
-				{
-					type: "text",
-					text: deleted ? `Cancelled ${params.id}` : `Failed to remove scheduled task '${params.id}'`,
-				},
-			],
+			content: [{ type: "text", text }],
 			details: { id: params.id, deleted },
 		};
 	}

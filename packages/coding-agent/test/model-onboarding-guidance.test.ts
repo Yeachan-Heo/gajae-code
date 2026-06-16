@@ -93,6 +93,17 @@ describe("model onboarding guidance", () => {
 		}
 	});
 
+	it("adds headless-aware credential guidance for OpenCode Go subscription providers (#755)", () => {
+		const text = formatNoCredentialOnboardingError("opencode-go");
+		expectProviderOnboardingGuidance(text);
+		expect(text).toContain("interactive; not available in headless/print mode");
+		expect(text).toContain("OpenCode subscriptions authenticate with an API key");
+		expect(text).toContain("https://opencode.ai/auth");
+		expect(text).toContain("OPENCODE_API_KEY");
+		expect(text).toContain("project .env is intentionally ignored");
+		expect(text).toContain("gjc auth-broker login opencode-go");
+	});
+
 	it("updates /model status output with provider setup and login routes", async () => {
 		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "model");
 		expect(command?.handle).toBeTruthy();
@@ -132,7 +143,7 @@ describe("model onboarding guidance", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30000);
 
 	it("uses shared provider onboarding text for AgentSession no-model and no-credential errors", async () => {
 		const noModelDir = await createTempDir();

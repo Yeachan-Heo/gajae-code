@@ -450,6 +450,52 @@ function activeFlag(value: unknown): boolean {
 	return isPlainObject(value) && value.active !== false;
 }
 
+function phaseFromActiveValue(value: unknown): string | undefined {
+	if (!isPlainObject(value) || typeof value.phase !== "string") return undefined;
+	const phase = value.phase.trim();
+	return phase || undefined;
+}
+
+const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
+	"final",
+	"handoff",
+	"complete",
+	"completed",
+	"failed",
+	"cancelled",
+	"canceled",
+	"inactive",
+]);
+
+function modeStatePhase(value: unknown): string | undefined {
+	if (!isPlainObject(value) || typeof value.current_phase !== "string") return undefined;
+	const phase = value.current_phase.trim();
+	if (!phase) return undefined;
+	if (value.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+	return phase;
+}
+
+function pushPhaseDriftProblem(options: {
+	problems: DoctorProblem[];
+	pathValue: string;
+	skill: CanonicalGjcWorkflowSkill;
+	entryKind: "active entry" | "active snapshot";
+	entrySkill: string;
+	entryPhase: string | undefined;
+	statePhase: string | undefined;
+}): void {
+	if (!options.entryPhase || !options.statePhase || options.entryPhase === options.statePhase) return;
+	options.problems.push(
+		doctorProblem(
+			"stale_active_state",
+			options.pathValue,
+			`${options.entryKind} for ${options.entrySkill} phase ${options.entryPhase} differs from canonical mode-state phase ${options.statePhase}`,
+			`gjc state ${options.skill} clear`,
+			options.skill,
+		),
+	);
+}
+
 async function collectDoctorSummary(
 	cwd: string,
 	skill: CanonicalGjcWorkflowSkill | undefined,
@@ -460,6 +506,7 @@ async function collectDoctorSummary(
 	const problems: DoctorProblem[] = [];
 	let filesScanned = 0;
 	let journalsScanned = 0;
+	const invalidModeStates = new Set<string>();
 
 	for (const currentSkill of skills) {
 		const filePath = modeStateFile(cwd, currentSkill, sessionId);
@@ -476,6 +523,7 @@ async function collectDoctorSummary(
 					currentSkill,
 				),
 			);
+			invalidModeStates.add(currentSkill);
 			continue;
 		}
 		const validation = validateWorkflowStateEnvelope(currentSkill, raw.value);
@@ -489,6 +537,7 @@ async function collectDoctorSummary(
 					currentSkill,
 				),
 			);
+			invalidModeStates.add(currentSkill);
 		}
 		const mismatch = await detectWorkflowEnvelopeIntegrityMismatch(filePath);
 		if (mismatch) {
@@ -501,6 +550,7 @@ async function collectDoctorSummary(
 					currentSkill,
 				),
 			);
+			invalidModeStates.add(currentSkill);
 		}
 	}
 
@@ -553,6 +603,17 @@ async function collectDoctorSummary(
 					),
 				);
 			}
+			if (canonical && activeFlag(entry.value) && !invalidModeStates.has(canonical)) {
+				pushPhaseDriftProblem({
+					problems,
+					pathValue: entryPath,
+					skill: canonical,
+					entryKind: "active entry",
+					entrySkill,
+					entryPhase: phaseFromActiveValue(entry.value),
+					statePhase: modeStatePhase(state.value),
+				});
+			}
 		}
 		if (isPlainObject(snapshot.value)) {
 			const activeSkills = Array.isArray(snapshot.value.active_skills) ? snapshot.value.active_skills : [];
@@ -571,6 +632,18 @@ async function collectDoctorSummary(
 							canonical ?? undefined,
 						),
 					);
+				}
+				if (canonical && activeFlag(entry) && !invalidModeStates.has(canonical)) {
+					const state = await readRawJson(modeStateFile(cwd, canonical, scopeSessionId));
+					pushPhaseDriftProblem({
+						problems,
+						pathValue: snapshotPath,
+						skill: canonical,
+						entryKind: "active snapshot",
+						entrySkill,
+						entryPhase: phaseFromActiveValue(entry),
+						statePhase: modeStatePhase(state.value),
+					});
 				}
 			}
 		}

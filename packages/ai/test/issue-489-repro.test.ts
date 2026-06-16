@@ -152,4 +152,103 @@ describe("opencode-go qwen3.7-max keeps anthropic-messages transport (issue #489
 		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go/v1");
 		expect(qwen?.cost.input).toBe(9);
 	});
+	test("gpt-5.5 context cap is clamped without clobbering static overrides", async () => {
+		const staticModels: Model<Api>[] = [
+			{
+				id: "gpt-5.5",
+				name: "GPT-5.5",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_100_000,
+				maxTokens: 128_000,
+			},
+			{
+				id: "gpt-5.5-pro",
+				name: "GPT-5.5 Pro",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_100_000,
+				maxTokens: 128_000,
+			},
+			{
+				id: "gpt-5.5-preview",
+				name: "GPT-5.5 Preview",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_100_000,
+				maxTokens: 128_000,
+			},
+			{
+				id: "gpt-5.5-experimental",
+				name: "GPT-5.5 Experimental",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_100_000,
+				maxTokens: 128_000,
+			},
+			{
+				id: "gpt-5.4",
+				name: "GPT-5.4",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_100_000,
+				maxTokens: 128_000,
+			},
+		];
+		const discovered: Model<Api>[] = [
+			{
+				...staticModels[0],
+				api: "openai-completions",
+				baseUrl: "https://proxy.example.com/v1",
+				contextWindow: 1_100_000,
+			},
+			{
+				...staticModels[1],
+				contextWindow: 1_100_000,
+			},
+		];
+
+		const { models } = await resolveProviderModels<Api>(
+			{
+				providerId: "openai",
+				staticModels,
+				cacheDbPath,
+				fetchDynamicModels: async () => discovered,
+			},
+			"online",
+		);
+
+		const gpt55 = models.find(m => m.id === "gpt-5.5");
+		const pro = models.find(m => m.id === "gpt-5.5-pro");
+		const preview = models.find(m => m.id === "gpt-5.5-preview");
+		const unknownSuffix = models.find(m => m.id === "gpt-5.5-experimental");
+		const other = models.find(m => m.id === "gpt-5.4");
+		expect(gpt55?.contextWindow).toBe(400_000);
+		expect(gpt55?.api).toBe("openai-responses");
+		expect(gpt55?.baseUrl).toBe("https://api.openai.com/v1");
+		expect(pro?.contextWindow).toBe(1_100_000);
+		expect(preview?.contextWindow).toBe(1_100_000);
+		expect(unknownSuffix?.contextWindow).toBe(1_100_000);
+		expect(other?.contextWindow).toBe(1_100_000);
+	});
 });

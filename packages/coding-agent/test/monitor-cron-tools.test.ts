@@ -355,7 +355,7 @@ describe("Cron tools", () => {
 		expect(listing.text).toContain(`${result.details.id} (every 5 minutes): poll deploys`);
 	});
 
-	it("cancels a scheduled task by id and reports unknown ids with upstream text", async () => {
+	it("cancels a scheduled task by id and treats unknown ids as terminal no-op results", async () => {
 		const { create, del, list } = makeTools();
 		const scheduled = expectText(
 			await create.execute("call", {
@@ -372,7 +372,7 @@ describe("Cron tools", () => {
 		expect(listing.text).toBe("No scheduled jobs");
 		const missing = expectText(await del.execute("call", { id: "doesnotex" }));
 		expect(missing.details.deleted).toBe(false);
-		expect(missing.text).toBe("Failed to remove scheduled task 'doesnotex'");
+		expect(missing.text).toBe("No scheduled task 'doesnotex' found; nothing to cancel.");
 	});
 
 	it("fires a one-shot task via fake timers and self-deletes after firing", async () => {
@@ -399,6 +399,36 @@ describe("Cron tools", () => {
 			expect(steered[0]?.customType).toBe("cron-fire");
 			expect(steered[0]?.content).toContain("run one");
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
+		});
+	});
+
+	it("treats deletion of an already-fired one-shot task as terminal and non-retryable", async () => {
+		const start = new Date("2026-06-02T12:00:10").getTime();
+		await withFakeTimers(start, async clock => {
+			const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+			const { create, del, list } = makeTools({ steered });
+			const result = await create.execute("call", {
+				cron_expression: "1 12 * * *",
+				prompt: "run one",
+				recurring: false,
+			});
+			const id = expectText(result).details.id;
+			const fireAt = calculateCronFireTimeMs({
+				id,
+				cronExpression: "1 12 * * *",
+				baseMatchMs: new Date("2026-06-02T12:01:00").getTime(),
+				recurring: false,
+				nowMs: clock.now(),
+			});
+			clock.tick(fireAt - clock.now());
+			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
+
+			const deleteResult = await del.execute("call", { id });
+			const terminal = expectText(deleteResult);
+			expect(terminal.details.deleted).toBe(false);
+			expect(terminal.text).toBe(`No scheduled task '${id}' found; nothing to cancel.`);
+			expect(deleteResult.isError).toBeUndefined();
+			expect(steered.filter(entry => entry.customType === "cron-fire")).toHaveLength(1);
 		});
 	});
 

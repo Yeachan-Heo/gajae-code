@@ -45,3 +45,36 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 		expect(skill).toMatch(/Bidirectional scoring is the pacing mechanism/i);
 	});
 });
+
+describe("deep-interview self-proofread output rule", () => {
+	it("adds a silent, best-effort self-proofread rule in Execution_Policy", () => {
+		expect(skill).toContain("one silent, best-effort self-proofread in the preserved session language");
+		expect(skill).toContain("natural-language prose governed by");
+		expect(skill).toContain("Apply it only to newly generated prose and never announce the proofreading");
+	});
+
+	it("covers generic error classes without language-specific special cases", () => {
+		expect(skill).toContain("obvious spelling, spacing, grammar, inflection/particle, and word-choice errors");
+		expect(skill).toContain("rather than special-casing any single language");
+	});
+
+	it("separates fixed-literal preservation from generated-prose proofreading", () => {
+		expect(skill).toContain(
+			"still apply the self-proofread to generated natural-language clauses or cells inside those structures",
+		);
+		expect(skill).toMatch(/Do not alter code blocks or identifiers/);
+	});
+
+	it("references the self-proofread at the four emission points", () => {
+		expect(skill).toContain("Before emitting the prose lines in this announcement, apply the");
+		expect(skill).toContain("apply the self-proofread once to new prose only");
+		expect(skill).toContain(
+			"apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing",
+		);
+		expect(skill).toContain("Apply the self-proofread once to newly generated spec prose before persistence");
+	});
+
+	it("adds a Final_Checklist item for the silent self-proofread", () => {
+		expect(skill).toContain("was silently self-proofread once according to");
+	});
+});
