@@ -178,7 +178,6 @@ const EDITOR_MAX_HEIGHT_MIN = 6;
 const EDITOR_MAX_HEIGHT_MAX = 18;
 const EDITOR_RESERVED_ROWS = 12;
 const EDITOR_FALLBACK_ROWS = 24;
-const COMPOSER_STATUS_SPACING_ROWS = 1;
 
 const HUD_NOTE_SUP_DIGITS: Record<string, string> = {
 	"0": "\u2070",
@@ -525,7 +524,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.todoContainer);
 		this.ui.addChild(this.btwContainer);
 		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer chrome is rendered by the editor.
-		this.ui.addChild(new Spacer(COMPOSER_STATUS_SPACING_ROWS));
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
