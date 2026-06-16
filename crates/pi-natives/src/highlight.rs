@@ -10,8 +10,17 @@ use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 use napi_derive::napi;
 use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxReference, SyntaxSet};
 
+use crate::env_uint;
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static SCOPE_MATCHERS: OnceLock<ScopeMatchers> = OnceLock::new();
+
+env_uint! {
+	// Above this many input bytes, `highlight_code` skips the synchronous syntect highlight (O(code);
+	// builds per-line parse state) and returns the original code unchanged. Defense-in-depth (F19/F3):
+	// TS callers cap lower, but this bounds every native caller. Generous default; env-overridable.
+	static MAX_HIGHLIGHT_BYTES: usize = "PI_NATIVE_MAX_HIGHLIGHT_BYTES" or 16 * 1024 * 1024 => [0, usize::MAX];
+}
 
 // Thread-local cache for scope -> color index lookups
 thread_local! {
@@ -122,7 +131,7 @@ fn get_scope_matchers() -> &'static ScopeMatchers {
 
 /// Theme colors for syntax highlighting.
 /// Each color is an ANSI escape sequence (e.g., "\x1b[38;2;255;0;0m").
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[napi(object)]
 pub struct HighlightColors {
 	/// ANSI color for comments.
@@ -357,6 +366,11 @@ fn find_syntax<'a>(ss: &'a SyntaxSet, lang: &str) -> Option<&'a SyntaxReference>
 /// fails.
 #[napi]
 pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColors) -> String {
+	// Defense-in-depth (F19/F3): above the cap, skip the synchronous highlight and
+	// return the original code — the same fallback used when highlighting fails.
+	if code.len() > *MAX_HIGHLIGHT_BYTES {
+		return code;
+	}
 	let inserted = colors.inserted.as_deref().unwrap_or("");
 	let deleted = colors.deleted.as_deref().unwrap_or("");
 
@@ -465,4 +479,16 @@ pub fn supports_language(lang: String) -> bool {
 pub fn get_supported_languages() -> Vec<String> {
 	let ss = get_syntax_set();
 	ss.syntaxes().iter().map(|s| s.name.clone()).collect()
+}
+
+#[cfg(test)]
+mod cap_tests {
+	use super::*;
+
+	#[test]
+	fn oversized_code_is_returned_unhighlighted() {
+		let code = "x".repeat(17 * 1024 * 1024);
+		let out = highlight_code(code.clone(), Some("rust".to_string()), HighlightColors::default());
+		assert_eq!(out, code, "above the cap highlight_code must return the original code unchanged");
+	}
 }

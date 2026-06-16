@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-16
+
+### Fixed
+
+- Hardened the TUI for very long-running sessions to stop freezes and unbounded memory growth: `Container.render` emits frame lines via a loop instead of `push(...spread)` so huge (~492k-line) frames no longer throw `RangeError`; the component/container/box `dispose()` lifecycle is reuse-safe (`clear()`/`removeChild()` dispose, `detach*()` does not) across tool/loader/oauth/mcp-wizard/extension-ui components, and the reusable editor is detached before transient hook UI is torn down so it is never disposed by accident; markdown gains a per-code-block highlight LRU cache plus a UTF-8 byte/line highlight cap and assistant-message instance reuse. An opt-in viewport-windowed normalize/diff path (`PI_TUI_VIRTUAL_VIEWPORT`, default off) keeps rendering O(rows) at 100k+ lines while staying byte-identical to the golden output (#716).
+
 ## [0.5.1] - 2026-06-14
 
 ### Fixed

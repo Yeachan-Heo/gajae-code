@@ -3,9 +3,18 @@ use std::collections::HashMap;
 use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
 
+use crate::env_uint;
+
 const FALLBACK_THRESHOLD: f64 = 0.8;
 const SEQUENCE_FUZZY_THRESHOLD: f64 = 0.92;
 const MAX_RECORDED_MATCHES: usize = 5;
+
+env_uint! {
+	// Above this many UTF-16 units in content or target, `h01_find_best_fuzzy_match` skips the
+	// O(content*target) fuzzy search and reports no match. Defense-in-depth (F19): TS callers cap the
+	// file at 8 MiB before this runs, but this bounds every native caller. Generous; env-overridable.
+	static MAX_FUZZY_UNITS: usize = "PI_NATIVE_MAX_FUZZY_UNITS" or 16 * 1024 * 1024 => [0, usize::MAX];
+}
 
 #[napi(object)]
 pub struct H01BestFuzzyMatch {
@@ -469,6 +478,16 @@ pub fn h01_find_best_fuzzy_match(
 	}
 	if target_units.last() == Some(&0) {
 		target_units = &target_units[..target_units.len() - 1];
+	}
+	// Defense-in-depth (F19): above the cap, skip the O(content*target) fuzzy
+	// search over the whole file and report no match so a pathological edit input
+	// cannot block a native thread.
+	if content_units.len() > *MAX_FUZZY_UNITS || target_units.len() > *MAX_FUZZY_UNITS {
+		return Ok(H01BestFuzzyMatchResult {
+			best:                  None,
+			above_threshold_count: 0,
+			second_best_score:     0.0,
+		});
 	}
 	let content_units = content_units.to_vec();
 	let target_units = target_units.to_vec();
