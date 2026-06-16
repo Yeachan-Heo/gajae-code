@@ -45,6 +45,7 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		load: async () => new (await import("./providers/gemini")).GeminiProvider(),
 	},
 	codex: { id: "codex", label: "OpenAI", load: async () => new (await import("./providers/codex")).CodexProvider() },
+	xai: { id: "xai", label: "xAI", load: async () => new (await import("./providers/xai")).XaiProvider() },
 	tavily: {
 		id: "tavily",
 		label: "Tavily",
@@ -104,6 +105,7 @@ export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"anthropic",
 	"gemini",
 	"codex",
+	"xai",
 	"zai",
 	"exa",
 	"parallel",
@@ -116,6 +118,7 @@ const MODEL_PROVIDER_TO_SEARCH: Record<string, SearchProviderId> = {
 	openai: "codex",
 	"openai-codex": "codex",
 	"openai-responses": "codex",
+	xai: "xai",
 	anthropic: "anthropic",
 	google: "gemini",
 	"google-gemini-cli": "gemini",
@@ -290,7 +293,8 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 			await appendAvailable(chain, directId, authStorage);
 		const inferred = inferNativeProviderFromModel(activeModelContext);
 		if (inferred) await appendAvailable(chain, inferred, authStorage);
-		if (await shouldTryGenericOpenAICompat(authStorage, activeModelContext, sessionId, signal))
+		const hasNativeXai = chain.includes("xai");
+		if (!hasNativeXai && (await shouldTryGenericOpenAICompat(authStorage, activeModelContext, sessionId, signal)))
 			appendDeduped(chain, "openai-compatible");
 	}
 

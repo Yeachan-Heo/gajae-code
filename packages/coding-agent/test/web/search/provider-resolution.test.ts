@@ -86,6 +86,21 @@ describe("native web-search provider resolution", () => {
 		).resolves.toEqual(["codex", "duckduckgo"]);
 	});
 
+	it("maps xAI active models to native xAI search without generic OpenAI-compatible fallback", async () => {
+		await expect(
+			ids(
+				{
+					provider: "xai",
+					modelId: "grok-4.3",
+					api: "openai-completions",
+					baseUrl: "https://api.x.ai/v1",
+					webSearch: "on",
+				},
+				{ auth: ["xai"] },
+			),
+		).resolves.toEqual(["xai", "duckduckgo"]);
+	});
+
 	it("honors forced provider first and dedupes configured fallback plus DuckDuckGo", async () => {
 		await expect(
 			ids(

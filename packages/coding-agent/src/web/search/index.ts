@@ -1,7 +1,7 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, xAI, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
@@ -225,7 +225,7 @@ export async function runSearchQuery(
 /**
  * Web search tool implementation.
  *
- * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
+ * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, xAI, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
  */
 export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
 	readonly name = "web_search";

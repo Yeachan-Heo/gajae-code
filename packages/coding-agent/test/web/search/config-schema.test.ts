@@ -15,8 +15,18 @@ describe("web search config schema", () => {
 		const fallback = SETTINGS_SCHEMA["web_search.fallback"];
 		expect(fallback.type).toBe("array");
 		expect(fallback.items?.enum).toContain("exa");
+		expect(fallback.items?.enum).toContain("xai");
 		expect(fallback.items?.enum).not.toContain("openai-compatible");
 		expect(isConfigurableSearchProviderId("openai-compatible")).toBe(false);
 		expect(isSearchProviderPreference("openai-compatible")).toBe(false);
+		expect(isConfigurableSearchProviderId("xai")).toBe(true);
+		expect(isSearchProviderPreference("xai")).toBe(true);
+	});
+
+	it("accepts xAI as a selectable web search provider", () => {
+		const webSearch = SETTINGS_SCHEMA["providers.webSearch"];
+		expect(webSearch.type).toBe("enum");
+		expect(webSearch.values).toContain("xai");
+		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "xai", label: "xAI" }));
 	});
 });

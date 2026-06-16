@@ -16,6 +16,7 @@ export type SearchProviderId =
 	| "perplexity"
 	| "gemini"
 	| "codex"
+	| "xai"
 	| "tavily"
 	| "parallel"
 	| "kagi"
@@ -46,6 +47,7 @@ export const CONFIGURABLE_SEARCH_PROVIDER_IDS = [
 	"perplexity",
 	"gemini",
 	"codex",
+	"xai",
 	"tavily",
 	"parallel",
 	"kagi",
