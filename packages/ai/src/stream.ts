@@ -231,7 +231,9 @@ export function formatProviderCredentialHint(provider: string): string {
 		parts.push("A value set only in a project .env is intentionally ignored for provider credentials.");
 	}
 	if (isOpenCodeSubscription) {
-		parts.push(`Or run \`gjc auth-broker login ${provider}\` once before headless/print mode to store the key interactively.`);
+		parts.push(
+			`Or run \`gjc auth-broker login ${provider}\` once before headless/print mode to store the key interactively.`,
+		);
 	}
 	return parts.join(" ");
 }
