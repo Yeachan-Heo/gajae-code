@@ -72,6 +72,16 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(lines.join("\n")).not.toContain("›");
 	});
 
+	it("renders one blank row between status line and composer", () => {
+		const rendered = mode.ui.render(48).map(line => stripVTControlCharacters(line));
+		const statusIndex = rendered.findIndex(line => line.includes("claude-sonnet-4-5"));
+		const composerIndex = rendered.findIndex(line => line.startsWith("┌") && line.endsWith("┐"));
+
+		expect(statusIndex).toBeGreaterThanOrEqual(0);
+		expect(composerIndex).toBeGreaterThan(statusIndex);
+		expect(rendered.slice(statusIndex + 1, composerIndex)).toEqual([""]);
+	});
+
 	it("keeps closed square composer chrome for one-line, multiline, and narrow prompts", () => {
 		for (const [width, text] of [
 			[48, "Ask gjc to improve the composer"],
