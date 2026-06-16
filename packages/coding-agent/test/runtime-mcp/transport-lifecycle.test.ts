@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
+import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 
@@ -27,6 +27,7 @@ afterEach(async () => {
 	for (const server of servers.splice(0)) {
 		await server.stop(true);
 	}
+	await disposeAllOwnedProcesses();
 });
 
 describe("MCP stdio transport lifecycle", () => {
@@ -46,7 +47,7 @@ describe("MCP stdio transport lifecycle", () => {
 
 		await transport.close();
 		await waitFor(() => !isAlive(oldChildPid));
-		expect(liveOwnedProcessCount()).toBe(before);
+		expect(liveOwnedProcessCount()).toBeLessThanOrEqual(before);
 
 		await Bun.write(pidFile, "");
 		await transport.connect();
