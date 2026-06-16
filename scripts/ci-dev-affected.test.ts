@@ -58,7 +58,7 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 	describe("deep-interview selector narrowing", () => {
-		test("deep-interview-only changes avoid native/full workspace validation", () => {
+		test("deep-interview-only changes avoid full workspace validation but still provide native artifacts", () => {
 			const tasks = planForPaths([
 				"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
 				"packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts",
@@ -66,10 +66,15 @@ describe("planTasks command shape (issue #622)", () => {
 				"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
 			]);
 			expect(tasks.map(task => task.key)).toEqual([
+				"native-linux-x64",
 				"deep-interview-definitions",
 				"deep-interview-runtime",
 			]);
-			expect(tasks.some(task => task.key.includes("native") || task.key === "root-test")).toBe(false);
+			const entries = describeTasks(tasks);
+			expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
+			expect(entries.find(entry => entry.key === "deep-interview-definitions")?.native).toBe(true);
+			expect(entries.find(entry => entry.key === "deep-interview-runtime")?.native).toBe(true);
+			expect(tasks.some(task => task.key === "root-test")).toBe(false);
 		});
 	});
 

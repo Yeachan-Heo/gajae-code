@@ -172,7 +172,14 @@ function isNativeBuildKey(key: string): boolean {
 // planTasks) every such task only appears in a plan that also includes a native
 // build task, so the shard can always download the artifact built once upstream.
 function taskNeedsNative(key: string): boolean {
-	return key === "root-test" || key === "cli-smoke" || key === "wrapper-version" || key.startsWith("test:");
+	return (
+		key === "root-test" ||
+		key === "cli-smoke" ||
+		key === "wrapper-version" ||
+		key === "deep-interview-definitions" ||
+		key === "deep-interview-runtime" ||
+		key.startsWith("test:")
+	);
 }
 
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
@@ -412,6 +419,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
 
 	if (deepInterviewOnly) {
+		addNativeBuild(tasks);
 		add(tasks, "deep-interview-definitions", "Deep interview default definition tests", ["bun", "test", "packages/coding-agent/test/default-gjc-definitions.test.ts"]);
 		add(tasks, "deep-interview-runtime", "Deep interview runtime tests", ["bun", "test", "packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts"]);
 		return Array.from(tasks.values());
