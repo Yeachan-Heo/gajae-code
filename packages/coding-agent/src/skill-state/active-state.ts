@@ -431,9 +431,10 @@ async function readModeStatePhase(
 		const parsed = JSON.parse(await Bun.file(filePath).text());
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
 		const record = parsed as Record<string, unknown>;
-		if (record.active === false) return undefined;
 		const phase = safeString(record.current_phase).trim();
-		return phase || undefined;
+		if (!phase) return undefined;
+		if (record.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+		return phase;
 	} catch {
 		return undefined;
 	}

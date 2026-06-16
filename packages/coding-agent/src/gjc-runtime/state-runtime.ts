@@ -456,10 +456,23 @@ function phaseFromActiveValue(value: unknown): string | undefined {
 	return phase || undefined;
 }
 
+const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
+	"final",
+	"handoff",
+	"complete",
+	"completed",
+	"failed",
+	"cancelled",
+	"canceled",
+	"inactive",
+]);
+
 function modeStatePhase(value: unknown): string | undefined {
-	if (!isPlainObject(value) || value.active === false || typeof value.current_phase !== "string") return undefined;
+	if (!isPlainObject(value) || typeof value.current_phase !== "string") return undefined;
 	const phase = value.current_phase.trim();
-	return phase || undefined;
+	if (!phase) return undefined;
+	if (value.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+	return phase;
 }
 
 function pushPhaseDriftProblem(options: {
