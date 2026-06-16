@@ -39,7 +39,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 
 <Execution_Policy>
 - Ask ONE question at a time -- never batch multiple questions
-- Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; for example Korean initial ideas must receive Korean deep-interview questions unless the user explicitly requests another language
+- Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
 - Target the WEAKEST clarity dimension with each question
 - Before Round 1 ambiguity scoring, run a one-time Round 0 topology enumeration gate that confirms the top-level component list and locks it into state
 - Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
@@ -96,7 +96,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
    - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/state` files directly unless an explicit force override is active.
    - Include both threshold and source in the final spec metadata.
-- Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, infer the user/session language from `{{ARGUMENTS}}` only when it is obvious. Do not surprise a Korean session with English questions.
+- Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
 
 ## Phase 1: Initialize
 

@@ -124,8 +124,8 @@ interface ResolvedDeepInterviewArgs {
 }
 
 interface DeepInterviewLanguagePreference {
-	code: "en" | "ko";
-	label: "English" | "Korean";
+	code: "en" | "user";
+	label: "English" | "User language";
 	source: "explicit-user-request" | "initial-idea";
 	instruction: string;
 }
@@ -239,21 +239,22 @@ function englishLanguagePreference(): DeepInterviewLanguagePreference {
 	};
 }
 
+function userLanguagePreference(): DeepInterviewLanguagePreference {
+	return {
+		code: "user",
+		label: "User language",
+		source: "initial-idea",
+		instruction:
+			"Ask every user-facing deep-interview question in the user/session language inferred from the initial idea unless the user explicitly requests another language. Keep code identifiers, file paths, commands, settings/JSON keys, library/API names, and quoted source text unchanged when appropriate.",
+	};
+}
+
 function resolveDeepInterviewLanguagePreference(idea: string): DeepInterviewLanguagePreference | undefined {
 	if (/\b(?:answer|ask|respond|reply|write|use|speak)\s+(?:only\s+)?in\s+English\b/i.test(idea)) {
 		return englishLanguagePreference();
 	}
-	if (/(?:영어로|영문으로|영어\s*(?:질문|답변|응답)|English\s+only)/i.test(idea)) {
-		return englishLanguagePreference();
-	}
-	if (/\p{Script=Hangul}/u.test(idea)) {
-		return {
-			code: "ko",
-			label: "Korean",
-			source: "initial-idea",
-			instruction:
-				"Ask every user-facing deep-interview question in Korean unless the user explicitly requests another language.",
-		};
+	if (/[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]/u.test(idea)) {
+		return userLanguagePreference();
 	}
 	return undefined;
 }
