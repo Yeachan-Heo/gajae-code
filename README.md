@@ -166,15 +166,17 @@ retry:
 
 The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win.
 
-### Theme quick pick
+### Bundled theme grid
 
-| Theme | Visual feel | Pick it when |
+Pick from Settings (`Appearance -> Dark theme` / `Light theme`) or `/theme`.
+
+| Theme | Visual feel | Best fit |
 | --- | --- | --- |
-| `red-claw` | Default dark GJC identity with warm red accents. | You want the native GJC look and strong status contrast. |
-| `blue-crab` | Light-friendly blue palette for bright terminals. | Your terminal or OS appearance is light and you want readable defaults. |
-| `claude-code` | Claude Code-inspired dark palette. | You are migrating from Claude Code and want familiar visual muscle memory. |
-| `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | You want a Codex-like dark workspace. |
-| `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | You want the closest bundled match for OpenCode muscle memory. |
+| `red-claw` | Dark GJC default with warm red-claw accents and strong status contrast. | Native GJC identity for dark terminals. |
+| `blue-crab` | Bright-terminal blue palette tuned for readable light slots. | Light terminal or OS appearance. |
+| `claude-code` | Claude Code-inspired dark palette with terracotta and pink highlights. | Claude Code muscle memory without leaving GJC. |
+| `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | A Codex-like dark workspace. |
+| `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | OpenCode muscle memory in the bundled picker. |
 
 ## Development
 
