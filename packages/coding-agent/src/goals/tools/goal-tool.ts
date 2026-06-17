@@ -125,7 +125,7 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<GoalToolDetails>> {
 		const response = await executeGoalOperation(this.#session, params);
-		return buildGoalToolResult(params.op, response);
+		return buildGoalToolResult(params.op as GoalToolDetails["op"], response);
 	}
 }
 
