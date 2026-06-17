@@ -195,6 +195,8 @@ export class InputController {
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
+		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
+		this.ctx.editor.onQueue = () => void this.handleQueueSubmit();
 
 		this.ctx.editor.clearCustomKeyHandlers();
 		// Wire up extension shortcuts
@@ -311,8 +313,8 @@ export class InputController {
 			// Handle skill commands (/skill:name [args]). While streaming, Enter
 			// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
 			// runs after it completes (matches the free-text Enter semantics applied
-			// a few lines below at the streaming branch). Ctrl+Enter always routes
-			// through `handleFollowUp` and dispatches the same helper with `"followUp"`.
+			// a few lines below at the streaming branch). Explicit queue shortcuts
+			// route through `handleFollowUp` and dispatch as `followUp`.
 			if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior())) {
 				return;
 			}
@@ -580,7 +582,7 @@ export class InputController {
 
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
-		// Ctrl+Enter (this handler) routes them as `followUp`.
+		// explicit queue shortcuts route them as `followUp`.
 		if (await this.#invokeSkillCommand(text, "followUp")) {
 			return;
 		}
@@ -600,6 +602,11 @@ export class InputController {
 		this.ctx.editor.addToHistory(text);
 		this.ctx.editor.setText("");
 		await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text));
+	}
+
+	/** Send editor text explicitly as a queued next-turn message. */
+	async handleQueueSubmit(): Promise<void> {
+		return this.handleFollowUp();
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
