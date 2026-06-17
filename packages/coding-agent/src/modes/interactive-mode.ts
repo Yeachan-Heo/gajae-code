@@ -406,7 +406,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
-		this.statusLine = new StatusLineComponent(session);
+		this.statusLine = new StatusLineComponent(session, { version: this.#version });
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
