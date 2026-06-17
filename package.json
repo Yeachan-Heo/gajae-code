@@ -121,6 +121,8 @@
     "ci:release:publish": "bun scripts/ci-release-publish.ts",
     "bench:gen-fixtures": "bun --cwd=packages/typescript-edit-benchmark run src/generate.ts --typescript-dir /tmp/typescript-source --count-per-type 8",
     "bench:edit": "bun --cwd=packages/typescript-edit-benchmark run start",
+    "bench:composer-stability-v3": "bun packages/agent/bench/composer-stability-v3.ts --mock --seed 42 -n 5 --model grok-build/grok-composer-2.5-fast --baseline-model openai-codex/gpt-5.5:low",
+    "bench:composer-stability-v3:trace": "bun packages/agent/bench/composer-stability-v3.ts --trace --trace-file packages/agent/test/fixtures/composer-stability-v3/traces/parity.json",
     "bench:orchestration-tokens": "bun --cwd=packages/orchestration-token-benchmark run start",
     "bench:orchestration-tokens:live": "bun --cwd=packages/orchestration-token-benchmark run bench:live",
     "stats:sync": "python3 scripts/session-stats/sync.py",

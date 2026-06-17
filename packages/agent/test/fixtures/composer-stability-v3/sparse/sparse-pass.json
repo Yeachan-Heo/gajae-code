@@ -1,0 +1,22 @@
+{
+  "records": [
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 0,
+      "events": [
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 0,
+      "events": [
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+{"scenarioId":"bash-discipline","modelRole":"candidate","model":"grok-build/grok-composer-2.5-fast","trial":9,"type":"tool_execution_end","toolName":"bash","status":"success","arguments":{"command":"cat src/secret.ts"}}
+{"scenarioId":"bash-discipline","modelRole":"candidate","model":"grok-build/grok-composer-2.5-fast","trial":9,"type":"scenario_result","status":"failed"}
