@@ -206,7 +206,10 @@ export function isComputerLoadablePlatform(platform: NodeJS.Platform = process.p
 }
 
 export function isComputerEnabled(session: Pick<ToolSession, "settings">): boolean {
-	return Boolean(session.settings.get("computer.enabled") || session.settings.get("computer.alwaysOn"));
+	if (session.settings.get("computer.enabled")) return true;
+	if (session.settings.has("computer.enabled")) return false;
+	if (session.settings.has("computer.alwaysOn")) return Boolean(session.settings.get("computer.alwaysOn"));
+	return true;
 }
 
 export function isComputerCallable(
