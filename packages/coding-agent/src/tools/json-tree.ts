@@ -81,6 +81,25 @@ function buildTreePrefix(theme: Theme, ancestors: readonly boolean[]): string {
 	return ancestors.map(hasNext => (hasNext ? `${theme.tree.vertical}  ` : "   ")).join("");
 }
 
+function splitByDisplayWidth(value: string, maxWidth: number): string[] {
+	const width = Math.max(1, maxWidth);
+	const fragments: string[] = [];
+	let current = "";
+	let currentWidth = 0;
+	for (const char of value) {
+		const charWidth = Math.max(1, Bun.stringWidth(char));
+		if (current && currentWidth + charWidth > width) {
+			fragments.push(current);
+			current = "";
+			currentWidth = 0;
+		}
+		current += char;
+		currentWidth += charWidth;
+	}
+	if (current || fragments.length === 0) fragments.push(current);
+	return fragments;
+}
+
 /**
  * Render a JSON value as tree lines.
  */
@@ -121,38 +140,32 @@ export function renderJsonTreeLines(
 			// Handle scalars
 			if (val === null || val === undefined || typeof val !== "object") {
 				const label = key ? theme.fg("muted", key) : theme.fg("muted", "value");
-
-				// Special handling for multiline strings
-				if (typeof val === "string" && val.includes("\n")) {
-					const strLines = val.split("\n");
-					const maxStrLines = Math.min(strLines.length, Math.max(1, maxLines - lines.length - 1));
+				if (typeof val === "string") {
+					const escaped = val.replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+					const marker = "…";
+					const firstFragmentWidth = Math.max(1, maxScalarLen - 2);
+					const continuationWidth = Math.max(1, maxScalarLen - Bun.stringWidth(marker) - 1);
+					const firstFragments = splitByDisplayWidth(escaped, firstFragmentWidth);
+					const firstFragment = firstFragments[0] ?? "";
+					const remainder = firstFragments.slice(1).join("");
+					const continuationFragments = remainder ? splitByDisplayWidth(remainder, continuationWidth) : [];
+					const fragments = [firstFragment, ...continuationFragments];
+					const lineBudget = Math.max(1, maxLines - lines.length);
+					const visibleCount = Math.min(fragments.length, lineBudget);
 					const continuePrefix = buildTreePrefix(theme, ancestors);
+					const isStringTruncated = visibleCount < fragments.length;
 
-					// First line with label
-					const firstLine = truncateToWidth(strLines[0], maxScalarLen);
-					pushLine(`${prefix}${iconScalar} ${label}: ${theme.fg("dim", `"${firstLine}`)}`);
-
-					// Subsequent lines indented
-					for (let i = 1; i < maxStrLines; i++) {
-						if (lines.length >= maxLines) {
-							truncated = true;
-							break;
-						}
-						const line = truncateToWidth(strLines[i], maxScalarLen);
-						pushLine(`${continuePrefix}   ${theme.fg("dim", ` ${line}`)}`);
+					for (let i = 0; i < visibleCount; i++) {
+						const isFirst = i === 0;
+						const isFinalVisible = i === visibleCount - 1;
+						const suffix = isStringTruncated && isFinalVisible ? `${marker}"` : isFinalVisible ? '"' : "";
+						const rendered = isFirst ? `"${fragments[i]}${suffix}` : `↳ ${fragments[i]}${suffix}`;
+						const line = isFirst
+							? `${prefix}${iconScalar} ${label}: ${theme.fg("dim", rendered)}`
+							: `${continuePrefix}   ${theme.fg("dim", rendered)}`;
+						if (!pushLine(line)) break;
 					}
-
-					// Show truncation and closing quote
-					if (strLines.length > maxStrLines) {
-						truncated = true;
-						pushLine(
-							`${continuePrefix}   ${theme.fg("dim", ` …(${strLines.length - maxStrLines} more lines)"`)}`,
-						);
-					} else {
-						// Add closing quote to last line - need to modify the last pushed line
-						const lastIdx = lines.length - 1;
-						lines[lastIdx] = `${lines[lastIdx]}${theme.fg("dim", '"')}`;
-					}
+					if (isStringTruncated) truncated = true;
 					return;
 				}
 
