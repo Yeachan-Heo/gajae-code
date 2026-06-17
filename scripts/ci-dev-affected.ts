@@ -13,8 +13,6 @@ const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "
 // Declared here (before the top-level `await main()`) so it is initialized for
 // every CLI mode despite top-level await halting later module statements.
 const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-linux-x64"]);
-const NON_NATIVE_TEST_KEYS: ReadonlySet<string> = new Set(["test:packages/coding-agent/test/rlm-live-model-e2e.test.ts"]);
-
 export interface PackageManifest {
 	name?: string;
 	scripts?: Record<string, string>;
@@ -172,13 +170,7 @@ function isNativeBuildKey(key: string): boolean {
 // prebuilt `.node` present in `packages/natives/native/`. By construction (see
 // planTasks) every such task only appears in a plan that also includes a native
 // build task, so the shard can always download the artifact built once upstream.
-// The live RLM E2E is opt-in and must remain default-CI safe when skipped, so it
-// is classified as non-native while ordinary coding-agent test shards stay
-// conservatively native.
 function taskNeedsNative(key: string): boolean {
-	if (NON_NATIVE_TEST_KEYS.has(key)) {
-		return false;
-	}
 	return (
 		key === "root-test" ||
 		key === "cli-smoke" ||

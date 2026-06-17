@@ -287,26 +287,25 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
-	test("the live RLM e2e test stays a non-native single-file shard", () => {
+	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {
 		const tasks = targeted(["packages/coding-agent/test/rlm-live-model-e2e.test.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
-		expect(keys).not.toContain("native-linux-x64");
-		expect(keys).not.toContain("native-build");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).not.toContain("check:@gajae-code/coding-agent");
 
 		const entries = describeTasks(tasks);
-		expect(entries).toEqual([
-			{
-				key: "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts",
-				description: "Test packages/coding-agent/test/rlm-live-model-e2e.test.ts",
-				command: ["bun", "test", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
-				native: false,
-				rust: false,
-				nativeBuild: false,
-			},
-		]);
+		const liveShard = entries.find(entry => entry.key === "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
+		expect(liveShard).toEqual({
+			key: "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+			description: "Test packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+			command: ["bun", "test", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
+			native: true,
+			rust: false,
+			nativeBuild: false,
+		});
+		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
 	test("a source file with a directly-named test maps to exactly that test", () => {
