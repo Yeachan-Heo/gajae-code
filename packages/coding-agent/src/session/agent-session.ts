@@ -5812,9 +5812,9 @@ export class AgentSession {
 		);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-apply thinking for the newly selected model. Prefer the model's
-		// configured defaultLevel; otherwise preserve the current level.
-		this.setThinkingLevel(model.thinking?.defaultLevel ?? this.thinkingLevel);
+		// Apply the explicitly selected thinking level when the selector supplies one;
+		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
+		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 

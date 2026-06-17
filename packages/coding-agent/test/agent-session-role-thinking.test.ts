@@ -174,6 +174,28 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(sessionSettings.getModelRole("default")).toBe(`${slowModel.provider}/${slowModel.id}:off`);
 	});
 
+	it("applies selected default role thinking to agent invocation state", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.Low,
+			modelRoles: {
+				default: `${initialModel.provider}/${initialModel.id}:low`,
+			},
+		});
+
+		await session.setModel(selectedModel, "default", {
+			selector: `${selectedModel.provider}/${selectedModel.id}`,
+			thinkingLevel: Effort.High,
+		});
+
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:high`);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.High);
+	});
+
 	it("clamps unsupported selections from model metadata", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		const agent = new Agent({
