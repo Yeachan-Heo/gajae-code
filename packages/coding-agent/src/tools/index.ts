@@ -209,7 +209,7 @@ export interface ToolSession {
 	/** Unattended workflow-gate emitter (present only when unattended mode is negotiated). */
 	getWorkflowGateEmitter?: () => WorkflowGateEmitter | undefined;
 	/** Optional per-session restriction for goal tool operations. */
-	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop")[];
+	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop" | "pause")[];
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */

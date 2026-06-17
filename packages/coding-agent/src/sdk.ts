@@ -314,7 +314,7 @@ export interface CreateAgentSessionOptions {
 	/** Restriction policy paired with bashAllowedPrefixes. */
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Optional per-session restriction for goal tool operations. */
-	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop")[];
+	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop" | "pause")[];
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
