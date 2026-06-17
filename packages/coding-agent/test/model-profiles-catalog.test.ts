@@ -152,7 +152,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 	},
 	{
 		name: "mimo-medium",
-		requiredProviders: ["xiaomi"],
+		requiredProviders: ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"],
 		mapping: {
 			default: "xiaomi/mimo-v2.5-pro:medium",
 			executor: "xiaomi/mimo-v2.5-pro:low",
@@ -163,7 +163,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 	},
 	{
 		name: "mimo-pro",
-		requiredProviders: ["xiaomi"],
+		requiredProviders: ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"],
 		mapping: {
 			default: "xiaomi/mimo-v2.5-pro:xhigh",
 			executor: "xiaomi/mimo-v2.5-pro:medium",
@@ -394,6 +394,9 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("zai", profiles)?.name).toBe("glm-medium");
 		expect(recommendModelProfileForProvider("kimi-code", profiles)?.name).toBe("kimi-coding-plan-medium");
 		expect(recommendModelProfileForProvider("xiaomi", profiles)?.name).toBe("mimo-medium");
+		expect(recommendModelProfileForProvider("xiaomi-token-plan-sgp", profiles)?.name).toBe("mimo-medium");
+		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
+		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
 		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");

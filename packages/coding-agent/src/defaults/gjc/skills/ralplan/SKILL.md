@@ -94,7 +94,7 @@ Follow the Plan skill's full documentation for consensus mode details.
 
 The Planner is a **same-session persisted subagent**: launched detached once, awaited before the Architect, then **resumed** with consolidated Architect + Critic feedback on every re-review pass instead of being re-spawned. The Architect and Critic stay **fresh, independent spawns each pass** so their verdicts remain reproducible from their pass artifacts alone. Do NOT modify the subagent control surface; this orchestration uses the existing `subagent` resume/steer controls only.
 
-**Persistence boundary:** this is same-parent, active-session continuity only. Resumability depends on the in-memory subagent record (and a persistent parent session — an in-memory parent yields `resumable:false`), not just a session file. The `.gjc` run-state record is an audit/routing hint, NOT a durable cross-process subagent registry. After a process restart, a missing record, or any unavailable/failed resume, use the fresh Planner fallback.
+**Persistence boundary:** this is same-parent, active-session continuity only. Resumability depends on the manager's retained subagent resume metadata and a persistent parent session (an in-memory parent yields `resumable:false`), not just the `.gjc` run-state record. A terminal subagent whose live job record was evicted can still be resumed when its retained resume descriptor points at a saved subagent session file. After a process restart, missing resume metadata, or any unavailable/failed resume, use the fresh Planner fallback.
 
 **Resume routing table** (per re-review pass, when resuming the persisted Planner id):
 
@@ -102,7 +102,7 @@ The Planner is a **same-session persisted subagent**: launched detached once, aw
 |---|---|
 | `running` | `steer`/inject the consolidated feedback to the same id, then await — do NOT fresh-spawn |
 | `queued` | retain/update the queued message or await the same id — do NOT fresh-spawn just because it is queued |
-| `context_unavailable`, `not_found`, `no_runner`, `resume_failed` | fresh Planner spawn for that pass; record the fallback metadata |
+| `context_unavailable`, `not_found`, `no_runner`, `resume_failed` | fresh Planner spawn for that pass; record the fallback metadata. `not_found` should only mean same-session resume metadata is unavailable, not merely that a terminal live job was evicted. |
 | terminal (`completed`/`failed`/`cancelled`) + revision message | resume the same id when context is available; otherwise use the fresh fallback above |
 
 **Recording persisted-Planner metadata** (audit/routing only — never claim `subagent list` proves resumability, since the snapshot does not expose `resumable`). Ride these optional flags on the normal `--write` for the planner/revision stage of the pass:

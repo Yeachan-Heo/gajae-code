@@ -15,6 +15,7 @@ export class CustomToolAdapter<TParams extends TSchema = TSchema, TDetails = any
 	declare description: string;
 	declare parameters: TParams;
 	readonly strict: boolean | undefined;
+	readonly concurrency: "shared" | "exclusive" | undefined;
 
 	constructor(
 		private tool: CustomTool<TParams, TDetails>,
@@ -22,6 +23,7 @@ export class CustomToolAdapter<TParams extends TSchema = TSchema, TDetails = any
 	) {
 		applyToolProxy(tool, this);
 		this.strict = tool.strict;
+		this.concurrency = tool.concurrency;
 	}
 
 	execute(

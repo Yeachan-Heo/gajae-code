@@ -12,6 +12,7 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	type ProviderSessionState,
 	type Usage,
 } from "@gajae-code/ai";
 import { isCompiledBinary, logger, prompt } from "@gajae-code/utils";
@@ -735,6 +736,16 @@ export interface SummaryOptions {
 	 */
 	telemetry?: AgentTelemetry;
 	authCredentialType?: "api_key" | "oauth";
+	/**
+	 * Provider session affinity id forwarded to the maintenance LLM call so it
+	 * reuses the live turn's provider/WebSocket session (matches the
+	 * `providerSessionId ?? sessionId` the agent loop sends for normal turns).
+	 */
+	sessionId?: string;
+	/** Shared provider state map so maintenance calls reuse session-scoped transport/session caches. */
+	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
+	preferWebsockets?: boolean;
 }
 
 export async function generateSummary(
@@ -801,6 +812,9 @@ export async function generateSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary" },
 	);
@@ -836,6 +850,15 @@ export interface HandoffOptions {
 	 */
 	telemetry?: AgentTelemetry;
 	authCredentialType?: "api_key" | "oauth";
+	/**
+	 * Provider session affinity id forwarded to the handoff LLM call so it
+	 * reuses the live turn's provider/WebSocket session.
+	 */
+	sessionId?: string;
+	/** Shared provider state map so the handoff call reuses session-scoped transport/session caches. */
+	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
+	preferWebsockets?: boolean;
 }
 
 export function renderHandoffPrompt(customInstructions?: string): string {
@@ -877,6 +900,9 @@ export async function generateHandoff(
 			toolChoice: "none",
 			initiatorOverride: options.initiatorOverride,
 			metadata: options.metadata,
+			sessionId: options.sessionId,
+			providerSessionState: options.providerSessionState,
+			preferWebsockets: options.preferWebsockets,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "handoff" },
 	);
@@ -936,6 +962,9 @@ async function generateShortSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary" },
 	);
@@ -1120,6 +1149,9 @@ export async function compact(
 		metadata: options?.metadata,
 		convertToLlm: options?.convertToLlm,
 		telemetry: options?.telemetry,
+		sessionId: options?.sessionId,
+		providerSessionState: options?.providerSessionState,
+		preferWebsockets: options?.preferWebsockets,
 	};
 
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
@@ -1159,9 +1191,22 @@ export async function compact(
 	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
 
+	// A single active Codex WebSocket session cannot service two concurrent
+	// requests ("websocket request already in progress"). When the maintenance
+	// calls use the Codex Responses provider, share one provider session, and
+	// websocket transport is not explicitly disabled, run the split-turn history
+	// and turn-prefix summaries sequentially. This covers websocket activation
+	// from config/env/model defaults too: the provider can select websockets even
+	// when `preferWebsockets` is undefined, while non-Codex providers keep the
+	// previous parallel behavior.
+	const summariesMayShareWebSocketSession = Boolean(
+		model.api === "openai-codex-responses" &&
+			summaryOptions.providerSessionState &&
+			summaryOptions.preferWebsockets !== false,
+	);
+
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
-		const [historyResult, turnPrefixResult] = await Promise.all([
+		const runHistorySummary = () =>
 			messagesToSummarize.length > 0
 				? generateSummary(
 						messagesToSummarize,
@@ -1173,9 +1218,19 @@ export async function compact(
 						previousSummary,
 						summaryOptions,
 					)
-				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(turnPrefixMessages, model, settings.reserveTokens, apiKey, signal, summaryOptions),
-		]);
+				: Promise.resolve("No prior history.");
+		const runTurnPrefixSummary = () =>
+			generateTurnPrefixSummary(turnPrefixMessages, model, settings.reserveTokens, apiKey, signal, summaryOptions);
+
+		let historyResult: string;
+		let turnPrefixResult: string;
+		if (summariesMayShareWebSocketSession) {
+			// Sequential: avoids concurrent requests on the same provider session.
+			historyResult = await runHistorySummary();
+			turnPrefixResult = await runTurnPrefixSummary();
+		} else {
+			[historyResult, turnPrefixResult] = await Promise.all([runHistorySummary(), runTurnPrefixSummary()]);
+		}
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
 	} else if (messagesToSummarize.length > 0) {
@@ -1211,6 +1266,9 @@ export async function compact(
 			initiatorOverride: summaryOptions.initiatorOverride,
 			metadata: summaryOptions.metadata,
 			telemetry: summaryOptions.telemetry,
+			sessionId: summaryOptions.sessionId,
+			providerSessionState: summaryOptions.providerSessionState,
+			preferWebsockets: summaryOptions.preferWebsockets,
 		},
 	);
 
@@ -1266,6 +1324,9 @@ async function generateTurnPrefixSummary(
 			reasoning: Effort.High,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
+			sessionId: options?.sessionId,
+			providerSessionState: options?.providerSessionState,
+			preferWebsockets: options?.preferWebsockets,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix" },
 	);

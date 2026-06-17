@@ -1,5 +1,5 @@
 import { readModelCache, writeModelCache } from "./model-cache";
-import { enrichModelThinking } from "./model-thinking";
+import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
 import { isRecord } from "./utils";
@@ -90,6 +90,7 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 		}
 		out.push(enrichModelThinking(item as Model<TApi>));
 	}
+	applyGeneratedModelPolicies(out as Model<Api>[]);
 	return out;
 }
 
@@ -322,7 +323,7 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 	// (issue #489). Keep the existing api, and only take the dynamic baseUrl
 	// when the api matches (same transport, same URL shape).
 	const baseUrl = existingModel.api === dynamicModel.api ? dynamicModel.baseUrl : existingModel.baseUrl;
-	return enrichModelThinking({
+	const merged = enrichModelThinking({
 		...existingModel,
 		...dynamicModel,
 		api: existingModel.api,
@@ -342,6 +343,9 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 		compat: dynamicModel.compat ?? existingModel.compat,
 		contextPromotionTarget: dynamicModel.contextPromotionTarget ?? existingModel.contextPromotionTarget,
 	});
+	const policyModels = [merged as Model<Api>];
+	applyGeneratedModelPolicies(policyModels);
+	return policyModels[0] as Model<TApi>;
 }
 
 function preferDiscoveryCost(discoveryCost: number, fallbackCost: number): number {

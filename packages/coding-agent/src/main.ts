@@ -705,11 +705,23 @@ async function buildSessionOptions(
 	return { options };
 }
 
+/**
+ * Research-mode (RLM) preset hook. Lets `gjc rlm` augment the session options
+ * (system prompt, restricted toolset, custom python tool) and assert the tool
+ * boundary once the session's tool registry is fully assembled.
+ */
+export interface RlmPreset {
+	applyOptions: (options: CreateAgentSessionOptions, settings: Settings) => void;
+	onSessionCreated?: (session: AgentSession) => void | Promise<void>;
+}
+
 interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	runAcpMode?: (createSession: AcpSessionFactory) => Promise<void>;
 	settings?: Settings;
+	rlmPreset?: RlmPreset;
+	suppressProcessExit?: boolean;
 }
 
 export async function runRootCommand(
@@ -897,6 +909,9 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
 
+	// Research-mode (RLM) preset: augment session options before session creation.
+	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
+
 	// Handle CLI --api-key as runtime override (not persisted)
 	if (parsedArgs.apiKey) {
 		if (!sessionOptions.model && !sessionOptions.modelPattern) {
@@ -937,6 +952,11 @@ export async function runRootCommand(
 			await createSession(sessionOptions);
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+		}
+
+		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
+		if (deps.rlmPreset?.onSessionCreated) {
+			await deps.rlmPreset.onSessionCreated(session);
 		}
 
 		await applyStartupModelProfilesOrExit({
@@ -1038,13 +1058,18 @@ export async function runRootCommand(
 				messages: parsedArgs.messages,
 				initialMessage,
 				initialImages,
+				suppressProcessExit: deps.suppressProcessExit,
 			});
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 			}
-			await session.dispose();
-			stopThemeWatcher();
-			await postmortem.quit(0);
+			if (!deps.suppressProcessExit) {
+				await session.dispose();
+				stopThemeWatcher();
+				await postmortem.quit(0);
+			} else {
+				stopThemeWatcher();
+			}
 		}
 	}
 }

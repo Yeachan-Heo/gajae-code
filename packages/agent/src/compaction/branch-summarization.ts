@@ -5,7 +5,7 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { Model } from "@gajae-code/ai";
+import type { Model, ProviderSessionState } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
@@ -86,6 +86,15 @@ export interface GenerateBranchSummaryOptions {
 	 * wrapped in an OTEL chat span tagged with `pi.gen_ai.oneshot.kind = "branch_summary"`.
 	 */
 	telemetry?: AgentTelemetry;
+	/**
+	 * Provider session affinity id forwarded to the branch summary LLM call so it
+	 * reuses the live turn's provider/WebSocket session.
+	 */
+	sessionId?: string;
+	/** Shared provider state map so the branch summary call reuses session-scoped transport/session caches. */
+	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
+	preferWebsockets?: boolean;
 }
 
 // ============================================================================
@@ -274,7 +283,17 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
-	const { model, apiKey, signal, customInstructions, reserveTokens = 16384, metadata } = options;
+	const {
+		model,
+		apiKey,
+		signal,
+		customInstructions,
+		reserveTokens = 16384,
+		metadata,
+		sessionId,
+		providerSessionState,
+		preferWebsockets,
+	} = options;
 
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 128000;
@@ -307,7 +326,7 @@ export async function generateBranchSummary(
 	const response = await instrumentedCompleteSimple(
 		model,
 		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
-		{ apiKey, signal, maxTokens: 2048, metadata },
+		{ apiKey, signal, maxTokens: 2048, metadata, sessionId, providerSessionState, preferWebsockets },
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
 	);
 

@@ -388,6 +388,8 @@ export interface AgentSessionConfig {
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	requestedToolNames?: ReadonlySet<string>;
+	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
+	discoverableToolAllowedNames?: readonly string[];
 	/**
 	 * Optional accessor for live MCP server instructions. Read by the session's
 	 * `rebuildSystemPrompt`-skip optimization to detect server-side instruction
@@ -548,6 +550,13 @@ function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): strin
 }
 
 const IRC_REPLY_MAX_BYTES = 4096;
+
+/**
+ * Hard cap for {@link AgentSession.disposeChildSubprocesses}. A `SIGINT`/`SIGTERM` handler
+ * awaits this teardown before exiting, so it must never block longer than this even if a
+ * subprocess (wedged Chrome renderer, stuck Python cell) refuses to settle.
+ */
+const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
 
 /**
  * Collapse degenerate IRC ephemeral replies before they hit the relay.
@@ -1009,6 +1018,7 @@ export class AgentSession {
 	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
+	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
 	#rpcHostToolNames = new Set<string>();
 	#gjcSubskillToolNames = new Set<string>();
 	#gjcSubskillToolSignature: string | undefined;
@@ -1217,6 +1227,9 @@ export class AgentSession {
 		this.#reloadSshTool = config.reloadSshTool;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
+		this.#discoverableToolAllowedNames = config.discoverableToolAllowedNames
+			? new Set(config.discoverableToolAllowedNames.map(name => name.toLowerCase()))
+			: undefined;
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#selectedMCPToolNames = new Set(config.initialSelectedMCPToolNames ?? []);
 		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
@@ -3221,6 +3234,36 @@ export class AgentSession {
 		this.#eventListeners = [];
 	}
 
+	/**
+	 * Bounded, best-effort teardown of the subprocess-spawning resources this session
+	 * owns: the browser tool's headless/spawned Chrome and the Python eval kernel + JS VM
+	 * contexts. Unlike {@link dispose}, this touches only child processes and is time-boxed,
+	 * so a top-level `SIGINT`/`SIGTERM`/`SIGHUP` handler can run it without hanging — without
+	 * it, an external kill bypasses `dispose()` and orphans Chrome/Python to PID 1 (#698).
+	 *
+	 * Idempotent: every step is a no-op once the graceful {@link dispose} path has released
+	 * the resources. Never throws; per-step failures are logged and the whole run is capped
+	 * at `timeoutMs` so a wedged subprocess can't stall process exit.
+	 */
+	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
+		const sessionId = this.sessionManager.getSessionId();
+		const kernelOwnerId = this.#evalKernelOwnerId;
+		const work = Promise.allSettled([
+			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
+			// always closes; connected/attached browsers only disconnect — never killed).
+			releaseTabsForOwner(sessionId, { kill: true }).catch((error: unknown) =>
+				logger.warn("signal teardown: releaseTabsForOwner failed", { error }),
+			),
+			disposeKernelSessionsByOwner(kernelOwnerId).catch((error: unknown) =>
+				logger.warn("signal teardown: disposeKernelSessionsByOwner failed", { error }),
+			),
+			disposeVmContextsByOwner(kernelOwnerId).catch((error: unknown) =>
+				logger.warn("signal teardown: disposeVmContextsByOwner failed", { error }),
+			),
+		]);
+		await Promise.race([work, Bun.sleep(timeoutMs)]);
+	}
+
 	#closeAllProviderSessions(reason: string): void {
 		for (const [providerKey, state] of this.#providerSessionState) {
 			try {
@@ -3516,6 +3559,7 @@ export class AgentSession {
 		for (const tool of this.#toolRegistry.values()) {
 			if (tool.loadMode !== "discoverable") continue;
 			if (activeNames.has(tool.name)) continue;
+			if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(tool.name)) continue;
 			const collected = collectDiscoverableTools([tool], { source: "builtin" });
 			result.push(...collected);
 		}
@@ -3562,6 +3606,7 @@ export class AgentSession {
 			const currentActiveNames = new Set(this.getActiveToolNames());
 			const newlyAdded: string[] = [];
 			for (const name of nonMcpNames) {
+				if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(name)) continue;
 				if (this.#toolRegistry.has(name) && !currentActiveNames.has(name)) {
 					newlyAdded.push(name);
 					this.#selectedDiscoveredToolNames.add(name);
@@ -5767,9 +5812,9 @@ export class AgentSession {
 		);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-apply thinking for the newly selected model. Prefer the model's
-		// configured defaultLevel; otherwise preserve the current level.
-		this.setThinkingLevel(model.thinking?.defaultLevel ?? this.thinkingLevel);
+		// Apply the explicitly selected thinking level when the selector supplies one;
+		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
+		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -6445,6 +6490,7 @@ export class AgentSession {
 				model,
 				apiKey,
 				{
+					...this.#maintenanceProviderTransport(),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -7376,6 +7422,25 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Transport-affinity fields forwarded into local maintenance one-shot LLM
+	 * calls (compaction, handoff, branch summary) so they reuse the live turn's
+	 * provider session state and configured WebSocket transport preference
+	 * instead of falling back to a fresh HTTP/SSE session. Mirrors the
+	 * `providerSessionId ?? sessionId` affinity the agent loop sends per turn.
+	 */
+	#maintenanceProviderTransport(): {
+		sessionId: string | undefined;
+		providerSessionState: Map<string, ProviderSessionState>;
+		preferWebsockets: boolean | undefined;
+	} {
+		return {
+			sessionId: this.agent.providerSessionId ?? this.agent.sessionId,
+			providerSessionState: this.#providerSessionState,
+			preferWebsockets: this.agent.preferWebsockets,
+		};
+	}
+
 	async #compactWithFallbackModel(
 		preparation: CompactionPreparation,
 		customInstructions: string | undefined,
@@ -7392,6 +7457,7 @@ export class AgentSession {
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
+					...this.#maintenanceProviderTransport(),
 					metadata: this.agent.metadataForProvider(candidate.provider),
 					convertToLlm,
 					telemetry,
@@ -7681,6 +7747,7 @@ export class AgentSession {
 					while (true) {
 						try {
 							compactResult = await compact(preparation, candidate, apiKey, undefined, autoCompactionSignal, {
+								...this.#maintenanceProviderTransport(),
 								promptOverride: compactionPrep.hookPrompt,
 								extraContext: compactionPrep.hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
@@ -7906,7 +7973,12 @@ export class AgentSession {
 	 */
 	#isRetryableError(message: AssistantMessage): boolean {
 		const classification = this.#classifyErrorForRetry(message);
-		return classification === "usage_limit" || classification === "transient" || classification === "unknown";
+		return (
+			classification === "usage_limit" ||
+			classification === "transient" ||
+			classification === "unknown" ||
+			classification === "first_event_timeout"
+		);
 	}
 
 	#isTransientErrorMessage(errorMessage: string): boolean {
@@ -7932,6 +8004,33 @@ export class AgentSession {
 		);
 	}
 
+	#isFirstEventTimeoutErrorMessage(errorMessage: string): boolean {
+		// First-event timeout: the stream watchdog aborted because no event
+		// arrived within the first-event window. Matches the shared lazy-stream
+		// message and the per-provider variants
+		// ("<Provider> stream timed out while waiting for the first event").
+		return /timed?\s*out while waiting for the first event|timeout waiting for first/i.test(errorMessage);
+	}
+
+	/**
+	 * Whether a first-event timeout on the error's provider should fail closed —
+	 * i.e. retry a bounded number of times (capped at retry.maxRetries) and then
+	 * surface, instead of joining the unbounded transient-retry class.
+	 *
+	 * Targets the ollama-chat API, which is exclusively ollama-cloud (local
+	 * Ollama uses the openai-responses API). That remote, queued backend can
+	 * stall before its first token even for tiny prompts; an unbounded
+	 * continuation retry re-issues the full request on every attempt and can
+	 * silently spike upstream usage (#713). First-party providers keep their
+	 * existing unbounded first-event-timeout retry behavior.
+	 */
+	#shouldFailClosedOnFirstEventTimeout(message: AssistantMessage): boolean {
+		// Prefer the active model's API (the model that produced the error);
+		// the errored message's API is a fallback for the rare case where the
+		// session model has already moved on.
+		return this.model?.api === "ollama-chat" || message.api === "ollama-chat";
+	}
+
 	#isTerminalErrorMessage(errorMessage: string): boolean {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
@@ -7953,11 +8052,12 @@ export class AgentSession {
 
 	/**
 	 * Ordered retry classification: overflow (compaction) -> terminal (surface)
-	 * -> usage_limit (rotation) -> transient (retry) -> unknown (retry).
+	 * -> usage_limit (rotation) -> first_event_timeout (bounded retry) ->
+	 * transient (retry) -> unknown (retry).
 	 */
 	#classifyErrorForRetry(
 		message: AssistantMessage,
-	): "none" | "overflow" | "terminal" | "usage_limit" | "transient" | "unknown" {
+	): "none" | "overflow" | "terminal" | "usage_limit" | "first_event_timeout" | "transient" | "unknown" {
 		if (message.stopReason !== "error" || !message.errorMessage) return "none";
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
@@ -7984,6 +8084,13 @@ export class AgentSession {
 		// parsed an incidental quota number such as "400 requests per minute".
 		if (isTerminalHttp4xx && (explicitStatus !== undefined || !/rate.?limit|too many requests/i.test(err))) {
 			return "terminal";
+		}
+		// A first-event timeout on ollama-cloud (the ollama-chat API) must not
+		// join the unbounded transient class: each continuation retry re-issues
+		// the full request to a remote, billable backend, so an unbounded loop
+		// can silently spike usage (#713). Bound it to retry.maxRetries instead.
+		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
+			return "first_event_timeout";
 		}
 		if (this.#isTransientErrorMessage(err)) return "transient";
 		return "unknown";
@@ -9488,6 +9595,7 @@ export class AgentSession {
 			}
 			const branchSummarySettings = this.settings.getGroup("branchSummary");
 			const result = await generateBranchSummary(entriesToSummarize, {
+				...this.#maintenanceProviderTransport(),
 				model,
 				apiKey,
 				signal: this.#branchSummaryAbortController.signal,

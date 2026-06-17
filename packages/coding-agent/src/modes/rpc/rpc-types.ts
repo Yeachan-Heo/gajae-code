@@ -32,6 +32,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
+	| { id?: string; type: "get_pending_workflow_gates" }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -132,6 +133,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_todos"; success: true; data: { todoPhases: TodoPhase[] } }
 	| { id?: string; type: "response"; command: "set_host_tools"; success: true; data: { toolNames: string[] } }
 	| { id?: string; type: "response"; command: "set_host_uri_schemes"; success: true; data: { schemes: string[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_pending_workflow_gates";
+			success: true;
+			data: { gates: RpcWorkflowGate[] };
+	  }
 
 	// Model
 	| {
@@ -446,6 +454,8 @@ export interface RpcWorkflowGateOption {
 
 export interface RpcWorkflowGateContext {
 	title?: string;
+	plan?: string;
+	source?: string;
 	prompt?: string;
 	summary?: string;
 	stage_state?: Record<string, unknown>;

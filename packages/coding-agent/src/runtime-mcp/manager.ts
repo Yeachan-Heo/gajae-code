@@ -58,8 +58,8 @@ type TrackedPromise<T> = {
 };
 
 const STARTUP_TIMEOUT_MS = 250;
-const STARTUP_TIMEOUT_GRACE_MS = 250;
-const MAX_STARTUP_TIMEOUT_MS = 1_500;
+const STARTUP_TIMEOUT_GRACE_MS = 500;
+const MAX_STARTUP_TIMEOUT_MS = 1_750;
 
 function resolveStartupTimeoutMs(configs: MCPServerConfig[]): number {
 	const configuredTimeouts = configs

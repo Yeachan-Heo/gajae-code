@@ -1,0 +1,22 @@
+# Linux systemd user unit for the persistent GJC RPC-mode session.
+# Copy to: ~/.config/systemd/user/gjc-rpc-session.service
+# IMPORTANT: run this as the same Unix user as the Telegram bot service.
+[Unit]
+Description=GJC persistent RPC session for Telegram Remote
+Documentation=https://github.com/gajae-ai/gajae-code/tree/dev/packages/telegram-remote
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/gajae-code
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=gjc
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/env gjc launch --output rpc --listen %t/gjc/telegram-remote.sock
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

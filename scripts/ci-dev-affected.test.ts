@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { packageScriptCommand, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, packageScriptCommand, planTargetedTasks, planTasks, resolvePackageCwd, runCommand, type WorkspacePackage } from "./ci-dev-affected";
 
 const packages: WorkspacePackage[] = [
 	{
@@ -56,6 +56,27 @@ describe("planTasks command shape (issue #622)", () => {
 		expect(build?.cwd).toBe(resolvePackageCwd("python/robogjc/web"));
 	});
 });
+
+	describe("deep-interview selector narrowing", () => {
+		test("deep-interview-only changes avoid full workspace validation but still provide native artifacts", () => {
+			const tasks = planForPaths([
+				"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+				"packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts",
+				"packages/coding-agent/test/default-gjc-definitions.test.ts",
+				"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
+			]);
+			expect(tasks.map(task => task.key)).toEqual([
+				"native-linux-x64",
+				"deep-interview-definitions",
+				"deep-interview-runtime",
+			]);
+			const entries = describeTasks(tasks);
+			expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
+			expect(entries.find(entry => entry.key === "deep-interview-definitions")?.native).toBe(true);
+			expect(entries.find(entry => entry.key === "deep-interview-runtime")?.native).toBe(true);
+			expect(tasks.some(task => task.key === "root-test")).toBe(false);
+		});
+	});
 
 describe("runCommand executes package scripts in the target cwd (issue #622)", () => {
 	const tempDirs: string[] = [];
@@ -114,5 +135,234 @@ describe("runCommand executes package scripts in the target cwd (issue #622)", (
 		expect(exitCode).toBe(0); // false green
 		expect(await Bun.file(markerPath).exists()).toBe(false); // script never ran
 		expect(output).toContain("Usage: bun run"); // it only printed help
+	});
+});
+
+describe("describeTasks matrix emission", () => {
+	test("package test task needs native, native build task is flagged, check does not", () => {
+		const entries = describeTasks(planForPaths(["packages/example/src/index.ts"]));
+		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
+		const pkgTest = entries.find(entry => entry.key === "test:@gajae-code/example");
+		const pkgCheck = entries.find(entry => entry.key === "check:@gajae-code/example");
+
+		expect(nativeBuild?.nativeBuild).toBe(true);
+		expect(nativeBuild?.native).toBe(false);
+		expect(pkgTest?.native).toBe(true);
+		expect(pkgTest?.nativeBuild).toBe(false);
+		expect(pkgCheck?.native).toBe(false);
+		expect(pkgCheck?.nativeBuild).toBe(false);
+
+		// Every descriptor carries the serialized command plus boolean setup flags.
+		for (const entry of entries) {
+			expect(Array.isArray(entry.command)).toBe(true);
+			expect(typeof entry.native).toBe("boolean");
+			expect(typeof entry.rust).toBe("boolean");
+			expect(typeof entry.nativeBuild).toBe("boolean");
+		}
+	});
+
+	test("rust tasks are flagged rust and need no native addon", () => {
+		const entries = describeTasks(planTasks(["crates/pi-natives/src/lib.rs"], packages));
+		const check = entries.find(entry => entry.key === "rust-check");
+		const runTest = entries.find(entry => entry.key === "rust-test");
+
+		expect(check?.rust).toBe(true);
+		expect(check?.native).toBe(false);
+		expect(runTest?.rust).toBe(true);
+		expect(entries.every(entry => !entry.nativeBuild)).toBe(true);
+	});
+
+	test("cwd is emitted repo-relative for package-scoped tasks", () => {
+		const entries = describeTasks(planForPaths(["packages/example/src/index.ts"]));
+		const pkgCheck = entries.find(entry => entry.key === "check:@gajae-code/example");
+		expect(pkgCheck?.cwd).toBe("packages/example");
+	});
+});
+
+describe("--matrix-json and --task CLI fan-out", () => {
+	const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
+	const repoRoot = path.join(import.meta.dir, "..");
+	const tempDirs: string[] = [];
+
+	afterAll(async () => {
+		await Promise.all(tempDirs.map(dir => fs.rm(dir, { recursive: true, force: true })));
+	});
+
+	async function runScript(
+		args: readonly string[],
+		changedPaths: string,
+		extraEnv: Record<string, string> = {},
+	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		const proc = Bun.spawn(["bun", scriptPath, ...args], {
+			cwd: repoRoot,
+			// Default to push (broad) mode so these CLI cases stay deterministic
+			// regardless of the GITHUB_EVENT_NAME of the CI run executing them;
+			// PR-mode behavior is asserted via planTargetedTasks unit tests.
+			env: { ...process.env, GITHUB_EVENT_NAME: "push", CI_DEV_CHANGED_PATHS: changedPaths, ...extraEnv },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		return { stdout, stderr, exitCode };
+	}
+
+	test("--matrix-json emits JSON descriptors and GitHub planner outputs", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-matrix-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "crates/pi-natives/src/lib.rs", {
+			GITHUB_OUTPUT: outputFile,
+		});
+		expect(exitCode).toBe(0);
+
+		const entries = JSON.parse(stdout.trim());
+		expect(entries.some((entry: { key: string; rust: boolean; native: boolean }) => entry.key === "rust-check" && entry.rust === true && entry.native === false)).toBe(true);
+
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_tasks=true");
+		expect(output).toContain("has_native=false");
+		expect(output).toContain("changed_paths<<");
+
+		const matrixLine = output.split("\n").find(line => line.startsWith("matrix="));
+		expect(matrixLine).toBeDefined();
+		const matrix = JSON.parse((matrixLine as string).slice("matrix=".length));
+		expect(matrix.include.some((shard: { key: string }) => shard.key === "rust-check")).toBe(true);
+		// Native build tasks never appear as shards.
+		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
+	});
+
+	test("--task runs exactly the selected planned task", async () => {
+		const { stdout, exitCode } = await runScript(["--task=affected-dry-run"], "scripts/ci-dev-affected.ts");
+		expect(exitCode).toBe(0);
+		// The selected task's group header proves the right single task was chosen,
+		// and the nested --dry-run output proves it actually executed.
+		expect(stdout).toContain("Affected CI selector self-check");
+		expect(stdout).toContain("Dev affected-path CI");
+	});
+
+	test("--task fails loudly on a key absent from the current plan", async () => {
+		const { stderr, exitCode } = await runScript(["--task=does-not-exist"], "docs/readme.md");
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("not in the current plan");
+	});
+
+	test("--native-build is a no-op when the plan has no native build task", async () => {
+		const { stdout, exitCode } = await runScript(["--native-build"], "docs/readme.md");
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("no native build tasks in plan");
+	});
+});
+
+describe("planTargetedTasks PR-mode targeting", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const testFiles = [
+		"packages/coding-agent/test/edit/foo.test.ts",
+		"packages/coding-agent/test/edit/bar.test.ts",
+		"packages/coding-agent/test/cli.test.ts",
+		"packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+	];
+
+	function targeted(paths: readonly string[]) {
+		return planTargetedTasks(paths, targetingPackages, testFiles);
+	}
+
+	test("a single coding-agent test change runs only that test, not the whole package suite", () => {
+		const tasks = targeted(["packages/coding-agent/test/edit/foo.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
+		// No broad package-wide test, and no other coding-agent test file.
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
+		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
+		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
+	});
+
+	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {
+		const tasks = targeted(["packages/coding-agent/test/rlm-live-model-e2e.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+
+		const entries = describeTasks(tasks);
+		const liveShard = entries.find(entry => entry.key === "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
+		expect(liveShard).toEqual({
+			key: "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+			description: "Test packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+			command: ["bun", "test", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
+			native: true,
+			rust: false,
+			nativeBuild: false,
+		});
+		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
+	});
+
+	test("a source file with a directly-named test maps to exactly that test", () => {
+		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+	});
+
+	test("a source file with no mapped test runs the owning package check, not its test suite", () => {
+		const tasks = targeted(["packages/coding-agent/src/edit/unmapped.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("cli-smoke"); // coding-agent runtime smoke
+		expect(keys.some(key => key.startsWith("test:"))).toBe(false);
+	});
+
+	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {
+		const tasks = targeted([".github/workflows/dev-ci.yml"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "yaml-parse"]);
+	});
+
+	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
+		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+	});
+
+	test("docs/changelog-only changes plan nothing expensive", () => {
+		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	});
+
+	test("native-consuming test files pull in a single native build task", () => {
+		const tasks = targeted(["packages/coding-agent/test/cli.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/cli.test.ts");
+		// ensureNativeBuild adds exactly one native build task (built once, shared).
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
+
+		const entries = describeTasks(tasks);
+		const cliShard = entries.find(entry => entry.key === "test:packages/coding-agent/test/cli.test.ts");
+		expect(cliShard?.native).toBe(true);
+	});
+});
+
+describe("push-mode broad planning still runs the fuller suite", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+
+	test("push mode plans the package-wide test for a coding-agent change", () => {
+		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
+		const keys = tasks.map(task => task.key);
+		// Broad planner keeps the package-wide test (the post-merge fuller suite).
+		expect(keys).toContain("test:@gajae-code/coding-agent");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 	});
 });

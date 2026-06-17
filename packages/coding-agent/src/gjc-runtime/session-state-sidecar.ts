@@ -6,7 +6,7 @@ import { logger } from "@gajae-code/utils";
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
 export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 
-type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | "completed" | "errored";
+export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | "completed" | "errored";
 
 interface RuntimeStateEvent {
 	type: string;
@@ -17,6 +17,66 @@ interface RuntimeStateContext {
 	sessionId: string;
 	cwd: string;
 	sessionFile?: string | null;
+}
+
+interface RuntimeStateSidecarPayload {
+	schema_version?: unknown;
+	session_id?: unknown;
+	state?: unknown;
+	ready_for_input?: unknown;
+	cwd?: unknown;
+	session_file?: unknown;
+}
+
+export type TerminalRuntimeStateStatus =
+	| { terminal: true; state: "completed" | "errored" }
+	| {
+			terminal: false;
+			reason:
+				| "missing_state_file"
+				| "invalid_json"
+				| "session_id_mismatch"
+				| "cwd_mismatch"
+				| "session_file_mismatch"
+				| "non_terminal_state";
+	  };
+
+function sameResolvedPath(left: string, right: string): boolean {
+	return path.resolve(left) === path.resolve(right);
+}
+
+export async function readTerminalRuntimeStateMarker(input: {
+	stateFile?: string | null;
+	sessionId?: string | null;
+	cwd?: string | null;
+	sessionFile?: string | null;
+}): Promise<TerminalRuntimeStateStatus> {
+	const stateFile = input.stateFile?.trim();
+	const sessionId = input.sessionId?.trim();
+	if (!stateFile || !sessionId) return { terminal: false, reason: "missing_state_file" };
+	let payload: RuntimeStateSidecarPayload;
+	try {
+		payload = JSON.parse(await Bun.file(stateFile).text()) as RuntimeStateSidecarPayload;
+	} catch (error) {
+		const code = (error as { code?: unknown }).code;
+		return {
+			terminal: false,
+			reason: code === "ENOENT" || code === "ENOTDIR" ? "missing_state_file" : "invalid_json",
+		};
+	}
+	if (payload.session_id !== sessionId) return { terminal: false, reason: "session_id_mismatch" };
+	if (input.cwd && typeof payload.cwd === "string" && !sameResolvedPath(payload.cwd, input.cwd)) {
+		return { terminal: false, reason: "cwd_mismatch" };
+	}
+	if (
+		input.sessionFile &&
+		typeof payload.session_file === "string" &&
+		!sameResolvedPath(payload.session_file, input.sessionFile)
+	) {
+		return { terminal: false, reason: "session_file_mismatch" };
+	}
+	if (payload.state === "completed" || payload.state === "errored") return { terminal: true, state: payload.state };
+	return { terminal: false, reason: "non_terminal_state" };
 }
 
 function lastAssistant(messages: unknown[] | undefined): AssistantMessage | undefined {

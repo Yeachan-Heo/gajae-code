@@ -8,6 +8,13 @@ function sanitizeOutputChunk(rawChunk: string): string {
 	return sanitizeWithOptionalSixelPassthrough(rawChunk, sanitizeText);
 }
 
+/**
+ * Flush threshold for the opt-in sanitize-coalescing path (F21). When coalescing is enabled, raw
+ * chunks accumulate until they reach this many chars, then are sanitized + delivered as one batch,
+ * so many-small-chunk output pays one sanitize pass per batch instead of one per tiny chunk.
+ */
+const COALESCE_FLUSH_CHARS = 64 * 1024;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -80,6 +87,13 @@ export interface OutputSinkOptions {
 	 * relative to the sink (the sink does not catch errors from this callback).
 	 */
 	onRawChunk?: (chunk: string) => void;
+	/**
+	 * Opt-in (F21): when true, sanitization + live callback delivery + retention are coalesced over
+	 * batched raw chunks instead of run per chunk, bounding sync CPU for many-small-chunk output. The
+	 * raw artifact mirror stays byte-correct. Defaults to the PI_OUTPUT_SANITIZE_COALESCE env flag
+	 * (default OFF — the per-chunk path is byte-identical to historical behavior).
+	 */
+	coalesceSanitize?: boolean;
 }
 
 export interface TruncationResult {
@@ -706,6 +720,8 @@ export class OutputSink {
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
 	readonly #artifactMaxBytes: number;
+	readonly #coalesceSanitize: boolean;
+	#coalesceBuf = "";
 
 	constructor(options?: OutputSinkOptions) {
 		const {
@@ -718,6 +734,7 @@ export class OutputSink {
 			chunkThrottleMs = 0,
 			onRawChunk,
 			artifactMaxBytes = DEFAULT_ARTIFACT_MAX_BYTES,
+			coalesceSanitize = process.env.PI_OUTPUT_SANITIZE_COALESCE === "1",
 		} = options ?? {};
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
@@ -728,6 +745,7 @@ export class OutputSink {
 		this.#onRawChunk = onRawChunk;
 		this.#chunkThrottleMs = chunkThrottleMs;
 		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
+		this.#coalesceSanitize = coalesceSanitize;
 	}
 
 	#headText(): string {
@@ -765,7 +783,28 @@ export class OutputSink {
 	 * visible retention windows are selected from the sanitized/column-capped
 	 * stream so production-default display matches the historical processed view.
 	 */
+	// F21: with coalescing enabled, accumulate raw chunks and process them in batches; the default
+	// (disabled) path calls #ingest directly and is byte-identical to the historical per-chunk path.
 	push(chunk: string): void {
+		if (!this.#coalesceSanitize) {
+			this.#ingest(chunk);
+			return;
+		}
+		this.#coalesceBuf += chunk;
+		if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) {
+			this.#flushCoalesced();
+		}
+	}
+
+	/** Process any buffered coalesced chunks as a single batch (F21). */
+	#flushCoalesced(): void {
+		if (this.#coalesceBuf.length === 0) return;
+		const batch = this.#coalesceBuf;
+		this.#coalesceBuf = "";
+		this.#ingest(batch);
+	}
+
+	#ingest(chunk: string): void {
 		const rawChunk = chunk;
 
 		// Live callbacks historically observe sanitized, uncapped chunks. The same
@@ -1046,6 +1085,7 @@ export class OutputSink {
 	 * branch in `dump()` against stale totals.
 	 */
 	replace(text: string): void {
+		this.#coalesceBuf = "";
 		this.#setTail(text);
 		this.#head = "";
 		this.#headBytes = 0;
@@ -1063,6 +1103,7 @@ export class OutputSink {
 	}
 
 	async dump(notice?: string): Promise<OutputSummary> {
+		this.#flushCoalesced();
 		const noticeLine = notice ? `[${notice}]\n` : "";
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 

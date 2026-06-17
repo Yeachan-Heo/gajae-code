@@ -1,6 +1,6 @@
 # Telegram Remote — v0 Roadmap (tiny operator button, not a cockpit)
 
-Status: **roadmap / doc-spec only** · Tracks issue #681 · Target: **0.6.0 planning** · Scope: **v0 only, no code**
+Status: **spec + reference implementation** · Tracks issue #681 · Target: **0.6.0** · Reference implementation: [`packages/telegram-remote`](../packages/telegram-remote/README.md) (incl. rich messaging; push deferred)
 
 Telegram Remote is a tiny, safe operator surface for Gajae-Code (`gjc`) session
 **lifecycle and observation** from a phone. It is deliberately **not** a remote
@@ -265,6 +265,58 @@ Each step is independently shippable; later steps stay fail-closed until wired.
 - Web "steering wheel" remote (sibling roadmap, harness/bridge-backed): [`docs/gajae-remote.md`](gajae-remote.md)
 - Bridge transport / fail-closed posture (why no second protocol): [`docs/bridge.md`](bridge.md)
 - RPC command/response contract and error shapes: [`docs/rpc.md`](rpc.md)
+- v0 reference implementation (this contract, as a small companion service): [`packages/telegram-remote`](../packages/telegram-remote/README.md)
+
+## Rich messaging and push notifications (implemented)
+
+The reference implementation adds optional rich messaging (default on) as a presentation +
+alternate-entry layer, without widening the action surface or transmitted-data allowlist:
+
+- HTML formatting and inline keyboards (**Observe** / **Stop** / **Refresh** / **Confirm stop** /
+  **Cancel**), a `setMyCommands` Bot menu (`sessions`/`observe`/`stop`/`help`/`start`; the hyphenated
+  `/start-session` cannot be registered and is documented in `/help`), and `/start` onboarding.
+- Callback queries are a new authenticated input channel that reuses the **same** default-deny
+  authorization, the **same** `CoordinatorClient` → Coordinator MCP calls, and the **same**
+  redaction. `callback_data` is an opaque `gtr:v1:<token>` (≤64 bytes, never the session id) backed
+  by TTL-bound, chat/user-bound, single-use server-side token metadata holding the exact raw id.
+  Every callback is answered; unauthorized/expired/malformed/missing-chat/replayed/cancel callbacks
+  are answer-only (no chat message, no backend call).
+
+**Push notifications reuse the `gjc_coordinator_watch_events` event surface.** Follow/Mute state is gateway-owned and bounded; delivery preserves the transmitted-data allowlist and does not introduce a Telegram-side session journal or shadow notification protocol.
+
+## RPC mode (second backend)
+
+The package also supports a second backend, `GJC_TELEGRAM_REMOTE_BACKEND=rpc`,
+for a single persistent session. In this mode the gateway dials an existing
+owner-only UNIX socket exposed by `gjc launch --output rpc`; it never spawns,
+kills, or tears down the session. Telegram acts as an attach/detach remote
+keyboard with `/attach`, `/detach`, `/status`, `/abort`, and `/help`/`/start`.
+Coordinator browsing commands (`/sessions`, `/observe`, `/presets`,
+`/start-session`, `/stop`) are not part of RPC mode and are rejected as unknown.
+
+RPC delivery is event-driven: agent questions and gates render as inline buttons,
+and turn completion sends only the final assistant text, HTML-escaped and
+Telegram-chunked. Session exit or liveness timeout produces exactly one
+stale-attachment alert. The socket's OS ownership is the real boundary: same-UID
+clients are fully trusted in v1, while protection targets different-UID users and
+unsafe filesystem placement. Controller ownership is last-connected-wins; a later
+UDS client becomes current, the gateway alerts once, reconnects, and resyncs.
+See [`packages/telegram-remote/README.md`](../packages/telegram-remote/README.md)
+and [`packages/telegram-remote/.env.example`](../packages/telegram-remote/.env.example)
+for RPC knobs.
+
+## Managed service examples
+
+`packages/telegram-remote/examples/systemd/` contains Linux systemd **user-unit** examples, which are the canonical always-on deployment path:
+
+- `gjc-telegram-remote-coordinator.service` runs the default Coordinator MCP backend as one bot service.
+- `gjc-rpc-session.service` runs the persistent `gjc launch --output rpc --listen <socket>` session.
+- `gjc-telegram-remote-rpc.service` runs the RPC Telegram bot, orders after and wants the session unit, and performs a finite socket wait because `After=` is not readiness.
+- `telegram-remote.env.example` is a service-oriented env template; copied real env files must be owner-only (`0600`).
+
+`packages/telegram-remote/examples/launchd/` contains macOS LaunchAgent parity examples. They use `com.example...` labels so operators replace the namespace, and shell wrappers source a protected env file then `exec` the real command. launchd parity cannot express systemd `Wants=`/`After=`/`BindsTo=` semantics; the RPC bot wrapper performs a finite socket wait.
+
+Service examples are not a new daemon and do not change the runtime contract. Coordinator mode remains one service. RPC mode remains two services because the Telegram gateway dials an existing owner-only socket and never owns the session. The examples document the same-UID socket boundary, `last-connected-wins`, concrete socket paths, `loginctl enable-linger` for boot-start Linux user services, absolute executable paths or a service-local `PATH`, no token in units/plists/argv/logs, and install/uninstall verification.
 
 —
 *[repo owner's gaebal-gajae (clawdbot) 🦞]*

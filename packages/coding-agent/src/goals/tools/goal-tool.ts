@@ -66,8 +66,15 @@ function buildGoalToolResult(op: GoalToolDetails["op"], response: GoalToolRespon
 	};
 }
 
+function assertGoalOperationAllowed(session: ToolSession, op: GoalToolInput["op"]): void {
+	const allowedOps = session.goalToolAllowedOps;
+	if (!allowedOps || allowedOps.includes(op)) return;
+	throw new ToolError(`Goal mode in this session only allows goal operations: ${allowedOps.join(", ")}.`);
+}
+
 async function executeGoalOperation(session: ToolSession, params: GoalToolInput): Promise<GoalToolResponse> {
 	rejectUnsupportedGoalArgs(params as Record<string, unknown>);
+	assertGoalOperationAllowed(session, params.op);
 	if (params.op === "get") {
 		const state = session.getGoalModeState?.();
 		return buildGoalToolResponse(state?.goal ?? null);

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.gajae-code.telegram-remote.coordinator</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>/Users/YOU/src/gajae-code/packages/telegram-remote/examples/launchd/bin/telegram-remote-coordinator.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>GJC_TELEGRAM_REMOTE_ENV_FILE</key>
+		<string>/Users/YOU/Library/Application Support/gjc/telegram-remote.env</string>
+		<key>GJC_TELEGRAM_REMOTE_CHECKOUT</key>
+		<string>/Users/YOU/src/gajae-code</string>
+		<key>GJC_BUN</key>
+		<string>/Users/YOU/.bun/bin/bun</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/YOU/src/gajae-code/packages/telegram-remote</string>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/gjc-telegram-remote-coordinator.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/gjc-telegram-remote-coordinator.err.log</string>
+</dict>
+</plist>

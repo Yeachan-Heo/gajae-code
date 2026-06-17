@@ -118,6 +118,7 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 		case "get_last_assistant_text":
 		case "get_messages":
 		case "get_login_providers":
+		case "get_pending_workflow_gates":
 			return true;
 		case "abort_and_prompt":
 			return stringField(value, "message") && optionalArray(value.images);

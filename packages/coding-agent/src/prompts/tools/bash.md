@@ -2,27 +2,45 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 
 <instruction>
 - Use `cwd` to set working directory, not `cd dir && …`
+{{#when restrictionProfile "==" "read-only"}}
+- Do not pass `env` overrides or `pty: true`; read-only bash rejects both.
+- Shell control operators such as `;`, `|`, `&`, `<`, `>`, and command substitution are blocked.
+- Internal URIs (`agent://`, `artifact://`, `rule://`, `local://`) are auto-resolved to filesystem paths without creating parent directories.
+{{else}}
 - Prefer `env: { NAME: "…" }` for multiline, quote-heavy, or untrusted values; reference as `$NAME`
 - Quote variable expansions like `"$NAME"` to preserve exact content
 - PTY mode is opt-in: set `pty: true` only when the command needs a real terminal (e.g. `sudo`, `ssh` requiring user input); default is `false`
 - Use `;` only when later commands should run regardless of earlier failures
 - Internal URIs (`agent://`, `artifact://`, `rule://`, `local://`) are auto-resolved to filesystem paths
+{{/when}}
 {{#if asyncEnabled}}
 - Use `async: true` for long-running commands when you don't need immediate output; the call returns a background job ID and the result is delivered automatically as a follow-up.
 {{/if}}
 </instruction>
 {{#if restrictedAllowedPrefixes}}
-<restricted-role-agent-mode>
+<restricted-bash-mode>
+{{#when restrictionProfile "==" "read-only"}}
+This session's bash tool is read-only. It accepts only simple, single-command inspections beginning with:
+{{#each restrictedAllowedPrefixes}}
+- `{{this}}`
+{{/each}}
+Shell control operators, command substitution, env overrides, redirects, pipelines, glob expansion, and known write-capable flags are blocked before execution. Use it only when an inspection command is materially better than `read`, `search`, or `find`.
+{{else}}
 This session's bash tool is restricted. It only accepts commands beginning with:
 {{#each restrictedAllowedPrefixes}}
 - `{{this}}`
 {{/each}}
 Use it only for sanctioned GJC workflow CLI persistence or state read/write/contract operations; per-command env overrides and all other shell command shapes are blocked before execution.
-</restricted-role-agent-mode>
+{{/when}}
+</restricted-bash-mode>
 {{/if}}
 
 <critical>
+{{#when restrictionProfile "==" "read-only"}}
+- Use read-only bash only for approved inspection commands that are materially better than `read`, `search`, or `find`; the tool itself blocks non-approved commands and unsafe shell shapes.
+{{else}}
 - NEVER use Linux coreutils (`cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `awk`, `sed`, `find`, `fd`, etc.) when a dedicated tool suffices — ALWAYS prefer `read`, `search`, `find`, `edit`, `write`.
+{{/when}}
 - NEVER pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
 - NEVER redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
 </critical>

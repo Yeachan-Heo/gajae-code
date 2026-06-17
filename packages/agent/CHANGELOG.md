@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-06-17
+
+### Fixed
+
+- Maintenance one-shot LLM calls now preserve active provider session state and the configured WebSocket transport preference. `SummaryOptions`, `HandoffOptions`, and `GenerateBranchSummaryOptions` accept `sessionId`, `providerSessionState`, and `preferWebsockets`, and `generateSummary`, `generateShortSummary`, `generateTurnPrefixSummary`, `generateHandoff`, `generateBranchSummary`, and `compact()` forward them through to `completeSimple` — previously these fields were dropped, so Codex/OpenAI-compatible compaction summaries, handoff generation, and branch summaries fell back to HTTP/SSE and lost `session_id` affinity even with `providers.openaiWebsockets: "on"`. Split-turn compaction now runs its history and turn-prefix summaries sequentially when they share a single provider WebSocket session, avoiding `websocket request already in progress`; non-WebSocket sessions still run them in parallel. `Agent` exposes a `preferWebsockets` getter so callers can forward the live transport preference (#736).
+
 ## [0.5.3] - 2026-06-16
 
 ### Fixed

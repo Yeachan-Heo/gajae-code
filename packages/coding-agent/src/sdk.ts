@@ -47,6 +47,7 @@ import {
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
+import type { BashRestrictionProfile } from "./tools/bash-allowed-prefixes";
 import "./discovery";
 import { resolveConfigValue } from "./config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "./defaults/gjc-defaults";
@@ -310,6 +311,12 @@ export interface CreateAgentSessionOptions {
 	agentDisplayName?: string;
 	/** Optional restricted bash command prefixes for read-only role agents. */
 	bashAllowedPrefixes?: string[];
+	/** Restriction policy paired with bashAllowedPrefixes. */
+	bashRestrictionProfile?: BashRestrictionProfile;
+	/** Optional per-session restriction for goal tool operations. */
+	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop")[];
+	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
+	discoverableToolAllowedNames?: readonly string[];
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
@@ -619,6 +626,7 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 		label: tool.label,
 		description: tool.description,
 		parameters: tool.parameters,
+		concurrency: tool.concurrency,
 		hidden: tool.hidden,
 		deferrable: tool.deferrable,
 		mcpServerName: tool.mcpServerName,
@@ -1219,6 +1227,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			getAgentId: () => resolvedAgentId,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
+			bashRestrictionProfile: options.bashRestrictionProfile,
+			goalToolAllowedOps: options.goalToolAllowedOps,
+			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
@@ -2028,6 +2039,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			rebuildSystemPrompt,
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
+			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
 			getMcpServerInstructions: mcpManager
 				? () => {
 						const raw = mcpManager.getServerInstructions();

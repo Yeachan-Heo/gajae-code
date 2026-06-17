@@ -44,6 +44,10 @@ export interface StatusLineSettings {
 	sessionAccent?: boolean;
 }
 
+export interface StatusLineComponentOptions {
+	version?: string;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-message token cache
 // ═══════════════════════════════════════════════════════════════════════════
@@ -161,6 +165,7 @@ export class StatusLineComponent implements Component {
 	#skillHudEntries: SkillActiveEntry[] = [];
 	#skillHudLastFetch = 0;
 	#skillHudInFlight = false;
+	#version: string | undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -197,7 +202,10 @@ export class StatusLineComponent implements Component {
 	#nonMessageTokensCache: number | undefined;
 	#nonMessageInputsKey: string | undefined;
 
-	constructor(private readonly session: AgentSession) {
+	constructor(
+		private readonly session: AgentSession,
+		options: StatusLineComponentOptions = {},
+	) {
 		this.#settings = {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
@@ -208,6 +216,7 @@ export class StatusLineComponent implements Component {
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
 		};
+		this.#version = options.version?.trim() || undefined;
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -700,6 +709,9 @@ export class StatusLineComponent implements Component {
 			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
 			const label = `${formatCount("job", runningBackgroundJobs)} running`;
 			rightParts.push(theme.fg("statusLineSubagents", `${icon}${label}`));
+		}
+		if (this.#version) {
+			rightParts.push(theme.fg("dim", `v${this.#version}`));
 		}
 		const topFillWidth = Math.max(0, width);
 		const left = [...leftParts];

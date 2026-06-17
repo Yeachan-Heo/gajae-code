@@ -18,6 +18,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.editor.external"
 	| "app.history.search"
 	| "app.message.dequeue"
+	| "app.message.queue"
 	| "app.clipboard.pasteImage"
 	| "app.clipboard.copyPrompt"
 >;
@@ -36,6 +37,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.thinking.toggle": ["ctrl+t"],
 	"app.editor.external": ["ctrl+g"],
 	"app.history.search": ["ctrl+r"],
+	"app.message.queue": ["alt+enter"],
 	"app.message.dequeue": ["alt+up"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
@@ -82,6 +84,8 @@ export class CustomEditor extends Editor {
 	onPastePendingInputCleared?: (reason: PastePendingClearReason, droppedInputCount: number) => void;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
+	/** Called when the configured queue shortcut is pressed. */
+	onQueue?: () => void;
 	/** Called when Caps Lock is pressed. */
 	onCapsLock?: () => void;
 
@@ -325,6 +329,12 @@ export class CustomEditor extends Editor {
 		// Intercept configured dequeue shortcut (restore queued message to editor)
 		if (this.#matchesAction(data, "app.message.dequeue") && this.onDequeue) {
 			this.onDequeue();
+			return;
+		}
+
+		// Intercept configured queue shortcut (send message after current turn)
+		if (this.#matchesAction(data, "app.message.queue") && this.onQueue) {
+			this.onQueue();
 			return;
 		}
 

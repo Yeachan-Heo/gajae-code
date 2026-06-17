@@ -45,6 +45,22 @@ bun install -g gajae-code
 
 The scoped package is also available as `@gajae-code/coding-agent`.
 
+### macOS Intel native binary install
+
+Release artifacts include both Apple Silicon (`gjc-darwin-arm64`) and Intel (`gjc-darwin-x64`) macOS standalone binaries. On Intel Macs, the binary installer selects `gjc-darwin-x64` automatically:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --binary
+```
+
+If an older release is missing `gjc-darwin-x64`, install through the npm/Bun package path instead, or choose a newer release that includes the Intel macOS asset:
+
+```sh
+bun install -g gajae-code
+# or
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --source
+```
+
 ### Windows (native install)
 
 On a clean Windows 11 machine, install Bun first, then install `gjc` with Bun's
@@ -144,9 +160,9 @@ No sprawling default skill zoo: GJC improves by making this small method better.
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
-| External controller / bot | `gjc mcp-serve coordinator` plus `gjc setup hermes` for compatible config, or `gjc --mode rpc` for a subprocess worker | Any MCP/RPC-capable bot drives GJC through the generic coordinator/RPC contract, not scrollback scraping. |
+| External controller / bot | `gjc --mode rpc` for a subprocess worker, or Bridge/HTTPS surfaces where configured | External controllers drive GJC through generic RPC/bridge contracts, not scrollback scraping. |
 
-For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across MCP, RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md). For the remote operator surfaces roadmap, see [`docs/gajae-remote.md`](docs/gajae-remote.md) (web steering wheel) and [`docs/telegram-remote.md`](docs/telegram-remote.md) (Telegram lifecycle button).
+For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md). For the remote operator surfaces roadmap, see [`docs/gajae-remote.md`](docs/gajae-remote.md) (web steering wheel) and [`docs/telegram-remote.md`](docs/telegram-remote.md) (Telegram lifecycle button).
 
 ## Configuration
 
@@ -165,6 +181,18 @@ retry:
 ## TUI identity
 
 The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win.
+
+### Bundled theme grid
+
+Pick from Settings (`Appearance -> Dark theme` / `Light theme`) or `/theme`.
+
+| Theme | Visual feel | Best fit |
+| --- | --- | --- |
+| `red-claw` | Dark GJC default with warm red-claw accents and strong status contrast. | Native GJC identity for dark terminals. |
+| `blue-crab` | Bright-terminal blue palette tuned for readable light slots. | Light terminal or OS appearance. |
+| `claude-code` | Claude Code-inspired dark palette with terracotta and pink highlights. | Claude Code muscle memory without leaving GJC. |
+| `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | A Codex-like dark workspace. |
+| `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | OpenCode muscle memory in the bundled picker. |
 
 ## Development
 

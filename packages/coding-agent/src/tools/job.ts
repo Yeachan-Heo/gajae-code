@@ -26,6 +26,7 @@ const jobSchema = z.object({
 	poll: z.array(z.string()).optional().describe("job ids to wait for"),
 	cancel: z.array(z.string()).optional().describe("job ids to cancel"),
 	list: z.boolean().optional().describe("snapshot all jobs"),
+	tail: z.array(z.string()).optional().describe("job ids whose retained output should be shown without waiting"),
 });
 
 type JobParams = z.infer<typeof jobSchema>;
@@ -60,9 +61,19 @@ interface CancelOutcome {
 	message: string;
 }
 
+export interface JobOutputTail {
+	id: string;
+	status: AsyncJob["status"];
+	text: string;
+	startOffset: number;
+	nextOffset: number;
+	truncated: boolean;
+}
+
 export interface JobToolDetails {
 	jobs: JobSnapshot[];
 	cancelled?: { id: string; status: CancelStatus }[];
+	output?: JobOutputTail[];
 }
 
 export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
@@ -107,7 +118,21 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			if (params.cancel?.length || params.poll?.length) {
 				throw new ToolError("`list` cannot be combined with `poll` or `cancel`.");
 			}
-			return this.#buildResult(manager, manager.getAllJobs(ownerFilter), []);
+			return this.#buildResult(
+				manager,
+				manager.getAllJobs(ownerFilter),
+				[],
+				this.#readOutputTails(manager, params.tail, ownerFilter),
+			);
+		}
+
+		if (params.tail?.length && !params.poll?.length && !params.cancel?.length) {
+			return this.#buildResult(
+				manager,
+				this.#visibleJobs(manager, params.tail, ownerId),
+				[],
+				this.#readOutputTails(manager, params.tail, ownerFilter),
+			);
 		}
 
 		const cancelIds = params.cancel ?? [];
@@ -150,7 +175,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 
 		if (!shouldPoll) {
 			const cancelledJobs = this.#visibleJobs(manager, cancelIds, ownerId);
-			return this.#buildResult(manager, cancelledJobs, cancelOutcomes);
+			return this.#buildResult(
+				manager,
+				cancelledJobs,
+				cancelOutcomes,
+				this.#readOutputTails(manager, params.tail, ownerFilter),
+			);
 		}
 
 		// Resolve which jobs to watch.
@@ -163,7 +193,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		if (jobsToWatch.length === 0) {
 			if (cancelOutcomes.length > 0) {
 				const cancelledJobs = this.#visibleJobs(manager, cancelIds, ownerId);
-				return this.#buildResult(manager, cancelledJobs, cancelOutcomes);
+				return this.#buildResult(
+					manager,
+					cancelledJobs,
+					cancelOutcomes,
+					this.#readOutputTails(manager, params.tail, ownerFilter),
+				);
 			}
 			const message = requestedPollIds?.length
 				? `No matching jobs found for IDs: ${requestedPollIds.join(", ")}`
@@ -178,7 +213,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		const runningJobs = jobsToWatch.filter(j => j.status === "running");
 		if (runningJobs.length === 0) {
 			const cancelledJobs = cancelIds.map(id => manager.getJob(id)).filter(j => j != null);
-			return this.#buildResult(manager, [...cancelledJobs, ...jobsToWatch], cancelOutcomes);
+			return this.#buildResult(
+				manager,
+				[...cancelledJobs, ...jobsToWatch],
+				cancelOutcomes,
+				this.#readOutputTails(manager, params.tail, ownerFilter),
+			);
 		}
 
 		// Wait until at least one running job finishes, the wait duration elapses, or the call is aborted.
@@ -231,7 +271,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			if (progressTimer) clearInterval(progressTimer);
 		}
 
-		return this.#buildResult(manager, allTrackedJobs, cancelOutcomes);
+		return this.#buildResult(
+			manager,
+			allTrackedJobs,
+			cancelOutcomes,
+			this.#readOutputTails(manager, params.tail, ownerFilter),
+		);
 	}
 
 	/**
@@ -239,6 +284,28 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	 * Drops missing ids and ids owned by other agents, so cross-agent inspection
 	 * via the `job` tool is impossible.
 	 */
+	#readOutputTails(
+		manager: AsyncJobManager,
+		ids: string[] | undefined,
+		ownerFilter: { ownerId: string } | undefined,
+	): JobOutputTail[] {
+		if (!ids?.length) return [];
+		const out: JobOutputTail[] = [];
+		for (const id of Array.from(new Set(ids.map(value => value.trim()).filter(Boolean)))) {
+			const slice = manager.readOutputSince(id, 0, ownerFilter);
+			if (!slice) continue;
+			out.push({
+				id: slice.jobId,
+				status: slice.status,
+				text: slice.text,
+				startOffset: slice.startOffset,
+				nextOffset: slice.nextOffset,
+				truncated: slice.truncated,
+			});
+		}
+		return out;
+	}
+
 	#visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: string | undefined): AsyncJob[] {
 		const out: AsyncJob[] = [];
 		for (const id of ids) {
@@ -290,6 +357,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			errorText?: string;
 		}[],
 		cancelOutcomes: CancelOutcome[],
+		outputTails: JobOutputTail[] = [],
 	): AgentToolResult<JobToolDetails> {
 		// Deduplicate by id (cancelled jobs may also appear in the watched set).
 		const seen = new Set<string>();
@@ -335,11 +403,21 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			}
 		}
 
+		if (outputTails.length > 0) {
+			lines.push("", `## Retained Output (${outputTails.length})\n`);
+			for (const tail of outputTails) {
+				lines.push(`### ${tail.id} — ${tail.status}`);
+				if (tail.truncated) lines.push(`(showing retained tail from byte ${tail.startOffset})`);
+				lines.push("```", tail.text || "(no retained output yet)", "```", `cursor: ${tail.nextOffset}`, "");
+			}
+		}
+
 		return {
 			content: [{ type: "text", text: lines.join("\n").trimEnd() }],
 			details: {
 				jobs: jobResults,
 				...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
+				...(outputTails.length ? { output: outputTails } : {}),
 			},
 		};
 	}
@@ -352,6 +430,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 interface JobRenderArgs {
 	poll?: string[];
 	cancel?: string[];
+	tail?: string[];
 }
 
 const COLLAPSED_LIST_LIMIT = PREVIEW_LIMITS.COLLAPSED_ITEMS;
@@ -391,12 +470,16 @@ function statusToColor(status: JobSnapshot["status"]): ToolUIColor {
 function describeTarget(args: JobRenderArgs | undefined): string {
 	const poll = args?.poll ?? [];
 	const cancel = args?.cancel ?? [];
+	const tail = args?.tail ?? [];
 	const parts: string[] = [];
 	if (cancel.length > 0) {
 		parts.push(cancel.length === 1 ? `cancel ${cancel[0]}` : `cancel ${cancel.length} jobs`);
 	}
 	if (poll.length > 0) {
 		parts.push(poll.length === 1 ? `poll ${poll[0]}` : `poll ${poll.length} jobs`);
+	}
+	if (tail.length > 0) {
+		parts.push(tail.length === 1 ? `tail ${tail[0]}` : `tail ${tail.length} jobs`);
 	}
 	if (parts.length === 0) return "all running jobs";
 	return parts.join(", ");

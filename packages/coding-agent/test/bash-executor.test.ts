@@ -107,6 +107,28 @@ describe("executeBash", () => {
 		expect(result.output.trim()).toBe("0:hello");
 	});
 
+	it("can ignore configured shell prefixes", async () => {
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell: Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash",
+			args: ["-l", "-c"],
+			env: {
+				PATH: Bun.env.PATH ?? "",
+				HOME: Bun.env.HOME ?? tempDir,
+			},
+			prefix: "false &&",
+		});
+
+		const blocked = await executeBash("echo prefixed", { cwd: tempDir, timeout: 5000 });
+		expect(blocked.exitCode).not.toBe(0);
+
+		const ignored = await executeBash("echo unprefixed", {
+			cwd: tempDir,
+			timeout: 5000,
+			ignoreShellPrefix: true,
+		});
+		expect(ignored.output.trim()).toBe("unprefixed");
+	});
+
 	it("invokes onChunk with command output", async () => {
 		let seenChunk: string | null = null;
 		const result = await executeBash("echo hello", {
@@ -472,6 +494,36 @@ describe("executeBash", () => {
 		await executeBash("true", { cwd: tempDir, timeout: 5000, sessionKey });
 		const result = await executeBash("echo $PI_SNAPSHOT_TEST", { cwd: tempDir, timeout: 5000, sessionKey });
 		expect(result.output.trim()).toBe("from_snapshot");
+	});
+
+	it("can disable shell snapshots", async () => {
+		if (process.platform === "win32") {
+			return;
+		}
+		const bashPath = Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash";
+		if (!fs.existsSync(bashPath)) {
+			return;
+		}
+		const snapshotPath = path.join(tempDir, "disabled-snapshot.sh");
+		fs.writeFileSync(snapshotPath, "export PI_DISABLED_SNAPSHOT_TEST=from_snapshot\n");
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell: bashPath,
+			args: ["-l", "-c"],
+			env: {
+				PATH: Bun.env.PATH ?? "",
+				HOME: Bun.env.HOME ?? tempDir,
+			},
+			prefix: undefined,
+		});
+		vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);
+
+		const result = await executeBash("printenv PI_DISABLED_SNAPSHOT_TEST || printf unset", {
+			cwd: tempDir,
+			timeout: 5000,
+			disableShellSnapshot: true,
+			sessionKey: "disabled-snapshot-test",
+		});
+		expect(result.output.trim()).toBe("unset");
 	});
 
 	it("sources large bash functions without base64 eval wrappers", async () => {

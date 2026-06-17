@@ -4,7 +4,7 @@ import { Settings } from "../src/config/settings";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
-import { executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
+import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
 import * as sshConfig from "../src/ssh/config-writer";
 
 interface FakeAcpBuiltinSession {
@@ -562,7 +562,9 @@ describe("ACP builtin slash commands", () => {
 
 		expect(configNotified).toBe(0);
 	});
-
+	it("does not advertise /copy to ACP clients", () => {
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "copy")).toBe(false);
+	});
 	// TUI-only and dropped commands fall through as false
 	it("TUI-only and dropped commands return false (fall through to model)", async () => {
 		const fallthroughCommands = [

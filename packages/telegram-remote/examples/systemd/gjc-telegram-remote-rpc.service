@@ -1,0 +1,23 @@
+# Linux systemd user unit for the Telegram Remote RPC backend.
+# Copy to: ~/.config/systemd/user/gjc-telegram-remote-rpc.service
+# The bot dials an existing socket; it never owns or kills the RPC session.
+[Unit]
+Description=GJC Telegram Remote gateway (RPC backend)
+Documentation=https://github.com/gajae-ai/gajae-code/tree/dev/packages/telegram-remote
+Wants=network-online.target gjc-rpc-session.service
+After=network-online.target gjc-rpc-session.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/gajae-code/packages/telegram-remote
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/gjc/telegram-remote.env
+ExecStartPre=/bin/sh -lc 'socket="$GJC_TELEGRAM_REMOTE_RPC_SOCKET"; i=0; while [ "$i" -lt 30 ]; do [ -S "$socket" ] && exit 0; i=$((i+1)); sleep 1; done; echo "RPC socket not ready after 30s" >&2; exit 1'
+ExecStart=/usr/bin/env bun run src/cli.ts
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

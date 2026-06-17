@@ -35,6 +35,14 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
 
 export interface RpcClientOptions {
+	/** Dial an existing Unix-domain socket instead of spawning a stdio child. */
+	socketPath?: string;
+	/** Explicit transport selector; defaults to uds when socketPath is set, otherwise stdio. */
+	transport?: "stdio" | "uds";
+	/** Observe transport close/error state. */
+	onTransportClose?: (error?: Error) => void;
+	/** Alias for transport close/error observation. */
+	onTransportError?: (error: Error) => void;
 	/** Path to the CLI entry point (default: searches for dist/cli.js) */
 	cliPath?: string;
 	/** Working directory for the agent */
@@ -176,62 +184,43 @@ function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): A
 // RPC Client
 // ============================================================================
 
-export class RpcClient {
+export interface RpcTransport {
+	readonly kind: "stdio" | "uds";
+	start(onFrame: (frame: unknown) => void, onClose: (error?: Error) => void): Promise<void>;
+	write(frame: unknown): void;
+	stop(): void;
+	getStderr(): string;
+}
+
+class StdioRpcTransport implements RpcTransport {
+	readonly kind = "stdio" as const;
 	#process: ptree.ChildProcess | null = null;
-	#eventListeners: RpcEventListener[] = [];
-	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
-		new Map();
-	#customTools: RpcClientCustomTool[] = [];
-	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
-	#requestId = 0;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
-	#workflowGateListeners: Set<(gate: RpcWorkflowGate) => void> = new Set();
 	#abortController = new AbortController();
+	#startupStderrPromise: Promise<string> = Promise.resolve("");
 
-	constructor(private options: RpcClientOptions = {}) {
-		this.#customTools = [...(options.customTools ?? [])];
-	}
+	constructor(private readonly options: RpcClientOptions) {}
 
-	/**
-	 * Start the RPC agent process.
-	 */
-	async start(): Promise<void> {
-		if (this.#process) {
-			throw new Error("Client already started");
-		}
-
+	async start(onFrame: (frame: unknown) => void, onClose: (error?: Error) => void): Promise<void> {
+		if (this.#process) throw new Error("Transport already started");
+		this.#abortController = new AbortController();
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
-
-		if (this.options.provider) {
-			args.push("--provider", this.options.provider);
-		}
-		if (this.options.model) {
-			args.push("--model", this.options.model);
-		}
-		if (this.options.sessionDir) {
-			args.push("--session-dir", this.options.sessionDir);
-		}
-		if (this.options.args) {
-			args.push(...this.options.args);
-		}
-
+		if (this.options.provider) args.push("--provider", this.options.provider);
+		if (this.options.model) args.push("--model", this.options.model);
+		if (this.options.sessionDir) args.push("--session-dir", this.options.sessionDir);
+		if (this.options.args) args.push(...this.options.args);
 		this.#process = ptree.spawn(["bun", cliPath, ...args], {
 			cwd: this.options.cwd,
 			env: { ...Bun.env, ...this.options.env },
 			stdin: "pipe",
 			stderr: "full",
 		});
-		const startupStderrPromise = this.#process.stderr
+		this.#startupStderrPromise = this.#process.stderr
 			? new Response(this.#process.stderr).text().catch(() => "")
 			: Promise.resolve("");
-		const getStartupStderr = async () => this.#process?.peekStderr() || (await startupStderrPromise);
-
-		// Wait for the "ready" signal or process exit
+		const getStartupStderr = async () => this.#process?.peekStderr() || (await this.#startupStderrPromise);
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
-
-		// Process lines in background, intercepting the ready signal
 		const lines = readJsonl(this.#process.stdout, this.#abortController.signal);
 		void (async () => {
 			for await (const line of lines) {
@@ -240,10 +229,8 @@ export class RpcClient {
 					readyResolve();
 					continue;
 				}
-				this.#handleLine(line);
+				onFrame(line);
 			}
-			// Stream ended without ready signal — process exited. Wait for the
-			// managed process wrapper so stderr is fully drained before reporting.
 			if (!readySettled) {
 				const proc = this.#process;
 				const exitCode = proc ? await proc.exited.catch(() => proc.exitCode ?? -1) : undefined;
@@ -256,40 +243,179 @@ export class RpcClient {
 						),
 					);
 				}
+			} else {
+				onClose(new Error("RPC stdio transport closed"));
 			}
 		})().catch((err: Error) => {
 			if (!readySettled) {
 				readySettled = true;
 				readyReject(err);
-			}
+			} else onClose(err);
 		});
-
-		// Also race against process exit (in case stdout closes before we read it)
 		void this.#process.exited.then(async (exitCode: number) => {
 			if (!readySettled) {
 				const stderr = await getStartupStderr();
 				if (readySettled) return;
 				readySettled = true;
 				readyReject(new Error(`Agent process exited with code ${exitCode}. Stderr: ${stderr}`));
-			}
+			} else onClose(new Error(`RPC stdio transport exited with code ${exitCode}`));
 		});
-
-		// Timeout to prevent hanging forever
-		const readyTimeout = this.#startTimeout(30000, () => {
+		const readyTimeout = setTimeout(() => {
 			if (readySettled) return;
 			readySettled = true;
-			void getStartupStderr().then(stderr => {
-				readyReject(new Error(`Timeout waiting for agent to become ready. Stderr: ${stderr}`));
-			});
-		});
-
+			void getStartupStderr().then(stderr =>
+				readyReject(new Error(`Timeout waiting for agent to become ready. Stderr: ${stderr}`)),
+			);
+		}, 30_000);
+		readyTimeout.unref();
 		try {
 			await readyPromise;
+		} finally {
+			clearTimeout(readyTimeout);
+		}
+	}
+
+	write(frame: unknown): void {
+		if (!this.#process?.stdin) throw new Error("Client not started");
+		const stdin = this.#process.stdin as import("bun").FileSink;
+		stdin.write(`${JSON.stringify(frame)}\n`);
+		const flushResult = stdin.flush();
+		if (flushResult instanceof Promise) void flushResult;
+	}
+
+	stop(): void {
+		if (!this.#process) return;
+		this.#process.kill();
+		this.#abortController.abort();
+		this.#process = null;
+	}
+
+	getStderr(): string {
+		return this.#process?.peekStderr() ?? "";
+	}
+}
+
+class UdsRpcTransport implements RpcTransport {
+	readonly kind = "uds" as const;
+	#socket: import("bun").Socket | null = null;
+	#buf = "";
+	#decoder = new TextDecoder("utf-8", { fatal: false });
+	constructor(private readonly socketPath: string) {}
+
+	async start(onFrame: (frame: unknown) => void, onClose: (error?: Error) => void): Promise<void> {
+		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
+		let readySettled = false;
+		this.#socket = await Bun.connect({
+			unix: this.socketPath,
+			socket: {
+				data: (_socket, data) => {
+					this.#buf += this.#decoder.decode(data);
+					while (true) {
+						const nl = this.#buf.indexOf("\n");
+						if (nl < 0) break;
+						const text = this.#buf.slice(0, nl).trim();
+						this.#buf = this.#buf.slice(nl + 1);
+						if (!text) continue;
+						let frame: unknown;
+						try {
+							frame = JSON.parse(text);
+						} catch (err) {
+							onClose(err instanceof Error ? err : new Error(String(err)));
+							continue;
+						}
+						if (!readySettled && isRecord(frame) && frame.type === "ready") {
+							readySettled = true;
+							readyResolve();
+							continue;
+						}
+						onFrame(frame);
+					}
+				},
+				close: () => {
+					if (!readySettled) {
+						readySettled = true;
+						readyReject(new Error(`RPC UDS transport closed before ready: ${this.socketPath}`));
+					} else onClose(new Error(`RPC UDS transport closed: ${this.socketPath}`));
+				},
+				error: (_socket, error) => {
+					const err = error instanceof Error ? error : new Error(String(error));
+					if (!readySettled) {
+						readySettled = true;
+						readyReject(err);
+					} else onClose(err);
+				},
+			},
+		});
+		const readyTimeout = setTimeout(() => {
+			if (readySettled) return;
+			readySettled = true;
+			readyReject(new Error(`Timeout waiting for RPC UDS ready frame: ${this.socketPath}`));
+		}, 30_000);
+		readyTimeout.unref();
+		try {
+			await readyPromise;
+		} finally {
+			clearTimeout(readyTimeout);
+		}
+	}
+
+	write(frame: unknown): void {
+		if (!this.#socket) throw new Error("Client not started");
+		this.#socket.write(`${JSON.stringify(frame)}\n`);
+	}
+
+	stop(): void {
+		this.#socket?.end();
+		this.#socket = null;
+	}
+
+	getStderr(): string {
+		return "";
+	}
+}
+
+export class RpcClient {
+	#transport: RpcTransport | null = null;
+	#transportClosed = false;
+	#eventListeners: RpcEventListener[] = [];
+	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
+		new Map();
+	#customTools: RpcClientCustomTool[] = [];
+	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
+	#requestId = 0;
+	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#workflowGateListeners: Set<(gate: RpcWorkflowGate) => void> = new Set();
+
+	constructor(private options: RpcClientOptions = {}) {
+		this.#customTools = [...(options.customTools ?? [])];
+	}
+
+	/**
+	 * Start the RPC agent process.
+	 */
+	async start(): Promise<void> {
+		if (this.#transport) {
+			throw new Error("Client already started");
+		}
+		this.#transportClosed = false;
+		const transportKind = this.options.transport ?? (this.options.socketPath ? "uds" : "stdio");
+		if (transportKind === "uds") {
+			if (!this.options.socketPath) throw new Error("socketPath is required for uds transport");
+			this.#transport = new UdsRpcTransport(this.options.socketPath);
+		} else {
+			this.#transport = new StdioRpcTransport(this.options);
+		}
+		try {
+			await this.#transport.start(
+				line => this.#handleLine(line),
+				error => this.#handleTransportClose(error),
+			);
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
-		} finally {
-			clearTimeout(readyTimeout);
+		} catch (error) {
+			this.#transport = null;
+			throw error;
 		}
 	}
 
@@ -297,16 +423,11 @@ export class RpcClient {
 	 * Stop the RPC agent process.
 	 */
 	stop() {
-		if (!this.#process) return;
+		if (!this.#transport) return;
 
-		this.#process.kill();
-		this.#abortController.abort();
-		this.#process = null;
-		this.#pendingRequests.clear();
-		for (const pendingCall of this.#pendingHostToolCalls.values()) {
-			pendingCall.controller.abort();
-		}
-		this.#pendingHostToolCalls.clear();
+		this.#transport.stop();
+		this.#transport = null;
+		this.#rejectAllPending(new Error("RPC client stopped"));
 	}
 
 	/**
@@ -367,6 +488,29 @@ export class RpcClient {
 		};
 	}
 
+	/** Respond to an extension UI request over the live transport. */
+	respondExtensionUi(response: import("./rpc-types").RpcExtensionUIResponse): void {
+		this.#writeFrame(response);
+	}
+
+	/** Observe transport close/error notifications. */
+	onTransportError(listener: (error: Error) => void): () => void {
+		const previousClose = this.options.onTransportClose;
+		const previousError = this.options.onTransportError;
+		this.options.onTransportClose = error => {
+			previousClose?.(error);
+			listener(error ?? new Error("RPC transport closed"));
+		};
+		this.options.onTransportError = error => {
+			previousError?.(error);
+			listener(error);
+		};
+		return () => {
+			this.options.onTransportClose = previousClose;
+			this.options.onTransportError = previousError;
+		};
+	}
+
 	/**
 	 * Enter unattended mode by declaring budget + scopes + action allowlist.
 	 * Returns the accepted declaration, or rejects (fail-closed) on refusal.
@@ -380,7 +524,7 @@ export class RpcClient {
 	 * Get collected stderr output (useful for debugging).
 	 */
 	getStderr(): string {
-		return this.#process?.peekStderr() ?? "";
+		return this.#transport?.getStderr() ?? "";
 	}
 
 	#startTimeout(timeoutMs: number, onTimeout: () => void): NodeJS.Timeout {
@@ -446,6 +590,12 @@ export class RpcClient {
 	async getState(include?: RpcGetStateInclude[]): Promise<RpcSessionState> {
 		const response = await this.#send(include ? { type: "get_state", include } : { type: "get_state" });
 		return this.#getData(response);
+	}
+
+	/** Return unresolved workflow gates persisted by the RPC session. */
+	async getPendingWorkflowGates(): Promise<RpcWorkflowGate[]> {
+		const response = await this.#send({ type: "get_pending_workflow_gates" });
+		return this.#getData<{ gates: RpcWorkflowGate[] }>(response).gates;
 	}
 
 	/**
@@ -658,7 +808,7 @@ export class RpcClient {
 	 */
 	async setCustomTools(tools: RpcClientCustomTool[]): Promise<string[]> {
 		this.#customTools = [...tools];
-		if (!this.#process) {
+		if (!this.#transport) {
 			return this.#customTools.map(tool => tool.name);
 		}
 		const definitions: RpcHostToolDefinition[] = this.#customTools.map(tool => ({
@@ -696,7 +846,7 @@ export class RpcClient {
 			if (settled) return;
 			settled = true;
 			unsubscribe();
-			reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+			reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#transport?.getStderr() ?? ""}`));
 		});
 		return promise;
 	}
@@ -722,7 +872,7 @@ export class RpcClient {
 			if (settled) return;
 			settled = true;
 			unsubscribe();
-			reject(new Error(`Timeout collecting events. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+			reject(new Error(`Timeout collecting events. Stderr: ${this.#transport?.getStderr() ?? ""}`));
 		});
 		return promise;
 	}
@@ -786,7 +936,7 @@ export class RpcClient {
 	}
 
 	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
-		if (!this.#process?.stdin) {
+		if (!this.#transport || this.#transportClosed) {
 			throw new Error("Client not started");
 		}
 
@@ -799,7 +949,7 @@ export class RpcClient {
 			this.#pendingRequests.delete(id);
 			settled = true;
 			reject(
-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#transport?.getStderr() ?? ""}`),
 			);
 		});
 
@@ -884,20 +1034,40 @@ export class RpcClient {
 	}
 
 	#writeFrame(
-		frame: RpcCommand | RpcWorkflowGateResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame:
+			| RpcCommand
+			| RpcWorkflowGateResponse
+			| RpcHostToolResult
+			| RpcHostToolUpdate
+			| import("./rpc-types").RpcExtensionUIResponse,
 		onError?: (error: Error) => void,
 	): void {
-		if (!this.#process?.stdin) {
+		if (!this.#transport || this.#transportClosed) {
 			throw new Error("Client not started");
 		}
-		const stdin = this.#process.stdin as import("bun").FileSink;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		const flushResult = stdin.flush();
-		if (flushResult instanceof Promise) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
+		try {
+			this.#transport.write(frame);
+		} catch (err) {
+			const error = err instanceof Error ? err : new Error(String(err));
+			onError?.(error);
+			this.#handleTransportClose(error);
 		}
+	}
+
+	#handleTransportClose(error?: Error): void {
+		if (this.#transportClosed) return;
+		this.#transportClosed = true;
+		const closeError = error ?? new Error("RPC transport closed");
+		this.options.onTransportClose?.(closeError);
+		this.options.onTransportError?.(closeError);
+		this.#rejectAllPending(closeError);
+	}
+
+	#rejectAllPending(error: Error): void {
+		for (const pending of this.#pendingRequests.values()) pending.reject(error);
+		this.#pendingRequests.clear();
+		for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort();
+		this.#pendingHostToolCalls.clear();
 	}
 
 	#getData<T>(response: RpcResponse): T {

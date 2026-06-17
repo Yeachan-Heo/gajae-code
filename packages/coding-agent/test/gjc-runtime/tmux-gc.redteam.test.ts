@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import type { GcContext } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import { tmuxSessionsGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/tmux-gc";
 
@@ -34,6 +35,8 @@ function sessionLine(overrides: {
 	panePid?: number;
 	branch?: string;
 	project?: string;
+	sessionId?: string;
+	sessionStateFile?: string;
 }): string {
 	return [
 		overrides.name,
@@ -47,6 +50,8 @@ function sessionLine(overrides: {
 		overrides.branch ?? "",
 		overrides.branch?.replaceAll("/", "-") ?? "",
 		overrides.project ?? "",
+		overrides.sessionId ?? "",
+		overrides.sessionStateFile ?? "",
 	].join("\t");
 }
 
@@ -94,8 +99,18 @@ describe("tmux GC red-team adversarial safety", () => {
 		expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_attached_stale"]);
 	});
 
-	it("revalidates before pruning and skips kill when a stale candidate becomes attached after classification", async () => {
+	it("revalidates before pruning and skips kill when a terminal-marker candidate becomes attached after classification", async () => {
 		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+		const stateFile = "/tmp/gjc-redteam-toctou-marker.json";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "toctou-session",
+				state: "completed",
+				cwd: "/tmp/gjc-redteam-deleted-project",
+			}),
+		);
 		const calls: string[][] = [];
 		let richListCount = 0;
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
@@ -112,24 +127,37 @@ describe("tmux GC red-team adversarial safety", () => {
 						attached: richListCount > 1,
 						branch: "deleted-branch",
 						project: "/tmp/gjc-redteam-deleted-project",
+						sessionId: "toctou-session",
+						sessionStateFile: stateFile,
 					}),
 				);
 			}
 			if (optionValue(cmd, "@gjc-profile")) return spawnResult(0, "1\n");
 			if (optionValue(cmd, "@gjc-project")) return spawnResult(0, "/tmp/gjc-redteam-deleted-project\n");
 			if (optionValue(cmd, "@gjc-branch")) return spawnResult(0, "deleted-branch\n");
+			if (optionValue(cmd, "@gjc-session-id")) return spawnResult(0, "toctou-session\n");
+			if (optionValue(cmd, "@gjc-session-state-file")) return spawnResult(0, `${stateFile}\n`);
 			return spawnResult(0, "");
 		});
 
-		const result = await tmuxSessionsGcAdapter.collect(ctx());
-		const record = result.records.find(entry => entry.id === "gajae_code_toctou");
+		try {
+			const result = await tmuxSessionsGcAdapter.collect(ctx());
+			const record = result.records.find(entry => entry.id === "gajae_code_toctou");
 
-		expect(record).toMatchObject({ status: "stale", stale: true, removable: true, reason: "project_missing" });
-		expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
-			removed: false,
-			skipped: "tmux_revalidation_failed_or_became_live",
-		});
-		expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_toctou"]);
+			expect(record).toMatchObject({
+				status: "stale",
+				stale: true,
+				removable: true,
+				reason: "terminal_runtime_marker_detached_idle_session",
+			});
+			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
+				removed: false,
+				skipped: "tmux_revalidation_failed_or_became_live",
+			});
+			expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_toctou"]);
+		} finally {
+			await fs.rm(stateFile, { force: true });
+		}
 	});
 
 	it("never prunes a non-GJC untagged session that superficially resembles an idle orphan", async () => {
@@ -161,7 +189,7 @@ describe("tmux GC red-team adversarial safety", () => {
 		expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae-code-old-orphan-looking"]);
 	});
 
-	it("prunes a genuine GJC-owned metadata-less idle orphan only after ownership, no-attachment, age, and revalidation", async () => {
+	it("keeps a GJC-owned metadata-less idle orphan non-removable without a terminal marker", async () => {
 		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
 		const calls: string[][] = [];
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
@@ -184,13 +212,15 @@ describe("tmux GC red-team adversarial safety", () => {
 		const record = result.records.find(entry => entry.id === "gajae_code_idle_orphan");
 
 		expect(record).toMatchObject({
-			status: "stale",
-			stale: true,
-			removable: true,
-			reason: "metadata_less_gjc_owned_idle_orphan",
+			status: "unclassified",
+			stale: false,
+			removable: false,
+			reason: "metadata_less_gjc_owned_idle_orphan_missing_terminal_marker",
 		});
-		expect(record?.detail).toContain("createdAt=2026-02-02T02:40:00.000Z");
-		expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({ removed: true });
-		expect(calls).toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_idle_orphan"]);
+		expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
+			removed: false,
+			skipped: "not_removable_tmux_session",
+		});
+		expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_idle_orphan"]);
 	});
 });

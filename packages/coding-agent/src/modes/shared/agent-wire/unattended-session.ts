@@ -181,6 +181,15 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 		return this.#broker.resolve(response);
 	}
 
+	listPendingGates(): import("../../rpc/rpc-types").RpcWorkflowGate[] {
+		const store = this.opts.store;
+		if (!store) return [];
+		return store
+			.list()
+			.filter(record => record.status === "pending")
+			.map(record => record.gate);
+	}
+
 	emitGate(input: OpenGateInput): Promise<unknown> {
 		if (!this.#broker) {
 			return Promise.reject(new Error("cannot emit a workflow gate before unattended mode is negotiated"));

@@ -115,6 +115,28 @@ describe("GoalTool", () => {
 		expect(JSON.stringify(completed.details)).not.toContain("Budget");
 	});
 
+	it("honors per-session goal operation restrictions", async () => {
+		const harness = createRuntimeHarness({
+			enabled: true,
+			mode: "active",
+			goal: createGoal({ objective: "RLM analysis" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				goalToolAllowedOps: ["get", "complete"],
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const fetched = await tool.execute("call-get", { op: "get" });
+		expect(fetched.details?.op).toBe("get");
+		await expect(tool.execute("call-drop", { op: "drop" })).rejects.toThrow(
+			"only allows goal operations: get, complete",
+		);
+		expect(harness.getState()?.goal.status).toBe("active");
+	});
+
 	it("rejects unsupported token_budget before creating or mutating", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(

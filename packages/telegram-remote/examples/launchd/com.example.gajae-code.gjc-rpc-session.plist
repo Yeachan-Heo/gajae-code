@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.gajae-code.gjc-rpc-session</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/YOU/.local/bin/gjc</string>
+		<string>launch</string>
+		<string>--output</string>
+		<string>rpc</string>
+		<string>--listen</string>
+		<string>/Users/YOU/Library/Caches/gjc/telegram-remote.sock</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/YOU/.bun/bin:/Users/YOU/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/YOU/src/gajae-code</string>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/gjc-rpc-session.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/gjc-rpc-session.err.log</string>
+</dict>
+</plist>

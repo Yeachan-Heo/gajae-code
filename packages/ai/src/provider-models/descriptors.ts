@@ -275,6 +275,24 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("Xiaomi", ["XIAOMI_API_KEY"]),
 	),
 	catalogDescriptor(
+		"xiaomi-token-plan-ams",
+		"mimo-v2.5",
+		config => xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-ams", tokenPlanRegion: "ams" }),
+		catalog("Xiaomi Token Plan (Europe)", ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"]),
+	),
+	catalogDescriptor(
+		"xiaomi-token-plan-cn",
+		"mimo-v2.5",
+		config => xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-cn", tokenPlanRegion: "cn" }),
+		catalog("Xiaomi Token Plan (China)", ["XIAOMI_TOKEN_PLAN_CN_API_KEY"]),
+	),
+	catalogDescriptor(
+		"xiaomi-token-plan-sgp",
+		"mimo-v2.5",
+		config => xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-sgp", tokenPlanRegion: "sgp" }),
+		catalog("Xiaomi Token Plan (Singapore)", ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"]),
+	),
+	catalogDescriptor(
 		"zenmux",
 		"anthropic/claude-opus-4.6",
 		config => zenmuxModelManagerOptions(config),

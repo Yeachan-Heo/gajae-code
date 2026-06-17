@@ -3,11 +3,18 @@ export interface BashAllowedPrefixesCheck {
 	reason?: string;
 }
 
+export type BashRestrictionProfile = "workflow" | "read-only";
+
+export interface BashRestrictionOptions {
+	profile?: BashRestrictionProfile;
+}
+
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
 const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}", "~"]);
 const STATE_FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id", "--to"]);
 const STATE_ACTIONS = new Set(["read", "write", "clear", "contract", "handoff"]);
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
+const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
 
 function parseShellWords(command: string): { words: string[]; reason?: string } {
 	const words: string[] = [];
@@ -118,6 +125,59 @@ function parseStateAction(words: readonly string[]): string | undefined {
 	return third ? undefined : second;
 }
 
+function optionWords(words: readonly string[]): string[] {
+	const options: string[] = [];
+	for (const word of words.slice(1)) {
+		if (word === "--") break;
+		options.push(word);
+	}
+	return options;
+}
+
+function isLongOption(word: string, option: string): boolean {
+	return word === option || word.startsWith(`${option}=`);
+}
+
+function hasShortOption(word: string, option: string): boolean {
+	return word.startsWith("-") && !word.startsWith("--") && word.slice(1).includes(option);
+}
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function resolvedExternalCommand(command: string): string | undefined {
+	return Bun.which(command) ?? undefined;
+}
+
+function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesCheck {
+	const command = words[0];
+	if (!command || !READ_ONLY_COMMANDS.has(command)) {
+		return { allowed: false, reason: "read-only bash only allows approved inspection commands" };
+	}
+
+	const options = optionWords(words);
+	if (command === "rg") {
+		for (const option of options) {
+			if (isLongOption(option, "--pre") || isLongOption(option, "--pre-glob")) {
+				return { allowed: false, reason: "read-only bash does not allow ripgrep preprocessors" };
+			}
+			if (isLongOption(option, "--search-zip") || hasShortOption(option, "z")) {
+				return { allowed: false, reason: "read-only bash does not allow ripgrep compressed-file subprocesses" };
+			}
+		}
+	}
+
+	if (command === "tree") {
+		for (const option of options) {
+			if (isLongOption(option, "--output") || hasShortOption(option, "o")) {
+				return { allowed: false, reason: "read-only bash does not allow tree output-file writes" };
+			}
+		}
+	}
+
+	return { allowed: true };
+}
+
 function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixesCheck {
 	if (words[0] !== "gjc") return { allowed: true };
 
@@ -145,9 +205,29 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 	return { allowed: true };
 }
 
+function commandAllowedPrefixesReason(normalizedPrefixes: readonly string[], options: BashRestrictionOptions): string {
+	const prefixList = normalizedPrefixes.join(", ");
+	return options.profile === "read-only"
+		? `read-only bash only allows commands starting with: ${prefixList}`
+		: `restricted role-agent bash only allows commands starting with: ${prefixList}`;
+}
+
+export function normalizeReadOnlyBashCommand(command: string): string | undefined {
+	const parsed = parseShellWords(command.trim());
+	if (parsed.reason || parsed.words.length === 0) return undefined;
+	const validation = validateReadOnlyCommand(parsed.words);
+	if (!validation.allowed) return undefined;
+	const [head, ...rest] = parsed.words;
+	if (!head) return undefined;
+	const resolvedHead = resolvedExternalCommand(head);
+	if (!resolvedHead) return undefined;
+	return [shellQuote(resolvedHead), ...rest.map(shellQuote)].join(" ");
+}
+
 export function checkBashAllowedPrefixes(
 	command: string,
 	allowedPrefixes: readonly string[] | undefined,
+	options: BashRestrictionOptions = {},
 ): BashAllowedPrefixesCheck {
 	const normalizedPrefixes = allowedPrefixes?.map(prefix => prefix.trim()).filter(Boolean) ?? [];
 	if (normalizedPrefixes.length === 0) return { allowed: true };
@@ -161,9 +241,12 @@ export function checkBashAllowedPrefixes(
 	if (!matched) {
 		return {
 			allowed: false,
-			reason: `restricted role-agent bash only allows commands starting with: ${normalizedPrefixes.join(", ")}`,
+			reason: commandAllowedPrefixesReason(normalizedPrefixes, options),
 		};
 	}
 
+	if (options.profile === "read-only") {
+		return validateReadOnlyCommand(parsed.words);
+	}
 	return validateMatchedGjcCommand(parsed.words);
 }

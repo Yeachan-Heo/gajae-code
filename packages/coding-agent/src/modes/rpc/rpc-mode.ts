@@ -11,7 +11,6 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $pickenv, logger, readLines, Snowflake } from "@gajae-code/utils";
 import type {
@@ -31,6 +30,7 @@ import { modelSupportsTokenCostMetrics, UnattendedSessionControlPlane } from "..
 import { FileGateStore } from "../shared/agent-wire/workflow-gate-broker";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { prepareRpcSocketPath, verifyRpcSocketAfterListen } from "./rpc-socket-security";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -128,6 +128,7 @@ export const RPC_SAFE_READ_CONTROL_COMMANDS: ReadonlySet<RpcCommand["type"]> = n
 	"get_last_assistant_text",
 	"get_messages",
 	"get_login_providers",
+	"get_pending_workflow_gates",
 ]);
 
 /** True when a command may bypass the ordered serial chain and run immediately. */
@@ -725,16 +726,7 @@ export async function runRpcMode(
 	// get_state/get_messages on reconnect).
 	if (options?.listen) {
 		const socketPath = options.listen;
-		await fs.mkdir(path.dirname(socketPath), { recursive: true }).catch(() => {});
-		// Refuse to clobber a live previous owner: probe the path first and only
-		// unlink a stale endpoint. A second `--listen` on the same path must not
-		// remove the socket another running server is still serving (#606).
-		// Unexpected probe failures are treated as alive, so this also refuses
-		// rather than unlinking a socket path we could not safely classify.
-		if (await isUnixSocketAlive(socketPath)) {
-			throw new RpcListenRefusedError(socketPath);
-		}
-		await fs.rm(socketPath, { force: true }).catch(() => {});
+		await prepareRpcSocketPath(socketPath);
 		await registerRpcSession({
 			sessionId: session.sessionId,
 			pid: process.pid,
@@ -748,7 +740,7 @@ export async function runRpcMode(
 		const noopSink = (_line: string): void => {};
 		let currentSocket: object | undefined;
 		let buf = "";
-		Bun.listen({
+		const server = Bun.listen({
 			unix: socketPath,
 			socket: {
 				open(socket) {
@@ -779,6 +771,8 @@ export async function runRpcMode(
 				error() {},
 			},
 		});
+		await verifyRpcSocketAfterListen(socketPath);
+		void server;
 
 		const onSignal = (): void => {
 			void shutdown(0, "RPC socket server signal");

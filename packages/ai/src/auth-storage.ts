@@ -1641,6 +1641,24 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "xiaomi-token-plan-sgp": {
+				const { loginXiaomiTokenPlan } = await import("./utils/oauth/xiaomi");
+				const apiKey = await loginXiaomiTokenPlan(ctrl, "sgp");
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "xiaomi-token-plan-ams": {
+				const { loginXiaomiTokenPlan } = await import("./utils/oauth/xiaomi");
+				const apiKey = await loginXiaomiTokenPlan(ctrl, "ams");
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "xiaomi-token-plan-cn": {
+				const { loginXiaomiTokenPlan } = await import("./utils/oauth/xiaomi");
+				const apiKey = await loginXiaomiTokenPlan(ctrl, "cn");
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "zenmux": {
 				const { loginZenMux } = await import("./utils/oauth/zenmux");
 				const apiKey = await loginZenMux(ctrl);

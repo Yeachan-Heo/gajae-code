@@ -19,6 +19,7 @@ const EXPECTED_RPC_COMMAND_TYPES: readonly RpcCommand["type"][] = [
 	"set_todos",
 	"set_host_tools",
 	"set_host_uri_schemes",
+	"get_pending_workflow_gates",
 	"set_model",
 	"cycle_model",
 	"get_available_models",

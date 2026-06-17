@@ -125,6 +125,26 @@ describe("HookSelectorComponent inline custom input", () => {
 		expect(calls.cancelled).toBe(0);
 	});
 
+	it("submits expanded large paste content instead of the display marker", () => {
+		const { component, calls } = createSelector();
+		moveToOther(component);
+		component.handleInput("\r");
+
+		const pastedText = Array.from({ length: 12 }, (_, index) => `pasted line ${index + 1}`).join("\n");
+		component.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+
+		const rendered = renderText(component);
+		expect(rendered).toContain("[paste #");
+		expect(calls.submitted).toEqual([]);
+
+		component.handleInput("\r");
+
+		expect(calls.submitted).toEqual([pastedText]);
+		expect(calls.submitted[0]).not.toContain("[paste #");
+		expect(calls.selected).toEqual([]);
+		expect(calls.cancelled).toBe(0);
+	});
+
 	it("escape returns to option selection without cancelling the dialog", () => {
 		const { component, calls } = createSelector();
 		moveToOther(component);

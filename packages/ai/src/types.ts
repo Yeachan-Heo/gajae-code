@@ -141,6 +141,9 @@ export type KnownProvider =
 	| "venice"
 	| "vllm"
 	| "xiaomi"
+	| "xiaomi-token-plan-sgp"
+	| "xiaomi-token-plan-ams"
+	| "xiaomi-token-plan-cn"
 	| "zenmux"
 	| "lm-studio";
 export type Provider = KnownProvider | string;

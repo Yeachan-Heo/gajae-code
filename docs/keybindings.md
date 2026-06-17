@@ -38,7 +38,8 @@ Set an action to an empty array to disable it:
 | `app.thinking.toggle` | `Ctrl+T` | Toggle thinking-block visibility |
 | `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
-| `app.message.followUp` | `Ctrl+Enter` | Queue a follow-up message |
+| `app.message.followUp` | `Ctrl+Enter` | Send a follow-up message |
+| `app.message.queue` | `Alt+Enter` | Explicitly queue a message for the next turn |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
 | `app.clipboard.copyPrompt` | `Alt+Shift+C` | Copy the whole prompt |

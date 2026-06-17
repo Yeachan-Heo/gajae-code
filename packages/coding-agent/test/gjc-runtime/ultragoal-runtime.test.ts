@@ -666,6 +666,39 @@ describe("ultragoal CLI replay validation", () => {
 			]),
 		);
 
+		const invalidReasonCodeRoot = await tempDir();
+		await writeStructuralArtifacts(invalidReasonCodeRoot);
+		const invalidReasonCodeError = await expectRejectedExecutorQa(
+			invalidReasonCodeRoot,
+			cliExecutorQa([
+				{
+					id: "cli-replay",
+					kind: "cli-replay",
+					description: "Invalid reasonCode CLI replay exemption",
+					replay: {
+						schemaVersion: 1,
+						kind: "cli-replay",
+						replayExempt: {
+							reasonCode: "network_required",
+							reason:
+								"Command depends on a live external service and cannot be deterministically replayed in the gate.",
+							approvedBy: "executor-qa",
+							fallbackArtifactRefs: ["pty-capture"],
+						},
+					},
+				},
+				{
+					id: "pty-capture",
+					kind: "pty-capture",
+					path: "artifacts/pty-capture.txt",
+					description: "Structurally-valid terminal fallback capture",
+				},
+			]),
+		);
+		expect(invalidReasonCodeError).toContain("reasonCode must be one of");
+		expect(invalidReasonCodeError).toContain("requires_network");
+		expect(invalidReasonCodeError).toContain("platform_unavailable");
+
 		const missingReasonRoot = await tempDir();
 		await writeStructuralArtifacts(missingReasonRoot);
 		const missingReasonError = await expectRejectedExecutorQa(

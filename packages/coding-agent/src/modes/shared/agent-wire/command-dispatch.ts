@@ -45,6 +45,8 @@ export interface RpcUnattendedControlPlane {
 	negotiate(declaration: RpcUnattendedDeclaration): RpcUnattendedAccepted;
 	/** Resolve a pending workflow gate with the agent's answer. */
 	resolveGate(response: RpcWorkflowGateResponse): Promise<RpcWorkflowGateResolution>;
+	/** List unresolved durable workflow gates for reconnect replay. */
+	listPendingGates?(): import("../../rpc/rpc-types").RpcWorkflowGate[];
 	isUnattended?(): boolean;
 	preflightCommand?(command: RpcCommand): void;
 	reconcileUsage?(phase?: string): void;
@@ -211,6 +213,11 @@ export async function dispatchRpcCommand(
 				const rpcTools = hostToolRegistry.setTools(tools);
 				await session.refreshRpcHostTools(rpcTools);
 				return rpcSuccess(id, "set_host_tools", { toolNames: tools.map(tool => tool.name) });
+			}
+
+			case "get_pending_workflow_gates": {
+				const gates = unattendedControlPlane?.listPendingGates?.() ?? [];
+				return rpcSuccess(id, "get_pending_workflow_gates", { gates });
 			}
 
 			case "set_host_uri_schemes": {

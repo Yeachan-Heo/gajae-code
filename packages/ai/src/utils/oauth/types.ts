@@ -50,6 +50,9 @@ export type OAuthProvider =
 	| "vllm"
 	| "xai"
 	| "xiaomi"
+	| "xiaomi-token-plan-sgp"
+	| "xiaomi-token-plan-ams"
+	| "xiaomi-token-plan-cn"
 	| "zenmux"
 	| "zai";
 
@@ -78,6 +81,7 @@ export interface OAuthController {
 	onManualCodeInput?(): Promise<string>;
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
 	signal?: AbortSignal;
+	fetch?: typeof globalThis.fetch;
 }
 
 export interface OAuthLoginCallbacks extends OAuthController {

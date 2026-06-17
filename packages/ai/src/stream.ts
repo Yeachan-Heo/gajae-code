@@ -194,6 +194,60 @@ export function listProvidersWithEnvKey(): string[] {
 	return Object.keys(serviceProviderMap);
 }
 
+/**
+ * Subscription-style providers whose "subscription" is delivered as an API key
+ * (created at https://opencode.ai/auth), not a separate OAuth/session token.
+ * Used to give OpenCode users an accurate headless auth diagnostic (#755).
+ */
+const OPENCODE_SUBSCRIPTION_PROVIDERS = new Set(["opencode-go", "opencode-zen"]);
+
+/**
+ * Provider-specific credential guidance appended to "no credential" errors.
+ *
+ * Headless GJC has no interactive `/login` TUI, so a bare "No API key" /
+ * "No credentials" error left users — OpenCode Go subscribers especially
+ * (#755) — unsure what signal GJC actually reads. OpenCode subscriptions are
+ * themselves API keys, so this names the env var GJC reads for the provider,
+ * warns that a project `.env` is intentionally ignored for provider
+ * credentials, and points OpenCode users at one-time interactive CLI credential capture.
+ *
+ * Returns an empty string when the provider has no env-var key and no special
+ * handling, so callers can append it unconditionally.
+ */
+export function formatProviderCredentialHint(provider: string): string {
+	const resolver = serviceProviderMap[provider];
+	const envVar = typeof resolver === "string" ? resolver : undefined;
+	const isOpenCodeSubscription = OPENCODE_SUBSCRIPTION_PROVIDERS.has(provider);
+	const parts: string[] = [];
+	if (isOpenCodeSubscription) {
+		parts.push(
+			"OpenCode subscriptions authenticate with an API key (created at https://opencode.ai/auth), not a separate session/OAuth token.",
+		);
+	}
+	if (envVar) {
+		parts.push(
+			`Headless GJC reads this provider's key from ${envVar} (exported in your shell or set in ~/.gjc/.env).`,
+		);
+		parts.push("A value set only in a project .env is intentionally ignored for provider credentials.");
+	}
+	if (isOpenCodeSubscription) {
+		parts.push(
+			`Or run \`gjc auth-broker login ${provider}\` once before headless/print mode to store the key interactively.`,
+		);
+	}
+	return parts.join(" ");
+}
+
+/**
+ * Build an actionable "missing API key" error for a provider, used by the
+ * low-level `stream`/`complete` entry points (#755).
+ */
+export function formatMissingApiKeyError(provider: string): string {
+	const base = `No API key for provider: ${provider}.`;
+	const hint = formatProviderCredentialHint(provider);
+	return hint ? `${base} ${hint}` : base;
+}
+
 export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
@@ -208,7 +262,7 @@ export function stream<TApi extends Api>(
 	if (isGitLabDuoModel(model)) {
 		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
 		if (!apiKey) {
-			throw new Error(`No API key for provider: ${model.provider}`);
+			throw new Error(formatMissingApiKeyError(model.provider));
 		}
 		return streamGitLabDuo(model, context, {
 			...(options as SimpleStreamOptions | undefined),
@@ -226,7 +280,7 @@ export function stream<TApi extends Api>(
 
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
 	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
+		throw new Error(formatMissingApiKeyError(model.provider));
 	}
 	const providerOptions = { ...options, apiKey };
 
@@ -410,7 +464,7 @@ export function streamSimple<TApi extends Api>(
 
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
 	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
+		throw new Error(formatMissingApiKeyError(model.provider));
 	}
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens

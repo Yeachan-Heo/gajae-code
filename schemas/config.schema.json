@@ -1670,6 +1670,48 @@
 			},
 			"additionalProperties": false
 		},
+		"computer": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the macOS computer tool for this session. Off by default.",
+					"default": false
+				},
+				"alwaysOn": {
+					"type": "boolean",
+					"description": "Keep the macOS computer tool callable without per-session enablement.",
+					"default": false
+				},
+				"autoScreenshot": {
+					"type": "boolean",
+					"description": "Automatically request bounded screenshots after computer actions when supported.",
+					"default": false
+				},
+				"screenshotMaxBytes": {
+					"type": "number",
+					"description": "Maximum screenshot payload size for computer action results.",
+					"default": 5000000
+				},
+				"killSwitchHotkey": {
+					"type": "string",
+					"description": "Native stop/suspend hotkey shown to users for computer-use sessions.",
+					"default": "Control+Option+Command+Escape"
+				},
+				"auditLog": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Persist audit records for enabled computer-use actions.",
+							"default": true
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"async": {
 			"type": "object",
 			"properties": {

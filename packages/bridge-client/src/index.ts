@@ -259,6 +259,10 @@ export class BridgeClient implements BridgeCommandHelpers {
 		return this.#command("set_host_uri_schemes", sessionId, { schemes }, options, "set-host-uri-schemes");
 	}
 
+	getPendingWorkflowGates(sessionId: string, options: BridgeCommandOptions = {}): Promise<unknown> {
+		return this.#command("get_pending_workflow_gates", sessionId, {}, options, "get-pending-workflow-gates");
+	}
+
 	setModel(
 		sessionId: string,
 		provider: string,

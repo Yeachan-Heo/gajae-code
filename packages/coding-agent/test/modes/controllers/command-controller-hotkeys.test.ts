@@ -6,6 +6,7 @@ describe("buildHotkeysMarkdown", () => {
 		const displayStrings: Record<string, string> = {
 			"app.clipboard.copyLine": "Alt+Shift+L",
 			"app.clipboard.copyPrompt": "Ctrl+Shift+P",
+			"app.message.queue": "Alt+Enter",
 			"app.plan.toggle": "Alt+M",
 			"app.tools.expand": "Ctrl+O",
 			"app.interrupt": "Esc",
@@ -34,6 +35,9 @@ describe("buildHotkeysMarkdown", () => {
 		const lines = markdown.split("\n");
 		expect(lines[0]).toBe("**Navigation**");
 		expect(markdown).toContain("| `Ctrl+Shift+P` | Copy whole prompt |");
+		expect(markdown).toContain("| `Enter` | Send / steer immediately |");
+		expect(markdown).toContain("| `Alt+Enter` | Queue message for next turn |");
+		expect(markdown).toContain("| `Shift+Enter` | New line |");
 		expect(markdown).toContain("| `Ctrl+Shift+L` | Select model (temporary) |");
 		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 		expect(markdown).toContain("| `Alt+M` | Toggle plan mode |");

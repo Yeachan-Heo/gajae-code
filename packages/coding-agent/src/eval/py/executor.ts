@@ -12,6 +12,7 @@ import {
 	type KernelExecuteResult,
 	PythonKernel,
 } from "./kernel";
+import type { PythonRuntimeOptions } from "./runtime";
 import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
 
 export type PythonKernelMode = "session" | "per-call";
@@ -44,6 +45,8 @@ export interface PythonExecutorOptions {
 	 * preferred over `PI_SESSION_FILE`-derived paths.
 	 */
 	artifactsDir?: string;
+	/** Runtime resolution/provisioning options (RLM managed workspace venv, package seeding). */
+	runtimeOptions?: PythonRuntimeOptions;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -276,6 +279,7 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	return await PythonKernel.start({
 		cwd,
 		env: buildKernelEnv(options),
+		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
 	});
@@ -562,7 +566,10 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await waitForPromiseWithCancellation(checkPythonKernelAvailability(cwd), options);
+	const availability = await waitForPromiseWithCancellation(
+		checkPythonKernelAvailability(cwd, options.runtimeOptions),
+		options,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}

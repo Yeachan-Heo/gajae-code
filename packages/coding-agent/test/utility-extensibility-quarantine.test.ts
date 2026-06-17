@@ -35,7 +35,6 @@ describe("GJC utility extensibility quarantine", () => {
 			"plan",
 			"share",
 			"browser",
-			"copy",
 			"todo",
 			"changelog",
 			"branch",

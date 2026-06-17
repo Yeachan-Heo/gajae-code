@@ -1,0 +1,180 @@
+{
+  "records": [
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 2,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "bash", "status": "success", "arguments": { "command": "cat src/secret.ts" } }
+      ]
+    },
+    {
+      "scenarioId": "bad-anchor-recovery",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 3,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "error", "message": "Edit rejected: anchors do not match" },
+        { "type": "scenario_result", "status": "failed" }
+      ]
+    },
+    {
+      "scenarioId": "tool-json-malformed-recovery",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 4,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "read", "status": "error", "message": "malformed tool arguments: invalid JSON" }
+      ]
+    },
+    {
+      "scenarioId": "multi-file-search-edit",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 5,
+      "expected": { "targetPath": "src/target.ts" },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/wrong.ts" } }
+      ]
+    },
+    {
+      "scenarioId": "three-turn-tools",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 6,
+      "expected": { "requiredTools": ["read", "search", "edit"] },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/a.ts" } },
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/a.ts" } }
+      ]
+    },
+    {
+      "scenarioId": "timeout-handling",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 6,
+      "events": [
+        { "type": "scenario_result", "status": "failed", "message": "deadline timeout waiting for model" }
+      ]
+    },
+    {
+      "scenarioId": "grok-sanitize-replay",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 7,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "error", "message": "sanitize replay failed: contaminated tool payload contains to=functions" }
+      ]
+    },
+    {
+      "scenarioId": "file-discovery-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 9,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "bash", "status": "success", "arguments": { "command": "ls packages/agent/src" } }
+      ]
+    },
+    {
+      "scenarioId": "shell-write-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 10,
+      "events": [
+        {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "status": "success",
+          "arguments": {
+            "command": "python - <<'PY'\nfrom pathlib import Path\nPath('src/a.ts').write_text('x')\nPY"
+          }
+        }
+      ]
+    },
+    {
+      "scenarioId": "command-contamination",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 11,
+      "events": [
+        {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "status": "error",
+          "arguments": {
+            "command": "I will now run tests\nbun test packages/ai/test/composer-discipline.test.ts"
+          }
+        }
+      ]
+    },
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 12,
+      "events": [
+        {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "status": "success",
+          "arguments": {
+            "command": "python -c \"open('src/secret.ts').read()\""
+          }
+        }
+      ]
+    },
+    {
+      "scenarioId": "file-discovery-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 13,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "bash", "status": "success", "arguments": { "command": "git -C . ls-files '*.ts'" } }
+      ]
+    },
+    {
+      "scenarioId": "shell-write-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 14,
+      "events": [
+        {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "status": "success",
+          "arguments": {
+            "command": "python -c \"from pathlib import Path; Path('src/a.ts').write_text('x')\""
+          }
+        }
+      ]
+    },
+    {
+      "scenarioId": "shell-write-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 15,
+      "events": [
+        {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "status": "success",
+          "arguments": {
+            "command": "python -c \"open('src/a.ts', 'w').write('x')\""
+          }
+        }
+      ]
+    },
+    {
+      "scenarioId": "tool-json-malformed-recovery",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 8,
+      "events": [
+        { "type": "tool_execution_end", "toolName": "read", "status": "error", "message": "malformed tool arguments: invalid JSON" },
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/ok.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    }
+  ]
+}

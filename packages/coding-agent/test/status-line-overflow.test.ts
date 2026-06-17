@@ -76,6 +76,7 @@ function createStatusLineSession(sessionName: string) {
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		getCurrentModel: () => undefined,
 		isFastModeEnabled: () => false,
+		isFastModeActive: () => false,
 		sessionManager: {
 			getSessionName: () => sessionName,
 			getUsageStatistics: () => ({
@@ -120,6 +121,35 @@ describe("status line session accent", () => {
 		// glyph) must not appear. The session_name segment may still emit the accent ANSI
 		// for its own text — we only care that the gap is not accent-painted.
 		expect(border).not.toContain(`${accentAnsi}${theme.boxRound.horizontal}`);
+	});
+});
+
+describe("status line version display", () => {
+	function buildComponent(widthVersion: string = "9.8.7") {
+		const component = new StatusLineComponent(createStatusLineSession("Version session"), { version: widthVersion });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae"],
+			rightSegments: ["model"],
+			separator: "powerline-thin",
+			showSkillHud: false,
+		});
+		return component;
+	}
+
+	it("shows the current version in the active status line", () => {
+		const lines = buildComponent().render(100);
+
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("v9.8.7");
+	});
+
+	it("drops the low-priority version before overflowing narrow terminals", () => {
+		const lines = buildComponent().render(12);
+
+		expect(lines).toHaveLength(1);
+		expect(visibleWidth(lines[0])).toBeLessThanOrEqual(12);
+		expect(lines[0]).not.toContain("v9.8.7");
 	});
 });
 

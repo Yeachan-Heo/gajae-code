@@ -195,17 +195,19 @@ describe("native gjc deep-interview runtime", () => {
 		expect(await fs.readFile(deepPayload.path, "utf-8")).toBe("# Requirements\n");
 		expect(await fs.readFile(ralplanPayload.path, "utf-8")).toBe("# Plan\n");
 	});
-	it("persists Korean as the deep-interview question language when the initial idea is Korean", async () => {
+	it("preserves an obvious non-English user/session language without a language-specific directive", async () => {
 		const root = await tempDir();
 		const result = await runNativeDeepInterviewCommand(["--json", "한국어 세션에서 구현 방향을 명확히 해줘"], root);
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.language).toMatchObject({
-			code: "ko",
-			label: "Korean",
+			code: "user",
+			label: "User language",
 			source: "initial-idea",
 		});
-		expect(payload.language.instruction).toContain("Korean");
+		expect(payload.language.instruction).toContain("user/session language");
+		expect(payload.language.instruction).not.toContain("Korean");
+		expect(payload.language.instruction).not.toContain("한국어");
 
 		const state = JSON.parse(
 			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
@@ -214,9 +216,9 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.state.language).toEqual(payload.language);
 	});
 
-	it("lets explicit English requests override Korean deep-interview language detection", async () => {
+	it("honors explicit English requests without language-specific keyword branches", async () => {
 		const root = await tempDir();
-		const result = await runNativeDeepInterviewCommand(["--json", "한국어 배경이지만 질문은 영어로 해줘"], root);
+		const result = await runNativeDeepInterviewCommand(["--json", "Please respond in English"], root);
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.language).toMatchObject({

@@ -34,6 +34,10 @@ export interface BashExecutorOptions {
 	artifactId?: string;
 	/** Execute without retaining a native Shell in the persistent session registry. */
 	oneShot?: boolean;
+	/** Ignore user-configured shell command prefixes. Used by constrained read-only shells. */
+	ignoreShellPrefix?: boolean;
+	/** Skip sourced shell snapshots. Used by constrained read-only shells. */
+	disableShellSnapshot?: boolean;
 	/**
 	 * Invoked when the native minimizer rewrote the command's output, giving
 	 * the caller a chance to persist the lossless original capture (typically
@@ -119,15 +123,17 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
 	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
-	const snapshotPath = shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
+	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
+	const snapshotPath =
+		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
 
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
 
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
 
-	// Apply command prefix if configured
-	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
+	// Apply command prefix if configured and allowed for this execution.
+	const prefixedCommand = configuredPrefix ? `${configuredPrefix} ${command}` : command;
 	const finalCommand = prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
@@ -160,7 +166,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 
 	const usePersistentShell = options?.oneShot !== true;
-	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
+	const sessionKey = buildSessionKey(shell, configuredPrefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
 	const persistentSessionBroken = usePersistentShell && brokenShellSessions.has(sessionKey);
 
 	let shellSession = persistentSessionBroken || !usePersistentShell ? undefined : shellSessions.get(sessionKey);

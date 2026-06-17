@@ -41,10 +41,11 @@ const DETAILS: SkillPromptDetails = {
 };
 
 describe("SkillMessageComponent rendering", () => {
-	it("collapsed view shows `[skill] <name>: <args>` and no debug metadata", () => {
+	it("collapsed view shows `[skill] <name>` with readable args and no debug metadata", () => {
 		const out = render(makeMessage({ ...DETAILS, args: "fix the login bug" }, "PROMPT BODY TEXT"), false);
 
-		expect(out).toContain("[skill] deep-interview: fix the login bug");
+		expect(out).toContain("[skill] deep-interview");
+		expect(out).toContain("fix the login bug");
 
 		// Debug-only detail must be hidden when collapsed.
 		expect(out).not.toContain("Skill:");
@@ -62,17 +63,35 @@ describe("SkillMessageComponent rendering", () => {
 		expect(out).not.toContain("deep-interview:");
 	});
 
-	it("truncates over-long args to a single line", () => {
-		const longArgs = `${"A".repeat(90)} ZZZEND`;
-		const out = render(makeMessage({ ...DETAILS, args: longArgs }, "BODY"), false);
-		expect(out).toContain("AAAA");
-		expect(out).not.toContain("ZZZEND");
+	it("collapsed view preserves multi-line args in a bounded preview", () => {
+		const args = [
+			"to re-architect our problem banks into source-based architecture, and",
+			"make sure gaebal-gajae skill-invocation modal does not truncate skill args,",
+			"even though we need few lines to use.",
+		].join("\n");
+		const out = render(makeMessage({ ...DETAILS, args }, "BODY"), false);
+
+		expect(out).toContain("[skill] deep-interview");
+		expect(out).toContain("to re-architect our problem banks");
+		expect(out).toContain("make sure gaebal-gajae skill-invocation modal");
+		expect(out).toContain("even though we need few lines to use.");
 	});
 
-	it("expanded view reveals path, line count, and full prompt body", () => {
+	it("bounds over-long args without leaking the full payload", () => {
+		const longArgs = Array.from({ length: 8 }, (_, index) => `line ${index + 1} ${"A".repeat(120)}`).join("\n");
+		const out = render(makeMessage({ ...DETAILS, args: longArgs }, "BODY"), false);
+
+		expect(out).toContain("line 1");
+		expect(out).toContain("…");
+		expect(out).not.toContain("line 8");
+	});
+
+	it("expanded view reveals path, line count, args, and full prompt body", () => {
 		const out = render(makeMessage({ ...DETAILS, args: "fix the login bug" }, "PROMPT BODY TEXT"), true);
 
-		expect(out).toContain("[skill] deep-interview: fix the login bug");
+		expect(out).toContain("[skill] deep-interview");
+		expect(out).toContain("Arguments");
+		expect(out).toContain("fix the login bug");
 		expect(out).toContain("Path:");
 		expect(out).toContain("embedded:gjc/skills/deep-interview/SKILL.md");
 		expect(out).toContain("858 lines");

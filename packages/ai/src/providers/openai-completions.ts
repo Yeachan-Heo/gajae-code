@@ -1465,9 +1465,9 @@ export function convertMessages(
 	};
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	// Composer-harness models need anchor/edit discipline pinned ahead of the
+	// Composer-harness models need anchor/edit discipline pinned ahead of any
 	// host prompt (see composer-discipline.ts for the observed failure modes).
-	if (systemPrompts.length > 0 && isComposerHarnessModel(model.id)) {
+	if (isComposerHarnessModel(model.id)) {
 		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
 	}
 	if (systemPrompts.length > 0) {

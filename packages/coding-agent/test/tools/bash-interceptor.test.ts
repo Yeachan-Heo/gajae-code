@@ -1,11 +1,19 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
+import { Settings } from "../../src/config/settings";
 import type { BashInterceptorRule } from "../../src/config/settings-schema";
+import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
 import type { ToolSession } from "../../src/tools";
 import { BashTool, type BashToolInput } from "../../src/tools/bash";
+import * as shellSnapshot from "../../src/utils/shell-snapshot";
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	await disposeAllShellSessions();
+});
 
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
@@ -126,12 +134,14 @@ describe("BashTool restricted role-agent allowlist", () => {
 	function createRestrictedBashTool(
 		cwd = process.cwd(),
 		bashAllowedPrefixes = ["gjc ralplan --write", "gjc state"],
+		bashRestrictionProfile?: ToolSession["bashRestrictionProfile"],
 	): BashTool {
 		const session = {
 			cwd,
 			getSessionFile: () => null,
 			getSessionId: () => undefined,
 			bashAllowedPrefixes,
+			bashRestrictionProfile,
 			settings: {
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
@@ -163,6 +173,73 @@ describe("BashTool restricted role-agent allowlist", () => {
 		await expect(tool.execute("tool-call", { command: "echo should-not-run" })).rejects.toThrow(
 			"restricted role-agent bash only allows commands starting with",
 		);
+	});
+
+	it("surfaces read-only bash restrictions in the tool description", () => {
+		const tool = createRestrictedBashTool(process.cwd(), ["grep", "rg", "tree", "ls"], "read-only");
+
+		expect(tool.description).toContain("This session's bash tool is read-only");
+		expect(tool.description).toContain("grep");
+		expect(tool.description).toContain("ls");
+	});
+
+	it("allows read-only commands and still blocks env overrides or non-inspection commands", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-bash-"));
+		try {
+			await fs.writeFile(path.join(root, "sample.txt"), "hello\n");
+			const tool = createRestrictedBashTool(root, ["ls", "grep"], "read-only");
+
+			const result = await tool.execute("tool-call", { command: "ls" });
+			expect(result.content.find(part => part.type === "text")?.text).toContain("sample.txt");
+
+			await expect(tool.execute("tool-call", { command: "touch nope" })).rejects.toThrow(
+				"read-only bash only allows commands starting with",
+			);
+			await expect(tool.execute("tool-call", { command: "ls", env: { PATH: "/tmp/fake" } })).rejects.toThrow(
+				"Read-only bash does not allow per-command env overrides",
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("runs read-only bash without PTY, configured prefixes, shell snapshots, or retained sessions", async () => {
+		if (process.platform === "win32") return;
+		const bashPath = Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash";
+		try {
+			await fs.access(bashPath);
+		} catch {
+			return;
+		}
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-bash-hardening-"));
+		try {
+			await disposeAllShellSessions();
+			await fs.writeFile(path.join(root, "sample.txt"), "hello\n");
+			const snapshotPath = path.join(root, "snapshot.sh");
+			await fs.writeFile(snapshotPath, "export PI_READ_ONLY_SNAPSHOT=from_snapshot\n");
+			vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+				shell: bashPath,
+				args: ["-l", "-c"],
+				env: {
+					PATH: Bun.env.PATH ?? "",
+					HOME: root,
+				},
+				prefix: "false &&",
+			});
+			const snapshotSpy = vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);
+			const tool = createRestrictedBashTool(root, ["ls"], "read-only");
+
+			await expect(tool.execute("tool-call", { command: "ls", pty: true })).rejects.toThrow(
+				"Read-only bash does not allow PTY mode",
+			);
+
+			const result = await tool.execute("tool-call", { command: "ls" });
+			expect(result.content.find(part => part.type === "text")?.text).toContain("sample.txt");
+			expect(snapshotSpy).not.toHaveBeenCalled();
+			expect(getShellSessionCount()).toBe(0);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("blocks ralplan invocations that are not artifact writes", async () => {

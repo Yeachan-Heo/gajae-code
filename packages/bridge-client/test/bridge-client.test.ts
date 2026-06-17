@@ -62,11 +62,14 @@ describe("BridgeClient", () => {
 		await client.connectEvents("sess/1", 42);
 		await client.prompt("sess/1", "via helper", { idempotencyKey: "idem-2" });
 
+		await client.getPendingWorkflowGates("sess/1", { idempotencyKey: "idem-3" });
 		expect(seen[0]).toBe("https://bridge.test/v1/sessions/sess%2F1/commands");
 		expect(headersSeen[0]).toBe("idem-1");
 		expect(seen[1]).toBe("https://bridge.test/v1/sessions/sess%2F1/events?last_seq=42");
 		expect(seen[2]).toBe("https://bridge.test/v1/sessions/sess%2F1/commands");
 		expect(headersSeen[2]).toBe("idem-2");
+		expect(seen[3]).toBe("https://bridge.test/v1/sessions/sess%2F1/commands");
+		expect(headersSeen[3]).toBe("idem-3");
 	});
 	it("sends controller claim and UI response requests", async () => {
 		const seen: Array<{ url: string; headers: Record<string, string>; body: string | null }> = [];

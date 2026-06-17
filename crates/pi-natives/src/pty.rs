@@ -947,6 +947,12 @@ mod tests {
 	fn bounded_reader_channel_reports_success_for_high_output() {
 		let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		let (_tx, rx) = mpsc::channel();
+		// GitHub-hosted Windows runners drive the `sh` printf loop through
+		// ConPTY far more slowly than Unix, so this synthetic high-output
+		// workload uses less data and a more generous budget there. The
+		// bounded reader's backpressure behavior is platform-independent;
+		// this budget only guards against deadlock / unbounded buffering,
+		// not raw shell throughput (Unix completes the same run in ~3s).
 		#[cfg(windows)]
 		let (line_count, timeout_ms, max_duration): (usize, u32, Duration) =
 			(20_000, 60_000, Duration::from_secs(60));

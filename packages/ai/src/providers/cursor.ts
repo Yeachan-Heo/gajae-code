@@ -2321,12 +2321,12 @@ function findLastUserMessageIndex(messages: Message[]): number {
  */
 export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined, modelId?: string): string[] {
 	const systemPrompts = normalizeSystemPrompts(systemPrompt);
-	if (systemPrompts.length === 0) {
-		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
-	}
-	const jsons = systemPrompts.map(content => JSON.stringify({ role: "system", content }));
-	// Composer-harness models need anchor/edit discipline pinned ahead of the
-	// host prompt (see composer-discipline.ts for the observed failure modes).
+	const jsons =
+		systemPrompts.length === 0
+			? [JSON.stringify({ role: "system", content: "You are a helpful assistant." })]
+			: systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	// Composer-harness models need anchor/edit discipline pinned ahead of any
+	// host/default prompt (see composer-discipline.ts for the observed failure modes).
 	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
 		jsons.unshift(JSON.stringify({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT }));
 	}

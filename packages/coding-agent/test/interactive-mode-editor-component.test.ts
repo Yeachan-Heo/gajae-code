@@ -72,6 +72,23 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(lines.join("\n")).not.toContain("›");
 	});
 
+	it("renders one visible blank row between status line and composer without hook widgets", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+
+		await mode.init();
+
+		const rendered = mode.ui.render(48).map(line => stripVTControlCharacters(line));
+		const composerIndex = rendered.findIndex(line => line.startsWith("┌") && line.endsWith("┐"));
+		let lastStatusIndex = -1;
+		for (let index = 0; index < composerIndex; index += 1) {
+			if (rendered[index] !== "") lastStatusIndex = index;
+		}
+
+		expect(composerIndex).toBeGreaterThan(0);
+		expect(lastStatusIndex).toBeGreaterThanOrEqual(0);
+		expect(rendered.slice(lastStatusIndex + 1, composerIndex)).toEqual([""]);
+	});
+
 	it("keeps closed square composer chrome for one-line, multiline, and narrow prompts", () => {
 		for (const [width, text] of [
 			[48, "Ask gjc to improve the composer"],

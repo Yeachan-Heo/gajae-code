@@ -1,12 +1,22 @@
 /**
  * Python runtime resolution utilities.
  *
- * Centralizes environment filtering, venv detection, and Python executable resolution
- * for both the shared gateway and local kernel spawning.
+ * Centralizes environment filtering, venv detection, managed workspace venv
+ * provisioning, and Python executable resolution for both the shared gateway
+ * and local kernel spawning.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $env, $which, getPythonEnvDir } from "@gajae-code/utils";
+
+export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
+
+export interface PythonRuntimeOptions {
+	/** Create/use <cwd>/.gjc/python-env when no BYO venv/conda env is present. */
+	managedWorkspaceVenv?: boolean;
+	/** Packages to seed into the managed workspace venv when provisioning it. */
+	seedPackages?: readonly string[];
+}
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -104,15 +114,22 @@ function resolvePathKey(env: Record<string, string | undefined>): string {
 	return match ?? "PATH";
 }
 
-function resolveManagedPythonEnv(): string {
+function resolveGlobalManagedPythonEnv(): string {
 	return getPythonEnvDir();
 }
 
-function resolveManagedPythonCandidate(): { venvPath: string; pythonPath: string } {
-	const venvPath = resolveManagedPythonEnv();
+function resolvePythonCandidateInVenv(venvPath: string): { venvPath: string; pythonPath: string; binDir: string } {
 	const binDir = process.platform === "win32" ? path.join(venvPath, "Scripts") : path.join(venvPath, "bin");
 	const pythonPath = path.join(binDir, process.platform === "win32" ? "python.exe" : "python");
-	return { venvPath, pythonPath };
+	return { venvPath, pythonPath, binDir };
+}
+
+function resolveManagedPythonCandidate(): { venvPath: string; pythonPath: string; binDir: string } {
+	return resolvePythonCandidateInVenv(resolveGlobalManagedPythonEnv());
+}
+
+function resolveWorkspaceManagedPythonCandidate(cwd: string): { venvPath: string; pythonPath: string; binDir: string } {
+	return resolvePythonCandidateInVenv(path.join(cwd, ".gjc", "python-env"));
 }
 
 export interface PythonRuntime {
@@ -122,6 +139,23 @@ export interface PythonRuntime {
 	env: Record<string, string | undefined>;
 	/** Path to virtual environment, if detected */
 	venvPath?: string;
+}
+
+function runtimeFromVenv(
+	venvPath: string,
+	pythonPath: string,
+	binDir: string,
+	env: Record<string, string | undefined>,
+): PythonRuntime {
+	env.VIRTUAL_ENV = venvPath;
+	const pathKey = resolvePathKey(env);
+	const currentPath = env[pathKey];
+	env[pathKey] = currentPath ? `${binDir}${path.delimiter}${currentPath}` : binDir;
+	return {
+		pythonPath,
+		env,
+		venvPath,
+	};
 }
 
 /**
@@ -161,42 +195,110 @@ export function resolveVenvPath(cwd: string): string | undefined {
 	return undefined;
 }
 
+async function runRuntimeCommand(
+	cmd: string[],
+	cwd: string,
+	env: Record<string, string | undefined>,
+	description: string,
+): Promise<void> {
+	const spawnEnv: Record<string, string> = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (typeof value === "string") spawnEnv[key] = value;
+	}
+	const proc = Bun.spawn(cmd, {
+		cwd,
+		env: spawnEnv,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (exitCode !== 0) {
+		const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+		throw new Error(`${description} failed with exit code ${exitCode}${output ? `: ${output}` : ""}`);
+	}
+}
+
+async function ensureWorkspaceManagedVenv(
+	cwd: string,
+	baseEnv: Record<string, string | undefined>,
+	seedPackages: readonly string[],
+): Promise<void> {
+	const managed = resolveWorkspaceManagedPythonCandidate(cwd);
+	if (!fs.existsSync(managed.pythonPath)) {
+		const basePython = $which("python3") ?? $which("python");
+		if (!basePython) throw new Error("Python executable not found on PATH");
+		await fs.promises.mkdir(path.dirname(managed.venvPath), { recursive: true });
+		await runRuntimeCommand(
+			[basePython, "-m", "venv", managed.venvPath],
+			cwd,
+			baseEnv,
+			"Managed Python venv creation",
+		);
+	}
+	if (seedPackages.length === 0) return;
+	const markerPath = path.join(managed.venvPath, ".gjc-seeded.json");
+	let seeded = false;
+	try {
+		const marker = JSON.parse(await fs.promises.readFile(markerPath, "utf8")) as { packages?: unknown };
+		const packages = Array.isArray(marker.packages) ? marker.packages : [];
+		seeded = seedPackages.every(pkg => packages.includes(pkg));
+	} catch {
+		seeded = false;
+	}
+	if (seeded) return;
+	const runtimeEnv = runtimeFromVenv(managed.venvPath, managed.pythonPath, managed.binDir, { ...baseEnv }).env;
+	await runRuntimeCommand(
+		[managed.pythonPath, "-m", "pip", "install", "--upgrade", "pip"],
+		cwd,
+		runtimeEnv,
+		"Managed Python pip bootstrap",
+	);
+	await runRuntimeCommand(
+		[managed.pythonPath, "-m", "pip", "install", ...seedPackages],
+		cwd,
+		runtimeEnv,
+		"Managed Python package seed",
+	);
+	await fs.promises.writeFile(
+		markerPath,
+		`${JSON.stringify({ packages: seedPackages, seededAt: new Date().toISOString() }, null, 2)}\n`,
+		"utf8",
+	);
+}
+
 /**
  * Resolve Python runtime including executable path, environment, and venv detection.
  */
-export function resolvePythonRuntime(cwd: string, baseEnv: Record<string, string | undefined>): PythonRuntime {
+export function resolvePythonRuntime(
+	cwd: string,
+	baseEnv: Record<string, string | undefined>,
+	options: PythonRuntimeOptions = {},
+): PythonRuntime {
 	const env = { ...baseEnv };
 	const venvPath = env.VIRTUAL_ENV ?? resolveVenvPath(cwd);
 
 	if (venvPath) {
-		env.VIRTUAL_ENV = venvPath;
-		const binDir = process.platform === "win32" ? path.join(venvPath, "Scripts") : path.join(venvPath, "bin");
-		const pythonCandidate = path.join(binDir, process.platform === "win32" ? "python.exe" : "python");
-		if (fs.existsSync(pythonCandidate)) {
-			const pathKey = resolvePathKey(env);
-			const currentPath = env[pathKey];
-			env[pathKey] = currentPath ? `${binDir}${path.delimiter}${currentPath}` : binDir;
-			return {
-				pythonPath: pythonCandidate,
-				env,
-				venvPath,
-			};
+		const candidate = resolvePythonCandidateInVenv(venvPath);
+		if (fs.existsSync(candidate.pythonPath)) {
+			return runtimeFromVenv(candidate.venvPath, candidate.pythonPath, candidate.binDir, env);
 		}
 	}
 
-	const managed = resolveManagedPythonCandidate();
-	if (fs.existsSync(managed.pythonPath)) {
-		env.VIRTUAL_ENV = managed.venvPath;
-		const pathKey = resolvePathKey(env);
-		const currentPath = env[pathKey];
-		const managedBin =
-			process.platform === "win32" ? path.join(managed.venvPath, "Scripts") : path.join(managed.venvPath, "bin");
-		env[pathKey] = currentPath ? `${managedBin}${path.delimiter}${currentPath}` : managedBin;
-		return {
-			pythonPath: managed.pythonPath,
-			env,
-			venvPath: managed.venvPath,
-		};
+	if (options.managedWorkspaceVenv) {
+		const workspaceManaged = resolveWorkspaceManagedPythonCandidate(cwd);
+		if (fs.existsSync(workspaceManaged.pythonPath)) {
+			return runtimeFromVenv(workspaceManaged.venvPath, workspaceManaged.pythonPath, workspaceManaged.binDir, env);
+		}
+	} else {
+		const managed = resolveManagedPythonCandidate();
+		if (fs.existsSync(managed.pythonPath)) {
+			return runtimeFromVenv(managed.venvPath, managed.pythonPath, managed.binDir, env);
+		}
 	}
 
 	const pythonPath = $which("python") ?? $which("python3");
@@ -207,4 +309,23 @@ export function resolvePythonRuntime(cwd: string, baseEnv: Record<string, string
 		pythonPath,
 		env,
 	};
+}
+
+export async function ensurePythonRuntime(
+	cwd: string,
+	baseEnv: Record<string, string | undefined>,
+	options: PythonRuntimeOptions = {},
+): Promise<PythonRuntime> {
+	if (options.managedWorkspaceVenv) {
+		const env = { ...baseEnv };
+		const venvPath = env.VIRTUAL_ENV ?? resolveVenvPath(cwd);
+		if (venvPath) {
+			const candidate = resolvePythonCandidateInVenv(venvPath);
+			if (fs.existsSync(candidate.pythonPath)) {
+				return runtimeFromVenv(candidate.venvPath, candidate.pythonPath, candidate.binDir, env);
+			}
+		}
+		await ensureWorkspaceManagedVenv(cwd, baseEnv, options.seedPackages ?? RLM_MANAGED_PYTHON_PACKAGES);
+	}
+	return resolvePythonRuntime(cwd, baseEnv, options);
 }

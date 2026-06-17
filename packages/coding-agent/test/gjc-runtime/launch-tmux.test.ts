@@ -72,6 +72,8 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.innerCommand).toContain(
 			"'/bin/bun' '/repo/packages/coding-agent/src/cli.ts' '--tmux' 'hello world'",
 		);
+		expect(plan.innerCommand).toContain("GJC_COORDINATOR_SESSION_ID=");
+		expect(plan.innerCommand).toContain("GJC_COORDINATOR_SESSION_STATE_FILE=");
 	});
 	it("uses a host command for compiled Bun virtual entrypoints", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
@@ -195,6 +197,48 @@ describe("default GJC tmux launch", () => {
 		expect(
 			buildGjcTmuxProfileCommands("gjc-session:0", { GJC_MOUSE: "off" }).flatMap(command => command.args),
 		).not.toContain("mouse");
+	});
+
+	it("records session identity markers in the required tmux profile", () => {
+		const commands = buildGjcTmuxProfileCommands(
+			"gjc-session:0",
+			{},
+			{
+				sessionId: "session-123",
+				sessionStateFile: "/tmp/gjc-state/session.json",
+			},
+		);
+		const args = commands.map(command => command.args);
+
+		expect(args).toContainEqual(["set-option", "-t", "gjc-session:0", "@gjc-session-id", "session-123"]);
+		expect(args).toContainEqual([
+			"set-option",
+			"-t",
+			"gjc-session:0",
+			"@gjc-session-state-file",
+			"/tmp/gjc-state/session.json",
+		]);
+	});
+
+	it("plans matching tmux marker tags and inner process marker env", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+		expect(plan.sessionId).toBe(plan.sessionName);
+		expect(plan.sessionStateFile).toContain("/repo/.gjc/runtime/tmux-sessions/");
+		expect(plan.innerCommand).toContain(`GJC_COORDINATOR_SESSION_ID='${plan.sessionId}'`);
+		expect(plan.innerCommand).toContain(`GJC_COORDINATOR_SESSION_STATE_FILE='${plan.sessionStateFile}'`);
 	});
 
 	it("applies the tmux profile only to the requested target", () => {

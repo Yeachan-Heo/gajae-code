@@ -18,7 +18,7 @@ import { Settings } from "../../config/settings";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
 import { PYTHON_PRELUDE } from "./prelude";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
-import { filterEnv, resolvePythonRuntime } from "./runtime";
+import { ensurePythonRuntime, filterEnv, type PythonRuntimeOptions } from "./runtime";
 
 export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
 export { renderKernelDisplay } from "./display";
@@ -89,6 +89,7 @@ interface KernelLifecycleOptions {
 interface KernelStartOptions extends KernelLifecycleOptions {
 	cwd: string;
 	env?: Record<string, string | undefined>;
+	runtimeOptions?: PythonRuntimeOptions;
 }
 
 interface KernelShutdownOptions {
@@ -120,7 +121,10 @@ function throwIfAborted(signal: AbortSignal | undefined, fallbackReason: string)
 	throw createAbortError("AbortError", typeof reason === "string" ? reason : fallbackReason);
 }
 
-export async function checkPythonKernelAvailability(cwd: string): Promise<PythonKernelAvailability> {
+export async function checkPythonKernelAvailability(
+	cwd: string,
+	runtimeOptions?: PythonRuntimeOptions,
+): Promise<PythonKernelAvailability> {
 	if (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK")) {
 		return { ok: true };
 	}
@@ -128,7 +132,7 @@ export async function checkPythonKernelAvailability(cwd: string): Promise<Python
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
 		const baseEnv = filterEnv(env);
-		const runtime = resolvePythonRuntime(cwd, baseEnv);
+		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions);
 		const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
 			.quiet()
 			.nothrow()
@@ -199,6 +203,7 @@ export class PythonKernel {
 			"PythonKernel.start:availabilityCheck",
 			checkPythonKernelAvailability,
 			options.cwd,
+			options.runtimeOptions,
 		);
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
@@ -207,7 +212,7 @@ export class PythonKernel {
 		const settings = await Settings.init();
 		const { env: shellEnv } = settings.getShellConfig();
 		const baseEnv = filterEnv(shellEnv);
-		const runtime = resolvePythonRuntime(options.cwd, baseEnv);
+		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions);
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;

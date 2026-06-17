@@ -1,0 +1,22 @@
+# Linux systemd user unit for the default Coordinator MCP backend.
+# Copy to: ~/.config/systemd/user/gjc-telegram-remote-coordinator.service
+# Then edit WorkingDirectory/PATH for your checkout/install paths.
+[Unit]
+Description=GJC Telegram Remote gateway (Coordinator MCP backend)
+Documentation=https://github.com/gajae-ai/gajae-code/tree/dev/packages/telegram-remote
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/gajae-code/packages/telegram-remote
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/gjc/telegram-remote.env
+ExecStart=/usr/bin/env bun run src/cli.ts
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

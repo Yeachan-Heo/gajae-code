@@ -61,6 +61,49 @@ function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<stri
 	return replacement && profiles.has(replacement) ? replacement : profileName;
 }
 
+/**
+ * Rewrite a selector only within the selector provider's own alternative group.
+ * Strict providers are never rewritten, and authenticated alternative providers
+ * keep their original selectors.
+ */
+function rewriteSelectorProvider(
+	selector: string,
+	authenticatedProviders: ReadonlySet<string>,
+	alternativeGroups: readonly (readonly string[])[],
+): string {
+	const slash = selector.indexOf("/");
+	if (slash < 0) return selector;
+
+	const provider = selector.substring(0, slash);
+	if (authenticatedProviders.has(provider)) return selector;
+
+	const group = alternativeGroups.find(candidates => candidates.includes(provider));
+	if (!group) return selector;
+
+	const replacement = group.find(candidate => authenticatedProviders.has(candidate));
+	if (!replacement) return selector;
+
+	return replacement + selector.substring(slash);
+}
+
+function rewriteBindingsProviders(
+	bindings: { defaultSelector?: string; agentModelOverrides: Record<string, string> },
+	authenticatedProviders: ReadonlySet<string>,
+	alternativeGroups: readonly (readonly string[])[],
+): { defaultSelector?: string; agentModelOverrides: Record<string, string> } {
+	return {
+		defaultSelector: bindings.defaultSelector
+			? rewriteSelectorProvider(bindings.defaultSelector, authenticatedProviders, alternativeGroups)
+			: undefined,
+		agentModelOverrides: Object.fromEntries(
+			Object.entries(bindings.agentModelOverrides).map(([role, sel]) => [
+				role,
+				rewriteSelectorProvider(sel, authenticatedProviders, alternativeGroups),
+			]),
+		),
+	};
+}
+
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
@@ -72,19 +115,44 @@ export async function prepareModelProfileActivation(
 		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
 	}
 
+	const allProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+
 	const missingProviders: string[] = [];
-	for (const provider of aggregateModelProfileRequiredProviders(profile.requiredProviders, profile)) {
+	const authenticatedProviders: string[] = [];
+	for (const provider of allProviders) {
 		const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.session.sessionId);
 		if (!isAuthenticated(apiKey)) {
 			missingProviders.push(provider);
+		} else {
+			authenticatedProviders.push(provider);
 		}
 	}
-	if (missingProviders.length > 0) {
+
+	// Check strict (non-alternative) providers — all must be authenticated.
+	const strictMissing = missingProviders.filter(p => !alternativeSet.has(p));
+	if (strictMissing.length > 0) {
+		throw new Error(formatModelProfileCredentialError(options.profileName, strictMissing));
+	}
+
+	// Check alternative groups — at least one provider per group must be authenticated.
+	for (const group of alternativeGroups) {
+		const groupAuthenticated = group.some(p => authenticatedProviders.includes(p));
+		if (!groupAuthenticated) {
+			throw new Error(formatModelProfileCredentialError(options.profileName, [...group]));
+		}
+	}
+
+	if (authenticatedProviders.length === 0) {
 		throw new Error(formatModelProfileCredentialError(options.profileName, missingProviders));
 	}
 
 	const availableModels = options.modelRegistry.getAll();
-	const bindings = resolveProfileBindings(profile);
+	let bindings = resolveProfileBindings(profile);
+	if (missingProviders.length > 0 && alternativeGroups.length > 0) {
+		bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
+	}
 	const resolvedDefault = bindings.defaultSelector
 		? resolveModelRoleValue(bindings.defaultSelector, availableModels, {
 				settings: options.settings as Settings,

@@ -7,7 +7,12 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
-
+// Keys for tasks that compile the @gajae-code/natives addon. They run once in
+// the dedicated dev-ci native-build job (not as matrix shards) and publish the
+// built `.node` files as an artifact the runtime-dependent shards download.
+// Declared here (before the top-level `await main()`) so it is initialized for
+// every CLI mode despite top-level await halting later module statements.
+const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-linux-x64"]);
 export interface PackageManifest {
 	name?: string;
 	scripts?: Record<string, string>;
@@ -30,17 +35,43 @@ export interface Task {
 	cwd?: string;
 }
 
+// Machine-readable descriptor for one planned task, emitted by `--matrix-json`
+// so dev-ci can fan the plan out across runners. `native`/`rust` declare the
+// per-task setup a single shard needs (prebuilt native addon / Rust toolchain);
+// `nativeBuild` marks the addon-compilation tasks that run once in the dedicated
+// native-build job rather than as shards.
+export interface TaskMatrixEntry {
+	key: string;
+	description: string;
+	command: readonly string[];
+	cwd?: string;
+	native: boolean;
+	rust: boolean;
+	nativeBuild: boolean;
+}
+
 async function main(): Promise<void> {
 	const dryRun = process.argv.includes("--dry-run");
-	const emitFlags = process.argv.includes("--emit-flags");
 
-	if (emitFlags) {
+	if (process.argv.includes("--emit-flags")) {
 		await emitAffectedFlags();
 		return;
 	}
+	if (process.argv.includes("--matrix-json")) {
+		await emitMatrix();
+		return;
+	}
+	if (process.argv.includes("--native-build")) {
+		await runNativeBuild();
+		return;
+	}
+	const taskArg = process.argv.find(arg => arg.startsWith("--task="));
+	if (taskArg) {
+		await runSingleTask(taskArg.slice("--task=".length));
+		return;
+	}
 	const changedPaths = await getChangedPaths();
-	const workspaces = await getWorkspacePackages();
-	const tasks = planTasks(changedPaths, workspaces);
+	const tasks = await resolvePlannedTasks(changedPaths);
 
 	printPlan(changedPaths, tasks);
 
@@ -62,6 +93,48 @@ if (import.meta.main) {
 	await main();
 }
 
+// CI runs in one of two planning modes:
+//   - "pr": pull_request runs get a fast, narrowly targeted plan (run only the
+//     tests/checks directly relevant to the changed paths).
+//   - "push": push-to-dev (and any non-PR event) gets the broader/full affected
+//     suite so the complete validation still runs once a change lands on dev.
+// The mode is derived from GITHUB_EVENT_NAME, which GitHub sets on every job of
+// a run, so the planner and every shard resolve the same mode deterministically.
+export type PlanMode = "pr" | "push";
+
+export function resolvePlanMode(): PlanMode {
+	return Bun.env.GITHUB_EVENT_NAME?.trim() === "pull_request" ? "pr" : "push";
+}
+
+// Resolve the plan for the current changed paths and CI mode. PR mode builds the
+// targeted plan from a filesystem index of test files (for source→test mapping);
+// push mode reuses the broad affected planner unchanged.
+async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
+	const packages = await getWorkspacePackages();
+	if (resolvePlanMode() === "pr") {
+		const testFiles = await gatherTestFiles();
+		return planTargetedTasks(paths, packages, testFiles);
+	}
+	return planTasks(paths, packages);
+}
+
+// Repo-relative list of TypeScript test files, used by PR-mode targeting to map
+// a changed source file to its directly-named test. node_modules is excluded so
+// the index is identical whether or not dependencies are installed (the planner
+// job skips install; shards install before running) — keeping plans stable.
+async function gatherTestFiles(): Promise<string[]> {
+	const patterns = ["packages/**/*.test.ts", "packages/**/*.test.tsx", "scripts/**/*.test.ts"];
+	const found = new Set<string>();
+	for (const pattern of patterns) {
+		for await (const entry of new Bun.Glob(pattern).scan({ cwd: repoRoot })) {
+			const normalized = entry.split(path.sep).join("/");
+			if (!normalized.includes("node_modules/")) {
+				found.add(normalized);
+			}
+		}
+	}
+	return Array.from(found).sort();
+}
 // `--emit-flags` resolves changed paths exactly as a normal run does, then
 // reports whether the resulting plan needs the Rust toolchain (rust-check /
 // rust-test) and/or a native build, so dev-ci can gate its Rust setup. It
@@ -86,6 +159,119 @@ async function emitAffectedFlags(): Promise<void> {
 	}
 	if (process.env.GITHUB_OUTPUT) {
 		await fs.appendFile(process.env.GITHUB_OUTPUT, `rust=${rust}\nnative=${native}\n`);
+	}
+}
+
+function isNativeBuildKey(key: string): boolean {
+	return NATIVE_BUILD_KEYS.has(key);
+}
+
+// Tasks that load the @gajae-code/natives addon at runtime and therefore need a
+// prebuilt `.node` present in `packages/natives/native/`. By construction (see
+// planTasks) every such task only appears in a plan that also includes a native
+// build task, so the shard can always download the artifact built once upstream.
+function taskNeedsNative(key: string): boolean {
+	return (
+		key === "root-test" ||
+		key === "cli-smoke" ||
+		key === "wrapper-version" ||
+		key === "deep-interview-definitions" ||
+		key === "deep-interview-runtime" ||
+		key.startsWith("test:")
+	);
+}
+
+// Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
+function taskNeedsRust(key: string): boolean {
+	return key === "rust-check" || key === "rust-test";
+}
+
+// Build the machine-readable descriptor list for the current changed-path plan.
+// `cwd` is emitted repo-relative so the JSON stays portable across runners.
+export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
+	return tasks.map(task => ({
+		key: task.key,
+		description: task.description,
+		command: task.command,
+		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
+		native: taskNeedsNative(task.key),
+		rust: taskNeedsRust(task.key),
+		nativeBuild: isNativeBuildKey(task.key),
+	}));
+}
+
+// `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
+// by tests and for debugging). Under GitHub Actions it also appends the dev-ci
+// planner outputs: `matrix` (the shard include list, excluding native-build
+// tasks), `has_tasks`, `has_native`, and the resolved `changed_paths` so every
+// downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
+// instead of re-resolving the base ref on each runner.
+async function emitMatrix(): Promise<void> {
+	const paths = await getChangedPaths();
+	const tasks = await resolvePlannedTasks(paths);
+	const entries = describeTasks(tasks);
+
+	console.log(JSON.stringify(entries));
+
+	const githubOutput = process.env.GITHUB_OUTPUT;
+	if (!githubOutput) {
+		return;
+	}
+	const shards = entries
+		.filter(entry => !entry.nativeBuild)
+		.map(entry => ({ key: entry.key, description: entry.description, native: entry.native, rust: entry.rust }));
+	const hasNative = entries.some(entry => entry.nativeBuild);
+	const lines = [
+		`matrix=${JSON.stringify({ include: shards })}`,
+		`has_tasks=${shards.length > 0}`,
+		`has_native=${hasNative}`,
+		"changed_paths<<__GJC_PATHS_EOF__",
+		...paths,
+		"__GJC_PATHS_EOF__",
+		"",
+	];
+	await fs.appendFile(githubOutput, lines.join("\n"));
+}
+
+// `--native-build` runs every native build task in the current plan exactly
+// once. The dedicated dev-ci native-build job uses it so the expensive native
+// compile happens a single time per run instead of on each runtime shard.
+async function runNativeBuild(): Promise<void> {
+	const paths = await getChangedPaths();
+	const tasks = (await resolvePlannedTasks(paths)).filter(task => isNativeBuildKey(task.key));
+	if (tasks.length === 0) {
+		console.log("ci-dev-affected: no native build tasks in plan; nothing to build.");
+		return;
+	}
+	for (const task of tasks) {
+		console.log(`\n::group::${task.description}`);
+		const exitCode = await runCommand(task.command, task.cwd ?? repoRoot);
+		console.log("::endgroup::");
+		if (exitCode !== 0) {
+			process.exit(exitCode);
+		}
+	}
+}
+
+// `--task=<key>` runs exactly one planned task selected by key. Matrix shards
+// use this to execute their single assigned task. An unknown key is a hard
+// error so plan drift between the planner and a shard fails loudly instead of
+// silently skipping validation.
+async function runSingleTask(key: string): Promise<void> {
+	const paths = await getChangedPaths();
+	const tasks = await resolvePlannedTasks(paths);
+	const task = tasks.find(candidate => candidate.key === key);
+	if (!task) {
+		const known = tasks.map(candidate => candidate.key).join(", ") || "(none)";
+		console.error(`ci-dev-affected: task '${key}' is not in the current plan. Planned tasks: ${known}`);
+		process.exit(1);
+		return;
+	}
+	console.log(`\n::group::${task.description}`);
+	const exitCode = await runCommand(task.command, task.cwd ?? repoRoot);
+	console.log("::endgroup::");
+	if (exitCode !== 0) {
+		process.exit(exitCode);
 	}
 }
 
@@ -226,9 +412,17 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	const publishChanged = paths.some(isReleasePublishPath);
 	const wrapperChanged = paths.some(isUnscopedWrapperPath);
 	const toolingScriptChanged = paths.some(isToolingScriptPath);
-	const needsNativeRuntime = paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace;
+	const deepInterviewOnly = isDeepInterviewOnly(paths);
+	const needsNativeRuntime = !deepInterviewOnly && (paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace);
 	const workflowHarnessOnly = paths.length > 0 && paths.every(isWorkflowHarnessPath);
 	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
+
+	if (deepInterviewOnly) {
+		addNativeBuild(tasks);
+		add(tasks, "deep-interview-definitions", "Deep interview default definition tests", ["bun", "test", "packages/coding-agent/test/default-gjc-definitions.test.ts"]);
+		add(tasks, "deep-interview-runtime", "Deep interview runtime tests", ["bun", "test", "packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts"]);
+		return Array.from(tasks.values());
+	}
 
 	if (needsNativeRuntime) {
 		add(tasks, "native-build", "Build native addon for CLI/test smoke", ["bun", "run", "build:native"]);
@@ -291,6 +485,170 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 
 	return Array.from(tasks.values());
+}
+
+// PR-mode targeted planner. For each changed path it emits the smallest safe set
+// of tasks instead of the broad affected suite:
+//   - docs/changelog-only -> nothing expensive
+//   - workflow / CI harness scripts -> yaml-parse + ci-selftest + ci-dry-run
+//   - a changed test file -> run exactly that test file (test:<path>)
+//   - a source file with a directly-named test -> run that test file only
+//   - a source file with no mapped test -> owning package check + relevant smoke
+//   - rust/python/web/install changes -> their scoped check+test
+// A genuine full-workspace config change still escalates to root check + test.
+// Native builds are added once (native-linux-x64) only when a planned task needs
+// the addon at runtime; the dedicated job restores it from cache when no native
+// source changed, so PRs never rebuild native per shard.
+export function planTargetedTasks(paths: readonly string[], packages: readonly WorkspacePackage[], testFiles: readonly string[]): Task[] {
+	const tasks = new Map<string, Task>();
+	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	if (relevant.length === 0) {
+		return [];
+	}
+
+	const fullWorkspace = relevant.some(isFullWorkspacePath) && !isRootPackageReleaseHarnessOnly(relevant);
+	let needCiSelftest = false;
+	let needYamlParse = false;
+
+	if (fullWorkspace) {
+		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
+		addNativeBuild(tasks);
+		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
+	}
+
+	for (const changedPath of relevant) {
+		if (isFullWorkspacePath(changedPath)) continue;
+		if (isWorkflowPath(changedPath)) {
+			needYamlParse = true;
+			needCiSelftest = true;
+			continue;
+		}
+		if (isCiHarnessScriptPath(changedPath)) {
+			needCiSelftest = true;
+			continue;
+		}
+		if (isPythonPath(changedPath)) {
+			add(tasks, "python-lint", "Python lint", ["bun", "run", "lint:py"]);
+			add(tasks, "python-test", "Python tests", ["bun", "run", "test:py"]);
+			continue;
+		}
+		if (isWebPath(changedPath)) {
+			add(tasks, "robogjc-web-typecheck", "robogjc web typecheck", packageScriptCommand("typecheck"), resolvePackageCwd("python/robogjc/web"));
+			add(tasks, "robogjc-web-build", "robogjc web build", packageScriptCommand("build"), resolvePackageCwd("python/robogjc/web"));
+			continue;
+		}
+		if (isRustPath(changedPath)) {
+			add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
+			add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
+			continue;
+		}
+		if (isInstallPath(changedPath)) {
+			add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+			continue;
+		}
+
+		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
+		if (mappedTests.length > 0) {
+			for (const testFile of mappedTests) {
+				addTestFileTask(tasks, testFile);
+			}
+			continue;
+		}
+
+		const owner = owningPackage(changedPath, packages);
+		if (owner) {
+			if (owner.manifest.scripts?.check) {
+				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+			}
+			if (isCodingAgentRuntimePath(changedPath)) {
+				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+			}
+			if (isUnscopedWrapperPath(changedPath)) {
+				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+			}
+			if (isReleasePublishPath(changedPath)) {
+				add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
+				add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+			}
+			continue;
+		}
+
+		// Unmapped root-level code/config (no owning package, no mapped test):
+		// fall back to the root tooling typecheck rather than the full suite.
+		if (isCodeIshPath(changedPath)) {
+			add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
+		}
+	}
+
+	if (needCiSelftest) {
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
+		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
+	}
+	if (needYamlParse) {
+		add(tasks, "yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
+	}
+
+	ensureNativeBuild(tasks);
+
+	return Array.from(tasks.values());
+}
+
+// Add a task that runs exactly one test file. Keyed as `test:<repo-relative-path>`
+// so the matrix shard name stays small and directly traceable to the file.
+function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
+	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
+}
+
+// Resolve the directly-named test(s) for a changed path: the changed file itself
+// if it is a test, otherwise test files whose basename is `<base>.test.ts(x)` and
+// which live within the changed file's owning package (or its directory for
+// root-level files). Returns [] when there is no direct mapping.
+function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
+	if (isTestFilePath(changedPath)) {
+		return [changedPath];
+	}
+	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
+	if (base === "") {
+		return [];
+	}
+	const wanted = new Set([`${base}.test.ts`, `${base}.test.tsx`]);
+	const owner = owningPackage(changedPath, packages);
+	const scopePrefix = owner ? `${owner.dir}/` : `${path.posix.dirname(changedPath)}/`;
+	return testFiles.filter(testFile => wanted.has(path.posix.basename(testFile)) && testFile.startsWith(scopePrefix));
+}
+
+function owningPackage(changedPath: string, packages: readonly WorkspacePackage[]): WorkspacePackage | undefined {
+	return packages.find(workspacePackage => changedPath === workspacePackage.dir || changedPath.startsWith(`${workspacePackage.dir}/`));
+}
+
+// Ensure a single native build task is present whenever any planned task loads
+// the native addon at runtime, preserving the invariant that native-consuming
+// shards always have an artifact to download.
+function ensureNativeBuild(tasks: Map<string, Task>): void {
+	const keys = Array.from(tasks.keys());
+	if (keys.some(taskNeedsNative) && !keys.some(isNativeBuildKey)) {
+		addNativeBuild(tasks);
+	}
+}
+
+function isDocOrChangelogPath(changedPath: string): boolean {
+	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
+}
+
+function isTestFilePath(changedPath: string): boolean {
+	return /\.test\.tsx?$/.test(changedPath);
+}
+
+function isCiHarnessScriptPath(changedPath: string): boolean {
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+}
+
+function isWebPath(changedPath: string): boolean {
+	return changedPath.startsWith("python/robogjc/web/");
+}
+
+function isCodeIshPath(changedPath: string): boolean {
+	return /\.(tsx?|jsx?|mts|cts|mjs|cjs|json|jsonc|toml|ya?ml|sh)$/.test(changedPath) || changedPath === "bun.lock";
 }
 
 
@@ -407,6 +765,16 @@ function isInstallPath(changedPath: string): boolean {
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
+}
+
+function isDeepInterviewOnly(paths: readonly string[]): boolean {
+	const allowed = new Set([
+		"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+		"packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts",
+		"packages/coding-agent/test/default-gjc-definitions.test.ts",
+		"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
+	]);
+	return paths.length > 0 && paths.every(changedPath => allowed.has(changedPath));
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {

@@ -292,6 +292,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingSubmissionDispose: (() => void) | undefined;
 	lastSigintTime = 0;
 	lastEscapeTime = 0;
+	lastComposerClearEscapeTime = 0;
 	shutdownRequested = false;
 	#isShuttingDown = false;
 	hookSelector: HookSelectorComponent | undefined = undefined;
@@ -306,6 +307,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#cleanupUnsubscribe?: () => void;
+	#subprocessTeardownUnsubscribe?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
 	#planModePreviousTools: string[] | undefined;
@@ -404,7 +406,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
-		this.statusLine = new StatusLineComponent(session);
+		this.statusLine = new StatusLineComponent(session, { version: this.#version });
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
@@ -446,6 +448,14 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Register session manager flush for signal handlers (SIGINT, SIGTERM, SIGHUP)
 		this.#cleanupUnsubscribe = postmortem.register("session-manager-flush", () => this.sessionManager.flush());
+
+		// Tear down subprocess-spawning tools (browser Chrome, Python eval kernel) on a
+		// signal kill (SIGINT/SIGTERM/SIGHUP) so they aren't reparented to PID 1 (#698).
+		// The graceful /quit path already releases these via session.dispose(); this hook
+		// is the bounded, idempotent fallback for an external kill that bypasses it.
+		this.#subprocessTeardownUnsubscribe = postmortem.register("session-subprocess-teardown", () =>
+			this.session.disposeChildSubprocesses(),
+		);
 
 		await logger.time(
 			"InteractiveMode.init:slashCommands",
@@ -1907,6 +1917,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (this.#cleanupUnsubscribe) {
 			this.#cleanupUnsubscribe();
+		}
+		if (this.#subprocessTeardownUnsubscribe) {
+			this.#subprocessTeardownUnsubscribe();
 		}
 		if (this.isInitialized) {
 			this.ui.stop();

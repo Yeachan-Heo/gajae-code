@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import * as path from "node:path";
 import { Process, ProcessStatus } from "@gajae-code/natives";
 import type { Browser, Page } from "puppeteer-core";
 import { ToolError, throwIfAborted } from "../tool-errors";
@@ -62,6 +63,17 @@ export async function waitForCdp(cdpUrl: string, timeoutMs: number, signal?: Abo
  * accepts both `--flag=value` and `--flag value`). Returns null if absent or
  * malformed.
  */
+export function findCdpPortInArgsForTest(args: string[]): number | null {
+	return findCdpPortInArgs(args);
+}
+export function findCdpAddressInArgsForTest(args: readonly string[]): string | null {
+	return findCdpAddressInArgs(args);
+}
+
+export function isSafeCdpAddressForTest(address: string | null): boolean {
+	return isSafeCdpAddress(address);
+}
+
 function findCdpPortInArgs(args: string[]): number | null {
 	for (const arg of args) {
 		const m = /^--remote-debugging-port=(\d+)$/.exec(arg);
@@ -79,6 +91,41 @@ function findCdpPortInArgs(args: string[]): number | null {
 	return null;
 }
 
+function findArgValue(args: readonly string[], name: string): string | null {
+	const prefix = `${name}=`;
+	for (const arg of args) {
+		if (arg.startsWith(prefix)) return arg.slice(prefix.length);
+	}
+	for (let i = 0; i < args.length - 1; i++) {
+		if (args[i] === name) return args[i + 1] ?? null;
+	}
+	return null;
+}
+
+function normalizeProfilePath(input: string): string {
+	return path.resolve(input);
+}
+
+export function argsMatchChromeProfileForTest(
+	args: readonly string[],
+	profile: { userDataDir: string; profileDirectory: string },
+): boolean {
+	return argsMatchChromeProfile(args, profile);
+}
+
+function argsMatchChromeProfile(
+	args: readonly string[],
+	profile: { userDataDir: string; profileDirectory: string },
+): boolean {
+	const userDataDir = findArgValue(args, "--user-data-dir");
+	const profileDirectory = findArgValue(args, "--profile-directory") ?? "Default";
+	return (
+		userDataDir !== null &&
+		normalizeProfilePath(userDataDir) === normalizeProfilePath(profile.userDataDir) &&
+		profileDirectory === profile.profileDirectory
+	);
+}
+
 /** One-shot probe: returns true when `/json/version` answers 200 within the timeout. */
 async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> {
 	const probeTimeout = AbortSignal.timeout(1500);
@@ -93,10 +140,26 @@ async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> 
 }
 
 /**
- * If any running instance of `exe` was launched with `--remote-debugging-port`
- * and that endpoint actually answers, return it so attach can reuse it instead
- * of killing and respawning. Idempotent re-attaches are the common case.
+ * Chromium binds remote debugging to loopback by default when no address is
+ * provided. Reuse only loopback CDP listeners; a matching profile launched with
+ * --remote-debugging-address=0.0.0.0, ::, or any LAN/public address is unsafe.
  */
+function findCdpAddressInArgs(args: readonly string[]): string | null {
+	return findArgValue(args, "--remote-debugging-address");
+}
+
+function isSafeCdpAddress(address: string | null): boolean {
+	if (address === null || address.trim() === "") return true;
+	const normalized = address.trim().toLowerCase();
+	return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized === "[::1]";
+}
+
+function unsafeCdpAddressReason(address: string): string {
+	return `Refusing to reuse Chrome profile CDP endpoint because --remote-debugging-address=${JSON.stringify(
+		address,
+	)} is not a loopback-only address. Restart Chrome with --remote-debugging-address=127.0.0.1 or omit the address flag.`;
+}
+
 export async function findReusableCdp(
 	exe: string,
 	signal?: AbortSignal,
@@ -111,9 +174,46 @@ export async function findReusableCdp(
 		}
 		const port = findCdpPortInArgs(args);
 		if (port === null) continue;
+		const address = findCdpAddressInArgs(args);
+		if (!isSafeCdpAddress(address)) continue;
 		if (await probeCdpAt(port, signal)) {
 			return { cdpUrl: `http://127.0.0.1:${port}`, pid: proc.pid };
 		}
+	}
+	return null;
+}
+
+export interface RunningChromeProfile {
+	pid: number;
+	cdpUrl: string | null;
+	unsafeCdpReason?: string;
+}
+
+export async function findRunningChromeProfile(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	signal?: AbortSignal,
+): Promise<RunningChromeProfile | null> {
+	const candidates = Process.fromPath(exe).filter(p => p.status() === ProcessStatus.Running);
+	for (const proc of candidates) {
+		let args: string[];
+		try {
+			args = proc.args();
+		} catch {
+			continue;
+		}
+		if (!argsMatchChromeProfile(args, profile)) continue;
+		const port = findCdpPortInArgs(args);
+		if (port !== null) {
+			const address = findCdpAddressInArgs(args);
+			if (!isSafeCdpAddress(address)) {
+				return { pid: proc.pid, cdpUrl: null, unsafeCdpReason: unsafeCdpAddressReason(address ?? "") };
+			}
+			if (await probeCdpAt(port, signal)) {
+				return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
+			}
+		}
+		return { pid: proc.pid, cdpUrl: null };
 	}
 	return null;
 }

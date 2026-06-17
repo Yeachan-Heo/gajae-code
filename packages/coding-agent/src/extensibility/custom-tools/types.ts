@@ -180,6 +180,8 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	label: string;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
+	/** Tool scheduling mode; exclusive tools do not run in parallel with other tools in a model turn. */
+	concurrency?: "shared" | "exclusive";
 	/** Description for LLM */
 	description: string;
 	/** Parameter schema (Zod or TypeBox; TypeBox is auto-lifted to Zod at registration). */

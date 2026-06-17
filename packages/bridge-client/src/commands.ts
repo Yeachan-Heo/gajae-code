@@ -9,6 +9,7 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 	"set_todos",
 	"set_host_tools",
 	"set_host_uri_schemes",
+	"get_pending_workflow_gates",
 	"workflow_gate_response",
 	"set_model",
 	"cycle_model",
@@ -69,6 +70,7 @@ export interface BridgeCommandHelpers {
 	setTodos(sessionId: string, phases: unknown[], options?: BridgeCommandOptions): Promise<unknown>;
 	setHostTools(sessionId: string, tools: unknown[], options?: BridgeCommandOptions): Promise<unknown>;
 	setHostUriSchemes(sessionId: string, schemes: unknown[], options?: BridgeCommandOptions): Promise<unknown>;
+	getPendingWorkflowGates(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	setModel(sessionId: string, provider: string, modelId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	cycleModel(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	getAvailableModels(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;

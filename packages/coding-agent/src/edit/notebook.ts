@@ -49,7 +49,7 @@ function cloneCell(cell: NotebookCell): NotebookCell {
 	return structuredClone(cell);
 }
 
-function createNotebookCell(cellType: NotebookCellType, source: string): NotebookCell {
+export function createNotebookCell(cellType: NotebookCellType, source: string): NotebookCell {
 	const cell: NotebookCell = {
 		cell_type: cellType,
 		metadata: {},
@@ -62,13 +62,17 @@ function createNotebookCell(cellType: NotebookCellType, source: string): Noteboo
 	return cell;
 }
 
-function createEmptyNotebook(): NotebookDocument {
+export function createEmptyNotebook(): NotebookDocument {
 	return {
 		cells: [],
 		metadata: {},
 		nbformat: 4,
 		nbformat_minor: 5,
 	};
+}
+
+export function serializeNotebookDocument(notebook: NotebookDocument): string {
+	return JSON.stringify(notebook, null, 1);
 }
 
 function validateNotebook(value: unknown, displayPath: string): NotebookDocument {

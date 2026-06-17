@@ -141,6 +141,21 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "xiaomi-token-plan-sgp",
+		name: "Xiaomi Token Plan (Singapore)",
+		available: true,
+	},
+	{
+		id: "xiaomi-token-plan-ams",
+		name: "Xiaomi Token Plan (Europe)",
+		available: true,
+	},
+	{
+		id: "xiaomi-token-plan-cn",
+		name: "Xiaomi Token Plan (China)",
+		available: true,
+	},
+	{
 		id: "opencode-zen",
 		name: "OpenCode Zen",
 		available: true,

@@ -46,6 +46,7 @@ const RPC_COMMAND_SCOPE_REGISTRY: Record<RpcCommandType, BridgeCommandScope> = {
 	set_todos: "control",
 	set_host_tools: "host_tools",
 	set_host_uri_schemes: "host_uri",
+	get_pending_workflow_gates: "message:read",
 	set_model: "model",
 	cycle_model: "model",
 	get_available_models: "model",

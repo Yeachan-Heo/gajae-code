@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -139,6 +139,38 @@ describe("AgentSession resilient retry", () => {
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 	}
 
+	// Builds a session pinned to an explicit model (e.g. ollama-cloud) so
+	// provider-scoped retry behavior can be exercised. The mock streams as
+	// itself, so the active model's API — not the errored message's API — is
+	// what the classifier reads.
+	function buildModelSession(options: {
+		model: Model;
+		responses: Array<{ throw: string } | { content: string[] }>;
+		settingsOverrides?: Record<string, unknown>;
+		requestedModels?: string[];
+	}): AgentSession {
+		const { model } = options;
+		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
+		const mock = createMockModel({ responses: options.responses });
+		const requestedModels = options.requestedModels ?? [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, opts) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, opts);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 1,
+			...options.settingsOverrides,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+	}
 	function track(s: AgentSession) {
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
@@ -480,5 +512,67 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(sess).stopReason).toBe("stop");
+	});
+
+	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
+		// ollama-cloud (ollama-chat API) can stall before its first token even
+		// for tiny prompts. Unbounded continuation retries re-issue the full
+		// request to a billable backend and spike usage; the retry must be
+		// capped at retry.maxRetries and then surface.
+		const model = getBundledModel("ollama-cloud", "gpt-oss:120b");
+		if (!model) throw new Error("Expected bundled ollama-cloud test model to exist");
+		const timeoutMessage = "Provider stream timed out while waiting for the first event";
+		const requestedModels: string[] = [];
+		session = buildModelSession({
+			model,
+			// Far more throws than maxRetries: an unbounded loop would consume them all.
+			responses: Array.from({ length: 10 }, () => ({ throw: timeoutMessage })),
+			settingsOverrides: { "retry.maxRetries": 2 },
+			requestedModels,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("tiny prompt");
+		await session.waitForIdle();
+
+		// Bounded: 1 initial attempt + retry.maxRetries(2) retries = 3 requests, then surface.
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(e => e.unbounded === false)).toBe(true);
+		expect(requestedModels).toHaveLength(3);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false });
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("first event");
+		expect(waitSpy).toHaveBeenCalled();
+	});
+
+	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {
+		// The fix is scoped to ollama-cloud: first-party providers keep their
+		// existing unbounded transient-retry behavior for first-event timeouts.
+		const requestedModels: string[] = [];
+		session = buildSession({
+			responses: [
+				{ throw: "Anthropic stream timed out while waiting for the first event" },
+				{ throw: "Anthropic stream timed out while waiting for the first event" },
+				{ throw: "Anthropic stream timed out while waiting for the first event" },
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("first-party first-event timeout");
+		await session.waitForIdle();
+
+		// maxRetries is 1, but unbounded transient retries continue past it.
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.every(e => e.unbounded === true)).toBe(true);
+		expect(requestedModels).toHaveLength(4);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 });

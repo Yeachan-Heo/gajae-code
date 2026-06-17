@@ -42,6 +42,32 @@ describe("CustomEditor temporary model selector keybinding", () => {
 	});
 });
 
+describe("CustomEditor queue keybinding", () => {
+	it("triggers explicit queue from the configured action key", () => {
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		editor.onQueue = onQueue;
+
+		editor.handleInput("\x1b\r");
+
+		expect(onQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("supports remapping the explicit queue key when Alt+Enter is unavailable", () => {
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		editor.onQueue = onQueue;
+		editor.setActionKeys("app.message.queue", ["alt+q"]);
+
+		editor.handleInput("\x1b\r");
+		expect(onQueue).not.toHaveBeenCalled();
+
+		editor.handleInput("\x1bq");
+		expect(onQueue).toHaveBeenCalledTimes(1);
+	});
+});
+
 describe("CustomEditor bracketed paste interception", () => {
 	it("lets coding-agent consume pasted content before the base editor stores it", async () => {
 		const editor = createEditor();

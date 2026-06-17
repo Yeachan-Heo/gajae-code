@@ -1,0 +1,118 @@
+{
+  "records": [
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 0,
+      "expected": { "requiredTools": ["read"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/secret.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "bash-discipline",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 0,
+      "expected": { "requiredTools": ["read"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/secret.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "file-discovery-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 1,
+      "expected": { "requiredTools": ["find"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "find", "status": "success", "arguments": { "paths": ["src/**/*.ts"] } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "file-discovery-discipline",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 1,
+      "expected": { "requiredTools": ["find"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "find", "status": "success", "arguments": { "paths": ["src/**/*.ts"] } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "shell-write-discipline",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 2,
+      "expected": { "requiredTools": ["edit"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/write-target.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "shell-write-discipline",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 2,
+      "expected": { "requiredTools": ["edit"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/write-target.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "command-contamination",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 3,
+      "expected": { "requiredTools": ["bash"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "bash", "status": "success", "arguments": { "command": "bun test packages/ai/test/composer-discipline.test.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "command-contamination",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 3,
+      "expected": { "requiredTools": ["bash"], "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "bash", "status": "success", "arguments": { "command": "bun test packages/ai/test/composer-discipline.test.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "bad-anchor-recovery",
+      "modelRole": "candidate",
+      "model": "grok-build/grok-composer-2.5-fast",
+      "trial": 4,
+      "expected": { "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "error", "message": "Edit rejected: anchors do not match" },
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/recover.ts" } },
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/recover.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    },
+    {
+      "scenarioId": "bad-anchor-recovery",
+      "modelRole": "baseline",
+      "model": "openai-codex/gpt-5.5:low",
+      "trial": 4,
+      "expected": { "requireSuccess": true },
+      "events": [
+        { "type": "tool_execution_end", "toolName": "edit", "status": "error", "message": "Edit rejected: anchors do not match" },
+        { "type": "tool_execution_end", "toolName": "read", "status": "success", "arguments": { "path": "src/recover.ts" } },
+        { "type": "tool_execution_end", "toolName": "edit", "status": "success", "arguments": { "path": "src/recover.ts" } },
+        { "type": "scenario_result", "status": "passed" }
+      ]
+    }
+  ]
+}

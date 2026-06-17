@@ -23,6 +23,7 @@ type FakeEditor = {
 	onToggleThinking?: () => void;
 	onExternalEditor?: () => void;
 	onDequeue?: () => void;
+	onQueue?: () => void | Promise<void>;
 	onChange?: (text: string) => void;
 	onSubmit?: (text: string) => void | Promise<void>;
 	setText(text: string): void;
@@ -39,6 +40,7 @@ async function createContext() {
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["ctrl+l"],
+		"app.message.queue": ["alt+enter"],
 	};
 	const setActionKeys = vi.fn();
 	const showModelSelector = vi.fn();
@@ -178,6 +180,25 @@ describe("InputController keybinding setup", () => {
 
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
+	});
+
+	it("registers an explicit queue action separately from immediate submit", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("queue after current response");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.queue", ["alt+enter"]);
+		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
+			streamingBehavior: "followUp",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
 	it("marks streaming follow-up submissions as local", async () => {

@@ -19,7 +19,7 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
-import { checkBashAllowedPrefixes } from "./bash-allowed-prefixes";
+import { checkBashAllowedPrefixes, normalizeReadOnlyBashCommand } from "./bash-allowed-prefixes";
 import { applyBashFixups } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
@@ -36,6 +36,12 @@ export const BASH_DEFAULT_PREVIEW_LINES = 10;
 
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
+const READ_ONLY_BASH_ENV: Record<string, string> = {
+	GREP_OPTIONS: "",
+	GREP_COLOR: "",
+	GREP_COLORS: "",
+	RIPGREP_CONFIG_PATH: "",
+};
 
 export async function saveBashOriginalArtifactForTests(
 	session: ToolSession,
@@ -261,6 +267,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasSearch: this.session.settings.get("search.enabled"),
 			hasFind: this.session.settings.get("find.enabled"),
 			restrictedAllowedPrefixes: this.session.bashAllowedPrefixes,
+			restrictionProfile: this.session.bashRestrictionProfile,
 		});
 	}
 
@@ -381,6 +388,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						artifactPath,
 						artifactId,
 						oneShot: true,
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							latestText = tailBuffer.text();
@@ -510,23 +519,37 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const rawCommand = input.command;
 		const allowedPrefixes = this.session.bashAllowedPrefixes;
+		if (
+			(this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes && allowedPrefixes.length > 0)) &&
+			env &&
+			Object.keys(env).length > 0
+		) {
+			const mode = this.session.bashRestrictionProfile === "read-only" ? "Read-only" : "Restricted role-agent";
+			throw new ToolError(`${mode} bash does not allow per-command env overrides.`);
+		}
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
-			if (env && Object.keys(env).length > 0) {
-				throw new ToolError("Restricted role-agent bash does not allow per-command env overrides.");
-			}
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
-				const allowlist = checkBashAllowedPrefixes(commandToCheck, allowedPrefixes);
+				const allowlist = checkBashAllowedPrefixes(commandToCheck, allowedPrefixes, {
+					profile: this.session.bashRestrictionProfile,
+				});
 				if (!allowlist.allowed) {
 					throw new ToolError(allowlist.reason ?? "Command blocked by restricted role-agent bash allowlist.");
 				}
 			}
 		}
+		if (this.session.bashRestrictionProfile === "read-only") {
+			const normalizedReadOnlyCommand = normalizeReadOnlyBashCommand(command);
+			if (!normalizedReadOnlyCommand) {
+				throw new ToolError("Read-only bash command could not be normalized safely.");
+			}
+			command = normalizedReadOnlyCommand;
+		}
 
 		// Check both the original command and the cwd-normalized command so
 		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
 		// or the dedicated-tool command that follows the directory change.
-		if (this.session.settings.get("bashInterceptor.enabled")) {
+		if (this.session.bashRestrictionProfile !== "read-only" && this.session.settings.get("bashInterceptor.enabled")) {
 			const rules = this.session.settings.getBashInterceptorRules();
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
@@ -545,7 +568,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				getSessionId: this.session.getSessionId,
 			},
 		};
-		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
+		command = await expandInternalUrls(command, {
+			...internalUrlOptions,
+			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
+		});
 		const sessionFile = this.session.getSessionFile?.() ?? null;
 		const expandedEnv = env
 			? Object.fromEntries(
@@ -568,6 +594,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				cwd: this.session.cwd,
 			}),
 			...expandedEnv,
+			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
 
@@ -682,6 +709,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						artifactPath,
 						artifactId,
 						oneShot: true,
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -729,6 +758,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (asyncRequested && !this.#asyncEnabled) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
+		if (this.session.bashRestrictionProfile === "read-only" && pty) {
+			throw new ToolError("Read-only bash does not allow PTY mode.");
+		}
+
 		const prepared = await this.#prepareBashExecution(
 			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
 			ctx,
@@ -810,7 +843,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		// Route through the client terminal when the client advertises the terminal capability.
 		// Skip when pty=true (PTY needs the local terminal UI).
-		const clientBridge = this.session.getClientBridge?.();
+		const clientBridge =
+			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
 			const handle = await clientBridge.createTerminal({
 				command,
@@ -983,7 +1017,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 
-		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
+		const interactiveUi =
+			this.session.bashRestrictionProfile === "read-only"
+				? undefined
+				: canUseInteractiveBashPty(pty, ctx)
+					? ctx?.ui
+					: undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -997,6 +1036,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			: await executeBash(command, {
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
+					oneShot: this.session.bashRestrictionProfile === "read-only",
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
@@ -1004,6 +1044,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
 					onMinimizedSave: originalText => saveBashOriginalArtifactForTests(this.session, originalText),
+					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
 		if (result.cancelled) {
 			if (signal?.aborted) {

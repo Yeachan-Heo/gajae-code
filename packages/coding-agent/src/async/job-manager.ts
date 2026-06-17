@@ -118,6 +118,12 @@ export interface ResumeDescriptor {
 	data: unknown;
 }
 
+function sessionFileFromResumeDescriptorData(data: unknown): string | null {
+	if (typeof data !== "object" || data === null) return null;
+	const sessionFile = (data as { sessionFile?: unknown }).sessionFile;
+	return typeof sessionFile === "string" && sessionFile.trim().length > 0 ? sessionFile : null;
+}
+
 /** A pending resume awaiting a free concurrency slot. */
 interface ResumeQueueEntry {
 	subagentId: string;
@@ -595,11 +601,31 @@ export class AsyncJobManager {
 		record.modelFellBack = model.modelFellBack;
 	}
 
+	#recordFromResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {
+		const descriptor = this.getResumeDescriptor(subagentId, filter);
+		if (!descriptor) return undefined;
+		const sessionFile = sessionFileFromResumeDescriptorData(descriptor.data);
+		const record: SubagentRecord = {
+			subagentId: descriptor.subagentId,
+			ownerId: descriptor.ownerId,
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile,
+			resumable: sessionFile !== null,
+		};
+		this.#subagentRecords.set(record.subagentId, record);
+		return record;
+	}
+
 	getSubagentRecord(subagentId: string, filter?: AsyncJobFilter): SubagentRecord | undefined {
-		const rec = this.#subagentRecords.get(subagentId.trim());
-		if (!rec) return undefined;
-		if (filter?.ownerId && rec.ownerId !== filter.ownerId) return undefined;
-		return rec;
+		const trimmed = subagentId.trim();
+		const rec = this.#subagentRecords.get(trimmed);
+		if (rec) {
+			if (filter?.ownerId && rec.ownerId !== filter.ownerId) return undefined;
+			return rec;
+		}
+		return this.#recordFromResumeDescriptor(trimmed, filter);
 	}
 
 	getSubagentRecords(filter?: AsyncJobFilter): SubagentRecord[] {
@@ -696,8 +722,6 @@ export class AsyncJobManager {
 		if (rec.status === "paused" || rec.status === "queued") return;
 		this.#liveHandles.delete(rec.subagentId);
 		this.#subagentProgress.delete(rec.subagentId);
-		this.#resumeDescriptors.delete(rec.subagentId);
-		this.#subagentRecords.delete(rec.subagentId);
 	}
 
 	#markRecordTerminal(jobId: string, status: "completed" | "failed" | "cancelled"): void {

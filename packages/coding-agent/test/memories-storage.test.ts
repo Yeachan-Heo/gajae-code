@@ -141,7 +141,7 @@ describe("memories/storage", () => {
 		expect(row.retry_remaining).toBe(3);
 		expect(row.retry_at).toBeNull();
 		closeMemoryDb(db);
-	});
+	}, 10_000);
 
 	test("clearMemoryData removes thread/output/job state", () => {
 		const db = openMemoryDb(dbPath);

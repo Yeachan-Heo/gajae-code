@@ -1,3 +1,5 @@
+import { formatProviderCredentialHint } from "@gajae-code/ai/stream";
+
 export const MODEL_ONBOARDING_API_PROVIDER_COMMAND =
 	"/provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model>";
 export const MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND = "/provider add --preset <minimax|minimax-cn|glm>";
@@ -26,14 +28,19 @@ export function formatNoModelOnboardingError(): string {
 }
 
 export function formatNoCredentialOnboardingError(providerId: string): string {
-	return [
+	const lines = [
 		`No credentials found for ${providerId}.`,
 		"",
 		`For MiniMax/GLM presets, configure credentials with ${MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND} (or ${MODEL_ONBOARDING_SETUP_COMMAND} --preset <preset>).`,
 		`For custom API-compatible providers, use ${MODEL_ONBOARDING_API_PROVIDER_COMMAND}.`,
-		`For OAuth/subscription providers, use ${MODEL_ONBOARDING_OAUTH_COMMAND}.`,
+		`For OAuth/subscription providers, use ${MODEL_ONBOARDING_OAUTH_COMMAND} (interactive; not available in headless/print mode).`,
+	];
+	const headlessHint = formatProviderCredentialHint(providerId);
+	if (headlessHint) lines.push(headlessHint);
+	lines.push(
 		"Then run /model to select a configured model or assign it to DEFAULT, EXECUTOR, ARCHITECT, PLANNER, or CRITIC.",
-	].join("\n");
+	);
+	return lines.join("\n");
 }
 
 export function formatNoModelsAvailableFallback(): string {

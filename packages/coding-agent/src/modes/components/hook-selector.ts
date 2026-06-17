@@ -518,7 +518,7 @@ export class HookSelectorComponent extends Container {
 			return;
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
-			this.#customInput?.onSubmit(editor.getText());
+			this.#customInput?.onSubmit(editor.getExpandedText());
 			return;
 		}
 		editor.handleInput(keyData);

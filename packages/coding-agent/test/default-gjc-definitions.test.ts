@@ -336,7 +336,9 @@ Project executor override body.
 		expect(content).toContain("do not edit `.gjc/state` directly without force override");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
-		expect(content).toContain("Do not surprise a Korean session with English questions");
+		expect(content).toContain(
+			"default to English unless `{{ARGUMENTS}}` makes another user/session language obvious",
+		);
 		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
 		expect(content).toContain("translated/localized according to `language.instruction`");

@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { safeStderrWrite } from "@gajae-code/utils";
 import type { Args } from "../cli/args";
+import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
 import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
@@ -77,6 +78,8 @@ export interface TmuxLaunchPlan {
 	branch?: string | null;
 	attachSessionName?: string;
 	project?: string | null;
+	sessionId?: string | null;
+	sessionStateFile?: string | null;
 }
 
 export interface GjcTmuxProfileResult {
@@ -94,12 +97,15 @@ export interface GjcTmuxProfileContext {
 	branch?: string | null;
 	branchSlug?: string | null;
 	project?: string | null;
+	sessionId?: string | null;
+	sessionStateFile?: string | null;
 }
 
 interface CommandResolutionContext {
 	cwd: string;
 	argv: string[];
 	execPath: string;
+	extraEnv?: Record<string, string>;
 }
 
 function parseLaunchPolicy(env: NodeJS.ProcessEnv): LaunchPolicy {
@@ -137,6 +143,11 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function buildEnvAssignments(values: Record<string, string> | undefined): string {
+	const entries = Object.entries(values ?? {});
+	return entries.length === 0 ? "" : ` ${entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")}`;
+}
+
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
 	const env = context.env ?? process.env;
 	const branchSlug = context.branch ? buildGjcTmuxSessionSlug(context.branch) : (context.branchSlug ?? null);
@@ -144,6 +155,8 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 		branch: context.branch ?? null,
 		branchSlug,
 		project: context.project ?? null,
+		sessionId: context.sessionId ?? env[GJC_COORDINATOR_SESSION_ID_ENV] ?? null,
+		sessionStateFile: context.sessionStateFile ?? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
 	});
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
@@ -173,7 +186,7 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
 	const command = resolveCurrentGjcCommand(context);
 	const quoted = [...command, ...rawArgs].map(shellQuote).join(" ");
-	return `exec env ${GJC_TMUX_LAUNCHED_ENV}=1 ${quoted}`;
+	return `exec env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;
 }
 
 function readCurrentBranch(cwd: string): string | null {
@@ -210,6 +223,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const project = context.project ?? cwd;
 	const sessionName = buildGjcTmuxSessionName(env, { branch });
 	const tmuxCommand = resolveGjcTmuxCommand(env);
+	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
+	const sessionStateFile =
+		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
+		path.join(cwd, ".gjc", "runtime", "tmux-sessions", `${buildGjcTmuxSessionSlug(sessionName)}.json`);
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) return undefined;
 	const existingBranchSessionName =
@@ -223,6 +240,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			cwd,
 			argv: context.argv ?? process.argv,
 			execPath: context.execPath ?? process.execPath,
+			extraEnv: {
+				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
+				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+			},
 		},
 		context.rawArgs,
 	);
@@ -234,6 +255,8 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		newSessionArgs: ["new-session", "-d", "-s", sessionName, "-c", cwd, innerCommand],
 		branch,
 		project,
+		sessionId,
+		sessionStateFile,
 		attachSessionName: existingBranchSessionName,
 	};
 }
@@ -276,6 +299,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			spawnSync,
 			branch: plan.branch,
 			project: plan.project,
+			sessionId: plan.sessionId ?? null,
+			sessionStateFile: plan.sessionStateFile ?? null,
 		});
 		if (profile.failures.length > 0) {
 			cleanupCreatedTmuxSession(plan, spawnSync, options);

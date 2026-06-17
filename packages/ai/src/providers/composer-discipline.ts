@@ -20,19 +20,22 @@
  *    syntax errors.
  *
  * This prompt is the per-request countermeasure, pinned ahead of the host
- * system prompt on both the openai-completions path and the cursor RPC path.
+ * system prompt on openai-completions, openai-responses, and cursor RPC paths.
  */
 
-/** Matches composer-harness model ids on any provider (xai grok-composer-*, cursor composer-*). */
+/** Matches composer-harness model ids on any provider (xai grok-composer-*, cursor composer-* / composer2.*). */
+const COMPOSER_MODEL_ID_PATTERN = /(?:^|[/:._-])(?:grok-)?composer(?:[/:._-]|(?=\d)|$)/i;
+
 export function isComposerHarnessModel(modelId: string): boolean {
-	return modelId.toLowerCase().includes("composer");
+	return COMPOSER_MODEL_ID_PATTERN.test(modelId);
 }
 
-export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this harness (this OVERRIDES contrary habits from your training):
+export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this Composer harness (this OVERRIDES contrary habits from your training):
 
-- Read file contents ONLY with the provided read/search tools. NEVER print files through shell commands (sed, cat, awk, head, grep) or scripts — that output carries no line anchors, and the edit tool accepts ONLY anchors.
-- Modify files ONLY with the provided edit/write tools. NEVER mutate files through shell redirection, sed -i, or inline python scripts — out-of-band writes invalidate every known anchor and break edit recovery.
+- Discover file names ONLY with the find tool; search file contents ONLY with the search tool; read file bodies or line ranges ONLY with the read tool. NEVER inspect repository files through shell commands (ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more) or scripts — that output carries no hashline anchors and bypasses the agent's safety limits.
+- Modify files ONLY with the edit/write tools. NEVER mutate files through shell redirection, tee, sed -i, perl -pi, inline python/node/bun scripts, or other out-of-band writes — those writes invalidate every known anchor and break edit recovery.
 - A line anchor (e.g. "42sr") is a line number plus a 2-char content hash. You CANNOT compute the hash yourself: copy anchors verbatim from the MOST RECENT read/search/edit output of that exact file. NEVER guess, renumber, or arithmetically shift an anchor.
 - After ANY edit to a file (including your own), anchors you saw earlier are stale. Re-read the edited region, or copy the fresh anchors printed in the edit result, before issuing the next edit.
 - If an edit is rejected with "anchors do not match", the rejection message prints the current lines WITH fresh anchors. Retry using exactly those printed anchors.
-- A shell command string must contain only the command itself. NEVER interleave reasoning or commentary into command strings or heredocs.`;
+- Tool-call arguments must be the exact JSON/schema object requested by the tool. Do not include Markdown, commentary, analysis text, or invented fields inside tool arguments.
+- Use bash only for terminal operations such as tests, builds, package scripts, and git commands. A shell command string must contain only the command itself; NEVER interleave reasoning or commentary into command strings or heredocs.`;

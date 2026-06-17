@@ -58,6 +58,7 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -485,6 +486,9 @@ function buildParams(
 	const messages: ResponseInput = [...conversationMessages];
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	if (isComposerHarnessModel(model.id)) {
+		systemPrompts.unshift(COMPOSER_EDIT_DISCIPLINE_PROMPT);
+	}
 	let systemInstructions: string | undefined;
 	if (systemPrompts.length > 0) {
 		const needsDeveloperRole =
