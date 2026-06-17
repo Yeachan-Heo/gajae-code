@@ -11,6 +11,9 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function summarizeArgs(args: unknown): string {
 	const input = asRecord(args);
+	if (input.action === "batch" && Array.isArray(input.actions)) {
+		return `batch ${input.actions.length} step${input.actions.length === 1 ? "" : "s"}`;
+	}
 	const action = typeof input.action === "string" ? input.action : "computer";
 	const parts = [action];
 	if (typeof input.x === "number" && typeof input.y === "number") parts.push(`@ ${input.x},${input.y}`);
@@ -29,6 +32,13 @@ export function summarizeComputerDetails(
 	theme: Theme,
 ): string {
 	if (!details) return isError ? "Computer action failed" : "Computer action completed";
+	if (details.action === "batch" && details.steps) {
+		const successCount = details.steps.filter(s => s.status === "success").length;
+		const parts: string[] = [`batch ${successCount}/${details.steps.length}`];
+		if (details.screenshot) parts.push(`screenshot ${details.screenshot.widthPx}x${details.screenshot.heightPx}`);
+		if (details.code) parts.push(theme.fg(isError ? "error" : "muted", details.code));
+		return parts.join(" ");
+	}
 	const parts: string[] = [details.action];
 	if (details.x !== undefined && details.y !== undefined) parts.push(`@ ${details.x},${details.y}`);
 	if (details.toX !== undefined && details.toY !== undefined) parts.push(`→ ${details.toX},${details.toY}`);
