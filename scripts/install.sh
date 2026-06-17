@@ -228,7 +228,21 @@ install_binary() {
     # Download binary
     BINARY_URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
     echo "Downloading ${BINARY}..."
-    curl -fsSL "$BINARY_URL" -o "${INSTALL_DIR}/gjc"
+    if ! curl -fsSL "$BINARY_URL" -o "${INSTALL_DIR}/gjc"; then
+        rm -f "${INSTALL_DIR}/gjc"
+        echo ""
+        echo "No prebuilt GJC binary was found for ${PLATFORM}-${ARCH} in ${LATEST}."
+        if [ "$PLATFORM" = "darwin" ] && [ "$ARCH" = "x64" ]; then
+            echo "Intel macOS native binaries are supported by releases that include the gjc-darwin-x64 asset."
+            echo "This release may predate that asset or the upload may have failed."
+        fi
+        echo "Fallback options:"
+        echo "  - Install via Bun/npm source package: bun install -g gajae-code"
+        echo "  - Re-run this installer with --source to build/use the npm package path"
+        echo "  - Choose a release that publishes ${BINARY}"
+        echo "Expected asset URL: $BINARY_URL"
+        exit 1
+    fi
     chmod +x "${INSTALL_DIR}/gjc"
     echo ""
     echo "✓ Installed gjc to ${INSTALL_DIR}/gjc"

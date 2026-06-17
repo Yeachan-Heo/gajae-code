@@ -78,3 +78,23 @@ describe("release bump set equals publish set", () => {
 		expect([...publishDirs].sort()).toEqual([...bumpableDirs].sort());
 	});
 });
+
+describe("native release binary coverage", () => {
+	test("release workflow builds and publishes Intel macOS binaries", async () => {
+		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
+
+		expect(workflow).toContain("{ os: macos-13, platform: darwin, arch: x64 }");
+		expect(workflow).toContain("target_id: darwin-x64");
+		expect(workflow).toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
+		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}");
+	});
+
+	test("installer explains missing Intel macOS release assets", async () => {
+		const installer = await Bun.file(path.join(repoRoot, "scripts/install.sh")).text();
+
+		expect(installer).toContain("No prebuilt GJC binary was found for ${PLATFORM}-${ARCH} in ${LATEST}.");
+		expect(installer).toContain("Intel macOS native binaries are supported by releases that include the gjc-darwin-x64 asset.");
+		expect(installer).toContain("Re-run this installer with --source");
+		expect(installer).toContain("Expected asset URL: $BINARY_URL");
+	});
+});

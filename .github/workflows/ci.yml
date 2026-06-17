@@ -245,6 +245,7 @@ jobs:
             include:
                - { os: ubuntu-22.04, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
                - { os: macos-14, platform: darwin, arch: arm64 }
+               - { os: macos-13, platform: darwin, arch: x64 }
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
       runs-on: ${{ matrix.os }}
       steps:
@@ -386,6 +387,13 @@ jobs:
                     arch: arm64,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/gjc-darwin-arm64,
+                 }
+               - {
+                    os: macos-13,
+                    platform: darwin,
+                    arch: x64,
+                    target_id: darwin-x64,
+                    binary_path: packages/coding-agent/binaries/gjc-darwin-x64,
                  }
                - {
                     os: windows-latest,
