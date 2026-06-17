@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { type Skill as CapabilitySkill, skillCapability } from "@gajae-code/coding-agent/capability/skill";
 import { getCapability } from "@gajae-code/coding-agent/discovery";
 import {
+	buildSkillPromptMessage,
 	loadSkills,
 	loadSkillsFromDir,
 	parseSkillInvocations,
@@ -47,6 +48,18 @@ describe("parseSkillInvocations", () => {
 		expect(parseSkillInvocations("/skill:alpha first /skill:beta second /not-a-skill", skillsByCommandName)).toEqual([
 			{ commandName: "skill:alpha", args: "first", skill: alpha },
 			{ commandName: "skill:beta", args: "second /not-a-skill", skill: beta },
+		]);
+	});
+
+	it("preserves multi-line and long arguments in invocation payloads", () => {
+		const args = [
+			"to re-architect our problem banks into source-based architecture, and",
+			"make sure gaebal-gajae skill-invocation modal does not truncate skill args,",
+			`${"even though we need few lines to use. ".repeat(20)}END`,
+		].join("\n");
+
+		expect(parseSkillInvocations(`/skill:alpha ${args}`, skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args, skill: alpha },
 		]);
 	});
 
@@ -471,6 +484,26 @@ description: Skill loaded from a tilde-expanded custom directory.
 			expect(skillMap.get("calendar")?.source).toBe("first");
 			expect(collisionWarnings).toHaveLength(1);
 			expect(collisionWarnings[0].message).toContain("name collision");
+		});
+	});
+
+	describe("buildSkillPromptMessage", () => {
+		it("preserves multi-line and long args in the actual prompt payload and details", async () => {
+			const args = [
+				"to re-architect our problem banks into source-based architecture, and",
+				"make sure gaebal-gajae skill-invocation modal does not truncate skill args,",
+				`${"even though we need few lines to use. ".repeat(20)}END`,
+			].join("\n");
+			const skill = {
+				...makeSkill("alpha"),
+				content: "---\nname: alpha\ndescription: Alpha\n---\n\n# Alpha\nDo work.",
+			};
+
+			const built = await buildSkillPromptMessage(skill, args);
+
+			expect(built.details.args).toBe(args);
+			expect(built.message).toContain(`User: ${args}`);
+			expect(built.message).toContain("END");
 		});
 	});
 });
