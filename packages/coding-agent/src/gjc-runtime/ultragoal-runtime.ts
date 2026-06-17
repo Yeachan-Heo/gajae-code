@@ -826,6 +826,7 @@ interface UltragoalChangeSet extends JsonObject {
 	trusted: true;
 }
 
+const COMPUTER_SURFACE_TOKENS = new Set(["computer", "computer-use", "desktop-input", "native-input"]);
 const MANDATORY_COMPUTER_CASE_IDS = [
 	"kill-switch-bypass",
 	"suspended-enforcement",
@@ -882,9 +883,22 @@ function isDocsOnlyStaticComputerChangeSet(changeSet: UltragoalChangeSet | undef
 }
 
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
-	if (!changeSet?.trusted) return false;
+	if (!changeSet || !changeSet.trusted) return false;
 	if (isDocsOnlyStaticComputerChangeSet(changeSet)) return false;
 	return changeSet.paths.some(isComputerChangePath);
+}
+
+function executorQaDeclaresComputerTouching(executorQa: JsonObject): boolean {
+	if (executorQa.computerTouching === true) return true;
+	const surfaces = Array.isArray(executorQa.surfaces) ? executorQa.surfaces : [];
+	if (surfaces.some(value => typeof value === "string" && COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(value))))
+		return true;
+	const surfaceRows = Array.isArray(executorQa.surfaceEvidence) ? executorQa.surfaceEvidence : [];
+	return surfaceRows.some(row => {
+		const object = qualityGateObject(row);
+		const surface = object ? nonEmptyString(object.surface) : null;
+		return surface ? COMPUTER_SURFACE_TOKENS.has(normalizeSurfaceToken(surface)) : false;
+	});
 }
 
 function requiresComputerRedTeamSuite(executorQa: JsonObject, changeSet: UltragoalChangeSet | undefined): boolean {

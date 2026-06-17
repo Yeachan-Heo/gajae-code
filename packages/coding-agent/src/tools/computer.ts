@@ -152,7 +152,6 @@ function createNativeComputerController(): NativeController {
 
 let controllerFactory: ComputerControllerFactory = createNativeComputerController;
 let platformOverrideForTests: NodeJS.Platform | undefined;
-let archOverrideForTests: NodeJS.Architecture | undefined;
 
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ?? createNativeComputerController;
@@ -162,23 +161,12 @@ export function setComputerPlatformForTests(platform: NodeJS.Platform | undefine
 	platformOverrideForTests = platform;
 }
 
-export function setComputerArchForTests(arch: NodeJS.Architecture | undefined): void {
-	archOverrideForTests = arch;
-}
-
 function currentComputerPlatform(): NodeJS.Platform {
 	return platformOverrideForTests ?? process.platform;
 }
 
-function currentComputerArch(): NodeJS.Architecture {
-	return archOverrideForTests ?? process.arch;
-}
-
-export function isComputerSupportedPlatform(
-	platform: NodeJS.Platform = currentComputerPlatform(),
-	arch: NodeJS.Architecture = currentComputerArch(),
-): boolean {
-	return platform === "darwin" && arch === "arm64";
+export function isComputerSupportedPlatform(platform: NodeJS.Platform = currentComputerPlatform()): boolean {
+	return platform === "darwin";
 }
 
 /**
@@ -196,9 +184,8 @@ export function isComputerEnabled(session: Pick<ToolSession, "settings">): boole
 export function isComputerCallable(
 	session: Pick<ToolSession, "settings">,
 	platform: NodeJS.Platform = currentComputerPlatform(),
-	arch: NodeJS.Architecture = currentComputerArch(),
 ): boolean {
-	return isComputerSupportedPlatform(platform, arch) && isComputerEnabled(session);
+	return isComputerSupportedPlatform(platform) && isComputerEnabled(session);
 }
 
 export class ComputerTool implements AgentTool<typeof computerSchema, ComputerToolDetails> {
@@ -206,7 +193,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 	readonly label = "Computer";
 	readonly loadMode = "discoverable";
 	readonly summary =
-		"Control the macOS desktop (Apple Silicon) with screenshot, pointer, keyboard, scroll, and wait actions; available by default on supported hosts and supervisor-gated";
+		"Control the explicitly enabled macOS desktop with screenshot, pointer, keyboard, scroll, and wait actions";
 	readonly parameters = computerSchema;
 	readonly strict = true;
 	#description?: string;
@@ -234,7 +221,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			details.status = "disabled";
 			details.code = COMPUTER_DISABLED_CODE;
 			details.message =
-				"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.alwaysOn=false to disable, or computer.enabled=true to manually enable on a supported host.";
+				"The computer tool is disabled. Enable computer.enabled or computer.alwaysOn on macOS to use it.";
 			return { ...toolResult(details).text(`${COMPUTER_DISABLED_CODE}: ${details.message}`).done(), isError: true };
 		}
 

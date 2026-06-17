@@ -329,10 +329,10 @@ export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[
 				name: "computer",
 				label: "Computer",
 				summary:
-					"macOS desktop (Apple Silicon) screenshot and input control; available by default on supported Apple Silicon hosts, supervisor-gated, and intended for judicious desktop-control tasks.",
+					"Explicitly enabled macOS desktop screenshot and input control; off by default and supervisor-gated.",
 				docsPath: "docs/tools/computer.md",
 				callableBuiltin: false,
-				defaultEnabled: true,
+				defaultEnabled: false,
 			},
 		]
 	: [];

@@ -7,7 +7,6 @@ import {
 	createTools,
 	isComputerCallable,
 	isComputerLoadablePlatform,
-	setComputerArchForTests,
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
 	type ToolSession,
@@ -68,35 +67,25 @@ describe("computer tool gating", () => {
 	afterEach(() => {
 		setComputerControllerFactoryForTests(undefined);
 		setComputerPlatformForTests(undefined);
-		setComputerArchForTests(undefined);
 	});
 
-	it("is callable and discoverable by default on Apple Silicon macOS", async () => {
-		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
+	it("is metadata-only by default and not callable/discoverable", async () => {
 		const session = createSession(Settings.isolated({ "tools.discoveryMode": "all" }));
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
-		expect(names).toContain("computer");
-		const discoverable = tools.filter(t => t.loadMode === "discoverable").map(t => t.name);
-		expect(discoverable).toContain("computer");
-	});
-
-	it("exposes honest static capability catalog metadata for computer", () => {
+		expect(names).not.toContain("computer");
 		const catalogEntry = BUILTIN_CAPABILITY_CATALOG.find(entry => entry.name === "computer");
 		if (isComputerLoadablePlatform()) {
-			expect(catalogEntry).toMatchObject({ callableBuiltin: false, defaultEnabled: true });
-			expect(catalogEntry?.summary ?? "").not.toBe("");
-			expect((catalogEntry?.summary ?? "").toLowerCase()).not.toContain("off by default");
-			expect(catalogEntry?.summary ?? "").not.toContain("Explicitly enabled");
+			expect(catalogEntry).toMatchObject({ callableBuiltin: false, defaultEnabled: false });
 		} else {
 			expect(catalogEntry).toBeUndefined();
 		}
+		const discoverable = tools.filter(t => t.loadMode === "discoverable").map(t => t.name);
+		expect(discoverable).not.toContain("computer");
 	});
 
 	it("is callable with per-session enable or alwaysOn on macOS", async () => {
 		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
 		const enabledNames = (await createTools(createSession(Settings.isolated({ "computer.enabled": true })))).map(
 			t => t.name,
 		);
@@ -107,13 +96,8 @@ describe("computer tool gating", () => {
 		expect(alwaysOnNames).toContain("computer");
 	});
 
-	it("is not callable on unsupported platform/arch even when settings enable it", () => {
-		const enabled = createSession(Settings.isolated({ "computer.enabled": true }));
-		const alwaysOn = createSession(Settings.isolated({ "computer.alwaysOn": true }));
-		expect(isComputerCallable(enabled, "darwin", "x64")).toBe(false);
-		expect(isComputerCallable(alwaysOn, "darwin", "x64")).toBe(false);
-		expect(isComputerCallable(enabled, "linux", "arm64")).toBe(false);
-		expect(isComputerCallable(enabled, "win32", "arm64")).toBe(false);
+	it("is absent on non-macOS even when settings enable it", () => {
+		expect(isComputerCallable(createSession(Settings.isolated({ "computer.enabled": true })), "linux")).toBe(false);
 	});
 
 	it("is loadable on macOS and Linux but not loaded at all on Windows", () => {
@@ -122,19 +106,13 @@ describe("computer tool gating", () => {
 		expect(isComputerLoadablePlatform("win32")).toBe(false);
 	});
 
-	it("is disabled when alwaysOn=false and enabled=false on Apple Silicon macOS (off-switch)", async () => {
-		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
-		const session = createSession(Settings.isolated({ "computer.alwaysOn": false, "computer.enabled": false }));
-		expect(isComputerCallable(session)).toBe(false);
-		const names = (await createTools(session)).map(t => t.name);
-		expect(names).not.toContain("computer");
+	it("returns COMPUTER_DISABLED without constructing native controller when directly invoked while disabled", async () => {
 		let constructed = false;
 		setComputerControllerFactoryForTests(() => {
 			constructed = true;
 			return {};
 		});
-		const tool = new ComputerTool(session);
+		const tool = new ComputerTool(createSession());
 		const result = await tool.execute("call", { action: "screenshot" });
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_DISABLED");
@@ -147,12 +125,10 @@ describe("computer tool dispatch", () => {
 	afterEach(() => {
 		setComputerControllerFactoryForTests(undefined);
 		setComputerPlatformForTests(undefined);
-		setComputerArchForTests(undefined);
 	});
 
 	it("maps snake_case model actions to native controller methods positionally", async () => {
 		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
 		const calls: Array<{ method: string; args: unknown[] }> = [];
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
@@ -185,7 +161,6 @@ describe("computer tool dispatch", () => {
 
 	it("maps native COMPUTER_* errors carried in the message into bounded tool errors", async () => {
 		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
 		setComputerControllerFactoryForTests(() => ({
 			click: () => {
 				// Mirror the real NAPI error: stable code in the message, generic .code.
