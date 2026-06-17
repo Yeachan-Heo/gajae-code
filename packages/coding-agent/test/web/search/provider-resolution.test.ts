@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import type { AuthStorage } from "../../../src/session/auth-storage";
 import {
+	inferNativeProviderFromModel,
 	resolveProviderChain,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
@@ -84,6 +85,57 @@ describe("native web-search provider resolution", () => {
 				{ auth: ["openai-codex", "codex"] },
 			),
 		).resolves.toEqual(["codex", "duckduckgo"]);
+	});
+
+	it("maps xAI active models to native xAI search without generic OpenAI-compatible fallback", async () => {
+		await expect(
+			ids(
+				{
+					provider: "xai",
+					modelId: "grok-4.3",
+					api: "openai-completions",
+					baseUrl: "https://api.x.ai/v1",
+					webSearch: "on",
+				},
+				{ auth: ["xai"] },
+			),
+		).resolves.toEqual(["xai", "duckduckgo"]);
+	});
+
+	it("infers xAI native search for Grok contexts behind proxies and suppresses generic fallback", async () => {
+		const ctx: ActiveSearchModelContext = {
+			provider: "proxy",
+			modelId: "grok-4.3",
+			api: "openai-completions",
+			baseUrl: "https://api.x.ai/v1",
+			webSearch: "on",
+		};
+
+		expect(inferNativeProviderFromModel(ctx)).toBe("xai");
+		await expect(ids(ctx, { auth: ["xai", "proxy"] })).resolves.toEqual(["xai", "duckduckgo"]);
+	});
+
+	it("uses xAI wire model ids for native search inference", async () => {
+		const ctx: ActiveSearchModelContext = {
+			provider: "proxy",
+			modelId: "routed-grok",
+			wireModelId: "x-ai/grok-4-fast",
+			api: "openai-completions",
+			baseUrl: "https://models.example/v1",
+		};
+
+		expect(inferNativeProviderFromModel(ctx)).toBe("xai");
+		await expect(ids(ctx, { auth: ["xai"] })).resolves.toEqual(["xai", "duckduckgo"]);
+	});
+
+	it("honors explicit xAI preference with availability gating before configured fallbacks", async () => {
+		await expect(
+			ids(undefined, { preferred: "xai", fallback: ["anthropic", "xai"], auth: ["xai", "anthropic"] }),
+		).resolves.toEqual(["xai", "anthropic", "duckduckgo"]);
+
+		await expect(
+			ids(undefined, { preferred: "xai", fallback: ["anthropic", "xai"], auth: ["anthropic"] }),
+		).resolves.toEqual(["anthropic", "duckduckgo"]);
 	});
 
 	it("honors forced provider first and dedupes configured fallback plus DuckDuckGo", async () => {

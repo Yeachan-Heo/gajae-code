@@ -172,7 +172,7 @@ describe("red-team provider chain resolution", () => {
 
 	it("skips unavailable keyed fallback providers while keeping available providers and terminal DuckDuckGo", async () => {
 		await expect(
-			chainIds(undefined, { fallback: ["exa", "anthropic", "duckduckgo"], auth: ["anthropic"] }),
+			chainIds(undefined, { fallback: ["kagi", "anthropic", "duckduckgo"], auth: ["anthropic"] }),
 		).resolves.toEqual(["anthropic", "duckduckgo"]);
 	});
 

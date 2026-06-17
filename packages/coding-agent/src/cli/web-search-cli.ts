@@ -6,9 +6,15 @@
 
 import { APP_NAME } from "@gajae-code/utils";
 import chalk from "chalk";
+import { Settings } from "../config/settings";
 import { initTheme, theme } from "../modes/theme/theme";
-import { runSearchQuery, type SearchQueryParams } from "../web/search/index";
-import { SEARCH_PROVIDER_ORDER } from "../web/search/provider";
+import {
+	isConfigurableSearchProviderId,
+	isSearchProviderPreference,
+	runSearchQuery,
+	type SearchQueryParams,
+} from "../web/search/index";
+import { SEARCH_PROVIDER_ORDER, setPreferredSearchProvider, setSearchFallbackProviders } from "../web/search/provider";
 import { renderSearchResult } from "../web/search/render";
 import type { SearchProviderId } from "../web/search/types";
 
@@ -18,11 +24,45 @@ export interface SearchCommandArgs {
 	recency?: "day" | "week" | "month" | "year";
 	limit?: number;
 	expanded: boolean;
+	xaiSearchMode?: SearchQueryParams["xai_search_mode"];
+	allowedDomains?: string[];
+	excludedDomains?: string[];
+	allowedXHandles?: string[];
+	excludedXHandles?: string[];
+	fromDate?: string;
+	toDate?: string;
+	enableImageUnderstanding?: boolean;
+	enableImageSearch?: boolean;
+	enableVideoUnderstanding?: boolean;
+	noInlineCitations?: boolean;
 }
 
 const PROVIDERS: Array<SearchProviderId | "auto"> = ["auto", ...SEARCH_PROVIDER_ORDER];
 
 const RECENCY_OPTIONS: SearchCommandArgs["recency"][] = ["day", "week", "month", "year"];
+const XAI_SEARCH_MODES: Array<NonNullable<SearchCommandArgs["xaiSearchMode"]>> = ["web", "x", "web_and_x"];
+
+function appendCsv(existing: string[] | undefined, raw: string | undefined): string[] | undefined {
+	const values = raw
+		?.split(",")
+		.map(value => value.trim())
+		.filter(Boolean);
+	if (!values?.length) return existing;
+	return [...(existing ?? []), ...values];
+}
+
+function splitFlag(raw: string): { flag: string; inlineValue?: string } {
+	const equals = raw.indexOf("=");
+	if (raw.startsWith("-") && equals > 0) return { flag: raw.slice(0, equals), inlineValue: raw.slice(equals + 1) };
+	return { flag: raw };
+}
+
+function readValue(args: string[], index: number, flag: string, inlineValue: string | undefined): string {
+	if (inlineValue !== undefined) return inlineValue;
+	const value = args[index + 1];
+	if (!value) throw new Error(`${flag} requires a value`);
+	return value;
+}
 
 /**
  * Parse web search subcommand arguments.
@@ -41,17 +81,53 @@ export function parseSearchArgs(args: string[]): SearchCommandArgs | undefined {
 	const positional: string[] = [];
 
 	for (let i = 1; i < args.length; i++) {
-		const arg = args[i];
+		const { flag: arg, inlineValue } = splitFlag(args[i]);
+		const value = () => readValue(args, i, arg, inlineValue);
+		const consumeSeparateValue = () => {
+			if (inlineValue === undefined) i++;
+		};
 		if (arg === "--provider") {
-			result.provider = args[++i] as SearchCommandArgs["provider"];
+			result.provider = value() as SearchCommandArgs["provider"];
+			consumeSeparateValue();
 		} else if (arg === "--recency") {
-			result.recency = args[++i] as SearchCommandArgs["recency"];
+			result.recency = value() as SearchCommandArgs["recency"];
+			consumeSeparateValue();
 		} else if (arg === "--limit" || arg === "-l") {
-			result.limit = Number.parseInt(args[++i], 10);
+			result.limit = Number.parseInt(value(), 10);
+			consumeSeparateValue();
+		} else if (arg === "--xai-mode") {
+			result.xaiSearchMode = value() as SearchCommandArgs["xaiSearchMode"];
+			consumeSeparateValue();
+		} else if (arg === "--allowed-domain" || arg === "--allowed-domains") {
+			result.allowedDomains = appendCsv(result.allowedDomains, value());
+			consumeSeparateValue();
+		} else if (arg === "--excluded-domain" || arg === "--excluded-domains") {
+			result.excludedDomains = appendCsv(result.excludedDomains, value());
+			consumeSeparateValue();
+		} else if (arg === "--allowed-x-handle" || arg === "--allowed-x-handles") {
+			result.allowedXHandles = appendCsv(result.allowedXHandles, value());
+			consumeSeparateValue();
+		} else if (arg === "--excluded-x-handle" || arg === "--excluded-x-handles") {
+			result.excludedXHandles = appendCsv(result.excludedXHandles, value());
+			consumeSeparateValue();
+		} else if (arg === "--from-date") {
+			result.fromDate = value();
+			consumeSeparateValue();
+		} else if (arg === "--to-date") {
+			result.toDate = value();
+			consumeSeparateValue();
+		} else if (arg === "--image-understanding") {
+			result.enableImageUnderstanding = true;
+		} else if (arg === "--image-search") {
+			result.enableImageSearch = true;
+		} else if (arg === "--video-understanding") {
+			result.enableVideoUnderstanding = true;
+		} else if (arg === "--no-inline-citations") {
+			result.noInlineCitations = true;
 		} else if (arg === "--compact") {
 			result.expanded = false;
 		} else if (!arg.startsWith("-")) {
-			positional.push(arg);
+			positional.push(args[i]);
 		}
 	}
 
@@ -80,18 +156,46 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		process.exit(1);
 	}
 
+	if (cmd.xaiSearchMode && !XAI_SEARCH_MODES.includes(cmd.xaiSearchMode)) {
+		process.stderr.write(`${chalk.red(`Error: Invalid xAI mode "${cmd.xaiSearchMode}"`)}\n`);
+		process.stderr.write(`${chalk.dim(`Valid xAI modes: ${XAI_SEARCH_MODES.join(", ")}`)}\n`);
+		process.exit(1);
+	}
+
 	if (cmd.limit !== undefined && Number.isNaN(cmd.limit)) {
 		process.stderr.write(`${chalk.red("Error: --limit must be a number")}\n`);
 		process.exit(1);
 	}
 
 	await initTheme();
+	const settings = await Settings.init();
+	const configuredProvider = settings.get("providers.webSearch");
+	if (typeof configuredProvider === "string" && isSearchProviderPreference(configuredProvider)) {
+		setPreferredSearchProvider(configuredProvider);
+	}
+	const configuredFallback = settings.get("web_search.fallback");
+	if (Array.isArray(configuredFallback)) {
+		setSearchFallbackProviders(
+			configuredFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
+		);
+	}
 
 	const params: SearchQueryParams = {
 		query: cmd.query,
 		provider: cmd.provider,
 		recency: cmd.recency,
 		limit: cmd.limit,
+		xai_search_mode: cmd.xaiSearchMode,
+		allowed_domains: cmd.allowedDomains,
+		excluded_domains: cmd.excludedDomains,
+		allowed_x_handles: cmd.allowedXHandles,
+		excluded_x_handles: cmd.excludedXHandles,
+		from_date: cmd.fromDate,
+		to_date: cmd.toDate,
+		enable_image_understanding: cmd.enableImageUnderstanding,
+		enable_image_search: cmd.enableImageSearch,
+		enable_video_understanding: cmd.enableVideoUnderstanding,
+		no_inline_citations: cmd.noInlineCitations,
 	};
 
 	const result = await runSearchQuery(params);
@@ -121,7 +225,18 @@ ${chalk.bold("Arguments:")}
 
 ${chalk.bold("Options:")}
   --provider <name>   Provider: ${PROVIDERS.join(", ")}
-  --recency <value>   Recency filter (Brave/Perplexity): ${RECENCY_OPTIONS.join(", ")}
+  --recency <value>   Recency filter: ${RECENCY_OPTIONS.join(", ")}
+  --xai-mode <mode>   xAI mode: web, x, web_and_x
+  --allowed-domain(s) d xAI web_search domain allow-list (comma-separated, repeatable)
+  --excluded-domain(s) d xAI web_search domain deny-list (comma-separated, repeatable)
+  --allowed-x-handle(s) h xAI x_search handle allow-list (comma-separated, repeatable)
+  --excluded-x-handle(s) h xAI x_search handle deny-list (comma-separated, repeatable)
+  --from-date <date>  xAI x_search start date (ISO8601)
+  --to-date <date>    xAI x_search end date (ISO8601)
+  --image-understanding Enable xAI image understanding
+  --image-search      Enable xAI web image search
+  --video-understanding Enable xAI X video understanding
+  --no-inline-citations Disable xAI inline citation markdown
   -l, --limit <n>     Max results to return
   --compact           Render condensed output
   -h, --help          Show this help

@@ -16,6 +16,7 @@ export type SearchProviderId =
 	| "perplexity"
 	| "gemini"
 	| "codex"
+	| "xai"
 	| "tavily"
 	| "parallel"
 	| "kagi"
@@ -46,6 +47,7 @@ export const CONFIGURABLE_SEARCH_PROVIDER_IDS = [
 	"perplexity",
 	"gemini",
 	"codex",
+	"xai",
 	"tavily",
 	"parallel",
 	"kagi",
@@ -94,8 +96,16 @@ export interface SearchCitation {
 export interface SearchUsage {
 	inputTokens?: number;
 	outputTokens?: number;
-	/** Anthropic: number of web search requests made */
+	/** Number of web search requests made */
 	searchRequests?: number;
+	/** Number of xAI X Search requests made */
+	xSearchRequests?: number;
+	/** Number of image search requests made */
+	imageSearchRequests?: number;
+	/** Number of image-understanding/view-image requests made */
+	imageUnderstandingRequests?: number;
+	/** Number of video-understanding requests made */
+	videoUnderstandingRequests?: number;
 	/** Perplexity: combined token count */
 	totalTokens?: number;
 }

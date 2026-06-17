@@ -2707,6 +2707,7 @@ export const SETTINGS_SCHEMA = {
 			"anthropic",
 			"gemini",
 			"codex",
+			"xai",
 			"tavily",
 			"kagi",
 			"synthetic",
@@ -2747,6 +2748,11 @@ export const SETTINGS_SCHEMA = {
 					value: "codex",
 					label: "OpenAI",
 					description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
+				},
+				{
+					value: "xai",
+					label: "xAI",
+					description: "xAI Responses web_search/x_search (uses xAI OAuth via /login xai or XAI_API_KEY)",
 				},
 				{
 					value: "gemini",

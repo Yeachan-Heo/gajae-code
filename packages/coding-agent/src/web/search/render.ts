@@ -144,6 +144,13 @@ export function renderSearchResult(
 		if (response.usage.outputTokens !== undefined) usageParts.push(`out ${response.usage.outputTokens}`);
 		if (response.usage.totalTokens !== undefined) usageParts.push(`total ${response.usage.totalTokens}`);
 		if (response.usage.searchRequests !== undefined) usageParts.push(`search ${response.usage.searchRequests}`);
+		if (response.usage.xSearchRequests !== undefined) usageParts.push(`x ${response.usage.xSearchRequests}`);
+		if (response.usage.imageSearchRequests !== undefined)
+			usageParts.push(`image ${response.usage.imageSearchRequests}`);
+		if (response.usage.imageUnderstandingRequests !== undefined)
+			usageParts.push(`view ${response.usage.imageUnderstandingRequests}`);
+		if (response.usage.videoUnderstandingRequests !== undefined)
+			usageParts.push(`video ${response.usage.videoUnderstandingRequests}`);
 		if (usageParts.length > 0)
 			metaLines.push(`${theme.fg("muted", "Usage:")} ${theme.fg("text", usageParts.join(theme.sep.dot))}`);
 	}

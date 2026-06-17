@@ -1,7 +1,7 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, xAI, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
@@ -29,6 +29,20 @@ export const webSearchSchema = z.object({
 	max_tokens: z.number().describe("max output tokens").optional(),
 	temperature: z.number().describe("sampling temperature").optional(),
 	num_search_results: z.number().describe("number of search results").optional(),
+	xai_search_mode: z
+		.enum(["web", "x", "web_and_x"])
+		.describe("xAI only: use web_search, x_search, or both")
+		.optional(),
+	allowed_domains: z.array(z.string()).max(5).describe("xAI web_search only: allowed domains").optional(),
+	excluded_domains: z.array(z.string()).max(5).describe("xAI web_search only: excluded domains").optional(),
+	allowed_x_handles: z.array(z.string()).max(20).describe("xAI x_search only: allowed X handles").optional(),
+	excluded_x_handles: z.array(z.string()).max(20).describe("xAI x_search only: excluded X handles").optional(),
+	from_date: z.string().describe("xAI x_search only: start date in ISO8601 format").optional(),
+	to_date: z.string().describe("xAI x_search only: end date in ISO8601 format").optional(),
+	enable_image_understanding: z.boolean().describe("xAI only: analyze images encountered during search").optional(),
+	enable_image_search: z.boolean().describe("xAI web_search only: search for and embed image results").optional(),
+	enable_video_understanding: z.boolean().describe("xAI x_search only: analyze videos in X posts").optional(),
+	no_inline_citations: z.boolean().describe("xAI only: disable inline citation markdown in the answer").optional(),
 });
 
 export type SearchToolParams = z.infer<typeof webSearchSchema>;
@@ -153,6 +167,17 @@ async function executeSearch(
 				maxOutputTokens: params.max_tokens,
 				numSearchResults: params.num_search_results,
 				temperature: params.temperature,
+				xaiSearchMode: params.xai_search_mode,
+				allowedDomains: params.allowed_domains,
+				excludedDomains: params.excluded_domains,
+				allowedXHandles: params.allowed_x_handles,
+				excludedXHandles: params.excluded_x_handles,
+				fromDate: params.from_date,
+				toDate: params.to_date,
+				enableImageUnderstanding: params.enable_image_understanding,
+				enableImageSearch: params.enable_image_search,
+				enableVideoUnderstanding: params.enable_video_understanding,
+				noInlineCitations: params.no_inline_citations,
 				signal,
 				authStorage,
 				sessionId,
@@ -225,7 +250,7 @@ export async function runSearchQuery(
 /**
  * Web search tool implementation.
  *
- * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
+ * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, OpenAI code backend, xAI, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
  */
 export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
 	readonly name = "web_search";
