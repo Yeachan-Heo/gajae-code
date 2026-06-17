@@ -357,6 +357,59 @@ describe("GoalTool", () => {
 		expect(harness.getState()?.enabled).toBe(true);
 		expect(harness.runtime.buildContinuationPrompt()).toBeTypeOf("string");
 	});
+	it("op=pause rejects a completed goal and leaves its lifecycle intact", async () => {
+		const harness = createRuntimeHarness({
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: createGoal({ objective: "Already done", status: "complete" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		await expect(tool.execute("call-pause", { op: "pause" })).rejects.toThrow(/not active/);
+
+		// the completed goal must not be driven into a paused-mode lifecycle
+		const state = harness.getState();
+		expect(state?.goal.status).toBe("complete");
+		expect(state?.mode).toBe("exiting");
+		expect(state?.reason).toBe("completed");
+		expect(state?.enabled).toBe(false);
+	});
+
+	it("op=pause rejects an already-paused goal", async () => {
+		const harness = createRuntimeHarness({
+			enabled: false,
+			mode: "active",
+			goal: createGoal({ objective: "Already parked", status: "paused" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		await expect(tool.execute("call-pause", { op: "pause" })).rejects.toThrow(/not active/);
+		expect(harness.getState()?.goal.status).toBe("paused");
+	});
+	it("op=pause on a dropped/empty goal is a no-op that returns no goal", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const result = await tool.execute("call-pause", { op: "pause" });
+		expect(result.details?.goal).toBeNull();
+		expect(harness.getState()).toBeUndefined();
+	});
 
 	it("op=drop clears goal state", async () => {
 		const harness = createRuntimeHarness({

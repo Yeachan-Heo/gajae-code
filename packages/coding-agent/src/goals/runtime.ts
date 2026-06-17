@@ -350,12 +350,13 @@ export class GoalRuntime {
 			await this.#flushUsageLocked();
 			const state = this.#getStateClone();
 			if (!state?.goal) return undefined;
+			if (state.goal.status !== "active") {
+				throw new Error(`cannot pause a goal that is not active (current status: ${state.goal.status})`);
+			}
 			state.enabled = false;
 			state.mode = "active";
 			state.reason = undefined;
-			if (state.goal.status === "active") {
-				state.goal.status = "paused";
-			}
+			state.goal.status = "paused";
 			state.goal.updatedAt = this.#now();
 			this.#clearActiveAccounting();
 			await this.#commitState(state, { persist: "goal_paused" });
