@@ -5,6 +5,7 @@
 ### Added
 
 - Added an opt-in `gjc rlm` research mode (v1, interactive): a Jupyter-notebook-style research session over the existing agent loop, backed by the shared persistent Python kernel. It loads a distinct research system prompt, restricts the toolset to a hard-gated allowlist (`python` + `read` + `web_search`, asserted after tool-registry assembly — no `bash`/edit/arbitrary mutation), optionally loads a project-root `DATA.md` (overridable via `--data <path>`), aggregates every executed cell live into `.gjc/rlm/<session>/notebook.ipynb` (single-queue atomic temp-rename writes with post-write validation), and synthesizes `.gjc/rlm/<session>/report.md` on session exit. Autonomous goal-arg runs, `--resume`, managed per-workspace venv provisioning, and the optional `>=N` completion gate are deferred follow-ups.
+- Added first-class xAI search provider support for the `web_search` tool and `gjc q`, including OAuth/API-key auth, web/X/combined search modes, xAI web/X filters, image/video options, citation controls, usage reporting, Settings provider selection, CLI flags, config schema wiring, and edge-case coverage.
 
 ## [0.5.3] - 2026-06-16
 
