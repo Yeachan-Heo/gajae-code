@@ -24,6 +24,19 @@ describe("/copy command", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("copies the latest assistant text", () => {
+		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const { controller, showStatus, showError } = createController({
+			assistantText: "latest **markdown** response",
+		});
+
+		controller.handleCopyCommand();
+
+		expect(copySpy).toHaveBeenCalledWith("latest **markdown** response");
+		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard");
+		expect(showError).not.toHaveBeenCalled();
+	});
+
 	it("falls back to the fresh handoff context when no assistant message exists", () => {
 		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
 		const { controller, showStatus, showError } = createController({
@@ -42,6 +55,19 @@ describe("/copy command", () => {
 		const { controller, showStatus, showError } = createController({
 			hasAssistantMessage: true,
 			handoffText: "<handoff-context>\n## Goal\nContinue\n</handoff-context>",
+		});
+
+		controller.handleCopyCommand();
+
+		expect(copySpy).not.toHaveBeenCalled();
+		expect(showStatus).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith("No agent messages to copy yet.");
+	});
+
+	it("shows an error when no assistant message or handoff context exists", () => {
+		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const { controller, showStatus, showError } = createController({
+			hasAssistantMessage: false,
 		});
 
 		controller.handleCopyCommand();
