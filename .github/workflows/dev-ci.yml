@@ -18,7 +18,6 @@ jobs:
   # exact diff via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref.
   affected-plan:
     name: Affected path validation / plan
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -173,7 +172,7 @@ jobs:
   # changes). The job name must stay exactly "Affected path validation".
   affected:
     name: Affected path validation
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ always() }}
     needs: [affected-plan, affected-native, affected-shards]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -193,7 +192,6 @@ jobs:
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -227,7 +225,7 @@ jobs:
   # Branch protection must keep requiring this stable aggregate status.
   gjc-state-gates:
     name: gjc-state-gates
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ always() }}
     needs: [gjc-state-gates-matrix]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
