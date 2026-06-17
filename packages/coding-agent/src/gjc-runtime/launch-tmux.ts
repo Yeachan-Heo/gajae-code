@@ -208,6 +208,20 @@ function truncateVisible(value: string, maxWidth: number): string {
 	return `${result}…`;
 }
 
+function truncateVisibleTail(value: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
+	if (visibleWidth(value) <= maxWidth) return value;
+	if (maxWidth === 1) return "…";
+
+	let result = "";
+	for (const char of Array.from(value).reverse()) {
+		if (visibleWidth(`…${char}${result}`) > maxWidth) break;
+		result = `${char}${result}`;
+	}
+
+	return `…${result}`;
+}
+
 export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
 	const project = path.basename(path.resolve(cwd)) || "gjc";
 	const trimmedBranch = branch?.trim();
@@ -221,11 +235,11 @@ export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | und
 	const remainingBranchWidth = GJC_TMUX_WINDOW_LABEL_MAX_WIDTH - projectWidth - separatorWidth;
 	if (remainingBranchWidth <= 0) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
-	return `${project}:${truncateVisible(trimmedBranch, remainingBranchWidth)}`;
+	return `${project}:${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
 }
 
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
-	return target ? ["rename-window", "-t", target, title] : ["rename-window", title];
+	return target ? ["rename-window", "-t", target, "--", title] : ["rename-window", "--", title];
 }
 
 function renameTmuxWindow(
