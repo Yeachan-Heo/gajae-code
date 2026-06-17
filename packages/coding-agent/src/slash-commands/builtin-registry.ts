@@ -450,6 +450,23 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "copy",
+		description: "Copy last response as markdown",
+		// Public `/copy` is strict zero-argument, but `allowArgs` lets the
+		// TUI dispatcher route `/copy <arg>` here so it can be rejected locally
+		// instead of falling through as a model prompt.
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			if (command.args.trim().length > 0) {
+				runtime.ctx.showError("Usage: /copy");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.handleCopyCommand(undefined);
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "dump",
 		description: "Copy session transcript to clipboard",
 		acpDescription: "Return full transcript as plain text",
