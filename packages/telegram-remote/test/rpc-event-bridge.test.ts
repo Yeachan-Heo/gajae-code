@@ -67,6 +67,14 @@ async function flush() {
 	}
 }
 
+async function waitForSent(out: ReturnType<typeof outbound>, count: number) {
+	for (let index = 0; index < 25; index += 1) {
+		if (out.sent.length >= count) return;
+		await Promise.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
+	}
+}
+
 describe("RpcEventBridge", () => {
 	test("turn_end delivers the last assistant message escaped in ordered <=4096 chunks", async () => {
 		const store = await storeWith();
@@ -84,6 +92,7 @@ describe("RpcEventBridge", () => {
 		await flush();
 
 		const expected = chunkForDelivery(raw);
+		await waitForSent(out, expected.length);
 		expect(out.sent.map(item => item.reply.text)).toEqual(expected);
 		expect(out.sent.every(item => item.reply.text.length <= 4096)).toBe(true);
 		expect(out.sent.join(" ")).not.toContain("<");
