@@ -4,6 +4,7 @@ import {
 	applyGjcTmuxProfile,
 	buildDefaultTmuxLaunchPlan,
 	buildGjcTmuxProfileCommands,
+	buildGjcTmuxWindowTitle,
 	GJC_TMUX_LAUNCHED_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	launchDefaultTmuxIfNeeded,
@@ -31,6 +32,28 @@ function stderrError(code: string): Error {
 describe("default GJC tmux launch", () => {
 	afterEach(() => {
 		process.stderr.write = originalStderrWrite;
+	});
+
+	it("builds project and branch tmux window titles", () => {
+		expect(buildGjcTmuxWindowTitle("/repo", "feature/demo")).toBe("repo:feature/demo");
+		expect(buildGjcTmuxWindowTitle("/repo", null)).toBe("repo");
+		expect(buildGjcTmuxWindowTitle("/repo", "")).toBe("repo");
+	});
+
+	it("truncates long tmux window titles to 48 visible columns while preserving the project", () => {
+		const title = buildGjcTmuxWindowTitle("/repo", `feature/${"a".repeat(80)}`);
+
+		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
+		expect(title.startsWith("repo:feature/")).toBe(true);
+		expect(title.endsWith("…")).toBe(true);
+	});
+
+	it("truncates wide-character tmux window titles by visible width", () => {
+		const title = buildGjcTmuxWindowTitle("/저장소", `feature/${"界".repeat(80)}`);
+
+		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
+		expect(title.startsWith("저장소:feature/")).toBe(true);
+		expect(title.endsWith("…")).toBe(true);
 	});
 
 	it("does not plan tmux for interactive root launch without --tmux", () => {
@@ -287,6 +310,135 @@ describe("default GJC tmux launch", () => {
 		).toBeUndefined();
 	});
 
+	it("renames the current window for direct interactive launches inside tmux", () => {
+		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"] }),
+			rawArgs: ["hello world"],
+			cwd: "/repo",
+			env: {
+				TMUX: "/tmp/tmux",
+			},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(false);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({
+			command: "tmux",
+			args: ["rename-window", "repo:feature/demo"],
+		});
+	});
+
+	it("does not rename direct launches already inside a GJC-launched tmux wrapper", () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"] }),
+			rawArgs: ["hello world"],
+			cwd: "/repo",
+			env: {
+				TMUX: "/tmp/tmux",
+				[GJC_TMUX_LAUNCHED_ENV]: "1",
+			},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(false);
+		expect(calls).toEqual([]);
+	});
+
+	it("skips direct tmux rename when guard conditions are not met", () => {
+		const cases = [
+			{
+				name: "non-interactive",
+				parsed: args({ print: true }),
+				env: { TMUX: "/tmp/tmux" },
+				tmuxAvailable: true,
+			},
+			{
+				name: "tmux unavailable",
+				parsed: args({ messages: ["hello world"] }),
+				env: { TMUX: "/tmp/tmux" },
+				tmuxAvailable: false,
+			},
+			{
+				name: "direct launch policy",
+				parsed: args({ messages: ["hello world"] }),
+				env: { TMUX: "/tmp/tmux", GJC_LAUNCH_POLICY: "direct" },
+				tmuxAvailable: true,
+			},
+		];
+
+		for (const testCase of cases) {
+			const calls: Array<{ command: string; args: string[] }> = [];
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: testCase.parsed,
+				rawArgs: ["hello world"],
+				cwd: "/repo",
+				env: testCase.env,
+				argv: ["/usr/local/bin/gjc"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: testCase.tmuxAvailable,
+				currentBranch: "feature/demo",
+				spawnSync: (command, spawnArgs) => {
+					calls.push({ command, args: spawnArgs });
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled, testCase.name).toBe(false);
+			expect(calls, testCase.name).toEqual([]);
+		}
+	});
+
+	it("renames managed tmux windows after creating the session", () => {
+		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		const newSessionIndex = calls.findIndex(call => call.args[0] === "new-session");
+		const renameIndex = calls.findIndex(call => call.args[0] === "rename-window");
+		const sessionName = calls[newSessionIndex]?.args[3] ?? "";
+
+		expect(newSessionIndex).toBeGreaterThanOrEqual(0);
+		expect(renameIndex).toBeGreaterThan(newSessionIndex);
+		expect(calls[renameIndex]?.args).toEqual(["rename-window", "-t", `=${sessionName}`, "repo:feature/demo"]);
+	});
 	it("falls through to direct launch when session creation fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({

@@ -27,6 +27,7 @@ export {
 
 export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
+export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 
 type LaunchPolicy = "direct" | "tmux";
 
@@ -189,6 +190,82 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 	return `exec env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;
 }
 
+function visibleWidth(value: string): number {
+	return Bun.stringWidth(value);
+}
+
+function truncateVisible(value: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
+	if (visibleWidth(value) <= maxWidth) return value;
+	if (maxWidth === 1) return "…";
+
+	let result = "";
+	for (const char of value) {
+		if (visibleWidth(`${result}${char}…`) > maxWidth) break;
+		result += char;
+	}
+
+	return `${result}…`;
+}
+
+export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
+	const project = path.basename(path.resolve(cwd)) || "gjc";
+	const trimmedBranch = branch?.trim();
+	if (!trimmedBranch) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+
+	const separatorWidth = visibleWidth(":");
+	const projectWidth = visibleWidth(project);
+	const fullTitle = `${project}:${trimmedBranch}`;
+	if (visibleWidth(fullTitle) <= GJC_TMUX_WINDOW_LABEL_MAX_WIDTH) return fullTitle;
+
+	const remainingBranchWidth = GJC_TMUX_WINDOW_LABEL_MAX_WIDTH - projectWidth - separatorWidth;
+	if (remainingBranchWidth <= 0) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+
+	return `${project}:${truncateVisible(trimmedBranch, remainingBranchWidth)}`;
+}
+
+function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
+	return target ? ["rename-window", "-t", target, title] : ["rename-window", title];
+}
+
+function renameTmuxWindow(
+	tmuxCommand: string,
+	title: string,
+	spawnSync: TmuxSpawnSync,
+	options: TmuxSpawnOptions,
+	target?: string,
+): void {
+	spawnSync(tmuxCommand, buildTmuxRenameWindowArgs(title, target), options);
+}
+
+function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
+	const env = context.env ?? process.env;
+	if (!env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return;
+	if (parseLaunchPolicy(env) === "direct") return;
+
+	const platform = context.platform ?? process.platform;
+	if (platform === "win32") return;
+
+	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
+	if (!isInteractiveRootLaunch(context.parsed, tty)) return;
+
+	const tmuxCommand = resolveGjcTmuxCommand(env);
+	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
+	if (!tmuxAvailable) return;
+
+	const cwd = context.cwd ?? process.cwd();
+	const branch = context.worktreeBranch ?? context.currentBranch ?? readCurrentBranch(cwd);
+	const title = buildGjcTmuxWindowTitle(context.project ?? cwd, branch);
+	const spawnSync = context.spawnSync ?? defaultSpawnSync;
+	renameTmuxWindow(tmuxCommand, title, spawnSync, {
+		cwd,
+		env,
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+}
+
 function readCurrentBranch(cwd: string): string | null {
 	try {
 		const result = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
@@ -274,6 +351,8 @@ function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOpt
 }
 
 export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
+	renameExistingTmuxWindowIfNeeded(context);
+
 	const plan = buildDefaultTmuxLaunchPlan(context);
 	if (!plan) return false;
 	const env = context.env ?? process.env;
@@ -285,12 +364,22 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stdout: "inherit",
 		stderr: "inherit",
 	};
+
 	if (plan.attachSessionName) {
 		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.attachSessionName}`], options);
 		return attached.exitCode === 0;
 	}
+
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
 	if (created.exitCode === 0) {
+		renameTmuxWindow(
+			plan.tmuxCommand,
+			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
+			spawnSync,
+			options,
+			`=${plan.sessionName}`,
+		);
+
 		const profile = applyGjcTmuxProfile({
 			tmuxCommand: plan.tmuxCommand,
 			target: plan.sessionName,
