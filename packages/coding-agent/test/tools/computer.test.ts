@@ -7,9 +7,9 @@ import {
 	createTools,
 	isComputerCallable,
 	isComputerLoadablePlatform,
+	setComputerArchForTests,
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
-	setComputerArchForTests,
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
 import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";

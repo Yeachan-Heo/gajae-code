@@ -2166,7 +2166,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Computer",
-			description: "Manually enable the macOS computer tool for this session on a supported Apple Silicon host. Default off; on supported hosts the tool is already available via computer.alwaysOn.",
+			description:
+				"Manually enable the macOS computer tool for this session on a supported Apple Silicon host. Default off; on supported hosts the tool is already available via computer.alwaysOn.",
 		},
 	},
 
@@ -2176,7 +2177,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Computer Always On",
-			description: "Keep the macOS computer tool available by default on supported Apple Silicon hosts without per-session enablement. Set to false to disable default availability.",
+			description:
+				"Keep the macOS computer tool available by default on supported Apple Silicon hosts without per-session enablement. Set to false to disable default availability.",
 		},
 	},
 
