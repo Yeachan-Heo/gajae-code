@@ -66,6 +66,13 @@ export async function waitForCdp(cdpUrl: string, timeoutMs: number, signal?: Abo
 export function findCdpPortInArgsForTest(args: string[]): number | null {
 	return findCdpPortInArgs(args);
 }
+export function findCdpAddressInArgsForTest(args: readonly string[]): string | null {
+	return findCdpAddressInArgs(args);
+}
+
+export function isSafeCdpAddressForTest(address: string | null): boolean {
+	return isSafeCdpAddress(address);
+}
 
 function findCdpPortInArgs(args: string[]): number | null {
 	for (const arg of args) {
@@ -133,10 +140,26 @@ async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> 
 }
 
 /**
- * If any running instance of `exe` was launched with `--remote-debugging-port`
- * and that endpoint actually answers, return it so attach can reuse it instead
- * of killing and respawning. Idempotent re-attaches are the common case.
+ * Chromium binds remote debugging to loopback by default when no address is
+ * provided. Reuse only loopback CDP listeners; a matching profile launched with
+ * --remote-debugging-address=0.0.0.0, ::, or any LAN/public address is unsafe.
  */
+function findCdpAddressInArgs(args: readonly string[]): string | null {
+	return findArgValue(args, "--remote-debugging-address");
+}
+
+function isSafeCdpAddress(address: string | null): boolean {
+	if (address === null || address.trim() === "") return true;
+	const normalized = address.trim().toLowerCase();
+	return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized === "[::1]";
+}
+
+function unsafeCdpAddressReason(address: string): string {
+	return `Refusing to reuse Chrome profile CDP endpoint because --remote-debugging-address=${JSON.stringify(
+		address,
+	)} is not a loopback-only address. Restart Chrome with --remote-debugging-address=127.0.0.1 or omit the address flag.`;
+}
+
 export async function findReusableCdp(
 	exe: string,
 	signal?: AbortSignal,
@@ -151,6 +174,8 @@ export async function findReusableCdp(
 		}
 		const port = findCdpPortInArgs(args);
 		if (port === null) continue;
+		const address = findCdpAddressInArgs(args);
+		if (!isSafeCdpAddress(address)) continue;
 		if (await probeCdpAt(port, signal)) {
 			return { cdpUrl: `http://127.0.0.1:${port}`, pid: proc.pid };
 		}
@@ -161,6 +186,7 @@ export async function findReusableCdp(
 export interface RunningChromeProfile {
 	pid: number;
 	cdpUrl: string | null;
+	unsafeCdpReason?: string;
 }
 
 export async function findRunningChromeProfile(
@@ -178,8 +204,14 @@ export async function findRunningChromeProfile(
 		}
 		if (!argsMatchChromeProfile(args, profile)) continue;
 		const port = findCdpPortInArgs(args);
-		if (port !== null && (await probeCdpAt(port, signal))) {
-			return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
+		if (port !== null) {
+			const address = findCdpAddressInArgs(args);
+			if (!isSafeCdpAddress(address)) {
+				return { pid: proc.pid, cdpUrl: null, unsafeCdpReason: unsafeCdpAddressReason(address ?? "") };
+			}
+			if (await probeCdpAt(port, signal)) {
+				return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
+			}
 		}
 		return { pid: proc.pid, cdpUrl: null };
 	}

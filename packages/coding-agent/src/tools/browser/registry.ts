@@ -130,17 +130,39 @@ async function hasChromeProfileLock(userDataDir: string): Promise<boolean> {
 	return false;
 }
 
+const CHROME_PROFILE_MANAGED_FLAGS = new Set([
+	"--user-data-dir",
+	"--profile-directory",
+	"--remote-debugging-address",
+	"--remote-debugging-port",
+]);
+
+function filterChromeProfileAppArgs(appArgs: readonly string[] | undefined): string[] {
+	if (!appArgs?.length) return [];
+	const filtered: string[] = [];
+	for (let i = 0; i < appArgs.length; i++) {
+		const arg = appArgs[i]!;
+		const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
+		if (CHROME_PROFILE_MANAGED_FLAGS.has(flagName)) {
+			if (!arg.includes("=") && i < appArgs.length - 1) i++;
+			continue;
+		}
+		filtered.push(arg);
+	}
+	return filtered;
+}
+
 export function buildChromeProfileLaunchArgs(
 	kind: SpawnedChromeProfileKind,
 	appArgs: readonly string[] | undefined,
 	port: number,
 ): string[] {
 	const args = [
-		...(appArgs ?? []),
+		...filterChromeProfileAppArgs(appArgs),
 		`--user-data-dir=${kind.userDataDir}`,
 		`--profile-directory=${kind.profileDirectory}`,
-		"--remote-debugging-address=127.0.0.1",
 		`--remote-debugging-port=${port}`,
+		"--remote-debugging-address=127.0.0.1",
 	];
 	if (kind.background || kind.noFocus) args.push("--no-startup-window");
 	return args;
@@ -184,8 +206,9 @@ export async function openChromeProfileHandle(
 		pid = running.pid;
 	} else if (running) {
 		throw new ToolError(
-			`Chrome profile ${JSON.stringify(kind.profileDirectory)} under ${kind.userDataDir} is already running without an attachable localhost CDP endpoint. ` +
-				"GJC will not kill or relaunch an existing Chrome profile. Close that Chrome profile first, or restart Chrome yourself with --remote-debugging-address=127.0.0.1 and --remote-debugging-port=<port> then use app.cdp_url.",
+			running.unsafeCdpReason ??
+				`Chrome profile ${JSON.stringify(kind.profileDirectory)} under ${kind.userDataDir} is already running without an attachable localhost CDP endpoint. ` +
+					"GJC will not kill or relaunch an existing Chrome profile. Close that Chrome profile first, or restart Chrome yourself with --remote-debugging-address=127.0.0.1 and --remote-debugging-port=<port> then use app.cdp_url.",
 		);
 	} else {
 		if (await hasChromeProfileLock(kind.userDataDir)) {
