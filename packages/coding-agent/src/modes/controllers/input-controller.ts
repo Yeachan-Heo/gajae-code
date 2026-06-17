@@ -483,7 +483,7 @@ export class InputController {
 	 * completes (in submission order). Only consulted while streaming.
 	 */
 	#busyStreamingBehavior(): "steer" | "followUp" {
-		return this.ctx.settings.get("busyPromptMode") === "queue" ? "followUp" : "steer";
+		return this.ctx.settings.get("busyPromptMode") === "steer" ? "steer" : "followUp";
 	}
 
 	/**

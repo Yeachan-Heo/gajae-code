@@ -995,12 +995,12 @@ export const SETTINGS_SCHEMA = {
 	busyPromptMode: {
 		type: "enum",
 		values: ["steer", "queue"] as const,
-		default: "steer",
+		default: "queue",
 		ui: {
 			tab: "interaction",
 			label: "Busy Prompt Mode",
 			description:
-				"What a submitted prompt does while the agent is busy: steer (interrupt the active turn) or queue (run after the active turn completes)",
+				"What a submitted prompt does while the agent is busy: queue normal chat for the next turn, or steer to interrupt the active turn",
 		},
 	},
 

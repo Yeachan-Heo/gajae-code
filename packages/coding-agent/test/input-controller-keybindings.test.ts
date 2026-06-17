@@ -35,7 +35,7 @@ type FakeEditor = {
 	clearCustomKeyHandlers(): void;
 };
 
-async function createContext() {
+async function createContext(options?: { busyPromptMode?: "steer" | "queue" }) {
 	let editorText = "";
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
@@ -90,6 +90,7 @@ async function createContext() {
 		settings: {
 			get(path: string) {
 				if (path === "images.autoResize") return false;
+				if (path === "busyPromptMode") return options?.busyPromptMode;
 				return undefined;
 			},
 		} as unknown as InteractiveModeContext["settings"],
@@ -197,6 +198,42 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
 			streamingBehavior: "followUp",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues streaming Enter submissions by default", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("queue by default while busy");
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("queue by default while busy");
+
+		expect(ctx.locallySubmittedUserSignatures.has("queue by default while busy\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("queue by default while busy", {
+			streamingBehavior: "followUp",
+			images: undefined,
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves explicit steer busy setting for streaming Enter submissions", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "steer" });
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("steer while busy");
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("steer while busy");
+
+		expect(ctx.locallySubmittedUserSignatures.has("steer while busy\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("steer while busy", {
+			streamingBehavior: "steer",
+			images: undefined,
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});

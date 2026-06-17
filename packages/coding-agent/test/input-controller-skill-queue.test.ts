@@ -151,10 +151,11 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("E1: streaming + steer -> enqueueCustomMessageDisplay called and details.__pendingDisplayTag set", async () => {
+	it("E1: streaming + explicit steer setting -> enqueueCustomMessageDisplay called and details.__pendingDisplayTag set", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
 			isStreaming: true,
+			busyPromptMode: "steer",
 		});
 
 		const controller = new InputController(ctx);
@@ -559,6 +560,20 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		// chip appears verbatim. Matches the user-facing "Steer: /skill:..." format.
 		const rendered = pendingMessagesContainer.render(120).join("\n");
 		expect(rendered).toMatch(/Steer: \/skill:test-skill arg1 arg2/);
+	});
+
+	it("E8b: updatePendingMessagesDisplay labels normal follow-up prompts as queued", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		await session.followUp("queue this normal message");
+
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.updatePendingMessagesDisplay();
+
+		const rendered = pendingMessagesContainer.render(120).join("\n");
+		expect(rendered).toMatch(/Queued: queue this normal message/);
+		expect(rendered).not.toMatch(/Follow-up: queue this normal message/);
 	});
 
 	it("E9: restoreQueuedMessagesToEditor recovers the compact slash form into the editor and clears the queue", async () => {

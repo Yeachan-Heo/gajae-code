@@ -35,7 +35,7 @@ describe("buildHotkeysMarkdown", () => {
 		const lines = markdown.split("\n");
 		expect(lines[0]).toBe("**Navigation**");
 		expect(markdown).toContain("| `Ctrl+Shift+P` | Copy whole prompt |");
-		expect(markdown).toContain("| `Enter` | Send / steer immediately |");
+		expect(markdown).toContain("| `Enter` | Send / queue while busy |");
 		expect(markdown).toContain("| `Alt+Enter` | Queue message for next turn |");
 		expect(markdown).toContain("| `Shift+Enter` | New line |");
 		expect(markdown).toContain("| `Ctrl+Shift+L` | Select model (temporary) |");

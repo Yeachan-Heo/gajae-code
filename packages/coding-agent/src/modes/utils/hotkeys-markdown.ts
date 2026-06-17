@@ -21,7 +21,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		"**Editing**",
 		"| Key | Action |",
 		"|-----|--------|",
-		"| `Enter` | Send / steer immediately |",
+		"| `Enter` | Send / queue while busy |",
 		`| \`${appKey(bindings, "app.message.queue")}\` | Queue message for next turn |`,
 		"| `Shift+Enter` | New line |",
 		"| `Ctrl+W` / `Option+Backspace` | Delete word backwards |",

@@ -559,11 +559,11 @@ export class UiHelpers {
 
 		const followUpMessages: Array<{ message: string; label: string }> = [];
 		for (const message of queuedMessages.followUp) {
-			followUpMessages.push({ message, label: "Follow-up" });
+			followUpMessages.push({ message, label: "Queued" });
 		}
 		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
 			if (entry.mode === "followUp") {
-				followUpMessages.push({ message: entry.text, label: "Follow-up" });
+				followUpMessages.push({ message: entry.text, label: "Queued" });
 			}
 		}
 
