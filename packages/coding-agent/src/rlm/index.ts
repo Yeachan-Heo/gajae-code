@@ -12,6 +12,7 @@ import { parseArgs } from "../cli/args";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { type RlmPreset, runRootCommand } from "../main";
+import rlmReportCommandPrompt from "../prompts/system/rlm-report-command.md" with { type: "text" };
 import type { CreateAgentSessionOptions } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import {
@@ -138,8 +139,7 @@ export function createRlmPreset({
 				{
 					name: "report",
 					description: "Synthesize a draft RLM report from the current notebook",
-					content:
-						"Call complete_research with final=false and a concise summary of the current notebook-backed findings. Do not mark the goal complete unless the full research objective is satisfied.",
+					content: rlmReportCommandPrompt,
 					source: "rlm",
 				},
 			];
@@ -265,7 +265,10 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 	if (resumeSessionId) {
 		parsed.continue = true;
 	}
-	const autonomous = parsed.print === true || parsed.mode !== undefined || parsed.messages.length > 0;
+	// Piped stdin (non-TTY) feeds an autonomous research prompt the same way an
+	// argv goal does, so it must get the shouldPause stop seam + completion gate.
+	const pipedStdin = process.stdin.isTTY === false;
+	const autonomous = parsed.print === true || parsed.mode !== undefined || parsed.messages.length > 0 || pipedStdin;
 	if (autonomous && parsed.mode === undefined) {
 		parsed.print = true;
 	}

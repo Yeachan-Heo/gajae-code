@@ -1058,6 +1058,7 @@ export async function runRootCommand(
 				messages: parsedArgs.messages,
 				initialMessage,
 				initialImages,
+				suppressProcessExit: deps.suppressProcessExit,
 			});
 			if ($env.PI_TIMING) {
 				logger.printTimings();

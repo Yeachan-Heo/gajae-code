@@ -23,6 +23,12 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+	/**
+	 * When true, an assistant error/abort does not call process.exit(); print mode
+	 * returns instead so the caller (e.g. RLM autonomous mode) can run its own
+	 * finalization/cleanup before the process exits.
+	 */
+	suppressProcessExit?: boolean;
 }
 
 /**
@@ -84,10 +90,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			) {
 				const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
 				const flushed = process.stderr.write(`${errorLine}\n`);
-				if (flushed) {
-					process.exit(1);
-				} else {
-					process.stderr.once("drain", () => process.exit(1));
+				// When the caller owns finalization (RLM autonomous), return instead of
+				// exiting so its cleanup runs; the caller surfaces a non-zero exit itself.
+				if (!options.suppressProcessExit) {
+					if (flushed) {
+						process.exit(1);
+					} else {
+						process.stderr.once("drain", () => process.exit(1));
+					}
 				}
 			}
 
