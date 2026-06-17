@@ -34,6 +34,8 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
+	#lastBackgroundFoldKeyTime = 0;
+
 	/** Set after a first Esc silently consumes a queued steer. Kept until the
 	 *  queued steer is either cancelled by a second Esc or drained by continuation,
 	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
@@ -208,16 +210,22 @@ export class InputController {
 		}
 
 		for (const key of this.ctx.keybindings.getKeys("app.session.new")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.handleClearCommand());
+			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleClearCommand());
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.tree")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showTreeSelector());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.ctx.showTreeSelector();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.fork")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showUserMessageSelector());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.ctx.showUserMessageSelector();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.resume")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionSelector());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.ctx.showSessionSelector();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.handleFollowUp());
@@ -226,13 +234,22 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.handleCopyCurrentLine());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.handleCopyCurrentLine();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.observe")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionObserver());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.ctx.showSessionObserver();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.jobs.open")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showJobsOverlay());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.ctx.showJobsOverlay();
+			});
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.tool.backgroundFold")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.handleForegroundToolBackgroundFold());
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -695,6 +712,31 @@ export class InputController {
 		}
 
 		process.kill(0, "SIGTSTP");
+	}
+
+	handleForegroundToolBackgroundFold(): boolean {
+		if (!this.ctx.session.hasForegroundBashBackgroundRequestHandler?.()) {
+			this.#lastBackgroundFoldKeyTime = 0;
+			return false;
+		}
+
+		const now = Date.now();
+		if (now - this.#lastBackgroundFoldKeyTime > 750) {
+			this.#lastBackgroundFoldKeyTime = now;
+			this.ctx.showStatus("Press Ctrl+B again to fold supported foreground bash into a background job");
+			return true;
+		}
+		this.#lastBackgroundFoldKeyTime = 0;
+
+		if (!this.ctx.session.requestForegroundBashBackground?.()) {
+			this.ctx.showWarning(
+				"No supported foreground tool can be folded. Use managed async bash/auto-background; raw Ctrl+Z/bg is not supported inside the TUI.",
+			);
+			return true;
+		}
+
+		this.ctx.showStatus("Folding foreground bash into a quiet background job…");
+		return true;
 	}
 
 	handleTextPaste(text: string): boolean | Promise<boolean> {

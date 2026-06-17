@@ -370,6 +370,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
+		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>
+			backgrounded ? { async: { state: "running", jobId, type: "bash" } } : undefined;
+		const completedDetails = (jobId: string): Record<string, unknown> | undefined =>
+			backgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined;
+		const failedDetails = (jobId: string): Record<string, unknown> | undefined =>
+			backgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
@@ -393,7 +399,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							latestText = tailBuffer.text();
-							void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
+							void reportProgress(latestText, runningDetails(jobId));
 						},
 						onRawChunk: chunk => {
 							// Forward the unthrottled sanitized chunk to the async-job
@@ -411,13 +417,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
 					completion.resolve({ kind: "completed", result: finalResult });
-					await reportProgress(finalText, { async: { state: "completed", jobId, type: "bash" } });
+					await reportProgress(finalText, completedDetails(jobId));
 					return finalText;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					completion.resolve({ kind: "failed", error });
-					await reportProgress(message, { async: { state: "failed", jobId, type: "bash" } });
+					await reportProgress(message, failedDetails(jobId));
 					throw error;
 				}
 			},
@@ -448,6 +454,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		job: ManagedBashJobHandle,
 		thresholdMs: number,
 		signal?: AbortSignal,
+		backgroundRequest?: Promise<void>,
 	): Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" }> {
 		if (signal?.aborted) {
 			return { kind: "aborted" };
@@ -457,6 +464,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			job.completion,
 			Bun.sleep(thresholdMs).then(() => ({ kind: "running" as const })),
 		];
+		if (backgroundRequest) {
+			waiters.push(backgroundRequest.then(() => ({ kind: "running" as const })));
+		}
 
 		if (!signal) {
 			return await Promise.race(waiters);
@@ -820,7 +830,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					notices: pendingNotices,
 				});
 			}
-			const waitResult = await this.#waitForManagedBashJob(job, autoBackgroundWaitMs, signal);
+			const backgroundRequest = Promise.withResolvers<void>();
+			const unregisterBackgroundRequest = this.session.registerForegroundBashBackgroundRequestHandler?.(() => {
+				job.setBackgrounded(true);
+				backgroundRequest.resolve();
+			});
+			let waitResult: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
+			try {
+				waitResult = await this.#waitForManagedBashJob(
+					job,
+					autoBackgroundWaitMs,
+					signal,
+					backgroundRequest.promise,
+				);
+			} finally {
+				unregisterBackgroundRequest?.();
+			}
 			if (waitResult.kind === "completed") {
 				autoBgManager.acknowledgeDeliveries([job.jobId]);
 				return waitResult.result;

@@ -946,6 +946,7 @@ export class AgentSession {
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
 	#pendingBashMessages: BashExecutionMessage[] = [];
+	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
 
 	// Python execution state
 	#evalAbortControllers = new Set<AbortController>();
@@ -3433,6 +3434,42 @@ export class AgentSession {
 	 */
 	getToolByName(name: string): AgentTool | undefined {
 		return this.#toolRegistry.get(name);
+	}
+
+	/**
+	 * Register a UI/control-plane request handler for a currently foregrounded
+	 * managed bash execution. This is intentionally narrower than generic
+	 * process/job control: unsupported tool types simply do not register a
+	 * handler, so Ctrl+B-style folding fails closed instead of aborting or
+	 * shell-suspending arbitrary work.
+	 */
+	registerForegroundBashBackgroundRequestHandler(handler: () => void): () => void {
+		this.#foregroundBashBackgroundRequestHandler = handler;
+		return () => {
+			if (this.#foregroundBashBackgroundRequestHandler === handler) {
+				this.#foregroundBashBackgroundRequestHandler = undefined;
+			}
+		};
+	}
+
+	/**
+	 * Returns whether a managed foreground bash call is currently backgroundable.
+	 * UI key handlers use this to avoid consuming normal editor shortcuts when
+	 * no fold target exists.
+	 */
+	hasForegroundBashBackgroundRequestHandler(): boolean {
+		return this.#foregroundBashBackgroundRequestHandler !== undefined;
+	}
+
+	/**
+	 * Ask the active managed foreground bash call to return as a background job.
+	 * Returns false when no supported foreground tool is currently backgroundable.
+	 */
+	requestForegroundBashBackground(): boolean {
+		const handler = this.#foregroundBashBackgroundRequestHandler;
+		if (!handler) return false;
+		handler();
+		return true;
 	}
 
 	/**

@@ -1209,6 +1209,81 @@ function b() {
 			await asyncJobManager.dispose();
 		});
 
+		it("should fold a managed foreground command into a background job when requested", async () => {
+			const deliveries: Array<{ jobId: string; text: string }> = [];
+			const updates: Array<{ text: string; asyncState?: string }> = [];
+			const asyncJobManager = new AsyncJobManager({
+				onJobComplete: async (jobId, text) => {
+					deliveries.push({ jobId, text });
+				},
+			});
+			AsyncJobManager.setInstance(asyncJobManager);
+			let backgroundRequestHandler: (() => void) | undefined;
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"bash.autoBackground.enabled": true,
+							"bash.autoBackground.thresholdMs": 30_000,
+						}),
+						{
+							getSessionId: () => "test-session",
+							registerForegroundBashBackgroundRequestHandler: handler => {
+								backgroundRequestHandler = handler;
+								return () => {
+									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+								};
+							},
+						},
+					),
+				),
+			);
+
+			const resultPromise = autoBackgroundBashTool.execute(
+				"test-call-9-fold-foreground",
+				{
+					command: "printf 'start\\n'; sleep 0.05; printf 'after-fold\\n'; sleep 0.2; printf 'done\\n'",
+				},
+				undefined,
+				partialResult => {
+					updates.push({
+						text: getTextOutput(partialResult),
+						asyncState: partialResult.details?.async?.state,
+					});
+				},
+			);
+
+			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+				await Bun.sleep(10);
+			}
+			expect(backgroundRequestHandler).toBeDefined();
+			backgroundRequestHandler?.();
+
+			const result = await resultPromise;
+			expect(result.details?.async?.state).toBe("running");
+			expect(result.details?.async?.type).toBe("bash");
+			expect(getTextOutput(result)).toContain("Background job");
+			expect(getTextOutput(result)).toContain("start");
+			expect(backgroundRequestHandler).toBeUndefined();
+
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) {
+				throw new Error("expected a folded background job id");
+			}
+			const runningJob = asyncJobManager.getJob(jobId);
+			expect(runningJob?.status).toBe("running");
+			await runningJob?.promise;
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
+			const postFoldProgress = updates.filter(update => update.text.includes("after-fold"));
+			expect(postFoldProgress.length).toBeGreaterThan(0);
+			expect(postFoldProgress.every(update => update.asyncState !== undefined)).toBe(true);
+			expect(deliveries).toHaveLength(1);
+			expect(deliveries[0]?.jobId).toBe(jobId);
+			expect(deliveries[0]?.text).toContain("done");
+			await asyncJobManager.dispose();
+		});
+
 		it("should background instead of timing out when auto-background wait exceeds the effective timeout", async () => {
 			const deliveries: Array<{ jobId: string; text: string }> = [];
 			const asyncJobManager = new AsyncJobManager({

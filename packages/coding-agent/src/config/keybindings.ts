@@ -27,6 +27,7 @@ interface AppKeybindings {
 	"app.model.select": true;
 	"app.model.selectTemporary": true;
 	"app.tools.expand": true;
+	"app.tool.backgroundFold": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.message.queue": true;
@@ -106,6 +107,10 @@ export const KEYBINDINGS = {
 	"app.tools.expand": {
 		defaultKeys: "ctrl+o",
 		description: "Expand tools",
+	},
+	"app.tool.backgroundFold": {
+		defaultKeys: "ctrl+b",
+		description: "Fold/background supported foreground tool",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",

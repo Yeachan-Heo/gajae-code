@@ -2,6 +2,8 @@ Inspects, waits, or cancels async jobs.
 
 Background job results are delivered automatically when complete. Running job output stays quiet by default to avoid flooding the conversation; use `tail` when you explicitly want to show/reopen retained output. Reach for this tool only when you need to inspect or intervene.
 
+In the interactive TUI, supported managed foreground bash can be folded into a background job by pressing `Ctrl+B` twice while it is running. Raw shell `Ctrl+Z`/`bg` is not the supported path inside GJC because it bypasses job ownership and output-routing contracts.
+
 # Operations
 
 ## `list: true`

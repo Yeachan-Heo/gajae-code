@@ -90,7 +90,7 @@ export class CustomEditor extends Editor {
 	onCapsLock?: () => void;
 
 	/** Custom key handlers from extensions and non-built-in app actions. */
-	#customKeyHandlers = new Map<KeyId, () => void>();
+	#customKeyHandlers = new Map<KeyId, () => boolean | undefined>();
 	#actionKeys = new Map<ConfigurableEditorAction, KeyId[]>(
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
@@ -116,7 +116,7 @@ export class CustomEditor extends Editor {
 	/**
 	 * Register a custom key handler. Extensions use this for shortcuts.
 	 */
-	setCustomKeyHandler(key: KeyId, handler: () => void): void {
+	setCustomKeyHandler(key: KeyId, handler: () => boolean | undefined): void {
 		this.#customKeyHandlers.set(key, handler);
 	}
 
@@ -353,8 +353,7 @@ export class CustomEditor extends Editor {
 		// Check custom key handlers (extensions)
 		for (const [keyId, handler] of this.#customKeyHandlers) {
 			if (matchesKey(data, keyId)) {
-				handler();
-				return;
+				if (handler() !== false) return;
 			}
 		}
 
