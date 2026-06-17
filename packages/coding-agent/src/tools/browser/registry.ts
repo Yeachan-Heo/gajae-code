@@ -3,12 +3,28 @@ import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError, ToolError } from "../tool-errors";
-import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByPath, waitForCdp } from "./attach";
+import {
+	findFreeCdpPort,
+	findReusableCdp,
+	findRunningChromeProfile,
+	gracefulKillTreeOnce,
+	killExistingByPath,
+	waitForCdp,
+} from "./attach";
 import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
 
 export type BrowserKind =
 	| { kind: "headless"; headless: boolean }
 	| { kind: "spawned"; path: string }
+	| {
+			kind: "chrome-profile";
+			path: string;
+			userDataDir: string;
+			profileDirectory: string;
+			background: boolean;
+			noFocus: boolean;
+			cdpPort?: number;
+	  }
 	| { kind: "connected"; cdpUrl: string };
 
 export type BrowserKindTag = BrowserKind["kind"];
@@ -23,6 +39,8 @@ export interface BrowserHandle {
 	refCount: number;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
+
+type SpawnedChromeProfileKind = Extract<BrowserKind, { kind: "chrome-profile" }>;
 
 const browsers = new Map<string, BrowserHandle>();
 
@@ -39,6 +57,8 @@ function browserKey(kind: BrowserKind): string {
 			return `headless:${kind.headless ? "1" : "0"}`;
 		case "spawned":
 			return `spawned:${kind.path}`;
+		case "chrome-profile":
+			return `chrome-profile:${kind.path}:${kind.userDataDir}:${kind.profileDirectory}:${kind.cdpPort ?? 0}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
 	}
@@ -94,7 +114,137 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			stealth: { browserSession: null, override: null },
 		};
 	}
+	if (kind.kind === "chrome-profile") {
+		return await openChromeProfileHandle(kind, opts);
+	}
 
+	return await openSpawnedBrowserHandle(kind, opts);
+}
+
+const CHROME_PROFILE_LOCK_FILES = ["SingletonLock", "SingletonSocket", "SingletonCookie"] as const;
+
+async function hasChromeProfileLock(userDataDir: string): Promise<boolean> {
+	for (const lockFile of CHROME_PROFILE_LOCK_FILES) {
+		if (await Bun.file(path.join(userDataDir, lockFile)).exists()) return true;
+	}
+	return false;
+}
+
+export function buildChromeProfileLaunchArgs(
+	kind: SpawnedChromeProfileKind,
+	appArgs: readonly string[] | undefined,
+	port: number,
+): string[] {
+	const args = [
+		...(appArgs ?? []),
+		`--user-data-dir=${kind.userDataDir}`,
+		`--profile-directory=${kind.profileDirectory}`,
+		"--remote-debugging-address=127.0.0.1",
+		`--remote-debugging-port=${port}`,
+	];
+	if (kind.background || kind.noFocus) args.push("--no-startup-window");
+	return args;
+}
+
+export function buildChromeProfileLaunchArgsForTest(
+	kind: SpawnedChromeProfileKind,
+	appArgs: readonly string[] | undefined,
+	port: number,
+): string[] {
+	return buildChromeProfileLaunchArgs(kind, appArgs, port);
+}
+
+export async function openChromeProfileHandle(
+	kind: SpawnedChromeProfileKind,
+	opts: AcquireBrowserOptions,
+): Promise<BrowserHandle> {
+	const exe = kind.path;
+	if (!path.isAbsolute(exe)) {
+		throw new ToolError(
+			`app.path must be absolute for app.browser="chrome" (got ${JSON.stringify(exe)}). Pass the Chrome binary path, not the .app bundle.`,
+		);
+	}
+
+	const running = await findRunningChromeProfile(
+		exe,
+		{ userDataDir: kind.userDataDir, profileDirectory: kind.profileDirectory },
+		opts.signal,
+	);
+	let cdpUrl: string;
+	let pid: number | undefined;
+	let subprocess: Subprocess | undefined;
+	if (running?.cdpUrl) {
+		logger.debug("Reusing existing Chrome profile CDP endpoint", {
+			exe,
+			pid: running.pid,
+			cdpUrl: running.cdpUrl,
+			profileDirectory: kind.profileDirectory,
+		});
+		cdpUrl = running.cdpUrl;
+		pid = running.pid;
+	} else if (running) {
+		throw new ToolError(
+			`Chrome profile ${JSON.stringify(kind.profileDirectory)} under ${kind.userDataDir} is already running without an attachable localhost CDP endpoint. ` +
+				"GJC will not kill or relaunch an existing Chrome profile. Close that Chrome profile first, or restart Chrome yourself with --remote-debugging-address=127.0.0.1 and --remote-debugging-port=<port> then use app.cdp_url.",
+		);
+	} else {
+		if (await hasChromeProfileLock(kind.userDataDir)) {
+			throw new ToolError(
+				`Chrome user data directory ${kind.userDataDir} appears to be locked by an existing Chrome process without an attachable localhost CDP endpoint. ` +
+					"GJC will not kill or relaunch an existing Chrome profile. Close that Chrome profile first, or restart Chrome yourself with --remote-debugging-address=127.0.0.1 and --remote-debugging-port=<port> then use app.cdp_url.",
+			);
+		}
+		const port = kind.cdpPort ?? (await findFreeCdpPort());
+		const launchArgs = buildChromeProfileLaunchArgs(kind, opts.appArgs, port);
+		const child = Bun.spawn([exe, ...launchArgs], {
+			stdout: "ignore",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+		child.unref();
+		subprocess = child;
+		pid = child.pid;
+		cdpUrl = `http://127.0.0.1:${port}`;
+		try {
+			await waitForCdp(cdpUrl, 30_000, opts.signal);
+		} catch (err) {
+			await gracefulKillTreeOnce(child.pid).catch(() => undefined);
+			if (err instanceof ToolAbortError) throw err;
+			if (err instanceof Error && err.name === "AbortError") throw err;
+			throw new ToolError(
+				`Failed to attach to Chrome profile ${JSON.stringify(kind.profileDirectory)} on ${cdpUrl}: ${(err as Error).message}`,
+			);
+		}
+	}
+
+	const puppeteer = await loadPuppeteer();
+	let browser: Browser;
+	try {
+		browser = await puppeteer.connect({
+			browserURL: cdpUrl,
+			defaultViewport: null,
+			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+		});
+	} catch (err) {
+		if (subprocess) await gracefulKillTreeOnce(subprocess.pid);
+		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
+	}
+	return {
+		key: browserKey(kind),
+		kind,
+		browser,
+		cdpUrl,
+		pid,
+		subprocess,
+		refCount: 0,
+		stealth: { browserSession: null, override: null },
+	};
+}
+
+async function openSpawnedBrowserHandle(
+	kind: Extract<BrowserKind, { kind: "spawned" }>,
+	opts: AcquireBrowserOptions,
+): Promise<BrowserHandle> {
 	const exe = kind.path;
 	if (!path.isAbsolute(exe)) {
 		throw new ToolError(
@@ -203,8 +353,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 		try {
 			handle.browser.disconnect();
 		} catch (err) {
-			logger.debug("Failed to disconnect from spawned browser", { error: (err as Error).message });
+			logger.debug(`Failed to disconnect from ${handle.kind.kind} browser`, { error: (err as Error).message });
 		}
 	}
+	if (handle.kind.kind === "chrome-profile" && !handle.subprocess) return;
 	if (opts.kill && handle.pid !== undefined) await gracefulKillTreeOnce(handle.pid);
 }

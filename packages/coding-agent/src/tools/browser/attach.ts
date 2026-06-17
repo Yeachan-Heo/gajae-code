@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import * as path from "node:path";
 import { Process, ProcessStatus } from "@gajae-code/natives";
 import type { Browser, Page } from "puppeteer-core";
 import { ToolError, throwIfAborted } from "../tool-errors";
@@ -62,6 +63,10 @@ export async function waitForCdp(cdpUrl: string, timeoutMs: number, signal?: Abo
  * accepts both `--flag=value` and `--flag value`). Returns null if absent or
  * malformed.
  */
+export function findCdpPortInArgsForTest(args: string[]): number | null {
+	return findCdpPortInArgs(args);
+}
+
 function findCdpPortInArgs(args: string[]): number | null {
 	for (const arg of args) {
 		const m = /^--remote-debugging-port=(\d+)$/.exec(arg);
@@ -77,6 +82,41 @@ function findCdpPortInArgs(args: string[]): number | null {
 		}
 	}
 	return null;
+}
+
+function findArgValue(args: readonly string[], name: string): string | null {
+	const prefix = `${name}=`;
+	for (const arg of args) {
+		if (arg.startsWith(prefix)) return arg.slice(prefix.length);
+	}
+	for (let i = 0; i < args.length - 1; i++) {
+		if (args[i] === name) return args[i + 1] ?? null;
+	}
+	return null;
+}
+
+function normalizeProfilePath(input: string): string {
+	return path.resolve(input);
+}
+
+export function argsMatchChromeProfileForTest(
+	args: readonly string[],
+	profile: { userDataDir: string; profileDirectory: string },
+): boolean {
+	return argsMatchChromeProfile(args, profile);
+}
+
+function argsMatchChromeProfile(
+	args: readonly string[],
+	profile: { userDataDir: string; profileDirectory: string },
+): boolean {
+	const userDataDir = findArgValue(args, "--user-data-dir");
+	const profileDirectory = findArgValue(args, "--profile-directory") ?? "Default";
+	return (
+		userDataDir !== null &&
+		normalizeProfilePath(userDataDir) === normalizeProfilePath(profile.userDataDir) &&
+		profileDirectory === profile.profileDirectory
+	);
 }
 
 /** One-shot probe: returns true when `/json/version` answers 200 within the timeout. */
@@ -114,6 +154,34 @@ export async function findReusableCdp(
 		if (await probeCdpAt(port, signal)) {
 			return { cdpUrl: `http://127.0.0.1:${port}`, pid: proc.pid };
 		}
+	}
+	return null;
+}
+
+export interface RunningChromeProfile {
+	pid: number;
+	cdpUrl: string | null;
+}
+
+export async function findRunningChromeProfile(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	signal?: AbortSignal,
+): Promise<RunningChromeProfile | null> {
+	const candidates = Process.fromPath(exe).filter(p => p.status() === ProcessStatus.Running);
+	for (const proc of candidates) {
+		let args: string[];
+		try {
+			args = proc.args();
+		} catch {
+			continue;
+		}
+		if (!argsMatchChromeProfile(args, profile)) continue;
+		const port = findCdpPortInArgs(args);
+		if (port !== null && (await probeCdpAt(port, signal))) {
+			return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
+		}
+		return { pid: proc.pid, cdpUrl: null };
 	}
 	return null;
 }

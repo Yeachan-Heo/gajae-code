@@ -10,9 +10,10 @@ Drives a real Chromium tab with full puppeteer access via JS execution.
 - Tabs survive across `run` calls and across in-process subagents. Open once, reuse many times.
 - Browser kinds, selected by the `app` field on `open`:
   - default (no `app`) → headless Chromium with stealth patches.
-  - `app.path` → spawn an absolute binary (Electron/CDP). If a running instance already exposes a CDP port, it is reused; otherwise stale instances are killed and a fresh one is spawned. No stealth patches — never tamper with a real desktop app.
-  - `app.cdp_url` → connect to an existing CDP endpoint (e.g. `http://127.0.0.1:9222`).
-  - `app.target` (with `path`/`cdp_url`) — substring matched against url+title to pick a BrowserWindow when the app exposes several.
+  - `app.path` → spawn an absolute binary (Electron/CDP). If a running instance already exposes a CDP port, it is reused; otherwise stale instances are killed and a fresh one is spawned. Do not use this for a daily Chrome profile; use `app.browser: "chrome"` instead.
+  - `app.browser: "chrome"` + `app.path` + `app.user_data_dir` + `app.profile_directory` → use an existing saved Chrome profile. GJC binds CDP to `127.0.0.1` on an ephemeral or `app.cdp_port` port, reuses a matching running profile only when it already exposes attachable localhost CDP, refuses a matching non-CDP running profile instead of killing/relaunching it, and kills only the Chrome process GJC launched. Externally-owned CDP is disconnect-only. `app.background`/`app.no_focus` add Chromium's `--no-startup-window` guard; focus avoidance is best-effort and platform-dependent.
+  - `app.cdp_url` → connect to an existing CDP endpoint (e.g. `http://127.0.0.1:9222`). For logged-in profiles, only expose CDP on localhost and treat the endpoint as full browser-account access.
+  - `app.target` (with `path`/`cdp_url`/Chrome profile) — substring matched against url+title to pick a BrowserWindow when the app exposes several.
 - Inside `run`, `tab` exposes high-level helpers; reach for `page` (raw puppeteer Page) when you need anything they don't cover.
   - `tab.goto(url, { waitUntil? })` — clears the element cache and navigates.
   - `tab.observe({ includeAll?, viewportOnly? })` — accessibility snapshot. Returns `{ url, title, viewport, scroll, elements: [{ id, role, name, value, states, … }] }`. Element ids are stable until the next observe/goto.
@@ -55,6 +56,9 @@ Drives a real Chromium tab with full puppeteer access via JS execution.
 
 # Attach to an existing Electron app
 `{"action":"open","name":"cursor","app":{"path":"/Applications/Cursor.app/Contents/MacOS/Cursor"}}`
+
+# Use an existing Chrome profile in the background
+`{"action":"open","name":"work-browser","app":{"browser":"chrome","path":"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome","user_data_dir":"~/Library/Application Support/Google/Chrome","profile_directory":"Profile 10","background":true,"no_focus":true,"target":"example.com"}}`
 
 # Close one tab (browser stays alive if other tabs reference it)
 `{"action":"close","name":"docs"}`

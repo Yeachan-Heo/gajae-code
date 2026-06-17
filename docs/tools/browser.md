@@ -48,14 +48,14 @@
 | `viewport` | `{ width: number; height: number; scale?: number }` | No | Requested viewport. For headless launch this becomes the initial viewport; for a page it is applied with `page.setViewport()`. `scale` maps to Puppeteer `deviceScaleFactor`. |
 | `wait_until` | `"load" \| "domcontentloaded" \| "networkidle0" \| "networkidle2"` | No | Navigation wait condition. Defaults to `"networkidle2"` where omitted. |
 | `dialogs` | `"accept" \| "dismiss"` | No | Installs a page `dialog` handler that auto-accepts or auto-dismisses dialogs. Omitted means no handler. |
-| `app` | `{ path?: string; cdp_url?: string; args?: string[]; target?: string }` | No | Selects browser kind. No `app` uses the session `browser.headless` setting. `app.path` is resolved against the session cwd and used as the executable path for spawn/attach reuse. `app.cdp_url` connects to an existing CDP endpoint. `args` are appended only when spawning `app.path`. `target` is only used for attached/spawned-app page selection. |
+| `app` | `{ path?: string; cdp_url?: string; browser?: "chrome"; user_data_dir?: string; profile_directory?: string; background?: boolean; no_focus?: boolean; cdp_port?: number; args?: string[]; target?: string }` | No | Selects browser kind. No `app` uses the session `browser.headless` setting. `app.path` alone is resolved against the session cwd and used as the executable path for spawn/attach reuse. `app.cdp_url` connects to an existing CDP endpoint. `app.browser: "chrome"` selects guarded saved-profile mode and requires `path`, `user_data_dir`, and `profile_directory`. `args` are appended only when spawning `app.path` or a Chrome profile. `target` is used for attached/spawned/profile page selection. |
 
 ### `action: "close"`
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `all` | `boolean` | No | Close every known tab. Omitted closes only `name`. |
-| `kill` | `boolean` | No | When a tab release drops a spawned-app browser handle to refcount 0, also terminate its process tree. Has no effect on headless shutdown and only disconnects connected CDP browsers. |
+| `kill` | `boolean` | No | When a tab release drops a spawned-app browser handle to refcount 0, also terminate its process tree. For Chrome profile mode this kills only a profile browser process launched by GJC; externally-owned profile CDP and `app.cdp_url` are disconnect-only. Has no effect on headless shutdown. |
 
 ### `action: "run"`
 
@@ -83,6 +83,7 @@ The tool returns one result per call; no streaming partial output is emitted fro
 1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches on `action`.
 2. `open` resolves browser kind with `resolveBrowserKind()`:
    - `app.cdp_url` → `{ kind: "connected" }` after trimming trailing slashes.
+   - `app.browser: "chrome"` → `{ kind: "chrome-profile" }` after resolving `path` and `user_data_dir` against session cwd and copying `profile_directory`, `background`, `no_focus`, and optional `cdp_port`.
    - `app.path` → `{ kind: "spawned" }` after resolving against session cwd.
    - otherwise → `{ kind: "headless", headless: session.settings.get("browser.headless") }`.
 3. `open` rejects reusing the same tab name across different browser kinds (`sameBrowserKind()`); callers must close first.
@@ -92,6 +93,7 @@ The tool returns one result per call; no streaming partial output is emitted fro
    - headless launches via `launchHeadlessBrowser()`;
    - `connected` waits for `${cdpUrl}/json/version`, then `puppeteer.connect()`;
    - `spawned` first tries `findReusableCdp()`, else kills same-path processes, allocates a free loopback port, spawns the executable with `--remote-debugging-port=<port>`, waits for CDP, then connects.
+   - `chrome-profile` checks same-executable processes for matching `--user-data-dir` and `--profile-directory`; if the matching process already exposes a responding `127.0.0.1` CDP port it reuses and later only disconnects, if it is running without attachable CDP it refuses without killing or relaunching, and if it is not running GJC launches Chrome with `--remote-debugging-address=127.0.0.1`, an ephemeral or configured `--remote-debugging-port`, `--user-data-dir`, `--profile-directory`, and `--no-startup-window` when `background` or `no_focus` is set. Only this GJC-launched process is eligible for `kill` cleanup.
 5. `open` acquires a tab through `acquireTab()` (`packages/coding-agent/src/tools/browser/tab-supervisor.ts`):
    - same-name + same-browser + alive tab is reused unless `dialogs` changed;
    - same-name but different browser handle, dead state, or changed dialog policy forces release and recreation;
@@ -102,6 +104,33 @@ The tool returns one result per call; no streaming partial output is emitted fro
 7. `acquireTab()` spawns a dedicated Bun `Worker` from `tab-worker-entry.ts`; if that fails it falls back to inline execution in the main thread (`spawnInlineWorker()`), preserving behavior but losing protection against synchronous infinite loops.
 8. `WorkerCore.#init()` (`packages/coding-agent/src/tools/browser/tab-worker.ts`) connects back to the browser websocket endpoint. Headless mode opens a new page, applies stealth patches, applies viewport, installs dialog handling if requested, and optionally navigates. Attach mode resolves the requested target page and optionally installs dialog handling.
 9. On success the worker sends `ready` with `{ url, title, viewport, targetId }`; the supervisor stores a `TabSession`, increments browser-handle refcount with `holdBrowser()`, and keeps the tab in a process-global `Map<string, TabSession>`.
+
+### Existing Chrome profile mode
+
+Use this mode when automation needs cookies and login state from a saved Chrome profile without risking the daily Chrome process:
+
+```json
+{
+  "action": "open",
+  "name": "work-browser",
+  "app": {
+    "browser": "chrome",
+    "path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "user_data_dir": "~/Library/Application Support/Google/Chrome",
+    "profile_directory": "Profile 10",
+    "background": true,
+    "no_focus": true,
+    "target": "example.com"
+  }
+}
+```
+
+Security and lifecycle rules:
+
+- CDP is bound to `127.0.0.1`; do not expose logged-in profile CDP ports on a public interface. A CDP client has full browser-account access.
+- A matching already-running profile is reused only when its localhost CDP endpoint responds. A matching profile running normally without CDP is refused with remediation text; GJC does not kill or relaunch it.
+- `background` and `no_focus` add Chromium's `--no-startup-window` launch guard. Focus avoidance is best-effort and platform-dependent; already-visible Chrome windows can still be selected by `target` but are not OS-keyboard/mouse driven.
+- Cleanup disconnects externally-owned CDP endpoints. `kill: true` terminates only the Chrome profile process that GJC launched for this mode.
 10. `run` requires non-empty `code`, looks up the tab with `getTab()`, then delegates to `runInTab()`.
 11. `runInTabWithSnapshot()` rejects dead tabs and concurrent runs (`Tab ... is busy`), captures session cwd plus optional `browser.screenshotDir`, registers an abort hook, sends a `run` message to the worker, and races the result against `timeoutMs + 750` ms. Timeouts force-kill the tab worker and, for headless tabs, close the orphaned page target.
 12. `WorkerCore.#run()` creates a VM context, exposes the raw Puppeteer `page`/`browser` plus a synthetic `tab` API, and executes `(async () => { ...code... })()` via `vm.runInContext()`.
