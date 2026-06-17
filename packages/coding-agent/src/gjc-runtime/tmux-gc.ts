@@ -1,13 +1,14 @@
 /**
- * GC adapter for gjc-tagged tmux sessions. Stale iff `@gjc-project` path is gone
- * OR `@gjc-branch` has no live git worktree. Removal is a spec-authorized
- * destructive `kill-session`, gated by exact-target re-read + revalidation.
+ * GC adapter for gjc-tagged tmux sessions. Destructive cleanup is authorized
+ * only for detached pane-less sessions whose exact runtime marker revalidates a
+ * terminal state. Project/branch/orphan heuristics are discovery signals only.
  */
 
 import * as fs from "node:fs";
 
 import { worktree } from "../utils/git";
 import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapter } from "./gc-runtime";
+import { readTerminalRuntimeStateMarker } from "./session-state-sidecar";
 import { GJC_TMUX_PROFILE_VALUE, GJC_TMUX_SESSION_PREFIX } from "./tmux-common";
 import {
 	type GjcTmuxSessionStatus,
@@ -102,6 +103,19 @@ function staleRecord(session: GjcTmuxSessionStatus, reason: string): GcRecord {
 	};
 }
 
+async function hasTerminalRuntimeMarker(input: {
+	sessionId?: string | null;
+	sessionStateFile?: string | null;
+	project?: string | null;
+}): Promise<boolean> {
+	const marker = await readTerminalRuntimeStateMarker({
+		stateFile: input.sessionStateFile,
+		sessionId: input.sessionId,
+		cwd: input.project,
+	});
+	return marker.terminal;
+}
+
 function isOldEnoughForOrphanGc(session: GjcTmuxSessionStatus): boolean {
 	const createdAt = Date.parse(session.createdAt);
 	return Number.isFinite(createdAt) && Date.now() - createdAt >= ORPHAN_MAX_AGE_MS;
@@ -114,14 +128,19 @@ function isGjcOwnedOrphan(session: GjcTmuxSessionStatus): boolean {
 async function classifyTaggedSession(session: GjcTmuxSessionStatus): Promise<GcRecord> {
 	const { name, project, branch } = session;
 	if (isSessionLive(session)) return liveRecord(session, "tmux_session_attached_or_has_live_panes");
+	if (await hasTerminalRuntimeMarker(session))
+		return staleRecord(session, "terminal_runtime_marker_detached_idle_session");
 	if (!project || !branch) {
-		if (isGjcOwnedOrphan(session) && isOldEnoughForOrphanGc(session)) {
-			return staleRecord(session, "metadata_less_gjc_owned_idle_orphan");
-		}
-		return unclassifiedRecord(name, "missing_project_or_branch_tag", project, branch);
+		const reason =
+			isGjcOwnedOrphan(session) && isOldEnoughForOrphanGc(session)
+				? "metadata_less_gjc_owned_idle_orphan_missing_terminal_marker"
+				: "missing_project_or_branch_tag";
+		return unclassifiedRecord(name, reason, project, branch);
 	}
-	if (!pathExists(project)) return staleRecord(session, "project_missing");
-	if (!(await hasLiveWorktreeForBranch(project, branch))) return staleRecord(session, "branch_no_worktree");
+	if (!pathExists(project))
+		return unclassifiedRecord(name, "project_missing_without_terminal_marker", project, branch);
+	if (!(await hasLiveWorktreeForBranch(project, branch)))
+		return unclassifiedRecord(name, "branch_no_worktree_without_terminal_marker", project, branch);
 	return {
 		store: STORE,
 		id: name,
@@ -152,21 +171,7 @@ async function revalidateRemovable(record: GcRecord, env: NodeJS.ProcessEnv): Pr
 	}
 	if (tags.attached || (tags.panePids?.length ?? 0) > 0) return false;
 	if (tags.profile !== GJC_TMUX_PROFILE_VALUE) return false;
-	if (!tags.project || !tags.branch)
-		return (
-			record.reason === "metadata_less_gjc_owned_idle_orphan" &&
-			isGjcOwnedOrphan({
-				name: record.id,
-				attached: false,
-				windows: 0,
-				panes: 0,
-				panePids: [],
-				bindings: "",
-				createdAt: tags.createdAt ?? "",
-			})
-		);
-	if (!pathExists(tags.project)) return true;
-	return !(await hasLiveWorktreeForBranch(tags.project, tags.branch));
+	return await hasTerminalRuntimeMarker(tags);
 }
 
 export const tmuxSessionsGcAdapter: GcStoreAdapter = {
