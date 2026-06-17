@@ -1349,6 +1349,82 @@ function b() {
 			// If it correctly acknowledged, the delivery is suppressed.
 			expect(manager.hasPendingDeliveries()).toBe(false);
 		});
+
+		it("should show retained output for a running job without waiting", async () => {
+			const manager = new AsyncJobManager({
+				onJobComplete: async () => {},
+			});
+			const session = createTestToolSession(testDir, Settings.isolated({ "bash.autoBackground.enabled": true }), {});
+			AsyncJobManager.setInstance(manager);
+			const jobTool = JobTool.createIf(session)!;
+
+			const jobId = manager.register("bash", "long job", async ({ signal }) => {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "done";
+			});
+			manager.appendOutput(jobId, "line one\n");
+			manager.appendOutput(jobId, "line two\n");
+
+			const result = await jobTool.execute("test-call-tail-1", { tail: [jobId] });
+			const output = getTextOutput(result);
+
+			expect(output).toContain("Still Running");
+			expect(output).toContain("Retained Output");
+			expect(output).toContain("line one");
+			expect(output).toContain("line two");
+			expect(result.details?.output?.[0]).toMatchObject({
+				id: jobId,
+				text: "line one\nline two\n",
+				truncated: false,
+			});
+
+			manager.cancel(jobId);
+			await manager.dispose({ timeoutMs: 100 });
+		});
+
+		it("should scope retained output tails to the calling owner", async () => {
+			const manager = new AsyncJobManager({
+				onJobComplete: async () => {},
+			});
+			const ownerSession = createTestToolSession(
+				testDir,
+				Settings.isolated({ "bash.autoBackground.enabled": true }),
+				{
+					getAgentId: () => "0-Owner",
+				},
+			);
+			const otherSession = createTestToolSession(
+				testDir,
+				Settings.isolated({ "bash.autoBackground.enabled": true }),
+				{
+					getAgentId: () => "0-Other",
+				},
+			);
+			AsyncJobManager.setInstance(manager);
+			const ownerTool = JobTool.createIf(ownerSession)!;
+			const otherTool = JobTool.createIf(otherSession)!;
+
+			const jobId = manager.register(
+				"bash",
+				"private job",
+				async ({ signal }) => {
+					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+					return "done";
+				},
+				{ ownerId: "0-Owner" },
+			);
+			manager.appendOutput(jobId, "owner-only\n");
+
+			const ownerResult = await ownerTool.execute("test-call-tail-owner", { tail: [jobId] });
+			const otherResult = await otherTool.execute("test-call-tail-other", { tail: [jobId] });
+
+			expect(ownerResult.details?.output?.[0]?.text).toBe("owner-only\n");
+			expect(otherResult.details?.output).toBeUndefined();
+			expect(getTextOutput(otherResult)).not.toContain("owner-only");
+
+			manager.cancel(jobId);
+			await manager.dispose({ timeoutMs: 100 });
+		});
 	});
 
 	describe("search tool", () => {
