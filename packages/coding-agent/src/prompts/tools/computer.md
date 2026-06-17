@@ -1,11 +1,11 @@
 # computer
 
-Use `computer` only when the session has explicitly enabled macOS computer-use. It controls the real desktop and is off by default.
+`computer` is available by default on supported Apple Silicon macOS. It controls the real desktop, so use it only when the task genuinely needs real desktop screenshot or input control.
 
 ## Safety contract
 
-- Disabled means disabled: when `computer.enabled` and `computer.alwaysOn` are both false, every action including `screenshot` fails with `COMPUTER_DISABLED` and captures nothing.
-- The tool is macOS-only in v1.
+- Disabled means disabled: when the tool is disabled (`computer.alwaysOn=false` with `computer.enabled` unset/false) or the platform is unsupported, every action including `screenshot` fails with `COMPUTER_DISABLED` and captures nothing.
+- Callable only on Apple Silicon macOS (`arm64` darwin); available by default there, with `computer.alwaysOn=false` as the off-switch and `computer.enabled=true` as the manual enable path.
 - Native execution remains supervisor-gated. If the stop/suspend supervisor is unavailable, stale, suspended, permissioned off, display-stale, or cancelled, the action fails closed with a `COMPUTER_*` code.
 - Respect the user's stop/suspend request immediately. Do not loop desktop actions after a stop/suspend/error.
 

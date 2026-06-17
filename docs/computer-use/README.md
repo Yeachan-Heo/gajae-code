@@ -16,8 +16,9 @@ the committed summary and roadmap.
 
 ## Locked decisions (ADR summary)
 
-- **Target:** the user's real macOS desktop, OS-native control. v1 is macOS-only
-  (Linux/Windows deferred behind the same tool schema).
+- **Target:** the user's real macOS desktop, OS-native control. Callable v1 support
+  is Apple Silicon macOS only (`arm64` darwin); Intel macOS, Linux, and Windows are
+  deferred behind the same tool schema.
 - **Driver:** any model via a generic structured tool-call interface — no
   provider-specific computer-use API.
 - **Action set:** the exact OpenAI computer-use primitives — `screenshot`,
@@ -33,8 +34,9 @@ the committed summary and roadmap.
 - **Permissions:** macOS TCC (Accessibility + Screen Recording) auto-preflighted;
   on a missing grant, open the relevant Settings pane and return a clear
   "grant then retry/relaunch" error.
-- **Gating:** off by default; opt-in config flag (per session) plus a persistent
-  always-on option.
+- **Gating:** available by default on supported Apple Silicon macOS via
+  `computer.alwaysOn` (default `true`); set `computer.alwaysOn=false` to disable
+  default availability. `computer.enabled` remains a per-session manual enable path.
 - **Safety:** no per-action approval (autonomous), **but** a daemon-enforced
   global kill-switch outside model control (global hotkey OR TUI stop key) that
   aborts queued actions, releases held keys/buttons, suspends further input, and

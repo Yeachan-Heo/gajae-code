@@ -1670,6 +1670,48 @@
 			},
 			"additionalProperties": false
 		},
+		"computer": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Manually enable the macOS computer tool for this session on a supported Apple Silicon host. Default off; on supported hosts the tool is already available via computer.alwaysOn.",
+					"default": false
+				},
+				"alwaysOn": {
+					"type": "boolean",
+					"description": "Keep the macOS computer tool available by default on supported Apple Silicon hosts without per-session enablement. Set to false to disable default availability.",
+					"default": true
+				},
+				"autoScreenshot": {
+					"type": "boolean",
+					"description": "Automatically request bounded screenshots after computer actions when supported.",
+					"default": false
+				},
+				"screenshotMaxBytes": {
+					"type": "number",
+					"description": "Maximum screenshot payload size for computer action results.",
+					"default": 5000000
+				},
+				"killSwitchHotkey": {
+					"type": "string",
+					"description": "Native stop/suspend hotkey shown to users for computer-use sessions.",
+					"default": "Control+Option+Command+Escape"
+				},
+				"auditLog": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Persist audit records for enabled computer-use actions.",
+							"default": true
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"async": {
 			"type": "object",
 			"properties": {

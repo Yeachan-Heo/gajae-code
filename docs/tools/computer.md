@@ -1,6 +1,6 @@
 # computer
 
-> Explicitly enabled macOS desktop screenshot and input control through the native supervisor-gated computer controller.
+> macOS desktop screenshot and input control through the native supervisor-gated computer controller; available by default on supported Apple Silicon macOS.
 
 ## Source
 
@@ -11,12 +11,14 @@
 
 ## Availability
 
-`computer` is first-class in the product catalog and documentation, but it is not a callable tool by default.
+`computer` is first-class in the product catalog and documentation. On supported Apple Silicon macOS it is callable by default; on unsupported platforms it is listed but not callable.
 
 Callable activation requires all of:
 
-1. macOS (`process.platform === "darwin"`), and
-2. `computer.enabled` or `computer.alwaysOn` set to `true`.
+1. Apple Silicon macOS (`process.platform === "darwin"` and `process.arch === "arm64"`), and
+2. `computer.alwaysOn` (default `true`) or `computer.enabled` set to `true`.
+
+On supported Apple Silicon macOS the tool is available by default because `computer.alwaysOn` defaults to `true`. Set `computer.alwaysOn=false` to disable default availability; `computer.enabled=true` remains a manual per-session enable path on supported hosts.
 
 When disabled, every action including `screenshot` returns `COMPUTER_DISABLED`. Disabled catalog/listing paths do not construct `ComputerController`, start hotkeys, probe Screen Recording, probe Accessibility, capture screenshots, or expose the callable schema to `search_tool_bm25`.
 
