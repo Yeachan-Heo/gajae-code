@@ -71628,7 +71628,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
+			"contextWindow": 1000000,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",

@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Corrected the bundled `zai/glm-5.2` context window from 200K to its true 1M (1,000,000-token) lossless window. GLM-5.2 was added in #579 by copying GLM-5.1's 200K entry, and that stale value survived every `generate-models` run because provider-scoped models bypass the models.dev refresh in `applyGlobalModelsDevFallback`. Added a regen-safe pin in `applyGeneratedModelPolicy` (mirroring the Bedrock-Opus-4.6 precedent) so the 1M value persists, and updated the bundled catalog entry. The wrong 200K tripped auto-compaction / context-cap thresholds ~5x early for GLM-5.2 sessions.
 
 ## [0.5.4] - 2026-06-17
 

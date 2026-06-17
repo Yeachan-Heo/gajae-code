@@ -397,6 +397,13 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (parsedModel.family === "openai") {
 		applyOpenAICatalogPolicy(model, parsedModel);
 	}
+	// GLM-5.2 (Zhipu/ZAI): ships a 1M lossless context window, but the bundled
+	// catalog copied GLM-5.1's 200K and that stale value survives generate-models
+	// (provider-scoped models bypass the models.dev refresh in applyGlobalModelsDevFallback).
+	// Pin to the true 1M so context-cap / auto-compaction thresholds aren't tripped ~5x early.
+	if (model.provider === "zai" && model.id === "glm-5.2") {
+		model.contextWindow = 1_000_000;
+	}
 }
 
 function scrubGeneratedModelName(name: string): string {

@@ -22,7 +22,7 @@ describe("preset catalog model entries", () => {
 		expect(model.name).toBe("GLM-5.2");
 		expect(model.reasoning).toBe(true);
 		expect(model.input).toContain("text");
-		expect(model.contextWindow).toBe(200_000);
+		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(131_072);
 		expect(model.thinking).toEqual({ mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
 	});
