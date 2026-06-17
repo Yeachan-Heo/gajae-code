@@ -19,7 +19,7 @@ jobs:
   affected-plan:
     name: Affected path validation / plan
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
       relevant: ${{ steps.relevance.outputs.relevant }}
@@ -54,7 +54,7 @@ jobs:
     name: Affected path validation / native-build
     needs: [affected-plan]
     if: ${{ needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_native == 'true' }}
-    runs-on: [self-hosted, Linux, X64, gajae-code-heavy]
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       CI_DEV_CHANGED_PATHS: ${{ needs.affected-plan.outputs.changed_paths }}
@@ -112,7 +112,7 @@ jobs:
     name: Affected path validation / ${{ matrix.key }}
     needs: [affected-plan, affected-native]
     if: ${{ always() && needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -169,7 +169,7 @@ jobs:
     name: Affected path validation
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: [affected-plan, affected-native, affected-shards]
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
       - name: Aggregate affected path validation shards
@@ -188,7 +188,7 @@ jobs:
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -223,7 +223,7 @@ jobs:
     name: gjc-state-gates
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: [gjc-state-gates-matrix]
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-3990x-2]
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
       - name: Aggregate GJC state gate shards
