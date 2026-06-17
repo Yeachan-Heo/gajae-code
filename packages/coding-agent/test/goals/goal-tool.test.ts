@@ -311,6 +311,52 @@ describe("GoalTool", () => {
 		expect(result.details?.goal?.status).toBe("active");
 		expect(harness.getState()?.enabled).toBe(true);
 	});
+	it("op=pause parks an active goal and stops the continuation loop", async () => {
+		const harness = createRuntimeHarness({
+			enabled: true,
+			mode: "active",
+			goal: createGoal({ objective: "Sing the vocal layers" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		// continuation is armed while the goal is active
+		expect(harness.runtime.buildContinuationPrompt()).toBeTypeOf("string");
+
+		const result = await tool.execute("call-pause", { op: "pause" });
+		expect(result.details?.op).toBe("pause");
+		expect(result.details?.goal?.status).toBe("paused");
+		expect(harness.getState()?.enabled).toBe(false);
+
+		// pausing suppresses the autonomous continuation steer
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+	});
+
+	it("a paused goal resumes back to active and re-arms continuation", async () => {
+		const harness = createRuntimeHarness({
+			enabled: true,
+			mode: "active",
+			goal: createGoal({ objective: "Sing the vocal layers" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		await tool.execute("call-pause", { op: "pause" });
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+
+		const resumed = await tool.execute("call-resume", { op: "resume" });
+		expect(resumed.details?.goal?.status).toBe("active");
+		expect(harness.getState()?.enabled).toBe(true);
+		expect(harness.runtime.buildContinuationPrompt()).toBeTypeOf("string");
+	});
 
 	it("op=drop clears goal state", async () => {
 		const harness = createRuntimeHarness({
@@ -331,11 +377,11 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("exposes the schema describe enumerating all five ops", () => {
+	it("exposes the schema describe enumerating all six ops", () => {
 		const tool = new GoalTool(createToolSession({}));
 		const opDescribe = (tool.parameters as any).shape.op.description;
 		expect(opDescribe).toBe(
-			"op: get | create | complete | drop | resume — drop clears the active goal without exiting goal mode (tool stays callable for the next create)",
+			"op: get | create | complete | drop | resume | pause — drop clears the active goal without exiting goal mode (tool stays callable for the next create); pause parks an active goal whose remaining work is blocked on human input so the autonomous continuation loop stops until resume",
 		);
 	});
 
@@ -347,6 +393,7 @@ describe("GoalTool", () => {
 		expect(opDescribe).toContain("complete");
 		expect(opDescribe).toContain("drop");
 		expect(opDescribe).toContain("resume");
+		expect(opDescribe).toContain("pause");
 		expect(opDescribe).toContain("without exiting goal mode");
 	});
 });

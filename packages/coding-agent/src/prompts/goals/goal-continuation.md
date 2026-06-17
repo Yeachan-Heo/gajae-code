@@ -23,3 +23,4 @@ Before calling `goal({op:"complete"})`, you MUST perform a completion audit agai
 Call `goal({op:"complete"})` only when every deliverable has direct, current-state evidence proving it is satisfied. The completion call is a load-bearing claim; it ends the autonomous loop and surfaces a "done" report to the user.
 
 If the work is not done, just keep working. Do not narrate that you are continuing — execute.
+If every outstanding deliverable is genuinely blocked on human input or action only the user can perform (e.g. the user must sing, record, edit, approve, or carry out a manual/physical step) and no further autonomous progress is possible, call `goal({op:"pause"})` to park the goal. This stops the autonomous continuation loop without falsely completing or dropping the objective. State the human blocker, pause, then stop. When the user later unblocks the work, they (or you) resume via `goal({op:"resume"})`.

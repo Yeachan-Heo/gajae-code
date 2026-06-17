@@ -19,7 +19,7 @@ export interface GoalModeState {
 	goal: Goal;
 }
 export interface GoalToolDetails {
-	op: "create" | "get" | "complete" | "resume" | "drop";
+	op: "create" | "get" | "complete" | "resume" | "drop" | "pause";
 	goal?: Goal | null;
 }
 

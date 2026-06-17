@@ -17,9 +17,9 @@ import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = z.object({
 	op: z
-		.enum(["create", "get", "complete", "resume", "drop"])
+		.enum(["create", "get", "complete", "resume", "drop", "pause"])
 		.describe(
-			"op: get | create | complete | drop | resume — drop clears the active goal without exiting goal mode (tool stays callable for the next create)",
+			"op: get | create | complete | drop | resume | pause — drop clears the active goal without exiting goal mode (tool stays callable for the next create); pause parks an active goal whose remaining work is blocked on human input so the autonomous continuation loop stops until resume",
 		),
 	objective: z.string().describe("goal objective").optional(),
 });
@@ -86,6 +86,10 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 		const resumed = await runtime.resumeGoal();
 		return buildGoalToolResponse(resumed.goal);
 	}
+	if (params.op === "pause") {
+		const paused = await runtime.pauseGoal();
+		return buildGoalToolResponse(paused?.goal ?? null);
+	}
 	if (params.op === "drop") {
 		const dropped = await runtime.dropGoal();
 		return buildGoalToolResponse(dropped ?? null);
@@ -135,6 +139,8 @@ function describeOp(op: string | undefined): string {
 			return "check";
 		case "resume":
 			return "resume";
+		case "pause":
+			return "pause";
 		case "drop":
 			return "drop";
 		default:

@@ -12,6 +12,7 @@ Usage:
 Use the `goal` tool to inspect or complete the active goal:
 - `goal({op:"get"})` returns the current goal and usage state.
 - `goal({op:"complete"})` is only for verified completion.
+- `goal({op:"pause"})` parks the goal when every outstanding deliverable is blocked on human input only the user can perform; it stops the autonomous continuation loop and is resumed with `goal({op:"resume"})`.
 
 You MUST keep the full objective intact across turns. Do not redefine success around a smaller, easier, or already-completed subset.
 

@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Exposed the existing goal-pause capability through the `goal` tool as `goal({op:"pause"})`. The runtime `pauseGoal()` method and `paused` status already existed and were reachable via the `/goal pause` slash command and the goal menu, but the agent-facing `goal` tool only enumerated `create | get | complete | resume | drop` — so an agent could not park a goal whose remaining work was blocked on human input. It was forced to either `drop` (clearing the goal) or leave the goal `active`, which re-fired the hidden autonomous-continuation steer every turn with no exit condition. `pause` reuses the existing `paused` status and continuation gate (`buildContinuationPrompt` already returns `undefined` when `enabled=false`), parks the goal without dropping it, persists as `goal_paused`, and is resumable via the existing `resume` op. The active-goal and continuation prompts now instruct the agent to pause when every remaining deliverable is genuinely human-blocked.
 
 ## [0.5.3] - 2026-06-16
 
