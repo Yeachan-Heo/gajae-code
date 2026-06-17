@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs";
 
-import { worktree } from "../utils/git";
+import { GitCommandError, worktree } from "../utils/git";
 import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapter } from "./gc-runtime";
 import { readTerminalRuntimeStateMarker } from "./session-state-sidecar";
 import { GJC_TMUX_PROFILE_VALUE, GJC_TMUX_SESSION_PREFIX } from "./tmux-common";
@@ -61,10 +61,18 @@ function branchMatches(candidate: string | undefined, branch: string): boolean {
 	]);
 	return branchNames.has(candidate);
 }
+function isNotGitRepositoryError(error: unknown): boolean {
+	return error instanceof GitCommandError && /not a git repository/i.test(error.message);
+}
 
 async function hasLiveWorktreeForBranch(project: string, branch: string): Promise<boolean> {
-	const entries = await worktree.list(project);
-	return entries.some(entry => branchMatches(entry.branch, branch));
+	try {
+		const entries = await worktree.list(project);
+		return entries.some(entry => branchMatches(entry.branch, branch));
+	} catch (error) {
+		if (isNotGitRepositoryError(error)) return false;
+		throw error;
+	}
 }
 
 function isSessionLive(session: Pick<GjcTmuxSessionStatus, "attached" | "panePids">): boolean {

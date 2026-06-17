@@ -175,7 +175,7 @@ describe("tmux GC safety", () => {
 
 	it("keeps stale project or branch metadata non-removable without a terminal marker", async () => {
 		const missingProject = "/tmp/gjc-missing-project";
-		const liveProject = process.cwd();
+		const nonRepoProject = "/tmp";
 		const calls: string[][] = [];
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
@@ -191,7 +191,7 @@ describe("tmux GC safety", () => {
 						sessionLine({
 							name: "gajae_code_no_worktree",
 							branch: "definitely-missing-gjc-branch",
-							project: liveProject,
+							project: nonRepoProject,
 						}),
 					].join("\n"),
 				);
