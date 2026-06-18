@@ -1506,7 +1506,16 @@ export class ModelRegistry {
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		const current = this.#modelsConfigFile.loadOrDefault();
+		const loaded = this.#modelsConfigFile.tryLoad();
+		if (loaded.status === "error") {
+			throw new Error(
+				`Cannot create custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before saving a new preset.`,
+			);
+		}
+		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
+		if (mergeModelProfiles(current.profiles).has(normalizedName)) {
+			throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
+		}
 		const next: ModelsConfig = {
 			...current,
 			profiles: {

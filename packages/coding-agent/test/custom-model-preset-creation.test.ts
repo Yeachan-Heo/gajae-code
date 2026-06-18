@@ -87,6 +87,91 @@ describe("custom model preset creation", () => {
 		expect(laterRegistry.getModelProfile("my-fast")?.displayName).toBe("My Fast");
 	});
 
+	it("rejects creating a preset when existing models config is invalid and preserves it", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const original = [
+			"providers:",
+			"  my-oai:",
+			"    baseUrl: https://proxy.example.com/v1",
+			"    apiKeyEnv: MY_OAI_KEY",
+			"profiles:",
+			"  existing:",
+			"    required_providers: [my-oai]",
+			"    model_mapping:",
+			"      default: my-oai/original",
+			"unexpected_top_level: must-stay",
+			"",
+		].join("\n");
+		await Bun.write(modelsPath, original);
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await expect(
+			registry.saveCustomModelProfile("my-fast", {
+				display_name: "My Fast",
+				required_providers: ["my-oai"],
+				model_mapping: { default: "my-oai/gpt-custom:low" },
+			}),
+		).rejects.toThrow("Cannot create custom model profile because");
+
+		expect(await Bun.file(modelsPath).text()).toBe(original);
+	});
+
+	it("rejects duplicate custom preset ids without overwriting existing profiles or providers", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"providers:",
+				"  my-oai:",
+				"    baseUrl: https://proxy.example.com/v1",
+				"    apiKeyEnv: MY_OAI_KEY",
+				"profiles:",
+				"  my-fast:",
+				"    display_name: Original Fast",
+				"    required_providers: [my-oai]",
+				"    model_mapping:",
+				"      default: my-oai/original",
+				"",
+			].join("\n"),
+		);
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await expect(
+			registry.saveCustomModelProfile("my-fast", {
+				display_name: "Replacement Fast",
+				required_providers: ["other-provider"],
+				model_mapping: { default: "other-provider/replacement" },
+			}),
+		).rejects.toThrow("Custom model profile already exists: my-fast");
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { apiKeyEnv?: string }>;
+			profiles: Record<
+				string,
+				{ display_name?: string; required_providers: string[]; model_mapping: Record<string, string> }
+			>;
+		};
+		expect(parsed.providers["my-oai"]?.apiKeyEnv).toBe("MY_OAI_KEY");
+		expect(parsed.providers["other-provider"]).toBeUndefined();
+		expect(parsed.profiles["my-fast"]?.display_name).toBe("Original Fast");
+		expect(parsed.profiles["my-fast"]?.required_providers).toEqual(["my-oai"]);
+		expect(parsed.profiles["my-fast"]?.model_mapping.default).toBe("my-oai/original");
+	});
+
+	it("rejects custom preset ids that shadow built-in presets", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await expect(
+			registry.saveCustomModelProfile("codex-medium", {
+				display_name: "Shadow Codex",
+				required_providers: ["my-oai"],
+				model_mapping: { default: "my-oai/gpt-custom:low" },
+			}),
+		).rejects.toThrow("Custom model profile already exists: codex-medium");
+		await expect(Bun.file(modelsPath).exists()).resolves.toBe(false);
+	});
+
 	it("rejects invalid persisted profile selectors with clear messages", async () => {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 
