@@ -24,15 +24,15 @@
   "artifacts": {
     "viewport": {
       "file": "viewport.txt",
-      "sha256": "d7c2d3820bd42e49a4cfa152e3dc8a3d61e3f75f74f13b450384e1c8dabece32"
+      "sha256": "479295f08a5b215df4ce2295408db5f5c154f171e5b91dc1af6becb99cbf2ba5"
     },
     "scrollback": {
       "file": "scrollback.txt",
-      "sha256": "4b1772926f9e6e251e68c7257b3320d7d0909cdacea95a797e163ec0165a6fde"
+      "sha256": "a1772ae48ba458ea2acdb0a201ddd2b6e450e1c203b04c7dd325fc21fe024a3d"
     },
     "writelog": {
       "file": "writelog.bin",
-      "sha256": "42663eab43ab284c5953ab04832748b669525ab5d1f95622fff7bbd525314f40"
+      "sha256": "37ebbe53ebec5249449678b4c1286036d0da007f74217a41d42b13eb28f170d3"
     }
   }
 }

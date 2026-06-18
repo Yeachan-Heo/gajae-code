@@ -2,7 +2,7 @@
  │ Deterministic quote with link (https://example.test/golden).                     
                                                                                     
  - list alpha                                                                       
- - list beta with CJK 表示 and 한글 jamo 한                                         
+ - list beta with CJK 表示 and 한글 jamo 한                                         
                                                                                     
  +--------+------------+                                                            
  | Glyph  | Value      |                                                            
