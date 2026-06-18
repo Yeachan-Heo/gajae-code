@@ -53,7 +53,11 @@ function requestPath(cwd: string): string {
 }
 
 function ultragoalGoalsPath(cwd: string): string {
-	return path.join(cwd, ".gjc", "ultragoal", "goals.json");
+	// Mirror getUltragoalPaths: honor GJC_ULTRAGOAL_DIR so the goal-mode handoff
+	// resolves the same per-session slot the runtime uses.
+	const override = process.env.GJC_ULTRAGOAL_DIR?.trim();
+	const dir = override ? path.resolve(cwd, override) : path.join(cwd, ".gjc", "ultragoal");
+	return path.join(dir, "goals.json");
 }
 
 function isCreateGoalsArg(value: string): boolean {

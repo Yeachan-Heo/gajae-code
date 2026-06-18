@@ -13,6 +13,7 @@ import {
 	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
+	getUltragoalPaths,
 	getUltragoalStatus,
 	readUltragoalLedger,
 	readUltragoalPlan,
@@ -3045,5 +3046,42 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 			const ledger = await Bun.file(path.join(root, ".gjc", "ultragoal", "ledger.jsonl")).text();
 			expect(ledger).toContain("reconcile_failed");
 		});
+	});
+});
+
+describe("getUltragoalPaths GJC_ULTRAGOAL_DIR override", () => {
+	let saved: string | undefined;
+	beforeEach(() => {
+		saved = process.env.GJC_ULTRAGOAL_DIR;
+		delete process.env.GJC_ULTRAGOAL_DIR;
+	});
+	afterEach(() => {
+		if (saved === undefined) delete process.env.GJC_ULTRAGOAL_DIR;
+		else process.env.GJC_ULTRAGOAL_DIR = saved;
+	});
+
+	it("defaults to <cwd>/.gjc/ultragoal when unset", () => {
+		const paths = getUltragoalPaths("/work/repo");
+		expect(paths.dir).toBe(path.join("/work/repo", ".gjc", "ultragoal"));
+		expect(paths.goalsPath).toBe(path.join("/work/repo", ".gjc", "ultragoal", "goals.json"));
+	});
+
+	it("uses an absolute GJC_ULTRAGOAL_DIR as-is, ignoring cwd", () => {
+		process.env.GJC_ULTRAGOAL_DIR = "/slots/session-a";
+		const paths = getUltragoalPaths("/work/repo");
+		expect(paths.dir).toBe("/slots/session-a");
+		expect(paths.ledgerPath).toBe(path.join("/slots/session-a", "ledger.jsonl"));
+	});
+
+	it("resolves a relative GJC_ULTRAGOAL_DIR against cwd", () => {
+		process.env.GJC_ULTRAGOAL_DIR = "slots/a";
+		const paths = getUltragoalPaths("/work/repo");
+		expect(paths.dir).toBe(path.join("/work/repo", "slots/a"));
+	});
+
+	it("trims and ignores a whitespace-only override", () => {
+		process.env.GJC_ULTRAGOAL_DIR = "   ";
+		const paths = getUltragoalPaths("/work/repo");
+		expect(paths.dir).toBe(path.join("/work/repo", ".gjc", "ultragoal"));
 	});
 });

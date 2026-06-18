@@ -28,6 +28,10 @@
 - Interactive sessions no longer orphan the `browser` tool's headless/spawned Chrome (and the Python eval kernel) to PID 1 when killed by a signal. The interactive entry now registers a bounded, idempotent `postmortem` cleanup (`session-subprocess-teardown`) that runs `AgentSession.disposeChildSubprocesses()` on `SIGINT`/`SIGTERM`/`SIGHUP`, force-releasing the session's browser tabs (`kill:true`) and disposing its Python/JS kernels — the teardown the graceful `/quit` (`dispose()`) path already performs but that an external `kill`/terminal-close used to bypass. Headless `disposeBrowserHandle` now also SIGTERM/SIGKILLs the captured Chrome process tree as a fallback when forced, so a wedged renderer can't survive a bounded CDP `close()`; graceful release behavior is unchanged. The teardown is time-boxed (5s) so a stuck subprocess can't hang process exit (#698).
 - Added first-class xAI search provider support for the `web_search` tool and `gjc q`, including OAuth/API-key auth, web/X/combined search modes, xAI web/X filters, image/video options, citation controls, usage reporting, Settings provider selection, CLI flags, config schema wiring, and edge-case coverage.
 
+### Added
+
+- Added a `GJC_ULTRAGOAL_DIR` env var that overrides the durable ultragoal slot location (`brief.md`/`goals.json`/`ledger.jsonl`), mirroring `GJC_TEAM_STATE_ROOT` for team state. The slot is otherwise hardcoded to `<cwd>/.gjc/ultragoal`, so multiple GJC sessions that share one checkout (e.g. the same repo opened in several terminals) clobber a single `goals.json` and interleave one `ledger.jsonl`. Setting `GJC_ULTRAGOAL_DIR` to a per-session path keeps each session's ultragoal isolated while leaving `cwd` unchanged. An absolute value is used as-is; a relative value resolves against `cwd`; unset preserves the historical default. Both `getUltragoalPaths` and the goal-mode handoff path resolution honor it.
+
 ## [0.5.3] - 2026-06-16
 
 ### Added

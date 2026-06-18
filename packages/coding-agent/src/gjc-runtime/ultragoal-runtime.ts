@@ -163,7 +163,14 @@ export function hashStructuredValue(value: unknown): string {
 }
 
 export function getUltragoalPaths(cwd: string): UltragoalPaths {
-	const dir = path.join(cwd, ".gjc", "ultragoal");
+	// GJC_ULTRAGOAL_DIR overrides the durable ultragoal slot location, mirroring
+	// GJC_TEAM_STATE_ROOT for team state. It lets several sessions that share one
+	// cwd (e.g. a single repo checkout opened in multiple terminals) keep isolated
+	// ultragoal slots instead of clobbering one .gjc/ultragoal. An absolute value
+	// is used as-is; a relative value resolves against cwd. Unset preserves the
+	// historical default (cwd/.gjc/ultragoal).
+	const override = process.env.GJC_ULTRAGOAL_DIR?.trim();
+	const dir = override ? path.resolve(cwd, override) : path.join(cwd, ".gjc", "ultragoal");
 	return {
 		dir,
 		briefPath: path.join(dir, "brief.md"),
