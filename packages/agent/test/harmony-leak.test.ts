@@ -72,6 +72,11 @@ describe("detectHarmonyLeak — negative cases (must NOT trip)", () => {
 		expect(detectHarmonyLeak("...to=funct", "tool_arg")).toBeUndefined();
 		expect(detectHarmonyLeak("...to=functions.", "tool_arg")).toBeUndefined();
 	});
+
+	it("does not treat normal Korean prose as a leak", () => {
+		const korean = "추천 내용 이해 자체가 어렵네요. 다음 질문은 제약 조건을 명확히 합니다.";
+		expect(detectHarmonyLeak(korean, "assistant_text")).toBeUndefined();
+	});
 });
 
 describe("detectHarmonyLeak — positive corpus cases (must trip with co-signal)", () => {
@@ -90,6 +95,22 @@ describe("detectHarmonyLeak — positive corpus cases (must trip with co-signal)
 			}
 		});
 	}
+
+	it("trips script-mismatch recovery for Korean-adjacent leaked tool markers", () => {
+		const cases = [
+			{ name: "Hangul syllables", text: "추천 내용" },
+			{ name: "Hangul Jamo", text: "한글" },
+			{ name: "Hangul compatibility Jamo", text: "ㅎㅏㄴㄱㅡㄹ" },
+		];
+
+		for (const { name, text } of cases) {
+			const leaked = `${"ascii context ".repeat(20)}${text} to=functions.edit code \\ubcdef`;
+			const detection = detectHarmonyLeak(leaked, "assistant_text");
+
+			expect(detection, name).toBeDefined();
+			expect(signalListLabel(detection!.signals), name).toContain("S");
+		}
+	});
 });
 
 describe("recoverHarmonyToolCall — edit DSL", () => {

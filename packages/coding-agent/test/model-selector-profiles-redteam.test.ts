@@ -162,7 +162,9 @@ describe("model selector profile red-team", () => {
 		const builtinProfile: ModelProfileDefinition = { ...userProfile, source: "builtin" };
 		const overriddenProfile: ModelProfileDefinition = { ...userProfile, source: "user" };
 		const selector = createSelector(() => {}, { profiles: [builtinProfile, overriddenProfile] });
-		const rendered = await renderSelector(selector);
+		await renderSelector(selector);
+		selector.handleInput("\x1b[C");
+		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered.match(/profile-a/g) ?? []).toHaveLength(1);
 	});
@@ -173,6 +175,7 @@ describe("model selector profile red-team", () => {
 			selections.push(selection);
 		});
 		await renderSelector(applySelector);
+		applySelector.handleInput("\x1b[C");
 		applySelector.handleInput("\x1b[B");
 		applySelector.handleInput("\n");
 		applySelector.handleInput("\n");
@@ -182,6 +185,7 @@ describe("model selector profile red-team", () => {
 			selections.push(selection);
 		});
 		await renderSelector(defaultSelector);
+		defaultSelector.handleInput("\x1b[C");
 		defaultSelector.handleInput("\x1b[B");
 		defaultSelector.handleInput("\n");
 		defaultSelector.handleInput("\n");
@@ -232,7 +236,9 @@ describe("model selector profile red-team", () => {
 			name: "Team/Profile: β 🚀 [default] {x}|$",
 		};
 		const selector = createSelector(() => {}, { profiles: [weirdProfile] });
-		const rendered = await renderSelector(selector);
+		await renderSelector(selector);
+		selector.handleInput("\x1b[C");
+		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("Model presets");
 		expect(rendered).toContain("Team/Profile: β 🚀 [default] {x}|$");
@@ -242,7 +248,6 @@ describe("model selector profile red-team", () => {
 	test("Browse all models switches to flat model rows", async () => {
 		const selector = createSelector(() => {});
 		await renderSelector(selector);
-		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));

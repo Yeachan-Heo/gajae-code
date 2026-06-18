@@ -250,7 +250,7 @@ const scenarios: ScriptedScenario[] = [
 		width: 22,
 		initialLines: [
 			...makeRows(34),
-			"wide-ascii-" + "x".repeat(80),
+			`wide-ascii-${"x".repeat(80)}`,
 			"bang-fit-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
 			"wide-cjk-界".repeat(20),
 		],

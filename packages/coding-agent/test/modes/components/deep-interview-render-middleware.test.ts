@@ -85,4 +85,26 @@ describe("deep-interview assistant render middleware", () => {
 		expect(rendered).toContain("Status");
 		expect(rendered).toContain("Clarity threshold met! Ready to proceed.");
 	});
+
+	it("preserves Korean text literally in deep-interview progress rendering", () => {
+		const raw = [
+			"Round 5 complete.",
+			"",
+			"| Dimension | Score | Weight | Weighted | Gap |",
+			"|-----------|-------|--------|----------|-----|",
+			"| Goal | 0.90 | 0.40 | 0.36 | Clear |",
+			"| Constraints | 0.70 | 0.30 | 0.21 | 추천 내용 이해 자체가 어렵네요 |",
+			"| Success Criteria | 0.60 | 0.30 | 0.18 | 한국어 출력이 리터럴로 보여야 합니다 |",
+			"| **Ambiguity** | | | **25%** | |",
+			"",
+			"**Next target:** 리뷰 UI / Success Criteria — 한국어 기준을 명확히 합니다",
+		].join("\n");
+
+		const rendered = renderAssistantText(raw);
+
+		expect(rendered).toContain("추천 내용 이해 자체가 어렵네요");
+		expect(rendered).toContain("한국어 출력이 리터럴로 보여야 합니다");
+		expect(rendered).toContain("한국어 기준을 명확히 합니다");
+		expect(rendered).not.toContain("\\u");
+	});
 });

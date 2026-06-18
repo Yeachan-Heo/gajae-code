@@ -3,7 +3,7 @@
  [2m│ [22m[3m[3mDeterministic quote with ]8;;https://example.test/golden[34m[4mlink[24m[39m]8;;]8;;https://example.test/golden[2m (https://example.test/golden)[22m]8;;.[23m[3m[23m             [0m]8;;
                                                                             [0m
  [36m- [39mlist alpha                                                               [0m
- [36m- [39mlist beta with CJK 表示 and 한글 jamo 한                                 [0m
+ [36m- [39mlist beta with CJK 表示 and 한글 jamo 한                                 [0m
                                                                             [0m
  +--------+------------+                                                    [0m
  | [1mGlyph [22m | [1mValue     [22m |                                                    [0m
@@ -23,7 +23,7 @@
  [2m│ [22m[2;3m(https://example.test/golden)[22m]8;;.[23m[3m[23m                         [0m]8;;
                                                           [0m
  [36m- [39mlist alpha                                             [0m
- [36m- [39mlist beta with CJK 表示 and 한글 jamo 한               [0m
+ [36m- [39mlist beta with CJK 表示 and 한글 jamo 한               [0m
                                                           [0m
  +--------+------------+                                  [0m
  | [1mGlyph [22m | [1mValue     [22m |                                  [0m
@@ -42,7 +42,7 @@
  [2m│ [22m[3m[3mDeterministic quote with ]8;;https://example.test/golden[34m[4mlink[24m[39m]8;;]8;;https://example.test/golden[2m (https://example.test/golden)[22m]8;;.[23m[3m[23m                     [0m]8;;
                                                                                     [0m
  [36m- [39mlist alpha                                                                       [0m
- [36m- [39mlist beta with CJK 表示 and 한글 jamo 한                                         [0m
+ [36m- [39mlist beta with CJK 表示 and 한글 jamo 한                                         [0m
                                                                                     [0m
  +--------+------------+                                                            [0m
  | [1mGlyph [22m | [1mValue     [22m |                                                            [0m

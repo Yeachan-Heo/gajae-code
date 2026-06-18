@@ -22,7 +22,7 @@ pub struct ComputerController;
 #[napi]
 impl ComputerController {
 	#[napi(constructor)]
-	pub fn new() -> Self {
+	pub const fn new() -> Self {
 		Self
 	}
 
@@ -51,7 +51,7 @@ impl ComputerController {
 		y: f64,
 		button: Option<String>,
 	) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Click { x, y, button: parse_button(button)? })
+		Self::execute(expected_epoch, InputAction::Click { x, y, button: parse_button(button)? })
 	}
 
 	#[napi(js_name = "doubleClick")]
@@ -62,12 +62,16 @@ impl ComputerController {
 		y: f64,
 		button: Option<String>,
 	) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::DoubleClick { x, y, button: parse_button(button)? })
+		Self::execute(expected_epoch, InputAction::DoubleClick {
+			x,
+			y,
+			button: parse_button(button)?,
+		})
 	}
 
 	#[napi]
 	pub fn move_(&self, expected_epoch: Option<f64>, x: f64, y: f64) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Move { x, y })
+		Self::execute(expected_epoch, InputAction::Move { x, y })
 	}
 
 	#[napi]
@@ -80,7 +84,7 @@ impl ComputerController {
 		to_y: f64,
 		button: Option<String>,
 	) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Drag {
+		Self::execute(expected_epoch, InputAction::Drag {
 			x,
 			y,
 			to_x,
@@ -98,25 +102,25 @@ impl ComputerController {
 		scroll_x: f64,
 		scroll_y: f64,
 	) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Scroll { x, y, scroll_x, scroll_y })
+		Self::execute(expected_epoch, InputAction::Scroll { x, y, scroll_x, scroll_y })
 	}
 
 	#[napi(js_name = "type")]
 	pub fn type_(&self, expected_epoch: Option<f64>, text: String) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Type { text })
+		Self::execute(expected_epoch, InputAction::Type { text })
 	}
 
 	#[napi]
 	pub fn keypress(&self, expected_epoch: Option<f64>, keys: Vec<String>) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Keypress { keys })
+		Self::execute(expected_epoch, InputAction::Keypress { keys })
 	}
 
 	#[napi]
 	pub fn wait(&self, expected_epoch: Option<f64>, ms: u32) -> napi::Result<()> {
-		self.execute(expected_epoch, InputAction::Wait { ms: u64::from(ms) })
+		Self::execute(expected_epoch, InputAction::Wait { ms: u64::from(ms) })
 	}
 
-	fn execute(&self, expected_epoch: Option<f64>, action: InputAction) -> napi::Result<()> {
+	fn execute(expected_epoch: Option<f64>, action: InputAction) -> napi::Result<()> {
 		hotkey::start();
 		let frame =
 			capture_primary_display().map_err(|err| napi::Error::from_reason(format!("{err}")))?;
@@ -138,6 +142,11 @@ impl ComputerController {
 	}
 }
 
+impl Default for ComputerController {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 fn parse_button(button: Option<String>) -> napi::Result<MouseButton> {
 	match button
 		.as_deref()

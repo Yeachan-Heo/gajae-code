@@ -281,6 +281,26 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("normalizes decomposed Korean jamo before terminal emission", async () => {
+			const term = new VirtualTerminal(20, 6);
+			const tui = new TUI(term);
+			const decomposed = "한글 출력";
+			const component = new MutableLinesComponent([decomposed]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const viewport = visible(term);
+				expect(viewport[0]).toBe("한글 출력");
+				expect(viewport.join("\n")).not.toContain("ᄒ");
+				expect(viewport.join("\n")).not.toContain("\\u");
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("maintains exact viewport rows across repeated width reflow on sparse mixed content", async () => {
 			const term = new VirtualTerminal(80, 18);
 			const tui = new TUI(term);

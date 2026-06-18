@@ -152,16 +152,21 @@ export function visibleWidth(str: string): number {
 
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
+const HANGUL_JAMO_REGEX = /[\u1100-\u11ff\ua960-\ua97f\ud7b0-\ud7ff]/;
 
 /**
  * Normalize text for terminal output without changing logical editor content.
- * Some terminals render precomposed Thai/Lao AM vowels inconsistently during
- * differential repaint. Their compatibility decompositions have the same cell
- * width but avoid stale-cell artifacts in terminal renderers.
+ * Some terminals render canonically decomposed Hangul jamo or precomposed
+ * Thai/Lao AM vowels inconsistently during differential repaint. Emit a stable
+ * terminal form while keeping the component/source strings unchanged.
  */
 export function normalizeTerminalOutput(str: string): string {
-	if (!THAI_LAO_AM_REGEX.test(str)) return str;
-	return str.replace(THAI_LAO_AM_GLOBAL_REGEX, char => (char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2"));
+	let normalized = str;
+	if (HANGUL_JAMO_REGEX.test(normalized)) normalized = normalized.normalize("NFC");
+	if (!THAI_LAO_AM_REGEX.test(normalized)) return normalized;
+	return normalized.replaceAll(THAI_LAO_AM_GLOBAL_REGEX, char =>
+		char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2",
+	);
 }
 
 const makeBoolArray = (chars: string): Uint8Array => {

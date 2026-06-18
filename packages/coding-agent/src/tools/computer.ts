@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
@@ -97,6 +99,7 @@ export interface ComputerScreenshotDetails {
 	displayEpoch?: string;
 	captureId?: string;
 	pngBytes?: number;
+	path?: string;
 }
 
 export interface ComputerToolDetails {
@@ -169,6 +172,7 @@ function createNativeComputerController(): NativeController {
 let controllerFactory: ComputerControllerFactory = createNativeComputerController;
 let platformOverrideForTests: NodeJS.Platform | undefined;
 let archOverrideForTests: NodeJS.Architecture | undefined;
+const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
 
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ?? createNativeComputerController;
@@ -281,16 +285,34 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					};
 				}
 				details.message = describeComputerSuccess(details);
+				const image = imageContentFromNativeResult(batchResult.screenshotSource);
+				if (batchResult.screenshotSource !== undefined) {
+					await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
+					details.message = describeComputerSuccess(details);
+				}
 				await writeComputerAuditLog(this.session, details);
-				return toolResult(details).text(details.message).done();
+				return image
+					? toolResult(details)
+							.content([{ type: "text", text: details.message }, image])
+							.done()
+					: toolResult(details).text(details.message).done();
 			}
 			const result = await dispatchComputerAction(controller, params, timeoutMs);
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) details.screenshot = screenshot;
 			details.status = "success";
 			details.message = describeComputerSuccess(details);
+			const image = imageContentFromNativeResult(result);
+			if (screenshot) {
+				await persistScreenshotFallback(result, details.screenshot, this.session);
+				details.message = describeComputerSuccess(details);
+			}
 			await writeComputerAuditLog(this.session, details);
-			return toolResult(details).text(details.message).done();
+			return image
+				? toolResult(details)
+						.content([{ type: "text", text: details.message }, image])
+						.done()
+				: toolResult(details).text(details.message).done();
 		} catch (error) {
 			if (error instanceof ToolAbortError) throw error;
 			const mapped = mapComputerError(error, hotkey);
@@ -362,6 +384,7 @@ function dispatchComputerAction(
 interface BatchDispatchResult {
 	steps: ComputerToolDetails[];
 	screenshot?: ComputerScreenshotDetails;
+	screenshotSource?: unknown;
 	failedStep?: { code: string; message: string };
 }
 
@@ -373,6 +396,7 @@ async function dispatchBatchComputerActions(
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
+	let lastScreenshotSource: unknown;
 	let bounds: CoordinateBounds | undefined;
 	for (const single of actions) {
 		const stepDetails = detailsFromParams(single);
@@ -382,6 +406,7 @@ async function dispatchBatchComputerActions(
 			if (screenshot) {
 				stepDetails.screenshot = screenshot;
 				lastScreenshot = screenshot;
+				lastScreenshotSource = result;
 				bounds = screenshot;
 			}
 			stepDetails.status = "success";
@@ -393,11 +418,16 @@ async function dispatchBatchComputerActions(
 			stepDetails.code = mapped.code;
 			stepDetails.message = mapped.message;
 			steps.push(stepDetails);
-			return { steps, screenshot: lastScreenshot, failedStep: { code: mapped.code, message: mapped.message } };
+			return {
+				steps,
+				screenshot: lastScreenshot,
+				screenshotSource: lastScreenshotSource,
+				failedStep: { code: mapped.code, message: mapped.message },
+			};
 		}
 		steps.push(stepDetails);
 	}
-	return { steps, screenshot: lastScreenshot };
+	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
 }
 
 function detailsFromParams(params: ComputerParams): ComputerToolDetails {
@@ -440,6 +470,53 @@ function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefi
 		captureId: shot.captureId,
 		pngBytes: getPngByteLength(shot.png),
 	};
+}
+
+function imageContentFromNativeResult(value: unknown): ImageContent | undefined {
+	const candidate =
+		value && typeof value === "object" && "screenshot" in value
+			? (value as { screenshot?: unknown }).screenshot
+			: value;
+	if (!candidate || typeof candidate !== "object") return undefined;
+	const png = (candidate as NativeScreenshot).png;
+	const data = pngToBase64(png);
+	return data ? { type: "image", data, mimeType: "image/png" } : undefined;
+}
+
+async function persistScreenshotFallback(
+	value: unknown,
+	screenshot: ComputerScreenshotDetails | undefined,
+	session: ToolSession,
+): Promise<void> {
+	if (!screenshot || screenshot.path) return;
+	const image = imageContentFromNativeResult(value);
+	if (!image) return;
+	const dir = await getScreenshotFallbackDir(session);
+	const filePath = path.join(dir, `computer-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+	await fs.writeFile(filePath, Buffer.from(image.data, "base64"), { mode: 0o600 });
+	screenshot.path = filePath;
+}
+
+function getScreenshotFallbackDir(session: ToolSession): Promise<string> {
+	let dir = screenshotFallbackDirs.get(session);
+	if (!dir) {
+		dir = createScreenshotFallbackDir();
+		screenshotFallbackDirs.set(session, dir);
+	}
+	return dir;
+}
+
+async function createScreenshotFallbackDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-computer-screenshots-"));
+	await fs.chmod(dir, 0o700);
+	return dir;
+}
+
+function pngToBase64(png: NativeScreenshot["png"]): string | undefined {
+	if (png === undefined) return undefined;
+	if (typeof png === "string") return png;
+	if (png instanceof ArrayBuffer) return Buffer.from(png).toString("base64");
+	return Buffer.from(png).toString("base64");
 }
 
 function getPngByteLength(png: NativeScreenshot["png"]): number | undefined {
@@ -550,12 +627,14 @@ function describeComputerSuccess(details: ComputerToolDetails): string {
 		const successCount = details.steps.filter(s => s.status === "success").length;
 		const summary = `${successCount}/${details.steps.length} batch steps completed`;
 		if (details.screenshot) {
-			return `Computer batch completed (${summary}; final screenshot ${details.screenshot.widthPx}x${details.screenshot.heightPx}).`;
+			const location = details.screenshot.path ? `; saved ${details.screenshot.path}` : "";
+			return `Computer batch completed (${summary}; final screenshot ${details.screenshot.widthPx}x${details.screenshot.heightPx}${location}).`;
 		}
 		return `Computer batch completed (${summary}).`;
 	}
 	if (details.screenshot) {
-		return `Computer ${details.action} completed (${details.screenshot.widthPx}x${details.screenshot.heightPx}).`;
+		const location = details.screenshot.path ? `; saved ${details.screenshot.path}` : "";
+		return `Computer ${details.action} completed (${details.screenshot.widthPx}x${details.screenshot.heightPx}${location}).`;
 	}
 	return `Computer ${details.action} completed.`;
 }

@@ -31,10 +31,11 @@ const FAKE_RESULT_RE = /to=functions\.\w+[\s\S]{0,80}?code_output\s*\nCell\s+\d+
 
 const FENCE_RE = /^\s*(?:```+|~~~+)/;
 
-// Non-Latin scripts seen in the corpus: CJK + ext, Cyrillic, Thai, Georgian,
-// Armenian, Kannada, Telugu, Devanagari, Arabic, Malayalam.
+// Non-Latin scripts seen in the corpus: CJK + ext, Hangul + Jamo,
+// Cyrillic, Thai, Georgian, Armenian, Kannada, Telugu, Devanagari,
+// Arabic, Malayalam.
 const SCRIPT_CLASS =
-	"\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u0400-\u04FF\u0E00-\u0E7F\u10A0-\u10FF\u0530-\u058F\u0C80-\u0CFF\u0C00-\u0C7F\u0900-\u097F\u0600-\u06FF\u0D00-\u0D7F";
+	"\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u0400-\u04FF\u0E00-\u0E7F\u10A0-\u10FF\u0530-\u058F\u0C80-\u0CFF\u0C00-\u0C7F\u0900-\u097F\u0600-\u06FF\u0D00-\u0D7F";
 const SCRIPT_RUN_RE = new RegExp(`[${SCRIPT_CLASS}]{2,}`, "u");
 
 // Recovery registry. Each entry's parser must recognize the configured

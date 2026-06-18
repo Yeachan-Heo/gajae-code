@@ -36,9 +36,18 @@ const profile: ModelProfileDefinition = {
 	modelMapping: { default: "provider-a/default:high", executor: "provider-a/alternate" },
 	source: "user",
 };
+const profileB: ModelProfileDefinition = {
+	name: "codex-eco",
+	requiredProviders: ["provider-b"],
+	modelMapping: { default: "provider-b/default" },
+	source: "user",
+};
 
 function createRegistry(options: { missingCredentials?: boolean } = {}) {
-	const profiles = new Map([[profile.name, profile]]);
+	const profiles = new Map([
+		[profile.name, profile],
+		[profileB.name, profileB],
+	]);
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
@@ -136,9 +145,57 @@ describe("model selector profiles", () => {
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Model presets");
+		expect(rendered).toContain("CODEX");
 		expect(rendered).toContain("COMBOS");
-		expect(rendered).toContain("profile-a");
+		expect(rendered).not.toContain("profile-a");
 		expect(rendered).toContain("Browse all models");
+	});
+
+	test("provider focus does not auto-expand until right arrow", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CODEX");
+		expect(rendered).not.toContain("Codex Eco");
+
+		selector.handleInput("\x1b[C");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Codex Eco");
+
+		selector.handleInput("\x1b[D");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CODEX");
+		expect(rendered).not.toContain("Codex Eco");
+	});
+
+	test("up and down navigation stays on provider rows while collapsed", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CODEX");
+		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("Browse all models");
+		expect(rendered).not.toContain("Codex Eco");
+		expect(rendered).not.toContain("profile-a");
+
+		selector.handleInput("\x1b[B");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("Browse all models");
+		expect(rendered).not.toContain("Codex Eco");
+		expect(rendered).not.toContain("profile-a");
+
+		selector.handleInput("\x1b[A");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CODEX");
+		expect(rendered).not.toContain("Codex Eco");
+		expect(rendered).not.toContain("profile-a");
 	});
 
 	test("temporary-only mode hides Profiles", async () => {
