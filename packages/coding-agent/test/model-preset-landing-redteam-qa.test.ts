@@ -159,6 +159,7 @@ describe("preset landing adversarial QA", () => {
 		const cancel = vi.fn();
 		const selector = createSelector({ onCancel: cancel });
 		await rendered(selector);
+		selector.handleInput("\x1b[C");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n"); // preview first expanded profile
 		selector.handleInput("\n"); // scope menu
@@ -186,6 +187,7 @@ describe("preset landing adversarial QA", () => {
 	test("printable input exits preview/scope menu into seeded model search", async () => {
 		const selector = createSelector();
 		await rendered(selector);
+		selector.handleInput("\x1b[C");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -234,7 +236,7 @@ describe("preset landing adversarial QA", () => {
 			},
 		});
 		await rendered(comboSelector);
-		comboSelector.handleInput("\n"); // expand CODEX so COMBOS is visible
+		comboSelector.handleInput("\x1b[C"); // expand CODEX so COMBOS is visible
 		comboSelector.handleInput("\x1b[B"); // codex-eco profile
 		comboSelector.handleInput("\x1b[B"); // MINIMAX group
 		comboSelector.handleInput("\x1b[B"); // COMBOS group
@@ -246,7 +248,7 @@ describe("preset landing adversarial QA", () => {
 
 		const miniSelector = createSelector({ authenticatedProviders: ["openai-codex", "anthropic", "provider-a"] });
 		await rendered(miniSelector);
-		for (let i = 0; i < 2; i++) miniSelector.handleInput("\x1b[B");
+		miniSelector.handleInput("\x1b[B");
 		miniSelector.handleInput("\n");
 		text = normalizeRenderedText(miniSelector.render(260).join("\n"));
 		expect(text).toContain("/login minimax-code");
@@ -271,6 +273,7 @@ describe("preset landing adversarial QA", () => {
 	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {
 		const selector = createSelector();
 		await rendered(selector);
+		selector.handleInput("\x1b[C");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 		let text = normalizeRenderedText(selector.render(260).join("\n"));
@@ -279,6 +282,7 @@ describe("preset landing adversarial QA", () => {
 
 		const suffixless = createSelector({ profiles: [noSuffixProfile] });
 		await rendered(suffixless);
+		suffixless.handleInput("\x1b[C");
 		suffixless.handleInput("\x1b[B");
 		suffixless.handleInput("\n");
 		text = normalizeRenderedText(suffixless.render(260).join("\n"));
@@ -292,6 +296,7 @@ describe("preset landing adversarial QA", () => {
 		// overshooting past the destination group header onto its first profile.
 		const selector = createSelector();
 		await rendered(selector);
+		selector.handleInput("\x1b[C"); // expand CODEX explicitly
 		selector.handleInput("\x1b[B"); // CODEX header -> Codex Eco profile
 		selector.handleInput("\x1b[B"); // cross boundary into MINIMAX group
 		const label = cursorRowLabel(selector);
@@ -305,6 +310,7 @@ describe("preset landing adversarial QA", () => {
 		// on the trailing Browse row.
 		const selector = createSelector({ profiles: [codexEco, codexMedium, codexPro, minimax] });
 		await rendered(selector);
+		selector.handleInput("\x1b[C"); // expand CODEX explicitly
 		selector.handleInput("\x1b[B"); // Codex Eco
 		selector.handleInput("\x1b[B"); // Codex Medium
 		selector.handleInput("\x1b[B"); // Codex Pro (last profile of CODEX)
@@ -314,7 +320,9 @@ describe("preset landing adversarial QA", () => {
 		expect(headerLabel).not.toContain("Browse all models");
 		expect(headerLabel).not.toContain("MiniMax Medium");
 
-		// Navigation continues correctly through the destination group.
+		// Navigation continues correctly through the destination group after
+		// explicit expansion; focus/up-down alone must not auto-expand.
+		selector.handleInput("\x1b[C");
 		selector.handleInput("\x1b[B"); // MINIMAX header -> MiniMax Medium profile
 		expect(cursorRowLabel(selector)).toContain("MiniMax Medium");
 	});
