@@ -26,7 +26,14 @@ async function storeWith(attachment: Partial<AttachmentRecord> = {}) {
 	return store;
 }
 
-function outbound(failAt: number[] = []) {
+type OutboundCapture = {
+	sent: Array<{ chatId: string; reply: ChatReply }>;
+	port: {
+		send(message: { chatId: string; reply: ChatReply }): Promise<{ ok: boolean; retryAfterMs?: number }>;
+	};
+};
+
+function outbound(failAt: number[] = []): OutboundCapture {
 	const sent: Array<{ chatId: string; reply: ChatReply }> = [];
 	let calls = 0;
 	return {
@@ -67,12 +74,16 @@ async function flush() {
 	}
 }
 
-async function waitForSent(out: ReturnType<typeof outbound>, count: number) {
+async function waitForCondition(predicate: () => boolean) {
 	for (let index = 0; index < 25; index += 1) {
-		if (out.sent.length >= count) return;
+		if (predicate()) return;
 		await Promise.resolve();
 		await new Promise(resolve => setTimeout(resolve, 0));
 	}
+}
+
+async function waitForSent(out: OutboundCapture, count: number) {
+	await waitForCondition(() => out.sent.length >= count);
 }
 
 describe("RpcEventBridge", () => {
@@ -96,6 +107,7 @@ describe("RpcEventBridge", () => {
 		expect(out.sent.map(item => item.reply.text)).toEqual(expected);
 		expect(out.sent.every(item => item.reply.text.length <= 4096)).toBe(true);
 		expect(out.sent.join(" ")).not.toContain("<");
+		await waitForCondition(() => store.get()?.deliveryIdentities.length === 1);
 		expect(store.get()?.deliveryIdentities).toHaveLength(1);
 	});
 
@@ -231,6 +243,7 @@ describe("RpcEventBridge", () => {
 		backend.emitEvent({ type: "session_exit" });
 		backend.emitEvent({ type: "agent_dead" });
 		await flush();
+		await waitForSent(out, 1);
 		expect(out.sent.map(item => item.reply.text)).toEqual([formatExitAlert()]);
 		expect(store.get()?.stale).toBe(true);
 
