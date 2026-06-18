@@ -7,7 +7,7 @@
 
 ### Fixed
 
-- Queued ordinary chat messages by default while the agent is busy: Enter now routes normal prompts into the next-turn queue unless `busyPromptMode` is explicitly set to `steer`, pending normal messages render as `Queued:`, and existing steer/cancel plus explicit queue/dequeue controls remain separate (#829).
+- Restored steer-by-default while the agent is busy: `busyPromptMode` now defaults to `steer`, so Enter on a normal prompt interrupts the active turn. Queueing for the next turn is reserved for the explicit Ctrl+Enter follow-up keystroke (or `busyPromptMode: "queue"`); existing steer/cancel plus explicit queue/dequeue controls remain separate (#829).
 
 ### Added
 

@@ -90,7 +90,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue" }) {
 		settings: {
 			get(path: string) {
 				if (path === "images.autoResize") return false;
-				if (path === "busyPromptMode") return options?.busyPromptMode;
+				if (path === "busyPromptMode") return options?.busyPromptMode ?? "steer";
 				return undefined;
 			},
 		} as unknown as InteractiveModeContext["settings"],
@@ -202,19 +202,19 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("queues streaming Enter submissions by default", async () => {
+	it("steers streaming Enter submissions by default", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const session = ctx.session as unknown as { isStreaming: boolean };
 		session.isStreaming = true;
-		editor.setText("queue by default while busy");
+		editor.setText("steer by default while busy");
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
-		await editor.onSubmit?.("queue by default while busy");
+		await editor.onSubmit?.("steer by default while busy");
 
-		expect(ctx.locallySubmittedUserSignatures.has("queue by default while busy\u00000")).toBe(true);
-		expect(spies.prompt).toHaveBeenCalledWith("queue by default while busy", {
-			streamingBehavior: "followUp",
+		expect(ctx.locallySubmittedUserSignatures.has("steer by default while busy\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("steer by default while busy", {
+			streamingBehavior: "steer",
 			images: undefined,
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);

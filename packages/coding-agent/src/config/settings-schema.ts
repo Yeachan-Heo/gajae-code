@@ -995,7 +995,7 @@ export const SETTINGS_SCHEMA = {
 	busyPromptMode: {
 		type: "enum",
 		values: ["steer", "queue"] as const,
-		default: "queue",
+		default: "steer",
 		ui: {
 			tab: "interaction",
 			label: "Busy Prompt Mode",
