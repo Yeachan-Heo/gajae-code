@@ -175,6 +175,8 @@ Presets only write `models.yml` entries that reference documented environment va
 
 Model profiles are optional top-level `profiles:` entries in `~/.gjc/agent/models.yml`. A profile can require provider credentials before activation and can map one or more model roles; omitted roles inherit from the active defaults.
 
+> See also: [Cross-vendor role-based profiles](./multi-vendor-profiles.md) — a curated multi-vendor `profiles:` recipe and verified selector notes that build on the mechanism described here.
+
 ```yaml
 profiles:
   team-standard:
