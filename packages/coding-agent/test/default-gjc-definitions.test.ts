@@ -302,6 +302,34 @@ Project executor override body.
 		expect(ultragoal).toContain("become unrecoverably wrong");
 	});
 
+	it("carries harness-style execution architecture from ralplan into ultragoal", async () => {
+		const ralplan = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
+		).text();
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		expect(ralplan).toContain("Harness-Style Execution Architecture");
+		for (const required of [
+			"Pattern",
+			"Agent roster",
+			"Task lanes",
+			"Execution mode recommendation",
+			"ultragoal-native-subagents",
+			"recommend `team` only when durable visible tmux workers",
+			"Domain-specific decomposition",
+		]) {
+			expect(ralplan).toContain(required);
+		}
+
+		expect(ultragoal).toContain("Harness-Style Execution Architecture Intake");
+		expect(ultragoal).toContain("execute from its Task lanes");
+		expect(ultragoal).toContain("Subagents return lane evidence only");
+		expect(ultragoal).toContain("Honor dependencies and parallel groups");
+		expect(ultragoal).toContain("Do not auto-launch Team as a substitute");
+	});
+
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
 		const team = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "team", "SKILL.md"),
