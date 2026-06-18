@@ -4,6 +4,7 @@
 ### Fixed
 
 - Corrected the bundled `zai/glm-5.2` context window from 200K to its true 1M (1,000,000-token) lossless window. GLM-5.2 was added in #579 by copying GLM-5.1's 200K entry, and that stale value survived every `generate-models` run because provider-scoped models bypass the models.dev refresh in `applyGlobalModelsDevFallback`. Added a regen-safe pin in `applyGeneratedModelPolicy` (mirroring the Bedrock-Opus-4.6 precedent) so the 1M value persists, and updated the bundled catalog entry. The wrong 200K tripped auto-compaction / context-cap thresholds ~5x early for GLM-5.2 sessions.
+- Corrected the bundled `minimax-m3` context window from 512K to its true 1M (1,000,000-token) window per the official MiniMax docs (platform.minimax.io documents MiniMax-M3 as a 1M-context frontier coding model). All four provider copies (`minimax`, `minimax-cn`, `minimax-code`, `minimax-code-cn`) carried the stale 512K, which survived `generate-models` (provider-scoped models bypass the models.dev refresh in `applyGlobalModelsDevFallback`) and tripped auto-compaction / context-cap thresholds 2x early on MiniMax sessions. Added a regen-safe pin in `applyGeneratedModelPolicy` keyed on `model.id === "minimax-m3"` and updated the bundled entries. `minimax-v3` (an undocumented catalog alias) is intentionally left untouched.
 
 ## [0.5.4] - 2026-06-17
 

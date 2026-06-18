@@ -34712,7 +34712,7 @@
 				"cacheRead": 0.12,
 				"cacheWrite": 0
 			},
-			"contextWindow": 512000,
+			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
@@ -34907,7 +34907,7 @@
 				"cacheRead": 0.12,
 				"cacheWrite": 0
 			},
-			"contextWindow": 512000,
+			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
@@ -35174,7 +35174,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 512000,
+			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"compat": {
 				"supportsStore": false,
@@ -35478,7 +35478,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 512000,
+			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"compat": {
 				"supportsStore": false,
