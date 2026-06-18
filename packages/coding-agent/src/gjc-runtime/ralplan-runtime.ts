@@ -423,14 +423,19 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 		throw new RalplanCommandError(2, "--artifact is required for ralplan --write");
 	}
 
-	const sessionIdRaw = flagValue(args, "--session-id")?.trim();
+	// Session-id resolution: explicit --session-id flag, then the GJC_SESSION_ID
+	// env var (set by AgentSession for agent-initiated CLI calls). Without this
+	// fallback, concurrent agent ralplan runs in one repo all resolve the global
+	// .gjc/state/ralplan-state.json and overwrite each other's active run id,
+	// scattering stage artifacts across run folders.
+	const sessionIdRaw = flagValue(args, "--session-id")?.trim() || process.env.GJC_SESSION_ID?.trim();
 	const sessionId = sessionIdRaw || undefined;
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
 
 	// Precedence for run_id:
 	//   1. explicit --run-id flag
 	//   2. existing run_id field in .gjc/state[/sessions/<id>]/ralplan-state.json
-	//   3. explicit --session-id flag (use as run id)
+	//   3. resolved session id (--session-id flag or GJC_SESSION_ID env) used as run id
 	//   4. freshly generated default run id
 	const explicitRunId = flagValue(args, "--run-id")?.trim();
 	const runId = explicitRunId || (await readActiveRunId(cwd, sessionId)) || sessionIdRaw || defaultRunId();
@@ -762,7 +767,7 @@ function resolveConsensusArgs(args: readonly string[]): ConsensusHandoffArgs {
 			`unknown --critic kind: ${criticKind}. Expected one of: ${[...KNOWN_CRITIC_KINDS].join(", ")}.`,
 		);
 	}
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
+	const sessionId = flagValue(args, "--session-id")?.trim() || process.env.GJC_SESSION_ID?.trim() || undefined;
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
 	const task = extractPositionalTask(args);
 	return {

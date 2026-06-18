@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -33,6 +33,20 @@ afterEach(async () => {
 		delete process.env.GJC_CODING_AGENT_DIR;
 	}
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+// Most tests below assert root-scoped .gjc/state paths. The runtime now falls back to
+// GJC_SESSION_ID when no --session-id flag is given, rerouting writes into
+// .gjc/state/sessions/<id>/. Clear it for the suite so those assertions stay
+// deterministic even when the dev shell exports a session id; the session-scoping
+// test restores it per-test.
+let priorSessionId: string | undefined;
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	delete process.env.GJC_SESSION_ID;
+});
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 });
 
 describe("native gjc deep-interview runtime", () => {
@@ -357,5 +371,51 @@ describe("native gjc deep-interview runtime", () => {
 		const result = await runNativeDeepInterviewCommand(["--no-such-flag", "idea"], root);
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("unknown flag");
+	});
+});
+
+describe("native gjc deep-interview runtime — session scoping (GJC_SESSION_ID)", () => {
+	it("routes --write spec state to the GJC_SESSION_ID session scope when no --session-id flag is passed", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "di-sess";
+		try {
+			const result = await runNativeDeepInterviewCommand(
+				["--write", "--stage", "final", "--slug", "scoped", "--spec", "# Spec body", "--json"],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}") as { state_path: string };
+			expect(payload.state_path).toContain(
+				path.join(".gjc", "state", "sessions", "di-sess", "deep-interview-state.json"),
+			);
+			await expect(fs.access(path.join(root, ".gjc", "state", "deep-interview-state.json"))).rejects.toThrow();
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
+	});
+
+	it("--session-id flag takes precedence over GJC_SESSION_ID env", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "env-sess";
+		try {
+			const result = await runNativeDeepInterviewCommand(
+				["--write", "--stage", "final", "--slug", "flag-scoped", "--spec", "# Spec", "--session-id", "flag-sess", "--json"],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}") as { state_path: string };
+			expect(payload.state_path).toContain(
+				path.join(".gjc", "state", "sessions", "flag-sess", "deep-interview-state.json"),
+			);
+			await expect(
+				fs.access(path.join(root, ".gjc", "state", "sessions", "env-sess", "deep-interview-state.json")),
+			).rejects.toThrow();
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
 	});
 });

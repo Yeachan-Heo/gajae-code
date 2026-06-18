@@ -277,7 +277,9 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		throw new DeepInterviewCommandError(2, "--spec is required for deep-interview --write");
 	}
 
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
+	// --session-id flag, then GJC_SESSION_ID env (set by AgentSession) so concurrent
+	// agent sessions in one repo get isolated state instead of sharing the global slot.
+	const sessionId = flagValue(args, "--session-id")?.trim() || process.env.GJC_SESSION_ID?.trim() || undefined;
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
 
 	const rawHandoff = flagValue(args, "--handoff")?.trim() || undefined;
@@ -324,7 +326,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 }
 
 async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewArgs> {
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
+	const sessionId = flagValue(args, "--session-id")?.trim() || process.env.GJC_SESSION_ID?.trim() || undefined;
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
 
 	const explicitResolutions = (["quick", "standard", "deep"] as const).filter(name => hasFlag(args, `--${name}`));

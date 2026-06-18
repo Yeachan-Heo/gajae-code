@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
@@ -15,6 +15,19 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+// The ralplan runtime falls back to GJC_SESSION_ID when no --session-id flag is
+// given, routing state into .gjc/state/sessions/<id>/. Clear it so the root-scoped
+// assertions in the suites below stay deterministic even when the dev shell exports
+// a session id; the session-scoping suite restores it per-test.
+let priorSessionId: string | undefined;
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	delete process.env.GJC_SESSION_ID;
+});
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 });
 
 describe("native gjc ralplan runtime — consensus handoff", () => {
@@ -1094,5 +1107,116 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		const after = await readState(root);
 		expect(after.active).toBe(false);
 		expect(after.current_phase).toBe("complete");
+	});
+});
+
+describe("native gjc ralplan runtime — session scoping (GJC_SESSION_ID)", () => {
+	it("routes --write run-state to the GJC_SESSION_ID session scope when no --session-id flag is passed", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "sess-aaaa";
+		try {
+			const result = await runNativeRalplanCommand(
+				["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "run-x", "--json"],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const sessionState = JSON.parse(
+				await fs.readFile(path.join(root, ".gjc", "state", "sessions", "sess-aaaa", "ralplan-state.json"), "utf-8"),
+			) as { run_id: string };
+			expect(sessionState.run_id).toBe("run-x");
+			await expect(fs.access(path.join(root, ".gjc", "state", "ralplan-state.json"))).rejects.toThrow();
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
+	});
+
+	it("isolates concurrent sessions: each GJC_SESSION_ID resolves its own active run id", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		try {
+			process.env.GJC_SESSION_ID = "sess-A";
+			await runNativeRalplanCommand(
+				["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# A", "--run-id", "a-run", "--json"],
+				root,
+			);
+			process.env.GJC_SESSION_ID = "sess-B";
+			await runNativeRalplanCommand(
+				["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# B", "--run-id", "b-run", "--json"],
+				root,
+			);
+			// Session A writes again WITHOUT --run-id: must resolve its OWN active run (a-run),
+			// not the globally-last-written b-run. This is the concurrency regression.
+			process.env.GJC_SESSION_ID = "sess-A";
+			const result = await runNativeRalplanCommand(
+				["--write", "--stage", "architect", "--stage_n", "2", "--artifact", "# A2", "--json"],
+				root,
+			);
+			const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string; path: string };
+			expect(payload.run_id).toBe("a-run");
+			expect(payload.path).toContain(path.join(".gjc", "plans", "ralplan", "a-run"));
+			expect(payload.path).not.toContain(path.join("ralplan", "b-run"));
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
+	});
+
+	it("--session-id flag takes precedence over GJC_SESSION_ID env", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "env-sess";
+		try {
+			await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"planner",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# P",
+					"--run-id",
+					"flag-run",
+					"--session-id",
+					"flag-sess",
+					"--json",
+				],
+				root,
+			);
+			const flagState = JSON.parse(
+				await fs.readFile(path.join(root, ".gjc", "state", "sessions", "flag-sess", "ralplan-state.json"), "utf-8"),
+			) as { run_id: string };
+			expect(flagState.run_id).toBe("flag-run");
+			await expect(
+				fs.access(path.join(root, ".gjc", "state", "sessions", "env-sess", "ralplan-state.json")),
+			).rejects.toThrow();
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
+	});
+
+	it("consensus handoff seeds session-scoped state from GJC_SESSION_ID env", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "handoff-sess";
+		try {
+			const result = await runNativeRalplanCommand(["--json", "--deliberate", "scoped task"], root);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}") as { state_path: string };
+			expect(payload.state_path).toContain(
+				path.join(".gjc", "state", "sessions", "handoff-sess", "ralplan-state.json"),
+			);
+			const state = JSON.parse(
+				await fs.readFile(path.join(root, ".gjc", "state", "sessions", "handoff-sess", "ralplan-state.json"), "utf-8"),
+			) as { session_id: string; task: string };
+			expect(state.session_id).toBe("handoff-sess");
+			expect(state.task).toBe("scoped task");
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
 	});
 });
