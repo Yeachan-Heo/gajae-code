@@ -7,6 +7,7 @@ export * from "./fields";
 export * from "./json-schema-validator";
 export * from "./meta-validator";
 export * from "./normalize";
+export * from "./root-combinator";
 export * from "./spill";
 export * from "./types";
 export * from "./wire";

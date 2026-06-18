@@ -19,7 +19,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
-import { toolWireSchema } from "../utils/schema/wire";
+import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -253,7 +253,7 @@ function convertTools(tools: Tool[] | undefined): OllamaFunctionTool[] | undefin
 		function: {
 			name: tool.name,
 			description: tool.description,
-			parameters: toolWireSchema(tool),
+			parameters: flattenToolRootCombinators(toolWireSchema(tool)),
 		},
 	}));
 }

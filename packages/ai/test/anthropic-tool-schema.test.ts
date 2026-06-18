@@ -1,8 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import {
-	normalizeAnthropicToolRootInputSchema,
-	normalizeAnthropicToolSchema,
-} from "@gajae-code/ai/providers/anthropic";
+import { normalizeAnthropicToolSchema } from "@gajae-code/ai/providers/anthropic";
+import { flattenToolRootCombinators } from "@gajae-code/ai/utils/schema";
 
 describe("normalizeAnthropicToolSchema — SDK whitelist", () => {
 	describe("number / integer nodes", () => {
@@ -196,9 +194,9 @@ describe("normalizeAnthropicToolSchema — SDK whitelist", () => {
 	});
 });
 
-describe("normalizeAnthropicToolRootInputSchema", () => {
+describe("flattenToolRootCombinators", () => {
 	it("removes root combinators, keeps common required fields only, derives action enum, and preserves nested combinators", () => {
-		const out = normalizeAnthropicToolRootInputSchema(
+		const out = flattenToolRootCombinators(
 			normalizeAnthropicToolSchema({
 				type: "object",
 				oneOf: [
@@ -241,7 +239,7 @@ describe("normalizeAnthropicToolRootInputSchema", () => {
 	});
 
 	it("demotes unsafe root combinators into description without removing nested combinators", () => {
-		const out = normalizeAnthropicToolRootInputSchema(
+		const out = flattenToolRootCombinators(
 			normalizeAnthropicToolSchema({
 				type: "object",
 				properties: {
@@ -270,7 +268,7 @@ describe("normalizeAnthropicToolRootInputSchema", () => {
 			{ action: "keypress", required: ["action", "keys"] },
 			{ action: "wait", required: ["action", "ms"] },
 		];
-		const out = normalizeAnthropicToolRootInputSchema(
+		const out = flattenToolRootCombinators(
 			normalizeAnthropicToolSchema({
 				type: "object",
 				oneOf: actions.map(({ action, required }) => ({
@@ -304,7 +302,7 @@ describe("normalizeAnthropicToolRootInputSchema", () => {
 			{ action: "screenshot", required: ["action"] },
 			{ action: "click", required: ["action", "x", "y"] },
 		];
-		const out = normalizeAnthropicToolRootInputSchema(
+		const out = flattenToolRootCombinators(
 			normalizeAnthropicToolSchema({
 				anyOf: [
 					{

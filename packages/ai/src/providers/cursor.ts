@@ -29,7 +29,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
-import { toolWireSchema } from "../utils/schema/wire";
+import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
@@ -2183,7 +2183,7 @@ function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[]
 	}
 
 	return advertisedTools.map(tool => {
-		const jsonSchema = toolWireSchema(tool);
+		const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
 		const schemaValue: JsonValue =
 			jsonSchema && typeof jsonSchema === "object"
 				? (jsonSchema as JsonValue)

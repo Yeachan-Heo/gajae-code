@@ -27,7 +27,7 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { resolveRetryBudget } from "../utils/retry-budget";
-import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
+import { flattenToolRootCombinators, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import {
@@ -373,7 +373,7 @@ function convertTools(tools: Tool[]): OpenAITool[] {
 		type: "function",
 		name: tool.name,
 		description: tool.description || "",
-		parameters: sanitizeSchemaForOpenAIResponses(toolWireSchema(tool)),
+		parameters: sanitizeSchemaForOpenAIResponses(flattenToolRootCombinators(toolWireSchema(tool))),
 		strict: false,
 	}));
 }

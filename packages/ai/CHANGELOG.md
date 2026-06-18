@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Generalized tool `input_schema` root-combinator flattening across providers so discriminated-union tool inputs (e.g. the `computer` tool, a `z.union`) no longer ship a bare top-level `anyOf`/`oneOf`/`allOf` root that strict validators reject. The Anthropic-only fix from 0.5.4 is now the shared, provider-agnostic `flattenToolRootCombinators` (in `utils/schema`) and is applied by Amazon Bedrock, OpenAI Chat Completions / Responses / Codex-Responses / Azure-Responses, Ollama, and Cursor. Previously only Anthropic flattened the root, so those providers forwarded the union root verbatim and a union-root tool failed upstream — Bedrock Converse (including via Kiro/CodeWhisperer relays) returned `400 TOOL_SCHEMA_INVALID: The value at toolConfig.tools.N.toolSpec.inputSchema.json.type must be one of the following: object`. Anthropic behavior is unchanged (it now calls the shared util), Google / Cloud Code Assist keep their own object-merge, and object-root tools, nested combinators, and runtime Zod validation are all untouched.
+
 ## [0.6.0] - 2026-06-18
 ### Fixed
 

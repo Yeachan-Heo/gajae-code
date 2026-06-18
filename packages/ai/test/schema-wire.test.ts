@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { normalizeAnthropicToolSchema } from "@gajae-code/ai/providers/anthropic";
 import type { Tool } from "@gajae-code/ai/types";
 import {
+	flattenToolRootCombinators,
 	isZodSchema,
 	normalizeEmptySchemas,
 	normalizeSchemaForCCA,
@@ -189,5 +190,95 @@ describe("provider normalizers on normalized open-record schemas", () => {
 		const out = normalizeSchemaForCCA(wire) as Record<string, unknown>;
 		const extra = (out.properties as Record<string, unknown>).extra as Record<string, unknown>;
 		expect(extra).not.toHaveProperty("additionalProperties");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// toolWireSchema — root combinator flattening
+// Regression: Bedrock Converse / OpenAI strict / Gemini reject tool input_schema
+// roots whose top level is a bare anyOf/oneOf/allOf. A `z.union(...)` tool (e.g.
+// `computer`) serialized to `{ anyOf: [...] }` and hit
+// `TOOL_SCHEMA_INVALID: ...inputSchema.json.type must be one of the following: object`.
+// ---------------------------------------------------------------------------
+
+describe("flattenToolRootCombinators over toolWireSchema output", () => {
+	function mkZod(parameters: z.ZodType): Tool {
+		return { name: "t", description: "", parameters, async execute() {} } as unknown as Tool;
+	}
+	function mkJson(parameters: Record<string, unknown>): Tool {
+		return { name: "t", description: "", parameters, async execute() {} } as unknown as Tool;
+	}
+	const wireOf = (tool: Tool) => flattenToolRootCombinators(toolWireSchema(tool));
+
+	it("flattens a z.union root into a single type:object schema", () => {
+		const wire = wireOf(
+			mkZod(
+				z.union([
+					z.object({ action: z.literal("screenshot") }).strict(),
+					z.object({ action: z.literal("click"), x: z.number(), y: z.number() }).strict(),
+				]),
+			),
+		);
+		expect(wire.type).toBe("object");
+		expect(wire).not.toHaveProperty("anyOf");
+		expect(wire).not.toHaveProperty("oneOf");
+		const properties = wire.properties as Record<string, unknown>;
+		// Branch properties are merged and the discriminant becomes an enum.
+		expect(properties.action).toBeDefined();
+		expect((properties.action as Record<string, unknown>).enum).toEqual(["screenshot", "click"]);
+		expect(properties.x).toBeDefined();
+		expect(properties.y).toBeDefined();
+	});
+
+	it("flattens a z.discriminatedUnion root", () => {
+		const wire = wireOf(
+			mkZod(
+				z.discriminatedUnion("action", [
+					z.object({ action: z.literal("a"), foo: z.string() }).strict(),
+					z.object({ action: z.literal("b"), bar: z.number() }).strict(),
+				]),
+			),
+		);
+		expect(wire.type).toBe("object");
+		expect(wire).not.toHaveProperty("anyOf");
+		expect(wire).not.toHaveProperty("oneOf");
+	});
+
+	it("flattens a raw JSON-Schema anyOf root carrying an injected intent (_i) field", () => {
+		// Mirrors the real intent-injected wire shape: agent-loop injects `_i` onto a
+		// union root, producing { anyOf, properties:{_i}, required:[_i] } with no root type.
+		const wire = wireOf(
+			mkJson({
+				anyOf: [
+					{
+						type: "object",
+						properties: { action: { const: "a" }, x: { type: "number" } },
+						required: ["action", "x"],
+						additionalProperties: false,
+					},
+					{
+						type: "object",
+						properties: { action: { const: "b" } },
+						required: ["action"],
+						additionalProperties: false,
+					},
+				],
+				properties: { _i: { type: "string" } },
+				required: ["_i"],
+			}),
+		);
+		expect(wire.type).toBe("object");
+		expect(wire).not.toHaveProperty("anyOf");
+		const properties = wire.properties as Record<string, unknown>;
+		expect(properties._i).toEqual({ type: "string" });
+		expect(properties.action).toBeDefined();
+		expect(properties.x).toBeDefined();
+	});
+
+	it("leaves a plain object-root tool unchanged", () => {
+		const wire = wireOf(mkZod(z.object({ path: z.string() }).strict()));
+		expect(wire.type).toBe("object");
+		expect(wire).not.toHaveProperty("anyOf");
+		expect((wire.properties as Record<string, unknown>).path).toBeDefined();
 	});
 });

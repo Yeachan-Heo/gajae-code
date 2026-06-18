@@ -33,7 +33,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
-import { toolWireSchema } from "../utils/schema/wire";
+import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -808,7 +808,7 @@ export function convertToolConfig(
 		toolSpec: {
 			name: tool.name,
 			description: tool.description || "",
-			inputSchema: { json: toolWireSchema(tool) },
+			inputSchema: { json: flattenToolRootCombinators(toolWireSchema(tool)) },
 		},
 	}));
 

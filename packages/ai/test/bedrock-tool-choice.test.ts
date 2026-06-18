@@ -87,3 +87,45 @@ describe("Bedrock tool choice", () => {
 		).toBeUndefined();
 	});
 });
+
+describe("Bedrock tool schema root", () => {
+	// Regression: a union-root tool (e.g. `computer`, a z.union) serialized to
+	// { anyOf: [...] } with no root `type`, which Bedrock Converse rejects with
+	// TOOL_SCHEMA_INVALID: inputSchema.json.type must be one of the following: object.
+	const unionTool: Tool = {
+		name: "computer",
+		description: "Union-root tool",
+		parameters: {
+			anyOf: [
+				{
+					type: "object",
+					properties: { action: { const: "screenshot" } },
+					required: ["action"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: { action: { const: "click" }, x: { type: "number" }, y: { type: "number" } },
+					required: ["action", "x", "y"],
+					additionalProperties: false,
+				},
+			],
+		} as unknown as Tool["parameters"],
+	};
+
+	it("flattens a union root to type:object so Bedrock accepts it", () => {
+		const config = convertToolConfig([unionTool], "auto");
+		const json = config?.tools[0]?.toolSpec.inputSchema.json as Record<string, unknown>;
+		expect(json.type).toBe("object");
+		expect(json).not.toHaveProperty("anyOf");
+		expect(json).not.toHaveProperty("oneOf");
+		expect((json.properties as Record<string, unknown>).action).toBeDefined();
+	});
+
+	it("leaves an object-root tool's schema unchanged", () => {
+		const config = convertToolConfig([tool], "auto");
+		const json = config?.tools[0]?.toolSpec.inputSchema.json as Record<string, unknown>;
+		expect(json.type).toBe("object");
+		expect(json).not.toHaveProperty("anyOf");
+	});
+});
