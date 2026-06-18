@@ -8,7 +8,7 @@
  */
 import * as fs from "node:fs/promises";
 import { getProjectDir } from "@gajae-code/utils";
-import { parseArgs } from "../cli/args";
+import { type Args, parseArgs } from "../cli/args";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { type RlmPreset, runRootCommand } from "../main";
@@ -183,6 +183,17 @@ export function buildRlmGoalObjective(input: {
 	}
 	return "Complete this RLM research session, grounding conclusions in notebook outputs and finishing with a report.";
 }
+export function isRlmAutonomousRun(parsed: Pick<Args, "print" | "mode" | "messages">, pipedStdin: boolean): boolean {
+	return parsed.print === true || parsed.mode !== undefined || pipedStdin;
+}
+
+export function prepareRlmLaunchMode(parsed: Args, pipedStdin: boolean): boolean {
+	const autonomous = isRlmAutonomousRun(parsed, pipedStdin);
+	if (autonomous && parsed.mode === undefined) {
+		parsed.print = true;
+	}
+	return autonomous;
+}
 
 async function loadExistingMetadata(paths: RlmArtifactPaths): Promise<RlmSessionMetadata | undefined> {
 	try {
@@ -265,13 +276,12 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 	if (resumeSessionId) {
 		parsed.continue = true;
 	}
-	// Piped stdin (non-TTY) feeds an autonomous research prompt the same way an
-	// argv goal does, so it must get the shouldPause stop seam + completion gate.
+	// Piped stdin (non-TTY), explicit --print, and explicit --mode run as autonomous
+	// research. Positional argv messages seed the interactive RLM shell, so
+	// `gjc rlm "question"` still loads the TUI instead of being coerced into
+	// print mode.
 	const pipedStdin = process.stdin.isTTY === false;
-	const autonomous = parsed.print === true || parsed.mode !== undefined || parsed.messages.length > 0 || pipedStdin;
-	if (autonomous && parsed.mode === undefined) {
-		parsed.print = true;
-	}
+	const autonomous = prepareRlmLaunchMode(parsed, pipedStdin);
 	const resumeContext = existingNotebook ? summarizeNotebookForReplay(existingNotebook) : undefined;
 	const preset = createRlmPreset({
 		dataContext,

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseArgs } from "@gajae-code/coding-agent/cli/args";
 import { readNotebookDocument } from "@gajae-code/coding-agent/edit/notebook";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 import {
@@ -21,7 +22,7 @@ import {
 	createRlmCompleteResearchTool,
 	summarizeNotebookForReplay,
 } from "@gajae-code/coding-agent/rlm/complete-research-tool";
-import { extractRlmFlags } from "@gajae-code/coding-agent/rlm/index";
+import { extractRlmFlags, isRlmAutonomousRun, prepareRlmLaunchMode } from "@gajae-code/coding-agent/rlm/index";
 import { RlmNotebookWriter } from "@gajae-code/coding-agent/rlm/notebook";
 import type { RlmCellResult } from "@gajae-code/coding-agent/rlm/types";
 
@@ -86,6 +87,41 @@ describe("extractRlmFlags", () => {
 		expect(parsed.rest).toEqual(["just a goal"]);
 		expect(() => extractRlmFlags(["--min-successful-runs", "two"])).toThrow(/non-negative integer/);
 		expect(() => extractRlmFlags(["--resume"])).toThrow(/requires an RLM session id/);
+	});
+});
+
+describe("RLM launch mode detection", () => {
+	test("plain positional text seeds interactive RLM instead of forcing print mode", () => {
+		expect(isRlmAutonomousRun({ messages: ["text"] }, false)).toBe(false);
+	});
+
+	test("explicit print, explicit mode, and piped stdin remain autonomous", () => {
+		expect(isRlmAutonomousRun({ messages: [], print: true }, false)).toBe(true);
+		expect(isRlmAutonomousRun({ messages: [], mode: "json" }, false)).toBe(true);
+		expect(isRlmAutonomousRun({ messages: [] }, true)).toBe(true);
+	});
+
+	test("launch preparation keeps positional text interactive and preserves the seed message", () => {
+		const parsed = parseArgs(["text"]);
+		expect(prepareRlmLaunchMode(parsed, false)).toBe(false);
+		expect(parsed.print).toBeUndefined();
+		expect(parsed.mode).toBeUndefined();
+		expect(parsed.messages).toEqual(["text"]);
+	});
+
+	test("launch preparation coerces only autonomous text mode to print", () => {
+		const printed = parseArgs(["--print", "text"]);
+		expect(prepareRlmLaunchMode(printed, false)).toBe(true);
+		expect(printed.print).toBe(true);
+
+		const jsonMode = parseArgs(["--mode", "json", "text"]);
+		expect(prepareRlmLaunchMode(jsonMode, false)).toBe(true);
+		expect(jsonMode.print).toBeUndefined();
+		expect(jsonMode.mode).toBe("json");
+
+		const piped = parseArgs([]);
+		expect(prepareRlmLaunchMode(piped, true)).toBe(true);
+		expect(piped.print).toBe(true);
 	});
 });
 
