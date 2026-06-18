@@ -186,8 +186,9 @@ function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
 }
 /**
  * Component that renders a canonical model selector with provider tabs.
- * - Tab/Arrow Left/Right: Switch between provider tabs
- * - Arrow Up/Down: Navigate model list
+ * - Preset landing Left/Right: Collapse/expand selected provider
+ * - Model browser Tab/Arrow Left/Right: Switch between provider tabs
+ * - Arrow Up/Down: Navigate rows
  * - Enter: Open assignment actions for default plus GJC role-agent models
  * - Escape: Close selector
  */
@@ -314,7 +315,6 @@ export class ModelSelectorComponent extends Container {
 				this.#viewMode = "models";
 			}
 			if (this.#viewMode === "presets") {
-				this.#updatePresetExpansion();
 				void this.#refreshProviderAuth();
 				this.#renderPresetLanding();
 			} else {
@@ -760,24 +760,34 @@ export class ModelSelectorComponent extends Container {
 		this.#tui.requestRender();
 	}
 
-	#updatePresetExpansion(): void {
-		const selected = this.#getSelectedPresetRow();
-		if (selected?.kind === "group") this.#expandedPresetProviderId = selected.groupId;
-		if (selected?.kind === "profile") this.#expandedPresetProviderId = selected.groupId;
+	#clampPresetCursor(): void {
 		const rows = this.#getPresetRows();
-		// Expanding/collapsing a group shifts row positions. Relocate the cursor by
-		// the selected row's logical identity so crossing a provider group boundary
-		// keeps it on the same logical row instead of overshooting into the
-		// destination group's profiles (or off the end of the list).
-		if (selected) {
-			const targetIdentity = presetRowIdentity(selected);
-			const relocated = rows.findIndex(row => presetRowIdentity(row) === targetIdentity);
-			if (relocated >= 0) {
-				this.#presetCursor = relocated;
-				return;
-			}
-		}
 		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, rows.length - 1));
+	}
+
+	#relocatePresetCursor(targetIdentity: string): boolean {
+		const relocated = this.#getPresetRows().findIndex(row => presetRowIdentity(row) === targetIdentity);
+		if (relocated < 0) return false;
+		this.#presetCursor = relocated;
+		return true;
+	}
+
+	#expandSelectedPresetProvider(): void {
+		const selected = this.#getSelectedPresetRow();
+		if (!selected || selected.kind === "browse") return;
+		if (this.#expandedPresetProviderId === selected.groupId) return;
+		const targetIdentity = presetRowIdentity(selected);
+		this.#expandedPresetProviderId = selected.groupId;
+		if (!this.#relocatePresetCursor(targetIdentity)) this.#clampPresetCursor();
+	}
+
+	#collapseSelectedPresetProvider(): void {
+		const selected = this.#getSelectedPresetRow();
+		if (!selected || selected.kind === "browse") return;
+		if (this.#expandedPresetProviderId !== selected.groupId) return;
+		const targetIdentity = selected.kind === "profile" ? `group:${selected.groupId}` : presetRowIdentity(selected);
+		this.#expandedPresetProviderId = undefined;
+		if (!this.#relocatePresetCursor(targetIdentity)) this.#clampPresetCursor();
 	}
 
 	#switchToModelMode(seed?: string): void {
@@ -1160,7 +1170,7 @@ export class ModelSelectorComponent extends Container {
 				this.#presetCursor = this.#presetCursor === 0 ? rows.length - 1 : this.#presetCursor - 1;
 				this.#previewProfileName = undefined;
 				this.#presetLoginHint = undefined;
-				this.#updatePresetExpansion();
+				this.#clampPresetCursor();
 			}
 			this.#renderPresetLanding();
 			return;
@@ -1174,9 +1184,27 @@ export class ModelSelectorComponent extends Container {
 				this.#presetCursor = (this.#presetCursor + 1) % rows.length;
 				this.#previewProfileName = undefined;
 				this.#presetLoginHint = undefined;
-				this.#updatePresetExpansion();
+				this.#clampPresetCursor();
 			}
 			this.#renderPresetLanding();
+			return;
+		}
+		if (matchesKey(keyData, "right")) {
+			if (!this.#presetScopeMenuOpen) {
+				this.#expandSelectedPresetProvider();
+				this.#previewProfileName = undefined;
+				this.#presetLoginHint = undefined;
+				this.#renderPresetLanding();
+			}
+			return;
+		}
+		if (matchesKey(keyData, "left")) {
+			if (!this.#presetScopeMenuOpen) {
+				this.#collapseSelectedPresetProvider();
+				this.#previewProfileName = undefined;
+				this.#presetLoginHint = undefined;
+				this.#renderPresetLanding();
+			}
 			return;
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
@@ -1196,7 +1224,7 @@ export class ModelSelectorComponent extends Container {
 			}
 			if (this.#expandedPresetProviderId) {
 				this.#expandedPresetProviderId = undefined;
-				this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
+				this.#clampPresetCursor();
 				this.#renderPresetLanding();
 				return;
 			}
