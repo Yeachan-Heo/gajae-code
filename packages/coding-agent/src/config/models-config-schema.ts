@@ -108,6 +108,7 @@ export const ProfileModelMappingSchema = z.partialRecord(ProfileRoleSchema, Prof
 export const ProfileDefinitionSchema = z
 	.object({
 		required_providers: z.array(z.string().min(1)).min(1),
+		display_name: z.string().min(1).optional(),
 		model_mapping: ProfileModelMappingSchema,
 	})
 	.strict();

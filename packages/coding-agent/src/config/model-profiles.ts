@@ -6,6 +6,7 @@ export type ModelProfileRole = GjcModelAssignmentTargetId;
 export interface ModelProfileDefinition {
 	name: string;
 	requiredProviders: string[];
+	displayName?: string;
 	/**
 	 * Optional groups of providers that are interchangeable fallbacks.
 	 * Each group is an array of provider ids where at least one must be
@@ -323,8 +324,14 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"minimax-code": "minimax-medium",
 };
 
-export function getModelProfilePresentation(name: string): ModelProfilePresentation {
-	return PROFILE_PRESENTATION[name] ?? { displayName: name, providerGroup: "COMBOS" };
+export function getModelProfilePresentation(
+	profile: string | Pick<ModelProfileDefinition, "name" | "displayName">,
+): ModelProfilePresentation {
+	const name = typeof profile === "string" ? profile : profile.name;
+	const displayName = typeof profile === "string" ? undefined : profile.displayName;
+	const presentation = PROFILE_PRESENTATION[name];
+	if (presentation) return presentation;
+	return { displayName: displayName ?? name, providerGroup: "CUSTOM" };
 }
 
 export function groupModelProfilesForPresetLanding(
@@ -333,7 +340,7 @@ export function groupModelProfilesForPresetLanding(
 	const groups = new Map<string, ModelProfileDefinition[]>();
 	for (const group of PROFILE_GROUP_ORDER) groups.set(group, []);
 	for (const profile of profiles.values()) {
-		const group = getModelProfilePresentation(profile.name).providerGroup;
+		const group = getModelProfilePresentation(profile).providerGroup;
 		if (!groups.has(group)) groups.set(group, []);
 		groups.get(group)?.push(profile);
 	}
@@ -365,6 +372,7 @@ export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map
 		const modelMapping = { ...definition.model_mapping };
 		profiles.set(name, {
 			name,
+			displayName: definition.display_name,
 			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
 			modelMapping,
 			source: "user",

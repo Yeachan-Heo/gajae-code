@@ -662,8 +662,8 @@
 				"steer",
 				"queue"
 			],
-			"description": "What a submitted prompt does while the agent is busy: steer (interrupt the active turn) or queue (run after the active turn completes)",
-			"default": "steer"
+			"description": "What a submitted prompt does while the agent is busy: queue normal chat for the next turn, or steer to interrupt the active turn",
+			"default": "queue"
 		},
 		"doubleEscapeAction": {
 			"type": "string",

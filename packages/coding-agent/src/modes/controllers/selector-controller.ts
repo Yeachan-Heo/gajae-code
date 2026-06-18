@@ -49,6 +49,10 @@ import {
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
+import {
+	CustomModelPresetWizardComponent,
+	type CustomModelPresetWizardSubmit,
+} from "../components/custom-model-preset-wizard";
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
@@ -211,6 +215,36 @@ export class SelectorController {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
 		}
 		this.ctx.ui.requestRender();
+	}
+
+	showCustomModelPresetWizard(): void {
+		this.showSelector(done => {
+			let wizard: CustomModelPresetWizardComponent;
+			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
+				try {
+					const profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
+					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.notifyConfigChanged?.();
+					this.ctx.showStatus(`Custom model preset created: ${profile.displayName ?? profile.name}`);
+					done();
+					this.ctx.ui.requestRender();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					wizard.setSubmitError(`Preset creation failed: ${message}`);
+				}
+			};
+			wizard = new CustomModelPresetWizardComponent(
+				input => {
+					void submit(input);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+				() => this.ctx.ui.requestRender(),
+			);
+			return { component: wizard, focus: wizard };
+		});
 	}
 
 	showCustomProviderWizard(): void {
@@ -618,6 +652,11 @@ export class SelectorController {
 				this.ctx.session.scopedModels,
 				async selection => {
 					try {
+						if (selection.kind === "createProfile") {
+							done();
+							this.showCustomModelPresetWizard();
+							return;
+						}
 						if (selection.kind === "profile") {
 							await activateModelProfile(
 								{

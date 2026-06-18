@@ -1141,6 +1141,10 @@
 							"minLength": 1
 						}
 					},
+					"display_name": {
+						"type": "string",
+						"minLength": 1
+					},
 					"model_mapping": {
 						"type": "object",
 						"propertyNames": {

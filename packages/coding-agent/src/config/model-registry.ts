@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	type Api,
@@ -45,11 +46,17 @@ import {
 	formatCanonicalVariantSelector,
 	type ModelEquivalenceConfig,
 } from "./model-equivalence";
-import { type ModelProfileDefinition, mergeModelProfiles } from "./model-profiles";
+import {
+	aggregateModelProfileRequiredProviders,
+	type ModelProfileDefinition,
+	mergeModelProfiles,
+} from "./model-profiles";
 import {
 	type ModelOverride,
+	type ModelProfileConfig,
 	type ModelsConfig,
 	ModelsConfigSchema,
+	ProfileDefinitionSchema,
 	type ProviderAuthMode,
 	type ProviderDiscovery,
 } from "./models-config-schema";
@@ -1488,6 +1495,44 @@ export class ModelRegistry {
 
 	getAvailableModelProfileNames(): string[] {
 		return [...this.#modelProfiles.keys()].sort((a, b) => a.localeCompare(b));
+	}
+
+	async saveCustomModelProfile(name: string, definition: ModelProfileConfig): Promise<ModelProfileDefinition> {
+		const normalizedName = name.trim();
+		if (!normalizedName) throw new Error("Profile name is required.");
+		const checkedDefinition = ProfileDefinitionSchema.safeParse(definition);
+		if (!checkedDefinition.success) {
+			const first = checkedDefinition.error.issues[0];
+			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+		}
+		const current = this.#modelsConfigFile.loadOrDefault();
+		const next: ModelsConfig = {
+			...current,
+			profiles: {
+				...(current.profiles ?? {}),
+				[normalizedName]: definition,
+			},
+		};
+		const checkedConfig = ModelsConfigSchema.safeParse(next);
+		if (!checkedConfig.success) {
+			const first = checkedConfig.error.issues[0];
+			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+		}
+		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
+		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(checkedConfig.data, null, 2));
+		this.#modelsConfigFile.invalidate();
+		this.#reloadStaticModels();
+		const modelMapping = { ...definition.model_mapping };
+		const profile: ModelProfileDefinition = {
+			name: normalizedName,
+			displayName: definition.display_name,
+			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
+			modelMapping,
+			source: "user",
+		};
+		return profile;
 	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
 		this.#modelBindingsTargetSettings = targetSettings;

@@ -102,6 +102,9 @@ export type ModelSelectorSelection =
 			kind: "profile";
 			profileName: string;
 			setDefault: boolean;
+	  }
+	| {
+			kind: "createProfile";
 	  };
 
 interface PendingThinkingChoice {
@@ -148,11 +151,15 @@ interface PresetProfileRow {
 	profile: ModelProfileDefinition;
 }
 
+interface PresetCreateRow {
+	kind: "create";
+}
+
 interface PresetBrowseRow {
 	kind: "browse";
 }
 
-type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetBrowseRow;
+type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetCreateRow | PresetBrowseRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -165,6 +172,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return `profile:${row.groupId}:${row.profile.name}`;
 		case "browse":
 			return "browse";
+		case "create":
+			return "create";
 	}
 }
 
@@ -701,6 +710,7 @@ export class ModelSelectorComponent extends Container {
 				for (const profile of profiles) rows.push({ kind: "profile", groupId, profile });
 			}
 		}
+		rows.push({ kind: "create" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -804,6 +814,11 @@ export class ModelSelectorComponent extends Container {
 			const row = rows[i];
 			const selected = i === this.#presetCursor;
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			if (row.kind === "create") {
+				const label = "Create custom preset";
+				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
 			if (row.kind === "browse") {
 				const label = "Browse all models";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
@@ -817,7 +832,7 @@ export class ModelSelectorComponent extends Container {
 				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
 				continue;
 			}
-			const presentation = getModelProfilePresentation(row.profile.name);
+			const presentation = getModelProfilePresentation(row.profile);
 			const authenticated = this.#isPresetAuthenticated(row.profile);
 			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
 			const label = `  ${mark} ${presentation.displayName}`;
@@ -835,11 +850,7 @@ export class ModelSelectorComponent extends Container {
 	#renderPresetPreview(profile: ModelProfileDefinition): void {
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
-			new Text(
-				theme.fg("muted", `  Preset preview: ${getModelProfilePresentation(profile.name).displayName}`),
-				0,
-				0,
-			),
+			new Text(theme.fg("muted", `  Preset preview: ${getModelProfilePresentation(profile).displayName}`), 0, 0),
 		);
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
@@ -1221,6 +1232,10 @@ export class ModelSelectorComponent extends Container {
 		}
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
+		if (row.kind === "create") {
+			this.#onSelectCallback({ kind: "createProfile" });
+			return;
+		}
 		if (row.kind === "browse") {
 			this.#switchToModelMode();
 			return;
