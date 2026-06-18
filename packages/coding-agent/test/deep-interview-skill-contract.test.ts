@@ -44,6 +44,27 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 		expect(skill).toMatch(/min-round floor, score-drop cap, (confidence )?dampening/i);
 		expect(skill).toMatch(/Bidirectional scoring is the pacing mechanism/i);
 	});
+
+	it("documents scope-trim rescue for broad ideas and weak question synthesis", () => {
+		expect(skill).toMatch(/scope-trim/i);
+		expect(skill).toMatch(/shrinks active scope before resuming normal depth/i);
+		expect(skill).toMatch(/2-4 answer options plus free-text/i);
+	});
+
+	it("requires a generic harness-style clarity architecture instead of a domain-specific default", () => {
+		expect(skill).toContain("Harness-Style Clarity Architecture");
+		expect(skill).toMatch(/fan-out\/fan-in/i);
+		expect(skill).toContain("Default clarity lenses");
+		expect(skill).toContain("Generic issue buckets");
+		expect(skill).toContain("hidden assumptions");
+		expect(skill).toContain("sounds-specific-but-underspecified risk");
+		expect(skill).toContain("unresolved_critical_issues");
+		expect(skill).toContain("unresolved_major_issues");
+		expect(skill).toContain("confidence_to_plan");
+		expect(skill).toContain("Generic crystallization template");
+		expect(skill).toContain("Domain lens selection");
+		expect(skill).toContain("Do not hardcode any field-specific crystallization template");
+	});
 });
 
 describe("deep-interview self-proofread output rule", () => {

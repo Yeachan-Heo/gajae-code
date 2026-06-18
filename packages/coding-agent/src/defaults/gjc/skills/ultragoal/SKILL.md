@@ -154,6 +154,18 @@ If an Ultragoal request has no approved plan or consensus artifact, run `ralplan
 
 The Ultragoal leader owns `.gjc/ultragoal/goals.json` and `.gjc/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 
+### Harness-Style Execution Architecture Intake
+
+When the approved ralplan artifact contains a Harness-Style Execution Architecture section, the Ultragoal leader must preserve it in the run context and execute from its Task lanes instead of flattening the work into leader-only serial execution.
+
+- Respect the declared `Pipeline`, `Fan-out/Fan-in`, `Expert Pool`, `Producer-Reviewer`, `Supervisor`, or `Hierarchical Delegation` pattern.
+- Spawn native subagents for independent Task lanes when the lanes have clear inputs, outputs/artifacts, acceptance criteria, and verification evidence.
+- Map lane runtime targets to available GJC agents: use project `.gjc/agents` entries when present, otherwise use `executor` for delivery, analysis, transformation, validation, or other domain-work lanes and `architect` or `critic` for review and challenge lanes.
+- The leader owns integration, checkpointing, steering, and `.gjc/ultragoal` writes. Subagents return lane evidence only.
+- Honor dependencies and parallel groups: run dependent lanes sequentially, run independent lanes in parallel when useful, then integrate before review lanes.
+- For domain-specific crystallization lanes, keep domain context/evidence, input or asset audit, method/design, implementation or production, evaluation/validation, reproducibility/operability, and failure/risk analysis as separate bounded lanes whenever the plan provides them. Prefer cheap smoke checks and reversible dry-runs before expensive or hard-to-revert work.
+- If no Execution Architecture exists, fall back to normal Ultragoal delegation heuristics and record that the run had no explicit task-to-agent architecture. Do not auto-launch Team as a substitute.
+
 For large subgoals with independent slices, the Ultragoal leader must spawn parallel `executor` subagents instead of doing serial solo work. Split only cleanly separable files/surfaces, give each executor bounded targets and acceptance criteria, and keep checkpoint ownership in the leader. Use `architect` / `critic` review lanes after integration; do not let worker agents mutate `.gjc/ultragoal` or call goal tools.
 
 ## Use Ultragoal and Team together
