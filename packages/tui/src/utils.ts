@@ -154,7 +154,6 @@ const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
 const HANGUL_JAMO_REGEX = /[\u1100-\u11ff\ua960-\ua97f\ud7b0-\ud7ff]/;
 
-
 /**
  * Normalize text for terminal output without changing logical editor content.
  * Some terminals render canonically decomposed Hangul jamo or precomposed
@@ -165,7 +164,9 @@ export function normalizeTerminalOutput(str: string): string {
 	let normalized = str;
 	if (HANGUL_JAMO_REGEX.test(normalized)) normalized = normalized.normalize("NFC");
 	if (!THAI_LAO_AM_REGEX.test(normalized)) return normalized;
-	return normalized.replaceAll(THAI_LAO_AM_GLOBAL_REGEX, char => (char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2"));
+	return normalized.replaceAll(THAI_LAO_AM_GLOBAL_REGEX, char =>
+		char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2",
+	);
 }
 
 const makeBoolArray = (chars: string): Uint8Array => {
