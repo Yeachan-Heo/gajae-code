@@ -224,8 +224,10 @@ describe("custom model preset creation", () => {
 		);
 		await new Promise(resolve => setTimeout(resolve, 0));
 
-		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		let text = normalizeRenderedText(selector.render(180).join("\n"));
 		expect(text).toContain("CUSTOM");
+		selector.handleInput("\x1b[C");
+		text = normalizeRenderedText(selector.render(180).join("\n"));
 		expect(text).toContain("My Fast");
 		expect(text).toContain("Create custom preset");
 		expect(text).toContain("Browse all models");

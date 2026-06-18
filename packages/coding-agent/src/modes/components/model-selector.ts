@@ -784,7 +784,7 @@ export class ModelSelectorComponent extends Container {
 
 	#expandSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse") return;
+		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
 		const targetIdentity = presetRowIdentity(selected);
 		this.#expandedPresetProviderId = selected.groupId;
@@ -793,7 +793,7 @@ export class ModelSelectorComponent extends Container {
 
 	#collapseSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse") return;
+		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
 		const targetIdentity = selected.kind === "profile" ? `group:${selected.groupId}` : presetRowIdentity(selected);
 		this.#expandedPresetProviderId = undefined;
