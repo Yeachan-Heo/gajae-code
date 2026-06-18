@@ -70,6 +70,7 @@ describe("openai-completions compatibility", () => {
 		const compat = {
 			supportsStore: true,
 			supportsDeveloperRole: true,
+			sendSessionHeaders: false,
 			supportsMultipleSystemMessages: true,
 			supportsReasoningEffort: true,
 			reasoningEffortMap: {},

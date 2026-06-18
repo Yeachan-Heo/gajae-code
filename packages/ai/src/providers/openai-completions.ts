@@ -453,6 +453,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.streamFirstEventTimeoutMs,
 				options?.authCredentialType,
 				options?.requestMaxRetries,
+				options?.sessionId,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -943,6 +944,7 @@ async function createClient(
 	streamFirstEventTimeoutOverride?: number,
 	authCredentialType?: OpenAICompletionsOptions["authCredentialType"],
 	requestMaxRetries?: number,
+	sessionId?: string,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -981,6 +983,14 @@ async function createClient(
 		headers["X-OpenRouter-Cache-TTL"] = "3600";
 	}
 	Object.assign(headers, extraHeaders);
+	if (sessionId && resolveOpenAICompat(model).sendSessionHeaders) {
+		// Forward the agent session id as vendor-neutral session-identity headers so
+		// OpenAI-compatible proxies/relays can do session-affinity routing and reuse a
+		// server-side prompt cache. Opt-in via `compat.sendSessionHeaders`; never
+		// overwrite a header the caller already set (model.headers / requestTransform).
+		headers.session_id ??= sessionId;
+		headers["x-session-id"] ??= sessionId;
+	}
 	if (model.provider === "kimi-code") {
 		headers = { ...getKimiCommonHeaders(), ...headers };
 	}

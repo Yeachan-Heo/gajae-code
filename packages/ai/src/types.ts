@@ -743,6 +743,17 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	/** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
 	supportsDeveloperRole?: boolean;
 	/**
+	 * Whether to forward the agent session id as vendor-neutral session-identity
+	 * headers (`session_id`, `x-session-id`) on every chat-completions request.
+	 * Off by default. Opt in for OpenAI-compatible proxies/relays that route on
+	 * session affinity or reuse a server-side prompt cache keyed by session.
+	 * First-party OpenAI does not need this (it has its own gated injection in
+	 * the openai-responses provider). Headers are only added when a non-empty
+	 * session id is available and are never allowed to overwrite a header the
+	 * caller already set via `headers`/`requestTransform`.
+	 */
+	sendSessionHeaders?: boolean;
+	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system
 	 * prompts are coalesced into a single message joined by `\n\n` so

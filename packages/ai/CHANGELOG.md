@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added opt-in `compat.sendSessionHeaders` for the `openai-completions` provider. When enabled (default off), the agent session id is forwarded as vendor-neutral `session_id` and `x-session-id` request headers to any OpenAI-compatible endpoint, letting relays/proxies do session-affinity routing and reuse a server-side prompt cache keyed by the session. Previously only the `openai-responses` provider injected session headers, and only against a first-party OpenAI base URL. Injection runs after the caller's `headers`/`extraHeaders` are merged and before `requestTransform`, and uses `??=` so any header the caller already set always wins; it is skipped entirely when the flag is off or no session id is available, leaving existing provider behavior byte-identical. The first-party `openai-responses` gating is unchanged.
 
 ## [0.6.0] - 2026-06-18
 ### Fixed

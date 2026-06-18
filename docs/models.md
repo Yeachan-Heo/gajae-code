@@ -701,6 +701,7 @@ Request shaping:
 
 - `supportsStore` — emit `store: false` on requests. Default: auto (off for non-standard endpoints).
 - `supportsDeveloperRole` — use the `developer` system role for reasoning models instead of `system`. Default: auto.
+- `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
