@@ -5,7 +5,16 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
+const COMPONENTS: SetupComponent[] = [
+	"credentials",
+	"defaults",
+	"external-root-survey",
+	"hermes",
+	"hooks",
+	"provider",
+	"python",
+	"stt",
+];
 
 export default class Setup extends Command {
 	static description = "Install GJC defaults or optional feature dependencies";
@@ -49,6 +58,21 @@ export default class Setup extends Command {
 		"models-path": Flags.string({ description: "Override models config path" }),
 		yes: Flags.boolean({ char: "y", description: "Import discovered credentials without an interactive prompt" }),
 		"dry-run": Flags.boolean({ description: "Preview discovered credentials without importing" }),
+		depth: Flags.string({
+			description: "External-root survey depth: inventory, config, or deep",
+			options: ["inventory", "config", "deep"],
+		}),
+		anchor: Flags.string({
+			description: "External-root survey anchor: codex, claude, gemini, hermes, or home (repeatable)",
+			multiple: true,
+			options: ["codex", "claude", "gemini", "hermes", "home"],
+		}),
+		"max-bytes": Flags.string({ description: "External-root survey maximum bytes per file/sample" }),
+		"max-entries": Flags.string({ description: "External-root survey maximum entries per scope" }),
+		"timeout-ms": Flags.string({ description: "External-root survey timeout in milliseconds" }),
+		"sample-limit": Flags.string({ description: "External-root survey sample limit" }),
+		report: Flags.boolean({ description: "External-root survey absorption catalog report" }),
+		home: Flags.string({ description: "External-root survey home directory override" }),
 	};
 
 	async run(): Promise<void> {
@@ -83,6 +107,14 @@ export default class Setup extends Command {
 				profileDir: flags["profile-dir"],
 				yes: flags.yes,
 				dryRun: flags["dry-run"],
+				depth: flags.depth,
+				anchor: flags.anchor,
+				maxBytes: flags["max-bytes"],
+				maxEntries: flags["max-entries"],
+				timeoutMs: flags["timeout-ms"],
+				sampleLimit: flags["sample-limit"],
+				report: flags.report,
+				home: flags.home,
 			},
 		};
 		await initTheme();

@@ -19,6 +19,12 @@ import {
 import { theme } from "../modes/theme/theme";
 import { discoverExternalCredentials, formatDiscoverySummary, importCredentials } from "../setup/credential-import";
 import {
+	formatExternalRootSurveyCatalogReport,
+	formatExternalRootSurveyResult,
+	runExternalRootSurvey,
+	type ExternalRootSurveyFlags,
+} from "../setup/external-root-survey";
+import {
 	formatHermesSetupResult,
 	type HermesSetupFlags,
 	hermesSetupExitCode,
@@ -31,7 +37,15 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 
-export type SetupComponent = "credentials" | "defaults" | "hermes" | "hooks" | "provider" | "python" | "stt";
+export type SetupComponent =
+	| "credentials"
+	| "defaults"
+	| "external-root-survey"
+	| "hermes"
+	| "hooks"
+	| "provider"
+	| "python"
+	| "stt";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -63,10 +77,27 @@ export interface SetupCommandArgs {
 		profileDir?: string;
 		yes?: boolean;
 		dryRun?: boolean;
+		depth?: string;
+		anchor?: string[];
+		maxBytes?: string;
+		maxEntries?: string;
+		timeoutMs?: string;
+		sampleLimit?: string;
+		report?: boolean;
+		home?: string;
 	};
 }
 
-const VALID_COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = [
+	"credentials",
+	"defaults",
+	"external-root-survey",
+	"hermes",
+	"hooks",
+	"provider",
+	"python",
+	"stt",
+];
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -123,6 +154,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.yes = true;
 		} else if (arg === "--dry-run") {
 			flags.dryRun = true;
+		} else if (arg === "--report") {
+			flags.report = true;
 		} else if (arg === "--root") {
 			flags.root = [...(flags.root ?? []), args[++i] ?? ""];
 		} else if (arg === "--repo") {
@@ -166,6 +199,20 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.model = [...(flags.model ?? []), args[++i] ?? ""];
 		} else if (arg === "--models-path") {
 			flags.modelsPath = args[++i];
+		} else if (arg === "--depth") {
+			flags.depth = args[++i];
+		} else if (arg === "--anchor") {
+			flags.anchor = [...(flags.anchor ?? []), args[++i] ?? ""];
+		} else if (arg === "--max-bytes") {
+			flags.maxBytes = args[++i];
+		} else if (arg === "--max-entries") {
+			flags.maxEntries = args[++i];
+		} else if (arg === "--timeout-ms") {
+			flags.timeoutMs = args[++i];
+		} else if (arg === "--sample-limit") {
+			flags.sampleLimit = args[++i];
+		} else if (arg === "--home") {
+			flags.home = args[++i];
 		} else if (!componentSeen && VALID_COMPONENTS.includes(arg as SetupComponent)) {
 			component = arg as SetupComponent;
 			componentSeen = true;
@@ -238,6 +285,9 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 		case "defaults":
 			await handleDefaultsSetup(cmd.flags);
 			break;
+		case "external-root-survey":
+			await handleExternalRootSurvey(cmd.flags);
+			break;
 		case "hermes":
 			await handleHermesSetup(cmd.flags);
 			break;
@@ -257,6 +307,19 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			await handleCredentialsSetup(cmd.flags);
 			break;
 	}
+}
+
+async function handleExternalRootSurvey(flags: ExternalRootSurveyFlags & { json?: boolean; report?: boolean }): Promise<void> {
+	const result = await runExternalRootSurvey(flags);
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+		return;
+	}
+	if (flags.report) {
+		process.stdout.write(`${formatExternalRootSurveyCatalogReport(result)}\n`);
+		return;
+	}
+	process.stdout.write(`${formatExternalRootSurveyResult(result)}\n`);
 }
 
 async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
@@ -619,6 +682,7 @@ ${chalk.bold("Components:")}
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
   credentials Optional: import existing Claude Code / Codex CLI credentials
+  external-root-survey Optional: survey external agent roots with tiered, capped discovery
 
 
 ${chalk.bold("Provider example:")}
@@ -656,6 +720,14 @@ ${chalk.bold("Options:")}
   --profile-dir     Hermes profile directory for full setup install
   --dry-run         Preview discovered credentials without importing (credentials)
   -y, --yes         Import discovered credentials without an interactive prompt (credentials)
+  --depth           External-root survey depth: inventory, config, or deep
+  --anchor          External-root survey anchor: codex, claude, gemini, hermes, or home (repeatable)
+  --max-bytes       External-root survey maximum bytes per file/sample
+  --max-entries     External-root survey maximum entries per scope
+  --timeout-ms      External-root survey timeout in milliseconds
+  --sample-limit    External-root survey sample limit
+  --report          External-root survey absorption catalog report
+  --home            External-root survey home directory override
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills
@@ -671,5 +743,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
   ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
   ${APP_NAME} setup credentials --yes      Import without an interactive prompt
+  ${APP_NAME} setup external-root-survey --json --depth inventory --anchor codex
+  ${APP_NAME} setup external-root-survey --depth config --anchor claude --max-entries 50
+  ${APP_NAME} setup external-root-survey --report --depth deep --anchor codex --anchor claude
 `);
 }
