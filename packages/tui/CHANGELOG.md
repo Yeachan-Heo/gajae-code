@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Normalized canonically decomposed Hangul jamo at the terminal emission boundary so Korean text remains precomposed/stable in VS Code Remote and other terminal renderers that mishandle jamo clusters during repaint (#837).
+
 ## [0.5.3] - 2026-06-16
 
 ### Fixed
