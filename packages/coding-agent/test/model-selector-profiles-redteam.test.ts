@@ -249,6 +249,7 @@ describe("model selector profile red-team", () => {
 		const selector = createSelector(() => {});
 		await renderSelector(selector);
 		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 

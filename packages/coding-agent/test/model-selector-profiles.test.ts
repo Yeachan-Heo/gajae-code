@@ -146,7 +146,7 @@ describe("model selector profiles", () => {
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Model presets");
 		expect(rendered).toContain("CODEX");
-		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("CUSTOM");
 		expect(rendered).not.toContain("profile-a");
 		expect(rendered).toContain("Browse all models");
 	});
@@ -179,14 +179,14 @@ describe("model selector profiles", () => {
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("CODEX");
-		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("CUSTOM");
 		expect(rendered).toContain("Browse all models");
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
 
 		selector.handleInput("\x1b[B");
 		rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered).toContain("COMBOS");
+		expect(rendered).toContain("CUSTOM");
 		expect(rendered).toContain("Browse all models");
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
