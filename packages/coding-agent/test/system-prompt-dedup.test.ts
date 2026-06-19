@@ -71,17 +71,35 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBe("Project SYSTEM prompt");
 	});
-	it("does not load user-home Claude or Codex prompt files", async () => {
+	it("does not load user-home context or prompt files into project context", async () => {
 		const projectDir = path.join(tempDir, "project");
 		fs.mkdirSync(projectDir, { recursive: true });
 		fs.mkdirSync(path.join(tempHomeDir, ".claude"), { recursive: true });
 		fs.mkdirSync(path.join(tempHomeDir, ".codex"), { recursive: true });
+		fs.mkdirSync(path.join(tempHomeDir, ".config", "opencode"), { recursive: true });
+		fs.mkdirSync(path.join(tempHomeDir, ".gemini"), { recursive: true });
 		fs.writeFileSync(path.join(tempHomeDir, ".claude", "CLAUDE.md"), "Home Claude instructions");
 		fs.writeFileSync(path.join(tempHomeDir, ".claude", "SYSTEM.md"), "Home Claude system prompt");
 		fs.writeFileSync(path.join(tempHomeDir, ".codex", "AGENTS.md"), "Home Codex instructions");
+		fs.writeFileSync(path.join(tempHomeDir, ".config", "opencode", "AGENTS.md"), "Home opencode instructions");
+		fs.writeFileSync(path.join(tempHomeDir, ".gemini", "GEMINI.md"), "Home Gemini instructions");
 
 		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBeNull();
 		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([]);
+	});
+	it("keeps project-level Gemini context files", async () => {
+		const projectDir = path.join(tempDir, "project");
+		const geminiDir = path.join(projectDir, ".gemini");
+		fs.mkdirSync(geminiDir, { recursive: true });
+		fs.writeFileSync(path.join(geminiDir, "GEMINI.md"), "Project Gemini instructions");
+
+		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([
+			{
+				path: path.join(geminiDir, "GEMINI.md"),
+				content: "Project Gemini instructions",
+				depth: -1,
+			},
+		]);
 	});
 	it("drops identical explicit context entries even when file names differ", async () => {
 		const farPath = path.join(tempDir, "far", "AGENTS.md");
