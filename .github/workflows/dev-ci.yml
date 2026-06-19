@@ -164,6 +164,8 @@ jobs:
       - name: Run affected task shard
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
 
   # Branch protection must keep requiring this stable aggregate status. It runs
