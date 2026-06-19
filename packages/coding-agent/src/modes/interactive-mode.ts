@@ -44,7 +44,7 @@ import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slas
 import { consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
 import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
-import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
+import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import {
 	humanizePlanTitle,
 	type PlanApprovalDetails,
@@ -71,6 +71,7 @@ import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import { ToolError } from "../tools/tool-errors";
+
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
@@ -2061,23 +2062,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#handleLspStartupEvent(event: LspStartupEvent): void {
 		this.#updateWelcomeLspServers();
 
-		if (event.type === "failed") {
-			this.showWarning(`LSP startup failed: ${event.error}. It will retry lazily on write.`);
-			return;
-		}
-
-		const failedServers = event.servers.filter(server => server.status === "error");
-
-		if (failedServers.length === 1) {
-			const failedServer = failedServers[0];
-			const detail = failedServer.error ? `: ${failedServer.error}` : "";
-			this.showWarning(`LSP startup failed for ${failedServer.name}${detail}. It will retry lazily on write.`);
-			return;
-		}
-
-		if (failedServers.length > 1) {
-			const failedNames = failedServers.map(server => server.name).join(", ");
-			this.showWarning(`LSP startup failed for ${failedNames}. It will retry lazily on write.`);
+		const warningMessage = getLspStartupWarningMessage(event);
+		if (warningMessage) {
+			this.showWarning(warningMessage);
 		}
 	}
 
