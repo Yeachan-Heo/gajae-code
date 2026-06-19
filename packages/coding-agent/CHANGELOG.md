@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `gjc update` now runs the freshly installed `gjc --smoke-test` after version verification and tells users to restart running sessions, surfacing stale or partial runtime updates such as native-addon release mismatches immediately.
+
 ## [0.6.1] - 2026-06-18
 
 ### Fixed

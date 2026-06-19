@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented OpenAI Codex Responses `invalid_function_parameters` / tool-schema validation error events from being treated as retryable `server_error`s, so malformed request schemas fail fast instead of burning the full retry budget.
+- Read LM Studio `/v1/models` nested metadata such as `meta.n_ctx`, `meta.n_ctx_train`, and `details.max_tokens` when normalizing dynamically discovered GGUF-backed local models.
+
 ## [0.6.1] - 2026-06-18
 
 ### Fixed

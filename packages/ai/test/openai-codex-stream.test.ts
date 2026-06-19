@@ -861,6 +861,42 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.content.find(block => block.type === "text")?.text).toBe("Hello after retry");
 	});
+	it("does not retry non-recoverable Codex schema validation SSE events", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const token = createCodexTestToken();
+		const errorSse = `${[
+			`data: ${JSON.stringify({
+				type: "error",
+				code: "server_error",
+				message:
+					"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
+			})}`,
+		].join("\n\n")}\n\n`;
+
+		const fetchMock = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response(errorSse, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			preferWebsockets: false,
+		};
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), { apiKey: token }).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("invalid_function_parameters");
+	});
 
 	it("honors streamMaxRetries for replay-safe Codex stream failures", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");

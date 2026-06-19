@@ -1,15 +1,19 @@
-import { afterEach, describe, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { lmStudioModelManagerOptions } from "../src/provider-models/openai-compat";
 
 const tempDirs: string[] = [];
+const originalFetch = globalThis.fetch;
 
 afterEach(() => {
+	globalThis.fetch = originalFetch;
 	for (const dir of tempDirs.splice(0)) {
 		fs.rmSync(dir, { force: true, recursive: true });
 	}
+	vi.restoreAllMocks();
 });
 
 function runDiscoveryIsolationScript(script: string, env: Record<string, string>, dotenv: string): void {
@@ -78,5 +82,37 @@ assertEqual(requests[0]?.authorization, "Bearer test-key", "discovery authorizat
 			{ OPENAI_BASE_URL: "https://inherited-openai.example.com/v1" },
 			"OPENAI_BASE_URL=https://dotenv-openai.example.com/v1\n",
 		);
+	});
+});
+
+describe("LM Studio model discovery metadata", () => {
+	it("uses nested LM Studio metadata for GGUF context and output limits", async () => {
+		globalThis.fetch = vi.fn(async () => {
+			return new Response(
+				JSON.stringify({
+					data: [
+						{
+							id: "DeepSeek-V4-Flash-Q4_K_M.gguf",
+							name: "DeepSeek V4 Flash",
+							meta: {
+								n_ctx: "131072",
+								n_ctx_train: 262144,
+							},
+							details: {
+								max_tokens: "8192",
+							},
+						},
+					],
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const options = lmStudioModelManagerOptions({ baseUrl: "http://127.0.0.1:1234/v1" });
+		const models = await options.fetchDynamicModels?.();
+
+		const model = models?.find(candidate => candidate.id === "DeepSeek-V4-Flash-Q4_K_M.gguf");
+		expect(model?.contextWindow).toBe(131072);
+		expect(model?.maxTokens).toBe(8192);
 	});
 });
