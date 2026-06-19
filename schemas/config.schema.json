@@ -710,6 +710,7 @@
 					"enum": [
 						"auto",
 						"unicode",
+						"square",
 						"ascii"
 					],
 					"description": "Logo style for the startup welcome screen",

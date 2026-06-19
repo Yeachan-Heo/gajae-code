@@ -13,7 +13,7 @@ export interface LspServerInfo {
 	fileTypes: string[];
 }
 
-export type WelcomeLogoMode = "unicode" | "ascii";
+export type WelcomeLogoMode = "unicode" | "square" | "ascii";
 
 /**
  * GJC-native launch surface with compact command affordances, project
@@ -280,7 +280,9 @@ export class WelcomeComponent implements Component {
 	}
 
 	#logoLines(): readonly string[] {
-		return this.logoMode === "ascii" ? ASCII_CLAW_LOGO : RED_CLAW_LOGO;
+		if (this.logoMode === "ascii") return ASCII_CLAW_LOGO;
+		if (this.logoMode === "square") return SQUARE_CLAW_LOGO;
+		return RED_CLAW_LOGO;
 	}
 }
 
@@ -292,6 +294,16 @@ const RED_CLAW_LOGO = [
 	"       ╭──────╮    ╰───╮  ╰──╮      ",
 	"╭──────╯      ╰──╮     ╰──╮  ╰─────╮",
 	"╰────────────────╯        ╰────────╯",
+];
+
+// biome-ignore format: preserve ASCII art layout
+const SQUARE_CLAW_LOGO = [
+	"┌────────────────┐        ┌────────┐",
+	"└──────┐      ┌──┘     ┌──┘  ┌─────┘",
+	"       └──────┘    ┌───┘  ┌──┘      ",
+	"       ┌──────┐    └───┐  └──┐      ",
+	"┌──────┘      └──┐     └──┐  └─────┐",
+	"└────────────────┘        └────────┘",
 ];
 
 // biome-ignore format: preserve ASCII art layout
@@ -405,5 +417,6 @@ const INTRO_SHINE_TRAVERSALS = 3;
 /** Resting gradient frames, cached for re-renders outside of the intro. */
 const REST_FRAMES: Record<WelcomeLogoMode, readonly string[]> = {
 	unicode: gradientLogo(RED_CLAW_LOGO, 0),
+	square: gradientLogo(SQUARE_CLAW_LOGO, 0),
 	ascii: gradientLogo(ASCII_CLAW_LOGO, 0),
 };

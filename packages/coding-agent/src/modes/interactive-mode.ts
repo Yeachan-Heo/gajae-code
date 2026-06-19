@@ -222,16 +222,19 @@ function parseGoalSubcommand(args: string): { sub: GoalSubcommand | undefined; r
 	return { sub: undefined, rest: trimmed };
 }
 
-type WelcomeBannerSettingMode = "auto" | "unicode" | "ascii";
+export type WelcomeBannerSettingMode = "auto" | "unicode" | "square" | "ascii";
 
 export function resolveWelcomeLogoMode(
 	mode: WelcomeBannerSettingMode,
 	env: Record<string, string | undefined> = Bun.env,
 	platform: NodeJS.Platform = process.platform,
 ): WelcomeLogoMode {
+	void env;
+	void platform;
 	if (mode === "unicode") return "unicode";
+	if (mode === "square") return "square";
 	if (mode === "ascii") return "ascii";
-	return platform === "win32" && env.WT_SESSION ? "ascii" : "unicode";
+	return "unicode";
 }
 
 /** Options for creating an InteractiveMode instance (for future API use) */

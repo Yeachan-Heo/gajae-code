@@ -35,3 +35,15 @@ Switching backends mid-session is honoured on the next system-prompt rebuild and
 ## Red-claw TUI theme
 
 The interactive TUI defaults to the bundled `red-claw` crustacean theme for dark terminals and the bundled `blue-crab` theme for light-appearance terminals, with matching welcome/icon assets. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win; set `theme.dark: red-claw` and `theme.light: blue-crab` in `~/.gjc/agent/config.yml` to pin them.
+
+### Welcome banner fonts on Windows Terminal
+
+The startup logo defaults to rounded Unicode box drawing. Windows Terminal can render it correctly when the selected profile font has the needed box-drawing glyphs; recommended choices are `Cascadia Mono` or `Cascadia Mono Nerd Font`. In Windows Terminal Settings, set the profile font face to one of those fonts, or add it to the profile JSON:
+
+```json
+"font": {
+  "face": "Cascadia Mono"
+}
+```
+
+For terminals or fonts with broken rounded corners, set `startup.welcomeBannerMode` in `~/.gjc/config.yml` to one of `unicode`, `square`, or `ascii`. `square` keeps a Unicode-looking logo using square corners (`┌ ┐ └ ┘`) while `ascii` uses only `+`, `-`, and `|`.

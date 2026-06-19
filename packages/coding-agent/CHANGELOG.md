@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Added `startup.welcomeBannerMode = "square"` for a square-corner Unicode welcome-logo fallback, and stopped treating Windows Terminal (`WT_SESSION`) as an automatic ASCII downgrade; `auto` now preserves the rounded Unicode logo while `unicode`, `square`, and `ascii` remain explicit overrides.
+
+### Documentation
+
+- Documented Windows Terminal welcome-logo troubleshooting with Cascadia Mono / Cascadia Mono Nerd Font and the profile `fontFace` setting.
+
 ## [0.6.3] - 2026-06-19
 
 ### Fixed

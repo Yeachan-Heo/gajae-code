@@ -126,11 +126,26 @@ describe("redesigned interactive shell chrome", () => {
 		}
 	});
 
-	it("resolves welcome banner auto mode for native Windows Terminal only", () => {
-		expect(resolveWelcomeLogoMode("auto", { WT_SESSION: "session-id" }, "win32")).toBe("ascii");
+	it("renders a square-corner Unicode welcome logo when requested", () => {
+		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai", [], [], "square");
+		const lines = component.render(54);
+		const rendered = Bun.stripANSI(lines.join("\n"));
+
+		expect(rendered).toContain("┌────────────────┐        ┌────────┐");
+		expect(rendered).toContain("└────────────────┘        └────────┘");
+		expect(rendered).not.toContain("╭────────────────╮");
+		expect(rendered).not.toContain("+----------------+");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(54);
+		}
+	});
+
+	it("resolves welcome banner auto and manual override modes", () => {
+		expect(resolveWelcomeLogoMode("auto", { WT_SESSION: "session-id" }, "win32")).toBe("unicode");
 		expect(resolveWelcomeLogoMode("auto", { WT_SESSION: "session-id" }, "linux")).toBe("unicode");
 		expect(resolveWelcomeLogoMode("auto", {}, "win32")).toBe("unicode");
 		expect(resolveWelcomeLogoMode("unicode", { WT_SESSION: "session-id" }, "win32")).toBe("unicode");
+		expect(resolveWelcomeLogoMode("square", { WT_SESSION: "session-id" }, "win32")).toBe("square");
 		expect(resolveWelcomeLogoMode("ascii", {}, "linux")).toBe("ascii");
 	});
 
