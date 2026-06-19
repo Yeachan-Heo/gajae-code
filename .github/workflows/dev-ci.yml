@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: packages/natives/native/pi_natives.*.node
-          key: dev-affected-native-${{ runner.os }}-${{ steps.native-host.outputs.glibc }}-${{ hashFiles('crates/**/*.rs', 'crates/**/Cargo.toml', 'crates/pi-natives/src/tokens.rs', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'packages/natives/scripts/**', 'packages/natives/package.json', 'packages/coding-agent/package.json', 'packages/coding-agent/scripts/build-npm-bin.ts', 'scripts/ci-build-native.ts', 'scripts/ci-release-build-binaries.ts', 'scripts/ci-release-publish.ts', 'scripts/host-detect.ts') }}
+          key: dev-affected-native-${{ runner.os }}-${{ steps.native-host.outputs.glibc }}-${{ hashFiles('crates/**/*.rs', 'crates/**/Cargo.toml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'packages/natives/scripts/**', 'packages/natives/package.json', 'scripts/ci-build-native.ts', 'scripts/host-detect.ts') }}
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         if: steps.native-cache.outputs.cache-hit != 'true'
         with:

@@ -113,6 +113,7 @@ import {
 	createTools,
 	discoverStartupLspServers,
 	EditTool,
+	EvalTool,
 	FindTool,
 	getSearchTools,
 	HIDDEN_TOOLS,
@@ -134,7 +135,6 @@ import {
 	warmupLspServers,
 } from "./tools";
 import { ToolContextStore } from "./tools/context";
-import { EvalTool } from "./tools/eval";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { guardToolForUltragoalAsk } from "./tools/ultragoal-ask-guard";
