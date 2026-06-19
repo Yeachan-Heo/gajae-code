@@ -113,6 +113,22 @@ describe("external controller integration docs", () => {
 		}
 	});
 
+	it("documents public-safe lifecycle notification forwarding", async () => {
+		const guide = await readRepoFile("docs", "bot-integration.md");
+
+		expect(guide).toContain("Forward finish/stop lifecycle notifications");
+		expect(guide).toContain("turn_end");
+		expect(guide).toContain("agent_end");
+		expect(guide).toContain("gjc_coordinator_watch_events");
+		expect(guide).toContain("waiting_for_answer");
+		expect(guide).toContain("metadata-only");
+		expect(guide).toContain("caller-supplied sanitized summary");
+		expect(guide).toContain("does not currently expose a structured stop-reason field on `agent_end`");
+		expect(guide).toContain("Do not forward raw prompts, transcripts, tool outputs");
+		expect(guide).not.toContain("webhook.site");
+		expect(guide).not.toContain("discord.com/api/webhooks");
+	});
+
 	it("keeps bot integration docs free of local-only operator details", async () => {
 		const docs = [
 			await readRepoFile("README.md"),
