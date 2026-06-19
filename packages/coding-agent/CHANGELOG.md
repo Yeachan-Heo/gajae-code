@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed combo/cross-provider model presets flipping the main provider on resume. A profile's main model was applied through `setModelTemporary`, which records the session `model_change` with `role: "temporary"`; on resume the session restored `models.default` (the stale pre-profile base model), so an "Apply for this session" combo like `opus-codex` came back on the base default (e.g. `openai-codex/gpt-5.5`) instead of the profile's main model (`anthropic/claude-opus-4-8`). Profile activation now records its main model as the session default (without writing global settings), while transient retry/fallback/context-promotion/plan-mode switches keep `role: "temporary"` so the issue #849 protection is preserved.
+
 ## [0.6.3] - 2026-06-19
 
 ### Fixed

@@ -209,7 +209,9 @@ export async function applyPreparedModelProfileActivation(
 
 	try {
 		if (prepared.defaultModel) {
-			await prepared.session.setModelTemporary(prepared.defaultModel, prepared.defaultThinkingLevel);
+			await prepared.session.setModelTemporary(prepared.defaultModel, prepared.defaultThinkingLevel, {
+				persistAsSessionDefault: true,
+			});
 			modelChanged = true;
 		}
 		if (Object.keys(prepared.agentModelOverrides).length > 0) {
@@ -234,7 +236,9 @@ export async function applyPreparedModelProfileActivation(
 		}
 		prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
 		if (modelChanged && previousModel) {
-			await prepared.session.setModelTemporary(previousModel, previousThinkingLevel);
+			await prepared.session.setModelTemporary(previousModel, previousThinkingLevel, {
+				persistAsSessionDefault: true,
+			});
 		}
 		throw error;
 	}

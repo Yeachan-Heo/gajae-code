@@ -5865,9 +5865,21 @@ export class AgentSession {
 	/**
 	 * Set model temporarily (for this session only).
 	 * Validates API key, saves to session log but NOT to settings.
+	 *
+	 * The change is recorded in the session log as `role: "temporary"` by
+	 * default, which means it is NOT restored as the session default on resume —
+	 * transient retry/fallback/context-promotion/plan switches must not clobber
+	 * the user's explicit pick (issue #849). Model-profile activation passes
+	 * `persistAsSessionDefault: true` so the profile's main model becomes the
+	 * session default and survives resume, while still not being written to
+	 * global settings (new sessions keep the global default).
 	 * @throws Error if no API key available for the model
 	 */
-	async setModelTemporary(model: Model, thinkingLevel?: ThinkingLevel): Promise<void> {
+	async setModelTemporary(
+		model: Model,
+		thinkingLevel?: ThinkingLevel,
+		options?: { persistAsSessionDefault?: boolean },
+	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
 		if (!apiKey) {
@@ -5876,7 +5888,10 @@ export class AgentSession {
 
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
-		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
+		this.sessionManager.appendModelChange(
+			`${model.provider}/${model.id}`,
+			options?.persistAsSessionDefault ? "default" : "temporary",
+		);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
 		// Apply explicit thinking level if given; otherwise prefer the model's
