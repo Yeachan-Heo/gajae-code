@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Buffer } from "node:buffer";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
 	applyGjcTmuxProfile,
@@ -21,6 +22,12 @@ function args(overrides: Partial<Args> = {}): Args {
 }
 
 const interactiveTty = { stdin: true, stdout: true };
+function decodePowerShellEncodedCommand(command: string): string {
+	const match = command.match(/ -EncodedCommand (?<encoded>[A-Za-z0-9+/=]+)$/);
+	if (!match?.groups?.encoded) throw new Error(`missing encoded command: ${command}`);
+	return Buffer.from(match.groups.encoded, "base64").toString("utf16le");
+}
+
 const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 function stderrError(code: string): Error {
@@ -120,6 +127,55 @@ describe("default GJC tmux launch", () => {
 		);
 		expect(plan.innerCommand).toContain("GJC_COORDINATOR_SESSION_ID=");
 		expect(plan.innerCommand).toContain("GJC_COORDINATOR_SESSION_STATE_FILE=");
+	});
+
+	it("plans native Windows --tmux launches when tmux is available", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "C:\\repo",
+			env: {},
+			argv: ["C:\\Program Files\\GJC\\gjc.exe"],
+			execPath: "C:\\Program Files\\GJC\\gjc.exe",
+			platform: "win32",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+
+		expect(plan.newSessionArgs.slice(0, 6)).toEqual(["new-session", "-d", "-s", plan.sessionName, "-c", "C:\\repo"]);
+		expect(plan.innerCommand).toStartWith(
+			"pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ",
+		);
+		expect(plan.innerCommand).not.toContain("exec env");
+		expect(decodePowerShellEncodedCommand(plan.innerCommand)).toContain("$env:GJC_TMUX_LAUNCHED = '1'");
+	});
+
+	it("builds a PowerShell-safe Windows tmux bootstrap command", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["say it's ok"], tmux: true }),
+			rawArgs: ["--tmux", "say it's ok"],
+			cwd: "C:\\repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "C:\\Program Files\\Bun\\bun.exe",
+			platform: "win32",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+
+		const script = decodePowerShellEncodedCommand(plan.innerCommand);
+		expect(script).toContain("$env:GJC_TMUX_LAUNCHED = '1'");
+		expect(script).toContain(`$env:GJC_COORDINATOR_SESSION_ID = '${plan.sessionId}'`);
+		expect(script).toContain(
+			"& 'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts' '--tmux' 'say it''s ok'",
+		);
+		expect(script).toEndWith("exit $LASTEXITCODE");
 	});
 	it("uses a host command for compiled Bun virtual entrypoints", () => {
 		const plan = buildDefaultTmuxLaunchPlan({

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import * as path from "node:path";
 import { safeStderrWrite } from "@gajae-code/utils";
 import type { Args } from "../cli/args";
@@ -107,6 +108,7 @@ interface CommandResolutionContext {
 	argv: string[];
 	execPath: string;
 	extraEnv?: Record<string, string>;
+	platform?: NodeJS.Platform;
 }
 
 function parseLaunchPolicy(env: NodeJS.ProcessEnv): LaunchPolicy {
@@ -148,6 +150,20 @@ function buildEnvAssignments(values: Record<string, string> | undefined): string
 	const entries = Object.entries(values ?? {});
 	return entries.length === 0 ? "" : ` ${entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")}`;
 }
+function powershellQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
+
+function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
+	const command = resolveCurrentGjcCommand(context);
+	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
+		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
+	);
+	const invocation = ["&", ...command.map(powershellQuote), ...rawArgs.map(powershellQuote)].join(" ");
+	const script = [...envLines, invocation, "exit $LASTEXITCODE"].join("\n");
+	const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
+	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
+}
 
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
 	const env = context.env ?? process.env;
@@ -177,14 +193,24 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 	if (isBunVirtualPath(entrypoint)) {
 		return isBunVirtualPath(context.execPath) ? ["gjc"] : [context.execPath];
 	}
-	const resolvedEntrypoint = path.isAbsolute(entrypoint) ? entrypoint : path.resolve(context.cwd, entrypoint);
+	const pathModule = pathModuleForPlatform(context.platform);
+	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
+		? entrypoint
+		: pathModule.resolve(context.cwd, entrypoint);
 	if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs")) {
 		return [context.execPath, resolvedEntrypoint];
 	}
 	return [resolvedEntrypoint];
 }
+function isWindowsPlatform(platform: NodeJS.Platform | undefined): boolean {
+	return platform === "win32";
+}
+function pathModuleForPlatform(platform: NodeJS.Platform | undefined): typeof path.win32 | typeof path {
+	return isWindowsPlatform(platform) ? path.win32 : path;
+}
 
 function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
+	if (isWindowsPlatform(context.platform)) return buildWindowsPowerShellInnerCommand(context, rawArgs);
 	const command = resolveCurrentGjcCommand(context);
 	const quoted = [...command, ...rawArgs].map(shellQuote).join(" ");
 	return `exec env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;
@@ -305,7 +331,6 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	if (!context.parsed.tmux || policy === "direct") return undefined;
 	if (env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return undefined;
 	const platform = context.platform ?? process.platform;
-	if (platform === "win32") return undefined;
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
 	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
@@ -335,6 +360,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
 			},
+			platform,
 		},
 		context.rawArgs,
 	);
