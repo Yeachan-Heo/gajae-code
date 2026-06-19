@@ -66,9 +66,9 @@ export interface BashResult {
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 const retiringShellSessions = new Set<Shell>();
-// Match pi-shell's bounded cancellation grace so executeBash does not return
-// before native descendant kill waves finish on slow CI runners.
-const CANCEL_CLEANUP_WAIT_MS = 2_500;
+// Cover pi-shell's normal cancellation kill waves without turning a stalled
+// native cleanup into a multi-second JavaScript tool stall.
+const CANCEL_CLEANUP_WAIT_MS = 400;
 
 /** Number of persistent shell sessions currently retained (owner gauge). */
 export function getShellSessionCount(): number {
