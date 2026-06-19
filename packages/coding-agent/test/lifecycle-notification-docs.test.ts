@@ -25,7 +25,10 @@ describe("lifecycle notification docs", () => {
 
 	it("keeps lifecycle notification guidance public-safe", async () => {
 		const readme = await readRepoFile("packages", "coding-agent", "README.md");
-		const section = readme.slice(readme.indexOf("## External lifecycle notifications"), readme.indexOf("## Memory backends"));
+		const section = readme.slice(
+			readme.indexOf("## External lifecycle notifications"),
+			readme.indexOf("## Memory backends"),
+		);
 
 		expect(section).toContain("Do not include raw prompts");
 		expect(section).toContain("assistant transcripts");
