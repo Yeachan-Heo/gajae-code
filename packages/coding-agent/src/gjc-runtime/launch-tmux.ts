@@ -160,7 +160,8 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
 	const invocation = ["&", ...command.map(powershellQuote), ...rawArgs.map(powershellQuote)].join(" ");
-	const script = [...envLines, invocation, "exit $LASTEXITCODE"].join("\n");
+	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
+	const script = [...envLines, invocation, exitLine].join("\n");
 	const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
 	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }

@@ -175,7 +175,7 @@ describe("default GJC tmux launch", () => {
 		expect(script).toContain(
 			"& 'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts' '--tmux' 'say it''s ok'",
 		);
-		expect(script).toEndWith("exit $LASTEXITCODE");
+		expect(script).toEndWith("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
 	});
 	it("uses a host command for compiled Bun virtual entrypoints", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
