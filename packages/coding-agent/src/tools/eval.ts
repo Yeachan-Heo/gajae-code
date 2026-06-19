@@ -4,7 +4,6 @@ import type { Component } from "@gajae-code/tui";
 import { Markdown, Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend } from "../eval/backend";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -185,7 +184,10 @@ function timeoutSecondsFromMs(timeoutMs: number): number {
 async function resolveBackend(session: ToolSession, language: EvalLanguage): Promise<ResolvedBackend> {
 	const allowPy = (session.settings.get("eval.py") as boolean | undefined) ?? true;
 	const allowJs = (session.settings.get("eval.js") as boolean | undefined) ?? true;
-
+	// Defer the eval kernel backends (~23MB python/js execution graph) to first
+	// use so importing this module for its renderer/constants/types never pulls
+	// them in. Idle-RSS optimization.
+	const { jsBackend, pythonBackend } = await import("../eval");
 	if (language === "python") {
 		if (!allowPy) throw new ToolError("Python backend is disabled (eval.py = false).");
 		if (!(await pythonBackend.isAvailable(session))) {

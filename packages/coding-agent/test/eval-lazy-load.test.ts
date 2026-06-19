@@ -8,6 +8,8 @@ import * as path from "node:path";
 // cannot silently re-add an eager import path.
 const toolsIndexPath = path.join(import.meta.dir, "..", "src", "tools", "index.ts");
 const toolsIndexSource = fs.readFileSync(toolsIndexPath, "utf8");
+const evalModulePath = path.join(import.meta.dir, "..", "src", "tools", "eval.ts");
+const evalModuleSource = fs.readFileSync(evalModulePath, "utf8");
 
 describe("eval tool is lazy-loaded", () => {
 	it("does not statically import EvalTool in the tools barrel", () => {
@@ -26,5 +28,16 @@ describe("eval tool is lazy-loaded", () => {
 		// The preflight import can transitively pull the eval tool tree; it must be
 		// dynamically imported at its call site instead of at module scope.
 		expect(toolsIndexSource).not.toMatch(/^import\s+\{[^}]*checkPythonKernelAvailability[^}]*\}\s+from/m);
+	});
+
+	it("defers the eval kernel backends so importing tools/eval is cheap", () => {
+		// The heavy bit is the python/js execution kernels. eval.ts must NOT
+		// statically import them; renderers.ts, sdk.ts and tool-execution.ts all
+		// import from tools/eval at startup, so a static backend import there would
+		// pull the ~23MB kernel graph into every session.
+		expect(evalModuleSource).not.toMatch(
+			/^import\s+\{[^}]*\b(jsBackend|pythonBackend)\b[^}]*\}\s+from\s+["']\.\.\/eval["']/m,
+		);
+		expect(evalModuleSource).toMatch(/await import\(\s*["']\.\.\/eval["']\s*\)/);
 	});
 });
