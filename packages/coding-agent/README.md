@@ -11,6 +11,66 @@ Package-specific references:
 - [DEVELOPMENT](./DEVELOPMENT.md)
 - [RenderMermaid guide](../../docs/render-mermaid.md)
 
+## External lifecycle notifications
+
+GJC already exposes public lifecycle events through the extension/hook event contract. External notification integrations for Discord, Hermes, clawhip, or similar channels should be opt-in and subscribe to these events instead of scraping transcripts or logs:
+
+- `turn_end` — a model/tool turn finished. The public payload is `{ type: "turn_end", turnIndex, message, toolResults }`.
+- `agent_end` — the agent loop for a submitted prompt reached a terminal boundary. The public payload is `{ type: "agent_end", messages }`.
+
+Recommended external mapping:
+
+| Notification | Public event | Status guidance |
+|---|---|---|
+| Turn finished | `turn_end` | Use the handler's own sanitized status such as `"finished"`. |
+| Agent stopped/finished | `agent_end` | Treat as terminal for the prompt. |
+| Waiting/blocked/failed | `agent_end` plus a caller-supplied safe summary | Current lifecycle events do not expose a separate structured waiting/blocked reason; inspect only public-safe, integration-owned state. |
+
+Forward only a minimal, caller-sanitized payload. Do not include raw prompts, assistant transcripts, hidden prompts, tool outputs, raw logs, host paths, private config, webhook URLs, channel IDs, tokens, or secrets. A safe notification payload should be built by the extension/hook itself, for example:
+
+```ts
+import type { ExtensionAPI } from "@gajae-code/coding-agent";
+
+type PublicLifecycleNotification = {
+	type: "turn_end" | "agent_end";
+	status: "finished" | "stopped" | "failed" | "blocked" | "waiting";
+	turnIndex?: number;
+	timestamp: string;
+	summary: string;
+};
+
+export default function lifecycleNotifier(pi: ExtensionAPI) {
+	const enabled = process.env.GJC_LIFECYCLE_NOTIFY === "1";
+	if (!enabled) return;
+
+	const send = async (payload: PublicLifecycleNotification) => {
+		// POST to Discord/Hermes/clawhip here. Keep target URLs and channel IDs in
+		// private config or environment variables; never include them in payloads.
+	};
+
+	pi.on("turn_end", event =>
+		send({
+			type: "turn_end",
+			status: "finished",
+			turnIndex: event.turnIndex,
+			timestamp: new Date().toISOString(),
+			summary: "GJC turn finished",
+		}),
+	);
+
+	pi.on("agent_end", () =>
+		send({
+			type: "agent_end",
+			status: "stopped",
+			timestamp: new Date().toISOString(),
+			summary: "GJC prompt reached a terminal lifecycle boundary",
+		}),
+	);
+}
+```
+
+This is the supported repo-native lifecycle notification path. It is not Claude Code hook compatibility, and it remains disabled unless the user configures an extension/hook handler and private delivery target.
+
 ## Memory backends
 
 The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.gjc/agent/config.yml`):
