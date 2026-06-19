@@ -605,7 +605,7 @@ function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
 // root-level files). Returns [] when there is no direct mapping.
 function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
 	if (isTestFilePath(changedPath)) {
-		return [changedPath];
+		return testFiles.includes(changedPath) ? [changedPath] : [];
 	}
 	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
 	if (base === "") {

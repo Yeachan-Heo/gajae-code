@@ -287,6 +287,13 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
+	test("a deleted test path is not scheduled as a runnable test shard", () => {
+		const tasks = targeted(["packages/coding-agent/test/edit/deleted.test.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).not.toContain("test:packages/coding-agent/test/edit/deleted.test.ts");
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+	});
+
 	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {
 		const tasks = targeted(["packages/coding-agent/test/rlm-live-model-e2e.test.ts"]);
 		const keys = tasks.map(task => task.key);
