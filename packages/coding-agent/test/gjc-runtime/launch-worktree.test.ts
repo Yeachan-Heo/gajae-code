@@ -231,6 +231,7 @@ describe("default launch worktrees", () => {
 			platform: "darwin",
 			tty: { stdin: true, stdout: true },
 			tmuxAvailable: true,
+			existingBranchSessionName: null,
 		});
 
 		expect(plan?.cwd).toBe(launch.cwd);
