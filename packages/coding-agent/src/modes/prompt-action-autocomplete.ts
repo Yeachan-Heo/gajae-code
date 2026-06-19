@@ -28,6 +28,7 @@ interface PromptActionAutocompleteOptions {
 	keybindings: KeybindingsManager;
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
+	pasteImage: () => void;
 	undo: (prefix: string) => void;
 	moveCursorToMessageEnd: () => void;
 	moveCursorToMessageStart: () => void;
@@ -190,7 +191,9 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			const query = promptActionPrefix.slice(1).toLowerCase();
 			const items = this.#actions
 				.map(action => {
-					const searchable = [action.label, action.description, ...action.keywords].join(" ").toLowerCase();
+					const searchable = [action.id, action.label, action.description, ...action.keywords]
+						.join(" ")
+						.toLowerCase();
 					if (!fuzzyMatch(query, searchable)) return null;
 					return {
 						value: action.label,
@@ -367,6 +370,13 @@ export function createPromptActionAutocompleteProvider(
 			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyPrompt")),
 			keywords: ["copy", "prompt", "clipboard", "message"],
 			execute: options.copyPrompt,
+		},
+		{
+			id: "paste-image",
+			label: "Paste image from clipboard",
+			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.pasteImage")),
+			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
+			execute: options.pasteImage,
 		},
 		{
 			id: "undo",

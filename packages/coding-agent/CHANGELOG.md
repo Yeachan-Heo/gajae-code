@@ -6,9 +6,12 @@
 
 - Added `startup.welcomeBannerMode = "square"` for a square-corner Unicode welcome-logo fallback, and stopped treating Windows Terminal (`WT_SESSION`) as an automatic ASCII downgrade; `auto` now preserves the rounded Unicode logo while `unicode`, `square`, and `ascii` remain explicit overrides.
 
+- Improved image input discoverability by adding an interactive `#paste-image` prompt action and clearer clipboard fallback guidance when no image is available.
+
 ### Documentation
 
 - Documented Windows Terminal welcome-logo troubleshooting with Cascadia Mono / Cascadia Mono Nerd Font and the profile `fontFace` setting.
+- Documented CLI `@image` attachments and interactive TUI clipboard image paste fallbacks in the root README.
 
 ## [0.6.3] - 2026-06-19
 

@@ -824,8 +824,9 @@ export class InputController {
 				this.ctx.ui.requestRender();
 				return true;
 			}
-			// No image in clipboard - show hint
-			this.ctx.showStatus("No image in clipboard (use terminal paste for text)");
+			this.ctx.showStatus(
+				"No image in clipboard. Use #paste-image, paste a copied image, or attach an image file with @path/to/image.png.",
+			);
 			return false;
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
@@ -840,6 +841,7 @@ export class InputController {
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
+			pasteImage: () => void this.handleImagePaste(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
