@@ -162,7 +162,9 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
-	const invocation = ["&", ...command.map(powershellQuote), ...stripRootTmuxFlag(rawArgs).map(powershellQuote)].join(" ");
+	const invocation = ["&", ...command.map(powershellQuote), ...stripRootTmuxFlag(rawArgs).map(powershellQuote)].join(
+		" ",
+	);
 	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
 	const script = [...envLines, invocation, exitLine].join("\n");
 	const encodedCommand = Buffer.from(script, "utf16le").toString("base64");

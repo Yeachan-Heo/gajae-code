@@ -170,7 +170,9 @@ describe("default GJC tmux launch", () => {
 		const script = decodePowerShellEncodedCommand(plan.innerCommand);
 		expect(script).toContain("$env:GJC_TMUX_LAUNCHED = '1'");
 		expect(script).toContain(`$env:GJC_COORDINATOR_SESSION_ID = '${plan.sessionId}'`);
-		expect(script).toContain("& 'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts' 'say it''s ok'");
+		expect(script).toContain(
+			"& 'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts' 'say it''s ok'",
+		);
 		expect(script).not.toContain("'--tmux'");
 		expect(script).toEndWith("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
 	});
@@ -592,7 +594,13 @@ describe("default GJC tmux launch", () => {
 
 		expect(handled).toBe(true);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
-		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", expect.any(String), "@gjc-profile", "1"]);
+		expect(calls.map(call => call.args)).toContainEqual([
+			"set-option",
+			"-t",
+			expect.any(String),
+			"@gjc-profile",
+			"1",
+		]);
 		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
 		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
 		expect(diagnostics).toEqual([]);
