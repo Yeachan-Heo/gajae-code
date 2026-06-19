@@ -26,6 +26,7 @@ jobs:
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
+      plan_mode: ${{ steps.plan.outputs.plan_mode }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -57,6 +58,7 @@ jobs:
     timeout-minutes: 30
     env:
       CI_DEV_CHANGED_PATHS: ${{ needs.affected-plan.outputs.changed_paths }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -124,6 +126,7 @@ jobs:
       matrix: ${{ fromJSON(needs.affected-plan.outputs.matrix) }}
     env:
       CI_DEV_CHANGED_PATHS: ${{ needs.affected-plan.outputs.changed_paths }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4

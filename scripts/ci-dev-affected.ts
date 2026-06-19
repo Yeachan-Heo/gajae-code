@@ -103,6 +103,10 @@ if (import.meta.main) {
 export type PlanMode = "pr" | "push";
 
 export function resolvePlanMode(): PlanMode {
+	const explicitMode = Bun.env.CI_DEV_PLAN_MODE?.trim();
+	if (explicitMode === "pr" || explicitMode === "push") {
+		return explicitMode;
+	}
 	return Bun.env.GITHUB_EVENT_NAME?.trim() === "pull_request" ? "pr" : "push";
 }
 
@@ -209,6 +213,7 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 // instead of re-resolving the base ref on each runner.
 async function emitMatrix(): Promise<void> {
 	const paths = await getChangedPaths();
+	const mode = resolvePlanMode();
 	const tasks = await resolvePlannedTasks(paths);
 	const entries = describeTasks(tasks);
 
@@ -226,6 +231,7 @@ async function emitMatrix(): Promise<void> {
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`plan_mode=${mode}`,
 		"changed_paths<<__GJC_PATHS_EOF__",
 		...paths,
 		"__GJC_PATHS_EOF__",
