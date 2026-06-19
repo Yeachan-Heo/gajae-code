@@ -137,6 +137,8 @@ function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[]
 export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus[] {
 	return listSessionLines(env)
 		.map(parseSessionLine)
+		.filter((session): session is GjcTmuxSessionStatus => session != null)
+		.map(session => hydrateSessionFromExactOptions(session, env))
 		.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -145,7 +147,8 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionsForGc {
 	const sessions = listSessionLines(env)
 		.map(parseSessionLine)
-		.filter((session): session is GjcTmuxSessionStatus => session != null);
+		.filter((session): session is GjcTmuxSessionStatus => session != null)
+		.map(session => hydrateSessionFromExactOptions(session, env));
 	const tagged = sessions
 		.filter(session => session.profile === GJC_TMUX_PROFILE_VALUE)
 		.sort((a, b) => a.name.localeCompare(b.name));
@@ -225,6 +228,22 @@ function readExactOptionForGc(sessionName: string, option: string, env: NodeJS.P
 	} catch {
 		return undefined;
 	}
+}
+
+function hydrateSessionFromExactOptions(session: GjcTmuxSessionStatus, env: NodeJS.ProcessEnv): GjcTmuxSessionStatus {
+	if (session.profile === GJC_TMUX_PROFILE_VALUE) return session;
+	const profile = readExactOptionForGc(session.name, GJC_TMUX_PROFILE_OPTION, env);
+	if (profile !== GJC_TMUX_PROFILE_VALUE) return session;
+	return {
+		...session,
+		profile,
+		branch: session.branch ?? readExactOptionForGc(session.name, GJC_TMUX_BRANCH_OPTION, env),
+		branchSlug: session.branchSlug ?? readExactOptionForGc(session.name, GJC_TMUX_BRANCH_SLUG_OPTION, env),
+		project: session.project ?? readExactOptionForGc(session.name, GJC_TMUX_PROJECT_OPTION, env),
+		sessionId: session.sessionId ?? readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, env),
+		sessionStateFile:
+			session.sessionStateFile ?? readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
+	};
 }
 
 /** @internal */

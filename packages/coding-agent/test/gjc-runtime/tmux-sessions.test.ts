@@ -114,6 +114,31 @@ describe("GJC tmux session management", () => {
 		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(/not fully supported/);
 	});
 
+	it("hydrates native Windows tmux sessions from exact option reads when list-sessions omits user options", () => {
+		const calls: string[][] = [];
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			calls.push(cmd);
+			if (cmd.includes("list-sessions")) {
+				return spawnResult(0, "win_session\t1\t0\t1770000000\t\troot\t1\t12345\t\t\t\t\t\n");
+			}
+			if (cmd.includes("show-options")) {
+				const option = cmd.at(-1);
+				if (option === "@gjc-profile") return spawnResult(0, "1\n");
+				if (option === "@gjc-branch") return spawnResult(0, "issue-882-windows-tmux\n");
+				return spawnResult(0, "\n");
+			}
+			return spawnResult(0, "");
+		});
+
+		const session = statusGjcTmuxSession("win_session", { GJC_TMUX_COMMAND: "tmux" });
+
+		expect(session.name).toBe("win_session");
+		expect(session.profile).toBe("1");
+		expect(session.branch).toBe("issue-882-windows-tmux");
+		expect(calls).toContainEqual(["tmux", "show-options", "-qv", "-t", "=win_session:", "@gjc-profile"]);
+	});
+
 	it("still reports plain not-found when the multiplexer does not list the session", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(0, ""));
 
