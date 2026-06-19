@@ -9,7 +9,7 @@ import type { Model, ProviderSessionState } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
-import { estimateTokens } from "./compaction";
+import { estimateMessageTokensHeuristic } from "./compaction";
 import type { ReadonlySessionManager, SessionEntry } from "./entries";
 import {
 	type ConvertToLlm,
@@ -243,7 +243,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		// Extract file ops from assistant messages (tool calls)
 		extractFileOpsFromMessage(message, fileOps);
 
-		const tokens = estimateTokens(message);
+		const tokens = estimateMessageTokensHeuristic(message);
 
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {

@@ -39,7 +39,8 @@ jobs:
            run: |
               hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
                       packages/natives/scripts packages/natives/package.json \
-                      scripts/ci-build-native.ts scripts/host-detect.ts \
+                      packages/coding-agent/package.json packages/coding-agent/scripts/build-npm-bin.ts \
+                      scripts/ci-build-native.ts scripts/ci-release-build-binaries.ts scripts/ci-release-publish.ts scripts/host-detect.ts \
                       -type f -print0 \
                     | sort -z \
                     | xargs -0 sha256sum \
@@ -527,6 +528,8 @@ jobs:
               pattern: pi-natives-*-h${{ needs.rust-hash.outputs.hash }}
               path: packages/natives/native
               merge-multiple: true
+         - name: Package install smoke (dry run)
+           run: bun run ci:test:install-methods
          - name: Configure npm auth
            env:
               NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

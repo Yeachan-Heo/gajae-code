@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	estimateEntriesTokens,
-	estimateEntryTokens,
-	estimateTokens,
-	findCutPoint,
-} from "@gajae-code/agent-core/compaction/compaction";
+import { estimateEntriesTokens, estimateEntryTokens, findCutPoint } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
 import { estimateOpenAiCompactInputTokens, trimOpenAiCompactInput } from "@gajae-code/agent-core/compaction/openai";
 import { type PruneConfig, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
@@ -49,6 +44,10 @@ function config(overrides: Partial<PruneConfig> = {}): PruneConfig {
 		staleOverridableTools: ["read"],
 		...overrides,
 	};
+}
+
+function freshEstimateEntryTokens(entry: SessionMessageEntry): number {
+	return estimateEntryTokens({ ...entry });
 }
 
 describe("entry token cache", () => {
@@ -127,7 +126,7 @@ describe("entry token cache", () => {
 		};
 		const entry: SessionMessageEntry = { type: "message", id: "assistant-order", parentId: null, timestamp, message };
 		const first = estimateEntryTokens(entry);
-		const firstFresh = estimateTokens(message);
+		const firstFresh = freshEstimateEntryTokens(entry);
 		expect(first).toBe(firstFresh);
 
 		message.content[0] = {
@@ -136,7 +135,7 @@ describe("entry token cache", () => {
 			name: "read",
 			arguments: { long_descriptive_property_name_with_many_tokens: "value with several words", a: 1 },
 		};
-		const secondFresh = estimateTokens(message);
+		const secondFresh = freshEstimateEntryTokens(entry);
 		expect(JSON.stringify(message.content[0].arguments)).not.toBe(
 			JSON.stringify({ a: 1, long_descriptive_property_name_with_many_tokens: "value with several words" }),
 		);
@@ -163,7 +162,7 @@ describe("entry token cache", () => {
 			} as Message,
 		};
 		const first = estimateEntryTokens(entry);
-		expect(first).toBe(estimateTokens(entry.message));
+		expect(first).toBe(freshEstimateEntryTokens(entry));
 
 		entry.message = {
 			role: "user",
@@ -173,7 +172,7 @@ describe("entry token cache", () => {
 			],
 			timestamp: Date.parse(timestamp),
 		} as Message;
-		expect(estimateEntryTokens(entry)).toBe(estimateTokens(entry.message));
+		expect(estimateEntryTokens(entry)).toBe(freshEstimateEntryTokens(entry));
 
 		entry.message = {
 			role: "user",
@@ -183,7 +182,7 @@ describe("entry token cache", () => {
 			],
 			timestamp: Date.parse(timestamp),
 		} as Message;
-		expect(estimateEntryTokens(entry)).toBe(estimateTokens(entry.message));
+		expect(estimateEntryTokens(entry)).toBe(freshEstimateEntryTokens(entry));
 
 		entry.message = {
 			role: "user",
@@ -193,10 +192,10 @@ describe("entry token cache", () => {
 			],
 			timestamp: Date.parse(timestamp),
 		} as Message;
-		expect(estimateEntryTokens(entry)).toBe(estimateTokens(entry.message));
+		expect(estimateEntryTokens(entry)).toBe(freshEstimateEntryTokens(entry));
 	});
 
-	test("entry token cache remains exactly equal to fresh estimateTokens for every counted role", () => {
+	test("entry token cache remains exactly equal to fresh estimateEntryTokens recomputation for every counted role", () => {
 		const messages: Message[] = [
 			{ role: "user", content: "user text", timestamp: Date.parse(timestamp) },
 			{ role: "developer", content: "developer custom text", timestamp: Date.parse(timestamp) } as Message,
@@ -287,7 +286,7 @@ describe("entry token cache", () => {
 
 		for (const entry of entries) {
 			if (entry.type !== "message") continue;
-			expect(estimateEntryTokens(entry)).toBe(estimateTokens(entry.message));
+			expect(estimateEntryTokens(entry)).toBe(freshEstimateEntryTokens(entry));
 		}
 		expect(estimateEntriesTokens(entries, 0, entries.length)).toBe(
 			entries.reduce((total, entry) => total + estimateEntryTokens(entry), 0),

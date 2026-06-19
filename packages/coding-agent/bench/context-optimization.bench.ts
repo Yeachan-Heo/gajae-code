@@ -14,7 +14,7 @@
  * improvement invariants so regressions are provable.
  */
 
-import { estimateTokens } from "@gajae-code/agent-core/compaction/compaction";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry } from "@gajae-code/agent-core/compaction/entries";
 import {
 	DEFAULT_PRUNE_CONFIG,
@@ -146,7 +146,7 @@ function totalToolResultTokens(entries: SessionEntry[]): number {
 		if (entry.type !== "message") continue;
 		const message = entry.message as AgentMessage;
 		if (message.role !== "toolResult") continue;
-		total += estimateTokens(message);
+		total += estimateMessageTokensHeuristic(message);
 	}
 	return total;
 }

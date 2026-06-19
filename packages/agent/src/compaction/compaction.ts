@@ -5,7 +5,6 @@
  * and after compaction the session is reloaded.
  */
 
-import { createRequire } from "node:module";
 import {
 	type AssistantMessage,
 	Effort,
@@ -15,7 +14,7 @@ import {
 	type ProviderSessionState,
 	type Usage,
 } from "@gajae-code/ai";
-import { isCompiledBinary, logger, prompt } from "@gajae-code/utils";
+import { logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
 import type { CompactionEntry, SessionEntry } from "./entries";
@@ -317,85 +316,16 @@ export function resolveThresholdTokens(
  * matching what providers typically bill for inline images.
  */
 const IMAGE_TOKEN_ESTIMATE = 1200;
-const SOURCE_NATIVE_TOKENIZER_ENTRYPOINT = "../../../natives/native/index.js";
-const COMPILED_NATIVE_TOKENIZER_ENTRYPOINT = "/$bunfs/root/packages/natives/native/index.js";
-
-const requireFromCompaction = createRequire(import.meta.url);
-
-interface NativeTokenizerModule {
-	countTokens(input: string | string[], encoding?: unknown): number;
-}
-
 /**
- * Lazily-required native `countTokens`. `@gajae-code/natives` dlopens a ~39MB
- * addon; importing it at module scope would put that cost on every cold path
- * that touches compaction exports (status line, print mode, context report).
- * Deferring the require to the first context-changing call keeps display paths
- * native-free.
- *
- * Do not resolve this via a package-name dynamic require of
- * `@gajae-code/natives`: Bun standalone binaries cannot satisfy those from
- * `$bunfs`. The sibling-package source path is stable for workspace and
- * package-install layouts:
- *
- * - workspace: `packages/agent` -> `packages/natives`
- * - npm/bun install: `node_modules/@gajae-code/agent-core` ->
- *   `node_modules/@gajae-code/natives`
- *
- * Bun rewrites `createRequire(import.meta.url)` to the compiled executable
- * root (`/$bunfs/root/gjc-*`) in standalone binaries, so compiled mode uses the
- * absolute bunfs module path emitted by the binary build scripts.
+ * Estimate tokens for collected message fragments using the native-free
+ * heuristic. Provider usage is the authoritative anchor for context-changing
+ * decisions (see {@link calculatePromptTokens}); this chars/4 estimate covers
+ * only unsent/trailing deltas and per-entry budgeting, and callers add a
+ * conservative inflation factor where threshold safety requires it.
  */
-let cachedNativeCountTokens: ((input: string | string[], encoding?: unknown) => number) | null = null;
-
-function nativeTokenizerEntrypoint(): string {
-	return isCompiledBinary() ? COMPILED_NATIVE_TOKENIZER_ENTRYPOINT : SOURCE_NATIVE_TOKENIZER_ENTRYPOINT;
-}
-
-/** Max total fragment chars sent to the synchronous native tokenizer (F22). */
-const MAX_NATIVE_TOKENIZE_CHARS = 2 * 1024 * 1024;
-
-function nativeCountTokens(fragments: string[]): number {
-	let totalChars = 0;
-	for (const fragment of fragments) totalChars += fragment.length;
-	if (totalChars > MAX_NATIVE_TOKENIZE_CHARS) {
-		// F22: skip the synchronous native BPE tokenizer (materializes a ~39MB table and is
-		// O(text)) on pathologically large inputs; the cheap chars/token heuristic is more
-		// than accurate enough for size/budget decisions and never blocks the event loop.
-		return estimateTextTokensHeuristic(fragments);
-	}
-	if (!cachedNativeCountTokens) {
-		const natives = requireFromCompaction(nativeTokenizerEntrypoint()) as NativeTokenizerModule;
-		cachedNativeCountTokens = natives.countTokens;
-	}
-	return cachedNativeCountTokens(fragments);
-}
-
 function countCollectedMessageFragments(collected: { fragments: string[]; extra: number }): number {
-	return nativeCountTokens(collected.fragments) + collected.extra;
+	return estimateTextTokensHeuristic(collected.fragments) + collected.extra;
 }
-
-/**
- * Estimate token count for a message using the native o200k tokenizer.
- * Exact for o200k only; an approximation for Anthropic/other model families
- * (Anthropic doesn't publish a tokenizer) within ~5–10% on English/code text.
- *
- * This materializes the native BPE table (~50MB RSS) on first call. Use it
- * only for context-changing decisions (compaction trigger/cut points, pruning
- * budgets, branch summarization, fork-context seeding, context-limit
- * enforcement). For display-only totals use
- * {@link estimateMessageTokensHeuristic}.
- */
-export function countMessageTokensNativeO200k(message: AgentMessage): number {
-	return countCollectedMessageFragments(collectMessageFragments(message));
-}
-
-/**
- * Backwards-compatible alias for {@link countMessageTokensNativeO200k}.
- * Existing callers treat this as the canonical message-token estimator for
- * context-changing decisions.
- */
-export const estimateTokens = countMessageTokensNativeO200k;
 
 /**
  * Average bytes per token for the cheap heuristic. ~4 bytes/token is the
@@ -406,10 +336,11 @@ export const estimateTokens = countMessageTokensNativeO200k;
 const HEURISTIC_BYTES_PER_TOKEN = 4;
 
 /**
- * Cheap, native-free token estimate for a message. Suitable ONLY for
- * display/init surfaces (status line, /context report, HUD totals) — never
- * for context-changing decisions, which must use
- * {@link countMessageTokensNativeO200k}.
+ * Native-free chars/4 token estimate for a message. This is the only message
+ * token estimator: provider usage (see {@link calculatePromptTokens}) anchors
+ * the already-sent context, and this covers unsent/trailing deltas, per-entry
+ * budgeting, and display surfaces. Callers add a conservative inflation factor
+ * where compaction-threshold safety requires it.
  */
 export function estimateMessageTokensHeuristic(message: AgentMessage): number {
 	const { fragments, extra } = collectMessageFragments(message);
@@ -421,8 +352,8 @@ export function estimateMessageTokensHeuristic(message: AgentMessage): number {
 }
 
 /**
- * Cheap, native-free token estimate for plain string fragments. Display-only
- * counterpart of the native `countTokens(fragments)` aggregate.
+ * Native-free chars/4 token estimate for plain string fragments. Fragment-level
+ * counterpart of {@link estimateMessageTokensHeuristic}.
  */
 export function estimateTextTokensHeuristic(fragments: string | readonly string[]): number {
 	if (typeof fragments === "string") return Math.ceil(fragments.length / HEURISTIC_BYTES_PER_TOKEN);

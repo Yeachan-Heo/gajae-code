@@ -1,20 +1,25 @@
 import { describe, expect, it } from "bun:test";
 import type { Message } from "@gajae-code/ai";
-import { estimateMessageTokensHeuristic, estimateTokens } from "../src/compaction/compaction";
+import { estimateMessageTokensHeuristic } from "../src/compaction/compaction";
 
 describe("oversized token-count guard (W8 / F22)", () => {
-	it("falls back to the cheap heuristic for a message above the native-tokenize cap (no sync BPE freeze)", () => {
+	it("keeps a huge message cheap, positive, and deterministic without native token loading", () => {
 		const huge = { role: "user", content: "x".repeat(3 * 1024 * 1024) } as Message;
-		const native = estimateTokens(huge);
-		const heuristic = estimateMessageTokensHeuristic(huge);
-		// Above the 2 MiB cap the native path returns the heuristic, so the two agree closely
-		// and the ~39MB BPE tokenizer is never invoked (the call returns immediately).
-		expect(native).toBeGreaterThan(0);
-		expect(Math.abs(native - heuristic) / heuristic).toBeLessThan(0.2);
+		const start = performance.now();
+		const first = estimateMessageTokensHeuristic(huge);
+		const elapsedMs = performance.now() - start;
+		const second = estimateMessageTokensHeuristic(huge);
+
+		expect(first).toBeGreaterThan(0);
+		expect(first).toBe(second);
+		expect(elapsedMs).toBeLessThan(1_000);
 	});
 
-	it("still produces a positive native count for a normal-sized message", () => {
+	it("still produces a positive deterministic heuristic count for a normal-sized message", () => {
 		const small = { role: "user", content: "hello world, this is a normal message" } as Message;
-		expect(estimateTokens(small)).toBeGreaterThan(0);
+		const first = estimateMessageTokensHeuristic(small);
+
+		expect(first).toBeGreaterThan(0);
+		expect(first).toBe(estimateMessageTokensHeuristic(small));
 	});
 });

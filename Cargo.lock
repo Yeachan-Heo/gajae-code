@@ -1047,7 +1047,7 @@ dependencies = [
  "fluent-syntax",
  "intl-memoizer",
  "intl_pluralrules",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "self_cell",
  "smallvec",
  "unic-langid",
@@ -1835,7 +1835,7 @@ dependencies = [
  "napi-build",
  "napi-sys",
  "nohash-hasher",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "tokio",
 ]
 
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2444,7 +2444,6 @@ dependencies = [
  "similar 3.1.1",
  "smallvec",
  "syntect",
- "tiktoken-rs",
  "tokio",
  "tokio-util",
  "toml",
@@ -2456,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -2813,12 +2812,6 @@ dependencies = [
  "archery",
  "smallvec",
 ]
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3249,21 +3242,6 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
-]
-
-[[package]]
-name = "tiktoken-rs"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac4a168cfc1d8ed65bf17a6ee0843ad9a68f863c63c0fb2fa7eab67838782ee"
-dependencies = [
- "anyhow",
- "base64",
- "bstr",
- "fancy-regex 0.17.0",
- "lazy_static",
- "regex",
- "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -3996,7 +3974,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
- "rustc-hash 2.1.2",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -4108,7 +4086,7 @@ dependencies = [
  "nix 0.31.3",
  "num-traits",
  "os_display",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "rustix",
  "thiserror 2.0.18",
  "unic-langid",

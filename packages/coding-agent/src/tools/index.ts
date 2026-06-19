@@ -4,7 +4,6 @@ import { $env, $flag, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
-import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
@@ -40,7 +39,6 @@ import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
 import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
-import { EvalTool } from "./eval";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
 import { InspectImageTool } from "./inspect-image";
@@ -78,7 +76,6 @@ export * from "./checkpoint";
 export * from "./computer";
 export * from "./cron";
 export * from "./debug";
-export * from "./eval";
 export * from "./find";
 export * from "./gh";
 export * from "./image-gen";
@@ -359,7 +356,11 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	render_mermaid: s => new RenderMermaidTool(s),
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
-	eval: s => new EvalTool(s),
+	// Defer the ~23MB eval module until first use to keep idle RSS down.
+	eval: async s => {
+		const mod = await import("./eval");
+		return new mod.EvalTool(s);
+	},
 	calc: s => new CalculatorTool(s),
 	ssh: loadSshTool,
 	github: GithubTool.createIf,
@@ -467,6 +468,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		!allowJs &&
 		(requestedTools === undefined || requestedTools.includes("eval"))
 	) {
+		const { checkPythonKernelAvailability } = await import("../eval/py/kernel");
 		const availability = await logger.time("createTools:pythonCheck", checkPythonKernelAvailability, session.cwd);
 		pythonAvailable = availability.ok;
 		if (!availability.ok) {

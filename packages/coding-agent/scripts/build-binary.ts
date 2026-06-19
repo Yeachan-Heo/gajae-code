@@ -5,12 +5,6 @@ import * as path from "node:path";
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "gjc");
 const nativeDir = path.join(packageDir, "..", "natives", "native");
-// Lazy native tokenizer entrypoint. `agent-core/compaction` loads this from
-// the explicit native entrypoint instead of a package-name dynamic require of
-// `@gajae-code/natives`, because those fail inside Bun standalone `$bunfs`.
-// Listing the module here makes the absolute target path exist in the compiled
-// bunfs.
-const nativeTokenizerEntrypoint = "../natives/native/index.js";
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
@@ -72,7 +66,6 @@ async function main(): Promise<void> {
 					"../stats/src/sync-worker.ts",
 					"./src/tools/browser/tab-worker-entry.ts",
 					"./src/eval/js/worker-entry.ts",
-					nativeTokenizerEntrypoint,
 					"--outfile",
 					"dist/gjc",
 				],

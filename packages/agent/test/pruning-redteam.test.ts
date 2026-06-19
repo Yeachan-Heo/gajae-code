@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { estimateTokens } from "@gajae-code/agent-core/compaction/compaction";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
 import { type PruneConfig, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
 import type { ToolResultMessage } from "@gajae-code/ai/types";
@@ -52,7 +52,7 @@ function textOf(entry: SessionMessageEntry): string {
 }
 
 function tokens(entry: SessionMessageEntry): number {
-	return estimateTokens(entry.message);
+	return estimateMessageTokensHeuristic(entry.message);
 }
 
 function config(overrides: Partial<PruneConfig> = {}): PruneConfig {

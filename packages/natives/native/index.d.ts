@@ -430,21 +430,6 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
- * Count tokens in `input`.
- *
- * `input` may be a single string or an array of strings; an array returns
- * the sum across all elements (encoded in parallel via rayon). Always
- * returns a single token total — use this for any aggregate budget question
- * without paying a per-element napi crossing.
- *
- * Uses ordinary encoding (no special-token handling), which is the right
- * choice for measuring user/model content rather than wire-protocol tokens.
- * Always counts with `o200k_base` in default builds (`Cl100kBase` is a
- * compatibility alias). Exact for o200k only.
- */
-export declare function countTokens(input: string | Array<string>, encoding?: Encoding | undefined | null): number
-
-/**
  * Detect macOS system appearance via CoreFoundation.
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */
@@ -476,18 +461,6 @@ export declare enum Ellipsis {
  * Returns an error if decoding, resizing, or SIXEL encoding fails.
  */
 export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string
-
-/** Tokenizer encoding to use. */
-export declare enum Encoding {
-  /** GPT-4o / o1 / GPT-5 (default). */
-  O200kBase = 'O200kBase',
-  /**
-   * Compatibility alias: routes to `o200k_base` in default builds. The
-   * cl100k BPE table is not embedded; callers needing true cl100k counts
-   * must use an external tokenizer.
-   */
-  Cl100kBase = 'Cl100kBase'
-}
 
 /**
  * Execute a brush shell command.

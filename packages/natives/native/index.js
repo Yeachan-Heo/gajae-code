@@ -31,7 +31,6 @@ export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
-export const countTokens = nativeBindings.countTokens;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
@@ -86,10 +85,6 @@ export const Ellipsis = {
 	Unicode: 0,
 	Ascii: 1,
 	Omit: 2,
-};
-export const Encoding = {
-	O200kBase: "O200kBase",
-	Cl100kBase: "Cl100kBase",
 };
 export const FileType = {
 	File: 1,

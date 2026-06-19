@@ -44,7 +44,6 @@ import {
 	type EmergencyCompactionSample,
 	emergencyCompactionReason,
 	estimateMessageTokensHeuristic,
-	estimateTokens,
 	generateBranchSummary,
 	generateHandoff,
 	prepareCompaction,
@@ -1475,7 +1474,7 @@ export class AgentSession {
 			}
 			const sanitized = sanitizeMessage(providerMessages[i]!);
 			if (!sanitized) continue;
-			const messageTokens = estimateTokens(sanitized);
+			const messageTokens = estimateMessageTokensHeuristic(sanitized);
 			if (maxTokens > 0 && approximateTokens + messageTokens > maxTokens) {
 				recordSkip("token-limit");
 				continue;
@@ -9901,9 +9900,9 @@ export class AgentSession {
 	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {
 		tokens: number;
 	} {
-		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageNativeContextTokens(message));
+		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageCompactionDeltaTokens(message));
 		return {
-			tokens: estimate.tokens + this.#estimateMessagesNativeContextTokens(pendingMessages),
+			tokens: estimate.tokens + this.#estimateMessagesCompactionDeltaTokens(pendingMessages),
 		};
 	}
 
@@ -9949,10 +9948,10 @@ export class AgentSession {
 		};
 	}
 
-	#estimateMessagesNativeContextTokens(messages: readonly AgentMessage[]): number {
+	#estimateMessagesCompactionDeltaTokens(messages: readonly AgentMessage[]): number {
 		let tokens = 0;
 		for (const message of messages) {
-			tokens += this.#estimateMessageNativeContextTokens(message);
+			tokens += this.#estimateMessageCompactionDeltaTokens(message);
 		}
 		return tokens;
 	}
@@ -9965,11 +9964,17 @@ export class AgentSession {
 		return tokens;
 	}
 
-	#nativeTokenCache = new WeakMap<AgentMessage, { len: number; tokens: number }>();
-
-	/** Cheap content-size signal to invalidate the native token cache on mutation (growth). */
 	/**
-	 * Cheap content-size signal to invalidate the native token cache on mutation. Recursively
+	 * Conservative inflation applied to the native-free chars/4 estimate of the
+	 * UNSENT context delta. chars/4 undercounts dense code/CJK, so we bias high
+	 * to compact slightly early rather than overflow the model window before the
+	 * next provider response re-anchors the exact count.
+	 */
+	#compactionDeltaInflation = 1.2;
+	#compactionDeltaTokenCache = new WeakMap<AgentMessage, { len: number; tokens: number }>();
+
+	/**
+	 * Cheap content-size signal to invalidate the compaction-delta token cache on mutation. Recursively
 	 * sums string lengths across the whole message (depth-bounded), so it covers every
 	 * provider-visible shape (text/thinking/tool args, toolResult output, tool names, etc.)
 	 * without allocating a serialized copy. A size-preserving in-place edit yields only a
@@ -9992,19 +9997,22 @@ export class AgentSession {
 		return 0;
 	}
 
-	#estimateMessageNativeContextTokens(message: AgentMessage): number {
-		// F10/F22: cache the expensive native token count per message object, invalidated by a
-		// cheap content-size signal, so unchanged (stable-size) messages are not re-tokenized on
-		// every pre-prompt estimate. A rare size-preserving in-place edit yields only a benign
-		// token-estimate drift, never wrong output.
+	#estimateMessageCompactionDeltaTokens(message: AgentMessage): number {
+		// Provider usage anchors the already-sent context (see calculatePromptTokens); this
+		// estimates only the UNSENT delta with the native-free chars/4 heuristic, inflated by
+		// #compactionDeltaInflation so dense input cannot undercount us past the compaction
+		// threshold before the next provider response re-anchors the exact count. Cached per
+		// message object, invalidated by a cheap content-size signal; a rare size-preserving
+		// in-place edit yields only a benign estimate drift, never wrong output.
 		const len = this.#messageTokenSize(message);
-		const cached = this.#nativeTokenCache.get(message);
+		const cached = this.#compactionDeltaTokenCache.get(message);
 		if (cached && cached.len === len) return cached.tokens;
-		let tokens = 0;
+		let heuristic = 0;
 		for (const llmMessage of convertToLlm([message])) {
-			tokens += estimateTokens(llmMessage);
+			heuristic += estimateMessageTokensHeuristic(llmMessage);
 		}
-		this.#nativeTokenCache.set(message, { len, tokens });
+		const tokens = Math.ceil(heuristic * this.#compactionDeltaInflation);
+		this.#compactionDeltaTokenCache.set(message, { len, tokens });
 		return tokens;
 	}
 

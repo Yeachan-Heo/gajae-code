@@ -43,7 +43,6 @@ serde_json.workspace = true
 similar.workspace = true
 smallvec.workspace = true
 syntect.workspace = true
-tiktoken-rs.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
