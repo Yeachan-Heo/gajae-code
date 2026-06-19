@@ -705,6 +705,16 @@
 					"description": "Skip welcome screen and startup status messages",
 					"default": false
 				},
+				"welcomeBannerMode": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"unicode",
+						"ascii"
+					],
+					"description": "Logo style for the startup welcome screen",
+					"default": "auto"
+				},
 				"checkUpdate": {
 					"type": "boolean",
 					"description": "If false, skip update check",

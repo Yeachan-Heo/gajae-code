@@ -9,6 +9,7 @@ import { FooterComponent } from "@gajae-code/coding-agent/modes/components/foote
 import { STATUS_LINE_PRESETS } from "@gajae-code/coding-agent/modes/components/status-line/presets";
 import { UserMessageComponent } from "@gajae-code/coding-agent/modes/components/user-message";
 import { WelcomeComponent } from "@gajae-code/coding-agent/modes/components/welcome";
+import { resolveWelcomeLogoMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { type TUI, visibleWidth } from "@gajae-code/tui";
@@ -110,6 +111,27 @@ describe("redesigned interactive shell chrome", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(54);
 		}
+	});
+
+	it("renders an ASCII-safe welcome logo when requested", () => {
+		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai", [], [], "ascii");
+		const lines = component.render(54);
+		const rendered = Bun.stripANSI(lines.join("\n"));
+
+		expect(rendered).toContain("+----------------+        +--------+");
+		expect(rendered).toContain("+------+      +--+     +--+  +-----+");
+		expect(rendered).not.toContain("╭────────────────╮");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(54);
+		}
+	});
+
+	it("resolves welcome banner auto mode for native Windows Terminal only", () => {
+		expect(resolveWelcomeLogoMode("auto", { WT_SESSION: "session-id" }, "win32")).toBe("ascii");
+		expect(resolveWelcomeLogoMode("auto", { WT_SESSION: "session-id" }, "linux")).toBe("unicode");
+		expect(resolveWelcomeLogoMode("auto", {}, "win32")).toBe("unicode");
+		expect(resolveWelcomeLogoMode("unicode", { WT_SESSION: "session-id" }, "win32")).toBe("unicode");
+		expect(resolveWelcomeLogoMode("ascii", {}, "linux")).toBe("ascii");
 	});
 
 	it("renders the live composer as a borderless opencode-style prompt", () => {

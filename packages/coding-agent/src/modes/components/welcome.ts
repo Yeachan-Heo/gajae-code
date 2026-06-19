@@ -13,6 +13,8 @@ export interface LspServerInfo {
 	fileTypes: string[];
 }
 
+export type WelcomeLogoMode = "unicode" | "ascii";
+
 /**
  * GJC-native launch surface with compact command affordances, project
  * signals, and a claw/talon mark without copying another agent shell.
@@ -27,6 +29,7 @@ export class WelcomeComponent implements Component {
 		private providerName: string,
 		private recentSessions: RecentSession[] = [],
 		private lspServers: LspServerInfo[] = [],
+		private readonly logoMode: WelcomeLogoMode = "unicode",
 	) {}
 
 	invalidate(): void {}
@@ -83,7 +86,8 @@ export class WelcomeComponent implements Component {
 		const minRightCol = 20;
 		const modelPill = this.#pill(theme.icon.model || "model", this.modelName, "statusLineModel");
 		const providerPill = this.#pill(theme.icon.package || "provider", this.providerName, "statusLinePath");
-		const logoMinWidth = Math.max(...RED_CLAW_LOGO.map(line => visibleWidth(line)));
+		const logoLines = this.#logoLines();
+		const logoMinWidth = Math.max(...logoLines.map(line => visibleWidth(line)));
 		const leftMinContentWidth = Math.max(
 			minLeftCol,
 			logoMinWidth,
@@ -102,8 +106,7 @@ export class WelcomeComponent implements Component {
 		const leftCol = showRightColumn ? dualLeftCol : boxWidth - 2;
 		const rightCol = showRightColumn ? dualRightCol : 0;
 
-		// Logo: pick a frame from the intro animation if active, else the resting frame.
-		const logoColored = this.#currentLogoFrame();
+		const logoColored = this.#currentLogoFrame(logoLines);
 
 		// Left column - centered content
 		const leftLines = [
@@ -258,10 +261,10 @@ export class WelcomeComponent implements Component {
 	}
 
 	/** Pick the logo frame for the current intro phase, or the resting frame. */
-	#currentLogoFrame(): readonly string[] {
-		if (this.#animStart == null) return REST_FRAME;
+	#currentLogoFrame(logoLines: readonly string[]): readonly string[] {
+		if (this.#animStart == null) return REST_FRAMES[this.logoMode];
 		const elapsed = performance.now() - this.#animStart;
-		if (elapsed >= INTRO_MS) return REST_FRAME;
+		if (elapsed >= INTRO_MS) return REST_FRAMES[this.logoMode];
 		// Ease-out cubic so the spin decelerates into the resting state.
 		const progress = elapsed / INTRO_MS;
 		const eased = 1 - (1 - progress) ** 3;
@@ -273,7 +276,11 @@ export class WelcomeComponent implements Component {
 		// the same ease-out curve so the highlight is gone by the resting frame.
 		const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
 		const shineStrength = (1 - eased) ** 1.5;
-		return gradientLogo(RED_CLAW_LOGO, phase, { strength: shineStrength, pos: shinePos });
+		return gradientLogo(logoLines, phase, { strength: shineStrength, pos: shinePos });
+	}
+
+	#logoLines(): readonly string[] {
+		return this.logoMode === "ascii" ? ASCII_CLAW_LOGO : RED_CLAW_LOGO;
 	}
 }
 
@@ -285,6 +292,16 @@ const RED_CLAW_LOGO = [
 	"       ╭──────╮    ╰───╮  ╰──╮      ",
 	"╭──────╯      ╰──╮     ╰──╮  ╰─────╮",
 	"╰────────────────╯        ╰────────╯",
+];
+
+// biome-ignore format: preserve ASCII art layout
+const ASCII_CLAW_LOGO = [
+	"+----------------+        +--------+",
+	"+------+      +--+     +--+  +-----+",
+	"       +------+    +---+  +--+      ",
+	"       +------+    +---+  +--+      ",
+	"+------+      +--+     +--+  +-----+",
+	"+----------------+        +--------+",
 ];
 
 /** Multi-stop palette for the red-claw diagonal gradient. */
@@ -385,5 +402,8 @@ const INTRO_SWEEPS = 2.5;
 /** Number of times the shine highlight crosses the diagonal across the intro. */
 const INTRO_SHINE_TRAVERSALS = 3;
 
-/** Resting gradient frame, cached for re-renders outside of the intro. */
-const REST_FRAME = gradientLogo(RED_CLAW_LOGO, 0);
+/** Resting gradient frames, cached for re-renders outside of the intro. */
+const REST_FRAMES: Record<WelcomeLogoMode, readonly string[]> = {
+	unicode: gradientLogo(RED_CLAW_LOGO, 0),
+	ascii: gradientLogo(ASCII_CLAW_LOGO, 0),
+};
