@@ -499,7 +499,13 @@ Project executor override body.
 		expect(skippedStdout).toContain("gjc setup defaults --force");
 
 		const jsonProc = Bun.spawn(
-			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults", "--json"],
+			[
+				process.execPath,
+				path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
+				"setup",
+				"defaults",
+				"--json",
+			],
 			{
 				cwd: externalRoot,
 				stdout: "pipe",
@@ -514,7 +520,6 @@ Project executor override body.
 		expect(jsonStdout).not.toContain("gjc skills list");
 		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 8 });
 	});
-
 });
 
 describe("bundled skills CLI", () => {

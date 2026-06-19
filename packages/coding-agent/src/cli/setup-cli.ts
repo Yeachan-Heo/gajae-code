@@ -391,7 +391,9 @@ async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; for
 			);
 			console.error(chalk.dim(inspectGuidance));
 			console.error(
-				chalk.dim(`Compare embedded defaults before overwriting local files with: ${APP_NAME} setup defaults --force`),
+				chalk.dim(
+					`Compare embedded defaults before overwriting local files with: ${APP_NAME} setup defaults --force`,
+				),
 			);
 			process.exit(1);
 		}
