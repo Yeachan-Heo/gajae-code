@@ -109,6 +109,48 @@ describe("gjc state doctor", () => {
 		});
 	});
 
+	it("uses GJC_SESSION_ID for session-scoped active state when --session-id is absent", async () => {
+		const root = await tempDir();
+		const sessionId = "doctor-env-default";
+		const write = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"deep-interview",
+				"--session-id",
+				sessionId,
+				"--input",
+				JSON.stringify({ current_phase: "interviewing" }),
+				"--json",
+			],
+			root,
+		);
+		expect(write.status).toBe(0);
+		const handoff = await runNativeStateCommand(
+			["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+			root,
+		);
+		expect(handoff.status).toBe(0);
+
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = sessionId;
+		try {
+			const result = await runDoctorUnchanged(root, ["doctor", "--json"]);
+			expect(result.status).toBe(0);
+			const parsed = JSON.parse(result.stdout ?? "{}");
+			expect(parsed.ok).toBe(true);
+			expect(parsed.summary.by_kind.stale_active_state).toBe(0);
+			expect(parsed.problems).toEqual([]);
+			expect(parsed.problems).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "stale_active_state" })]),
+			);
+			expect(result.stdout).not.toContain("gjc state ralplan clear");
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prior;
+		}
+	});
+
 	it("detects orphan transaction journals and prints the hard prune fix command", async () => {
 		const root = await tempDir();
 		const journalPath = path.join(root, ".gjc", "state", "transactions", "orphan.json");

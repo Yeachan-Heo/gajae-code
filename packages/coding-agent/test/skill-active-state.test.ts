@@ -268,32 +268,49 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
-	it("keeps every active pipeline skill at the read layer (HUD pipeline collapse is render-only)", async () => {
+	it("enforces canonical pipeline precedence when downstream stages activate", async () => {
 		await withTempCwd(async cwd => {
-			// `gjc ralplan` then `gjc ultragoal` each activate their own row without
-			// demoting the other. The shared read keeps both so blocking consumers
-			// (deep-interview mutation guard, handoff caller inference) still see the
-			// true active set; collapsing to the current stage is the HUD renderer's
-			// job, covered in skill-hud-bar.test.ts.
 			await syncSkillActiveState({
 				cwd,
-				skill: "ralplan",
-				phase: "final",
+				skill: "deep-interview",
+				phase: "handoff",
 				active: true,
-				source: "gjc-ralplan-native",
+				source: "gjc-deep-interview",
 				nowIso: "2026-01-01T00:00:00.000Z",
 			});
 			await syncSkillActiveState({
 				cwd,
-				skill: "ultragoal",
-				phase: "executing",
+				skill: "ralplan",
+				phase: "planner",
 				active: true,
-				source: "gjc-ultragoal",
+				source: "gjc-ralplan-native",
 				nowIso: "2026-01-01T00:05:00.000Z",
 			});
 
-			const visible = await readVisibleSkillActiveState(cwd);
-			expect(visible?.active_skills?.map(entry => entry.skill).sort()).toEqual(["ralplan", "ultragoal"]);
+			let visible = await readVisibleSkillActiveState(cwd);
+			expect(visible?.skill).toBe("ralplan");
+			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ralplan"]);
+
+			await syncSkillActiveState({
+				cwd,
+				skill: "deep-interview",
+				phase: "interviewing",
+				active: true,
+				source: "stale-upstream",
+				nowIso: "2026-01-01T00:10:00.000Z",
+			});
+			await syncSkillActiveState({
+				cwd,
+				skill: "ultragoal",
+				phase: "goal-planning",
+				active: true,
+				source: "gjc-ultragoal",
+				nowIso: "2026-01-01T00:15:00.000Z",
+			});
+
+			visible = await readVisibleSkillActiveState(cwd);
+			expect(visible?.skill).toBe("ultragoal");
+			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal"]);
 		});
 	});
 
@@ -375,6 +392,33 @@ describe("GJC skill-active state", () => {
 			const visible = await readVisibleSkillActiveState(cwd);
 			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["deep-interview"]);
 			expect(visible?.active_skills?.[0]?.phase).toBe("intent-first");
+		});
+	});
+
+	it("chooses the most advanced active pipeline stage as snapshot primary regardless of file order", async () => {
+		await withTempCwd(async cwd => {
+			const activeDir = path.join(cwd, ".gjc", "state", "active");
+			await fs.mkdir(activeDir, { recursive: true });
+			await fs.writeFile(
+				path.join(activeDir, "deep-interview.json"),
+				JSON.stringify({ skill: "deep-interview", phase: "interviewing", active: true }),
+			);
+			await fs.writeFile(
+				path.join(activeDir, "ralplan.json"),
+				JSON.stringify({ skill: "ralplan", phase: "planner", active: true }),
+			);
+			await fs.writeFile(
+				path.join(activeDir, "ultragoal.json"),
+				JSON.stringify({ skill: "ultragoal", phase: "goal-planning", active: true }),
+			);
+
+			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true });
+
+			const snapshot = JSON.parse(
+				await fs.readFile(path.join(cwd, ".gjc", "state", "skill-active-state.json"), "utf-8"),
+			);
+			expect(snapshot.skill).toBe("ultragoal");
+			expect(snapshot.phase).toBe("goal-planning");
 		});
 	});
 

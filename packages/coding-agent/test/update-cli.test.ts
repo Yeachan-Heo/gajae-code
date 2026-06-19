@@ -6,6 +6,7 @@ import {
 	buildReleaseBinaryUrlForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
+	formatVerificationFailureForTest,
 	replaceBinaryForUpdate,
 	resolveUpdateMethodForTest,
 } from "../src/cli/update-cli";
@@ -86,6 +87,23 @@ describe("update-cli binary release assets", () => {
 		expect(formatManualUpdateInstructionsForTest("win32")).toContain(
 			"raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1",
 		);
+	});
+
+	it("reports smoke-test failures as stale or partial update risk", () => {
+		const message = formatVerificationFailureForTest(
+			{
+				ok: false,
+				actual: "0.6.1",
+				smokeTestFailed: true,
+				smokeTestOutput: "native addon\nrelease\tmismatch",
+			},
+			"0.6.1",
+		);
+
+		expect(message).toContain("--smoke-test failed");
+		expect(message).toContain("stale or partial update");
+		expect(message).toContain("native addon release mismatch");
+		expect(message).not.toContain("undefined");
 	});
 
 	it("includes actionable guidance when a release asset download fails", () => {

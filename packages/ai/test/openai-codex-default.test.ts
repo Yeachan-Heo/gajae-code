@@ -16,8 +16,10 @@ describe("OpenAI Codex defaults", () => {
 			maxLevel: Effort.XHigh,
 			defaultLevel: Effort.XHigh,
 		});
-		// gpt-5.5 is a 400K-context model and must not demote to the smaller gpt-5.4.
-		expect(model.contextWindow).toBe(400000);
-		expect(model.contextPromotionTarget).toBeUndefined();
+		// gpt-5.5 exposes a 272K context window, matching the rest of the codex family and
+		// the live discovery API (`context_window`/`max_context_window` both 272000).
+		// Whether it promotes to a larger model on overflow is governed by the Auto-Promote
+		// Context option, not pinned here.
+		expect(model.contextWindow).toBe(272000);
 	});
 });

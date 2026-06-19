@@ -176,6 +176,57 @@ function mapWithBundledReference<TApi extends Api>(
 	};
 }
 
+function getNestedModelValue(entry: OpenAICompatibleModelRecord, path: readonly string[]): unknown {
+	let current: unknown = entry;
+	for (const segment of path) {
+		if (!isRecord(current)) {
+			return undefined;
+		}
+		current = current[segment];
+	}
+	return current;
+}
+
+function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
+	for (const candidate of candidates) {
+		const value = toNumber(candidate);
+		if (value !== undefined && value > 0) {
+			return value;
+		}
+	}
+	return fallback;
+}
+
+function mapLmStudioModel(
+	entry: OpenAICompatibleModelRecord,
+	defaults: Model<"openai-completions">,
+	reference: Model<"openai-completions"> | undefined,
+): Model<"openai-completions"> {
+	const model = mapWithBundledReference(entry, defaults, reference);
+	return {
+		...model,
+		contextWindow: firstPositiveModelNumber(
+			model.contextWindow,
+			entry.context_length,
+			entry.max_context_length,
+			getNestedModelValue(entry, ["meta", "n_ctx"]),
+			getNestedModelValue(entry, ["details", "context_length"]),
+			getNestedModelValue(entry, ["details", "n_ctx"]),
+			getNestedModelValue(entry, ["meta", "n_ctx_train"]),
+		),
+		maxTokens: firstPositiveModelNumber(
+			model.maxTokens,
+			entry.max_completion_tokens,
+			entry.max_tokens,
+			entry.max_output_tokens,
+			getNestedModelValue(entry, ["details", "max_completion_tokens"]),
+			getNestedModelValue(entry, ["details", "max_tokens"]),
+			getNestedModelValue(entry, ["meta", "max_completion_tokens"]),
+			getNestedModelValue(entry, ["meta", "max_tokens"]),
+		),
+	};
+}
+
 function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string): string {
 	const value = baseUrl?.trim();
 	if (!value) {
@@ -1215,7 +1266,7 @@ export function lmStudioModelManagerOptions(
 				apiKey,
 				mapModel: (entry, defaults) => {
 					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
+					return mapLmStudioModel(entry, defaults, reference);
 				},
 			}),
 	};

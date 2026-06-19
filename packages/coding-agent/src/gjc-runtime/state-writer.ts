@@ -298,8 +298,28 @@ function flattenActiveSubskills(entries: SkillActiveEntry[]): ActiveSubskillEntr
 	return [...deduped.values()];
 }
 
+const CANONICAL_PIPELINE_RANK = new Map<string, number>([
+	["deep-interview", 0],
+	["ralplan", 1],
+	["ultragoal", 2],
+]);
+
+function canonicalPipelineRank(skill: string): number | undefined {
+	return CANONICAL_PIPELINE_RANK.get(skill);
+}
+
+function compareActiveEntryPrimary(a: SkillActiveEntry, b: SkillActiveEntry): number {
+	const aRank = canonicalPipelineRank(a.skill);
+	const bRank = canonicalPipelineRank(b.skill);
+	if (aRank !== undefined || bRank !== undefined) return (bRank ?? -1) - (aRank ?? -1);
+	const aTime = Date.parse(safeString(a.updated_at));
+	const bTime = Date.parse(safeString(b.updated_at));
+	if (Number.isFinite(aTime) || Number.isFinite(bTime)) return (bTime || 0) - (aTime || 0);
+	return 0;
+}
+
 function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
-	const visible = entries.filter(entry => entry.active !== false);
+	const visible = entries.filter(entry => entry.active !== false).toSorted(compareActiveEntryPrimary);
 	const primary = visible[0];
 	return {
 		version: 1,

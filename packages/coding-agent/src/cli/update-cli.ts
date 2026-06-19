@@ -25,6 +25,8 @@ export interface InstalledVersionVerification {
 	ok: boolean;
 	actual?: string;
 	path?: string;
+	smokeTestFailed?: boolean;
+	smokeTestOutput?: string;
 }
 
 /** Paths and verifier used while replacing a downloaded binary update. */
@@ -226,6 +228,36 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 	}
 }
 
+async function verifyInstalledRuntime(expectedVersion: string): Promise<InstalledVersionVerification> {
+	const versionResult = await verifyInstalledVersion(expectedVersion);
+	if (!versionResult.ok || !versionResult.path) {
+		return versionResult;
+	}
+	try {
+		const smokeResult = await $`${versionResult.path} --smoke-test`.quiet().nothrow();
+		if (smokeResult.exitCode === 0) {
+			return versionResult;
+		}
+		return {
+			...versionResult,
+			ok: false,
+			smokeTestFailed: true,
+			smokeTestOutput: smokeResult.text().trim(),
+		};
+	} catch (error) {
+		return {
+			...versionResult,
+			ok: false,
+			smokeTestFailed: true,
+			smokeTestOutput: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function printRestartGuidance(): void {
+	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
+}
+
 function printVerifiedVersion(expectedVersion: string): void {
 	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
 }
@@ -289,20 +321,38 @@ export function formatManualUpdateInstructionsForTest(platform: NodeJS.Platform 
 	return formatManualUpdateInstructions(platform);
 }
 
+function normalizeVerificationOutput(output: string | undefined): string {
+	return output?.replace(/\s+/g, " ").trim() ?? "";
+}
+
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
+	if (result.smokeTestFailed) {
+		const output = normalizeVerificationOutput(result.smokeTestOutput);
+		const outputSuffix = output ? `: ${output}` : "";
+		const pathSuffix = result.path ? ` at ${result.path}` : "";
+		return `${APP_NAME}${pathSuffix} reports ${result.actual ?? expectedVersion}, but --smoke-test failed${outputSuffix}. Close running ${APP_NAME} sessions and reinstall to repair a stale or partial update.`;
+	}
 	if (result.actual) {
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
 	}
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
 }
 
+export function formatVerificationFailureForTest(
+	result: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	return formatVerificationFailure(result, expectedVersion);
+}
+
 /**
  * Print post-update verification result.
  */
 async function printVerification(expectedVersion: string): Promise<void> {
-	const result = await verifyInstalledVersion(expectedVersion);
+	const result = await verifyInstalledRuntime(expectedVersion);
 	if (result.ok) {
 		printVerifiedVersion(expectedVersion);
+		printRestartGuidance();
 		return;
 	}
 	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
@@ -385,10 +435,10 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 		tempPath,
 		backupPath,
 		expectedVersion,
-		verifyInstalledVersion,
+		verifyInstalledVersion: verifyInstalledRuntime,
 	});
 	printVerifiedVersion(expectedVersion);
-	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
+	printRestartGuidance();
 }
 
 /**

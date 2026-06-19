@@ -59,6 +59,9 @@
 							"supportsDeveloperRole": {
 								"type": "boolean"
 							},
+							"sendSessionHeaders": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -469,6 +472,9 @@
 										"supportsDeveloperRole": {
 											"type": "boolean"
 										},
+										"sendSessionHeaders": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -836,6 +842,9 @@
 											"type": "boolean"
 										},
 										"supportsDeveloperRole": {
+											"type": "boolean"
+										},
+										"sendSessionHeaders": {
 											"type": "boolean"
 										},
 										"supportsMultipleSystemMessages": {

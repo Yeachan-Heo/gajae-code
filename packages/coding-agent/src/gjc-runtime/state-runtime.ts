@@ -297,12 +297,26 @@ async function resolveSelectors(
 	}
 	if (mode) assertKnownMode(mode);
 
+	const sessionId = resolveSessionIdFromArgs(args, payload);
+
+	const threadId = flagValue(args, "--thread-id")?.trim() || undefined;
+	if (threadId) assertSafePathComponent(threadId, "thread-id");
+	const turnId = flagValue(args, "--turn-id")?.trim() || undefined;
+	if (turnId) assertSafePathComponent(turnId, "turn-id");
+
+	return { mode: mode as CanonicalGjcWorkflowSkill | undefined, sessionId, threadId, turnId, payload };
+}
+
+// Session-id resolution order: explicit --session-id flag, then payload
+// session_id, then GJC_SESSION_ID env var (set by AgentSession.sdk for
+// agent-initiated CLI invocations). The env-var default keeps shell
+// snippets in skill docs short while still routing state commands to the
+// caller's session-scoped state files.
+function resolveSessionIdFromArgs(
+	args: readonly string[],
+	payload: Record<string, unknown> | undefined,
+): string | undefined {
 	const explicitSessionId = flagValue(args, "--session-id");
-	// Session-id resolution order: explicit --session-id flag, then payload
-	// session_id, then GJC_SESSION_ID env var (set by AgentSession.sdk for
-	// agent-initiated CLI invocations). The env-var default keeps shell
-	// snippets in skill docs short while still routing writes/reads to the
-	// caller's session-scoped state files.
 	let sessionId = explicitSessionId !== undefined ? explicitSessionId.trim() || undefined : undefined;
 	if (!sessionId && payload && typeof payload.session_id === "string") {
 		sessionId = payload.session_id.trim() || undefined;
@@ -312,13 +326,7 @@ async function resolveSelectors(
 		if (envSessionId) sessionId = envSessionId;
 	}
 	if (sessionId) assertSafePathComponent(sessionId, "session-id");
-
-	const threadId = flagValue(args, "--thread-id")?.trim() || undefined;
-	if (threadId) assertSafePathComponent(threadId, "thread-id");
-	const turnId = flagValue(args, "--turn-id")?.trim() || undefined;
-	if (turnId) assertSafePathComponent(turnId, "turn-id");
-
-	return { mode: mode as CanonicalGjcWorkflowSkill | undefined, sessionId, threadId, turnId, payload };
+	return sessionId;
 }
 
 async function inferModeFromActiveState(
@@ -718,8 +726,8 @@ async function handleDoctor(
 ): Promise<StateCommandResult> {
 	const rawSkill = flagValue(args, "--skill")?.trim() || flagValue(args, "--mode")?.trim() || positionalSkill?.trim();
 	if (rawSkill) assertKnownMode(rawSkill);
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+	const payload = await readInputJson(flagValue(args, "--input"), cwd);
+	const sessionId = resolveSessionIdFromArgs(args, payload);
 	const summary = await collectDoctorSummary(cwd, rawSkill as CanonicalGjcWorkflowSkill | undefined, sessionId);
 	return {
 		status: summary.ok ? 0 : 1,

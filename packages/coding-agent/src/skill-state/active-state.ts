@@ -559,39 +559,44 @@ function dedupeVisibleBySkill(entries: SkillActiveEntry[], sessionId?: string): 
 
 /**
  * The planning pipeline advances one stage at a time: `deep-interview →
- * ralplan → ultragoal`. Each stage is activated through its own command path
- * (`gjc deep-interview`, `gjc ralplan`, `gjc ultragoal`), and those activations
- * do not demote the previous stage's row — only the explicit `handoff` verb
- * does. Without this collapse, activating ultragoal while ralplan is still
- * `active:true` would render both stages and keep showing a workflow that has
- * already handed control forward. Keep only the most recently updated pipeline
- * stage so the HUD reflects the single current workflow. `team` is intentionally
- * excluded — it runs alongside ultragoal — and every non-pipeline skill is left
- * untouched.
- *
- * This is a HUD-display policy only. It is applied by the skill HUD renderer and
- * deliberately NOT folded into `readVisibleSkillActiveState`, whose callers (the
- * deep-interview mutation guard and handoff caller inference) must keep seeing
- * every genuinely-active skill rather than the single most-recent pipeline stage.
+ * ralplan → ultragoal`. Activating a downstream stage supersedes upstream
+ * stages so stale rows cannot keep owning the HUD, gate, or primary active
+ * snapshot. `team` is intentionally excluded — it runs alongside ultragoal —
+ * and every non-pipeline skill is left untouched.
  */
 const PLANNING_PIPELINE_SKILLS = new Set<string>(["deep-interview", "ralplan", "ultragoal"]);
+const PLANNING_PIPELINE_RANK = new Map<string, number>([
+	["deep-interview", 0],
+	["ralplan", 1],
+	["ultragoal", 2],
+]);
+
+function planningPipelineRank(skill: string): number | undefined {
+	return PLANNING_PIPELINE_RANK.get(skill);
+}
+
+function comparePipelineEntry(a: SkillActiveEntry, b: SkillActiveEntry): number {
+	const aRank = planningPipelineRank(a.skill);
+	const bRank = planningPipelineRank(b.skill);
+	if (aRank !== undefined || bRank !== undefined) return (bRank ?? -1) - (aRank ?? -1);
+	const aRecency = entryRecency(a);
+	const bRecency = entryRecency(b);
+	if (Number.isFinite(aRecency) || Number.isFinite(bRecency)) return (bRecency || 0) - (aRecency || 0);
+	return 0;
+}
+
+function upstreamPlanningPipelineSkills(skill: string): string[] {
+	const rank = planningPipelineRank(skill);
+	if (rank === undefined) return [];
+	return [...PLANNING_PIPELINE_RANK.entries()]
+		.filter(([, candidateRank]) => candidateRank < rank)
+		.map(([candidate]) => candidate);
+}
 
 export function collapsePlanningPipeline(entries: readonly SkillActiveEntry[]): SkillActiveEntry[] {
 	const pipeline = entries.filter(entry => PLANNING_PIPELINE_SKILLS.has(entry.skill));
 	if (pipeline.length <= 1) return [...entries];
-	let current = pipeline[0];
-	let currentRecency = entryRecency(current);
-	for (const entry of pipeline) {
-		const recency = entryRecency(entry);
-		// Prefer a strictly-newer valid timestamp; a valid timestamp also beats a
-		// missing/unparseable one. Ties (or all-invalid) keep the first stage
-		// deterministically rather than letting an unknown-recency row win.
-		const better = Number.isFinite(recency) && (!Number.isFinite(currentRecency) || recency > currentRecency);
-		if (better) {
-			current = entry;
-			currentRecency = recency;
-		}
-	}
+	const current = pipeline.toSorted(comparePipelineEntry)[0];
 	return entries.filter(entry => !PLANNING_PIPELINE_SKILLS.has(entry.skill) || entry === current);
 }
 
@@ -618,9 +623,11 @@ async function mergeVisibleEntries(
 		merged.set(entryKey(entry), entry);
 	}
 	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
-	return dedupeVisibleBySkill([...merged.values()], sessionId)
-		.filter(entry => entry.active !== false)
-		.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
+	return collapsePlanningPipeline(
+		dedupeVisibleBySkill([...merged.values()], sessionId)
+			.filter(entry => entry.active !== false)
+			.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase)),
+	);
 }
 
 export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveState | null> {
@@ -682,6 +689,20 @@ async function rebuildActiveState(cwd: string, sessionScope?: ActiveSessionScope
 	await rebuildActiveSnapshot(cwd, sessionScope, { cwd, audit: activeStateWriterAudit("rebuild-active-snapshot") });
 }
 
+async function removeSupersededPlanningPipelineEntries(
+	cwd: string,
+	sessionScope: ActiveSessionScope | undefined,
+	entry: SkillActiveEntry,
+): Promise<void> {
+	if (entry.active === false) return;
+	for (const skill of upstreamPlanningPipelineSkills(entry.skill)) {
+		await removeActiveEntry(cwd, sessionScope, skill, {
+			cwd,
+			audit: activeStateWriterAudit("remove-superseded-pipeline-entry"),
+		});
+	}
+}
+
 async function activeSubskillsForExistingEntry(
 	cwd: string,
 	sessionId: string | undefined,
@@ -725,11 +746,13 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 				? { active_subskills: preservedActiveSubskills }
 				: {}),
 	};
+	await removeSupersededPlanningPipelineEntries(options.cwd, undefined, entry);
 	await persistActiveEntry(options.cwd, undefined, entry);
 	await rebuildActiveState(options.cwd);
 
 	if (!options.sessionId) return;
 	const sessionScope = { sessionId: options.sessionId };
+	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
 	await persistActiveEntry(options.cwd, sessionScope, entry);
 	await rebuildActiveState(options.cwd, sessionScope);
 }

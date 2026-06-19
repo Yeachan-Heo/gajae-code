@@ -189,6 +189,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 	return {
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
+		sendSessionHeaders: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort: !isGrok && !isZai,
 		reasoningEffortMap,
@@ -254,6 +255,7 @@ export function resolveOpenAICompat(
 	return {
 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
+		sendSessionHeaders: model.compat.sendSessionHeaders ?? detected.sendSessionHeaders,
 		supportsMultipleSystemMessages:
 			model.compat.supportsMultipleSystemMessages ?? detected.supportsMultipleSystemMessages,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,

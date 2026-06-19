@@ -22,6 +22,7 @@ const emptyUsage: Usage = {
 const compat: Required<OpenAICompat> = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
+	sendSessionHeaders: false,
 	supportsMultipleSystemMessages: true,
 	supportsReasoningEffort: true,
 	reasoningEffortMap: {},
