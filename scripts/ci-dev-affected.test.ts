@@ -205,9 +205,16 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const proc = Bun.spawn(["bun", scriptPath, ...args], {
 			cwd: repoRoot,
 			// Default to push (broad) mode so these CLI cases stay deterministic
-			// regardless of the GITHUB_EVENT_NAME of the CI run executing them;
-			// PR-mode behavior is asserted via planTargetedTasks unit tests.
-			env: { ...process.env, GITHUB_EVENT_NAME: "push", CI_DEV_CHANGED_PATHS: changedPaths, ...extraEnv },
+			// regardless of the GITHUB_EVENT_NAME/CI_DEV_PLAN_MODE of the CI run
+			// executing them; PR-mode behavior is asserted via planTargetedTasks unit
+			// tests and explicit shard-mode cases.
+			env: {
+				...process.env,
+				GITHUB_EVENT_NAME: "push",
+				CI_DEV_PLAN_MODE: "push",
+				CI_DEV_CHANGED_PATHS: changedPaths,
+				...extraEnv,
+			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
