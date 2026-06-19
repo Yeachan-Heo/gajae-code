@@ -161,6 +161,15 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
+	test("root-check shards need native artifacts for schema generation", () => {
+		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
+		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
+		const rootCheck = entries.find(entry => entry.key === "root-check");
+
+		expect(nativeBuild?.nativeBuild).toBe(true);
+		expect(rootCheck).toMatchObject({ native: true, nativeBuild: false });
+	});
+
 	test("rust tasks are flagged rust and need no native addon", () => {
 		const entries = describeTasks(planTasks(["crates/pi-natives/src/lib.rs"], packages));
 		const check = entries.find(entry => entry.key === "rust-check");
@@ -292,6 +301,9 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		const keys = tasks.map(task => task.key);
 		expect(keys).not.toContain("test:packages/coding-agent/test/edit/deleted.test.ts");
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("cli-smoke");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
 	});
 
 	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {
@@ -339,6 +351,17 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+	});
+
+	test("root-level codeish changes that fall back to root-check provide native artifacts", () => {
+		const tasks = targeted(["scripts/unmapped-tool.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("root-check");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
+
+		const entries = describeTasks(tasks);
+		expect(entries.find(entry => entry.key === "root-check")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {

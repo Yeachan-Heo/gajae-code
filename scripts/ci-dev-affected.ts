@@ -172,6 +172,7 @@ function isNativeBuildKey(key: string): boolean {
 // build task, so the shard can always download the artifact built once upstream.
 function taskNeedsNative(key: string): boolean {
 	return (
+		key === "root-check" ||
 		key === "root-test" ||
 		key === "cli-smoke" ||
 		key === "wrapper-version" ||
@@ -449,6 +450,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 
 	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
+		ensureNativeBuild(tasks);
 	}
 	if (wrapperChanged) {
 		add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
