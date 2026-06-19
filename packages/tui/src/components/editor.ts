@@ -447,6 +447,7 @@ export class Editor implements Component, Focusable {
 	onAltEnter?: (text: string) => void;
 	onChange?: (text: string) => void;
 	onAutocompleteCancel?: () => void;
+	onTabDeclined?: (text: string) => void;
 	disableSubmit: boolean = false;
 
 	// Custom top border (for status line integration)
@@ -1248,7 +1249,7 @@ export class Editor implements Component, Focusable {
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
 			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
 			(data.length > 1 && data.includes("\x1b") && data.includes("\r")) ||
-			(data === "\n" && data.length === 1) // Shift+Enter from iTerm2 mapping
+			(data === "\n" && data.length === 1 && process.platform !== "win32") // Shift+Enter from iTerm2 mapping
 		) {
 			if (this.#shouldSubmitOnBackslashEnter(data, kb)) {
 				this.#handleBackspace();
@@ -2612,6 +2613,9 @@ export class Editor implements Component, Focusable {
 
 	// Autocomplete methods
 	async #tryTriggerAutocomplete(explicitTab: boolean = false): Promise<void> {
+		const declineExplicitTab = (): void => {
+			if (explicitTab) this.onTabDeclined?.(this.getText());
+		};
 		if (!this.#autocompleteProvider) return;
 		// Check if we should trigger file completion on Tab
 		if (explicitTab) {
@@ -2620,6 +2624,7 @@ export class Editor implements Component, Focusable {
 				!provider.shouldTriggerFileCompletion ||
 				provider.shouldTriggerFileCompletion(this.#state.lines, this.#state.cursorLine, this.#state.cursorCol);
 			if (!shouldTrigger) {
+				declineExplicitTab();
 				return;
 			}
 		}
@@ -2641,6 +2646,7 @@ export class Editor implements Component, Focusable {
 		} else {
 			this.#cancelAutocomplete();
 			this.onAutocompleteUpdate?.();
+			declineExplicitTab();
 		}
 	}
 	#createAutocompleteList(
@@ -2655,7 +2661,10 @@ export class Editor implements Component, Focusable {
 	}
 
 	#handleTabCompletion(): void {
-		if (!this.#autocompleteProvider) return;
+		if (!this.#autocompleteProvider) {
+			this.onTabDeclined?.(this.getText());
+			return;
+		}
 
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
@@ -2726,6 +2735,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		} else {
 			this.#cancelAutocomplete();
 			this.onAutocompleteUpdate?.();
+			if (explicitTab) this.onTabDeclined?.(this.getText());
 		}
 	}
 

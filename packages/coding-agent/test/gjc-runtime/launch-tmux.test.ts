@@ -277,6 +277,55 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.newSessionArgs.slice(0, 6)).toEqual(["new-session", "-d", "-s", "custom-gjc", "-c", "/repo"]);
 	});
 
+	it("does not reuse a same-branch session from another worktree path in the same project", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo/worktree-b",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			project: "/repo/worktree-b",
+			existingBranchSessionName: null,
+		});
+
+		expect(plan?.attachSessionName).toBeUndefined();
+		expect(plan?.branch).toBe("feature/demo");
+		expect(plan?.project).toBe("/repo/worktree-b");
+	});
+
+	it("cleans up a newly created managed session when attach fails", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(true);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+	});
+
 	it("builds a session-scoped tmux profile without global tmux mutation", () => {
 		const commands = buildGjcTmuxProfileCommands("gjc-session:0", {});
 		const args = commands.map(command => command.args);
@@ -630,7 +679,7 @@ describe("default GJC tmux launch", () => {
 		expect(handled).toBe(true);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
 		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
-		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(true);
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
 		expect(diagnostics[0].length).toBeLessThan(320);

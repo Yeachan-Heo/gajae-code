@@ -182,6 +182,22 @@ export function findGjcTmuxSessionByBranch(
 	);
 }
 
+export function findGjcTmuxSessionByName(
+	sessionName: string,
+	env: NodeJS.ProcessEnv = process.env,
+): GjcTmuxSessionStatus | undefined {
+	return listGjcTmuxSessions(env).find(session => session.name === sessionName);
+}
+
+export function findGjcTmuxSessionByScope(
+	project: string,
+	branch: string | null | undefined,
+	env: NodeJS.ProcessEnv = process.env,
+): GjcTmuxSessionStatus | undefined {
+	return listGjcTmuxSessions(env).find(
+		session => session.project === project && (branch ? session.branch === branch : session.branch === undefined),
+	);
+}
 export function statusGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {
 	const session = listGjcTmuxSessions(env).find(candidate => candidate.name === sessionName);
 	if (session) return session;

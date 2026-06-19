@@ -199,6 +199,9 @@ export class InputController {
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => void this.handleQueueSubmit();
+		this.ctx.editor.onTabDeclined = () => {
+			if (this.ctx.session.isStreaming) void this.handleQueueSubmit();
+		};
 
 		this.ctx.editor.clearCustomKeyHandlers();
 		// Wire up extension shortcuts

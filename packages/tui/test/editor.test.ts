@@ -506,6 +506,26 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("submits raw LF as Enter on Windows instead of inserting newline", () => {
+			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+			Object.defineProperty(process, "platform", { value: "win32" });
+			try {
+				const editor = new Editor(defaultEditorTheme);
+				let submitted = "";
+				editor.onSubmit = text => {
+					submitted = text;
+				};
+
+				editor.handleInput("a");
+				editor.handleInput("\n");
+
+				expect(submitted).toBe("a");
+				expect(editor.getText()).toBe("");
+			} finally {
+				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+			}
+		});
+
 		it("deletes single-code-unit unicode characters (umlauts) with Backspace", () => {
 			const editor = new Editor(defaultEditorTheme);
 

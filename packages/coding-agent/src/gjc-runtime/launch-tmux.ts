@@ -15,7 +15,7 @@ import {
 	type GjcTmuxProfileCommand,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
-import { findGjcTmuxSessionByBranch } from "./tmux-sessions";
+import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope } from "./tmux-sessions";
 
 export {
 	buildGjcTmuxProfileCommands,
@@ -82,6 +82,20 @@ export interface TmuxLaunchPlan {
 	project?: string | null;
 	sessionId?: string | null;
 	sessionStateFile?: string | null;
+}
+
+function explicitTmuxSessionName(env: NodeJS.ProcessEnv): string | undefined {
+	return env.GJC_TMUX_SESSION?.trim() || undefined;
+}
+
+function findExistingSessionForLaunch(context: {
+	env: NodeJS.ProcessEnv;
+	project: string;
+	branch?: string | null;
+}): string | undefined {
+	const explicit = explicitTmuxSessionName(context.env);
+	if (explicit) return findGjcTmuxSessionByName(explicit, context.env)?.name;
+	return findGjcTmuxSessionByScope(context.project, context.branch, context.env)?.name;
 }
 
 export interface GjcTmuxProfileResult {
@@ -351,12 +365,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		path.join(cwd, ".gjc", "runtime", "tmux-sessions", `${buildGjcTmuxSessionSlug(sessionName)}.json`);
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) return undefined;
-	const existingBranchSessionName =
+	const existingSessionName =
 		"existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
-			: context.worktreeBranch
-				? findGjcTmuxSessionByBranch(context.worktreeBranch, env, project)?.name
-				: undefined;
+			: findExistingSessionForLaunch({
+					env,
+					project,
+					branch,
+				});
 	const innerCommand = buildInnerCommand(
 		{
 			cwd,
@@ -380,7 +396,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		project,
 		sessionId,
 		sessionStateFile,
-		attachSessionName: existingBranchSessionName,
+		attachSessionName: existingSessionName,
 	};
 }
 
@@ -447,8 +463,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 	}
 	if (created.exitCode !== 0) return false;
-	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", plan.sessionName], options);
+	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], options);
 	if (attached.exitCode === 0) return true;
+	cleanupCreatedTmuxSession(plan, spawnSync, options);
 	(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
 	return true;
 }

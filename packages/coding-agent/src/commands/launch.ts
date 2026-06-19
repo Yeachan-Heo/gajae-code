@@ -169,7 +169,7 @@ export default class Index extends Command {
 				rawArgs: launch.args,
 				cwd: launch.cwd,
 				worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
-				project: launch.worktree.enabled ? launch.worktree.repoRoot : launch.cwd,
+				project: launch.cwd,
 			})
 		)
 			return;

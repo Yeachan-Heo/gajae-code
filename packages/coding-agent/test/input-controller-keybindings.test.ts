@@ -26,6 +26,7 @@ type FakeEditor = {
 	onQueue?: () => void | Promise<void>;
 	onChange?: (text: string) => void;
 	onSubmit?: (text: string) => void | Promise<void>;
+	onTabDeclined?: (text: string) => void;
 	setText(text: string): void;
 	getText(): string;
 	insertText(text: string): void;
@@ -197,6 +198,23 @@ describe("InputController keybinding setup", () => {
 		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.queue", ["alt+enter"]);
 		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
+			streamingBehavior: "followUp",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues streaming Tab only after editor tab completion declines", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("queue after declined tab completion");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onTabDeclined?.(editor.getText());
+		await Bun.sleep(0);
+
+		expect(spies.prompt).toHaveBeenCalledWith("queue after declined tab completion", {
 			streamingBehavior: "followUp",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
