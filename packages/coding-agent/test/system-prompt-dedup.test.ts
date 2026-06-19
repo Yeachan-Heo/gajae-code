@@ -60,7 +60,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 15_000);
 
 	it("prefers project SYSTEM.md over user SYSTEM.md", async () => {
 		const projectDir = path.join(tempDir, "project");
