@@ -170,6 +170,18 @@ And four bundled role agents:
 
 No sprawling default skill zoo: GJC improves by making this small method better.
 
+### Skill migration and bundled skill inspection
+
+When moving a workflow into GJC, inspect the bundled defaults before installing or overwriting anything:
+
+```sh
+gjc skills list
+gjc skills read ralplan
+gjc setup defaults --check
+```
+
+`gjc setup defaults` installs the four bundled GJC workflow skills into your user `.gjc` directory and preserves existing local files by default. If `--check` reports missing or different files, compare the embedded copy with `gjc skills read <name>` first; use `gjc setup defaults --force` only when you intentionally want to replace local default workflow skill files.
+
 ## Works beside your existing agent or bot
 
 | Tool or bot | Recommended GJC command | Boundary |

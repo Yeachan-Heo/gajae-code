@@ -455,6 +455,66 @@ Project executor override body.
 			);
 		});
 	});
+	it("prints skill inspection guidance for setup defaults without changing JSON output", async () => {
+		const externalRoot = await makeTempRoot();
+		const home = await makeTempRoot();
+		const env = {
+			...process.env,
+			HOME: home,
+			PI_NO_TITLE: "1",
+			NO_COLOR: "1",
+			FORCE_COLOR: undefined,
+		};
+
+		const installProc = Bun.spawn(
+			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
+			{
+				cwd: externalRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
+		const installStdout = await new Response(installProc.stdout).text();
+		const installStderr = await new Response(installProc.stderr).text();
+		expect(await installProc.exited).toBe(0);
+		expect(installStderr).toBe("");
+		expect(installStdout).toContain("gjc skills list");
+		expect(installStdout).toContain("gjc skills read ralplan");
+
+		const skippedProc = Bun.spawn(
+			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
+			{
+				cwd: externalRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
+		const skippedStdout = await new Response(skippedProc.stdout).text();
+		const skippedStderr = await new Response(skippedProc.stderr).text();
+		expect(await skippedProc.exited).toBe(0);
+		expect(skippedStderr).toBe("");
+		expect(skippedStdout).toContain("gjc skills list");
+		expect(skippedStdout).toContain("gjc setup defaults --force");
+
+		const jsonProc = Bun.spawn(
+			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults", "--json"],
+			{
+				cwd: externalRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
+		const jsonStdout = await new Response(jsonProc.stdout).text();
+		const jsonStderr = await new Response(jsonProc.stderr).text();
+		expect(await jsonProc.exited).toBe(0);
+		expect(jsonStderr).toBe("");
+		expect(jsonStdout).not.toContain("gjc skills list");
+		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 8 });
+	});
+
 });
 
 describe("bundled skills CLI", () => {

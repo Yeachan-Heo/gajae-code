@@ -374,6 +374,7 @@ async function handleHooksSetup(flags: { json?: boolean; check?: boolean }): Pro
 async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; force?: boolean }): Promise<void> {
 	const result = await installDefaultGjcDefinitions({ check: flags.check, force: flags.force });
 	const hasCheckFailure = result.missing > 0 || result.different > 0;
+	const inspectGuidance = `Inspect bundled skills with: ${APP_NAME} skills list; read one with: ${APP_NAME} skills read ralplan`;
 
 	if (flags.json) {
 		console.log(JSON.stringify(result, null, 2));
@@ -388,18 +389,28 @@ async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; for
 			console.error(
 				chalk.dim(`Missing: ${result.missing}; different: ${result.different}; matching: ${result.matching}`),
 			);
+			console.error(chalk.dim(inspectGuidance));
+			console.error(
+				chalk.dim(`Compare embedded defaults before overwriting local files with: ${APP_NAME} setup defaults --force`),
+			);
 			process.exit(1);
 		}
 		console.log(chalk.green(`${theme.status.success} Default GJC workflow skills are installed`));
 		console.log(chalk.dim(`Target: ${result.targetRoot}`));
+		console.log(chalk.dim(inspectGuidance));
 		return;
 	}
 
 	console.log(chalk.green(`${theme.status.success} Default GJC workflow skills installed`));
 	console.log(chalk.dim(`Target: ${result.targetRoot}`));
 	console.log(chalk.dim(`Written: ${result.written}; skipped: ${result.skipped}`));
+	console.log(chalk.dim(inspectGuidance));
 	if (result.skipped > 0 && !flags.force) {
-		console.log(chalk.dim("Use --force to overwrite existing default workflow skill files."));
+		console.log(
+			chalk.dim(
+				`Existing local default workflow skill files were preserved. Use ${APP_NAME} setup defaults --force to overwrite them intentionally.`,
+			),
+		);
 	}
 }
 
