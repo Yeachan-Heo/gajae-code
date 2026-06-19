@@ -388,7 +388,14 @@ export async function processResponsesStream<TApi extends Api>(
 	const resolveEntry = (
 		itemId: string | undefined,
 		outputIndex: number | undefined,
-		allowLastKey: boolean,
+		// Fallback to the most-recently-added entry (`lastKey`) when the event
+		// cannot be resolved by identity:
+		//  - "never": tool ghost events with an explicit but unmatched key are ignored.
+		//  - "no-key": only when BOTH item_id and a finite output_index are absent —
+		//    the legacy single continuation-style tool delta/done shape.
+		//  - "always": continuation-style non-tool events (reasoning/text), which may
+		//    legitimately omit identity and target the open block.
+		fallback: "never" | "no-key" | "always",
 	): ItemEntry | undefined => {
 		if (itemId) {
 			const byId = items.get(idKey(itemId));
@@ -398,6 +405,8 @@ export async function processResponsesStream<TApi extends Api>(
 			const byIdx = items.get(idxKey(outputIndex));
 			if (byIdx) return byIdx;
 		}
+		const hasExplicitKey = !!itemId || hasIndex(outputIndex);
+		const allowLastKey = fallback === "always" || (fallback === "no-key" && !hasExplicitKey);
 		if (allowLastKey && lastKey) return items.get(lastKey);
 		return undefined;
 	};
@@ -470,13 +479,13 @@ export async function processResponsesStream<TApi extends Api>(
 				stream.push({ type: "toolcall_start", contentIndex: entry.blockContentIndex, partial: output });
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "reasoning") {
 				entry.item.summary = entry.item.summary || [];
 				entry.item.summary.push(event.part);
 			}
 		} else if (event.type === "response.reasoning_summary_text.delta") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
 				entry.item.summary = entry.item.summary || [];
 				const lastPart = entry.item.summary[entry.item.summary.length - 1];
@@ -492,7 +501,7 @@ export async function processResponsesStream<TApi extends Api>(
 				}
 			}
 		} else if (event.type === "response.reasoning_summary_part.done") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
 				entry.item.summary = entry.item.summary || [];
 				const lastPart = entry.item.summary[entry.item.summary.length - 1];
@@ -510,7 +519,7 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_text.delta") {
 			// Raw reasoning text delta from local providers that stream thinking
 			// directly rather than via the OpenAI summary tracking protocol.
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
 				entry.block.thinking += event.delta;
 				stream.push({
@@ -521,7 +530,7 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 			}
 		} else if (event.type === "response.content_part.added") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "message") {
 				entry.item.content = entry.item.content || [];
 				if (event.part.type === "output_text" || event.part.type === "refusal") {
@@ -529,7 +538,7 @@ export async function processResponsesStream<TApi extends Api>(
 				}
 			}
 		} else if (event.type === "response.output_text.delta") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "message" && entry.block.type === "text") {
 				const lastPart = entry.item.content?.[entry.item.content.length - 1];
 				if (lastPart?.type === "output_text") {
@@ -544,7 +553,7 @@ export async function processResponsesStream<TApi extends Api>(
 				}
 			}
 		} else if (event.type === "response.refusal.delta") {
-			const entry = resolveEntry(event.item_id, event.output_index, true);
+			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "message" && entry.block.type === "text") {
 				const lastPart = entry.item.content?.[entry.item.content.length - 1];
 				if (lastPart?.type === "refusal") {
@@ -559,7 +568,7 @@ export async function processResponsesStream<TApi extends Api>(
 				}
 			}
 		} else if (event.type === "response.function_call_arguments.delta") {
-			const entry = resolveEntry(event.item_id, event.output_index, false);
+			const entry = resolveEntry(event.item_id, event.output_index, "no-key");
 			if (entry?.item.type === "function_call" && entry.block.type === "toolCall") {
 				entry.block.partialJson += event.delta;
 				entry.block.arguments = parseStreamingJson(entry.block.partialJson);
@@ -571,13 +580,13 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 			}
 		} else if (event.type === "response.function_call_arguments.done") {
-			const entry = resolveEntry(event.item_id, event.output_index, false);
+			const entry = resolveEntry(event.item_id, event.output_index, "no-key");
 			if (entry?.item.type === "function_call" && entry.block.type === "toolCall") {
 				entry.block.partialJson = event.arguments;
 				entry.block.arguments = parseStreamingJson(entry.block.partialJson);
 			}
 		} else if (event.type === "response.custom_tool_call_input.delta") {
-			const entry = resolveEntry(event.item_id, event.output_index, false);
+			const entry = resolveEntry(event.item_id, event.output_index, "no-key");
 			if (entry?.item.type === "custom_tool_call" && entry.block.type === "toolCall") {
 				entry.block.partialJson += event.delta;
 				entry.block.arguments = { input: entry.block.partialJson };
@@ -589,7 +598,7 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 			}
 		} else if (event.type === "response.custom_tool_call_input.done") {
-			const entry = resolveEntry(event.item_id, event.output_index, false);
+			const entry = resolveEntry(event.item_id, event.output_index, "no-key");
 			if (entry?.item.type === "custom_tool_call" && entry.block.type === "toolCall") {
 				entry.block.partialJson = event.input;
 				entry.block.arguments = { input: event.input };
@@ -597,7 +606,7 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
 			options?.onOutputItemDone?.(item);
-			const entry = resolveEntry(item.id, event.output_index, false);
+			const entry = resolveEntry(item.id, event.output_index, "never");
 			if (item.type === "reasoning") {
 				const thinking =
 					item.summary?.length > 0

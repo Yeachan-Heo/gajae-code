@@ -421,4 +421,74 @@ describe("Responses multi-tool-call stream correlation", () => {
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.toolCall.arguments).toEqual({ ok: 1 });
 	});
+
+	test("legacy single continuation-style tool stream with no item_id/output_index still accumulates", async () => {
+		// Sparse/continuation shape: a single tool item whose delta/done events omit
+		// BOTH item_id and output_index. The most-recently-added entry must still
+		// accumulate input and emit live toolcall_delta events (backward compatibility).
+		const events = [
+			{
+				type: "response.output_item.added",
+				item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_1", name: "apply_patch", input: "" },
+			},
+			{ type: "response.custom_tool_call_input.delta", delta: "*** Begin Patch\n" },
+			{ type: "response.custom_tool_call_input.delta", delta: "*** End Patch\n" },
+			{ type: "response.custom_tool_call_input.done", input: "*** Begin Patch\n*** End Patch\n" },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "custom_tool_call",
+					id: "ctc_1",
+					call_id: "call_1",
+					name: "apply_patch",
+					input: "*** Begin Patch\n*** End Patch\n",
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const blocks = toolBlocks(output);
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]?.name).toBe("apply_patch");
+		expect(blocks[0]?.arguments).toEqual({ input: "*** Begin Patch\n*** End Patch\n" });
+		// Live delta accumulation must emit toolcall_delta events, not only finalize.
+		const deltas = emitted.filter(e => e.type === "toolcall_delta");
+		expect(deltas.length).toBeGreaterThan(0);
+		const ends = toolCallEnds(emitted);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.toolCall.arguments).toEqual({ input: "*** Begin Patch\n*** End Patch\n" });
+	});
+
+	test("function_call delta with no item_id/output_index accumulates onto the open item", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "alpha_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", delta: '{"command"' },
+			{ type: "response.function_call_arguments.delta", delta: ':"go"}' },
+			{ type: "response.function_call_arguments.done", arguments: '{"command":"go"}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "alpha_tool",
+					arguments: '{"command":"go"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const blocks = toolBlocks(output);
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]?.arguments).toEqual({ command: "go" });
+		const deltas = emitted.filter(e => e.type === "toolcall_delta");
+		expect(deltas.length).toBeGreaterThan(0);
+	});
 });
