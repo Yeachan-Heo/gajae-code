@@ -13,7 +13,7 @@ Package-specific references:
 
 ## Memory backends
 
-The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.gjc/config.yml`):
+The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.gjc/agent/config.yml`):
 
 - `off` (default) — no memory subsystem runs.
 - `local` — existing rollout-summarisation pipeline; writes `memory_summary.md` and consolidated artifacts under the agent dir.
@@ -46,4 +46,4 @@ The startup logo defaults to rounded Unicode box drawing. Windows Terminal can r
 }
 ```
 
-For terminals or fonts with broken rounded corners, set `startup.welcomeBannerMode` in `~/.gjc/config.yml` to one of `unicode`, `square`, or `ascii`. `square` keeps a Unicode-looking logo using square corners (`┌ ┐ └ ┘`) while `ascii` uses only `+`, `-`, and `|`.
+For terminals or fonts with broken rounded corners, set `startup.welcomeBannerMode` in `~/.gjc/agent/config.yml` to one of `unicode`, `square`, or `ascii`. `square` keeps a Unicode-looking logo using square corners (`┌ ┐ └ ┘`) while `ascii` uses only `+`, `-`, and `|`.
