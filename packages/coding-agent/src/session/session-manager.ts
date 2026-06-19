@@ -1129,6 +1129,23 @@ function formatTimeAgo(date: Date): string {
 	return date.toLocaleDateString();
 }
 
+async function movePathAcrossDevicesSafe(source: string, destination: string): Promise<void> {
+	try {
+		await fs.promises.rename(source, destination);
+		return;
+	} catch (error) {
+		if (!hasFsCode(error, "EXDEV")) throw error;
+	}
+	const stat = await fs.promises.stat(source);
+	if (stat.isDirectory()) {
+		await fs.promises.cp(source, destination, { recursive: true, force: false, errorOnExist: true });
+		await fs.promises.rm(source, { recursive: true, force: false });
+		return;
+	}
+	await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+	await fs.promises.unlink(source);
+}
+
 const MAX_PERSIST_CHARS = 500_000;
 const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
 /** Minimum base64 length to externalize to blob store (skip tiny inline images) */
@@ -2498,14 +2515,14 @@ export class SessionManager {
 			try {
 				// Guard: session file may not exist yet (no assistant messages persisted)
 				if (hadSessionFile) {
-					await fs.promises.rename(oldSessionFile, newSessionFile);
+					await movePathAcrossDevicesSafe(oldSessionFile, newSessionFile);
 					movedSessionFile = true;
 				}
 
 				try {
 					const stat = await fs.promises.stat(oldArtifactDir);
 					if (stat.isDirectory()) {
-						await fs.promises.rename(oldArtifactDir, newArtifactDir);
+						await movePathAcrossDevicesSafe(oldArtifactDir, newArtifactDir);
 						movedArtifactDir = true;
 					}
 				} catch (err) {
