@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed argument mis-attribution in the OpenAI-compatible Responses API streaming decoder when a single response emits multiple tool-call items. The decoder buffered streamed argument deltas against a single most-recent item/block slot, so interleaved or back-to-back `function_call`/`custom_tool_call` argument deltas could be applied to the wrong item — finalizing a tool call with another call's arguments (e.g. one tool's payload landing on a different tool's schema and tripping validation). Streamed deltas now accumulate against a per-item buffer keyed on stable item identity (`item_id` primary; positional `output_index` only when finite), each block records its content index at registration time, and finalization writes onto the same block stored in the message content while reading only the matching item's buffer. Single-tool-call streams, reasoning/text streaming, and the Chat Completions path are unchanged.
+
 ## [0.6.2] - 2026-06-19
 ### Added
 
