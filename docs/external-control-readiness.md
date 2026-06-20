@@ -13,6 +13,10 @@ This document classifies every public GJC surface that an external controller, b
 
 ## Surface details
 
+### Standalone TUI and MCP inheritance
+
+Normal standalone GJC (`gjc`, `gjc --tmux`, and print-mode prompts) does not inherit Claude Code, Codex, Cursor, Gemini, Windsurf, or other tools' MCP servers as a public startup contract. It also does not expose a supported standalone-TUI setting that automatically imports arbitrary MCP servers for the model. See [Standalone GJC MCP support](./standalone-mcp.md) for the user-facing boundary and workarounds.
+
 ### Coordinator MCP
 
 Coordinator MCP is the default answer for external bot and orchestration integrations. It exposes a transport-level MCP tool contract for session discovery, managed session start, visible tmux registration, prompt delivery, bounded turn waiting, structured question answering, artifact reads, and explicit completion/failure/cancellation reports.
