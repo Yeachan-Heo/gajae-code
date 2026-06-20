@@ -32,7 +32,7 @@ type FakeEditor = {
 	insertText(text: string): void;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
-	setCustomKeyHandler(key: string, handler: () => void): void;
+	setCustomKeyHandler(key: string, handler: () => boolean | undefined): void;
 	clearCustomKeyHandlers(): void;
 };
 
@@ -42,6 +42,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue" }) {
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["ctrl+l"],
 		"app.message.queue": ["alt+enter"],
+		"app.message.followUp": ["ctrl+enter"],
 	};
 	const setActionKeys = vi.fn();
 	const showModelSelector = vi.fn();
@@ -201,6 +202,41 @@ describe("InputController keybinding setup", () => {
 			streamingBehavior: "followUp",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets idle Ctrl+Enter fall through to editor newline handling", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const followUpRegistration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "ctrl+enter",
+		);
+		expect(followUpRegistration).toBeDefined();
+		const handler = followUpRegistration?.[1] as () => boolean | undefined;
+
+		expect(handler()).toBe(false);
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("consumes Ctrl+Enter as follow-up while streaming", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("follow up from shortcut");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const followUpRegistration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "ctrl+enter",
+		);
+		const handler = followUpRegistration?.[1] as () => boolean | undefined;
+
+		expect(handler()).toBe(true);
+		await Bun.sleep(0);
+		expect(spies.prompt).toHaveBeenCalledWith("follow up from shortcut", {
+			streamingBehavior: "followUp",
+		});
 	});
 
 	it("queues streaming Tab only after editor tab completion declines", async () => {

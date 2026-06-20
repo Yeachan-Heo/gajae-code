@@ -231,7 +231,11 @@ export class InputController {
 			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => void this.handleFollowUp());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.#isFollowUpShortcutActive()) return false;
+				void this.handleFollowUp();
+				return true;
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
@@ -504,6 +508,15 @@ export class InputController {
 	 */
 	#busyStreamingBehavior(): "steer" | "followUp" {
 		return this.ctx.settings.get("busyPromptMode") === "steer" ? "steer" : "followUp";
+	}
+
+	#isFollowUpShortcutActive(): boolean {
+		return (
+			this.ctx.session.isStreaming ||
+			this.ctx.session.isCompacting ||
+			this.ctx.session.isBashRunning ||
+			this.ctx.session.isEvalRunning
+		);
 	}
 
 	/**
