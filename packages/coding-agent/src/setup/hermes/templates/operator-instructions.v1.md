@@ -31,7 +31,7 @@ Provider-specific commands are examples only, never product defaults.
 
 ## Visible routed-session fallback
 
-If a Hermes/OpenClaw/Clawhip-style operator needs a human-visible, channel-routed GJC pane instead of a pure Coordinator MCP session, use the visible session pattern in [`docs/gjc-session-clawhip-routing.md`](../../../../../docs/gjc-session-clawhip-routing.md).
+If a Hermes/OpenClaw/Clawhip-style operator needs a human-visible, channel-routed GJC pane instead of a pure Coordinator MCP session, use the visible session pattern in [`docs/gjc-session-clawhip-routing.md`](../../../../../../docs/gjc-session-clawhip-routing.md).
 
 Use that pattern only when the router must watch tmux output, send stale-session alerts, or inject follow-up prompts into the same visible pane. The short version is: prepare a dedicated worktree, register a stable tmux session through the host router, start interactive `gjc`, wait for TUI readiness, inject the task prompt separately, and verify actual tool/work activity before reporting acceptance.
 
