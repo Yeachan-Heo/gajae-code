@@ -305,6 +305,7 @@ const KITTY_MOD_SUPER = 8;
 const KITTY_MOD_NUM_LOCK = 128;
 const KITTY_LOCK_MASK = 64 + 128; // Caps Lock + Num Lock
 const MODIFY_OTHER_KEYS_PATTERN = /^\x1b\[27;(\d+);(\d+)~$/;
+const PSMUX_MODIFIED_ENTER_PATTERN = /^\x1b\[13;(2|6)~$/;
 const KITTY_KEYPAD_OPERATOR_TEXT: Record<number, string> = {
 	57410: "/",
 	57411: "*",
@@ -376,6 +377,20 @@ export function parseKittySequence(data: string): ParsedKittySequence | null {
 		modifier: result.modifier,
 		eventType: result.eventType,
 	};
+}
+
+function parsePsmuxModifiedEnter(data: string): string | undefined {
+	const match = data.match(PSMUX_MODIFIED_ENTER_PATTERN);
+	if (!match) return undefined;
+	return match[1] === "6" ? "shift+ctrl+enter" : "shift+enter";
+}
+
+function matchesPsmuxModifiedEnter(data: string, keyId: KeyId): boolean {
+	const parsed = parsePsmuxModifiedEnter(data);
+	if (!parsed) return false;
+	const expected = String(keyId);
+	if (parsed === expected) return true;
+	return parsed === "shift+ctrl+enter" && expected === "ctrl+shift+enter";
 }
 
 function hasControlChars(data: string): boolean {
@@ -521,7 +536,7 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
-	return matchesKeyNative(data, keyId, kittyProtocolActive);
+	return matchesPsmuxModifiedEnter(data, keyId) || matchesKeyNative(data, keyId, kittyProtocolActive);
 }
 
 /**
@@ -533,5 +548,5 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
  * @param data - Raw input data from terminal
  */
 export function parseKey(data: string): string | undefined {
-	return parseKeyNative(data, kittyProtocolActive) ?? undefined;
+	return parsePsmuxModifiedEnter(data) ?? parseKeyNative(data, kittyProtocolActive) ?? undefined;
 }

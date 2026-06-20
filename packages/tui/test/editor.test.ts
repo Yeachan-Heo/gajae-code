@@ -507,7 +507,7 @@ describe("Editor component", () => {
 		});
 
 		it("inserts a newline for Ctrl+Shift+Enter terminal protocol variants", () => {
-			const variants = ["\x1b[13;6u", "\x1b[27;6;13~"];
+			const variants = ["\x1b[13;6u", "\x1b[27;6;13~", "\x1b[13;6~", "\x1b[13;2~"];
 
 			for (const [index, variant] of variants.entries()) {
 				const editor = new Editor(defaultEditorTheme);
