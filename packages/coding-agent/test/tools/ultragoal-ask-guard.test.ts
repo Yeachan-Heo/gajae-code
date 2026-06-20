@@ -15,6 +15,8 @@ import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { guardToolForUltragoalAsk } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 
+const TEST_SESSION_ID = "ultragoal-ask-guard-test-session";
+const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
 const tempRoots: string[] = [];
 
 async function tempDir(): Promise<string> {
@@ -24,6 +26,8 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
+	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -83,15 +87,24 @@ class StubExtensionWrappedAskTool {
 }
 
 describe("ultragoal ask guard", () => {
-	it("allows ask when durable ultragoal state is absent", async () => {
+	it("allows ask when durable ultragoal state is absent without requiring ambient GJC_SESSION_ID", async () => {
 		const cwd = await tempDir();
-		const diagnostic = await isUltragoalAskBlocked(cwd);
-		expect(diagnostic.active).toBe(false);
-		expect(diagnostic.source).toBe("absent");
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const diagnostic = await isUltragoalAskBlocked(cwd);
+			expect(diagnostic.active).toBe(false);
+			expect(diagnostic.source).toBe("absent");
+			expect(diagnostic.goalsPath).toBe(path.join(cwd, ".gjc", "ultragoal", "goals.json"));
+		} finally {
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
+		}
 	});
 
 	it("blocks SDK-initial-path style wrapped ask while ultragoal is active", async () => {
 		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		const execute = vi.fn(async () => {});
 		const guarded = guardToolForUltragoalAsk(stubAskTool(execute), () => cwd);
@@ -117,6 +130,7 @@ describe("ultragoal ask guard", () => {
 
 	it("blocks an unwrapped AskTool before prompting while ultragoal is active", async () => {
 		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		const select = vi.fn(async () => "Yes");
 		const tool = new AskTool(createSession(cwd));
@@ -135,6 +149,7 @@ describe("ultragoal ask guard", () => {
 
 	it("allows ask when the ultragoal run is verified complete", async () => {
 		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		const paths = getUltragoalPaths(cwd);
 		const now = new Date().toISOString();

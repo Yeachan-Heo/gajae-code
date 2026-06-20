@@ -22,9 +22,22 @@ afterEach(async () => {
 });
 
 describe("Hermes MCP safety policy", () => {
-	it("defaults to read-only with no implicit global namespace", () => {
+	it("defaults to read-only with a deterministic local state root when no session env exists", () => {
+		const config = buildCoordinatorMcpConfig({});
+
+		expect(config.stateRoot).toBe(path.join(process.cwd(), ".gjc", "state", "coordinator-mcp"));
+		expect(config.mutationClasses.size).toBe(0);
+		expect(config.namespace.profile).toBeNull();
+		expect(config.namespace.repo).toBeNull();
+		expect(config.artifactByteCap).toBe(65536);
+	});
+
+	it("scopes the default state root to GJC_SESSION_ID when present", () => {
 		const config = buildCoordinatorMcpConfig({ GJC_SESSION_ID: "coordinator-policy-test-session" });
 
+		expect(config.stateRoot).toContain(
+			path.join(".gjc", "_session-coordinator-policy-test-session", "state", "coordinator-mcp"),
+		);
 		expect(config.mutationClasses.size).toBe(0);
 		expect(config.namespace.profile).toBeNull();
 		expect(config.namespace.repo).toBeNull();

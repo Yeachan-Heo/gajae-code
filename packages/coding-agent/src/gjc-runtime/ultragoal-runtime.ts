@@ -7,7 +7,7 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { latestUltragoalLedgerEventFromText } from "./ledger-event-renderer";
-import { sessionUltragoalDir } from "./session-layout";
+import { gjcRoot, sessionUltragoalDir } from "./session-layout";
 import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
@@ -170,8 +170,7 @@ export function hashStructuredValue(value: unknown): string {
 
 export function getUltragoalPaths(cwd: string, sessionId?: string | null): UltragoalPaths {
 	const explicitSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
-	if (!explicitSessionId) throw new Error("ultragoal paths require a session id");
-	const dir = sessionUltragoalDir(cwd, explicitSessionId);
+	const dir = explicitSessionId ? sessionUltragoalDir(cwd, explicitSessionId) : path.join(gjcRoot(cwd), "ultragoal");
 	return {
 		dir,
 		briefPath: path.join(dir, "brief.md"),
