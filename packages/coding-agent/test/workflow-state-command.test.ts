@@ -6,6 +6,9 @@ import * as path from "node:path";
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const workflowSkills = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
+function sessionStateDir(cwd: string, sessionId: string): string {
+	return path.join(cwd, ".gjc", `_session-${encodeURIComponent(sessionId).replaceAll(".", "%2E")}`, "state");
+}
 const initialPhases: Record<(typeof workflowSkills)[number], string> = {
 	"deep-interview": "interviewing",
 	ralplan: "planner",
@@ -60,7 +63,7 @@ describe("gjc state workflow command", () => {
 				expect(payload).toMatchObject({ skill, status: "fresh" });
 
 				const modeState = await Bun.file(
-					path.join(cwd, ".gjc", "state", "sessions", `session-${skill}`, `${skill}-state.json`),
+					path.join(sessionStateDir(cwd, `session-${skill}`), `${skill}-state.json`),
 				).json();
 				expect(modeState).toMatchObject({
 					skill,
@@ -70,7 +73,7 @@ describe("gjc state workflow command", () => {
 				expect(modeState.receipt.command).toBe(`gjc state ${skill} write`);
 
 				const activeState = await Bun.file(
-					path.join(cwd, ".gjc", "state", "sessions", `session-${skill}`, "skill-active-state.json"),
+					path.join(sessionStateDir(cwd, `session-${skill}`), "skill-active-state.json"),
 				).json();
 				expect(activeState.active_skills[0]).toMatchObject({
 					skill,
@@ -130,12 +133,12 @@ describe("gjc state workflow command", () => {
 			expect(transition.exitCode, transition.stderr.toString()).toBe(0);
 
 			const modeState = await Bun.file(
-				path.join(cwd, ".gjc", "state", "sessions", "session-1", "deep-interview-state.json"),
+				path.join(sessionStateDir(cwd, "session-1"), "deep-interview-state.json"),
 			).json();
 			expect(modeState.current_phase).toBe("handoff");
 
 			const activeState = await Bun.file(
-				path.join(cwd, ".gjc", "state", "sessions", "session-1", "skill-active-state.json"),
+				path.join(sessionStateDir(cwd, "session-1"), "skill-active-state.json"),
 			).json();
 			expect(activeState.active_skills[0]).toMatchObject({ skill: "deep-interview", phase: "handoff" });
 

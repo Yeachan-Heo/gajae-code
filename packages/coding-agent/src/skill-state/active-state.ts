@@ -1,6 +1,6 @@
 import * as logger from "@gajae-code/utils/logger";
 import { activeSnapshotPath, assertNonEmptyGjcSessionId, modeStatePath } from "../gjc-runtime/session-layout";
-import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
+import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
 import {
 	type ActiveSessionScope,
 	readActiveEntries,
@@ -614,7 +614,13 @@ async function mergeVisibleEntries(
 }
 
 export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveState | null> {
-	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	let resolvedSessionId: string;
+	try {
+		resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	} catch (error) {
+		if (error instanceof SessionResolutionError && error.code === "no_session") return null;
+		throw error;
+	}
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
@@ -702,6 +708,7 @@ async function activeSubskillsForExistingEntry(
 }
 
 export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
+	if (!options.sessionId) return;
 	const preservedActiveSubskills =
 		options.active_subskills === undefined
 			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
@@ -728,7 +735,6 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 				? { active_subskills: preservedActiveSubskills }
 				: {}),
 	};
-	if (!options.sessionId) return;
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
 	await persistActiveEntry(options.cwd, sessionScope, entry);

@@ -1,9 +1,14 @@
-import { resolveGjcSessionForRead } from "../../gjc-runtime/session-resolution";
+import { resolveGjcSessionForRead, SessionResolutionError } from "../../gjc-runtime/session-resolution";
 
-async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string> {
+async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string | undefined> {
 	const normalizedSessionId = sessionId?.trim();
 	if (normalizedSessionId) return normalizedSessionId;
-	return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+	try {
+		return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+	} catch (error) {
+		if (error instanceof SessionResolutionError && error.code === "no_session") return undefined;
+		throw error;
+	}
 }
 
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
@@ -44,7 +49,7 @@ export async function resolveCurrentPhaseForParent(input: {
 	if (explicitPhase) return explicitPhase;
 
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
-	const state = await readVisibleSkillActiveState(input.cwd, resolvedSessionId);
+	const state = resolvedSessionId ? await readVisibleSkillActiveState(input.cwd, resolvedSessionId) : null;
 	const persistedPhase = state?.active_skills?.find(entry => entry.skill === input.parent)?.phase?.trim();
 	if (persistedPhase) return persistedPhase;
 
@@ -77,6 +82,8 @@ export async function buildSubskillInjection(input: {
 		return { block: wrapSubskillBlock(directActivation, body), details: directActivation };
 	}
 
+	if (!resolvedSessionId) return null;
+
 	const [entry] = await readActiveSubskillsForParent({
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
@@ -107,6 +114,7 @@ export async function buildAgentSubskillInjection(input: {
 	if (!(GJC_SUBSKILL_PARENT_AGENTS as readonly string[]).includes(input.agentName)) return "";
 
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
+	if (!resolvedSessionId) return "";
 	const entries = await readActiveSubskillsForParent({
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,

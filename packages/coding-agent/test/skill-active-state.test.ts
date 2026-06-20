@@ -45,7 +45,7 @@ describe("GJC skill-active state", () => {
 		]);
 	});
 
-	it("writes root and session copies under .gjc/state", async () => {
+	it("writes session-scoped active state under .gjc/_session-*", async () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
@@ -67,7 +67,7 @@ describe("GJC skill-active state", () => {
 		await withTempCwd(async cwd => {
 			const paths = getSkillActiveStatePaths(cwd, "../escape/session");
 			expect(paths.sessionPath).toBe(
-				path.join(cwd, ".gjc", "state", "sessions", "%2E%2E%2Fescape%2Fsession", "skill-active-state.json"),
+				path.join(cwd, ".gjc", "_session-%2E%2E%2Fescape%2Fsession", "state", "skill-active-state.json"),
 			);
 		});
 	});
@@ -154,7 +154,13 @@ describe("GJC skill-active state", () => {
 			// the in-TUI skill chain hands off under a concrete session id. The
 			// demotion must supersede the global row so the HUD stops showing the
 			// already-handed-off skill.
-			await syncSkillActiveState({ cwd, skill: "deep-interview", phase: "interviewing", active: true });
+			await syncSkillActiveState({
+				cwd,
+				skill: "deep-interview",
+				phase: "interviewing",
+				active: true,
+				sessionId: "sess1",
+			});
 			await applyHandoffToActiveState({
 				cwd,
 				strict: true,
@@ -275,6 +281,7 @@ describe("GJC skill-active state", () => {
 				skill: "deep-interview",
 				phase: "handoff",
 				active: true,
+				sessionId: "sess1",
 				source: "gjc-deep-interview",
 				nowIso: "2026-01-01T00:00:00.000Z",
 			});
@@ -283,11 +290,12 @@ describe("GJC skill-active state", () => {
 				skill: "ralplan",
 				phase: "planner",
 				active: true,
+				sessionId: "sess1",
 				source: "gjc-ralplan-native",
 				nowIso: "2026-01-01T00:05:00.000Z",
 			});
 
-			let visible = await readVisibleSkillActiveState(cwd);
+			let visible = await readVisibleSkillActiveState(cwd, "sess1");
 			expect(visible?.skill).toBe("ralplan");
 			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ralplan"]);
 
@@ -296,6 +304,7 @@ describe("GJC skill-active state", () => {
 				skill: "deep-interview",
 				phase: "interviewing",
 				active: true,
+				sessionId: "sess1",
 				source: "stale-upstream",
 				nowIso: "2026-01-01T00:10:00.000Z",
 			});
@@ -304,11 +313,12 @@ describe("GJC skill-active state", () => {
 				skill: "ultragoal",
 				phase: "goal-planning",
 				active: true,
+				sessionId: "sess1",
 				source: "gjc-ultragoal",
 				nowIso: "2026-01-01T00:15:00.000Z",
 			});
 
-			visible = await readVisibleSkillActiveState(cwd);
+			visible = await readVisibleSkillActiveState(cwd, "sess1");
 			expect(visible?.skill).toBe("ultragoal");
 			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal"]);
 		});
@@ -356,7 +366,7 @@ describe("GJC skill-active state", () => {
 			// Root read (no session scope) with two same-skill rows that carry no
 			// trustworthy timestamp. The active row must win the tie instead of an
 			// inactive row suppressing it by merge order.
-			const { rootPath } = getSkillActiveStatePaths(cwd);
+			const { rootPath } = getSkillActiveStatePaths(cwd, "sess1");
 			await fs.mkdir(path.dirname(rootPath), { recursive: true });
 			await fs.writeFile(
 				rootPath,
@@ -371,7 +381,7 @@ describe("GJC skill-active state", () => {
 				}),
 			);
 
-			const visible = await readVisibleSkillActiveState(cwd);
+			const visible = await readVisibleSkillActiveState(cwd, "sess1");
 			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["deep-interview"]);
 			expect(visible?.active_skills?.[0]?.phase).toBe("interviewing");
 		});
@@ -382,14 +392,14 @@ describe("GJC skill-active state", () => {
 			// Pre-`active_skills` state files stored a single workflow at the top
 			// level with no `active_skills` array. The raw visible read must still
 			// surface it for the HUD, mutation guard, and caller inference.
-			const { rootPath } = getSkillActiveStatePaths(cwd);
+			const { rootPath } = getSkillActiveStatePaths(cwd, "sess1");
 			await fs.mkdir(path.dirname(rootPath), { recursive: true });
 			await fs.writeFile(
 				rootPath,
 				JSON.stringify({ version: 1, active: true, skill: "deep-interview", phase: "intent-first" }),
 			);
 
-			const visible = await readVisibleSkillActiveState(cwd);
+			const visible = await readVisibleSkillActiveState(cwd, "sess1");
 			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["deep-interview"]);
 			expect(visible?.active_skills?.[0]?.phase).toBe("intent-first");
 		});
@@ -397,7 +407,7 @@ describe("GJC skill-active state", () => {
 
 	it("chooses the most advanced active pipeline stage as snapshot primary regardless of file order", async () => {
 		await withTempCwd(async cwd => {
-			const activeDir = path.join(cwd, ".gjc", "state", "active");
+			const activeDir = path.join(cwd, ".gjc", "_session-sess1", "state", "active");
 			await fs.mkdir(activeDir, { recursive: true });
 			await fs.writeFile(
 				path.join(activeDir, "deep-interview.json"),
@@ -412,10 +422,10 @@ describe("GJC skill-active state", () => {
 				JSON.stringify({ skill: "ultragoal", phase: "goal-planning", active: true }),
 			);
 
-			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true });
+			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true, sessionId: "sess1" });
 
 			const snapshot = JSON.parse(
-				await fs.readFile(path.join(cwd, ".gjc", "state", "skill-active-state.json"), "utf-8"),
+				await fs.readFile(path.join(cwd, ".gjc", "_session-sess1", "state", "skill-active-state.json"), "utf-8"),
 			);
 			expect(snapshot.skill).toBe("ultragoal");
 			expect(snapshot.phase).toBe("goal-planning");
