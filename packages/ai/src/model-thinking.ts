@@ -409,7 +409,7 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	// 512K. The stale 512K survives generate-models (provider-scoped models bypass the
 	// models.dev refresh in applyGlobalModelsDevFallback), tripping auto-compaction /
 	// context-cap thresholds 2x early on MiniMax sessions. Pin to the true 1M.
-	if (model.id === "minimax-m3") {
+	if (model.provider !== "opencode-go" && model.id === "minimax-m3") {
 		model.contextWindow = 1_000_000;
 	}
 }

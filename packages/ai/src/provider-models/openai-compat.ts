@@ -812,6 +812,8 @@ function openCodeModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
+	const references =
+		providerId === "opencode-go" ? createBundledReferenceMap<"openai-completions">(providerId) : undefined;
 	return {
 		providerId,
 		...(apiKey && {
@@ -821,6 +823,13 @@ function openCodeModelManagerOptions(
 					provider: providerId,
 					baseUrl,
 					apiKey,
+					...(providerId === "opencode-go" && {
+						mapModel: (entry, defaults) => {
+							const reference = references?.get(defaults.id);
+							const model = mapWithBundledReference(entry, defaults, reference);
+							return applyOpenCodeGoOfficialMetadata(model);
+						},
+					}),
 				}),
 		}),
 	};
@@ -1921,6 +1930,8 @@ export interface ModelsDevProviderDescriptor {
 	 * Can return null to skip the model, or an array to emit multiple models.
 	 */
 	transformModel?: (model: Model<Api>, modelId: string, raw: ModelsDevModel) => Model<Api> | Model<Api>[] | null;
+	/** Optional static rows appended after mapped models. Used only for official provider catalogs missing from models.dev. */
+	appendModels?: readonly Model<Api>[];
 	/**
 	 * Optional: override the API type per-model.
 	 * Called with (modelId, raw). Return the API type to use.
@@ -1937,55 +1948,58 @@ export function mapModelsDevToModels(
 	const models: Model<Api>[] = [];
 	for (const desc of descriptors) {
 		const providerData = (data as Record<string, Record<string, unknown>>)[desc.modelsDevKey];
-		if (!isRecord(providerData) || !isRecord(providerData.models)) continue;
+		if (isRecord(providerData) && isRecord(providerData.models)) {
+			for (const [modelId, rawModel] of Object.entries(providerData.models)) {
+				if (!isRecord(rawModel)) continue;
+				const m = rawModel as ModelsDevModel;
 
-		for (const [modelId, rawModel] of Object.entries(providerData.models)) {
-			if (!isRecord(rawModel)) continue;
-			const m = rawModel as ModelsDevModel;
-
-			// Default filter: tool_call must be true
-			if (desc.filterModel) {
-				if (!desc.filterModel(modelId, m)) continue;
-			} else {
-				if (m.tool_call !== true) continue;
-			}
-
-			// Resolve API and baseUrl (may be per-model for providers like OpenCode)
-			const resolved = desc.resolveApi?.(modelId, m) ?? { api: desc.api, baseUrl: desc.baseUrl };
-			if (!resolved) continue;
-
-			const mapped: Model<Api> = {
-				id: modelId,
-				name: toModelName(m.name, modelId),
-				api: resolved.api,
-				provider: desc.providerId as Model<Api>["provider"],
-				baseUrl: resolved.baseUrl,
-				reasoning: m.reasoning === true,
-				input: toInputCapabilities(m.modalities?.input),
-				cost: {
-					input: toNumber(m.cost?.input) ?? 0,
-					output: toNumber(m.cost?.output) ?? 0,
-					cacheRead: toNumber(m.cost?.cache_read) ?? 0,
-					cacheWrite: toNumber(m.cost?.cache_write) ?? 0,
-				},
-				contextWindow: toPositiveNumber(m.limit?.context, desc.defaultContextWindow ?? UNK_CONTEXT_WINDOW),
-				maxTokens: toPositiveNumber(m.limit?.output, desc.defaultMaxTokens ?? UNK_MAX_TOKENS),
-				...(desc.compat && { compat: desc.compat }),
-				...(desc.headers && { headers: { ...desc.headers } }),
-			};
-
-			// Apply per-model transform
-			if (desc.transformModel) {
-				const result = desc.transformModel(mapped, modelId, m);
-				if (result === null) continue;
-				if (Array.isArray(result)) {
-					models.push(...result);
+				// Default filter: tool_call must be true
+				if (desc.filterModel) {
+					if (!desc.filterModel(modelId, m)) continue;
 				} else {
-					models.push(result);
+					if (m.tool_call !== true) continue;
 				}
-			} else {
-				models.push(mapped);
+
+				// Resolve API and baseUrl (may be per-model for providers like OpenCode)
+				const resolved = desc.resolveApi?.(modelId, m) ?? { api: desc.api, baseUrl: desc.baseUrl };
+				if (!resolved) continue;
+
+				const mapped: Model<Api> = {
+					id: modelId,
+					name: toModelName(m.name, modelId),
+					api: resolved.api,
+					provider: desc.providerId as Model<Api>["provider"],
+					baseUrl: resolved.baseUrl,
+					reasoning: m.reasoning === true,
+					input: toInputCapabilities(m.modalities?.input),
+					cost: {
+						input: toNumber(m.cost?.input) ?? 0,
+						output: toNumber(m.cost?.output) ?? 0,
+						cacheRead: toNumber(m.cost?.cache_read) ?? 0,
+						cacheWrite: toNumber(m.cost?.cache_write) ?? 0,
+					},
+					contextWindow: toPositiveNumber(m.limit?.context, desc.defaultContextWindow ?? UNK_CONTEXT_WINDOW),
+					maxTokens: toPositiveNumber(m.limit?.output, desc.defaultMaxTokens ?? UNK_MAX_TOKENS),
+					...(desc.compat && { compat: desc.compat }),
+					...(desc.headers && { headers: { ...desc.headers } }),
+				};
+
+				// Apply per-model transform
+				if (desc.transformModel) {
+					const result = desc.transformModel(mapped, modelId, m);
+					if (result === null) continue;
+					if (Array.isArray(result)) {
+						models.push(...result);
+					} else {
+						models.push(result);
+					}
+				} else {
+					models.push(mapped);
+				}
 			}
+		}
+		if (desc.appendModels) {
+			models.push(...desc.appendModels);
 		}
 	}
 	return models;
@@ -2076,22 +2090,35 @@ function createOpenCodeApiResolution(
 	};
 }
 
+const OPENCODE_GO_BASE_PATH = "https://opencode.ai/zen/go";
 const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
-// OpenCode Go: models.dev declares minimax-m2.7 / qwen3.5-plus / qwen3.6-plus
-// with `provider.npm = "@ai-sdk/anthropic"`, but the OpenCode Go gateway only
-// serves them at `https://opencode.ai/zen/go/v1/chat/completions` (verified
-// against https://opencode.ai/zen/go/v1/models and the upstream endpoint
-// table at https://opencode.ai/docs/go/#endpoints — minimax-m2.5 works the
-// same way and lacks an `npm` field on models.dev so it already falls through
-// to the openai-completions default). Without this override the resolver
-// would POST anthropic-style requests to /v1/messages and the gateway would
-// return its `Page Not Found` HTML (issue #887). Override the resolver so
-// regenerating models.json keeps the correct routing.
-const OPENCODE_GO_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen/go", {
-	"minimax-m2.7": "openai-completions",
-	"qwen3.5-plus": "openai-completions",
-	"qwen3.6-plus": "openai-completions",
-});
+const OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS = [
+	"deepseek-v4-flash",
+	"deepseek-v4-pro",
+	"glm-5.1",
+	"glm-5.2",
+	"kimi-k2.6",
+	"kimi-k2.7-code",
+	"mimo-v2.5",
+	"mimo-v2.5-pro",
+] as const;
+const OPENCODE_GO_MESSAGES_MODEL_IDS = [
+	"minimax-m2.5",
+	"minimax-m2.7",
+	"minimax-m3",
+	"qwen3.6-plus",
+	"qwen3.7-max",
+	"qwen3.7-plus",
+] as const;
+const OPENCODE_GO_API_OVERRIDES: Readonly<Record<string, Api>> = {
+	...Object.fromEntries(OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS.map(id => [id, "openai-completions"])),
+	...Object.fromEntries(OPENCODE_GO_MESSAGES_MODEL_IDS.map(id => [id, "anthropic-messages"])),
+} as Record<string, Api>;
+// OpenCode Go has a provider-specific endpoint table at
+// https://opencode.ai/docs/go/#endpoints. Keep routing aligned with that table:
+// GLM/Kimi/DeepSeek/MiMo rows use /v1/chat/completions, while MiniMax and
+// current Qwen Plus/Max rows use /v1/messages via the Anthropic client.
+const OPENCODE_GO_API_RESOLUTION = createOpenCodeApiResolution(OPENCODE_GO_BASE_PATH, OPENCODE_GO_API_OVERRIDES);
 
 const COPILOT_BASE_URL = "https://api.githubcopilot.com";
 
@@ -2320,6 +2347,215 @@ const filterActiveToolCallModels = (_id: string, m: ModelsDevModel): boolean => 
 	return true;
 };
 
+interface OpenCodeGoOfficialModelMetadata {
+	name: string;
+	contextWindow: number;
+	maxTokens: number;
+	input: ("text" | "image")[];
+	reasoning: boolean;
+	cost: Model["cost"];
+}
+
+const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialModelMetadata>> = {
+	"deepseek-v4-flash": {
+		name: "DeepSeek V4 Flash",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+	},
+	"deepseek-v4-pro": {
+		name: "DeepSeek V4 Pro",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1.74, output: 3.48, cacheRead: 0.0145, cacheWrite: 0 },
+	},
+	"glm-5": {
+		name: "GLM-5",
+		contextWindow: 204_800,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1, output: 3.2, cacheRead: 0.2, cacheWrite: 0 },
+	},
+	"glm-5.1": {
+		name: "GLM-5.1",
+		contextWindow: 200_000,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	},
+	"glm-5.2": {
+		name: "GLM-5.2",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	},
+	"kimi-k2.5": {
+		name: "Kimi K2.5",
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.9, cacheRead: 0, cacheWrite: 0 },
+	},
+	"kimi-k2.6": {
+		name: "Kimi K2.6",
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.95, output: 4, cacheRead: 0.2, cacheWrite: 0 },
+	},
+	"kimi-k2.7-code": {
+		name: "Kimi K2.7 Code",
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.95, output: 4, cacheRead: 0.19, cacheWrite: 0 },
+	},
+	"minimax-m2.5": {
+		name: "MiniMax M2.5",
+		contextWindow: 204_800,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0.375 },
+	},
+	"minimax-m2.7": {
+		name: "MiniMax M2.7",
+		contextWindow: 204_800,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0.375 },
+	},
+	"minimax-m3": {
+		name: "MiniMax M3",
+		contextWindow: 512_000,
+		maxTokens: 128_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+	},
+	"qwen3.5-plus": {
+		name: "Qwen3.5 Plus",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.4, output: 2.4, cacheRead: 0, cacheWrite: 0 },
+	},
+	"qwen3.6-plus": {
+		name: "Qwen3.6 Plus",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 2.5 },
+	},
+	"qwen3.7-max": {
+		name: "Qwen3.7 Max",
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 2.5, output: 7.5, cacheRead: 0.5, cacheWrite: 3.125 },
+	},
+	"qwen3.7-plus": {
+		name: "Qwen3.7 Plus",
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 1.2, output: 4.8, cacheRead: 0.12, cacheWrite: 1.5 },
+	},
+	"mimo-v2-omni": {
+		name: "MiMo-V2-Omni",
+		contextWindow: 262_144,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.4, output: 2, cacheRead: 0.08, cacheWrite: 0 },
+	},
+	"mimo-v2-pro": {
+		name: "MiMo-V2-Pro",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1, output: 3, cacheRead: 0.2, cacheWrite: 0 },
+	},
+	"mimo-v2.5": {
+		name: "MiMo-V2.5",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+	},
+	"mimo-v2.5-pro": {
+		name: "MiMo-V2.5-Pro",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 1.74, output: 3.48, cacheRead: 0.0145, cacheWrite: 0 },
+	},
+	"hy3-preview": {
+		name: "Hy3 preview",
+		contextWindow: 256_000,
+		maxTokens: 64_000,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.066, output: 0.26, cacheRead: 0.029, cacheWrite: 0 },
+	},
+};
+
+function applyOpenCodeGoOfficialMetadata<TApi extends Api>(model: Model<TApi>): Model<TApi> {
+	const metadata = OPENCODE_GO_OFFICIAL_MODELS[model.id];
+	if (!metadata) return model;
+	return {
+		...model,
+		name: metadata.name,
+		reasoning: metadata.reasoning,
+		input: [...metadata.input],
+		cost: { ...metadata.cost },
+		contextWindow: metadata.contextWindow,
+		maxTokens: metadata.maxTokens,
+	};
+}
+
+function createOpenCodeGoOfficialModels(): Model<Api>[] {
+	return Object.entries(OPENCODE_GO_OFFICIAL_MODELS).map(([id, metadata]) => {
+		const resolved = resolveApiByRules(
+			id,
+			{},
+			OPENCODE_GO_API_RESOLUTION.rules,
+			OPENCODE_GO_API_RESOLUTION.defaultResolution,
+		);
+		return {
+			id,
+			name: metadata.name,
+			api: resolved.api,
+			provider: "opencode-go",
+			baseUrl: resolved.baseUrl,
+			reasoning: metadata.reasoning,
+			input: [...metadata.input],
+			cost: { ...metadata.cost },
+			contextWindow: metadata.contextWindow,
+			maxTokens: metadata.maxTokens,
+		};
+	});
+}
+
 const MODELS_DEV_PROVIDER_DESCRIPTORS_SPECIALIZED: readonly ModelsDevProviderDescriptor[] = [
 	// --- Cloudflare AI Gateway ---
 	anthropicMessagesDescriptor(
@@ -2350,6 +2586,8 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_SPECIALIZED: readonly ModelsDevProviderDes
 				OPENCODE_GO_API_RESOLUTION.rules,
 				OPENCODE_GO_API_RESOLUTION.defaultResolution,
 			),
+		transformModel: model => applyOpenCodeGoOfficialMetadata(model),
+		appendModels: createOpenCodeGoOfficialModels(),
 	}),
 	// --- GitHub Copilot ---
 	openAiCompletionsDescriptor("github-copilot", "github-copilot", COPILOT_BASE_URL, {
