@@ -103,7 +103,12 @@ describe("GJC sub-skill activation dispatch", () => {
 			active_subskills: result.activeSubskillsToPersist.map(toActiveSubskillEntry),
 		});
 
-		const executorSubskills = await readActiveSubskillsForParent({ cwd, sessionId, parent: "executor", phase: "prompt" });
+		const executorSubskills = await readActiveSubskillsForParent({
+			cwd,
+			sessionId,
+			parent: "executor",
+			phase: "prompt",
+		});
 		expect(executorSubskills).toHaveLength(1);
 		expect(executorSubskills[0]).toMatchObject({
 			plugin: "combined-pack",
