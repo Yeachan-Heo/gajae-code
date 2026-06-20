@@ -250,11 +250,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "[objective]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
-			// Capture state BEFORE the call (see /plan above for rationale).
-			const wasGoalModeEnabled = runtime.ctx.goalModeEnabled;
+			// The goal command always consumes the typed input: it either submits
+			// the bare objective (never the literal `/goal …` text the user typed)
+			// or shows a warning, so the normal submission path never records it in
+			// input history. Preserve the typed command whenever args were supplied
+			// — including the first-time `/goal set <objective>` case where goal
+			// mode was not yet active. A previous `wasGoalModeEnabled` guard dropped
+			// that first-time case from history (up/down-arrow recall).
 			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
-			if (hadArgs && wasGoalModeEnabled) {
+			if (command.args) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
 			runtime.ctx.editor.setText("");

@@ -69,3 +69,51 @@ describe("builtin /copy slash command", () => {
 		expect(setText).toHaveBeenCalledWith("");
 	});
 });
+
+function createGoalTuiRuntime(goalModeEnabled: boolean) {
+	const handleGoalModeCommand = vi.fn(async () => {});
+	const addToHistory = vi.fn();
+	const setText = vi.fn();
+	const ctx = {
+		goalModeEnabled,
+		handleGoalModeCommand,
+		editor: { addToHistory, setText },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		handleGoalModeCommand,
+		addToHistory,
+		setText,
+	};
+}
+
+describe("builtin /goal slash command", () => {
+	it("records the first-time /goal set in input history even when goal mode was inactive", async () => {
+		const { runtime, handleGoalModeCommand, addToHistory } = createGoalTuiRuntime(false);
+
+		const result = await executeBuiltinSlashCommand("/goal set Ship the release", runtime);
+
+		expect(result).toBe(true);
+		expect(handleGoalModeCommand).toHaveBeenCalledWith("set Ship the release");
+		expect(addToHistory).toHaveBeenCalledWith("/goal set Ship the release");
+	});
+
+	it("records a replacement /goal set in input history when goal mode is active", async () => {
+		const { runtime, addToHistory } = createGoalTuiRuntime(true);
+
+		const result = await executeBuiltinSlashCommand("/goal set Replace the objective", runtime);
+
+		expect(result).toBe(true);
+		expect(addToHistory).toHaveBeenCalledWith("/goal set Replace the objective");
+	});
+
+	it("does not record an argument-less /goal in input history", async () => {
+		const { runtime, addToHistory } = createGoalTuiRuntime(false);
+
+		const result = await executeBuiltinSlashCommand("/goal", runtime);
+
+		expect(result).toBe(true);
+		expect(addToHistory).not.toHaveBeenCalled();
+	});
+});
