@@ -1,4 +1,4 @@
-import { logger } from "@gajae-code/utils";
+import * as logger from "@gajae-code/utils/logger";
 import { activeSnapshotPath, assertNonEmptyGjcSessionId, modeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import {
@@ -8,13 +8,12 @@ import {
 	removeActiveEntry,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
+import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "./canonical-skills";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
 
-export const CANONICAL_GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
-
-export type CanonicalGjcWorkflowSkill = (typeof CANONICAL_GJC_WORKFLOW_SKILLS)[number];
+export { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill };
 export type WorkflowHudSeverity = "info" | "warning" | "blocked" | "error" | "success";
 
 export interface WorkflowHudChip {

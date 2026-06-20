@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { listVerbs } from "../packages/coding-agent/src/gjc-runtime/workflow-manifest";
-import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../packages/coding-agent/src/skill-state/active-state";
+import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../packages/coding-agent/src/skill-state/canonical-skills";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const skillsRoot = path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills");

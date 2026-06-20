@@ -1,5 +1,4 @@
-import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/active-state";
+import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../skill-state/canonical-skills";
 import { getSkillManifest } from "./workflow-manifest";
 
 export type StateGraphSkill = CanonicalGjcWorkflowSkill | "all";

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { listCommandRefBlocks } from "../packages/coding-agent/src/gjc-runtime/workflow-command-ref";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../packages/coding-agent/src/skill-state/active-state";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../packages/coding-agent/src/skill-state/canonical-skills";
 
 interface SectionBudget {
 	blockId: string;

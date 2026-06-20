@@ -4,13 +4,7 @@
  * hand-edited.
  */
 
-import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
-
-// Keep this local to avoid importing skill-active runtime modules when CI static
-// gates only need the manifest projection. `active-state.ts` pulls state-writer
-// and, transitively, native addon loading; state-gates run before native artifacts
-// are downloaded.
-const CANONICAL_GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const satisfies readonly CanonicalGjcWorkflowSkill[];
+import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../skill-state/canonical-skills";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 
 export interface WorkflowState {
