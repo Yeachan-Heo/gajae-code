@@ -38,6 +38,14 @@ const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\
 const BASH_TOKEN_RE = /'[^']*'|"(?:\\.|[^"\\])*"|\S+/g;
 const BASH_REDIRECT_RE = /^(?:\d*)>>?$/;
 const BASH_HEREDOC_RE = /^(?:\d*)<<-?$/;
+// A file-descriptor duplication / move / close redirect target (`2>&1`, `>&2`,
+// `1>&-`, `&-`). These rewire a file descriptor — they NEVER name a filesystem
+// path, so they must not be recorded as write targets. Without this carve-out
+// the `&1` of a benign `... 2>&1` resolves to an in-project path and falsely
+// trips the planning phase-boundary block — which traps `gjc … --write … 2>&1`,
+// the very escape/finalize command this guard instructs the agent to run. A real
+// `>&file` (word, not a digit) still falls through and is recorded.
+const BASH_FD_DUP_TARGET_RE = /^&(?:\d+-?|-)$/;
 // Shell command-list / redirection / substitution operators. Includes `\r` and
 // `\n` because the shell treats a newline as a command separator and tool command
 // strings can be multiline (e.g. heredocs).
@@ -362,13 +370,16 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index] ?? "";
 		if (BASH_REDIRECT_RE.test(token)) {
-			addPath(targets, tokens[index + 1]);
+			// `2>` `&1` split form: a following fd-dup word is not a path target.
+			const next = tokens[index + 1] ?? "";
+			if (!BASH_FD_DUP_TARGET_RE.test(next)) addPath(targets, next);
 			index++;
 			continue;
 		}
 		const redirectMatch = token.match(/^(?:\d*)>>?(.+)$/);
 		if (redirectMatch?.[1]) {
-			addPath(targets, redirectMatch[1]);
+			// Skip fd duplication/close (`2>&1`, `>&2`, `1>&-`); record real files.
+			if (!BASH_FD_DUP_TARGET_RE.test(redirectMatch[1])) addPath(targets, redirectMatch[1]);
 			continue;
 		}
 		// A heredoc delimiter (`<<EOF`) is a here-document word, NOT a filesystem

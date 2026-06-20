@@ -255,6 +255,47 @@ describe("deep-interview mutation guard", () => {
 		}
 	});
 
+	it("allows fd-duplication redirects (2>&1, >&2) and the gjc escape command wrapped in them", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			// fd duplication / close is never a filesystem path → no phantom target.
+			"git status 2>&1",
+			"bun test 1>&2",
+			"ls -la >&-",
+			// The exact escape/finalize command an agent reaches for, wrapped in the
+			// near-universal `2>&1 || echo` defensive shell. This MUST stay allowed or
+			// deep-interview becomes an inescapable trap (the guard's own message tells
+			// the agent to run `gjc deep-interview --write --stage final`).
+			'gjc deep-interview --write --stage final --slug x --spec /tmp/x.md --json 2>&1 || echo "EXIT:$?"',
+			"gjc state deep-interview handoff --to ralplan --json 2>&1",
+		]) {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+			expect(decision.targets).toEqual([]);
+		}
+	});
+
+	it("still blocks a real file redirect even alongside an fd-duplication redirect", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of ["gjc state read 2>&1 > .gjc/state/foo.json", "build 2>&1 | tee src/product.ts"]) {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+		}
+	});
 	it("blocks mutating bash that targets .gjc during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
