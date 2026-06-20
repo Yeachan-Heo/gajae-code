@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import { parseSetupArgs, runSetupCommand } from "../src/cli/setup-cli";
-import { runHermesSetup } from "../src/setup/hermes-setup";
 import { addApiCompatibleProvider } from "../src/setup/provider-onboarding";
 
 let tempRoot: string | undefined;
@@ -65,7 +64,11 @@ describe("setup CLI parsing", () => {
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		const [exitCode, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		const [exitCode, stdout, stderr] = await Promise.all([
+			proc.exited,
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
 
 		expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: "ok", stderr: "" });
 	});
