@@ -102,6 +102,20 @@ describe("ultragoal ask guard", () => {
 		}
 	});
 
+	it("blocks latest session-scoped ultragoal ask when GJC_SESSION_ID is absent", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		delete process.env.GJC_SESSION_ID;
+
+		const diagnostic = await isUltragoalAskBlocked(cwd);
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+		expect(diagnostic.goalsPath).toBe(getUltragoalPaths(cwd, TEST_SESSION_ID).goalsPath);
+		expect(diagnostic.message).toContain("record-review-blockers");
+	});
+
 	it("blocks SDK-initial-path style wrapped ask while ultragoal is active", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;

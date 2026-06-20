@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
 import {
 	computeUltragoalPlanGeneration,
 	getUltragoalPaths,
@@ -10,6 +11,7 @@ import {
 	type UltragoalCompletionVerification,
 	type UltragoalGoal,
 	type UltragoalLedgerEvent,
+	type UltragoalPaths,
 	type UltragoalPlan,
 	type UltragoalReceiptKind,
 } from "./ultragoal-runtime";
@@ -63,9 +65,30 @@ function isKnownUltragoalObjective(currentObjective: string): boolean {
 	);
 }
 
-async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
+async function ultragoalReadPaths(cwd: string): Promise<UltragoalPaths> {
+	const envSessionId = process.env.GJC_SESSION_ID?.trim();
+	if (envSessionId) return getUltragoalPaths(cwd, envSessionId);
 	try {
-		await fs.stat(getUltragoalPaths(cwd, process.env.GJC_SESSION_ID).dir);
+		const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
+		return getUltragoalPaths(cwd, session.gjcSessionId);
+	} catch (error) {
+		if (error instanceof SessionResolutionError && error.code === "no_session") {
+			return getUltragoalPaths(cwd, null);
+		}
+		throw error;
+	}
+}
+
+async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
+	let paths: UltragoalPaths;
+	try {
+		paths = await ultragoalReadPaths(cwd);
+	} catch (error) {
+		if (error instanceof SessionResolutionError) return true;
+		throw error;
+	}
+	try {
+		await fs.stat(paths.dir);
 		return true;
 	} catch (error) {
 		if (
@@ -331,7 +354,15 @@ export async function readUltragoalVerificationState(input: {
 }
 
 export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBlockDiagnostic> {
-	const paths = getUltragoalPaths(cwd, process.env.GJC_SESSION_ID);
+	let paths: UltragoalPaths;
+	try {
+		paths = await ultragoalReadPaths(cwd);
+	} catch (error) {
+		return activeAskDiagnostic({
+			reason: `Unable to resolve durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,
+			source: "durable_state_unreadable",
+		});
+	}
 	try {
 		await fs.stat(paths.dir);
 	} catch (error) {
