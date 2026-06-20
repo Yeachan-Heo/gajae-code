@@ -404,7 +404,7 @@ async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promis
 
 async function runSmoke(spec: CoordinatorSetupSpec): Promise<HermesSetupResult["smoke"]> {
 	const requiredTools = [...COORDINATOR_MCP_TOOL_NAMES];
-	const server = createCoordinatorMcpServer({ env: {} });
+	const server = createCoordinatorMcpServer({ env: renderHermesServerBlock(spec).env as NodeJS.ProcessEnv });
 	const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
 	const listedResult = isRecord(listed.result) ? listed.result : {};
 	const tools = Array.isArray(listedResult.tools) ? listedResult.tools : [];
