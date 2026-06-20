@@ -114,7 +114,13 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 		output = runTmux(["list-sessions", "-F", format], env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (message.includes("no server running") || message.includes("failed to connect to server")) return [];
+		if (
+			message.includes("no server running") ||
+			message.includes("failed to connect to server") ||
+			message.includes("error connecting to")
+		) {
+			return [];
+		}
 		throw error;
 	}
 	return output
