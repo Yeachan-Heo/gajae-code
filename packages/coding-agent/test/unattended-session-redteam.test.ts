@@ -179,28 +179,38 @@ describe("UnattendedSessionControlPlane red-team G011", () => {
 
 describe("AskTool unattended gate red-team G011", () => {
 	it("decodes a multi-select gate answer to multiple selectedOptions", async () => {
-		const emitter = new StubEmitter(() => ({ selected: ["JWT", "OAuth2"], other: false }));
-		const tool = new AskTool(createSession(emitter));
+		const previousGjcSessionId = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "unattended-redteam-ask-test-session";
+		try {
+			const emitter = new StubEmitter(() => ({ selected: ["JWT", "OAuth2"], other: false }));
+			const tool = new AskTool(createSession(emitter));
 
-		const result = await tool.execute(
-			"call-redteam-multi",
-			{
-				questions: [
-					{
-						id: "auth",
-						question: "Which auth methods?",
-						options: [{ label: "JWT" }, { label: "OAuth2" }, { label: "Passkeys" }],
-						multi: true,
-					},
-				],
-			},
-			undefined,
-			undefined,
-			createContext(),
-		);
+			const result = await tool.execute(
+				"call-redteam-multi",
+				{
+					questions: [
+						{
+							id: "auth",
+							question: "Which auth methods?",
+							options: [{ label: "JWT" }, { label: "OAuth2" }, { label: "Passkeys" }],
+							multi: true,
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext(),
+			);
 
-		expect(emitter.received).toHaveLength(1);
-		expect(emitter.received[0]).toMatchObject({ stage: "deep-interview", kind: "question" });
-		expect(result.details).toMatchObject({ selectedOptions: ["JWT", "OAuth2"] });
+			expect(emitter.received).toHaveLength(1);
+			expect(emitter.received[0]).toMatchObject({ stage: "deep-interview", kind: "question" });
+			expect(result.details).toMatchObject({ selectedOptions: ["JWT", "OAuth2"] });
+		} finally {
+			if (previousGjcSessionId === undefined) {
+				delete process.env.GJC_SESSION_ID;
+			} else {
+				process.env.GJC_SESSION_ID = previousGjcSessionId;
+			}
+		}
 	});
 });
