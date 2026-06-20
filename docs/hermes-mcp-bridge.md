@@ -94,6 +94,8 @@ With that command configured, `gjc_coordinator_start_session` launches a detache
 
 For resume safety, prefer the generated GJC-native worktree command over creating a git worktree in Hermes itself. GJC's launch path records the original repo as the project identity while running in the worktree, so session listing/resume can still group the session under the source project. If Hermes creates and later deletes an unmanaged worktree, a saved session may still exist but its cwd can be gone.
 
+When an operator needs the session to stay visible in a routed tmux pane (for example a Clawhip/Hermes/OpenClaw channel that watches stale sessions and accepts follow-up prompts), use the documented visible-session fallback instead of inventing a private terminal protocol: [`docs/gjc-session-clawhip-routing.md`](./gjc-session-clawhip-routing.md). It keeps the same worktree isolation discipline while making the router, not GJC internals, own channel ids, mentions, and notification policy.
+
 Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`.
 
 `gjc setup hermes` renders `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` with the host platform path delimiter (`:` on POSIX, `;` on Windows). Manual configs should prefer the same encoding.
