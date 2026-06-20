@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { updateJsonAtomic, withWorkflowStateLock } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 
 const tempRoots: string[] = [];
@@ -27,7 +28,7 @@ function sleep(ms: number): Promise<void> {
 describe("state-writer concurrency (issue #646)", () => {
 	it("updateJsonAtomic does not lose concurrent read-modify-write updates", async () => {
 		const root = await tempDir();
-		const target = ".gjc/state/cas-probe.json";
+		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "cas-probe.json"));
 		const filePath = path.join(root, target);
 		const keys = Array.from({ length: 16 }, (_, index) => `k${index}`);
 
@@ -57,7 +58,7 @@ describe("state-writer concurrency (issue #646)", () => {
 
 	it("updateJsonAtomic applies sequential increments without losing any", async () => {
 		const root = await tempDir();
-		const target = ".gjc/state/counter.json";
+		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "counter.json"));
 		const filePath = path.join(root, target);
 		const bumps = 24;
 
@@ -81,7 +82,7 @@ describe("state-writer concurrency (issue #646)", () => {
 
 	it("withWorkflowStateLock serializes mutations of the same resolved target", async () => {
 		const root = await tempDir();
-		const target = ".gjc/state/lock-probe.json";
+		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "lock-probe.json"));
 
 		let active = 0;
 		let maxActive = 0;

@@ -11,6 +11,7 @@ import { getProjectDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../cli/args";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import { resolveSessionIdFromSources, writeSessionActivityMarker } from "../gjc-runtime/session-resolution";
 import { type RlmPreset, runRootCommand } from "../main";
 import rlmReportCommandPrompt from "../prompts/system/rlm-report-command.md" with { type: "text" };
 import type { CreateAgentSessionOptions } from "../sdk";
@@ -231,6 +232,12 @@ async function writeRlmMetadata(input: {
 		successfulRuns: input.successfulRuns,
 	};
 	await Bun.write(input.paths.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+	// Best-effort: update the per-session activity marker so latest-session auto-detect
+	// accounts for RLM-only generated output (AC2). Never let marker failure break RLM.
+	const gjcSessionId = resolveSessionIdFromSources({ envSessionId: process.env.GJC_SESSION_ID })?.gjcSessionId;
+	if (gjcSessionId) {
+		await writeSessionActivityMarker(input.cwd, gjcSessionId, { writer: "rlm" }).catch(() => {});
+	}
 }
 
 export async function runRlmCommand(argv: string[]): Promise<void> {

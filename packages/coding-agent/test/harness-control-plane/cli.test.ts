@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { harnessStateRoot } from "../../src/gjc-runtime/session-layout";
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import {
 	appendEvent,
@@ -19,17 +20,26 @@ const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"
 let root: string;
 let workspace: string;
 let cliEnv: HarnessCliEnv;
+let originalGjcSessionId: string | undefined;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-cli-root-"));
 	workspace = realpathSync(await mkdtemp(path.join(tmpdir(), "harness-cli-ws-")));
 	cliEnv = createHarnessCliEnv(repoRoot);
+	originalGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = "test-session";
+	cliEnv.env.GJC_SESSION_ID = "test-session";
 });
 
 afterEach(async () => {
 	cliEnv.cleanup();
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
+	if (originalGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = originalGjcSessionId;
+	}
 });
 
 interface HarnessResult {
@@ -321,7 +331,7 @@ describe("gjc harness CLI (foundation)", () => {
 			expect(started.code).toBe(0);
 			const sessionId = started.json.evidence.handle.sessionId as string;
 
-			await appendEvent(path.join(workspace, ".gjc", "state", "harness"), sessionId, {
+			await appendEvent(harnessStateRoot(workspace, "test-session"), sessionId, {
 				eventId: "evt-cross-cwd-prompt",
 				cursor: 1,
 				createdAt: "2026-06-03T00:00:01.000Z",

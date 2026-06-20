@@ -2,16 +2,20 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-receipts-"));
 	const priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	try {
 		await fn(dir);
 	} finally {
 		if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+		else delete process.env.GJC_SESSION_ID;
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }
@@ -21,7 +25,7 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
 }
 
 async function readAuditEntries(cwd: string): Promise<Array<Record<string, unknown>>> {
-	const raw = await fs.readFile(path.join(cwd, ".gjc/state/audit.jsonl"), "utf-8");
+	const raw = await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf-8");
 	return raw
 		.trim()
 		.split("\n")
@@ -76,7 +80,7 @@ describe("G5 gjc state receipts", () => {
 			expect(writePayload).toMatchObject({ ok: true, skill: "ralplan", current_phase: "planner", active: true });
 			expect(writePayload.state).toBeUndefined();
 			expectCliChecksum(writePayload);
-			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			expectValidReceipt(await readJson(statePath), "ralplan");
 			expectAuditEntry(findAuditEntry(await readAuditEntries(cwd), "write"), "write");
 
@@ -105,7 +109,7 @@ describe("G5 gjc state receipts", () => {
 			expectCliChecksum(handoffReceipts.from);
 			expectCliChecksum(handoffReceipts.to);
 			expect(handoffReceipts.from.version).toBeUndefined();
-			expectValidReceipt(await readJson(path.join(cwd, ".gjc/state/deep-interview-state.json")), "deep-interview");
+			expectValidReceipt(await readJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview")), "deep-interview");
 			expectValidReceipt(await readJson(statePath), "ralplan");
 
 			const entries = await readAuditEntries(cwd);

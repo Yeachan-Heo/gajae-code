@@ -326,14 +326,15 @@ Project executor override body.
 		expect(deepInterview).toBeDefined();
 		const content = deepInterview?.content ?? "";
 
-		for (const required of ["ask", ".gjc/state", "pending approval"]) {
+		for (const required of ["ask", ".gjc/_session-{sessionid}/state", "pending approval"]) {
 			expect(content).toContain(required);
 		}
 		expect(content).toContain("/skill:ralplan");
 		expect(content).toContain("/skill:team");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
-		expect(content).toContain("Direct `.gjc/` file edits are forbidden");
-		expect(content).toContain("do not edit `.gjc/state` directly without force override");
+		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
+		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
+		expect(content).toContain("gjc state clear --force --mode deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
@@ -370,9 +371,10 @@ Project executor override body.
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
-		expect(content).toContain("do not directly edit `.gjc/plans`");
+		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
+		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain(
-			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/specs`, `.gjc/plans`, `.gjc/state`, or any other `.gjc/` path are forbidden",
+			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",
 		);
 	});
 

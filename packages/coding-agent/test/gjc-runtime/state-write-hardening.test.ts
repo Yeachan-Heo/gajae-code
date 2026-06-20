@@ -1,7 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 const tempRoots: string[] = [];
 
@@ -18,10 +21,11 @@ afterEach(async () => {
 let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 function receiptFrom(stdout: string | undefined): Record<string, unknown> {
@@ -35,7 +39,7 @@ async function writeState(root: string, mode: string, state: Record<string, unkn
 }
 
 async function writeRawState(root: string, mode: string, state: unknown) {
-	const stateDir = path.join(root, ".gjc", "state");
+	const stateDir = sessionStateDir(root, TEST_SESSION_ID);
 	await fs.mkdir(stateDir, { recursive: true });
 	await fs.writeFile(
 		path.join(stateDir, `${mode}-state.json`),
@@ -97,7 +101,7 @@ describe("gjc state write hardening", () => {
 		const result = await writeState(root, "ralplan", { active: true });
 		expect(result.status).toBe(0);
 		expect(receiptFrom(result.stdout).current_phase).toBe("planner");
-		const onDisk = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"));
 		expect(onDisk.current_phase).toBe("planner");
 	});
 
@@ -106,7 +110,7 @@ describe("gjc state write hardening", () => {
 		const result = await writeState(root, "ralplan", { current_phase: "" });
 		expect(result.status).toBe(0);
 		expect(receiptFrom(result.stdout).current_phase).toBe("planner");
-		const onDisk = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"));
 		expect(onDisk.current_phase).toBe("planner");
 	});
 
@@ -122,7 +126,7 @@ describe("gjc state write hardening", () => {
 		const result = await writeState(root, "ralplan", { active: true });
 		expect(result.status).toBe(0);
 		expect(receiptFrom(result.stdout).current_phase).toBe("planner");
-		const onDisk = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"));
 		expect(onDisk.current_phase).toBe("planner");
 	});
 
@@ -146,7 +150,7 @@ describe("gjc state write hardening", () => {
 
 	it("reads unknown legacy phases fail-open", async () => {
 		const root = await tempDir();
-		const stateDir = path.join(root, ".gjc", "state");
+		const stateDir = sessionStateDir(root, TEST_SESSION_ID);
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(
 			path.join(stateDir, "ralplan-state.json"),
@@ -228,9 +232,7 @@ describe("gjc state write hardening", () => {
 		expect(result.status).toBe(0);
 		const written = receiptFrom(result.stdout);
 		expect(written).toMatchObject({ ok: true, skill: "deep-interview", current_phase: "interviewing" });
-		const onDisk = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
-		);
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(onDisk.state.rounds).toEqual(extension.rounds);
 		expect(onDisk.state.topology).toEqual(extension.topology);
 		expect(onDisk.state.ontology_snapshots).toEqual(extension.ontology_snapshots);

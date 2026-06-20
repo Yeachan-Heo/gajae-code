@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -17,14 +17,27 @@ import {
 	readDeepInterviewStateCompact,
 	validateDeepInterviewScoredTransition,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let priorSessionId: string | undefined;
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-recorder-"));
 	tempRoots.push(dir);
 	return dir;
 }
+
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
+});
 
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -263,7 +276,7 @@ describe("deep-interview recorder: state-shape migration & compact projection", 
 
 describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	function statePathFor(cwd: string): string {
-		return path.join(cwd, ".gjc", "state", "deep-interview-state.json");
+		return modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 	}
 
 	it("persists exactly one durable record per key and no-ops identical replay", async () => {
@@ -277,10 +290,10 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			dimension: "goal",
 			selectedOptions: ["A"],
 		};
-		const created = await appendOrMergeDeepInterviewRound(cwd, statePath, input);
+		const created = await appendOrMergeDeepInterviewRound(cwd, statePath, input, { sessionId: TEST_SESSION_ID });
 		expect(created.action).toBe("created");
 
-		const replay = await appendOrMergeDeepInterviewRound(cwd, statePath, input);
+		const replay = await appendOrMergeDeepInterviewRound(cwd, statePath, input, { sessionId: TEST_SESSION_ID });
 		expect(replay.action).toBe("noop");
 
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
@@ -291,17 +304,27 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("enriches the same record to scored without appending a second", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			questionText: "Q1?",
-		});
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.5 },
-			ambiguity: 0.5,
-		});
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				questionText: "Q1?",
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.5 },
+				ambiguity: 0.5,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		expect(persisted.state.rounds).toHaveLength(1);
 		expect(persisted.state.rounds[0].lifecycle).toBe("scored");
@@ -312,26 +335,41 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
 		// Round 1 establishes a clear baseline (goal 0.5, ambiguity 0.5).
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			questionText: "Q1?",
-			dimension: "goal",
-		});
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.5 },
-			ambiguity: 0.5,
-		});
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				questionText: "Q1?",
+				dimension: "goal",
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.5 },
+				ambiguity: 0.5,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		// Round 2 claims an active goal contradiction yet improves clarity and drops
 		// ambiguity — an impossible scored transition that would falsely converge.
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 2,
-			questionId: "q2",
-			questionText: "Q2?",
-			dimension: "goal",
-		});
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 2,
+				questionId: "q2",
+				questionText: "Q2?",
+				dimension: "goal",
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		await expect(
 			enrichDeepInterviewRoundScoring(cwd, statePath, {
 				round: 2,
@@ -354,31 +392,51 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("persists a valid scored transition that lowers the dimension and raises ambiguity", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			questionText: "Q1?",
-			dimension: "goal",
-		});
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.5 },
-			ambiguity: 0.5,
-		});
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 2,
-			questionId: "q2",
-			questionText: "Q2?",
-			dimension: "goal",
-		});
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			round: 2,
-			questionId: "q2",
-			scores: { goal: 0.3 },
-			ambiguity: 0.62,
-			triggers: [trigger()],
-		});
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				questionText: "Q1?",
+				dimension: "goal",
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.5 },
+				ambiguity: 0.5,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 2,
+				questionId: "q2",
+				questionText: "Q2?",
+				dimension: "goal",
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				round: 2,
+				questionId: "q2",
+				scores: { goal: 0.3 },
+				ambiguity: 0.62,
+				triggers: [trigger()],
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		const round2 = persisted.state.rounds.find((r: DeepInterviewRoundRecord) => r.round === 2);
 		expect(round2.lifecycle).toBe("scored");

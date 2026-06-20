@@ -1,8 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	activeSnapshotPath,
+	modeStatePath,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
+
+const TEST_SESSION_ID = "test-session";
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-state-handoff-"));
@@ -11,11 +18,12 @@ async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	// id into temp-dir scenarios. Individual tests that target the env
 	// default restore GJC_SESSION_ID inside their own setup.
 	const priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	try {
 		await fn(dir);
 	} finally {
 		if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+		else delete process.env.GJC_SESSION_ID;
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }
@@ -39,7 +47,7 @@ async function readJson(filePath: string): Promise<Record<string, unknown> | nul
 describe("gjc state handoff", () => {
 	it("transitions caller -> callee atomically across mode-state and active-state", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -68,13 +76,13 @@ describe("gjc state handoff", () => {
 			expect(caller?.handoff_at).toBe(handoffAt);
 			expect(caller?.version).toBe(WORKFLOW_STATE_VERSION);
 
-			const callee = await readJson(path.join(cwd, ".gjc/state/ralplan-state.json"));
+			const callee = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
 			expect(callee?.active).toBe(true);
 			expect(callee?.handoff_from).toBe("deep-interview");
 			expect(callee?.handoff_at).toBe(handoffAt);
 			expect(callee?.version).toBe(WORKFLOW_STATE_VERSION);
 
-			const activeState = await readJson(path.join(cwd, ".gjc/state/skill-active-state.json"));
+			const activeState = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
 			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
 			// Handoff demotes the caller to active:false with handoff_to lineage so
 			// downstream readers can audit the transition; HUD readers filter on
@@ -92,8 +100,8 @@ describe("gjc state handoff", () => {
 
 	it("normalizes legacy caller and callee envelopes to v2 during handoff", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
-			const calleePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -121,8 +129,8 @@ describe("gjc state handoff", () => {
 
 	it("bootstraps an absent callee mode-state during handoff", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
-			const calleePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -145,8 +153,8 @@ describe("gjc state handoff", () => {
 
 	it("rejects corrupt callee mode-state without --force and overwrites with --force", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
-			const calleePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -177,7 +185,7 @@ describe("gjc state handoff", () => {
 
 	it("rejects corrupt caller mode-state without --force and proceeds with --force", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 			await fs.mkdir(path.dirname(callerPath), { recursive: true });
 			await fs.writeFile(callerPath, "{broken json", "utf-8");
 
@@ -196,15 +204,15 @@ describe("gjc state handoff", () => {
 			expect(forced.status).toBe(0);
 			const caller = await readJson(callerPath);
 			expect(caller?.active).toBe(false);
-			const callee = await readJson(path.join(cwd, ".gjc/state/ralplan-state.json"));
+			const callee = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
 			expect(callee?.handoff_from).toBe("deep-interview");
 		});
 	});
 
 	it("writes callee mode-state before caller mode-state (HUD-coherent ordering)", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
-			const calleePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -230,7 +238,7 @@ describe("gjc state handoff", () => {
 
 	it("rejects missing --to", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
@@ -244,7 +252,7 @@ describe("gjc state handoff", () => {
 
 	it("rejects unknown callee skill", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
@@ -261,7 +269,7 @@ describe("gjc state handoff", () => {
 
 	it("rejects --to equal to caller", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/ralplan-state.json"), {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"), {
 				skill: "ralplan",
 				version: 1,
 				active: true,
@@ -286,7 +294,7 @@ describe("gjc state handoff", () => {
 
 	it("supports backward chain ultragoal -> ralplan", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/ultragoal-state.json"), {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"), {
 				skill: "ultragoal",
 				version: 1,
 				active: true,
@@ -297,11 +305,11 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(0);
-			const ultragoal = await readJson(path.join(cwd, ".gjc/state/ultragoal-state.json"));
+			const ultragoal = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"));
 			expect(ultragoal?.active).toBe(false);
 			expect(ultragoal?.current_phase).toBe("handoff");
 			expect(ultragoal?.handoff_to).toBe("ralplan");
-			const ralplan = await readJson(path.join(cwd, ".gjc/state/ralplan-state.json"));
+			const ralplan = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
 			expect(ralplan?.active).toBe(true);
 			expect(ralplan?.handoff_from).toBe("ultragoal");
 		});
@@ -309,9 +317,7 @@ describe("gjc state handoff", () => {
 	it("handoffs session-scoped state when --session-id is forwarded", async () => {
 		await withTempCwd(async cwd => {
 			const sessionId = "session-G007";
-			const encodedSession = encodeURIComponent(sessionId).replaceAll(".", "%2E");
-			const sessionDir = path.join(cwd, ".gjc/state/sessions", encodedSession);
-			await writeJson(path.join(sessionDir, "deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, sessionId, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
@@ -327,12 +333,12 @@ describe("gjc state handoff", () => {
 
 			// Session-scoped caller mode-state demoted; root mode-state untouched.
 			const caller = JSON.parse(
-				await fs.readFile(path.join(sessionDir, "deep-interview-state.json"), "utf-8"),
+				await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf-8"),
 			) as Record<string, unknown>;
 			expect(caller.active).toBe(false);
 			expect(caller.current_phase).toBe("handoff");
 
-			const callee = JSON.parse(await fs.readFile(path.join(sessionDir, "ralplan-state.json"), "utf-8")) as Record<
+			const callee = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ralplan"), "utf-8")) as Record<
 				string,
 				unknown
 			>;
@@ -340,12 +346,12 @@ describe("gjc state handoff", () => {
 			expect(callee.handoff_from).toBe("deep-interview");
 
 			// Root state files were NOT mutated for this session-scoped handoff.
-			await expect(fs.access(path.join(cwd, ".gjc/state/deep-interview-state.json"))).rejects.toThrow();
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"))).rejects.toThrow();
 
 			// Session-scoped active-state has callee active and carries lineage.
-			const sessionActive = JSON.parse(
-				await fs.readFile(path.join(sessionDir, "skill-active-state.json"), "utf-8"),
-			) as { active_skills?: Array<Record<string, unknown>> };
+			const sessionActive = JSON.parse(await fs.readFile(activeSnapshotPath(cwd, sessionId), "utf-8")) as {
+				active_skills?: Array<Record<string, unknown>>;
+			};
 			const ralplanEntry = sessionActive.active_skills?.find(e => e.skill === "ralplan");
 			expect(ralplanEntry?.handoff_from).toBe("deep-interview");
 			expect(typeof ralplanEntry?.handoff_at).toBe("string");
@@ -353,7 +359,7 @@ describe("gjc state handoff", () => {
 	});
 	it("propagates strict sync failure when active-state write fails after mode-state writes succeed", async () => {
 		await withTempCwd(async cwd => {
-			const callerPath = path.join(cwd, ".gjc/state/deep-interview-state.json");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 			await writeJson(callerPath, {
 				skill: "deep-interview",
 				version: 1,
@@ -365,7 +371,7 @@ describe("gjc state handoff", () => {
 			// exercises the strict active-state path, not the pre-sync mode-state
 			// path, and proves the CLI returns non-zero status when the atomic
 			// transaction cannot complete.
-			await fs.mkdir(path.join(cwd, ".gjc/state/skill-active-state.json"), { recursive: true });
+			await fs.mkdir(activeSnapshotPath(cwd, TEST_SESSION_ID), { recursive: true });
 
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
@@ -382,7 +388,7 @@ describe("gjc state handoff", () => {
 			expect(caller.current_phase).toBe("handoff");
 			expect(caller.active).toBe(false);
 			const callee = JSON.parse(
-				await fs.readFile(path.join(cwd, ".gjc/state/ralplan-state.json"), "utf-8"),
+				await fs.readFile(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"), "utf-8"),
 			) as Record<string, unknown>;
 			expect(callee.active).toBe(true);
 			expect(callee.handoff_from).toBe("deep-interview");
@@ -391,14 +397,14 @@ describe("gjc state handoff", () => {
 
 	it("treats corrupt active-state JSON as a strict failure", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(path.join(cwd, ".gjc/state/deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
 				current_phase: "interviewing",
 			});
-			await fs.mkdir(path.join(cwd, ".gjc/state"), { recursive: true });
-			await fs.writeFile(path.join(cwd, ".gjc/state/skill-active-state.json"), "{ not valid json");
+			await fs.mkdir(sessionStateDir(cwd, TEST_SESSION_ID), { recursive: true });
+			await fs.writeFile(activeSnapshotPath(cwd, TEST_SESSION_ID), "{ not valid json");
 
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
@@ -411,7 +417,7 @@ describe("gjc state handoff", () => {
 
 	it("preserves earlier inactive lineage across successive handoffs (D->R->U keeps di's handoff_to in active_skills)", async () => {
 		await withTempCwd(async cwd => {
-			const stateDir = path.join(cwd, ".gjc/state");
+			const stateDir = sessionStateDir(cwd, TEST_SESSION_ID);
 			await writeJson(path.join(stateDir, "deep-interview-state.json"), {
 				skill: "deep-interview",
 				version: 1,
@@ -469,9 +475,7 @@ describe("gjc state handoff", () => {
 	it("defaults session-id from GJC_SESSION_ID env var when no --session-id flag is passed", async () => {
 		await withTempCwd(async cwd => {
 			const sessionId = "session-env-default";
-			const encodedSession = encodeURIComponent(sessionId).replaceAll(".", "%2E");
-			const sessionDir = path.join(cwd, ".gjc/state/sessions", encodedSession);
-			await writeJson(path.join(sessionDir, "deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, sessionId, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
@@ -490,12 +494,12 @@ describe("gjc state handoff", () => {
 				expect(result.status).toBe(0);
 				// Session-scoped mode-state demoted (proves env default was applied).
 				const caller = JSON.parse(
-					await fs.readFile(path.join(sessionDir, "deep-interview-state.json"), "utf-8"),
+					await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf-8"),
 				) as Record<string, unknown>;
 				expect(caller.active).toBe(false);
 				expect(caller.current_phase).toBe("handoff");
 			} finally {
-				if (prior === undefined) delete process.env.GJC_SESSION_ID;
+				if (prior === undefined) process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 				else process.env.GJC_SESSION_ID = prior;
 			}
 		});
@@ -504,10 +508,8 @@ describe("gjc state handoff", () => {
 	it("supports the documented agent flow: write current_phase=handoff via env-defaulted session, then handoff CLI from skill tool", async () => {
 		await withTempCwd(async cwd => {
 			const sessionId = "session-docs-flow";
-			const encodedSession = encodeURIComponent(sessionId).replaceAll(".", "%2E");
-			const sessionDir = path.join(cwd, ".gjc/state/sessions", encodedSession);
 			// Bootstrap: an active deep-interview session-scoped state exists.
-			await writeJson(path.join(sessionDir, "deep-interview-state.json"), {
+			await writeJson(modeStatePath(cwd, sessionId, "deep-interview"), {
 				skill: "deep-interview",
 				version: 1,
 				active: true,
@@ -525,7 +527,7 @@ describe("gjc state handoff", () => {
 				);
 				expect(writeResult.status).toBe(0);
 				const di1 = JSON.parse(
-					await fs.readFile(path.join(sessionDir, "deep-interview-state.json"), "utf-8"),
+					await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf-8"),
 				) as Record<string, unknown>;
 				expect(di1.current_phase).toBe("handoff");
 				expect(di1.active).toBe(true); // write does NOT demote; only handoff verb does
@@ -537,18 +539,18 @@ describe("gjc state handoff", () => {
 				);
 				expect(handoffResult.status).toBe(0);
 				const di2 = JSON.parse(
-					await fs.readFile(path.join(sessionDir, "deep-interview-state.json"), "utf-8"),
+					await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf-8"),
 				) as Record<string, unknown>;
 				expect(di2.active).toBe(false);
 				expect(di2.handoff_to).toBe("ralplan");
-				const rp = JSON.parse(await fs.readFile(path.join(sessionDir, "ralplan-state.json"), "utf-8")) as Record<
+				const rp = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ralplan"), "utf-8")) as Record<
 					string,
 					unknown
 				>;
 				expect(rp.active).toBe(true);
 				expect(rp.handoff_from).toBe("deep-interview");
 			} finally {
-				if (prior === undefined) delete process.env.GJC_SESSION_ID;
+				if (prior === undefined) process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 				else process.env.GJC_SESSION_ID = prior;
 			}
 		});

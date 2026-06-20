@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -10,13 +10,26 @@ import {
 	writeCurrentSessionGoalModeState,
 	writePendingGoalModeRequest,
 } from "@gajae-code/coding-agent/gjc-runtime/goal-mode-request";
+import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
 	type SessionEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let priorSessionId: string | undefined;
+
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
+});
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-goal-mode-"));
@@ -39,7 +52,7 @@ describe("GJC ultragoal goal mode request", () => {
 
 	it("reads gjcObjective from the generated ultragoal plan", async () => {
 		const root = await tempDir();
-		const goalsPath = path.join(root, ".gjc", "ultragoal", "goals.json");
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
 		await fs.mkdir(path.dirname(goalsPath), { recursive: true });
 		await Bun.write(goalsPath, JSON.stringify({ gjcObjective: "Complete .gjc/ultragoal/goals.json" }));
 
@@ -53,8 +66,8 @@ describe("GJC ultragoal goal mode request", () => {
 		const root = await tempDir();
 		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal", goalsPath: "goals.json" });
 
-		const request = await consumePendingGoalModeRequest(root);
-		const consumedAgain = await consumePendingGoalModeRequest(root);
+		const request = await consumePendingGoalModeRequest(root, TEST_SESSION_ID);
+		const consumedAgain = await consumePendingGoalModeRequest(root, TEST_SESSION_ID);
 
 		expect(request?.objective).toBe("Complete ultragoal");
 		expect(request?.source).toBe("ultragoal");
@@ -95,14 +108,13 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(owned?.sessionId).toBe("session-A");
 	});
 
-	it("keeps consuming legacy unscoped requests from any session", async () => {
+	it("consumes pending requests from the owning session", async () => {
 		const root = await tempDir();
-		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal" });
+		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal", sessionId: "session-X" });
 
-		// No sessionId stamped (legacy/CLI-only producer) → consumable by any session.
 		const request = await consumePendingGoalModeRequest(root, "session-X");
 		expect(request?.objective).toBe("Complete ultragoal");
-		expect(request?.sessionId).toBeUndefined();
+		expect(request?.sessionId).toBe("session-X");
 	});
 
 	it("writes goal mode state into the current session file", async () => {
@@ -277,7 +289,7 @@ describe("GJC ultragoal goal mode request", () => {
 
 	it("surfaces corrupt pending request json", async () => {
 		const root = await tempDir();
-		const requestPath = path.join(root, ".gjc", "state", "goal-mode-request.json");
+		const requestPath = path.join(sessionStateDir(root, TEST_SESSION_ID), "goal-mode-request.json");
 		await fs.mkdir(path.dirname(requestPath), { recursive: true });
 		await Bun.write(requestPath, "{");
 
@@ -286,7 +298,7 @@ describe("GJC ultragoal goal mode request", () => {
 
 	it("surfaces corrupt ultragoal goals json", async () => {
 		const root = await tempDir();
-		const goalsPath = path.join(root, ".gjc", "ultragoal", "goals.json");
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
 		await fs.mkdir(path.dirname(goalsPath), { recursive: true });
 		await Bun.write(goalsPath, "{");
 

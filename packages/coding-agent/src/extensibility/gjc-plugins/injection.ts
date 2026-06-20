@@ -1,3 +1,11 @@
+import { resolveGjcSessionForRead } from "../../gjc-runtime/session-resolution";
+
+async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string> {
+	const normalizedSessionId = sessionId?.trim();
+	if (normalizedSessionId) return normalizedSessionId;
+	return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+}
+
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import { initialPhaseForSkill } from "../../skill-state/initial-phase";
 import { readActiveSubskillsForParent } from "./state";
@@ -35,7 +43,8 @@ export async function resolveCurrentPhaseForParent(input: {
 	const explicitPhase = input.explicitPhase?.trim();
 	if (explicitPhase) return explicitPhase;
 
-	const state = await readVisibleSkillActiveState(input.cwd, input.sessionId);
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
+	const state = await readVisibleSkillActiveState(input.cwd, resolvedSessionId);
 	const persistedPhase = state?.active_skills?.find(entry => entry.skill === input.parent)?.phase?.trim();
 	if (persistedPhase) return persistedPhase;
 
@@ -54,9 +63,10 @@ export async function buildSubskillInjection(input: {
 	activation?: LoadedSubskillActivation;
 	currentPhase?: string;
 }): Promise<{ block: string; details?: LoadedSubskillActivation } | null> {
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const resolvedPhase = await resolveCurrentPhaseForParent({
 		cwd: input.cwd,
-		sessionId: input.sessionId,
+		sessionId: resolvedSessionId,
 		parent: input.skillName,
 		explicitPhase: input.currentPhase,
 	});
@@ -69,7 +79,7 @@ export async function buildSubskillInjection(input: {
 
 	const [entry] = await readActiveSubskillsForParent({
 		cwd: input.cwd,
-		sessionId: input.sessionId,
+		sessionId: resolvedSessionId,
 		parent: input.skillName,
 		phase: resolvedPhase,
 	});
@@ -96,9 +106,10 @@ export async function buildAgentSubskillInjection(input: {
 }): Promise<string> {
 	if (!(GJC_SUBSKILL_PARENT_AGENTS as readonly string[]).includes(input.agentName)) return "";
 
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const entries = await readActiveSubskillsForParent({
 		cwd: input.cwd,
-		sessionId: input.sessionId,
+		sessionId: resolvedSessionId,
 		parent: input.agentName,
 		phase: "prompt",
 	});

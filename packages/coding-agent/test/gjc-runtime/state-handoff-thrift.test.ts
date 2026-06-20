@@ -6,11 +6,14 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { createUltragoalPlan, runNativeUltragoalCommand } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
+
+const TEST_SESSION_ID = "test-session";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const roots: string[] = [];
@@ -23,7 +26,7 @@ async function tempDir(prefix = "gjc-handoff-thrift-"): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 
 function scrub(text: string): string {
@@ -84,7 +87,7 @@ async function makeSkill(name: string, content: string): Promise<Skill> {
 
 describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 	it("goldens and asserts every preserved consumer key field", async () => {
-		delete process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		const root = await tempDir();
 
 		const ralplanReceipt = await runNativeRalplanCommand(
@@ -153,7 +156,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			"
 			`);
 
-		await writeJson(path.join(root, ".gjc/state/deep-interview-state.json"), {
+		await writeJson(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), {
 			skill: "deep-interview",
 			version: 1,
 			active: true,

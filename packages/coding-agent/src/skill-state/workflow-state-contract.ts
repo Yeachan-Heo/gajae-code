@@ -141,10 +141,10 @@ export function sanctionedWorkflowStateCommand(skill: CanonicalGjcWorkflowSkill)
 export function describeWorkflowStateContract(skill: CanonicalGjcWorkflowSkill): string[] {
 	return [
 		`Sanctioned mutation path: gjc state ${skill} read|write --input '<json>'`,
-		`Canonical active HUD state: .gjc/state/${SKILL_ACTIVE_STATE_FILE} and .gjc/state/sessions/<session>/${SKILL_ACTIVE_STATE_FILE}`,
-		`Skill mode state: .gjc/state/${workflowModeStateFileName(skill)} or .gjc/state/sessions/<session>/${workflowModeStateFileName(skill)}`,
+		`Canonical active HUD state: .gjc/_session-{sessionid}/state/${SKILL_ACTIVE_STATE_FILE}`,
+		`Skill mode state: .gjc/_session-{sessionid}/state/${workflowModeStateFileName(skill)}`,
 		"Receipts include version, skill, owner, command, state_path, storage_path, mutated_at, fresh_until, status, and mutation_id.",
 		"Receipts are fresh for 30 minutes; older receipts are stale and render as HUD warnings.",
-		"Planning artifacts under .gjc/specs/** and .gjc/plans/** remain writable outside the state command.",
+		"Planning artifacts under .gjc/_session-{sessionid}/specs/** and .gjc/_session-{sessionid}/plans/** remain writable outside the state command.",
 	];
 }

@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { readWorkflowStateJson, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 
+const TEST_SESSION_ID = "test-session";
+
 const tempRoots: string[] = [];
 let priorSessionId: string | undefined;
 
@@ -14,11 +16,12 @@ async function tempDir(): Promise<string> {
 
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 afterEach(async () => {

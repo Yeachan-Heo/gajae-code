@@ -27,6 +27,13 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
+import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
+import {
+	resolveGjcSessionForRead,
+	resolveGjcSessionForWrite,
+	SessionResolutionError,
+	writeSessionActivityMarker,
+} from "./session-resolution";
 import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState, migrateWorkflowState } from "./state-migrations";
 import {
@@ -60,9 +67,9 @@ import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor
 /**
  * Native implementation of the `gjc state read|write|clear` command surface.
  *
- * Simple file-receipt operations against `.gjc/state/[sessions/<id>/]<mode>-state.json` and
- * `.gjc/state/[sessions/<id>/]skill-active-state.json`. This is the sanctioned CLI mediator for
- * the mutation-guarded `.gjc/state` ACL — agents call it instead of editing those files directly.
+ * Simple file-receipt operations against session-scoped state under
+ * `.gjc/_session-{id}/state/`. This is the sanctioned CLI mediator for
+ * mutation-guarded GJC state — agents call it instead of editing those files directly.
  */
 
 export interface StateCommandResult {
@@ -72,6 +79,7 @@ export interface StateCommandResult {
 }
 
 const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
+const TERMINAL_CLEAR_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed"]);
 const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const KNOWN_MODES: readonly string[] = CANONICAL_GJC_WORKFLOW_SKILLS;
 
@@ -269,16 +277,22 @@ async function readInputJson(value: string | undefined, cwd: string): Promise<Re
 
 interface ResolvedSelectors {
 	mode: CanonicalGjcWorkflowSkill | undefined;
-	sessionId: string | undefined;
+	gjcSessionId: string;
 	threadId: string | undefined;
 	turnId: string | undefined;
 	payload: Record<string, unknown> | undefined;
 }
 
+// `clear` resolves like a read (explicit -> payload -> env -> latest-activity marker)
+// per the spec: read/status/clear may fall back to the most-recent session. Commands
+// that create or mutate new state roots still require an explicit/env session id.
+const WRITE_SESSION_ACTIONS = new Set<ParsedInvocation["action"]>(["write", "handoff", "prune", "migrate"]);
+
 async function resolveSelectors(
 	args: readonly string[],
 	cwd: string,
 	positionalSkill: string | undefined,
+	action: ParsedInvocation["action"],
 ): Promise<ResolvedSelectors> {
 	const payload = await readInputJson(flagValue(args, "--input"), cwd);
 
@@ -297,41 +311,32 @@ async function resolveSelectors(
 	}
 	if (mode) assertKnownMode(mode);
 
-	const sessionId = resolveSessionIdFromArgs(args, payload);
+	const sessionSources = {
+		flagValue: flagValue(args, "--session-id"),
+		payloadSessionId: payload?.session_id,
+		envSessionId: process.env.GJC_SESSION_ID,
+	};
+	const session = WRITE_SESSION_ACTIONS.has(action)
+		? resolveGjcSessionForWrite(cwd, sessionSources)
+		: await resolveGjcSessionForRead(cwd, sessionSources);
 
 	const threadId = flagValue(args, "--thread-id")?.trim() || undefined;
 	if (threadId) assertSafePathComponent(threadId, "thread-id");
 	const turnId = flagValue(args, "--turn-id")?.trim() || undefined;
 	if (turnId) assertSafePathComponent(turnId, "turn-id");
 
-	return { mode: mode as CanonicalGjcWorkflowSkill | undefined, sessionId, threadId, turnId, payload };
-}
-
-// Session-id resolution order: explicit --session-id flag, then payload
-// session_id, then GJC_SESSION_ID env var (set by AgentSession.sdk for
-// agent-initiated CLI invocations). The env-var default keeps shell
-// snippets in skill docs short while still routing state commands to the
-// caller's session-scoped state files.
-function resolveSessionIdFromArgs(
-	args: readonly string[],
-	payload: Record<string, unknown> | undefined,
-): string | undefined {
-	const explicitSessionId = flagValue(args, "--session-id");
-	let sessionId = explicitSessionId !== undefined ? explicitSessionId.trim() || undefined : undefined;
-	if (!sessionId && payload && typeof payload.session_id === "string") {
-		sessionId = payload.session_id.trim() || undefined;
-	}
-	if (!sessionId && explicitSessionId === undefined) {
-		const envSessionId = process.env.GJC_SESSION_ID?.trim();
-		if (envSessionId) sessionId = envSessionId;
-	}
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
-	return sessionId;
+	return {
+		mode: mode as CanonicalGjcWorkflowSkill | undefined,
+		gjcSessionId: session.gjcSessionId,
+		threadId,
+		turnId,
+		payload,
+	};
 }
 
 async function inferModeFromActiveState(
 	cwd: string,
-	sessionId: string | undefined,
+	sessionId: string,
 ): Promise<CanonicalGjcWorkflowSkill | undefined> {
 	const state = await readVisibleSkillActiveState(cwd, sessionId);
 	const entries = listActiveSkills(state);
@@ -341,22 +346,53 @@ async function inferModeFromActiveState(
 	return canonical ?? undefined;
 }
 
-function encodeSessionSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
+function stateDirFor(cwd: string, sessionId: string): string {
+	return sessionStateDir(cwd, sessionId);
 }
 
-function stateDirFor(cwd: string, sessionId: string | undefined): string {
-	const base = path.join(cwd, ".gjc", "state");
-	if (!sessionId) return base;
-	return path.join(base, "sessions", encodeSessionSegment(sessionId));
+function modeStateFile(cwd: string, mode: string, sessionId: string): string {
+	return modeStatePath(cwd, sessionId, mode);
 }
 
-function modeStateFile(cwd: string, mode: string, sessionId: string | undefined): string {
-	return path.join(stateDirFor(cwd, sessionId), `${mode}-state.json`);
+function activeStateFile(cwd: string, sessionId: string): string {
+	return activeSnapshotPath(cwd, sessionId);
 }
 
-function activeStateFile(cwd: string, sessionId: string | undefined): string {
-	return path.join(stateDirFor(cwd, sessionId), SKILL_ACTIVE_STATE_FILE);
+function stateRelativePath(cwd: string, filePath: string): string {
+	return path.relative(cwd, filePath).split(path.sep).join(path.posix.sep);
+}
+
+async function touchStateActivityMarker(cwd: string, sessionId: string, filePath: string): Promise<void> {
+	await writeSessionActivityMarker(cwd, sessionId, {
+		writer: "state-runtime",
+		path: stateRelativePath(cwd, filePath),
+	});
+}
+
+async function readActivePhaseForSkill(
+	cwd: string,
+	sessionId: string,
+	mode: CanonicalGjcWorkflowSkill,
+): Promise<string | undefined> {
+	const state = await readVisibleSkillActiveState(cwd, sessionId);
+	const entries = listActiveSkills(state);
+	const entry = entries.find(item => item.skill === mode) ?? (state?.skill === mode ? state : undefined);
+	return isPlainObject(entry) && typeof entry.phase === "string" ? entry.phase.trim() || undefined : undefined;
+}
+
+async function describeStaleClearState(
+	cwd: string,
+	sessionId: string,
+	mode: CanonicalGjcWorkflowSkill,
+	existing: Record<string, unknown>,
+): Promise<string | undefined> {
+	const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : undefined;
+	if (phase && TERMINAL_CLEAR_PHASES.has(phase)) return `mode-state is already terminal (${phase})`;
+	const activePhase = await readActivePhaseForSkill(cwd, sessionId, mode);
+	if (activePhase && phase && activePhase !== phase) {
+		return `active-state phase ${activePhase} differs from mode-state phase ${phase}`;
+	}
+	return undefined;
 }
 
 async function readJsonFile(filePath: string): Promise<Record<string, unknown> | null> {
@@ -446,7 +482,7 @@ function doctorProblem(
 		: { type, path: pathValue, message, fixCommand };
 }
 
-function activeEntryDir(cwd: string, sessionId: string | undefined): string {
+function activeEntryDir(cwd: string, sessionId: string): string {
 	return path.join(stateDirFor(cwd, sessionId), "active");
 }
 
@@ -507,9 +543,9 @@ function pushPhaseDriftProblem(options: {
 async function collectDoctorSummary(
 	cwd: string,
 	skill: CanonicalGjcWorkflowSkill | undefined,
-	sessionId: string | undefined,
+	sessionId: string,
 ): Promise<DoctorSummary> {
-	const root = path.join(cwd, ".gjc", "state");
+	const root = sessionStateDir(cwd, sessionId);
 	const skills = skill ? [skill] : [...CANONICAL_GJC_WORKFLOW_SKILLS];
 	const problems: DoctorProblem[] = [];
 	let filesScanned = 0;
@@ -583,7 +619,7 @@ async function collectDoctorSummary(
 		}
 	}
 
-	const inspectActiveScope = async (scopeSessionId: string | undefined): Promise<void> => {
+	const inspectActiveScope = async (scopeSessionId: string): Promise<void> => {
 		const snapshotPath = activeStateFile(cwd, scopeSessionId);
 		const snapshot = await readRawJson(snapshotPath);
 		if (snapshot.exists) filesScanned += 1;
@@ -624,7 +660,9 @@ async function collectDoctorSummary(
 			}
 		}
 		if (isPlainObject(snapshot.value)) {
-			const activeSkills = Array.isArray(snapshot.value.active_skills) ? snapshot.value.active_skills : [];
+			const activeSkills: unknown[] = Array.isArray(snapshot.value.active_skills)
+				? snapshot.value.active_skills
+				: [];
 			for (const entry of activeSkills) {
 				const entrySkill = skillFromActiveValue(entry);
 				if (!entrySkill) continue;
@@ -658,21 +696,6 @@ async function collectDoctorSummary(
 	};
 
 	await inspectActiveScope(sessionId);
-	if (!sessionId) {
-		const sessionsDir = path.join(root, "sessions");
-		let sessions: string[] = [];
-		try {
-			const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
-			sessions = entries
-				.filter(entry => entry.isDirectory())
-				.map(entry => entry.name)
-				.sort();
-		} catch (error) {
-			const err = error as NodeJS.ErrnoException;
-			if (err.code !== "ENOENT") throw error;
-		}
-		for (const rawSession of sessions) await inspectActiveScope(decodeURIComponent(rawSession));
-	}
 
 	problems.sort(
 		(a, b) =>
@@ -727,8 +750,16 @@ async function handleDoctor(
 	const rawSkill = flagValue(args, "--skill")?.trim() || flagValue(args, "--mode")?.trim() || positionalSkill?.trim();
 	if (rawSkill) assertKnownMode(rawSkill);
 	const payload = await readInputJson(flagValue(args, "--input"), cwd);
-	const sessionId = resolveSessionIdFromArgs(args, payload);
-	const summary = await collectDoctorSummary(cwd, rawSkill as CanonicalGjcWorkflowSkill | undefined, sessionId);
+	const session = await resolveGjcSessionForRead(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		payloadSessionId: payload?.session_id,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const summary = await collectDoctorSummary(
+		cwd,
+		rawSkill as CanonicalGjcWorkflowSkill | undefined,
+		session.gjcSessionId,
+	);
 	return {
 		status: summary.ok ? 0 : 1,
 		stdout: hasFlag(args, "--json") ? `${JSON.stringify(summary, null, 2)}\n` : renderDoctorText(summary),
@@ -737,6 +768,7 @@ async function handleDoctor(
 
 async function warnAndAuditOutOfBandIfNeeded(
 	cwd: string,
+	sessionId: string,
 	filePath: string,
 	skill: CanonicalGjcWorkflowSkill,
 	options?: { mutationId?: string; forced?: boolean },
@@ -751,7 +783,7 @@ async function warnAndAuditOutOfBandIfNeeded(
 	}
 	if (!mismatch) return undefined;
 	const message = `WARNING: workflow mode-state out-of-band edit detected for ${skill}: ${filePath} expected sha256 ${mismatch.expected} but found ${mismatch.actual}`;
-	await appendAuditEntry(cwd, {
+	await appendAuditEntry(cwd, sessionId, {
 		ts: new Date().toISOString(),
 		skill,
 		category: "state",
@@ -772,6 +804,7 @@ async function writeJsonAtomic(
 	value: unknown,
 	verb: "write" | "clear" | "handoff" | "reconcile" = "write",
 	options?: {
+		sessionId: string;
 		skill?: CanonicalGjcWorkflowSkill;
 		mutationId?: string;
 		force?: boolean;
@@ -781,7 +814,7 @@ async function writeJsonAtomic(
 	},
 ): Promise<{ warning?: string; stamped: Record<string, unknown> }> {
 	const warning = options?.skill
-		? await warnAndAuditOutOfBandIfNeeded(cwd, filePath, options.skill, {
+		? await warnAndAuditOutOfBandIfNeeded(cwd, options.sessionId, filePath, options.skill, {
 				mutationId: options.mutationId,
 				forced: options.force ?? false,
 			})
@@ -792,6 +825,7 @@ async function writeJsonAtomic(
 	await writeWorkflowEnvelopeAtomic(filePath, value, {
 		cwd,
 		audit: {
+			sessionId: options?.sessionId ?? "",
 			category: "state",
 			verb,
 			owner: options?.owner ?? "gjc-state-cli",
@@ -851,13 +885,14 @@ function parseSinceFlag(args: readonly string[]): string | undefined {
 async function readAuditWindow(
 	cwd: string,
 	args: readonly string[],
+	sessionId: string,
 ): Promise<{ entries: unknown[]; limit: number; since?: string; truncated: boolean }> {
 	const limit = parseLimitFlag(args);
 	const since = parseSinceFlag(args);
-	const auditPath = path.join(cwd, ".gjc", "state", "audit.jsonl");
+	const auditFile = auditPath(cwd, sessionId);
 	let raw = "";
 	try {
-		raw = await fs.readFile(auditPath, "utf-8");
+		raw = await fs.readFile(auditFile, "utf-8");
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code !== "ENOENT") throw error;
@@ -1014,7 +1049,7 @@ function buildHudForMode(
 async function syncWorkflowSkillState(options: {
 	cwd: string;
 	mode: CanonicalGjcWorkflowSkill;
-	sessionId: string | undefined;
+	sessionId: string;
 	threadId?: string;
 	turnId?: string;
 	active: boolean;
@@ -1053,14 +1088,18 @@ async function syncWorkflowSkillState(options: {
 export async function reconcileWorkflowSkillState(options: {
 	cwd: string;
 	mode: CanonicalGjcWorkflowSkill;
-	sessionId: string | undefined;
+	sessionId?: string;
 	threadId?: string;
 	turnId?: string;
 	active: boolean;
 	phase: string;
 	payload: Record<string, unknown>;
 }): Promise<{ stateFile: string }> {
-	const { cwd, mode, sessionId, threadId, turnId, active, payload } = options;
+	const { cwd, mode, threadId, turnId, active, payload } = options;
+	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(cwd, {
+		payloadSessionId: options.sessionId,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const existingRead = await readExistingStateForMutation(filePath);
 	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
@@ -1105,6 +1144,7 @@ export async function reconcileWorkflowSkillState(options: {
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
 	await writeJsonAtomic(cwd, filePath, merged, "reconcile", {
+		sessionId,
 		skill: mode,
 		mutationId,
 		force: true,
@@ -1129,6 +1169,7 @@ export async function reconcileWorkflowSkillState(options: {
 		hud: buildHudForMode(mode, merged),
 		receipt,
 	});
+	await touchStateActivityMarker(cwd, sessionId, filePath);
 	return { stateFile: filePath };
 }
 export async function readWorkflowStateJson(
@@ -1136,7 +1177,11 @@ export async function readWorkflowStateJson(
 	skill: CanonicalGjcWorkflowSkill,
 	sessionId?: string,
 ): Promise<Record<string, unknown>> {
-	return (await readJsonFile(modeStateFile(cwd, skill, sessionId))) ?? {};
+	const session = await resolveGjcSessionForRead(cwd, {
+		payloadSessionId: sessionId,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	return (await readJsonFile(modeStateFile(cwd, skill, session.gjcSessionId))) ?? {};
 }
 
 async function handleRead(
@@ -1144,12 +1189,12 @@ async function handleRead(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "read");
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.gjcSessionId));
 	const fields = parseFieldsFlag(args);
 	if (mode) {
-		const filePath = modeStateFile(cwd, mode, selectors.sessionId);
-		const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
+		const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
+		const existing = await readWorkflowStateJson(cwd, mode, selectors.gjcSessionId);
 		const envelope = { skill: mode, state: existing, storage_path: filePath };
 		const manifest = getSkillManifest(mode);
 		if (fields) {
@@ -1177,7 +1222,7 @@ async function handleRead(
 				: renderStateMarkdown(mode, envelope, manifest),
 		};
 	}
-	const filePath = activeStateFile(cwd, selectors.sessionId);
+	const filePath = activeStateFile(cwd, selectors.gjcSessionId);
 	const existingRaw = await readJsonValue(filePath);
 	const existing = isPlainObject(existingRaw) ? existingRaw : null;
 	return { status: 0, stdout: `${JSON.stringify(existing ?? {}, null, 2)}\n` };
@@ -1188,16 +1233,16 @@ async function handleStatus(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "read");
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.gjcSessionId));
 	if (!mode) {
 		throw new StateCommandError(
 			2,
-			"gjc state status requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state status requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 	}
-	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
-	const existing = await readWorkflowStateJson(cwd, mode, selectors.sessionId);
+	const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
+	const existing = await readWorkflowStateJson(cwd, mode, selectors.gjcSessionId);
 	const summary = buildStateStatusSummary(
 		mode,
 		{ skill: mode, state: existing, storage_path: filePath },
@@ -1215,14 +1260,14 @@ async function handleWrite(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const { sessionId, threadId, turnId, payload } = selectors;
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "write");
+	const { gjcSessionId: sessionId, threadId, turnId, payload } = selectors;
 	if (!payload) throw new StateCommandError(2, "gjc state write requires --input '<json>'");
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
 	if (!mode)
 		throw new StateCommandError(
 			2,
-			"gjc state write requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state write requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
@@ -1311,6 +1356,7 @@ async function handleWrite(
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
 	const { warning: outOfBandWarning, stamped } = await writeJsonAtomic(cwd, filePath, merged, "write", {
+		sessionId,
 		skill: mode,
 		mutationId,
 		force: forced,
@@ -1322,6 +1368,7 @@ async function handleWrite(
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
 	const active = merged.active !== false;
 	await syncWorkflowSkillState({ cwd, mode, sessionId, threadId, turnId, active, phase, payload: merged, receipt });
+	await touchStateActivityMarker(cwd, sessionId, filePath);
 
 	return {
 		status: 0,
@@ -1344,13 +1391,13 @@ async function handleClear(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const { sessionId, threadId, turnId } = selectors;
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "clear");
+	const { gjcSessionId: sessionId, threadId, turnId } = selectors;
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
 	if (!mode)
 		throw new StateCommandError(
 			2,
-			"gjc state clear requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state clear requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
@@ -1363,6 +1410,10 @@ async function handleClear(
 		);
 	}
 	const existing = existingRead.kind === "valid" ? existingRead.value : {};
+	const staleReason = await describeStaleClearState(cwd, sessionId, mode, existing);
+	if (staleReason && !forced) {
+		throw new StateCommandError(2, `existing state for ${mode} is stale (${staleReason}); use --force to clear`);
+	}
 	const clearedAt = nowIso();
 	const cleared: Record<string, unknown> = {
 		skill: mode,
@@ -1385,6 +1436,7 @@ async function handleClear(
 	});
 	cleared.receipt = receipt;
 	const { warning: outOfBandWarning, stamped } = await writeJsonAtomic(cwd, filePath, cleared, "clear", {
+		sessionId,
 		skill: mode,
 		mutationId,
 		force: forced,
@@ -1403,6 +1455,7 @@ async function handleClear(
 		phase: "complete",
 		payload: cleared,
 	});
+	await touchStateActivityMarker(cwd, sessionId, filePath);
 	return {
 		status: 0,
 		stdout: renderCliWriteReceipt({
@@ -1443,13 +1496,13 @@ async function handleHandoff(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const { sessionId, threadId, turnId } = selectors;
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "handoff");
+	const { gjcSessionId: sessionId, threadId, turnId } = selectors;
 	const caller = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
 	if (!caller) {
 		throw new StateCommandError(
 			2,
-			"gjc state handoff requires --mode <caller>, positional <caller>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state handoff requires --mode <caller>, positional <caller>, input.skill, or an active workflow in the current session active state",
 		);
 	}
 	const calleeRaw = flagValue(args, "--to")?.trim();
@@ -1552,6 +1605,7 @@ async function handleHandoff(
 
 	await beginWorkflowTransactionJournal({
 		cwd,
+		sessionId,
 		mutationId,
 		caller,
 		callee,
@@ -1567,21 +1621,23 @@ async function handleHandoff(
 	// only; corrupt JSON / IO failures propagate as non-zero CLI status.
 	const force = hasFlag(args, "--force");
 	const calleeWrite = await writeJsonAtomic(cwd, calleePath, mergedCalleeState, "handoff", {
+		sessionId,
 		skill: callee,
 		mutationId,
 		force,
 		fromPhase: typeof existingCallee.current_phase === "string" ? existingCallee.current_phase : undefined,
 		toPhase: calleeInitial,
 	});
-	await updateWorkflowTransactionJournal(cwd, mutationId, { steps: ["callee-mode-state"] });
+	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["callee-mode-state"] });
 	const callerWrite = await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", {
+		sessionId,
 		skill: caller,
 		mutationId,
 		force,
 		fromPhase: typeof existingCaller.current_phase === "string" ? existingCaller.current_phase : undefined,
 		toPhase: "handoff",
 	});
-	await updateWorkflowTransactionJournal(cwd, mutationId, {
+	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 		steps: ["callee-mode-state", "caller-mode-state"],
 	});
 	const warnings = [calleeWrite.warning, callerWrite.warning].filter(
@@ -1626,10 +1682,11 @@ async function handleHandoff(
 			receipt: calleeReceipt,
 		},
 	});
-	await updateWorkflowTransactionJournal(cwd, mutationId, {
+	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 		steps: ["callee-mode-state", "caller-mode-state", "active-state"],
 	});
-	await completeWorkflowTransactionJournal(cwd, mutationId);
+	await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
+	await touchStateActivityMarker(cwd, sessionId, callerPath);
 
 	return {
 		status: 0,
@@ -1668,7 +1725,7 @@ async function handleContract(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const { mode } = await resolveSelectors(args, cwd, positionalSkill);
+	const { mode } = await resolveSelectors(args, cwd, positionalSkill, "read");
 	if (!mode) {
 		throw new StateCommandError(2, "gjc state contract requires --mode <skill>, positional <skill>, or input.skill");
 	}
@@ -1723,11 +1780,7 @@ function categoryForStateRelativePath(relativePath: string): string | undefined 
 	if (normalized === "audit.jsonl") return undefined;
 	if (normalized === SKILL_ACTIVE_STATE_FILE || normalized.endsWith(`/${SKILL_ACTIVE_STATE_FILE}`)) return undefined;
 	if (normalized.startsWith("active/") || normalized.includes("/active/")) return undefined;
-	if (
-		/^[^/]+-state\.json$/.test(normalized) ||
-		(normalized.includes("/sessions/") && /\/[^/]+-state\.json$/.test(normalized))
-	)
-		return undefined;
+	if (/^[^/]+-state\.json$/.test(normalized) || false) return undefined;
 	if (normalized.startsWith("artifacts/") || normalized.includes("/artifacts/")) return "artifact";
 	if (
 		normalized.startsWith("logs/") ||
@@ -1753,9 +1806,10 @@ function categoryForStateRelativePath(relativePath: string): string | undefined 
 
 async function collectRetentionCandidates(
 	cwd: string,
+	sessionId: string,
 	skills: readonly CanonicalGjcWorkflowSkill[],
 ): Promise<RetentionCandidate[]> {
-	const stateRoot = path.join(cwd, ".gjc", "state");
+	const stateRoot = sessionStateDir(cwd, sessionId);
 	const policies = new Map<string, { keep?: number; maxAgeDays?: number }>();
 	for (const skill of skills) {
 		for (const policy of getSkillManifest(skill).retention) {
@@ -1836,7 +1890,11 @@ async function buildGcSummary(
 		flagValue(args, "--skill")?.trim() || flagValue(args, "--mode")?.trim() || positionalSkill?.trim() || "all";
 	if (rawSkill !== "all") assertKnownMode(rawSkill);
 	const skills = rawSkill === "all" ? CANONICAL_GJC_WORKFLOW_SKILLS : [rawSkill as CanonicalGjcWorkflowSkill];
-	const eligible = selectRetentionEligible(await collectRetentionCandidates(cwd, skills));
+	const session = await resolveGjcSessionForRead(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const eligible = selectRetentionEligible(await collectRetentionCandidates(cwd, session.gjcSessionId, skills));
 	const counts: Record<string, number> = {};
 	for (const candidate of eligible) counts[candidate.category] = (counts[candidate.category] ?? 0) + 1;
 	const targets: GenericHardPruneTarget[] = eligible.map(candidate => ({
@@ -1850,6 +1908,7 @@ async function buildGcSummary(
 			cwd,
 			audit: {
 				cwd,
+				sessionId: session.gjcSessionId,
 				skill: rawSkill,
 				category: "prune",
 				verb: "gc",
@@ -1861,7 +1920,7 @@ async function buildGcSummary(
 		skill: rawSkill as CanonicalGjcWorkflowSkill | "all",
 		dry_run: dryRun,
 		eligible: eligible.map(candidate => candidate.relativePath),
-		pruned: pruned.map(filePath => path.relative(path.join(cwd, ".gjc", "state"), filePath)),
+		pruned: pruned.map(filePath => path.relative(sessionStateDir(cwd, session.gjcSessionId), filePath)),
 		counts,
 	};
 }
@@ -1872,7 +1931,11 @@ async function handleGraph(
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
 	if (hasFlag(args, "--history")) {
-		const history = await readAuditWindow(_cwd, args);
+		const session = await resolveGjcSessionForRead(_cwd, {
+			flagValue: flagValue(args, "--session-id"),
+			envSessionId: process.env.GJC_SESSION_ID,
+		});
+		const history = await readAuditWindow(_cwd, args, session.gjcSessionId);
 		return {
 			status: 0,
 			stdout: hasFlag(args, "--json") ? `${JSON.stringify(history, null, 2)}\n` : renderHistoryMarkdown(history),
@@ -1895,20 +1958,21 @@ async function handlePrune(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "prune");
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.gjcSessionId));
 	if (!mode) {
 		throw new StateCommandError(
 			2,
-			"gjc state prune requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state prune requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 	}
-	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
 	const olderThanDays = parseNonNegativeIntegerFlag(args, "--older-than");
 	const status = flagValue(args, "--status")?.trim();
 	const targets: GenericHardPruneTarget[] = [{ path: filePath, category: "prune" }];
 	const audit: StateWriterAuditContext = {
 		cwd,
+		sessionId: selectors.gjcSessionId,
 		skill: mode,
 		category: "prune",
 		verb: hasFlag(args, "--hard") ? "hard-prune" : "soft-delete",
@@ -1964,17 +2028,17 @@ async function handleMigrate(
 	cwd: string,
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
-	const selectors = await resolveSelectors(args, cwd, positionalSkill);
-	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.sessionId));
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "migrate");
+	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.gjcSessionId));
 	if (!mode) {
 		throw new StateCommandError(
 			2,
-			"gjc state migrate requires --mode <skill>, positional <skill>, input.skill, or an active workflow in .gjc/state/skill-active-state.json",
+			"gjc state migrate requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 	}
-	const filePath = modeStateFile(cwd, mode, selectors.sessionId);
+	const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
 	const forced = hasFlag(args, "--force");
-	const mismatchWarning = await warnAndAuditOutOfBandIfNeeded(cwd, filePath, mode, {
+	const mismatchWarning = await warnAndAuditOutOfBandIfNeeded(cwd, selectors.gjcSessionId, filePath, mode, {
 		forced,
 	});
 	if (mismatchWarning && !forced) {
@@ -1984,7 +2048,7 @@ async function handleMigrate(
 		cwd,
 		skill: mode,
 		statePath: filePath,
-		sessionId: selectors.sessionId,
+		sessionId: selectors.gjcSessionId,
 	});
 	return {
 		status: 0,
@@ -2026,6 +2090,7 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 		}
 	} catch (error) {
 		if (error instanceof StateCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof SessionResolutionError) return { status: 2, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
 }

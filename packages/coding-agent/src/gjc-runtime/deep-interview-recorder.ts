@@ -11,6 +11,7 @@ import {
 	normalizeDeepInterviewEnvelope,
 	questionHash,
 } from "./deep-interview-state";
+import { writeSessionActivityMarker } from "./session-resolution";
 import { readExistingStateForMutation, writeWorkflowEnvelopeAtomic } from "./state-writer";
 
 export * from "./deep-interview-state";
@@ -310,6 +311,7 @@ async function persistEnvelope(
 	sessionId: string | undefined,
 	command: string,
 ): Promise<void> {
+	if (!sessionId) throw new Error("deep-interview recorder requires a session id");
 	const now = new Date().toISOString();
 	const payload: Record<string, unknown> = { ...normalizeDeepInterviewEnvelope(envelope), updated_at: now };
 	// Guarantee RequiredOnWriteEnvelopeSchema fields for the fresh/absent fallback;
@@ -321,8 +323,9 @@ async function persistEnvelope(
 	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
 		receipt: { cwd, skill: "deep-interview", owner: "gjc-runtime", command, sessionId, nowIso: now },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
+	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-recorder", path: statePath });
 }
 
 /**

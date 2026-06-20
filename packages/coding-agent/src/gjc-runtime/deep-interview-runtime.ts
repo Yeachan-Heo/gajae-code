@@ -7,6 +7,8 @@ import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { normalizeDeepInterviewEnvelope } from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
+import { modeStatePath, sessionSpecsDir } from "./session-layout";
+import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
 
@@ -76,10 +78,6 @@ function assertSafePathComponent(value: string, label: string): void {
 	}
 }
 
-function encodeSessionSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
-}
-
 function defaultSpecSlug(now: Date = new Date()): string {
 	const yyyy = now.getUTCFullYear().toString().padStart(4, "0");
 	const mm = (now.getUTCMonth() + 1).toString().padStart(2, "0");
@@ -89,14 +87,10 @@ function defaultSpecSlug(now: Date = new Date()): string {
 	return `${yyyy}-${mm}-${dd}-${hh}${min}-${randomBytes(2).toString("hex")}`;
 }
 
-function stateDirFor(cwd: string, sessionId: string | undefined): string {
-	return sessionId
-		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(sessionId))
-		: path.join(cwd, ".gjc", "state");
-}
-
-export function deepInterviewStatePath(cwd: string, sessionId: string | undefined): string {
-	return path.join(stateDirFor(cwd, sessionId), "deep-interview-state.json");
+export function deepInterviewStatePath(cwd: string, sessionId?: string): string {
+	const resolvedSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
+	if (!resolvedSessionId) throw new Error("deep-interview state path requires a session id");
+	return modeStatePath(cwd, resolvedSessionId, "deep-interview");
 }
 
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
@@ -117,7 +111,7 @@ interface ResolvedDeepInterviewArgs {
 	resolution: DeepInterviewResolution;
 	threshold: number;
 	thresholdSource: string;
-	sessionId?: string;
+	sessionId: string;
 	idea: string;
 	language?: DeepInterviewLanguagePreference;
 	json: boolean;
@@ -134,7 +128,7 @@ export interface ResolvedDeepInterviewSpecWriteArgs {
 	stage: "final";
 	slug: string;
 	spec: string;
-	sessionId?: string;
+	sessionId: string;
 	json: boolean;
 	deliberate: boolean;
 	handoff?: "ralplan";
@@ -277,8 +271,12 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 		throw new DeepInterviewCommandError(2, "--spec is required for deep-interview --write");
 	}
 
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
+	assertSafePathComponent(sessionId, "session-id");
 
 	const rawHandoff = flagValue(args, "--handoff")?.trim() || undefined;
 	if (rawHandoff && rawHandoff !== "ralplan") {
@@ -324,8 +322,12 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 }
 
 async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewArgs> {
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
+	assertSafePathComponent(sessionId, "session-id");
 
 	const explicitResolutions = (["quick", "standard", "deep"] as const).filter(name => hasFlag(args, `--${name}`));
 	if (explicitResolutions.length > 1) {
@@ -402,19 +404,34 @@ export async function persistDeepInterviewSpec(
 	}
 	const existing = existingRead.kind === "valid" ? existingRead.value : {};
 
-	const specPath = path.join(cwd, ".gjc", "specs", `deep-interview-${resolved.slug}.md`);
+	const specPath = path.join(sessionSpecsDir(cwd, resolved.sessionId), `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	await writeArtifact(specPath, content, {
 		cwd,
-		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+		audit: {
+			category: "artifact",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			sessionId: resolved.sessionId,
+		},
 	});
 
 	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
 	await appendJsonl(
-		path.join(cwd, ".gjc", "specs", "deep-interview-index.jsonl"),
+		path.join(sessionSpecsDir(cwd, resolved.sessionId), "deep-interview-index.jsonl"),
 		{ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 },
-		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview" } },
+		{
+			cwd,
+			audit: {
+				category: "ledger",
+				verb: "append",
+				owner: "gjc-runtime",
+				skill: "deep-interview",
+				sessionId: resolved.sessionId,
+			},
+		},
 	);
 
 	const payload = normalizeDeepInterviewEnvelope({
@@ -446,9 +463,11 @@ export async function persistDeepInterviewSpec(
 			verb: "write",
 			owner: "gjc-runtime",
 			skill: "deep-interview",
+			sessionId: resolved.sessionId,
 			forced: resolved.force,
 		},
 	});
+	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,
 		sessionId: resolved.sessionId,
@@ -503,8 +522,15 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 			sessionId: resolved.sessionId,
 			nowIso: now,
 		},
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview" },
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			sessionId: resolved.sessionId,
+		},
 	});
+	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({ cwd, sessionId: resolved.sessionId, payload, phase: "interviewing" });
 	return statePath;
 }

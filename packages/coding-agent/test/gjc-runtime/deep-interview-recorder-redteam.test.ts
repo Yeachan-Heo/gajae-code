@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -12,9 +12,12 @@ import {
 	readDeepInterviewStateCompact,
 	validateDeepInterviewScoredTransition,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { askSchema } from "@gajae-code/coding-agent/tools/ask";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let priorSessionId: string | undefined;
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-recorder-redteam-"));
@@ -22,12 +25,22 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
+});
+
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 function statePathFor(cwd: string): string {
-	return path.join(cwd, ".gjc", "state", "deep-interview-state.json");
+	return modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 }
 
 async function readPersistedRounds(statePath: string): Promise<DeepInterviewRoundRecord[]> {
@@ -93,9 +106,9 @@ describe("deep-interview recorder redteam: corrupt state is fail-closed (not ove
 		await fs.writeFile(statePath, corruptContent, "utf-8");
 
 		// Fail closed: recording must not silently overwrite corrupt/tampered state.
-		await expect(appendOrMergeDeepInterviewRound(cwd, statePath, answerInput())).rejects.toThrow(
-			/corrupt or tampered/,
-		);
+		await expect(
+			appendOrMergeDeepInterviewRound(cwd, statePath, answerInput(), { sessionId: TEST_SESSION_ID }),
+		).rejects.toThrow(/corrupt or tampered/);
 
 		// The corrupt file is preserved unchanged for recovery.
 		expect(await fs.readFile(statePath, "utf-8")).toBe(corruptContent);
@@ -106,21 +119,30 @@ describe("deep-interview recorder redteam: persistence merge invariants", () => 
 	it("replace-then-enrich keeps exactly one record and enriches the replacement answer", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ selectedOptions: ["A"] }));
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ selectedOptions: ["A"] }), {
+			sessionId: TEST_SESSION_ID,
+		});
 
-		const replaced = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ selectedOptions: ["B"] }));
+		const replaced = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ selectedOptions: ["B"] }), {
+			sessionId: TEST_SESSION_ID,
+		});
 		expect(replaced.action).toBe("replaced");
 		let rounds = await readPersistedRounds(statePath);
 		expect(rounds).toHaveLength(1);
 		expect(rounds[0].answer_hash).toBe(answerHash(["B"], undefined));
 
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			interviewId: "iv-redteam",
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.35 },
-			ambiguity: 0.7,
-		});
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				interviewId: "iv-redteam",
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.35 },
+				ambiguity: 0.7,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		rounds = await readPersistedRounds(statePath);
 		expect(rounds).toHaveLength(1);
@@ -131,8 +153,12 @@ describe("deep-interview recorder redteam: persistence merge invariants", () => 
 	it("idempotent replay across persistence returns noop and does not append", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
-		const first = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput());
-		const second = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput());
+		const first = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput(), {
+			sessionId: TEST_SESSION_ID,
+		});
+		const second = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput(), {
+			sessionId: TEST_SESSION_ID,
+		});
 
 		expect(first.action).toBe("created");
 		expect(second.action).toBe("noop");
@@ -194,42 +220,63 @@ describe("deep-interview recorder redteam: out-of-order re-score never compares 
 		const statePath = statePathFor(cwd);
 
 		// Round 1: chronological predecessor — low ambiguity, high goal clarity.
-		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 1, questionId: "q1" }));
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			interviewId: "iv-redteam",
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.6 },
-			ambiguity: 0.4,
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 1, questionId: "q1" }), {
+			sessionId: TEST_SESSION_ID,
 		});
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				interviewId: "iv-redteam",
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.6 },
+				ambiguity: 0.4,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		// Round 2: answered shell, deferred for an out-of-order re-score below.
-		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 2, questionId: "q2" }));
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 2, questionId: "q2" }), {
+			sessionId: TEST_SESSION_ID,
+		});
 
 		// Round 3: a LATER scored round with high ambiguity / low goal clarity. If the
 		// validator compared against the latest round in array order, this "future" round
 		// would be picked as the baseline for round 2.
-		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 3, questionId: "q3" }));
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			interviewId: "iv-redteam",
-			round: 3,
-			questionId: "q3",
-			scores: { goal: 0.2 },
-			ambiguity: 0.9,
+		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 3, questionId: "q3" }), {
+			sessionId: TEST_SESSION_ID,
 		});
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				interviewId: "iv-redteam",
+				round: 3,
+				questionId: "q3",
+				scores: { goal: 0.2 },
+				ambiguity: 0.9,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		// Re-score round 2 with an active goal trigger. This transition is VALID against
 		// round 1 (ambiguity rises 0.4 -> 0.5, goal does not improve 0.6 -> 0.5) but would
 		// be INVALID against the future round 3 (ambiguity 0.9 -> 0.5 does not rise; goal
 		// 0.2 -> 0.5 improves). It must succeed, proving the chronological prior is used.
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			interviewId: "iv-redteam",
-			round: 2,
-			questionId: "q2",
-			scores: { goal: 0.5 },
-			ambiguity: 0.5,
-			triggers: [trigger({ dimension: "goal" })],
-		});
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				interviewId: "iv-redteam",
+				round: 2,
+				questionId: "q2",
+				scores: { goal: 0.5 },
+				ambiguity: 0.5,
+				triggers: [trigger({ dimension: "goal" })],
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		const rounds = await readPersistedRounds(statePath);
 		const round2 = rounds.find(r => r.round === 2);
@@ -304,20 +351,27 @@ describe("deep-interview recorder redteam: compact read transcript minimization"
 				cwd,
 				statePath,
 				answerInput({ round, questionId: `q${round}`, questionText: `Scored question ${round}?` }),
+				{ sessionId: TEST_SESSION_ID },
 			);
-			await enrichDeepInterviewRoundScoring(cwd, statePath, {
-				interviewId: "iv-redteam",
-				round,
-				questionId: `q${round}`,
-				scores: { goal: 1 - round / 10 },
-				ambiguity: round / 10,
-			});
+			await enrichDeepInterviewRoundScoring(
+				cwd,
+				statePath,
+				{
+					interviewId: "iv-redteam",
+					round,
+					questionId: `q${round}`,
+					scores: { goal: 1 - round / 10 },
+					ambiguity: round / 10,
+				},
+				{ sessionId: TEST_SESSION_ID },
+			);
 		}
 		for (let round = 7; round <= 9; round++) {
 			await appendOrMergeDeepInterviewRound(
 				cwd,
 				statePath,
 				answerInput({ round, questionId: `q${round}`, questionText: `Pending question ${round}?` }),
+				{ sessionId: TEST_SESSION_ID },
 			);
 		}
 

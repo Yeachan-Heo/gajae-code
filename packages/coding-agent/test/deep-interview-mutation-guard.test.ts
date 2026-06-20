@@ -4,6 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import {
+	activeSnapshotPath,
+	modeStatePath,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
 	assertDeepInterviewMutationRawPathsAllowed,
 	DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
 	getDeepInterviewMutationDecision,
@@ -15,10 +20,6 @@ import { logger } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 
-function encodePathSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
-}
-
 async function makeTempRoot(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-guard-"));
 	tempRoots.push(root);
@@ -27,7 +28,7 @@ async function makeTempRoot(): Promise<string> {
 
 async function writeActiveDeepInterview(cwd: string, sessionId = "session-a", phase = "interviewing"): Promise<void> {
 	const now = new Date().toISOString();
-	const sessionDir = path.join(cwd, ".gjc", "state", "sessions", encodePathSegment(sessionId));
+	const sessionDir = sessionStateDir(cwd, sessionId);
 	await fs.mkdir(sessionDir, { recursive: true });
 	const activeState = {
 		version: 1,
@@ -45,9 +46,9 @@ async function writeActiveDeepInterview(cwd: string, sessionId = "session-a", ph
 			},
 		],
 	};
-	await Bun.write(path.join(sessionDir, "skill-active-state.json"), `${JSON.stringify(activeState, null, 2)}\n`);
+	await Bun.write(activeSnapshotPath(cwd, sessionId), `${JSON.stringify(activeState, null, 2)}\n`);
 	await Bun.write(
-		path.join(sessionDir, "deep-interview-state.json"),
+		modeStatePath(cwd, sessionId, "deep-interview"),
 		`${JSON.stringify({ active: true, current_phase: phase, session_id: sessionId }, null, 2)}\n`,
 	);
 }
@@ -59,7 +60,7 @@ async function writeActiveSkill(
 	sessionId = "session-a",
 ): Promise<void> {
 	const now = new Date().toISOString();
-	const sessionDir = path.join(cwd, ".gjc", "state", "sessions", encodePathSegment(sessionId));
+	const sessionDir = sessionStateDir(cwd, sessionId);
 	await fs.mkdir(sessionDir, { recursive: true });
 	const activeState = {
 		version: 1,
@@ -69,9 +70,9 @@ async function writeActiveSkill(
 		updated_at: now,
 		active_skills: [{ skill, phase, active: true, updated_at: now, session_id: sessionId }],
 	};
-	await Bun.write(path.join(sessionDir, "skill-active-state.json"), `${JSON.stringify(activeState, null, 2)}\n`);
+	await Bun.write(activeSnapshotPath(cwd, sessionId), `${JSON.stringify(activeState, null, 2)}\n`);
 	await Bun.write(
-		path.join(sessionDir, `${skill}-state.json`),
+		modeStatePath(cwd, sessionId, skill),
 		`${JSON.stringify({ active: true, current_phase: phase, session_id: sessionId }, null, 2)}\n`,
 	);
 }
@@ -138,9 +139,14 @@ describe("deep-interview mutation guard", () => {
 		const blockedCases: Array<[string, AgentTool, unknown]> = [
 			["write active", tool("write"), { path: ".gjc/state/skill-active-state.json", content: "{}" }],
 			[
-				"write session active",
+				"write session active legacy",
 				tool("write"),
 				{ path: ".gjc/state/sessions/session-a/skill-active-state.json", content: "{}" },
+			],
+			[
+				"write session active generated",
+				tool("write"),
+				{ path: ".gjc/_session-session-a/state/skill-active-state.json", content: "{}" },
 			],
 			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
 				skill =>
@@ -148,6 +154,14 @@ describe("deep-interview mutation guard", () => {
 						`write ${skill}`,
 						tool("write"),
 						{ path: `.gjc/state/sessions/session-a/${skill}-state.json`, content: "{}" },
+					] as [string, AgentTool, unknown],
+			),
+			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
+				skill =>
+					[
+						`write generated ${skill}`,
+						tool("write"),
+						{ path: `.gjc/_session-session-a/state/${skill}-state.json`, content: "{}" },
 					] as [string, AgentTool, unknown],
 			),
 			[
@@ -313,7 +327,7 @@ describe("deep-interview mutation guard", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
 		await Bun.write(
-			path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"),
+			modeStatePath(cwd, "session-a", "deep-interview"),
 			JSON.stringify({ active: "yes", current_phase: "interviewing", session_id: "session-a" }),
 		);
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -335,7 +349,7 @@ describe("deep-interview mutation guard", () => {
 	it("allows writes and logs when deep-interview mode state is corrupt JSON", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
-		await Bun.write(path.join(cwd, ".gjc", "state", "sessions", "session-a", "deep-interview-state.json"), "{");
+		await Bun.write(modeStatePath(cwd, "session-a", "deep-interview"), "{");
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const decision = await getDeepInterviewMutationDecision({
@@ -552,12 +566,12 @@ describe("deep-interview mutation guard", () => {
 		const cwd = await makeTempRoot();
 		const sessionId = "session-a";
 		const now = new Date().toISOString();
-		const sessionDir = path.join(cwd, ".gjc", "state", "sessions", encodePathSegment(sessionId));
+		const sessionDir = sessionStateDir(cwd, sessionId);
 		await fs.mkdir(sessionDir, { recursive: true });
 		// A real handoff demotes the prior planning skill to active:false and promotes the
 		// executor. The demoted deep-interview entry must not keep blocking the executor.
 		await Bun.write(
-			path.join(sessionDir, "skill-active-state.json"),
+			activeSnapshotPath(cwd, sessionId),
 			`${JSON.stringify(
 				{
 					version: 1,
@@ -582,11 +596,11 @@ describe("deep-interview mutation guard", () => {
 			)}\n`,
 		);
 		await Bun.write(
-			path.join(sessionDir, "ultragoal-state.json"),
+			modeStatePath(cwd, sessionId, "ultragoal"),
 			`${JSON.stringify({ active: true, current_phase: "active", session_id: sessionId }, null, 2)}\n`,
 		);
 		await Bun.write(
-			path.join(sessionDir, "deep-interview-state.json"),
+			modeStatePath(cwd, sessionId, "deep-interview"),
 			`${JSON.stringify({ active: false, current_phase: "handoff", session_id: sessionId }, null, 2)}\n`,
 		);
 
@@ -651,14 +665,14 @@ describe("deep-interview mutation guard", () => {
 	it("selects the most-recently-updated workflow skill when several are momentarily active", async () => {
 		const cwd = await makeTempRoot();
 		const sessionId = "session-a";
-		const sessionDir = path.join(cwd, ".gjc", "state", "sessions", encodePathSegment(sessionId));
+		const sessionDir = sessionStateDir(cwd, sessionId);
 		await fs.mkdir(sessionDir, { recursive: true });
 		const older = new Date(Date.now() - 60_000).toISOString();
 		const newer = new Date().toISOString();
 		// Stale ralplan `final` (older) coexists with a newer ultragoal executor; the
 		// newer executor must win so product mutation is allowed.
 		await Bun.write(
-			path.join(sessionDir, "skill-active-state.json"),
+			activeSnapshotPath(cwd, sessionId),
 			`${JSON.stringify(
 				{
 					version: 1,
@@ -676,11 +690,11 @@ describe("deep-interview mutation guard", () => {
 			)}\n`,
 		);
 		await Bun.write(
-			path.join(sessionDir, "ralplan-state.json"),
+			modeStatePath(cwd, sessionId, "ralplan"),
 			`${JSON.stringify({ active: true, current_phase: "final", session_id: sessionId }, null, 2)}\n`,
 		);
 		await Bun.write(
-			path.join(sessionDir, "ultragoal-state.json"),
+			modeStatePath(cwd, sessionId, "ultragoal"),
 			`${JSON.stringify({ active: true, current_phase: "active", session_id: sessionId }, null, 2)}\n`,
 		);
 

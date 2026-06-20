@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import { Buffer } from "node:buffer";
+import * as path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
 	applyGjcTmuxProfile,
@@ -11,6 +12,7 @@ import {
 	launchDefaultTmuxIfNeeded,
 	type TmuxSpawnOptions,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
+import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -21,6 +23,7 @@ function args(overrides: Partial<Args> = {}): Args {
 	};
 }
 
+const TEST_SESSION_ID = "test-session";
 const interactiveTty = { stdin: true, stdout: true };
 type SpawnSyncResult = Bun.SyncSubprocess<"pipe", "pipe">;
 
@@ -37,6 +40,20 @@ function decodePowerShellEncodedCommand(command: string): string {
 	return Buffer.from(match.groups.encoded, "base64").toString("utf16le");
 }
 
+let previousGjcSessionId: string | undefined;
+
+beforeAll(() => {
+	previousGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (previousGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = previousGjcSessionId;
+	}
+});
 const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 function stderrError(code: string): Error {
@@ -425,7 +442,7 @@ describe("default GJC tmux launch", () => {
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
-			env: {},
+			env: { GJC_SESSION_ID: TEST_SESSION_ID },
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
 			execPath: "/bin/bun",
 			platform: "darwin",
@@ -438,9 +455,35 @@ describe("default GJC tmux launch", () => {
 		expect(plan).toBeDefined();
 		if (!plan) throw new Error("expected tmux plan");
 		expect(plan.sessionId).toBe(plan.sessionName);
-		expect(plan.sessionStateFile).toContain("/repo/.gjc/runtime/tmux-sessions/");
+		if (!plan.sessionId || !plan.sessionStateFile) throw new Error("expected tmux session id and state file");
+		// The runtime state path is rooted on the GJC session (GJC_SESSION_ID), not the
+		// coordinator/tmux identity.
+		expect(path.dirname(plan.sessionStateFile)).toBe(
+			path.join(sessionRuntimeDir("/repo", TEST_SESSION_ID), "tmux-sessions"),
+		);
 		expect(plan.innerCommand).toContain(`GJC_COORDINATOR_SESSION_ID='${plan.sessionId}'`);
 		expect(plan.innerCommand).toContain(`GJC_COORDINATOR_SESSION_STATE_FILE='${plan.sessionStateFile}'`);
+	});
+
+	it("roots runtime state on GJC_SESSION_ID even when GJC_COORDINATOR_SESSION_ID differs", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { GJC_SESSION_ID: "gjc-sess", GJC_COORDINATOR_SESSION_ID: "coord-sess" },
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+		expect(plan).toBeDefined();
+		if (!plan?.sessionStateFile) throw new Error("expected tmux plan with state file");
+		// Coordinator identity is the coordinator id; the state-file root is the GJC session.
+		expect(plan.sessionId).toBe("coord-sess");
+		expect(path.dirname(plan.sessionStateFile)).toBe(
+			path.join(sessionRuntimeDir("/repo", "gjc-sess"), "tmux-sessions"),
+		);
 	});
 
 	it("applies the tmux profile only to the requested target", () => {

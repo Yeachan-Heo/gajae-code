@@ -8,7 +8,7 @@ import { getDeepInterviewMutationDecision } from "../../src/skill-state/deep-int
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acl-gate-"));
 	const priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = "test-session";
 	try {
 		await fn(dir);
 	} finally {

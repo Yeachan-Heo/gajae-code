@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { coordinatorMcpStateRoot } from "../gjc-runtime/session-layout";
 
 export type CoordinatorMutationClass = "sessions" | "questions" | "reports";
 
@@ -74,8 +75,10 @@ function cleanScope(value: string | undefined): string | null {
 }
 
 export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorMcpConfig {
-	const stateRoot =
-		env.GJC_COORDINATOR_MCP_STATE_ROOT?.trim() || path.join(process.cwd(), ".gjc", "state", "coordinator-mcp");
+	const stateRootOverride = env.GJC_COORDINATOR_MCP_STATE_ROOT?.trim();
+	const gjcSessionId = env.GJC_SESSION_ID?.trim();
+	const stateRoot = stateRootOverride || (gjcSessionId ? coordinatorMcpStateRoot(process.cwd(), gjcSessionId) : null);
+	if (!stateRoot) throw new Error("GJC_SESSION_ID is required for default coordinator MCP state root");
 	return {
 		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
 		mutationClasses: parseMutationClasses(

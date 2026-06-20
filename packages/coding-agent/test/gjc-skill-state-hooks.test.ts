@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
+import { activeSnapshotPath, modeStatePath, sessionSpecsDir, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
 	addUltragoalSubgoal,
@@ -26,6 +27,20 @@ import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contra
 
 describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
+	let originalGjcSessionId: string | undefined;
+
+	beforeAll(() => {
+		originalGjcSessionId = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "test-session";
+	});
+
+	afterAll(() => {
+		if (originalGjcSessionId === undefined) {
+			delete process.env.GJC_SESSION_ID;
+		} else {
+			process.env.GJC_SESSION_ID = originalGjcSessionId;
+		}
+	});
 
 	const testEffectiveSkillConfig = {
 		skillsSettings: {
@@ -183,9 +198,7 @@ describe("GJC native skill-state hooks", () => {
 			session_id: "session-1",
 			initialized_mode: "deep-interview",
 		});
-		expect(state?.initialized_state_path).toBe(
-			path.join(root, ".gjc", "state", "sessions", "session-1", "deep-interview-state.json"),
-		);
+		expect(state?.initialized_state_path).toBe(modeStatePath(root, "session-1", "deep-interview"));
 		const modeState = await Bun.file(state?.initialized_state_path ?? "").json();
 		expect(modeState).toMatchObject({
 			active: true,
@@ -201,7 +214,7 @@ describe("GJC native skill-state hooks", () => {
 
 	it("reads valid custom skill-active state unchanged", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
+		const stateDir = sessionStateDir(root, "test-session");
 		await fs.mkdir(stateDir, { recursive: true });
 		const state = {
 			version: 1,
@@ -211,17 +224,17 @@ describe("GJC native skill-state hooks", () => {
 		};
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
 
-		await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toEqual(state);
+		await expect(readVisibleSkillActiveState(root, "test-session")).resolves.toMatchObject(state);
 	});
 
 	it("fails open and logs when custom skill-active state is corrupt", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
+		const stateDir = sessionStateDir(root, "test-session");
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), "{");
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
-			await expect(readVisibleSkillActiveState(root, undefined, stateDir)).resolves.toBeNull();
+			await expect(readVisibleSkillActiveState(root, "test-session")).resolves.toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid skill-active-state at");
 			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("invalid JSON");
@@ -232,10 +245,9 @@ describe("GJC native skill-state hooks", () => {
 
 	it("Stop reads valid custom mode state unchanged", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
-		await fs.mkdir(path.join(stateDir, "sessions", "session-valid"), { recursive: true });
+		await fs.mkdir(sessionStateDir(root, "session-valid"), { recursive: true });
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-valid", "skill-active-state.json"),
+			activeSnapshotPath(root, "session-valid"),
 			JSON.stringify({
 				version: 1,
 				active: true,
@@ -243,7 +255,7 @@ describe("GJC native skill-state hooks", () => {
 			}),
 		);
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-valid", "ralplan-state.json"),
+			modeStatePath(root, "session-valid", "ralplan"),
 			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-valid", extra: "preserved" }),
 		);
 
@@ -253,24 +265,23 @@ describe("GJC native skill-state hooks", () => {
 				cwd: root,
 				sessionId: "session-valid",
 			} as never,
-			{ stateDir },
+			undefined,
 		);
 		expect(allowed.outputJson).toBeNull();
 	});
 
 	it("Stop fails open and logs when a non-handoff skill's mode state is corrupt", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
-		await fs.mkdir(path.join(stateDir, "sessions", "session-corrupt"), { recursive: true });
+		await fs.mkdir(sessionStateDir(root, "session-corrupt"), { recursive: true });
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-corrupt", "skill-active-state.json"),
+			activeSnapshotPath(root, "session-corrupt"),
 			JSON.stringify({
 				version: 1,
 				active: true,
 				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-corrupt" }],
 			}),
 		);
-		await fs.writeFile(path.join(stateDir, "sessions", "session-corrupt", "team-state.json"), "{");
+		await fs.writeFile(modeStatePath(root, "session-corrupt", "team"), "{");
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
@@ -279,7 +290,7 @@ describe("GJC native skill-state hooks", () => {
 					cwd: root,
 					sessionId: "session-corrupt",
 				} as never,
-				{ stateDir },
+				undefined,
 			);
 			expect(allowed.outputJson).toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
@@ -292,10 +303,9 @@ describe("GJC native skill-state hooks", () => {
 
 	it("Stop treats schema-invalid non-handoff mode state as inactive and logs", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
-		await fs.mkdir(path.join(stateDir, "sessions", "session-invalid"), { recursive: true });
+		await fs.mkdir(sessionStateDir(root, "session-invalid"), { recursive: true });
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-invalid", "skill-active-state.json"),
+			activeSnapshotPath(root, "session-invalid"),
 			JSON.stringify({
 				version: 1,
 				active: true,
@@ -303,7 +313,7 @@ describe("GJC native skill-state hooks", () => {
 			}),
 		);
 		await fs.writeFile(
-			path.join(stateDir, "sessions", "session-invalid", "team-state.json"),
+			modeStatePath(root, "session-invalid", "team"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -314,7 +324,7 @@ describe("GJC native skill-state hooks", () => {
 					cwd: root,
 					sessionId: "session-invalid",
 				} as never,
-				{ stateDir },
+				undefined,
 			);
 			expect(allowed.outputJson).toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
@@ -327,10 +337,10 @@ describe("GJC native skill-state hooks", () => {
 
 	it("UserPromptSubmit treats schema-invalid active ultragoal mode state as inactive and logs", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, "custom-state");
+		const stateDir = sessionStateDir(root, "test-session");
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(
-			path.join(stateDir, "ultragoal-state.json"),
+			modeStatePath(root, "test-session", "ultragoal"),
 			JSON.stringify({ active: true, current_phase: 7, objective: "ship" }),
 		);
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -341,7 +351,7 @@ describe("GJC native skill-state hooks", () => {
 					prompt: "continue the implementation",
 					cwd: root,
 				} as never,
-				{ stateDir },
+				undefined,
 			);
 			expect(allowed.outputJson).toBeNull();
 			expect(warn).toHaveBeenCalledTimes(1);
@@ -455,14 +465,9 @@ describe("GJC native skill-state hooks", () => {
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
 
-		const encodedSession = "%2E%2E%2F%2E%2E%2F%2E%2E%2Fescape";
 		const state = await readVisibleSkillActiveState(root, "../../../escape");
-		expect(state?.initialized_state_path).toBe(
-			path.join(root, ".gjc", "state", "sessions", encodedSession, "team-state.json"),
-		);
-		expect(
-			await fs.stat(path.join(root, ".gjc", "state", "sessions", encodedSession, "skill-active-state.json")),
-		).toBeDefined();
+		expect(state?.initialized_state_path).toBe(modeStatePath(root, "../../../escape", "team"));
+		expect(await fs.stat(activeSnapshotPath(root, "../../../escape"))).toBeDefined();
 		await expect(fs.stat(path.join(root, ".gjc", "escape"))).rejects.toThrow();
 	});
 
@@ -671,7 +676,7 @@ disabledExtensions:
 		expect(blocked.outputJson).toMatchObject({ decision: "block", stopReason: "gjc_skill_ralplan_planner" });
 
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-2", "ralplan-state.json"),
+			modeStatePath(root, "session-2", "ralplan"),
 			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-2" }),
 		);
 		const allowed = await dispatchGjcNativeSkillHook({
@@ -699,7 +704,7 @@ disabledExtensions:
 		// Remove the mode-state file while skill-active-state.json still lists the
 		// handoff skill active. The Stop hook must not treat the missing file as
 		// terminal — handoff skills must always offer a next step.
-		await fs.rm(path.join(root, ".gjc", "state", "sessions", "session-missing", "ralplan-state.json"), {
+		await fs.rm(modeStatePath(root, "session-missing", "ralplan"), {
 			force: true,
 		});
 
@@ -728,7 +733,7 @@ disabledExtensions:
 		// A handoff-phase deep-interview that is still active must keep blocking so
 		// the agent presents the next handoff step via the ask tool.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-handoff", "deep-interview-state.json"),
+			modeStatePath(root, "session-handoff", "deep-interview"),
 			JSON.stringify({ active: true, current_phase: "handoff", session_id: "session-handoff" }),
 		);
 		const blocked = await dispatchGjcNativeSkillHook({
@@ -742,7 +747,7 @@ disabledExtensions:
 
 		// Once demoted to active:false (the handoff/clear outcome), stop is allowed.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-handoff", "deep-interview-state.json"),
+			modeStatePath(root, "session-handoff", "deep-interview"),
 			JSON.stringify({ active: false, current_phase: "handoff", session_id: "session-handoff" }),
 		);
 		const allowed = await dispatchGjcNativeSkillHook({
@@ -772,7 +777,7 @@ disabledExtensions:
 		// and force the crystallize/handoff path instead of letting the distilled
 		// interview state vanish as a generic stopped task (#674).
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-di-uncrystallized", "deep-interview-state.json"),
+			modeStatePath(root, "session-di-uncrystallized", "deep-interview"),
 			JSON.stringify({ active: true, current_phase: "complete", session_id: "session-di-uncrystallized" }),
 		);
 
@@ -806,10 +811,10 @@ disabledExtensions:
 
 		// A persisted final spec is the crystallization evidence; once it exists
 		// on disk the run may terminalize through the ordinary stop path.
-		const specPath = path.join(root, ".gjc", "specs", "deep-interview-sample.md");
+		const specPath = path.join(sessionSpecsDir(root, "session-di-crystallized"), "deep-interview-sample.md");
 		await Bun.write(specPath, "# Final deep-interview spec\n");
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-di-crystallized", "deep-interview-state.json"),
+			modeStatePath(root, "session-di-crystallized", "deep-interview"),
 			JSON.stringify({
 				active: true,
 				current_phase: "complete",
@@ -843,12 +848,12 @@ disabledExtensions:
 		// A spec_path that does not resolve to a real file is not crystallization;
 		// the guard must still force a real crystallize/handoff before stopping.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-di-stale-spec", "deep-interview-state.json"),
+			modeStatePath(root, "session-di-stale-spec", "deep-interview"),
 			JSON.stringify({
 				active: true,
 				current_phase: "completed",
 				session_id: "session-di-stale-spec",
-				spec_path: path.join(root, ".gjc", "specs", "deep-interview-missing.md"),
+				spec_path: path.join(sessionSpecsDir(root, "session-di-stale-spec"), "deep-interview-missing.md"),
 			}),
 		);
 
@@ -880,7 +885,7 @@ disabledExtensions:
 		// An explicit abort/cancel is a legitimate terminal even without a spec:
 		// the crystallization guard must not override deliberate cancellation.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-di-cancelled", "deep-interview-state.json"),
+			modeStatePath(root, "session-di-cancelled", "deep-interview"),
 			JSON.stringify({ active: true, current_phase: "cancelled", session_id: "session-di-cancelled" }),
 		);
 
@@ -937,7 +942,7 @@ disabledExtensions:
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = path.join(root, ".gjc", "state", "sessions", "session-ultra-block", "ultragoal-state.json");
+		const statePath = modeStatePath(root, "session-ultra-block", "ultragoal");
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
@@ -1008,32 +1013,26 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-stop-pending",
+				sessionId: "test-session",
 				threadId: "thread-ultra-stop-pending",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = path.join(
-			root,
-			".gjc",
-			"state",
-			"sessions",
-			"session-ultra-stop-pending",
-			"ultragoal-state.json",
-		);
+		const statePath = modeStatePath(root, "test-session", "ultragoal");
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
 		const blocked = await dispatchGjcNativeSkillHook({
 			hookEventName: "Stop",
 			cwd: root,
-			sessionId: "session-ultra-stop-pending",
+			sessionId: "test-session",
 			threadId: "thread-ultra-stop-pending",
 		});
 
 		expect(blocked.outputJson).toMatchObject({ decision: "block" });
-		expect(String(blocked.outputJson?.reason ?? "")).toContain("G002");
-		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain(
+			"aggregate completion requires a fresh final aggregate receipt",
+		);
 	});
 
 	it("Stop blocks when stale Ultragoal mode-state would release but the plan still has pending goals", async () => {
@@ -1057,7 +1056,7 @@ disabledExtensions:
 		// cross-file coherence guard must keep blocking while the plan has
 		// incomplete goals.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-ultra-stale-release", "ultragoal-state.json"),
+			modeStatePath(root, "session-ultra-stale-release", "ultragoal"),
 			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-stale-release" }),
 		);
 
@@ -1093,7 +1092,7 @@ disabledExtensions:
 		// active:true but a terminal phase still releases via STOP_RELEASING_PHASES;
 		// the coherence guard must override that release while goals remain.
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-ultra-releasing-phase", "ultragoal-state.json"),
+			modeStatePath(root, "session-ultra-releasing-phase", "ultragoal"),
 			JSON.stringify({ active: true, current_phase: "completed", session_id: "session-ultra-releasing-phase" }),
 		);
 
@@ -1126,7 +1125,7 @@ disabledExtensions:
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
 		await Bun.write(
-			path.join(root, ".gjc", "state", "sessions", "session-ultra-no-plan", "ultragoal-state.json"),
+			modeStatePath(root, "session-ultra-no-plan", "ultragoal"),
 			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-no-plan" }),
 		);
 
@@ -1164,19 +1163,12 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-bypass-pending",
+				sessionId: "test-session",
 				threadId: "thread-ultra-bypass-pending",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = path.join(
-			root,
-			".gjc",
-			"state",
-			"sessions",
-			"session-ultra-bypass-pending",
-			"ultragoal-state.json",
-		);
+		const statePath = modeStatePath(root, "test-session", "ultragoal");
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
@@ -1184,13 +1176,14 @@ disabledExtensions:
 			hookEventName: "UserPromptSubmit",
 			userPrompt: 'please call goal({"op":"complete"})',
 			cwd: root,
-			sessionId: "session-ultra-bypass-pending",
+			sessionId: "test-session",
 			threadId: "thread-ultra-bypass-pending",
 		});
 
 		expect(result.outputJson).toMatchObject({ decision: "block" });
-		expect(String(result.outputJson?.reason ?? "")).toContain("G002");
-		expect(String(result.outputJson?.reason ?? "")).toContain("complete-goals");
+		expect(String(result.outputJson?.reason ?? "")).toContain(
+			"aggregate completion requires a fresh final aggregate receipt",
+		);
 	});
 	it("UserPromptSubmit includes steer guidance when activating Ultragoal", async () => {
 		const root = await cwd();
@@ -1273,7 +1266,7 @@ disabledExtensions:
 
 	it("ensureWorkflowSkillActivationState is idempotent and preserves handoff lineage", async () => {
 		const root = await cwd();
-		const stateDir = path.join(root, ".gjc", "state", "sessions", "session-keep");
+		const stateDir = sessionStateDir(root, "session-keep");
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(
 			path.join(stateDir, "skill-active-state.json"),

@@ -1,7 +1,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	activeSnapshotPath,
+	modeStatePath,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 const tempRoots: string[] = [];
 
@@ -15,19 +22,16 @@ afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
-// Tests in this file assume root-scoped `.gjc/state` paths. The state runtime
-// falls back to the `GJC_SESSION_ID` env var when no `--session-id` flag is
-// provided, which would route writes into `.gjc/state/sessions/<id>/` and
-// break these root-scoped assertions when run inside a shell session that
-// exports `GJC_SESSION_ID` (e.g. the coding-agent dev loop). Clear and
-// restore the env so each test sees a deterministic root scope.
+// Tests in this file use a deterministic session id so runtime writes land in
+// the session-scoped state layout regardless of the host shell environment.
 let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 function parseStdout(stdout: string | undefined): Record<string, unknown> {
@@ -51,7 +55,7 @@ describe("native gjc state runtime", () => {
 
 	it("reads corrupt mode-state fail-open as empty state", async () => {
 		const root = await tempDir();
-		const stateDir = path.join(root, ".gjc", "state");
+		const stateDir = sessionStateDir(root, TEST_SESSION_ID);
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(path.join(stateDir, "ralplan-state.json"), "{not json");
 
@@ -98,7 +102,7 @@ describe("native gjc state runtime", () => {
 		expect(parsed.active).toBe(true);
 		// ralplan-state.json was written but deep-interview-state.json contained `active:true` too;
 		// verify CLI flag won by reading the underlying file path
-		const ralplanFile = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const ralplanFile = modeStatePath(root, TEST_SESSION_ID, "ralplan");
 		expect(JSON.parse(await fs.readFile(ralplanFile, "utf-8")).active).toBe(true);
 	});
 
@@ -134,9 +138,7 @@ describe("native gjc state runtime", () => {
 		const receipt = parseStdout(second.stdout);
 		expect(receipt).toMatchObject({ ok: true, skill: "deep-interview", active: true, current_phase: "interviewing" });
 		expect(receipt.state).toBeUndefined();
-		const merged = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
-		);
+		const merged = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(merged.state.current_ambiguity).toBe(0.5);
 		expect(merged.state.threshold_source).toBe("user");
 		expect(merged.state.interview_id).toBe("abc");
@@ -158,9 +160,7 @@ describe("native gjc state runtime", () => {
 		const receipt = parseStdout(result.stdout);
 		expect(receipt).toMatchObject({ ok: true, skill: "deep-interview", active: true });
 		expect(receipt.state).toBeUndefined();
-		const merged = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
-		);
+		const merged = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(merged.active).toBe(true);
 		expect(Object.hasOwn(merged, "drop_me")).toBe(false);
 	});
@@ -181,9 +181,7 @@ describe("native gjc state runtime", () => {
 		const receipt = parseStdout(result.stdout);
 		expect(receipt).toMatchObject({ ok: true, skill: "deep-interview", active: false });
 		expect(receipt.state).toBeUndefined();
-		const replaced = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
-		);
+		const replaced = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(replaced.active).toBe(false);
 		expect(Object.hasOwn(replaced, "keep_me")).toBe(false);
 	});
@@ -208,7 +206,7 @@ describe("native gjc state runtime", () => {
 
 	it("clear flips active:false and removes the entry from skill-active-state", async () => {
 		const root = await tempDir();
-		const activeStateDir = path.join(root, ".gjc", "state");
+		const activeStateDir = sessionStateDir(root, TEST_SESSION_ID);
 		await fs.mkdir(activeStateDir, { recursive: true });
 		await fs.writeFile(
 			path.join(activeStateDir, "skill-active-state.json"),
@@ -247,6 +245,91 @@ describe("native gjc state runtime", () => {
 		expect(rootActive.active).toBe(false);
 	});
 
+	it("rejects write when no session id is resolvable", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const result = await runNativeStateCommand(
+				["write", "--input", JSON.stringify({ active: true }), "--mode", "deep-interview"],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("a session id is required to write state");
+		} finally {
+			if (prior !== undefined) process.env.GJC_SESSION_ID = prior;
+			else process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		}
+	});
+
+	it("errors read/status when no session directories exist", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const read = await runNativeStateCommand(["read", "--mode", "deep-interview", "--json"], root);
+			expect(read.status).toBe(2);
+			expect(read.stderr).toContain("no active GJC session found");
+			const status = await runNativeStateCommand(["status", "--mode", "deep-interview", "--json"], root);
+			expect(status.status).toBe(2);
+			expect(status.stderr).toContain("no active GJC session found");
+		} finally {
+			if (prior !== undefined) process.env.GJC_SESSION_ID = prior;
+			else process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		}
+	});
+
+	it("clear resolves the latest session via activity marker when no --session-id/env", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		// Seed one active session (with state + activity marker) via a normal write.
+		await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ active: true, current_phase: "interviewing" }),
+				"--mode",
+				"deep-interview",
+				"--session-id",
+				"only-session",
+			],
+			root,
+		);
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const cleared = await runNativeStateCommand(["clear", "--mode", "deep-interview", "--force", "--json"], root);
+			expect(cleared.status).toBe(0);
+			const file = JSON.parse(await fs.readFile(modeStatePath(root, "only-session", "deep-interview"), "utf-8"));
+			expect(file.active).toBe(false);
+			expect(file.current_phase).toBe("complete");
+		} finally {
+			if (prior !== undefined) process.env.GJC_SESSION_ID = prior;
+			else process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		}
+	});
+
+	it("clear errors on an ambiguous (near-tie) latest session", async () => {
+		const root = await tempDir();
+		const prior = process.env.GJC_SESSION_ID;
+		await runNativeStateCommand(
+			["write", "--input", JSON.stringify({ active: true }), "--mode", "deep-interview", "--session-id", "sess-a"],
+			root,
+		);
+		await runNativeStateCommand(
+			["write", "--input", JSON.stringify({ active: true }), "--mode", "deep-interview", "--session-id", "sess-b"],
+			root,
+		);
+		delete process.env.GJC_SESSION_ID;
+		try {
+			const cleared = await runNativeStateCommand(["clear", "--mode", "deep-interview", "--force", "--json"], root);
+			expect(cleared.status).toBe(2);
+			expect(cleared.stderr).toContain("ambiguous latest session");
+		} finally {
+			if (prior !== undefined) process.env.GJC_SESSION_ID = prior;
+			else process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		}
+	});
+
 	it("rejects an unknown --mode with exit 2", async () => {
 		const root = await tempDir();
 		const result = await runNativeStateCommand(["read", "--mode", "nope"], root);
@@ -254,14 +337,11 @@ describe("native gjc state runtime", () => {
 		expect(result.stderr).toContain("unknown --mode");
 	});
 
-	it("rejects a traversal --session-id with exit 2", async () => {
+	it("rejects a blank --session-id with exit 2", async () => {
 		const root = await tempDir();
-		const result = await runNativeStateCommand(
-			["read", "--mode", "deep-interview", "--session-id", "../escape"],
-			root,
-		);
+		const result = await runNativeStateCommand(["read", "--mode", "deep-interview", "--session-id", ""], root);
 		expect(result.status).toBe(2);
-		expect(result.stderr).toContain("invalid path component");
+		expect(result.stderr).toContain("--session-id was provided but blank");
 	});
 
 	it("rejects write without --input", async () => {
@@ -287,9 +367,7 @@ describe("native gjc state runtime", () => {
 		]);
 		expect(first.status).toBe(0);
 		expect(second.status).toBe(0);
-		const final = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "deep-interview-state.json"), "utf-8"),
-		);
+		const final = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		// `a` always survives because both writers started from it; whichever writer landed last contributes its key
 		expect(final.a).toBe(1);
 		expect(final.b === 2 || final.c === 3).toBe(true);
@@ -318,9 +396,7 @@ describe("native gjc state runtime", () => {
 			],
 			root,
 		);
-		const active = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "skill-active-state.json"), "utf-8"),
-		);
+		const active = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8"));
 		const entry = (
 			active.active_skills as Array<{
 				skill: string;
@@ -348,9 +424,7 @@ describe("native gjc state runtime", () => {
 			],
 			root,
 		);
-		const active = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "skill-active-state.json"), "utf-8"),
-		);
+		const active = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8"));
 		const entry = (
 			active.active_skills as Array<{
 				skill: string;
@@ -373,16 +447,14 @@ describe("native gjc state runtime", () => {
 			root,
 		);
 		await runNativeStateCommand(["clear", "--mode", "ralplan"], root);
-		const active = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "skill-active-state.json"), "utf-8"),
-		);
+		const active = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8"));
 		expect((active.active_skills as Array<{ skill: string }>).some(e => e.skill === "ralplan")).toBe(false);
 	});
 
 	it("infers the active workflow for write when --mode/positional/input.skill are absent", async () => {
 		const root = await tempDir();
 		// Activate ralplan via the active-state file (simulating UserPromptSubmit hook output)
-		const stateDir = path.join(root, ".gjc", "state");
+		const stateDir = sessionStateDir(root, TEST_SESSION_ID);
 		await fs.mkdir(stateDir, { recursive: true });
 		await fs.writeFile(
 			path.join(stateDir, "skill-active-state.json"),
@@ -416,7 +488,7 @@ describe("native gjc state runtime", () => {
 		);
 		const result = await runNativeStateCommand(["clear"], root);
 		expect(result.status).toBe(0);
-		const onDisk = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"));
 		expect(onDisk.active).toBe(false);
 	});
 

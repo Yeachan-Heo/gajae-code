@@ -1,5 +1,5 @@
-import * as path from "node:path";
 import type { ExtensionUIContext } from "../../extensibility/extensions";
+import { workflowGatePath } from "../../gjc-runtime/session-layout";
 import type { AgentSession } from "../../session/agent-session";
 import type { ClientBridgePermissionOutcome } from "../../session/client-bridge";
 import type { RpcCommand, RpcResponse, RpcWorkflowGateResponse } from "../rpc/rpc-types";
@@ -611,7 +611,7 @@ export async function runBridgeMode(
 		});
 	};
 	const gateStore = new FileGateStore(
-		path.join(session.sessionManager.getCwd(), ".gjc", "state", "workflow-gates", `${session.sessionId}.json`),
+		workflowGatePath(session.sessionManager.getCwd(), session.sessionId, session.sessionId),
 	);
 	const unattendedControlPlane = new UnattendedSessionControlPlane({
 		runId: session.sessionId,

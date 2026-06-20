@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import * as path from "node:path";
 import { safeStderrWrite } from "@gajae-code/utils";
 import type { Args } from "../cli/args";
+import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
 import {
 	buildGjcTmuxProfileCommands,
@@ -360,9 +361,13 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const sessionName = buildGjcTmuxSessionName(env, { branch });
 	const tmuxCommand = resolveGjcTmuxCommand(env);
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
+	// The session ROOT is keyed by the active GJC session (GJC_SESSION_ID), NOT the
+	// coordinator/tmux identity. Fall back to the coordinator id only for standalone
+	// tmux launches with no GJC session context.
+	const gjcSessionId = env.GJC_SESSION_ID?.trim() || sessionId;
 	const sessionStateFile =
 		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
-		path.join(cwd, ".gjc", "runtime", "tmux-sessions", `${buildGjcTmuxSessionSlug(sessionName)}.json`);
+		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) return undefined;
 	const existingSessionName =

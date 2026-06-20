@@ -65,7 +65,7 @@ function isKnownUltragoalObjective(currentObjective: string): boolean {
 
 async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
 	try {
-		await fs.stat(getUltragoalPaths(cwd).dir);
+		await fs.stat(getUltragoalPaths(cwd, process.env.GJC_SESSION_ID).dir);
 		return true;
 	} catch (error) {
 		if (
@@ -331,7 +331,7 @@ export async function readUltragoalVerificationState(input: {
 }
 
 export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBlockDiagnostic> {
-	const paths = getUltragoalPaths(cwd);
+	const paths = getUltragoalPaths(cwd, process.env.GJC_SESSION_ID);
 	try {
 		await fs.stat(paths.dir);
 	} catch (error) {

@@ -4,6 +4,8 @@ import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
+import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/local-protocol";
 import { resolveToCwd } from "../tools/path-utils";
@@ -93,15 +95,18 @@ function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
-function encodePathSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
+async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string | null> {
+	const normalizedSessionId = sessionId?.trim();
+	if (normalizedSessionId) return normalizedSessionId;
+	try {
+		return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+	} catch {
+		return null;
+	}
 }
 
-function modeStatePath(cwd: string, skill: string, sessionId?: string): string {
-	const stateDir = path.join(cwd, ".gjc", "state");
-	const fileName = `${skill}-state.json`;
-	if (sessionId) return path.join(stateDir, "sessions", encodePathSegment(sessionId), fileName);
-	return path.join(stateDir, fileName);
+function modeStatePath(cwd: string, skill: string, sessionId: string): string {
+	return sessionModeStatePath(cwd, sessionId, skill);
 }
 
 function warnInvalidModeState(filePath: string, error: string): void {
@@ -129,12 +134,8 @@ async function readValidatedModeState(filePath: string): Promise<ModeState | nul
 	}
 	return state;
 }
-async function readVisibleModeState(cwd: string, skill: string, sessionId?: string): Promise<ModeState | null> {
-	if (sessionId) {
-		const sessionState = await readValidatedModeState(modeStatePath(cwd, skill, sessionId));
-		if (sessionState) return sessionState;
-	}
-	return await readValidatedModeState(modeStatePath(cwd, skill));
+async function readVisibleModeState(cwd: string, skill: string, sessionId: string): Promise<ModeState | null> {
+	return await readValidatedModeState(modeStatePath(cwd, skill, sessionId));
 }
 
 /**
@@ -228,16 +229,20 @@ async function getActivePlanningSkill(
 	sessionId?: string,
 	threadId?: string,
 ): Promise<ActivePlanningSkill | null> {
-	const skillState = await readVisibleSkillActiveState(cwd, sessionId);
+	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	if (!resolvedSessionId) return { skill: "deep-interview", phase: "unresolved-session" };
+	const skillState = await readVisibleSkillActiveState(cwd, resolvedSessionId);
 	if (!skillState) return null;
-	const activeEntries = listActiveSkills(skillState).filter(entry => entryMatchesContext(entry, sessionId, threadId));
+	const activeEntries = listActiveSkills(skillState).filter(entry =>
+		entryMatchesContext(entry, resolvedSessionId, threadId),
+	);
 	if (activeEntries.length === 0) return null;
 	const current = resolveCurrentWorkflowEntry(activeEntries, safeString(skillState.skill).trim());
 	if (!isPlanningSkill(current.skill)) return null;
-	const modeState = await readVisibleModeState(cwd, current.skill, sessionId);
+	const modeState = await readVisibleModeState(cwd, current.skill, resolvedSessionId);
 	if (!modeState) return null;
 	if (modeState.active !== true) return null;
-	if (!modeStateMatchesContext(modeState, sessionId, threadId)) return null;
+	if (!modeStateMatchesContext(modeState, resolvedSessionId, threadId)) return null;
 	const phase = String(modeState.current_phase ?? current.phase ?? "").trim();
 	if (!isBlockingPlanningPhase(current.skill, phase)) return null;
 	return { skill: current.skill, phase };
@@ -460,8 +465,9 @@ function relativeGjcSegments(cwd: string, rawPath: string): string[] | null {
 function blockedWorkflowStateSkill(cwd: string, rawPath: string): CanonicalGjcWorkflowSkill | null {
 	const segments = relativeGjcSegments(cwd, rawPath);
 	if (segments?.[0] !== ".gjc") return null;
-	if (segments[1] === "specs" || segments[1] === "plans") return null;
-	if (segments[1] !== "state") return null;
+	const generatedRoot = segments[1]?.startsWith(GJC_SESSION_PREFIX) ? segments[2] : segments[1];
+	if (generatedRoot === "specs" || generatedRoot === "plans") return null;
+	if (generatedRoot !== "state") return null;
 	const fileName = segments.at(-1) ?? "";
 	for (const skillName of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
 		if (fileName === workflowModeStateFileName(skillName)) return skillName;
@@ -481,7 +487,8 @@ function firstBlockedWorkflowStateSkill(cwd: string, targets: ExtractedTargets):
 function isAllowlistedPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
 	if (segments?.[0] !== ".gjc") return false;
-	return segments[1] === "specs" || segments[1] === "plans";
+	const generatedRoot = segments[1]?.startsWith(GJC_SESSION_PREFIX) ? segments[2] : segments[1];
+	return generatedRoot === "specs" || generatedRoot === "plans";
 }
 function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);

@@ -1,7 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { auditPath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 const tempRoots: string[] = [];
 
@@ -18,10 +21,11 @@ afterEach(async () => {
 let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 async function writeFileWithAge(
@@ -30,7 +34,7 @@ async function writeFileWithAge(
 	ageDays: number,
 	content = "{}\n",
 ): Promise<string> {
-	const filePath = path.join(root, ".gjc", "state", relativePath);
+	const filePath = path.join(sessionStateDir(root, TEST_SESSION_ID), relativePath);
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.writeFile(filePath, content, "utf-8");
 	const when = new Date(Date.now() - ageDays * 24 * 60 * 60 * 1000);
@@ -91,7 +95,7 @@ describe("native gjc state retention gc", () => {
 		expect(await exists(currentSnapshot)).toBe(true);
 		expect(await exists(audit)).toBe(true);
 
-		const auditLines = (await fs.readFile(path.join(root, ".gjc", "state", "audit.jsonl"), "utf-8"))
+		const auditLines = (await fs.readFile(auditPath(root, TEST_SESSION_ID), "utf-8"))
 			.trim()
 			.split(/\r?\n/)
 			.map(line => JSON.parse(line) as Record<string, unknown>);

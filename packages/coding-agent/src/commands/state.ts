@@ -2,7 +2,8 @@ import { Command } from "@gajae-code/utils/cli";
 import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
 
 export default class State extends Command {
-	static description = "Read or update GJC workflow state receipts under .gjc/state";
+	static description =
+		"Read or update current-session GJC workflow state receipts under .gjc/_session-{sessionid}/state";
 	static strict = false;
 	static examples = [
 		'$ gjc state read --input \'{"mode":"deep-interview"}\' --json',

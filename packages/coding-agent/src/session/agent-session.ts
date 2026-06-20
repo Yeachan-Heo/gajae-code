@@ -183,6 +183,11 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import {
+	assertNonEmptyGjcSessionId,
+	modeStatePath as sessionModeStatePath,
+	sessionStateDir,
+} from "../gjc-runtime/session-layout";
 import { persistCoordinatorRuntimeStateFromEvent } from "../gjc-runtime/session-state-sidecar";
 import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
@@ -311,13 +316,6 @@ export type AgentSessionEvent =
 	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
-
-/**
- * Safe path component pattern used to validate session-id segments before
- * joining them into `.gjc/state` paths. Mirrors the regex used by the
- * `gjc state` runtime selector resolver.
- */
-const SAFE_PATH_COMPONENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
@@ -1370,21 +1368,17 @@ export class AgentSession {
 	getActiveSkillPhase(): string | undefined {
 		const active = this.#activeSkillState;
 		if (!active) return undefined;
-		// Path safety: refuse to read mode-state files when the skill or
-		// session-id are not safe path components. The `skill` tool
-		// interprets undefined as a non-terminal phase, so chaining is
-		// refused — there is no risk of bypassing the guard via a custom
-		// skill name with `..` or a session-id with separators.
 		if (!isCanonicalGjcWorkflowSkill(active.skill)) return undefined;
-		if (active.sessionId !== undefined && !SAFE_PATH_COMPONENT.test(active.sessionId)) {
-			return undefined;
-		}
+		const sessionId = active.sessionId ?? this.sessionManager.getSessionId();
 		try {
-			const stateDir = path.join(this.sessionManager.getCwd(), ".gjc", "state");
-			const segments = active.sessionId
-				? [stateDir, "sessions", encodeURIComponent(active.sessionId).replaceAll(".", "%2E")]
-				: [stateDir];
-			const filePath = path.join(...segments, `${active.skill}-state.json`);
+			assertNonEmptyGjcSessionId(sessionId, "AgentSession.getActiveSkillPhase");
+			// Keep the session-state-dir construction explicit here so the chain guard
+			// refuses to fall back to a legacy root `.gjc/state` read.
+			const stateDir = sessionStateDir(this.sessionManager.getCwd(), sessionId);
+			const filePath = path.join(
+				stateDir,
+				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), sessionId, active.skill)),
+			);
 			const raw = fs.readFileSync(filePath, "utf-8");
 			const parsed = JSON.parse(raw) as { current_phase?: unknown };
 			return typeof parsed.current_phase === "string" ? parsed.current_phase : undefined;

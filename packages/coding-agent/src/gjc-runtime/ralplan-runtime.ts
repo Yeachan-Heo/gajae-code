@@ -12,6 +12,8 @@ import {
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
 import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
+import { modeStatePath, sessionPlansDir } from "./session-layout";
+import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
@@ -169,18 +171,15 @@ interface ResolvedArtifactArgs {
 	stageN: number;
 	runId: string;
 	artifact: string;
-	sessionId: string | undefined;
+	sessionId: string;
 	json: boolean;
 }
 
-function ralplanStatePath(cwd: string, sessionId: string | undefined): string {
-	const stateDir = sessionId
-		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(sessionId))
-		: path.join(cwd, ".gjc", "state");
-	return path.join(stateDir, "ralplan-state.json");
+function ralplanStatePath(cwd: string, sessionId: string): string {
+	return modeStatePath(cwd, sessionId, "ralplan");
 }
 
-async function readActiveRunId(cwd: string, sessionId: string | undefined): Promise<string | undefined> {
+async function readActiveRunId(cwd: string, sessionId: string): Promise<string | undefined> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "absent") return undefined;
@@ -221,12 +220,7 @@ function advanceCurrentPhase(existingPhase: unknown, stage: RalplanStage): strin
 	return stage;
 }
 
-async function persistActiveRunId(
-	cwd: string,
-	sessionId: string | undefined,
-	runId: string,
-	stage: RalplanStage,
-): Promise<void> {
+async function persistActiveRunId(cwd: string, sessionId: string, runId: string, stage: RalplanStage): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
@@ -261,7 +255,7 @@ async function persistActiveRunId(
 	await writeWorkflowEnvelopeAtomic(statePath, existing, {
 		cwd,
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
 }
 
@@ -384,11 +378,7 @@ function plannerStatePayload(update: PlannerStateUpdate): Record<string, unknown
  * audit/routing hint only — it records what the caller has already proven and is
  * NOT a durable cross-process subagent registry.
  */
-async function applyPlannerStateUpdate(
-	cwd: string,
-	sessionId: string | undefined,
-	update: PlannerStateUpdate,
-): Promise<void> {
+async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: PlannerStateUpdate): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
@@ -407,7 +397,7 @@ async function applyPlannerStateUpdate(
 	await writeWorkflowEnvelopeAtomic(statePath, existing, {
 		cwd,
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
 }
 
@@ -423,9 +413,13 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 		throw new RalplanCommandError(2, "--artifact is required for ralplan --write");
 	}
 
-	const sessionIdRaw = flagValue(args, "--session-id")?.trim();
-	const sessionId = sessionIdRaw || undefined;
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
+	assertSafePathComponent(sessionId, "session-id");
+	const sessionIdRaw = sessionId;
 
 	// Precedence for run_id:
 	//   1. explicit --run-id flag
@@ -469,13 +463,19 @@ async function persistArtifact(
 	content: string,
 	sha256: string,
 ): Promise<PersistedArtifact> {
-	const runDir = path.join(cwd, ".gjc", "plans", "ralplan", resolved.runId);
+	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
 
 	const fileName = `stage-${pad2(resolved.stageN)}-${resolved.stage}.md`;
 	const filePath = path.join(runDir, fileName);
 	await writeArtifact(filePath, content, {
 		cwd,
-		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+		audit: {
+			category: "artifact",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "ralplan",
+			sessionId: resolved.sessionId,
+		},
 	});
 
 	const createdAt = new Date().toISOString();
@@ -488,7 +488,13 @@ async function persistArtifact(
 	};
 	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
-		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "ralplan" },
+		audit: {
+			category: "ledger",
+			verb: "append",
+			owner: "gjc-runtime",
+			skill: "ralplan",
+			sessionId: resolved.sessionId,
+		},
 		key: ralplanIndexKey,
 	});
 
@@ -497,7 +503,13 @@ async function persistArtifact(
 		pendingApprovalPath = path.join(runDir, "pending-approval.md");
 		await writeArtifact(pendingApprovalPath, content, {
 			cwd,
-			audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+			audit: {
+				category: "artifact",
+				verb: "write",
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId: resolved.sessionId,
+			},
 		});
 	}
 
@@ -528,11 +540,12 @@ interface ExistingStageArtifact {
  */
 async function findExistingStageArtifact(
 	cwd: string,
+	sessionId: string,
 	runId: string,
 	stage: RalplanStage,
 	stageN: number,
 ): Promise<ExistingStageArtifact | undefined> {
-	const indexPath = path.join(cwd, ".gjc", "plans", "ralplan", runId, "index.jsonl");
+	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
 	let text: string;
 	try {
 		text = await fs.readFile(indexPath, "utf8");
@@ -566,9 +579,9 @@ async function findExistingStageArtifact(
  * Read and parse the run's `index.jsonl` rows. Best-effort: returns [] when the
  * file is absent or unreadable so HUD sync never fails on a missing index.
  */
-async function readRalplanIndexRows(cwd: string, runId: string): Promise<RalplanIndexRow[]> {
+async function readRalplanIndexRows(cwd: string, sessionId: string, runId: string): Promise<RalplanIndexRow[]> {
 	try {
-		const indexPath = path.join(cwd, ".gjc", "plans", "ralplan", runId, "index.jsonl");
+		const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
 		const text = await fs.readFile(indexPath, "utf8");
 		const rows: RalplanIndexRow[] = [];
 		for (const line of text.split(/\r?\n/)) {
@@ -583,7 +596,7 @@ async function readRalplanIndexRows(cwd: string, runId: string): Promise<Ralplan
 
 async function syncRalplanHud(options: {
 	cwd: string;
-	sessionId?: string;
+	sessionId: string;
 	stage: string;
 	pendingApproval: boolean;
 	iteration?: number;
@@ -612,11 +625,12 @@ async function buildRalplanHud(options: {
 	iteration?: number;
 	latestSummary?: string;
 	runId?: string;
+	sessionId?: string;
 }) {
 	let iterationFromIndex: number | undefined;
 	let stages: string | undefined;
-	if (options.runId) {
-		const rows = await readRalplanIndexRows(options.cwd, options.runId);
+	if (options.runId && options.sessionId) {
+		const rows = await readRalplanIndexRows(options.cwd, options.sessionId, options.runId);
 		if (rows.length > 0) {
 			const summary = summarizeRalplanIndex(rows);
 			iterationFromIndex = summary.iteration;
@@ -643,7 +657,13 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
 	// silently clobber the artifact or append a duplicate ledger row. Classify before any
 	// state mutation so a conflict never regresses run-state phase.
-	const existingArtifact = await findExistingStageArtifact(cwd, resolved.runId, resolved.stage, resolved.stageN);
+	const existingArtifact = await findExistingStageArtifact(
+		cwd,
+		resolved.sessionId,
+		resolved.runId,
+		resolved.stage,
+		resolved.stageN,
+	);
 	if (existingArtifact) {
 		if (existingArtifact.sha256 !== sha256) {
 			throw new RalplanCommandError(
@@ -660,6 +680,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	if (plannerState) {
 		await applyPlannerStateUpdate(cwd, resolved.sessionId, plannerState);
 	}
+	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: persisted.path });
 	await syncRalplanHud({
 		cwd,
 		sessionId: resolved.sessionId,
@@ -706,7 +727,12 @@ function buildDeduplicatedResult(
 		deduplicated: true,
 	};
 	if (resolved.stage === "final") {
-		payload.pending_approval_path = path.join(cwd, ".gjc", "plans", "ralplan", resolved.runId, "pending-approval.md");
+		payload.pending_approval_path = path.join(
+			sessionPlansDir(cwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			"pending-approval.md",
+		);
 	}
 	const stdout = resolved.json
 		? `${JSON.stringify(payload, null, 2)}\n`
@@ -721,7 +747,7 @@ interface ConsensusHandoffArgs {
 	deliberate: boolean;
 	architectKind?: string;
 	criticKind?: string;
-	sessionId?: string;
+	sessionId: string;
 	task: string;
 	json: boolean;
 }
@@ -747,7 +773,7 @@ function extractPositionalTask(args: readonly string[]): string {
 	return parts.join(" ").trim();
 }
 
-function resolveConsensusArgs(args: readonly string[]): ConsensusHandoffArgs {
+function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHandoffArgs {
 	const architectKind = flagValue(args, "--architect")?.trim() || undefined;
 	if (architectKind && !KNOWN_ARCHITECT_KINDS.has(architectKind)) {
 		throw new RalplanCommandError(
@@ -762,8 +788,12 @@ function resolveConsensusArgs(args: readonly string[]): ConsensusHandoffArgs {
 			`unknown --critic kind: ${criticKind}. Expected one of: ${[...KNOWN_CRITIC_KINDS].join(", ")}.`,
 		);
 	}
-	const sessionId = flagValue(args, "--session-id")?.trim() || undefined;
-	if (sessionId) assertSafePathComponent(sessionId, "session-id");
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
+	assertSafePathComponent(sessionId, "session-id");
 	const task = extractPositionalTask(args);
 	return {
 		interactive: hasFlag(args, "--interactive"),
@@ -776,19 +806,11 @@ function resolveConsensusArgs(args: readonly string[]): ConsensusHandoffArgs {
 	};
 }
 
-function encodeSessionSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
-}
-
 async function seedRalplanState(
 	cwd: string,
 	resolved: ConsensusHandoffArgs,
 ): Promise<{ statePath: string; runId: string }> {
-	const stateDir = resolved.sessionId
-		? path.join(cwd, ".gjc", "state", "sessions", encodeSessionSegment(resolved.sessionId))
-		: path.join(cwd, ".gjc", "state");
-
-	const statePath = path.join(stateDir, "ralplan-state.json");
+	const statePath = ralplanStatePath(cwd, resolved.sessionId);
 	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
 	// orphan in-progress artifacts under a fresh run id.
 	const existingRunId = await readActiveRunId(cwd, resolved.sessionId);
@@ -818,13 +840,20 @@ async function seedRalplanState(
 			command: "gjc ralplan seed",
 			sessionId: resolved.sessionId,
 		},
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan" },
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "ralplan",
+			sessionId: resolved.sessionId,
+		},
 	});
+	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
 	return { statePath, runId };
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
-	const resolved = resolveConsensusArgs(args);
+	const resolved = resolveConsensusArgs(args, cwd);
 	if (!resolved.task) {
 		throw new RalplanCommandError(2, 'gjc ralplan requires a task description, e.g. `gjc ralplan "<task>"`.');
 	}

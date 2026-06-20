@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,13 +6,13 @@ import {
 	appendOrMergeDeepInterviewRound,
 	enrichDeepInterviewRoundScoring,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
-import {
-	deepInterviewStatePath,
-	runNativeDeepInterviewCommand,
-} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { activeSnapshotPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let priorSessionId: string | undefined;
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-di-hud-sync-"));
@@ -21,7 +21,13 @@ async function tempDir(): Promise<string> {
 }
 
 beforeAll(() => {
-	delete process.env.GJC_SESSION_ID;
+	priorSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 afterEach(async () => {
@@ -29,7 +35,7 @@ afterEach(async () => {
 });
 
 async function deepInterviewChips(cwd: string): Promise<Record<string, string | undefined>> {
-	const raw = JSON.parse(await fs.readFile(path.join(cwd, ".gjc", "state", "skill-active-state.json"), "utf-8")) as {
+	const raw = JSON.parse(await fs.readFile(activeSnapshotPath(cwd, TEST_SESSION_ID), "utf-8")) as {
 		active_skills?: Array<{ skill: string; hud?: { chips?: Array<{ label: string; value?: string }> } }>;
 	};
 	const entry = (raw.active_skills ?? []).find(skill => skill.skill === "deep-interview");
@@ -39,16 +45,21 @@ async function deepInterviewChips(cwd: string): Promise<Record<string, string | 
 describe("deep-interview recorder -> HUD sync", () => {
 	it("refreshes active-state HUD round count after recording an answered round", async () => {
 		const cwd = await tempDir();
-		const statePath = deepInterviewStatePath(cwd, undefined);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			questionText: "What is the core entity?",
-			component: "api",
-			dimension: "goal",
-			ambiguity: 0.8,
-			selectedOptions: ["A"],
-		});
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				questionText: "What is the core entity?",
+				component: "api",
+				dimension: "goal",
+				ambiguity: 0.8,
+				selectedOptions: ["A"],
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		const chips = await deepInterviewChips(cwd);
 		expect(chips.round).toBe("1");
 		expect(chips.phase).toBe("interviewing");
@@ -56,14 +67,24 @@ describe("deep-interview recorder -> HUD sync", () => {
 
 	it("refreshes HUD ambiguity after scoring enrichment", async () => {
 		const cwd = await tempDir();
-		const statePath = deepInterviewStatePath(cwd, undefined);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, { round: 1, questionId: "q1", questionText: "Q?" });
-		await enrichDeepInterviewRoundScoring(cwd, statePath, {
-			round: 1,
-			questionId: "q1",
-			scores: { goal: 0.5 },
-			ambiguity: 0.45,
-		});
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 1, questionId: "q1", questionText: "Q?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.5 },
+				ambiguity: 0.45,
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 		const chips = await deepInterviewChips(cwd);
 		expect(chips.round).toBe("1");
 		expect(chips.ambiguity).toContain("45%");
@@ -73,9 +94,19 @@ describe("deep-interview recorder -> HUD sync", () => {
 describe("deep-interview gjc state write preserves recorder rounds", () => {
 	it("does not drop recorder-written rounds on a partial scoring write", async () => {
 		const cwd = await tempDir();
-		const statePath = deepInterviewStatePath(cwd, undefined);
-		await appendOrMergeDeepInterviewRound(cwd, statePath, { round: 1, questionId: "q1", questionText: "Q1?" });
-		await appendOrMergeDeepInterviewRound(cwd, statePath, { round: 2, questionId: "q2", questionText: "Q2?" });
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 1, questionId: "q1", questionText: "Q1?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 2, questionId: "q2", questionText: "Q2?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		const write = await runNativeStateCommand(
 			[
@@ -125,7 +156,7 @@ describe("deep-interview reconcile and write produce identical HUD", () => {
 		await reconcileWorkflowSkillState({
 			cwd: reconcileCwd,
 			mode: "deep-interview",
-			sessionId: undefined,
+			sessionId: TEST_SESSION_ID,
 			active: true,
 			phase: "interviewing",
 			payload: { current_phase: "interviewing", state: payloadState },
@@ -147,7 +178,7 @@ describe("deep-interview spec persistence canonicalizes state", () => {
 			cwd,
 		);
 		expect(result.status).toBe(0);
-		const onDisk = JSON.parse(await fs.readFile(deepInterviewStatePath(cwd, undefined), "utf-8"));
+		const onDisk = JSON.parse(await fs.readFile(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(onDisk.current_phase).toBe("handoff");
 		expect(onDisk.spec_slug).toBe("canon-missing");
 		expect(Array.isArray(onDisk.state?.rounds)).toBe(true);
@@ -156,7 +187,7 @@ describe("deep-interview spec persistence canonicalizes state", () => {
 
 	it("hoists flattened legacy transcript into nested state during spec persistence", async () => {
 		const cwd = await tempDir();
-		const statePath = deepInterviewStatePath(cwd, undefined);
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(
 			statePath,
@@ -182,7 +213,7 @@ describe("deep-interview spec persistence canonicalizes state", () => {
 describe("deep-interview handoff canonicalizes caller state", () => {
 	it("rewrites a flattened deep-interview caller into canonical nested state on handoff", async () => {
 		const cwd = await tempDir();
-		const statePath = deepInterviewStatePath(cwd, undefined);
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(
 			statePath,

@@ -11,6 +11,13 @@ import {
 	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
+import {
+	activeEntryPath as layoutActiveEntryPath,
+	activeSnapshotPath as layoutActiveSnapshotPath,
+	activeStateDir as layoutActiveStateDir,
+	auditPath as layoutAuditPath,
+	transactionJournalPath as layoutTransactionJournalPath,
+} from "./session-layout";
 import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
 /**
@@ -22,7 +29,7 @@ import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
  * supplied mutation context. No lockfiles are used; isolation is by atomic rename,
  * append, O_EXCL creates, conditional deletes, per-entry active-state files,
  * and derived active-state snapshots.
- * Transaction journals are per mutation id under `.gjc/state/transactions/`;
+ * Transaction journals are per mutation id under the session state transactions directory;
  * they are recovery evidence only, never global locks or waiters, so stale
  * journals do not block unrelated state reads or writes.
  */
@@ -50,6 +57,7 @@ export interface StateWriterReceiptContext {
 
 export interface StateWriterAuditContext {
 	cwd?: string;
+	sessionId?: string;
 	category: WriterCategory;
 	verb: string;
 	owner: WorkflowStateMutationOwner;
@@ -255,32 +263,23 @@ function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
-function encodePathSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
+function requireSessionId(sessionScope: string | ActiveSessionScope | undefined, source: string): string {
+	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
+	const normalizedSessionId = safeString(sessionId).trim();
+	if (!normalizedSessionId) throw new Error(`a non-empty GJC session id is required (${source})`);
+	return normalizedSessionId;
 }
 
 function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope): string {
-	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
-	const normalizedSessionId = safeString(sessionId).trim();
-	const stateDir = path.join(cwd, ".gjc", "state");
-	return normalizedSessionId
-		? path.join(stateDir, "sessions", encodePathSegment(normalizedSessionId), "active")
-		: path.join(stateDir, "active");
+	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
 }
 
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
-	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
-	const normalizedSessionId = safeString(sessionId).trim();
-	const stateDir = path.join(cwd, ".gjc", "state");
-	return normalizedSessionId
-		? path.join(stateDir, "sessions", encodePathSegment(normalizedSessionId), "skill-active-state.json")
-		: path.join(stateDir, "skill-active-state.json");
+	return layoutActiveSnapshotPath(cwd, requireSessionId(sessionScope, "activeSnapshotPath"));
 }
 
 function activeEntryPath(cwd: string, sessionScope: string | ActiveSessionScope | undefined, skill: string): string {
-	const normalizedSkill = safeString(skill).trim();
-	if (!normalizedSkill) throw new Error("skill is required");
-	return path.join(activeStateDir(cwd, sessionScope), `${encodePathSegment(normalizedSkill)}.json`);
+	return layoutActiveEntryPath(cwd, requireSessionId(sessionScope, "activeEntryPath"), skill);
 }
 
 function activeSubskillKey(entry: ActiveSubskillEntry): string {
@@ -378,7 +377,7 @@ async function maybeAudit(mutatedPath: string, options?: StateWriterOptions): Pr
 	if (!options?.audit) return;
 	const audit = options.audit;
 	const cwd = path.resolve(audit.cwd ?? options.cwd ?? process.cwd());
-	await appendAuditEntry(cwd, {
+	await appendAuditEntry(cwd, options?.audit?.sessionId ?? "", {
 		ts: new Date().toISOString(),
 		skill: audit.skill,
 		category: audit.category,
@@ -449,7 +448,7 @@ async function recordInvalidWorkflowTransition(args: {
 	// internal write skipped a manifest edge.
 	const cwd = path.resolve(options?.audit?.cwd ?? options?.cwd ?? process.cwd());
 	try {
-		await appendAuditEntry(cwd, {
+		await appendAuditEntry(cwd, options?.audit?.sessionId ?? "", {
 			ts: new Date().toISOString(),
 			skill,
 			category: "state",
@@ -756,8 +755,7 @@ export async function removeFileAudited(targetPath: string, options?: StateWrite
 }
 
 /**
- * Active entry files under `.gjc/state/active/<skill>.json` and
- * `.gjc/state/sessions/<id>/active/<skill>.json` are authoritative. The
+ * Active entry files under `.gjc/_session-{id}/state/active/<skill>.json` are authoritative. The
  * adjacent `skill-active-state.json` file is only a derived cache rebuilt from
  * those entries, so concurrent snapshot rebuilds can race without losing any
  * writer's per-skill state.
@@ -925,7 +923,7 @@ export async function hardPrune(
 	}
 	if (options?.audit && removed.length > 0) {
 		const audit = options.audit;
-		await appendAuditEntry(path.resolve(audit.cwd ?? options.cwd ?? process.cwd()), {
+		await appendAuditEntry(path.resolve(audit.cwd ?? options.cwd ?? process.cwd()), audit.sessionId ?? "", {
 			ts: new Date().toISOString(),
 			skill: audit.skill,
 			category: audit.category,
@@ -967,26 +965,41 @@ export async function forceOverwrite(
 	);
 }
 
-export async function appendAuditEntry(cwd: string, entry: AuditEntry): Promise<string> {
-	const filePath = resolveGjcTarget(path.join(".gjc", "state", "audit.jsonl"), cwd);
+export async function appendAuditEntry(
+	cwd: string,
+	sessionIdOrEntry: string | AuditEntry,
+	maybeEntry?: AuditEntry,
+): Promise<string> {
+	const sessionId =
+		typeof sessionIdOrEntry === "string"
+			? sessionIdOrEntry.trim()
+			: safeString((sessionIdOrEntry as AuditEntry & { session_id?: unknown }).session_id).trim();
+	if (!sessionId) throw new Error("a non-empty GJC session id is required (appendAuditEntry)");
+	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
+	if (!entry) throw new Error("audit entry is required");
+	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
 	return filePath;
 }
 
-function transactionJournalPath(cwd: string, mutationId: string): string {
-	return path.join(path.resolve(cwd), ".gjc", "state", "transactions", `${encodePathSegment(mutationId)}.json`);
+function transactionJournalPath(cwd: string, sessionId: string, mutationId: string): string {
+	return layoutTransactionJournalPath(path.resolve(cwd), sessionId, mutationId);
 }
 
 export async function readWorkflowTransactionJournal(
 	cwd: string,
+	sessionId: string,
 	mutationId: string,
 ): Promise<WorkflowTransactionJournal | undefined> {
-	return (await readJsonIfPresent(transactionJournalPath(cwd, mutationId))) as WorkflowTransactionJournal | undefined;
+	return (await readJsonIfPresent(transactionJournalPath(cwd, sessionId, mutationId))) as
+		| WorkflowTransactionJournal
+		| undefined;
 }
 
 export async function beginWorkflowTransactionJournal(input: {
 	cwd: string;
+	sessionId: string;
 	mutationId: string;
 	caller?: CanonicalGjcWorkflowSkill;
 	callee?: CanonicalGjcWorkflowSkill;
@@ -1005,7 +1018,7 @@ export async function beginWorkflowTransactionJournal(input: {
 		steps: [],
 	};
 	try {
-		return await createJsonNoClobber(transactionJournalPath(input.cwd, input.mutationId), journal, {
+		return await createJsonNoClobber(transactionJournalPath(input.cwd, input.sessionId, input.mutationId), journal, {
 			cwd: input.cwd,
 		});
 	} catch (error) {
@@ -1016,17 +1029,22 @@ export async function beginWorkflowTransactionJournal(input: {
 
 export async function updateWorkflowTransactionJournal(
 	cwd: string,
+	sessionId: string,
 	mutationId: string,
 	patch: Partial<WorkflowTransactionJournal>,
 ): Promise<string> {
-	const filePath = transactionJournalPath(cwd, mutationId);
+	const filePath = transactionJournalPath(cwd, sessionId, mutationId);
 	const current = ((await readJsonIfPresent(filePath)) ?? {}) as WorkflowTransactionJournal;
 	const next = { ...current, ...patch, updated_at: new Date().toISOString() } as WorkflowTransactionJournal;
 	await atomicWrite(filePath, jsonText(next));
 	return filePath;
 }
 
-export async function completeWorkflowTransactionJournal(cwd: string, mutationId: string): Promise<void> {
-	await updateWorkflowTransactionJournal(cwd, mutationId, { status: "committed" });
-	await atomicRemove(transactionJournalPath(cwd, mutationId)).catch(() => false);
+export async function completeWorkflowTransactionJournal(
+	cwd: string,
+	sessionId: string,
+	mutationId: string,
+): Promise<void> {
+	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { status: "committed" });
+	await atomicRemove(transactionJournalPath(cwd, sessionId, mutationId)).catch(() => false);
 }

@@ -2,17 +2,21 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { normalizeLegacyState } from "../../src/gjc-runtime/state-migrations";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-migration-"));
 	const priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	try {
 		await fn(dir);
 	} finally {
 		if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+		else delete process.env.GJC_SESSION_ID;
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }
@@ -27,7 +31,7 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
 }
 
 async function readAuditEntries(cwd: string): Promise<Array<Record<string, unknown>>> {
-	const raw = await fs.readFile(path.join(cwd, ".gjc/state/audit.jsonl"), "utf-8");
+	const raw = await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf-8");
 	return raw
 		.trim()
 		.split("\n")
@@ -38,7 +42,7 @@ async function readAuditEntries(cwd: string): Promise<Array<Record<string, unkno
 describe("G7 gjc state migration gate", () => {
 	it("normalizes legacy state purely and persists migration only through the state command", async () => {
 		await withTempCwd(async cwd => {
-			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			const legacy = {
 				current_phase: "planning",
 				extension_field: { nested: true },
@@ -79,7 +83,7 @@ describe("G7 gjc state migration gate", () => {
 
 	it("rejects tampered migrated state without --force and leaves the file untouched", async () => {
 		await withTempCwd(async cwd => {
-			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			const legacy = {
 				current_phase: "planning",
 				extension_field: { nested: true },
@@ -109,7 +113,7 @@ describe("G7 gjc state migration gate", () => {
 
 	it("migrates tampered state with --force and audits the forced mismatch", async () => {
 		await withTempCwd(async cwd => {
-			const statePath = path.join(cwd, ".gjc/state/ralplan-state.json");
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			const legacy = {
 				current_phase: "planning",
 				extension_field: { nested: true },

@@ -1,3 +1,11 @@
+import { resolveGjcSessionForRead } from "../../gjc-runtime/session-resolution";
+
+async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string> {
+	const normalizedSessionId = sessionId?.trim();
+	if (normalizedSessionId) return normalizedSessionId;
+	return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+}
+
 import type { ActiveSubskillEntry } from "../../skill-state/active-state";
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import type { LoadedSubskillActivation } from "./types";
@@ -21,7 +29,10 @@ export async function readActiveSubskillsForParent(input: {
 	parent: string;
 	phase: string;
 }): Promise<ActiveSubskillEntry[]> {
-	const state = await readVisibleSkillActiveState(input.cwd, input.sessionId);
+	const state = await readVisibleSkillActiveState(
+		input.cwd,
+		await resolveBoundarySessionId(input.cwd, input.sessionId),
+	);
 	const parent = input.parent.trim();
 	const phase = input.phase.trim();
 	if (!state || !parent || !phase) return [];

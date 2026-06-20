@@ -1,10 +1,22 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readWorkflowStateJson, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let priorSessionId: string | undefined;
+
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
+});
 
 async function tempDir(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-token-thrift-"));
@@ -31,22 +43,16 @@ describe("GJC state token thrift", () => {
 			ci_gates: [{ name: "gate" }],
 			research_findings: [{ source: "paper" }],
 		};
-		await runNativeStateCommand(
-			["write", "--mode", "deep-interview", "--session-id", "", "--input", JSON.stringify(payload)],
-			root,
-		);
+		await runNativeStateCommand(["write", "--mode", "deep-interview", "--input", JSON.stringify(payload)], root);
 
-		const compactMarkdown = await runNativeStateCommand(
-			["read", "--mode", "deep-interview", "--session-id", "", "--compact"],
-			root,
-		);
+		const compactMarkdown = await runNativeStateCommand(["read", "--mode", "deep-interview", "--compact"], root);
 		expect(compactMarkdown.status).toBe(0);
 		expect(compactMarkdown.stdout).toContain("rounds: 2 entries (elided)");
 		expect(compactMarkdown.stdout).toContain("ontology_snapshots: 1 entries (elided)");
 		expect(compactMarkdown.stdout).not.toContain("transcript");
 
 		const compactJson = await runNativeStateCommand(
-			["read", "--mode", "deep-interview", "--session-id", "", "--compact", "--json"],
+			["read", "--mode", "deep-interview", "--compact", "--json"],
 			root,
 		);
 		expect(compactJson.status).toBe(0);
@@ -54,10 +60,7 @@ describe("GJC state token thrift", () => {
 		expect(parsedCompact.rounds).toBeUndefined();
 		expect(parsedCompact.elided.rounds).toEqual({ type: "array", count: 2, pointer: "/state/rounds" });
 
-		const json = await runNativeStateCommand(
-			["read", "--mode", "deep-interview", "--session-id", "", "--json"],
-			root,
-		);
+		const json = await runNativeStateCommand(["read", "--mode", "deep-interview", "--json"], root);
 		expect(json.status).toBe(0);
 		const parsed = JSON.parse(json.stdout ?? "{}");
 		const raw = await readWorkflowStateJson(root, "deep-interview");

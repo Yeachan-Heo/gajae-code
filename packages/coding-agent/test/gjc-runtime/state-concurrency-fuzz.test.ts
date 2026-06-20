@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { activeSnapshotPath, auditPath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	AlreadyExistsError,
 	appendJsonl,
@@ -9,6 +10,8 @@ import {
 	writeActiveEntry,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import type { SkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+
+const TEST_SESSION_ID = "test-session";
 
 const tempRoots: string[] = [];
 const WORKER_COUNT = 8;
@@ -26,10 +29,11 @@ afterEach(async () => {
 let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 async function readJson<T>(filePath: string): Promise<T> {
@@ -46,7 +50,7 @@ describe("gjc state no-lock concurrency fuzz", () => {
 			skills.map(async (skill, index) => {
 				await writeActiveEntry(
 					root,
-					undefined,
+					{ sessionId: TEST_SESSION_ID },
 					skill,
 					{
 						skill,
@@ -57,12 +61,12 @@ describe("gjc state no-lock concurrency fuzz", () => {
 					},
 					{ cwd: root },
 				);
-				await rebuildActiveSnapshot(root, undefined, { cwd: root });
+				await rebuildActiveSnapshot(root, { sessionId: TEST_SESSION_ID }, { cwd: root });
 			}),
 		);
 
-		await rebuildActiveSnapshot(root, undefined, { cwd: root });
-		const snapshot = await readJson<SkillActiveState>(path.join(root, ".gjc", "state", "skill-active-state.json"));
+		await rebuildActiveSnapshot(root, { sessionId: TEST_SESSION_ID }, { cwd: root });
+		const snapshot = await readJson<SkillActiveState>(activeSnapshotPath(root, TEST_SESSION_ID));
 		const activeSkills = snapshot.active_skills ?? [];
 		const bySkill = new Map(activeSkills.map(entry => [entry.skill, entry]));
 
@@ -79,7 +83,10 @@ describe("gjc state no-lock concurrency fuzz", () => {
 
 	it("allows exactly one O_EXCL claim winner when workers race the same team claim file", async () => {
 		const root = await tempDir();
-		const claimPath = ".gjc/state/team/claims/shared-task.json";
+		const claimPath = path.relative(
+			root,
+			path.join(sessionStateDir(root, TEST_SESSION_ID), "team", "claims", "shared-task.json"),
+		);
 		const attempts = await Promise.all(
 			Array.from({ length: WORKER_COUNT }, async (_, index) => {
 				try {
@@ -111,20 +118,20 @@ describe("gjc state no-lock concurrency fuzz", () => {
 
 	it("keeps concurrent audit JSONL appends complete and parseable", async () => {
 		const root = await tempDir();
-		const auditPath = ".gjc/state/audit.jsonl";
+		const auditLogPath = path.relative(root, auditPath(root, TEST_SESSION_ID));
 		const ids = Array.from({ length: WORKER_COUNT }, (_, index) => `audit-${index}`);
 
 		await Promise.all(
 			ids.map((id, index) =>
 				appendJsonl(
-					auditPath,
+					auditLogPath,
 					{ id, event: "concurrency-fuzz", worker_id: `worker-${index}`, at: `2026-06-03T00:00:0${index}.000Z` },
 					{ cwd: root },
 				),
 			),
 		);
 
-		const raw = await fs.readFile(path.join(root, auditPath), "utf-8");
+		const raw = await fs.readFile(path.join(root, auditLogPath), "utf-8");
 		const lines = raw.trimEnd().split("\n");
 		const parsed = lines.map(line => JSON.parse(line) as Record<string, unknown>);
 		const seenIds = new Set(parsed.map(entry => entry.id));

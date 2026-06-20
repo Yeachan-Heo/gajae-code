@@ -11,11 +11,11 @@ export default class DeepInterview extends Command {
 		threshold: Flags.string({ description: "Override ambiguity threshold for kickoff" }),
 		"threshold-source": Flags.string({ description: "Describe the threshold override source" }),
 		"session-id": Flags.string({
-			description: "Route state/spec handoff through a session-scoped .gjc state directory",
+			description: "Route state/spec handoff through a session-scoped .gjc/_session-{sessionid} directory",
 		}),
 		write: Flags.boolean({ description: "Persist a final deep-interview spec through the sanctioned GJC CLI/API" }),
 		stage: Flags.string({ description: 'Spec stage for --write (currently "final")' }),
-		slug: Flags.string({ description: "Safe slug for .gjc/specs/deep-interview-<slug>.md" }),
+		slug: Flags.string({ description: "Safe slug for .gjc/_session-{sessionid}/specs/deep-interview-<slug>.md" }),
 		spec: Flags.string({ description: "Final spec markdown or a path to the final spec markdown" }),
 		handoff: Flags.string({ description: 'After --write, hand off to a workflow target (currently "ralplan")' }),
 		deliberate: Flags.boolean({

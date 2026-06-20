@@ -1,7 +1,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	auditPath,
+	modeStatePath,
+	sessionStateDir,
+	transactionJournalPath,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+
+const TEST_SESSION_ID = "test-session";
 
 const tempRoots: string[] = [];
 
@@ -18,10 +26,11 @@ afterEach(async () => {
 let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
-	delete process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
 });
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
@@ -84,7 +93,7 @@ async function writeStampedState(root: string, skill: string, value: Record<stri
 		root,
 	);
 	expect(result.status).toBe(0);
-	return path.join(root, ".gjc", "state", `${skill}-state.json`);
+	return modeStatePath(root, TEST_SESSION_ID, skill);
 }
 
 describe("gjc state doctor", () => {
@@ -95,7 +104,7 @@ describe("gjc state doctor", () => {
 			current_phase: "interviewing",
 		});
 		expect(statePath).toContain("deep-interview-state.json");
-		await writeJson(path.join(root, ".gjc", "state", "audit.jsonl"), { seeded: true });
+		await writeJson(auditPath(root, TEST_SESSION_ID), { seeded: true });
 
 		const result = await runDoctorUnchanged(root, ["doctor", "--json"]);
 		expect(result.status).toBe(0);
@@ -146,16 +155,16 @@ describe("gjc state doctor", () => {
 			);
 			expect(result.stdout).not.toContain("gjc state ralplan clear");
 		} finally {
-			if (prior === undefined) delete process.env.GJC_SESSION_ID;
+			if (prior === undefined) process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 			else process.env.GJC_SESSION_ID = prior;
 		}
 	});
 
 	it("detects orphan transaction journals and prints the hard prune fix command", async () => {
 		const root = await tempDir();
-		const journalPath = path.join(root, ".gjc", "state", "transactions", "orphan.json");
+		const journalPath = transactionJournalPath(root, TEST_SESSION_ID, "orphan");
 		await writeJson(journalPath, { version: 1, mutation_id: "orphan", status: "committed", paths: [] });
-		await writeJson(path.join(root, ".gjc", "state", "audit.jsonl"), { seeded: true });
+		await writeJson(auditPath(root, TEST_SESSION_ID), { seeded: true });
 
 		const text = await runDoctorUnchanged(root, ["doctor"]);
 		expect(text.status).toBe(1);
@@ -179,7 +188,7 @@ describe("gjc state doctor", () => {
 		const state = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		state.current_phase = "critic";
 		await writeJson(statePath, state);
-		await writeJson(path.join(root, ".gjc", "state", "audit.jsonl"), { seeded: true });
+		await writeJson(auditPath(root, TEST_SESSION_ID), { seeded: true });
 
 		const result = await runDoctorUnchanged(root, ["doctor", "--skill", "ralplan", "--json"]);
 		expect(result.status).toBe(1);
@@ -197,9 +206,9 @@ describe("gjc state doctor", () => {
 
 	it("detects schema violations and prints the migrate fix command", async () => {
 		const root = await tempDir();
-		const statePath = path.join(root, ".gjc", "state", "ultragoal-state.json");
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "ultragoal");
 		await writeJson(statePath, { skill: "ultragoal", version: "one", active: "yes", current_phase: 7 });
-		await writeJson(path.join(root, ".gjc", "state", "audit.jsonl"), { seeded: true });
+		await writeJson(auditPath(root, TEST_SESSION_ID), { seeded: true });
 
 		const result = await runDoctorUnchanged(root, ["doctor", "--json"]);
 		expect(result.status).toBe(1);
@@ -216,7 +225,7 @@ describe("gjc state doctor", () => {
 
 	it("detects stale active-state from raw snapshot and per-skill active entries", async () => {
 		const root = await tempDir();
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = sessionStateDir(root, TEST_SESSION_ID);
 		const activeEntryPath = path.join(stateRoot, "active", "team.json");
 		await writeJson(activeEntryPath, { skill: "team", active: true, phase: "running" });
 		await writeJson(path.join(stateRoot, "skill-active-state.json"), {

@@ -80,7 +80,7 @@ describe("GJC public CLI command surface", () => {
 
 		expect(result.exitCode, output).toBe(0);
 		expect(output).toContain("--dry-run");
-		expect(output).toContain(".gjc/state/team");
+		expect(output).toContain(".gjc/_session-{sessionid}/state/team");
 		expect(output).toContain("do not commit");
 		expect(output).toContain("existing tmux/GJC --tmux session");
 		expect(output).toContain("gjc --tmux");

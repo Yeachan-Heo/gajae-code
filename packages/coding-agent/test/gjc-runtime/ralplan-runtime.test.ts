@@ -1,11 +1,38 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
+import {
+	activeEntryPath,
+	activeSnapshotPath,
+	modeStatePath,
+	sessionPlansDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let previousGjcSessionId: string | undefined;
+
+const ralplanStatePath = (root: string) => modeStatePath(root, TEST_SESSION_ID, "ralplan");
+const ralplanRunDir = (root: string, runId: string) =>
+	path.join(sessionPlansDir(root, TEST_SESSION_ID), "ralplan", runId);
+const ralplanPlanPath = (root: string, runId: string, ...parts: string[]) =>
+	path.join(ralplanRunDir(root, runId), ...parts);
+
+beforeAll(() => {
+	previousGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (previousGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = previousGjcSessionId;
+	}
+});
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ralplan-runtime-"));
@@ -23,7 +50,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		const result = await runNativeRalplanCommand(["--interactive", "--deliberate", "make state native"], root);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("ralplan seed run_id=");
-		const state = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const state = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
 		expect(state.mode).toBe("deliberate");
 		expect(state.interactive).toBe(true);
 		expect(state.task).toBe("make state native");
@@ -41,13 +68,13 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 			handoff: "/skill:ralplan",
 		});
 		expect(typeof payload.run_id).toBe("string");
-		expect(payload.state_path).toContain(path.join(".gjc", "state", "ralplan-state.json"));
+		expect(payload.state_path).toBe(ralplanStatePath(root));
 		expect(payload.task).toBeUndefined();
 	});
 
 	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {
 		const root = await tempDir();
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(statePath, "{broken json", "utf-8");
 
@@ -60,7 +87,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 
 	it("reuses a valid active run id during consensus handoff seeding", async () => {
 		const root = await tempDir();
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(
 			statePath,
@@ -85,7 +112,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 			root,
 		);
 		expect(result.status).toBe(0);
-		const state = JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8"));
+		const state = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
 		expect(state.architect_kind).toBe("openai-code");
 		expect(state.critic_kind).toBe("openai-code");
 	});
@@ -93,9 +120,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 	it("syncs ralplan HUD chips for the active run", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "task"], root);
-		const active = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "state", "skill-active-state.json"), "utf-8"),
-		);
+		const active = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8"));
 		const entry = (
 			active.active_skills as Array<{
 				skill: string;
@@ -113,13 +138,13 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 	it("visible HUD prefers canonical final over a stale active-state snapshot", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
 		await runNativeRalplanCommand(
 			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
 			root,
 		);
-		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const snapshotPath = activeSnapshotPath(root, TEST_SESSION_ID);
 		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8")) as {
 			active_skills?: Array<{
 				skill: string;
@@ -133,7 +158,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		);
 		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
 		await fs.writeFile(
-			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			activeEntryPath(root, TEST_SESSION_ID, "ralplan"),
 			`${JSON.stringify(
 				{
 					skill: "ralplan",
@@ -156,13 +181,13 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 	it("visible HUD prefers canonical inactive handoff over stale active entries", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
 		await runNativeRalplanCommand(
 			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
 			root,
 		);
-		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const snapshotPath = activeSnapshotPath(root, TEST_SESSION_ID);
 		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
 		await fs.writeFile(
 			statePath,
@@ -171,7 +196,7 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		);
 		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
 		await fs.writeFile(
-			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			activeEntryPath(root, TEST_SESSION_ID, "ralplan"),
 			`${JSON.stringify(
 				{
 					skill: "ralplan",
@@ -237,12 +262,10 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(payload.stage).toBe("planner");
 		expect(payload.stage_n).toBe(1);
 		expect(typeof payload.sha256).toBe("string");
-		const filePath = path.join(root, ".gjc", "plans", "ralplan", "test-run-1", "stage-01-planner.md");
+		const filePath = ralplanPlanPath(root, "test-run-1", "stage-01-planner.md");
 		const content = await fs.readFile(filePath, "utf-8");
 		expect(content).toBe("# Plan body\n");
-		const indexLine = (
-			await fs.readFile(path.join(root, ".gjc", "plans", "ralplan", "test-run-1", "index.jsonl"), "utf-8")
-		).trim();
+		const indexLine = (await fs.readFile(ralplanPlanPath(root, "test-run-1", "index.jsonl"), "utf-8")).trim();
 		expect(JSON.parse(indexLine).sha256).toBe(payload.sha256);
 	});
 
@@ -255,10 +278,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 			root,
 		);
 		expect(result.status).toBe(0);
-		const content = await fs.readFile(
-			path.join(root, ".gjc", "plans", "ralplan", "file-run", "stage-02-architect.md"),
-			"utf-8",
-		);
+		const content = await fs.readFile(ralplanPlanPath(root, "file-run", "stage-02-architect.md"), "utf-8");
 		expect(content).toBe("# Draft\nbody\n");
 	});
 
@@ -285,7 +305,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 			);
 			expect(result.status).toBe(0);
 			const content = await fs.readFile(
-				path.join(root, ".gjc", "plans", "ralplan", "restricted-file-run", "stage-02-architect.md"),
+				ralplanPlanPath(root, "restricted-file-run", "stage-02-architect.md"),
 				"utf-8",
 			);
 			expect(content).toBe(`${artifactPath}\n`);
@@ -318,10 +338,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(typeof payload.pending_approval_path).toBe("string");
-		const pendingApproval = await fs.readFile(
-			path.join(root, ".gjc", "plans", "ralplan", "final-run", "pending-approval.md"),
-			"utf-8",
-		);
+		const pendingApproval = await fs.readFile(ralplanPlanPath(root, "final-run", "pending-approval.md"), "utf-8");
 		expect(pendingApproval).toBe("# Final Plan\n");
 	});
 
@@ -377,11 +394,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 			["--write", "--stage", "architect", "--stage_n", "2", "--artifact", "a2", "--run-id", "multi"],
 			root,
 		);
-		const indexLines = (
-			await fs.readFile(path.join(root, ".gjc", "plans", "ralplan", "multi", "index.jsonl"), "utf-8")
-		)
-			.trim()
-			.split("\n");
+		const indexLines = (await fs.readFile(ralplanPlanPath(root, "multi", "index.jsonl"), "utf-8")).trim().split("\n");
 		expect(indexLines.length).toBe(2);
 		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
 		expect(JSON.parse(indexLines[1]).stage).toBe("architect");
@@ -406,9 +419,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		// Without explicit --run-id, both writes should target the same auto-generated run.
 		expect(secondPayload.run_id).toBe(firstPayload.run_id);
 
-		const indexLines = (
-			await fs.readFile(path.join(root, ".gjc", "plans", "ralplan", firstPayload.run_id, "index.jsonl"), "utf-8")
-		)
+		const indexLines = (await fs.readFile(ralplanPlanPath(root, firstPayload.run_id, "index.jsonl"), "utf-8"))
 			.trim()
 			.split("\n");
 		expect(indexLines.length).toBe(2);
@@ -435,7 +446,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 
 describe("native gjc ralplan runtime — run-state phase coherence", () => {
 	const readPhase = async (root: string): Promise<string> => {
-		const raw = await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8");
+		const raw = await fs.readFile(ralplanStatePath(root), "utf-8");
 		return (JSON.parse(raw) as { current_phase?: string }).current_phase ?? "";
 	};
 
@@ -465,7 +476,7 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
 		const runId = (
-			JSON.parse(await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8")) as {
+			JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")) as {
 				run_id: string;
 			}
 		).run_id;
@@ -483,7 +494,7 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 
 	it("does not regress a handed-off run-state phase on a stray --write (chain guard intact)", async () => {
 		const root = await tempDir();
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(
 			statePath,
@@ -507,13 +518,13 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 	it("doctor reports active-state phase drift from canonical final", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
 		await runNativeRalplanCommand(
 			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
 			root,
 		);
-		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const snapshotPath = activeSnapshotPath(root, TEST_SESSION_ID);
 		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
 		await runNativeRalplanCommand(
 			["--write", "--stage", "final", "--stage_n", "6", "--artifact", "# final", "--run-id", runId],
@@ -521,7 +532,7 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 		);
 		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
 		await fs.writeFile(
-			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			activeEntryPath(root, TEST_SESSION_ID, "ralplan"),
 			`${JSON.stringify({ skill: "ralplan", active: true, phase: "revision" }, null, 2)}\n`,
 			"utf-8",
 		);
@@ -544,13 +555,13 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 	it("doctor reports drift from canonical inactive handoff", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "--json", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const runId = (JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string }).run_id;
 		await runNativeRalplanCommand(
 			["--write", "--stage", "revision", "--stage_n", "4", "--artifact", "# revision", "--run-id", runId],
 			root,
 		);
-		const snapshotPath = path.join(root, ".gjc", "state", "skill-active-state.json");
+		const snapshotPath = activeSnapshotPath(root, TEST_SESSION_ID);
 		const staleSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8"));
 		await fs.writeFile(
 			statePath,
@@ -559,7 +570,7 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 		);
 		await fs.writeFile(snapshotPath, `${JSON.stringify(staleSnapshot, null, 2)}\n`, "utf-8");
 		await fs.writeFile(
-			path.join(root, ".gjc", "state", "active", "ralplan.json"),
+			activeEntryPath(root, TEST_SESSION_ID, "ralplan"),
 			`${JSON.stringify({ skill: "ralplan", active: true, phase: "revision" }, null, 2)}\n`,
 			"utf-8",
 		);
@@ -581,7 +592,7 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 });
 
 describe("native gjc ralplan runtime — duplicate --write guard", () => {
-	const runDir = (root: string, runId: string) => path.join(root, ".gjc", "plans", "ralplan", runId);
+	const runDir = ralplanRunDir;
 
 	it("treats an identical repeated write as a deterministic no-op", async () => {
 		const root = await tempDir();
@@ -670,7 +681,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 });
 
 describe("native gjc ralplan runtime — persisted Planner state", () => {
-	const statePath = (root: string) => path.join(root, ".gjc", "state", "ralplan-state.json");
+	const statePath = (root: string) => ralplanStatePath(root);
 
 	async function readState(root: string): Promise<Record<string, unknown>> {
 		const raw = await fs.readFile(statePath(root), "utf-8");
@@ -934,7 +945,7 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 			root,
 		);
 		expect(result.status).toBe(2);
-		const filePath = path.join(root, ".gjc", "plans", "ralplan", "no-side-effect", "stage-01-planner.md");
+		const filePath = ralplanPlanPath(root, "no-side-effect", "stage-01-planner.md");
 		await expect(fs.readFile(filePath, "utf-8")).rejects.toThrow();
 	});
 
@@ -1010,14 +1021,14 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 
 describe("native gjc ralplan runtime — post-clear re-activation (#644)", () => {
 	const readState = async (root: string): Promise<{ active?: unknown; current_phase?: unknown; run_id?: unknown }> => {
-		const raw = await fs.readFile(path.join(root, ".gjc", "state", "ralplan-state.json"), "utf-8");
+		const raw = await fs.readFile(ralplanStatePath(root), "utf-8");
 		return JSON.parse(raw);
 	};
 
 	it("re-asserts active:true and resets phase out of terminal lock when a new run_id is written after a clear", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const seeded = await readState(root);
 		expect(seeded.active).toBe(true);
 
@@ -1039,7 +1050,7 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 
 	it("re-asserts active:true on a same-run continuation write at the current phase", async () => {
 		const root = await tempDir();
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		await fs.mkdir(path.dirname(statePath), { recursive: true });
 		await fs.writeFile(
 			statePath,
@@ -1078,7 +1089,7 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 	it("does not re-arm a cleared run on a stray same-run-id --write (demote-on-clear preserved)", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "task"], root);
-		const statePath = path.join(root, ".gjc", "state", "ralplan-state.json");
+		const statePath = ralplanStatePath(root);
 		const seeded = await readState(root);
 		const seededRunId = seeded.run_id as string;
 

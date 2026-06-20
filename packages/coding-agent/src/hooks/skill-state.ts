@@ -1,7 +1,9 @@
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
-import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
+import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
+import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { writeJsonAtomic, writeWorkflowEnvelopeAtomic } from "../gjc-runtime/state-writer";
 import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
 import { getUltragoalRunCompletionState, readUltragoalPlan } from "../gjc-runtime/ultragoal-runtime";
@@ -11,6 +13,11 @@ import {
 	type SkillActiveEntry,
 	type SkillActiveState,
 } from "../skill-state/active-state";
+import { initialPhaseForSkill } from "../skill-state/initial-phase";
+
+// Re-export for existing callers and tests that imported it from this module.
+export { initialPhaseForSkill };
+
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
 	compareSkillKeywordMatches,
@@ -19,7 +26,7 @@ import {
 	isGjcWorkflowSkill,
 } from "./skill-keywords";
 
-export const GJC_STATE_DIR = ".gjc/state";
+export const GJC_STATE_DIR = ".gjc";
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
 
 export interface EffectiveSkillConfigInput {
@@ -199,27 +206,18 @@ export function resolveGjcStateDir(cwd: string, stateDir?: string): string {
 	return stateDir ? path.resolve(cwd, stateDir) : path.join(cwd, GJC_STATE_DIR);
 }
 
-function encodeStatePathSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
+async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promise<string> {
+	const normalizedSessionId = sessionId?.trim();
+	if (normalizedSessionId) return normalizedSessionId;
+	return (await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
 }
 
-import { initialPhaseForSkill } from "../skill-state/initial-phase";
-
-// Re-export for existing callers and tests that imported it from this module.
-export { initialPhaseForSkill };
-
-function modeStateFileName(skill: GjcWorkflowSkill): string {
-	return `${skill}-state.json`;
+function modeStatePath(cwd: string, skill: GjcWorkflowSkill, sessionId: string): string {
+	return sessionModeStatePath(cwd, sessionId, skill);
 }
 
-function modeStatePath(stateDir: string, skill: GjcWorkflowSkill, sessionId?: string): string {
-	if (sessionId) return path.join(stateDir, "sessions", encodeStatePathSegment(sessionId), modeStateFileName(skill));
-	return path.join(stateDir, modeStateFileName(skill));
-}
-
-function skillStatePath(stateDir: string, sessionId?: string): string {
-	if (sessionId) return path.join(stateDir, "sessions", encodeStatePathSegment(sessionId), SKILL_ACTIVE_STATE_FILE);
-	return path.join(stateDir, SKILL_ACTIVE_STATE_FILE);
+function skillStatePath(cwd: string, sessionId: string): string {
+	return activeSnapshotPath(cwd, sessionId);
 }
 
 function warnInvalidState(kind: string, filePath: string, error: string): void {
@@ -254,10 +252,10 @@ async function readValidatedJsonFile<T>(
 	return value;
 }
 
-async function writeJsonFile(filePath: string, value: unknown, cwd: string): Promise<void> {
+async function writeJsonFile(filePath: string, value: unknown, cwd: string, sessionId: string): Promise<void> {
 	await writeJsonAtomic(filePath, value, {
 		cwd,
-		audit: { category: "state", verb: "write", owner: "gjc-hook" },
+		audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId },
 	});
 }
 
@@ -286,23 +284,9 @@ function isWorkflowActiveEntry(entry: SkillActiveEntry): entry is SkillActiveEnt
 export async function readVisibleSkillActiveState(
 	cwd: string,
 	sessionId?: string,
-	stateDir?: string,
+	_stateDir?: string,
 ): Promise<SkillActiveState | null> {
-	if (!stateDir) return await readCanonicalVisibleSkillActiveState(cwd, sessionId);
-	const resolvedStateDir = resolveGjcStateDir(cwd, stateDir);
-	if (sessionId) {
-		const sessionState = await readValidatedJsonFile<SkillActiveState>(
-			skillStatePath(resolvedStateDir, sessionId),
-			"skill-active-state",
-			SkillActiveStateSchema,
-		);
-		if (sessionState) return sessionState;
-	}
-	return await readValidatedJsonFile<SkillActiveState>(
-		skillStatePath(resolvedStateDir),
-		"skill-active-state",
-		SkillActiveStateSchema,
-	);
+	return await readCanonicalVisibleSkillActiveState(cwd, await resolveBoundarySessionId(cwd, sessionId));
 }
 
 interface SeedSkillActivationStateInput {
@@ -320,17 +304,17 @@ async function seedSkillActivationState(
 	source: string,
 	input: SeedSkillActivationStateInput,
 ): Promise<SkillActiveState> {
-	const resolvedStateDir = resolveGjcStateDir(input.cwd, input.stateDir);
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const nowIso = input.nowIso ?? new Date().toISOString();
 	const phase = initialPhaseForSkill(skill);
-	const initializedStatePath = modeStatePath(resolvedStateDir, skill, input.sessionId);
+	const initializedStatePath = modeStatePath(input.cwd, skill, resolvedSessionId);
 	const entry: SkillActiveEntry = {
 		skill,
 		phase,
 		active: true,
 		activated_at: nowIso,
 		updated_at: nowIso,
-		...(input.sessionId ? { session_id: input.sessionId } : {}),
+		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 	};
@@ -343,7 +327,7 @@ async function seedSkillActivationState(
 		activated_at: nowIso,
 		updated_at: nowIso,
 		source,
-		...(input.sessionId ? { session_id: input.sessionId } : {}),
+		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 		initialized_mode: skill,
@@ -357,7 +341,7 @@ async function seedSkillActivationState(
 		skill,
 		cwd: input.cwd,
 		updated_at: nowIso,
-		...(input.sessionId ? { session_id: input.sessionId } : {}),
+		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 	};
@@ -373,14 +357,11 @@ async function seedSkillActivationState(
 			skill,
 			owner: "gjc-hook",
 			command: source,
-			sessionId: input.sessionId,
+			sessionId: resolvedSessionId,
 		},
-		audit: { category: "state", verb: "write", owner: "gjc-hook", skill },
+		audit: { category: "state", verb: "write", owner: "gjc-hook", skill, sessionId: resolvedSessionId },
 	});
-	await writeJsonFile(skillStatePath(resolvedStateDir, input.sessionId), state, input.cwd);
-	if (input.sessionId) {
-		await writeJsonFile(skillStatePath(resolvedStateDir), state, input.cwd);
-	}
+	await writeJsonFile(skillStatePath(input.cwd, resolvedSessionId), state, input.cwd, resolvedSessionId);
 	return state;
 }
 
@@ -418,16 +399,17 @@ export async function ensureWorkflowSkillActivationState(
 ): Promise<SkillActiveState | null> {
 	const skill = input.skill.trim();
 	if (!isGjcWorkflowSkill(skill)) return null;
-	const existing = await readVisibleSkillActiveState(input.cwd, input.sessionId, input.stateDir);
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
+	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
 	const alreadyActive = listActiveSkills(existing).some(
 		entry =>
 			entry.skill === skill &&
-			(existing ? entryMatchesContext(entry, existing, input.sessionId, input.threadId) : true),
+			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
 	if (alreadyActive) return existing;
 	return await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
 		cwd: input.cwd,
-		sessionId: input.sessionId,
+		sessionId: resolvedSessionId,
 		threadId: input.threadId,
 		turnId: input.turnId,
 		nowIso: input.nowIso,
@@ -565,18 +547,13 @@ async function readVisibleModeState(
 	cwd: string,
 	skill: GjcWorkflowSkill,
 	sessionId?: string,
-	stateDir?: string,
+	_stateDir?: string,
 ): Promise<{ state: ModeState; statePath: string } | null> {
-	const resolvedStateDir = resolveGjcStateDir(cwd, stateDir);
-	if (sessionId) {
-		const sessionStatePath = modeStatePath(resolvedStateDir, skill, sessionId);
-		const sessionState = await readValidatedJsonFile<ModeState>(sessionStatePath, "mode-state", ModeStateSchema);
-		if (sessionState) return { state: sessionState, statePath: sessionStatePath };
-	}
-	const rootStatePath = modeStatePath(resolvedStateDir, skill);
-	const rootState = await readValidatedJsonFile<ModeState>(rootStatePath, "mode-state", ModeStateSchema);
-	if (!rootState) return null;
-	return { state: rootState, statePath: rootStatePath };
+	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	const sessionStatePath = modeStatePath(cwd, skill, resolvedSessionId);
+	const sessionState = await readValidatedJsonFile<ModeState>(sessionStatePath, "mode-state", ModeStateSchema);
+	if (!sessionState) return null;
+	return { state: sessionState, statePath: sessionStatePath };
 }
 
 function stateMatchesContext(state: ModeState, sessionId?: string, threadId?: string): boolean {
@@ -599,10 +576,11 @@ async function readCurrentGoalObjectiveFromSessionFile(sessionFile: string | und
 }
 
 export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitStateInput): Promise<string | null> {
-	const visibleModeState = await readVisibleModeState(input.cwd, "ultragoal", input.sessionId, input.stateDir);
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
+	const visibleModeState = await readVisibleModeState(input.cwd, "ultragoal", resolvedSessionId, input.stateDir);
 	if (!visibleModeState) return null;
 	if (isTerminalModeState(visibleModeState.state)) return null;
-	if (!stateMatchesContext(visibleModeState.state, input.sessionId, input.threadId)) return null;
+	if (!stateMatchesContext(visibleModeState.state, resolvedSessionId, input.threadId)) return null;
 
 	const phase = String(visibleModeState.state.current_phase ?? "active");
 	const stateObjective =
@@ -639,16 +617,18 @@ export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitS
 }
 
 export async function buildSkillStopOutput(input: StopHookInput): Promise<Record<string, unknown> | null> {
-	const resolvedStateDir = resolveGjcStateDir(input.cwd, input.stateDir);
-	const skillState = await readVisibleSkillActiveState(input.cwd, input.sessionId, input.stateDir);
+	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
+	const skillState = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
 	const activeEntries = listActiveSkills(skillState)
 		.filter(isWorkflowActiveEntry)
-		.filter(entry => (skillState ? entryMatchesContext(entry, skillState, input.sessionId, input.threadId) : false));
+		.filter(entry =>
+			skillState ? entryMatchesContext(entry, skillState, resolvedSessionId, input.threadId) : false,
+		);
 	if (!skillState || activeEntries.length === 0) return null;
 
 	for (const entry of activeEntries) {
 		const modeState = await readValidatedJsonFile<ModeState>(
-			modeStatePath(resolvedStateDir, entry.skill, input.sessionId),
+			modeStatePath(input.cwd, entry.skill, resolvedSessionId),
 			"mode-state",
 			ModeStateSchema,
 		);
@@ -660,11 +640,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			// of trusting the single file (see #659).
 			const staleRelease = await detectStaleModeStateRelease(entry.skill, input.cwd);
 			if (staleRelease) {
-				const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(
-					resolvedStateDir,
-					entry.skill,
-					input.sessionId,
-				)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
+				const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(input.cwd, entry.skill, resolvedSessionId)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
 				return {
 					decision: "block",
 					reason: coherenceMessage,
@@ -678,11 +654,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			// as legitimate terminals). See #674.
 			const uncrystallized = await detectUncrystallizedDeepInterviewStop(entry.skill, modeState, input.cwd);
 			if (uncrystallized) {
-				const crystallizeMessage = `GJC deep-interview must crystallize before stopping (${modeStatePath(
-					resolvedStateDir,
-					entry.skill,
-					input.sessionId,
-				)}): ${uncrystallized}.`;
+				const crystallizeMessage = `GJC deep-interview must crystallize before stopping (${modeStatePath(input.cwd, entry.skill, resolvedSessionId)}): ${uncrystallized}.`;
 				return {
 					decision: "block",
 					reason: crystallizeMessage,
@@ -693,7 +665,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			continue;
 		}
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
-		const statePath = modeStatePath(resolvedStateDir, entry.skill, input.sessionId);
+		const statePath = modeStatePath(input.cwd, entry.skill, resolvedSessionId);
 		if (entry.skill === "ultragoal") {
 			const objective =
 				(await readCurrentGoalObjectiveFromSessionFile(input.sessionFile)) ??

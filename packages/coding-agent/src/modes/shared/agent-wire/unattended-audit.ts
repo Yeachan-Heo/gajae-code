@@ -12,6 +12,7 @@
  */
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import * as path from "node:path";
+import { sessionAuditDir } from "../../../gjc-runtime/session-layout";
 import type { RpcBudgetExceeded, RpcWorkflowGateKind, RpcWorkflowStage } from "../../rpc/rpc-types";
 import { answerHashOf } from "./workflow-gate-schema";
 
@@ -69,9 +70,9 @@ function defaultId(): string {
 	return `ae_${Date.now().toString(36)}_${idCounter.toString(36)}`;
 }
 
-export function defaultAuditPath(runId: string, root = process.cwd()): string {
+export function defaultAuditPath(runId: string, root = process.cwd(), gjcSessionId = runId): string {
 	const safe = runId.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return path.join(root, ".gjc", "audit", "unattended", `${safe}.jsonl`);
+	return path.join(sessionAuditDir(root, gjcSessionId), "unattended", `${safe}.jsonl`);
 }
 
 /** Append-only audit log writer + reader for one unattended run. */

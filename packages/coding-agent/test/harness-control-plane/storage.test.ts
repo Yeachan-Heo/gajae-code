@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { harnessStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
 	appendEvent,
 	assertSafeSessionId,
@@ -30,16 +31,24 @@ import {
 let root: string;
 let registryRoot: string;
 let registryEnv: NodeJS.ProcessEnv;
+let originalGjcSessionId: string | undefined;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-store-"));
 	registryRoot = await mkdtemp(path.join(tmpdir(), "harness-root-registry-"));
 	registryEnv = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot };
+	originalGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = "test-session";
 });
 
 afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
 	await rm(registryRoot, { recursive: true, force: true });
+	if (originalGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = originalGjcSessionId;
+	}
 });
 
 function state(sessionId: string): SessionState {
@@ -126,8 +135,8 @@ describe("harness storage", () => {
 		expect(resolveHarnessRoot({ env: { GJC_HARNESS_STATE_ROOT: "/z" } as NodeJS.ProcessEnv })).toBe(
 			path.resolve("/z"),
 		);
-		expect(resolveHarnessRoot({ cwd: "/repo", env: {} as NodeJS.ProcessEnv })).toBe(
-			path.join("/repo", ".gjc", "state", "harness"),
+		expect(resolveHarnessRoot({ cwd: "/repo", env: { GJC_SESSION_ID: "test-session" } as NodeJS.ProcessEnv })).toBe(
+			harnessStateRoot("/repo", "test-session"),
 		);
 	});
 

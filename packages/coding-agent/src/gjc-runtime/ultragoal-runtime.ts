@@ -7,6 +7,8 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { latestUltragoalLedgerEventFromText } from "./ledger-event-renderer";
+import { sessionUltragoalDir } from "./session-layout";
+import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
 import { appendJsonl, writeArtifact, writeJsonAtomic } from "./state-writer";
@@ -107,6 +109,10 @@ interface JsonObject {
 	[key: string]: unknown;
 }
 
+function currentUltragoalSessionId(cwd: string): string {
+	return resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+}
+
 const TERMINAL_OR_SKIPPED_STATUSES = new Set<UltragoalGoalStatus>(["complete", "superseded"]);
 const CLEAN_ARCHITECT_STATUS = "CLEAR";
 const APPROVE_RECOMMENDATION = "APPROVE";
@@ -162,8 +168,10 @@ export function hashStructuredValue(value: unknown): string {
 		.digest("hex");
 }
 
-export function getUltragoalPaths(cwd: string): UltragoalPaths {
-	const dir = path.join(cwd, ".gjc", "ultragoal");
+export function getUltragoalPaths(cwd: string, sessionId?: string | null): UltragoalPaths {
+	const explicitSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
+	if (!explicitSessionId) throw new Error("ultragoal paths require a session id");
+	const dir = sessionUltragoalDir(cwd, explicitSessionId);
 	return {
 		dir,
 		briefPath: path.join(dir, "brief.md"),
@@ -178,8 +186,10 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
-async function appendLedger(cwd: string, event: JsonObject): Promise<UltragoalLedgerEvent> {
-	const paths = getUltragoalPaths(cwd);
+async function appendLedger(cwd: string, event: JsonObject, sessionId?: string | null): Promise<UltragoalLedgerEvent> {
+	const resolvedSessionId =
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const paths = getUltragoalPaths(cwd, resolvedSessionId);
 	const entry: UltragoalLedgerEvent = {
 		eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
 		...event,
@@ -187,14 +197,18 @@ async function appendLedger(cwd: string, event: JsonObject): Promise<UltragoalLe
 	};
 	await appendJsonl(paths.ledgerPath, entry, {
 		cwd,
-		audit: { category: "ledger", verb: "append", owner: "gjc-runtime" },
+		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
+	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
 }
 
-export async function readUltragoalLedger(cwd: string): Promise<UltragoalLedgerEvent[]> {
+export async function readUltragoalLedger(cwd: string, sessionId?: string | null): Promise<UltragoalLedgerEvent[]> {
+	const resolvedSessionId =
+		sessionId?.trim() ||
+		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
 	try {
-		const raw = await Bun.file(getUltragoalPaths(cwd).ledgerPath).text();
+		const raw = await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).ledgerPath).text();
 		return raw
 			.split(/\r?\n/)
 			.map(line => line.trim())
@@ -206,16 +220,19 @@ export async function readUltragoalLedger(cwd: string): Promise<UltragoalLedgerE
 	}
 }
 
-async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
-	const paths = getUltragoalPaths(cwd);
+async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | null): Promise<void> {
+	const resolvedSessionId =
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const paths = getUltragoalPaths(cwd, resolvedSessionId);
 	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
 		cwd,
-		audit: { category: "artifact", verb: "write", owner: "gjc-runtime" },
+		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
 	await writeJsonAtomic(paths.goalsPath, plan, {
 		cwd,
-		audit: { category: "state", verb: "write", owner: "gjc-runtime" },
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
+	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.goalsPath });
 }
 
 function requiredUltragoalGoals(plan: UltragoalPlan): UltragoalGoal[] {
@@ -462,9 +479,12 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 	};
 }
 
-export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan | null> {
+export async function readUltragoalPlan(cwd: string, sessionId?: string | null): Promise<UltragoalPlan | null> {
+	const resolvedSessionId =
+		sessionId?.trim() ||
+		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
 	try {
-		return normalizePlan(await Bun.file(getUltragoalPaths(cwd).goalsPath).json());
+		return normalizePlan(await Bun.file(getUltragoalPaths(cwd, resolvedSessionId).goalsPath).json());
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		throw error;
@@ -483,9 +503,12 @@ function emptyCounts(): Record<UltragoalGoalStatus, number> {
 	};
 }
 
-export async function getUltragoalStatus(cwd: string): Promise<UltragoalStatusSummary> {
-	const paths = getUltragoalPaths(cwd);
-	const plan = await readUltragoalPlan(cwd);
+export async function getUltragoalStatus(cwd: string, sessionId?: string | null): Promise<UltragoalStatusSummary> {
+	const resolvedSessionId =
+		sessionId?.trim() ||
+		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
+	const paths = getUltragoalPaths(cwd, resolvedSessionId);
+	const plan = await readUltragoalPlan(cwd, resolvedSessionId);
 	const counts = emptyCounts();
 	if (!plan) return { exists: false, status: "missing", paths, counts, goals: [] };
 	for (const goal of plan.goals) counts[goal.status] += 1;
@@ -3329,7 +3352,7 @@ function renderCompleteHandoff(
 			goal_id: result.goal?.id,
 			goal_status: result.goal?.status,
 			gjc_objective: result.plan.gjcObjective,
-			goals_path: getUltragoalPaths(cwd).goalsPath,
+			goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 		});
 	}
 	if (result.allComplete) return "ultragoal complete all=true\n";
@@ -3353,7 +3376,7 @@ function renderCheckpointContinuation(
 			ok: true,
 			goal_id: result.checkpointedGoal.id,
 			status,
-			goals_path: getUltragoalPaths(cwd).goalsPath,
+			goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 			completion_receipt_kind: result.checkpointedGoal.completionVerification?.receiptKind,
 			quality_gate_hash: result.checkpointedGoal.completionVerification?.qualityGateHash,
 			all_complete: result.allComplete,
@@ -3407,7 +3430,12 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 				return {
 					kind,
 					message: "Accepted add_subgoal steering.\n",
-					receipt: { ok: true, kind, goal_id: result.goalId, goals_path: getUltragoalPaths(cwd).goalsPath },
+					receipt: {
+						ok: true,
+						kind,
+						goal_id: result.goalId,
+						goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
+					},
 				};
 			}
 			case "split_subgoal": {
@@ -3427,7 +3455,7 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 						kind,
 						goal_id: result.goalId,
 						replacement_goal_ids: result.replacementGoalIds,
-						goals_path: getUltragoalPaths(cwd).goalsPath,
+						goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 					},
 				};
 			}
@@ -3446,7 +3474,7 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 						ok: true,
 						kind,
 						pending_goal_ids: result.pendingGoalIds,
-						goals_path: getUltragoalPaths(cwd).goalsPath,
+						goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 					},
 				};
 			}
@@ -3468,7 +3496,7 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 						kind,
 						goal_id: result.goalId,
 						changed_fields: result.changedFields,
-						goals_path: getUltragoalPaths(cwd).goalsPath,
+						goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 					},
 				};
 			}
@@ -3477,7 +3505,11 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 				return {
 					kind,
 					message: "Accepted annotate_ledger steering.\n",
-					receipt: { ok: true, kind, ledger_path: getUltragoalPaths(cwd).ledgerPath },
+					receipt: {
+						ok: true,
+						kind,
+						ledger_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).ledgerPath,
+					},
 				};
 			}
 			case "mark_blocked_superseded": {
@@ -3496,7 +3528,7 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 						kind,
 						goal_id: result.goalId,
 						no_replacement_required: true,
-						goals_path: getUltragoalPaths(cwd).goalsPath,
+						goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 					},
 				};
 			}
@@ -3517,6 +3549,7 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 }
 
 async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
+	const sessionId = currentUltragoalSessionId(cwd);
 	const help = renderUltragoalHelp(args);
 	if (help) return { status: 0, stdout: help };
 	try {
@@ -3524,7 +3557,7 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 		const json = hasFlag(args, "--json");
 		switch (command) {
 			case "status":
-				return { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd), json) };
+				return { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd, sessionId), json) };
 			case "create":
 			case "create-goals": {
 				const mode = flagValue(args, "--gjc-goal-mode") === "per-story" ? "per-story" : "aggregate";
@@ -3537,9 +3570,9 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 								ok: true,
 								goals_count: plan.goals.length,
 								goal_ids: plan.goals.map(goal => goal.id),
-								goals_path: getUltragoalPaths(cwd).goalsPath,
+								goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 							})
-						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd).goalsPath}.\n`,
+						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath}.\n`,
 				};
 			}
 			case "complete-goals":
@@ -3598,7 +3631,11 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				return {
 					status: 0,
 					stdout: json
-						? renderCliWriteReceipt({ ok: true, goal_id: goal?.id, goals_path: getUltragoalPaths(cwd).goalsPath })
+						? renderCliWriteReceipt({
+								ok: true,
+								goal_id: goal?.id,
+								goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
+							})
 						: "Recorded review blockers.\n",
 				};
 			}
@@ -3632,9 +3669,9 @@ const RECONCILE_COMMANDS = new Set([
  * beyond that reconcile-failure audit event.
  */
 async function reconcileUltragoalState(cwd: string): Promise<void> {
-	const sessionId = process.env.GJC_SESSION_ID?.trim() || undefined;
+	const sessionId = currentUltragoalSessionId(cwd);
 	try {
-		const summary = await getUltragoalStatus(cwd);
+		const summary = await getUltragoalStatus(cwd, sessionId);
 		const status = summary.status;
 		const active = summary.exists && status !== "complete";
 		const payload: Record<string, unknown> = {

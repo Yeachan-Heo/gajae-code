@@ -173,6 +173,7 @@ export async function migrateAndPersistLegacyState(
 			verb: "migrate",
 			owner: "gjc-state-cli",
 			category: "state",
+			sessionId: args.sessionId,
 		},
 	});
 	return { migrated: true, path: persistedPath };

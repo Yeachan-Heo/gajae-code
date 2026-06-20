@@ -6,6 +6,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createEmptyNotebook, readNotebookDocument } from "@gajae-code/coding-agent/edit/notebook";
 import type { CustomTool } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
+import { rlmArtifactRoot } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	ensureRlmSessionDir,
 	generateRlmSessionId,
@@ -67,15 +68,21 @@ describe("rlm artifacts", () => {
 		expect(a).not.toBe(b);
 	});
 
-	test("resolves artifact paths under .gjc/rlm/<id> and creates the dir", async () => {
-		const paths = resolveRlmArtifactPaths(tmp, "sess1");
-		expect(paths.dir).toBe(path.join(tmp, ".gjc", "rlm", "sess1"));
-		expect(paths.notebookPath.endsWith(path.join("sess1", "notebook.ipynb"))).toBe(true);
-		expect(paths.reportPath.endsWith("report.md")).toBe(true);
-		await ensureRlmSessionDir(paths);
-		expect((await fs.stat(paths.dir)).isDirectory()).toBe(true);
+	test("resolves artifact paths under the session-scoped rlm dir and creates the dir", async () => {
+		const prior = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = "test-session";
+		try {
+			const paths = resolveRlmArtifactPaths(tmp, "sess1");
+			expect(paths.dir).toBe(rlmArtifactRoot(tmp, "test-session", "sess1"));
+			expect(paths.notebookPath.endsWith(path.join("sess1", "notebook.ipynb"))).toBe(true);
+			expect(paths.reportPath.endsWith("report.md")).toBe(true);
+			await ensureRlmSessionDir(paths);
+			expect((await fs.stat(paths.dir)).isDirectory()).toBe(true);
+		} finally {
+			if (prior !== undefined) process.env.GJC_SESSION_ID = prior;
+			else delete process.env.GJC_SESSION_ID;
+		}
 	});
-
 	test("rejects invalid session ids when resolving paths", () => {
 		expect(() => resolveRlmArtifactPaths(tmp, "../escape")).toThrow();
 	});

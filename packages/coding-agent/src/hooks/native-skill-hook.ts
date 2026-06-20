@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
+import { sessionLogsDir } from "../gjc-runtime/session-layout";
 import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
@@ -253,7 +254,18 @@ async function readStdinJson(): Promise<{ payload: HookPayload; parseError: Erro
 }
 
 async function logHookError(cwd: string, type: string, error: unknown): Promise<void> {
-	const logsDir = path.join(cwd, ".gjc", "logs");
+	const gjcSessionId = process.env.GJC_SESSION_ID?.trim();
+	if (!gjcSessionId) {
+		console.error(
+			JSON.stringify({
+				timestamp: new Date().toISOString(),
+				type,
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+		return;
+	}
+	const logsDir = sessionLogsDir(cwd, gjcSessionId);
 	await mkdir(logsDir, { recursive: true }).catch(() => {});
 	await appendFile(
 		path.join(logsDir, `native-hook-${new Date().toISOString().split("T")[0]}.jsonl`),

@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
-
+import { modeStatePath as sessionModeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	createUltragoalPlan,
 	readUltragoalLedger,
@@ -11,7 +11,9 @@ import {
 	startNextUltragoalGoal,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
+const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
+let savedSessionId: string | undefined;
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -22,6 +24,11 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
 	]);
 	if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stdout}${stderr}`);
 }
+
+beforeAll(() => {
+	savedSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
 
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-review-"));
@@ -36,7 +43,13 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+afterAll(() => {
+	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = savedSessionId;
 });
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -202,12 +215,7 @@ async function review(root: string, args: string[]): Promise<Record<string, unkn
 }
 
 function modeStatePath(root: string): string {
-	const sessionId = process.env.GJC_SESSION_ID?.trim();
-	if (sessionId) {
-		const encoded = encodeURIComponent(sessionId).replaceAll(".", "%2E");
-		return path.join(root, ".gjc", "state", "sessions", encoded, "ultragoal-state.json");
-	}
-	return path.join(root, ".gjc", "state", "ultragoal-state.json");
+	return sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal");
 }
 
 async function readModeState(root: string): Promise<Record<string, unknown>> {
