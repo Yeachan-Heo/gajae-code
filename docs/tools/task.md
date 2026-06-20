@@ -141,16 +141,13 @@ Artifacts and side channels:
   - Patch mode — capture/apply root patches, keep patch artifacts when application fails.
   - Branch mode — commit each task onto `gjc/task/<id>` branch, cherry-pick into parent, preserve failed branches for manual resolution.
 - Agent source
-  - Bundled GJC agents — retained four-agent surface.
-  - Bundled agents — appended last from `packages/coding-agent/src/task/agents.ts`.
+  - Project/user agents discovered from configured agent directories.
+  - Bundled GJC role agents — the retained canonical four-agent surface from `packages/coding-agent/src/task/agents.ts`.
 - Bundled agent types
-  - `explore` — read-only scout with structured handoff output.
-  - `plan` — architecture/planning agent; may spawn `explore`.
-  - `designer` — UI/UX specialist.
-  - `reviewer` — review agent with `report_finding` extraction.
-  - `task` — general-purpose worker with full capabilities.
-  - `quick_task` — low-reasoning mechanical worker using the same task prompt body.
-  - `librarian` — source-grounded external API/library researcher.
+  - `executor` — bounded implementation, fixes, and refactors.
+  - `architect` — read-only architecture and code-review assessment.
+  - `planner` — read-only sequencing and acceptance criteria.
+  - `critic` — read-only plan critique and actionability review.
 
 ## Side Effects
 - Filesystem

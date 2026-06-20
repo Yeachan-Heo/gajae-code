@@ -107,12 +107,12 @@ Before launching `gjc team`, require a grounded context snapshot:
    - constraints
    - unknowns/open questions
    - likely codebase touchpoints
-4. If ambiguity remains high, run `explore` first for brownfield facts, then run `$deep-interview --quick <task>` before team launch.
+4. If ambiguity remains high, gather brownfield facts with focused repo inspection or a canonical read-only role agent first, then run `$deep-interview --quick <task>` before team launch.
 5. If current correctness depends on official docs, version-aware framework guidance, best practices, or external dependency behavior, auto-delegate `researcher` as an evidence lane before or alongside worker launch instead of relying on repo-local recall alone.
 
 Do not start the worker pane until this gate is satisfied; if forced to proceed quickly, state explicit scope/risk limitations in the launch report.
 
-For simple read-only brownfield lookups during intake, follow active session guidance: when `USE_GJC_EXPLORE_CMD` is enabled, prefer `gjc explore` with narrow, concrete prompts; otherwise use the richer normal explore path and fall back normally if `gjc explore` is unavailable.
+For simple read-only brownfield lookups during intake, use narrow repo inspection first; for broader mapping, delegate to `planner` or `architect` with a concrete fact-finding assignment.
 
 ## Follow-up Staffing Contract
 

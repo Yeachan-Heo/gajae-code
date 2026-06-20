@@ -82,7 +82,7 @@ The plan MUST be scannable yet detailed enough to execute.
 
 <procedure>
 ### Phase 1: Understand
-You MUST focus on the request and associated code. You SHOULD launch parallel explore agents when scope spans multiple areas.
+You MUST focus on the request and associated code. You SHOULD launch parallel canonical role agents (`planner` or `architect`) when scope spans multiple areas.
 
 ### Phase 2: Design
 You MUST draft an approach based on exploration. You MUST consider trade-offs briefly, then choose.

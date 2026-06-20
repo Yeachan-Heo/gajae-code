@@ -38,5 +38,5 @@ Performs structural code search using AST matching via native ast-grep.
 <critical>
 - Avoid repo-root scans — narrow `paths` first
 - Parse issues are query failure, not evidence of absence: repair the pattern or tighten `paths` before concluding "no matches"
-- For broad/open-ended exploration across subsystems, use Task tool with explore subagent first
+- For broad/open-ended inspection across subsystems, delegate a bounded fact-finding task to an appropriate canonical role agent (`planner` or `architect`) first
 </critical>
