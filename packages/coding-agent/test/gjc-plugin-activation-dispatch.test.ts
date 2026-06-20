@@ -93,15 +93,17 @@ describe("GJC sub-skill activation dispatch", () => {
 		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
 		expect(result.activation).toBeDefined();
 
+		const sessionId = "activation-pack-session";
 		await syncSkillActiveState({
 			cwd,
+			sessionId,
 			skill: "ralplan",
 			active: true,
 			phase: result.activation!.phase,
 			active_subskills: result.activeSubskillsToPersist.map(toActiveSubskillEntry),
 		});
 
-		const executorSubskills = await readActiveSubskillsForParent({ cwd, parent: "executor", phase: "prompt" });
+		const executorSubskills = await readActiveSubskillsForParent({ cwd, sessionId, parent: "executor", phase: "prompt" });
 		expect(executorSubskills).toHaveLength(1);
 		expect(executorSubskills[0]).toMatchObject({
 			plugin: "combined-pack",
@@ -180,15 +182,17 @@ describe("GJC sub-skill activation dispatch", () => {
 		const result = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
 		expect(result.activation).toBeDefined();
 
+		const sessionId = "active-subskill-writer-session";
 		await syncSkillActiveState({
 			cwd,
+			sessionId,
 			skill: "ralplan",
 			active: true,
 			phase: "planner",
 			active_subskills: result.activeSubskillsToPersist.map(toActiveSubskillEntry),
 		});
 
-		const persisted = await readActiveSubskillsForParent({ cwd, parent: "ralplan", phase: "planner" });
+		const persisted = await readActiveSubskillsForParent({ cwd, sessionId, parent: "ralplan", phase: "planner" });
 		expect(persisted).toHaveLength(1);
 		expect(persisted[0]).toMatchObject({
 			plugin: "valid-skill-plugin",
@@ -198,12 +202,13 @@ describe("GJC sub-skill activation dispatch", () => {
 
 		await syncSkillActiveState({
 			cwd,
+			sessionId,
 			skill: "ralplan",
 			active: true,
 			phase: "planner",
 		});
 
-		const preserved = await readActiveSubskillsForParent({ cwd, parent: "ralplan", phase: "planner" });
+		const preserved = await readActiveSubskillsForParent({ cwd, sessionId, parent: "ralplan", phase: "planner" });
 		expect(preserved).toHaveLength(1);
 		expect(preserved[0]).toMatchObject({
 			plugin: "valid-skill-plugin",
@@ -213,13 +218,14 @@ describe("GJC sub-skill activation dispatch", () => {
 
 		await syncSkillActiveState({
 			cwd,
+			sessionId,
 			skill: "ralplan",
 			active: true,
 			phase: "planner",
 			active_subskills: [],
 		});
 
-		const cleared = await readActiveSubskillsForParent({ cwd, parent: "ralplan", phase: "planner" });
+		const cleared = await readActiveSubskillsForParent({ cwd, sessionId, parent: "ralplan", phase: "planner" });
 		expect(cleared).toHaveLength(0);
 	});
 });
