@@ -1245,6 +1245,7 @@ export class Editor implements Component, Focusable {
 		else if (
 			(data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
 			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
+			matchesKey(data, "ctrl+shift+enter") || // Ctrl+Shift+Enter (Kitty/modifyOtherKeys combined modifier)
 			data === "\x1b\r" || // Option+Enter in some terminals (legacy)
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
 			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
