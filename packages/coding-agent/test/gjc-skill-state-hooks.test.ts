@@ -1030,9 +1030,8 @@ disabledExtensions:
 		});
 
 		expect(blocked.outputJson).toMatchObject({ decision: "block" });
-		expect(String(blocked.outputJson?.reason ?? "")).toContain(
-			"aggregate completion requires a fresh final aggregate receipt",
-		);
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("Ultragoal still has incomplete required goals: G002");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
 	});
 
 	it("Stop blocks when stale Ultragoal mode-state would release but the plan still has pending goals", async () => {
@@ -1181,9 +1180,8 @@ disabledExtensions:
 		});
 
 		expect(result.outputJson).toMatchObject({ decision: "block" });
-		expect(String(result.outputJson?.reason ?? "")).toContain(
-			"aggregate completion requires a fresh final aggregate receipt",
-		);
+		expect(String(result.outputJson?.reason ?? "")).toContain("Ultragoal still has incomplete required goals: G002");
+		expect(String(result.outputJson?.reason ?? "")).toContain("complete-goals");
 	});
 	it("UserPromptSubmit includes steer guidance when activating Ultragoal", async () => {
 		const root = await cwd();
