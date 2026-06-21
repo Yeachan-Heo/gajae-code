@@ -1,4 +1,3 @@
-import * as nodeCrypto from "node:crypto";
 import * as fs from "node:fs";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
@@ -118,12 +117,7 @@ export function buildBetaHeader(baseBetas: string[], extraBetas: string[]): stri
 	return result.join(",");
 }
 
-const claudeCodeBetaDefaults = [
-	"claude-code-20250219",
-	"oauth-2025-04-20",
-	"context-management-2025-06-27",
-	"prompt-caching-scope-2026-01-05",
-];
+const anthropicBetaDefaults = ["oauth-2025-04-20", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05"];
 const fineGrainedToolStreamingBeta = "fine-grained-tool-streaming-2025-05-14";
 const interleavedThinkingBeta = "interleaved-thinking-2025-05-14";
 const fastModeBeta = "fast-mode-2026-02-01";
@@ -135,11 +129,6 @@ function getHeaderCaseInsensitive(headers: Record<string, string> | undefined, h
 		if (key.toLowerCase() === normalizedName) return value;
 	}
 	return undefined;
-}
-
-function isClaudeCodeClientUserAgent(userAgent: string | undefined): userAgent is string {
-	if (!userAgent) return false;
-	return userAgent.toLowerCase().startsWith("claude-cli");
 }
 
 function isAnthropicApiBaseUrl(baseUrl?: string): boolean {
@@ -165,7 +154,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 	const oauthToken = options.isOAuth ?? isAnthropicOAuthToken(options.apiKey);
 	const extraBetas = options.extraBetas ?? [];
 	const stream = options.stream ?? false;
-	const betaHeader = buildBetaHeader(claudeCodeBetaDefaults, extraBetas);
+	const betaHeader = buildBetaHeader(anthropicBetaDefaults, extraBetas);
 	const acceptHeader = stream ? "text/event-stream" : "application/json";
 	const modelHeaders = Object.fromEntries(
 		Object.entries(options.modelHeaders ?? {}).filter(([key]) => !enforcedHeaderKeys.has(key.toLowerCase())),
@@ -183,17 +172,13 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 
 	if (oauthToken) {
 		const incomingUserAgent = getHeaderCaseInsensitive(options.modelHeaders, "User-Agent");
-		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent)
-			? incomingUserAgent
-			: `claude-cli/${claudeCodeVersion} (external, cli)`;
 		return {
 			...modelHeaders,
-			...claudeCodeHeaders,
 			Accept: acceptHeader,
 			Authorization: `Bearer ${options.apiKey}`,
 			...sharedHeaders,
 			"Anthropic-Beta": betaHeader,
-			"User-Agent": userAgent,
+			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
 		};
 	} else if (!isAnthropicApiBaseUrl(options.baseUrl)) {
 		const incomingUserAgent = getHeaderCaseInsensitive(options.modelHeaders, "User-Agent");
@@ -382,58 +367,20 @@ function getCacheControl(
 	};
 }
 
-// Stealth mode: Mimic Anthropic Code headers and tool prefixing.
-export const claudeCodeVersion = "2.1.63";
-export const claudeToolPrefix: string = "proxy_";
-export const claudeCodeSystemInstruction = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-
-export function mapStainlessOs(platform: string): "MacOS" | "Windows" | "Linux" | "FreeBSD" | `Other::${string}` {
-	switch (platform.toLowerCase()) {
-		case "darwin":
-			return "MacOS";
-		case "windows":
-		case "win32":
-			return "Windows";
-		case "linux":
-			return "Linux";
-		case "freebsd":
-			return "FreeBSD";
-		default:
-			return `Other::${platform.toLowerCase()}`;
-	}
-}
-
-export function mapStainlessArch(arch: string): "x64" | "arm64" | "x86" | `other::${string}` {
-	switch (arch.toLowerCase()) {
-		case "amd64":
-		case "x64":
-			return "x64";
-		case "arm64":
-		case "aarch64":
-			return "arm64";
-		case "386":
-		case "x86":
-		case "ia32":
-			return "x86";
-		default:
-			return `other::${arch.toLowerCase()}`;
-	}
-}
-
-export const claudeCodeHeaders = {
-	"X-Stainless-Retry-Count": "0",
-	"X-Stainless-Runtime-Version": "v24.3.0",
-	"X-Stainless-Package-Version": "0.74.0",
-	"X-Stainless-Runtime": "node",
-	"X-Stainless-Lang": "js",
-	"X-Stainless-Arch": mapStainlessArch(process.arch),
-	"X-Stainless-Os": mapStainlessOs(process.platform),
-	"X-Stainless-Timeout": "600",
-} as const;
+const legacyClaudeCodeHeaderKeys = [
+	"X-Stainless-Retry-Count",
+	"X-Stainless-Runtime-Version",
+	"X-Stainless-Package-Version",
+	"X-Stainless-Runtime",
+	"X-Stainless-Lang",
+	"X-Stainless-Arch",
+	"X-Stainless-Os",
+	"X-Stainless-Timeout",
+] as const;
 
 const enforcedHeaderKeys = new Set(
 	[
-		...Object.keys(claudeCodeHeaders),
+		...legacyClaudeCodeHeaderKeys,
 		"Accept",
 		"Accept-Encoding",
 		"Connection",
@@ -449,64 +396,14 @@ const enforcedHeaderKeys = new Set(
 	].map(key => key.toLowerCase()),
 );
 
-const CLAUDE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
-
-function createClaudeBillingHeader(payload: unknown): string {
-	const payloadJson = JSON.stringify(payload) ?? "";
-	const cch = nodeCrypto.createHash("sha256").update(payloadJson).digest("hex").slice(0, 5);
-	const randomBytes = new Uint8Array(2);
-	crypto.getRandomValues(randomBytes);
-	const buildHash = Array.from(randomBytes, byte => byte.toString(16).padStart(2, "0"))
-		.join("")
-		.slice(0, 3);
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=cli; cch=${cch};`;
-}
-
-const CLAUDE_CLOAKING_USER_ID_REGEX =
-	/^user_[0-9a-fA-F]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-export function isClaudeCloakingUserId(userId: string): boolean {
-	return CLAUDE_CLOAKING_USER_ID_REGEX.test(userId);
-}
-
-/**
- * Real Anthropic Code sends `metadata.user_id` as a JSON-stringified object of the
- * shape `{ device_id, account_uuid, session_id, ...extra }` (see
- * services/api/Anthropic model.ts → getAPIMetadata). Accept that shape so callers that
- * supply a stable `session_id` aren't silently overwritten with fresh entropy
- * on every request, which would inflate the backend session count.
- */
-function isClaudeJsonUserId(userId: string): boolean {
-	if (userId.length === 0 || userId[0] !== "{") return false;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(userId);
-	} catch {
-		return false;
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-	const obj = parsed as Record<string, unknown>;
-	return typeof obj.session_id === "string" && obj.session_id.length > 0;
-}
-
-export function generateClaudeCloakingUserId(): string {
-	const userHash = nodeCrypto.randomBytes(32).toString("hex");
-	const accountId = nodeCrypto.randomUUID().toLowerCase();
-	const sessionId = nodeCrypto.randomUUID().toLowerCase();
-	return `user_${userHash}_account_${accountId}_session_${sessionId}`;
-}
-
-function resolveAnthropicMetadataUserId(userId: unknown, isOAuthToken: boolean): string | undefined {
-	if (typeof userId === "string") {
-		if (!isOAuthToken || isClaudeCloakingUserId(userId) || isClaudeJsonUserId(userId)) {
-			return userId;
-		}
-	}
-
-	if (!isOAuthToken) return undefined;
-	return generateClaudeCloakingUserId();
-}
+export const claudeToolPrefix: string = "";
 const ANTHROPIC_BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "text_editor", "computer"]);
+
+function resolveAnthropicMetadataUserId(userId: unknown): string | undefined {
+	if (typeof userId !== "string") return undefined;
+	const trimmed = userId.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
 export const applyClaudeToolPrefix = (name: string, prefixOverride: string = claudeToolPrefix) => {
 	if (!prefixOverride) return name;
 	if (ANTHROPIC_BUILTIN_TOOL_NAMES.has(name.toLowerCase())) return name;
@@ -1568,8 +1465,10 @@ export type AnthropicSystemBlock = {
 	cache_control?: AnthropicCacheControl;
 };
 type SystemBlockOptions = {
+	/** @deprecated Transparent Anthropic OAuth never injects Claude Code identity. */
 	includeClaudeCodeInstruction?: boolean;
 	extraInstructions?: string[];
+	/** @deprecated Transparent Anthropic OAuth never emits synthetic billing headers. */
 	billingPayload?: unknown;
 	cacheControl?: AnthropicCacheControl;
 };
@@ -1578,25 +1477,10 @@ export function buildAnthropicSystemBlocks(
 	systemPrompt: readonly string[] | undefined,
 	options: SystemBlockOptions = {},
 ): AnthropicSystemBlock[] | undefined {
-	const { includeClaudeCodeInstruction = false, extraInstructions = [], billingPayload, cacheControl } = options;
+	const { extraInstructions = [], cacheControl } = options;
 	const blocks: AnthropicSystemBlock[] = [];
 	const sanitizedPrompts = normalizeSystemPrompts(systemPrompt);
 	const trimmedInstructions = extraInstructions.map(instruction => instruction.trim()).filter(Boolean);
-	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.includes(CLAUDE_BILLING_HEADER_PREFIX));
-
-	if (includeClaudeCodeInstruction && !hasBillingHeader) {
-		const payloadSeed = billingPayload ?? {
-			system: sanitizedPrompts,
-			extraInstructions: trimmedInstructions,
-		};
-		blocks.push(
-			{ type: "text", text: createClaudeBillingHeader(payloadSeed) },
-			{
-				type: "text",
-				text: claudeCodeSystemInstruction,
-			},
-		);
-	}
 
 	for (const instruction of trimmedInstructions) {
 		blocks.push({ type: "text", text: instruction });
@@ -2108,7 +1992,7 @@ function buildParams(
 		}
 	}
 
-	const metadataUserId = resolveAnthropicMetadataUserId(options?.metadata?.user_id, isOAuthToken);
+	const metadataUserId = resolveAnthropicMetadataUserId(options?.metadata?.user_id);
 	if (metadataUserId) {
 		params.metadata = { user_id: metadataUserId };
 	}
@@ -2136,18 +2020,7 @@ function buildParams(
 		}
 	}
 
-	const shouldInjectClaudeCodeInstruction = isOAuthToken && !model.id.startsWith("claude-3-5-haiku");
-	const billingSystemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	const billingPayload = shouldInjectClaudeCodeInstruction
-		? {
-				...params,
-				...(billingSystemPrompts.length > 0 ? { system: billingSystemPrompts } : {}),
-			}
-		: undefined;
-	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
-		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
-		billingPayload,
-	});
+	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt);
 	if (systemBlocks) {
 		params.system = systemBlocks;
 	}

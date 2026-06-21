@@ -18,13 +18,12 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
 
-const CLAUDE_HEADERS = {
+const CLAUDE_USAGE_HEADERS = {
 	accept: "application/json, text/plain, */*",
 	"accept-encoding": "gzip, compress, deflate, br",
 	"anthropic-beta":
-		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
+		"oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
 	"content-type": "application/json",
-	"user-agent": "claude-cli/2.1.63 (external, cli)",
 	connection: "keep-alive",
 } as const;
 
@@ -333,7 +332,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 	const baseUrl = normalizeClaudeBaseUrl(params.baseUrl);
 	const url = `${baseUrl}/usage`;
 	const headers: Record<string, string> = {
-		...CLAUDE_HEADERS,
+		...CLAUDE_USAGE_HEADERS,
 		authorization: `Bearer ${credential.accessToken}`,
 	};
 

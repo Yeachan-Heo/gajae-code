@@ -1009,7 +1009,7 @@ const key = getEnvApiKey("openai"); // checks OPENAI_API_KEY
 
 Several providers support OAuth authentication (some also support static API keys):
 
-- **Anthropic** (Anthropic model Pro/Max subscription)
+- **Anthropic** (OAuth token auth; API-key auth remains supported)
 - **OpenAI code provider** (ChatGPT Plus/Pro subscription, access to GPT-5.x OpenAI code models)
 - **GitHub Copilot** (Copilot subscription)
 - **Google Gemini CLI** (Gemini 2.0/2.5 via Google Cloud Code Assist; free tier or paid subscription)
@@ -1172,6 +1172,8 @@ const response = await complete(
 ```
 
 ### Provider Notes
+
+**Anthropic OAuth**: Requests use the bearer token transparently. The runtime does not synthesize Claude Code user agents, billing headers, tool prefixes, or metadata identifiers; unsupported account/subscription flows surface as provider errors instead of being emulated.
 
 **OpenAI code provider**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x OpenAI code models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options.
 

@@ -28,7 +28,7 @@ function getHeaderCaseInsensitive(
 }
 
 describe("claude usage request headers", () => {
-	it("sends aligned anthropic fingerprint and bearer auth headers", async () => {
+	it("sends transparent Anthropic OAuth usage headers", async () => {
 		const now = Date.now();
 		const token = "oat-test-access-token";
 		const calls: Array<{ input: string; init?: RequestInit }> = [];
@@ -75,12 +75,12 @@ describe("claude usage request headers", () => {
 
 		const headers = calls[0]?.init?.headers;
 		expect(getHeaderCaseInsensitive(headers, "authorization")).toBe(`Bearer ${token}`);
-		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe("claude-cli/2.1.63 (external, cli)");
+		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBeUndefined();
 
 		const beta = getHeaderCaseInsensitive(headers, "anthropic-beta");
 		expect(beta).toBeDefined();
 		const betaTokens = beta?.split(",").map(tokenValue => tokenValue.trim()) ?? [];
-		expect(betaTokens).toContain("claude-code-20250219");
+		expect(betaTokens).not.toContain("claude-code-20250219");
 		expect(betaTokens).toContain("oauth-2025-04-20");
 		expect(betaTokens).toContain("interleaved-thinking-2025-05-14");
 		expect(betaTokens).toContain("context-management-2025-06-27");
