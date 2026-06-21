@@ -27,29 +27,39 @@ export interface PlanOutput {
 
 interface DestSkillIndex {
 	/** slug -> kind of existing destination entry. */
-	slugs: Map<string, "dir-with-skill" | "stale-dir" | "file">;
+	slugs: Map<string, "dir-with-skill" | "stale-dir" | "occupied">;
 	/** effective loaded name -> owning slug. */
 	effectiveNames: Map<string, string>;
+	/** The skills root exists but is unsafe to write through. */
+	rootUnsafe?: boolean;
 }
 
 async function indexDestinationSkills(skillsDir: string): Promise<DestSkillIndex> {
 	const index: DestSkillIndex = { slugs: new Map(), effectiveNames: new Map() };
-	const entries = await fs.readdir(skillsDir, { withFileTypes: true }).catch((error: unknown) => {
-		if (isEnoent(error)) return null;
+	let rootStat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		rootStat = await fs.lstat(skillsDir);
+	} catch (error) {
+		if (isEnoent(error)) return index;
 		throw error;
-	});
-	if (!entries) return index;
+	}
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return { ...index, rootUnsafe: true };
+	const entries = await fs.readdir(skillsDir, { withFileTypes: true });
 	for (const entry of entries) {
 		const name = String(entry.name);
-		if (entry.isFile()) {
-			index.slugs.set(name, "file");
+		if (!entry.isDirectory() || entry.isSymbolicLink()) {
+			index.slugs.set(name, "occupied");
 			continue;
 		}
-		if (!entry.isDirectory()) continue;
 		const slug = name;
 		const skillFile = path.join(skillsDir, slug, "SKILL.md");
 		let content: string | undefined;
 		try {
+			const skillFileStat = await fs.lstat(skillFile);
+			if (!skillFileStat.isFile() || skillFileStat.isSymbolicLink()) {
+				index.slugs.set(slug, "occupied");
+				continue;
+			}
 			content = await fs.readFile(skillFile, "utf-8");
 		} catch (error) {
 			if (isEnoent(error)) {
@@ -211,6 +221,25 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 			const existingKind = destIndex.slugs.get(slug);
 			const effectiveOwner = destIndex.effectiveNames.get(slug);
 
+			if (destIndex.rootUnsafe) {
+				if (!input.force) {
+					actions.push({
+						...base,
+						operation: "skip",
+						status: "skipped_exists",
+						reason: "skills destination root is not a real directory",
+					});
+				} else {
+					actions.push({
+						...base,
+						operation: "fail",
+						status: "failed_invalid_destination",
+						reason: "skills destination root is not a real directory; refusing to write",
+					});
+				}
+				continue;
+			}
+
 			// Effective-name collision with a different existing destination skill.
 			if (effectiveOwner && effectiveOwner !== slug) {
 				if (!input.force) {
@@ -231,20 +260,20 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				continue;
 			}
 
-			if (existingKind === "file") {
+			if (existingKind === "occupied") {
 				if (!input.force) {
 					actions.push({
 						...base,
 						operation: "skip",
 						status: "skipped_exists",
-						reason: "a file occupies the destination path",
+						reason: "a non-directory or unsafe file occupies the destination path",
 					});
 				} else {
 					actions.push({
 						...base,
 						operation: "fail",
 						status: "failed_invalid_destination",
-						reason: "a file occupies the destination path; refusing to delete",
+						reason: "a non-directory or unsafe file occupies the destination path; refusing to delete",
 					});
 				}
 				continue;

@@ -84,6 +84,29 @@ describe("end-to-end import", () => {
 		expect(second.ok).toBe(true);
 	});
 
+	test("pre-existing skill destination symlink is reported as a conflict and not followed", async () => {
+		await write(".claude/skills/alpha/SKILL.md", "---\ndescription: a\n---\nbody");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-import-outside-"));
+		try {
+			await fs.mkdir(path.join(cwd, ".gjc", "skills"), { recursive: true });
+			await fs.symlink(outside, path.join(cwd, ".gjc", "skills", "alpha"), "dir");
+
+			const report = await runMigrate(opts({ from: ["claude-code"] }));
+			const alphaAction = report.actions.find(action => action.type === "skill" && action.name === "alpha");
+
+			expect(alphaAction).toMatchObject({ operation: "skip", status: "skipped_exists" });
+			expect(report.ok).toBe(true);
+			expect(
+				await fs.access(path.join(outside, "SKILL.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
 	test("force overwrites existing MCP server", async () => {
 		await write(".claude.json", JSON.stringify({ mcpServers: { srv: { command: "v1" } } }));
 		await runMigrate(opts({ from: ["claude-code"] }));

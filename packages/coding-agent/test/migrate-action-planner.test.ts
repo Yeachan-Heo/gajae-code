@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { planMigration } from "../src/migrate/action-planner";
+import { executeActions } from "../src/migrate/executor";
 import type { AdapterResult, McpCandidate, MigrateDestinations, SkillCandidate } from "../src/migrate/types";
 
 let tmp: string;
@@ -153,6 +154,61 @@ describe("planMigration — skills", () => {
 		expect(forced.actions[0]).toMatchObject({ status: "failed_invalid_destination" });
 	});
 
+	test("skills root symlink: skip default, fail on force", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-planner-root-outside-"));
+		try {
+			await fs.symlink(outside, dest.skillsDir, "dir");
+			const skipped = await planMigration({
+				results: [result({ skillCandidates: [skill("alpha")] })],
+				destinations: dest,
+				force: false,
+			});
+			expect(skipped.actions[0]).toMatchObject({
+				operation: "skip",
+				status: "skipped_exists",
+			});
+			const forced = await planMigration({
+				results: [result({ skillCandidates: [skill("alpha")] })],
+				destinations: dest,
+				force: true,
+			});
+			expect(forced.actions[0]).toMatchObject({
+				operation: "fail",
+				status: "failed_invalid_destination",
+			});
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("symlink at destination path: skip default, fail on force (no follow)", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-planner-outside-"));
+		try {
+			await fs.mkdir(dest.skillsDir, { recursive: true });
+			await fs.symlink(outside, path.join(dest.skillsDir, "alpha"), "dir");
+			const skipped = await planMigration({
+				results: [result({ skillCandidates: [skill("alpha")] })],
+				destinations: dest,
+				force: false,
+			});
+			expect(skipped.actions[0]).toMatchObject({
+				operation: "skip",
+				status: "skipped_exists",
+			});
+			const forced = await planMigration({
+				results: [result({ skillCandidates: [skill("alpha")] })],
+				destinations: dest,
+				force: true,
+			});
+			expect(forced.actions[0]).toMatchObject({
+				operation: "fail",
+				status: "failed_invalid_destination",
+			});
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
 	test("effective-name collision across dirs: fail on force", async () => {
 		// Existing dir "other" whose frontmatter name slugifies to "target".
 		await writeDestSkill("other", "name: Target\ndescription: d");
@@ -197,5 +253,37 @@ describe("planMigration — diagnostics", () => {
 			force: false,
 		});
 		expect(actions[0]).toMatchObject({ type: "source", status: "failed_invalid_source", operation: "fail" });
+	});
+});
+
+describe("executeActions — skill destination safety", () => {
+	test("does not follow a symlinked ancestor while creating a skill", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-executor-outside-"));
+		try {
+			const agentRoot = path.join(tmp, ".gjc");
+			await fs.symlink(outside, agentRoot, "dir");
+			const [action] = await executeActions([
+				{
+					source: "claude-code",
+					type: "skill",
+					name: "alpha",
+					effectiveName: "alpha",
+					destination: path.join(agentRoot, "skills", "alpha", "SKILL.md"),
+					operation: "create",
+					status: "imported",
+					skill: { content: "---\ndescription: a\n---\nbody" },
+				},
+			]);
+
+			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
+			expect(
+				await fs.access(path.join(outside, "skills", "alpha", "SKILL.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
 	});
 });
