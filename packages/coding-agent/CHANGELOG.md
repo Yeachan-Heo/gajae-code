@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded the `computer` tool's inline screenshot so a single high-resolution capture (Retina/6K/ultrawide) can no longer exceed the provider's per-image limit and 400 the whole request; the model-facing image is downscaled/recompressed through the shared image-resize path while the full-resolution PNG is still persisted to disk for `inspect_image`/`read` (#934).
+
 ## [0.6.4] - 2026-06-20
 
 ### Changed

@@ -6,6 +6,7 @@ import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
+import { resizeImage } from "../utils/image-resize";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -285,7 +286,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					};
 				}
 				details.message = describeComputerSuccess(details);
-				const image = imageContentFromNativeResult(batchResult.screenshotSource);
+				const image = await inlineImageFromNativeResult(batchResult.screenshotSource);
 				if (batchResult.screenshotSource !== undefined) {
 					await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
 					details.message = describeComputerSuccess(details);
@@ -302,7 +303,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			if (screenshot) details.screenshot = screenshot;
 			details.status = "success";
 			details.message = describeComputerSuccess(details);
-			const image = imageContentFromNativeResult(result);
+			const image = await inlineImageFromNativeResult(result);
 			if (screenshot) {
 				await persistScreenshotFallback(result, details.screenshot, this.session);
 				details.message = describeComputerSuccess(details);
@@ -472,15 +473,63 @@ function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefi
 	};
 }
 
-function imageContentFromNativeResult(value: unknown): ImageContent | undefined {
+function nativeScreenshot(value: unknown): NativeScreenshot | undefined {
 	const candidate =
 		value && typeof value === "object" && "screenshot" in value
 			? (value as { screenshot?: unknown }).screenshot
 			: value;
 	if (!candidate || typeof candidate !== "object") return undefined;
-	const png = (candidate as NativeScreenshot).png;
-	const data = pngToBase64(png);
+	return candidate as NativeScreenshot;
+}
+
+function imageContentFromNativeResult(value: unknown): ImageContent | undefined {
+	const data = pngToBase64(nativeScreenshot(value)?.png);
 	return data ? { type: "image", data, mimeType: "image/png" } : undefined;
+}
+
+// Raw screenshot bytes for disk persistence — avoids round-tripping the full-resolution
+// PNG through base64 just to decode it back before writing.
+function pngBufferFromNativeResult(value: unknown): Uint8Array | undefined {
+	const png = nativeScreenshot(value)?.png;
+	if (png === undefined) return undefined;
+	if (typeof png === "string") return Buffer.from(png, "base64");
+	if (png instanceof ArrayBuffer) return new Uint8Array(png);
+	return png;
+}
+
+// The model-facing screenshot is bounded so a single capture can never exceed the
+// provider's per-image limit; an oversized image block 400s the whole request and wedges
+// the session. 1568px is Anthropic's internal vision threshold, so clamping to it is
+// effectively lossless for the model while keeping the payload small. The full-resolution
+// PNG is still persisted to disk (persistScreenshotFallback) for inspect_image/read.
+const SCREENSHOT_INLINE_MAX_EDGE = 1568;
+const SCREENSHOT_INLINE_MAX_BYTES = 3 * 1024 * 1024;
+// Hard ceiling on the base64 payload, matching the strictest provider per-image limit.
+// If a capture still exceeds this after resizing (e.g. it could not be decoded), omit the
+// inline image rather than send a block that would be rejected.
+const SCREENSHOT_INLINE_MAX_BASE64_BYTES = 5 * 1024 * 1024;
+
+async function inlineImageFromNativeResult(value: unknown): Promise<ImageContent | undefined> {
+	const raw = imageContentFromNativeResult(value);
+	if (!raw) return undefined;
+	const inline = await resizeForInline(raw);
+	if (Buffer.byteLength(inline.data, "utf8") > SCREENSHOT_INLINE_MAX_BASE64_BYTES) return undefined;
+	return inline;
+}
+
+async function resizeForInline(raw: ImageContent): Promise<ImageContent> {
+	try {
+		const resized = await resizeImage(raw, {
+			maxWidth: SCREENSHOT_INLINE_MAX_EDGE,
+			maxHeight: SCREENSHOT_INLINE_MAX_EDGE,
+			maxBytes: SCREENSHOT_INLINE_MAX_BYTES,
+		});
+		return { type: "image", data: resized.data, mimeType: resized.mimeType };
+	} catch {
+		// Could not re-encode (e.g. an undecodable capture); fall back to the raw image and
+		// let the base64 ceiling guard in the caller drop it if it is still too large.
+		return raw;
+	}
 }
 
 async function persistScreenshotFallback(
@@ -489,11 +538,11 @@ async function persistScreenshotFallback(
 	session: ToolSession,
 ): Promise<void> {
 	if (!screenshot || screenshot.path) return;
-	const image = imageContentFromNativeResult(value);
-	if (!image) return;
+	const buffer = pngBufferFromNativeResult(value);
+	if (!buffer) return;
 	const dir = await getScreenshotFallbackDir(session);
 	const filePath = path.join(dir, `computer-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
-	await fs.writeFile(filePath, Buffer.from(image.data, "base64"), { mode: 0o600 });
+	await fs.writeFile(filePath, buffer, { mode: 0o600 });
 	screenshot.path = filePath;
 }
 

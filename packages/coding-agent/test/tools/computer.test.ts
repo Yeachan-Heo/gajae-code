@@ -411,6 +411,68 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.code).toBe("COMPUTER_SUPERVISOR_NOT_LIVE");
 		expect(textOf(result)).toContain("supervisor is not live");
 	});
+
+	it("downscales the inline screenshot while persisting the full-resolution capture", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		// 1x1 transparent PNG seed, upscaled to a real, decodable capture larger than the inline edge cap.
+		const seed = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+		const fullRes = await new Bun.Image(Buffer.from(seed, "base64")).resize(2000, 1400).png().bytes();
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 2000, heightPx: 1400, png: fullRes }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const result = await tool.execute("shot", { action: "screenshot" });
+
+		// Coordinate frame stays at native resolution.
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 2000, heightPx: 1400 });
+
+		const image = result.content.find(block => block.type === "image") as { data: string } | undefined;
+		expect(image).toBeDefined();
+		const inlineMeta = await new Bun.Image(Buffer.from(image?.data ?? "", "base64")).metadata();
+		expect(inlineMeta.width).toBeLessThanOrEqual(1568);
+		expect(inlineMeta.height).toBeLessThanOrEqual(1568);
+		expect(inlineMeta.width).toBeLessThan(2000);
+
+		// Disk fallback keeps the full-resolution PNG.
+		const savedPath = result.details?.screenshot?.path;
+		expect(savedPath).toBeTruthy();
+		try {
+			const saved = await fs.readFile(savedPath ?? "");
+			expect(saved.length).toBe(fullRes.length);
+			const savedMeta = await new Bun.Image(saved).metadata();
+			expect(savedMeta.width).toBe(2000);
+			expect(savedMeta.height).toBe(1400);
+		} finally {
+			if (savedPath) await fs.rm(path.dirname(savedPath), { recursive: true, force: true });
+		}
+	});
+
+	it("omits the inline screenshot when it cannot be bounded, keeping the disk fallback", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		// An undecodable 6 MB capture: resizeImage cannot shrink it, so the oversized inline
+		// image block must be dropped rather than sent (it would 400 the request).
+		const oversized = new Uint8Array(6 * 1024 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 6000, heightPx: 3400, png: oversized }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const result = await tool.execute("shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		expect(result.details?.status).toBe("success");
+		expect(result.content.some(block => block.type === "image")).toBe(false);
+
+		const savedPath = result.details?.screenshot?.path;
+		expect(savedPath).toBeTruthy();
+		try {
+			expect((await fs.stat(savedPath ?? "")).size).toBe(oversized.length);
+			expect(textOf(result)).toContain("saved");
+		} finally {
+			if (savedPath) await fs.rm(path.dirname(savedPath), { recursive: true, force: true });
+		}
+	});
 });
 
 describe("computer renderer", () => {
