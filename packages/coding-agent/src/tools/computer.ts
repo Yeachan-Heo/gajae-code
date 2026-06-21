@@ -6,6 +6,7 @@ import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
+import { resizeImage } from "../utils/image-resize";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -174,6 +175,11 @@ let platformOverrideForTests: NodeJS.Platform | undefined;
 let archOverrideForTests: NodeJS.Architecture | undefined;
 const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
 
+const COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH = 1568;
+const COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT = 1568;
+const COMPUTER_INLINE_SCREENSHOT_MAX_BYTES = 500 * 1024;
+const COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY = 70;
+
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ?? createNativeComputerController;
 }
@@ -285,11 +291,11 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					};
 				}
 				details.message = describeComputerSuccess(details);
-				const image = imageContentFromNativeResult(batchResult.screenshotSource);
 				if (batchResult.screenshotSource !== undefined) {
 					await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
 					details.message = describeComputerSuccess(details);
 				}
+				const image = await inlineImageContentFromNativeResult(batchResult.screenshotSource, details);
 				await writeComputerAuditLog(this.session, details);
 				return image
 					? toolResult(details)
@@ -302,11 +308,11 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			if (screenshot) details.screenshot = screenshot;
 			details.status = "success";
 			details.message = describeComputerSuccess(details);
-			const image = imageContentFromNativeResult(result);
 			if (screenshot) {
 				await persistScreenshotFallback(result, details.screenshot, this.session);
 				details.message = describeComputerSuccess(details);
 			}
+			const image = await inlineImageContentFromNativeResult(result, details);
 			await writeComputerAuditLog(this.session, details);
 			return image
 				? toolResult(details)
@@ -472,7 +478,7 @@ function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefi
 	};
 }
 
-function imageContentFromNativeResult(value: unknown): ImageContent | undefined {
+function fullResolutionImageContentFromNativeResult(value: unknown): ImageContent | undefined {
 	const candidate =
 		value && typeof value === "object" && "screenshot" in value
 			? (value as { screenshot?: unknown }).screenshot
@@ -483,13 +489,40 @@ function imageContentFromNativeResult(value: unknown): ImageContent | undefined 
 	return data ? { type: "image", data, mimeType: "image/png" } : undefined;
 }
 
+async function inlineImageContentFromNativeResult(
+	value: unknown,
+	details: ComputerToolDetails,
+): Promise<ImageContent | undefined> {
+	const image = fullResolutionImageContentFromNativeResult(value);
+	if (!image) return undefined;
+	const originalBytes = Buffer.byteLength(image.data, "base64");
+	if (originalBytes <= COMPUTER_INLINE_SCREENSHOT_MAX_BYTES) return image;
+
+	try {
+		const resized = await resizeImage(image, {
+			maxWidth: COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH,
+			maxHeight: COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT,
+			maxBytes: COMPUTER_INLINE_SCREENSHOT_MAX_BYTES,
+			jpegQuality: COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY,
+		});
+		if (resized.buffer.length <= COMPUTER_INLINE_SCREENSHOT_MAX_BYTES) {
+			return { type: "image", data: resized.data, mimeType: resized.mimeType };
+		}
+	} catch {
+		// Keep the action successful and rely on the full-resolution artifact path below.
+	}
+
+	details.message = `${details.message} Inline screenshot omitted because it could not be bounded below ${formatByteCount(COMPUTER_INLINE_SCREENSHOT_MAX_BYTES)}; use the saved screenshot artifact instead.`;
+	return undefined;
+}
+
 async function persistScreenshotFallback(
 	value: unknown,
 	screenshot: ComputerScreenshotDetails | undefined,
 	session: ToolSession,
 ): Promise<void> {
 	if (!screenshot || screenshot.path) return;
-	const image = imageContentFromNativeResult(value);
+	const image = fullResolutionImageContentFromNativeResult(value);
 	if (!image) return;
 	const dir = await getScreenshotFallbackDir(session);
 	const filePath = path.join(dir, `computer-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
@@ -524,6 +557,13 @@ function getPngByteLength(png: NativeScreenshot["png"]): number | undefined {
 	if (typeof png === "string") return Buffer.byteLength(png, "base64");
 	if (png instanceof ArrayBuffer) return png.byteLength;
 	return png.byteLength;
+}
+
+function formatByteCount(bytes: number): string {
+	if (bytes < 1024) return `${bytes} bytes`;
+	const kib = bytes / 1024;
+	if (kib < 1024) return `${Math.round(kib)} KiB`;
+	return `${(kib / 1024).toFixed(1)} MiB`;
 }
 
 function mapComputerError(error: unknown, hotkey?: string): { code: string; message: string } {

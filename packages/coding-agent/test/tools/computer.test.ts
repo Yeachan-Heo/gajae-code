@@ -17,6 +17,7 @@ import {
 } from "@gajae-code/coding-agent/tools";
 import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
+import { zlibSync } from "fflate";
 
 function createSession(settings = Settings.isolated(), sessionFile: string | null = null): ToolSession {
 	return {
@@ -30,6 +31,56 @@ function createSession(settings = Settings.isolated(), sessionFile: string | nul
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content.map(c => c.text ?? "").join("\n");
+}
+
+function crc32(bytes: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) {
+			crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+		}
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Uint8Array): Buffer {
+	const typeBytes = Buffer.from(type, "ascii");
+	const chunk = Buffer.alloc(12 + data.length);
+	chunk.writeUInt32BE(data.length, 0);
+	typeBytes.copy(chunk, 4);
+	Buffer.from(data).copy(chunk, 8);
+	const crcInput = Buffer.concat([typeBytes, Buffer.from(data)]);
+	chunk.writeUInt32BE(crc32(crcInput), 8 + data.length);
+	return chunk;
+}
+
+function makeNoisePng(width: number, height: number): Buffer {
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const raw = Buffer.alloc(stride * height);
+	for (let y = 0; y < height; y += 1) {
+		const row = y * stride;
+		raw[row] = 0;
+		for (let x = 0; x < width; x += 1) {
+			const offset = row + 1 + x * 4;
+			const seed = (x * 1103515245 + y * 12345) >>> 0;
+			raw[offset] = seed & 0xff;
+			raw[offset + 1] = (seed >>> 8) & 0xff;
+			raw[offset + 2] = (seed >>> 16) & 0xff;
+			raw[offset + 3] = 0xff;
+		}
+	}
+	return Buffer.concat([
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		pngChunk("IHDR", ihdr),
+		pngChunk("IDAT", zlibSync(raw, { level: 0 })),
+		pngChunk("IEND", Buffer.alloc(0)),
+	]);
 }
 
 describe("computer tool schema", () => {
@@ -236,6 +287,50 @@ describe("computer tool dispatch", () => {
 		expect(calls[1].args).toEqual([undefined, 1, 2, "right"]);
 		expect(calls[2].args).toEqual([undefined, 1, 2, 3, 4, "left"]);
 		expect(calls[3].args).toEqual([undefined, 1, 2, 5, -6]);
+	});
+
+	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeNoisePng(1024, 1024);
+		expect(png.length).toBeGreaterThan(500 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 1024, heightPx: 1024, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("oversized-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		expect(result.details?.screenshot?.pngBytes).toBe(png.length);
+		const artifactPath = result.details?.screenshot?.path;
+		expect(artifactPath).toBeTruthy();
+		if (!artifactPath) throw new Error("expected persisted screenshot path");
+		expect((await fs.stat(artifactPath)).size).toBe(png.length);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(Buffer.byteLength(image.data, "base64")).toBeLessThanOrEqual(500 * 1024);
+	});
+
+	it("omits an oversized inline screenshot safely if resizing cannot decode it", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const invalidPngBase64 = Buffer.alloc(600 * 1024, 0xff).toString("base64");
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 10, heightPx: 10, png: invalidPngBase64 }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("invalid-oversized-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		expect(result.content.some(block => block.type === "image")).toBe(false);
+		expect(textOf(result)).toContain("Inline screenshot omitted");
+		const artifactPath = result.details?.screenshot?.path;
+		expect(artifactPath).toBeTruthy();
+		if (!artifactPath) throw new Error("expected persisted screenshot path");
+		expect((await fs.stat(artifactPath)).size).toBe(600 * 1024);
 	});
 
 	it("persists screenshot fallbacks in private per-session directories with restrictive file modes", async () => {
