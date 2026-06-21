@@ -64,3 +64,21 @@ describe("detectDefaultKeyCollisions", () => {
 		expect(byKey.get("ctrl+c")).toEqual(expect.arrayContaining(["tui.input.copy", "tui.select.cancel"]));
 	});
 });
+
+describe("tui.global.debug registry action", () => {
+	it("resolves to the default Shift+Ctrl+D chord", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+		expect(keybindings.getKeys("tui.global.debug")).toEqual(["shift+ctrl+d"]);
+		expect(keybindings.matches("\x1b[100;6u", "tui.global.debug")).toBe(true);
+		expect(keybindings.matches("\x04", "tui.global.debug")).toBe(false);
+	});
+
+	it("is remappable like any other registry action", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
+			"tui.global.debug": "ctrl+alt+d",
+		});
+		expect(keybindings.getKeys("tui.global.debug")).toEqual(["ctrl+alt+d"]);
+		expect(keybindings.matches("\x1b[100;7u", "tui.global.debug")).toBe(true);
+		expect(keybindings.matches("\x1b[100;6u", "tui.global.debug")).toBe(false);
+	});
+});

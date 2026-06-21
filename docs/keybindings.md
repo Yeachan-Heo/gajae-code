@@ -150,6 +150,12 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.history.search` | `ctrl+r` | |
 | `app.stt.toggle` | `alt+h` | |
 
+### Global engine context (`tui.global.*`)
+
+| Action ID | Default | Notes |
+| --- | --- | --- |
+| `tui.global.debug` | `shift+ctrl+d` | Toggle debug overlay; resolved through the registry in `tui.ts` |
+
 Cross-context default reuse (`ctrl+p`, `ctrl+s`, `ctrl+r`, `ctrl+d`, `ctrl+b`, `ctrl+left`/`ctrl+right`, `enter`, `escape`, `ctrl+c`) is intentional: each pair is active in a different focused context and is disambiguated at dispatch time. Use `detectDefaultKeyCollisions()` (above) to re-derive this list from the registry.
 
 ### Not yet registry-managed
@@ -157,5 +163,4 @@ Cross-context default reuse (`ctrl+p`, `ctrl+s`, `ctrl+r`, `ctrl+d`, `ctrl+b`, `
 A few contexts still match chords directly instead of resolving through the registry, and are tracked for a later phase:
 
 - Tree selector (`tree-selector.ts`): up/down/left/right/enter, `ctrl+c`, filter cycling (`ctrl+o` / `ctrl+shift+o`), filter modes (`alt+d/t/u/l/a`), label edit (`shift+l`).
-- Global debug overlay: `shift+ctrl+d` (`tui.ts`).
 - Parts of the model selector.

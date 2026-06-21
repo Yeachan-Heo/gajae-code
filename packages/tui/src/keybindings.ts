@@ -39,6 +39,8 @@ export interface Keybindings {
 	"tui.select.pageDown": true;
 	"tui.select.confirm": true;
 	"tui.select.cancel": true;
+	// Global engine actions
+	"tui.global.debug": true;
 }
 
 export type Keybinding = keyof Keybindings;
@@ -133,6 +135,10 @@ export const TUI_KEYBINDINGS = {
 	"tui.select.cancel": {
 		defaultKeys: ["escape", "ctrl+c"],
 		description: "Cancel selection",
+	},
+	"tui.global.debug": {
+		defaultKeys: "shift+ctrl+d",
+		description: "Toggle debug overlay",
 	},
 } as const satisfies KeybindingDefinitions;
 

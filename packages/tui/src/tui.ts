@@ -5,7 +5,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { $flag, getDebugLogPath } from "@gajae-code/utils";
-import { isKeyRelease, matchesKey } from "./keys";
+import { getKeybindings } from "./keybindings";
+import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
 import type { Terminal } from "./terminal";
 import { ImageProtocol, setCellDimensions, setTerminalImageProtocol, TERMINAL } from "./terminal-capabilities";
@@ -842,8 +843,8 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Global debug key handler (Shift+Ctrl+D)
-		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
+		// Global debug key handler (registry: tui.global.debug, default Shift+Ctrl+D)
+		if (getKeybindings().matches(data, "tui.global.debug") && this.onDebug) {
 			this.onDebug();
 			return;
 		}
