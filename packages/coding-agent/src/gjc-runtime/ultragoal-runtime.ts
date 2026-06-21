@@ -599,6 +599,7 @@ export async function createUltragoalPlan(input: {
 	cwd: string;
 	brief: string;
 	gjcGoalMode?: UltragoalGjcGoalMode;
+	sessionId?: string | null;
 }): Promise<UltragoalPlan> {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
@@ -623,8 +624,8 @@ export async function createUltragoalPlan(input: {
 		createdAt: now,
 		updatedAt: now,
 	};
-	await writePlan(input.cwd, plan);
-	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) });
+	await writePlan(input.cwd, plan, input.sessionId);
+	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) }, input.sessionId);
 	return plan;
 }
 
@@ -661,12 +662,16 @@ export function getUltragoalRunCompletionState(
 	};
 }
 
-export async function startNextUltragoalGoal(input: { cwd: string; retryFailed?: boolean }): Promise<{
+export async function startNextUltragoalGoal(input: {
+	cwd: string;
+	retryFailed?: boolean;
+	sessionId?: string | null;
+}): Promise<{
 	plan: UltragoalPlan;
 	goal?: UltragoalGoal;
 	allComplete: boolean;
 }> {
-	const plan = await readUltragoalPlan(input.cwd);
+	const plan = await readUltragoalPlan(input.cwd, input.sessionId);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
 	const goal = chooseNextGoal(plan, input.retryFailed === true);
 	if (!goal) return { plan, allComplete: getUltragoalRunCompletionState(plan).allComplete };
@@ -676,8 +681,8 @@ export async function startNextUltragoalGoal(input: { cwd: string; retryFailed?:
 		goal.startedAt = goal.startedAt ?? now;
 		goal.updatedAt = now;
 		plan.updatedAt = now;
-		await writePlan(input.cwd, plan);
-		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id });
+		await writePlan(input.cwd, plan, input.sessionId);
+		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
 	}
 	return { plan, goal, allComplete: false };
 }

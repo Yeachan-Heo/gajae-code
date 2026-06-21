@@ -37,9 +37,12 @@ export default factory;
 	return toolPath;
 }
 
+const TEST_SESSION_ID = "gjc-plugin-tools-test";
+
 async function writeActiveSubskill(cwd: string, toolPaths: string[]): Promise<void> {
 	await syncSkillActiveState({
 		cwd,
+		sessionId: TEST_SESSION_ID,
 		skill: "ralplan",
 		active: true,
 		phase: "planner",
@@ -70,11 +73,17 @@ describe("GJC plugin sub-skill tools", () => {
 		const toolPath = await writeTool(cwd, "domain-note.ts", "domain_note");
 		await writeActiveSubskill(cwd, [toolPath]);
 
-		const loaded = await loadActiveSubskillTools({ cwd, parent: "ralplan", phase: "planner" });
+		const loaded = await loadActiveSubskillTools({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			parent: "ralplan",
+			phase: "planner",
+		});
 		expect(loaded.map(tool => tool.name)).toEqual(["domain_note"]);
 
 		const reserved = await loadActiveSubskillTools({
 			cwd,
+			sessionId: TEST_SESSION_ID,
 			parent: "ralplan",
 			phase: "planner",
 			reservedToolNames: ["domain_note"],
@@ -89,6 +98,7 @@ describe("GJC plugin sub-skill tools", () => {
 
 		const loaded = await loadActiveSubskillTools({
 			cwd,
+			sessionId: TEST_SESSION_ID,
 			parent: "ralplan",
 			phase: "planner",
 			reservedToolNames: ["read"],
@@ -102,7 +112,12 @@ describe("GJC plugin sub-skill tools", () => {
 		const toolPath = await writeTool(cwd, "domain-note.ts", "domain_note");
 		await writeActiveSubskill(cwd, [toolPath]);
 
-		const loaded = await loadActiveSubskillTools({ cwd, parent: "team", phase: "planner" });
+		const loaded = await loadActiveSubskillTools({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			parent: "team",
+			phase: "planner",
+		});
 
 		expect(loaded).toEqual([]);
 	});

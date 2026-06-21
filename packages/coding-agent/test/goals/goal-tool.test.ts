@@ -255,8 +255,9 @@ describe("GoalTool", () => {
 	it("blocks direct unified goal completion for active ultragoal objectives without verification receipt", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-goal-ultragoal-"));
 		try {
-			const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
-			await startNextUltragoalGoal({ cwd: root });
+			const sessionId = "goal-tool-ultragoal-test";
+			const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal", sessionId });
+			await startNextUltragoalGoal({ cwd: root, sessionId });
 			const harness = createRuntimeHarness({
 				enabled: true,
 				mode: "active",
@@ -265,6 +266,7 @@ describe("GoalTool", () => {
 			const tool = new GoalTool(
 				createToolSession({
 					cwd: root,
+					getSessionId: () => sessionId,
 					getGoalRuntime: () => harness.runtime,
 					getGoalModeState: () => harness.getState(),
 				}),

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
+import { sessionDirName } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { Settings } from "../../src/config/settings";
 import type { BashInterceptorRule } from "../../src/config/settings-schema";
 import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
@@ -139,7 +140,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 		const session = {
 			cwd,
 			getSessionFile: () => null,
-			getSessionId: () => undefined,
+			getSessionId: () => "restricted-bash-test",
 			bashAllowedPrefixes,
 			bashRestrictionProfile,
 			settings: {
@@ -270,13 +271,21 @@ describe("BashTool restricted role-agent allowlist", () => {
 			const bunPath = process.execPath;
 			const tool = createRestrictedBashTool(root, [`${bunPath} ${cliPath} ralplan --write`]);
 			const result = await tool.execute("tool-call", {
-				command: `${bunPath} ${cliPath} ralplan --write --stage architect --stage_n 1 --artifact ${artifactPath} --run-id bash-marker`,
+				command: `${bunPath} ${cliPath} ralplan --write --stage architect --stage_n 1 --artifact ${artifactPath} --run-id bash-marker --session-id restricted-bash-test`,
 				timeout: 30,
 			});
 
 			expect(result.content.find(part => part.type === "text")?.text).toContain("stage-01-architect.md");
 			const persisted = await fs.readFile(
-				path.join(root, ".gjc", "plans", "ralplan", "bash-marker", "stage-01-architect.md"),
+				path.join(
+					root,
+					".gjc",
+					sessionDirName("restricted-bash-test"),
+					"plans",
+					"ralplan",
+					"bash-marker",
+					"stage-01-architect.md",
+				),
 				"utf-8",
 			);
 			expect(persisted).toBe(`${artifactPath}\n`);

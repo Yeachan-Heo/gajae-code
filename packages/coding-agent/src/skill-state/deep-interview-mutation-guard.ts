@@ -230,7 +230,7 @@ async function getActivePlanningSkill(
 	threadId?: string,
 ): Promise<ActivePlanningSkill | null> {
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
-	if (!resolvedSessionId) return { skill: "deep-interview", phase: "unresolved-session" };
+	if (!resolvedSessionId) return null;
 	const skillState = await readVisibleSkillActiveState(cwd, resolvedSessionId);
 	if (!skillState) return null;
 	const activeEntries = listActiveSkills(skillState).filter(entry =>

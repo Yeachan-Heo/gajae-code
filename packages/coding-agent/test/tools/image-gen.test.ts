@@ -13,6 +13,8 @@ import {
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
+const originalGeminiKey = Bun.env.GEMINI_API_KEY;
+const originalGoogleKey = Bun.env.GOOGLE_API_KEY;
 const originalOpenAIBaseUrl = Bun.env.OPENAI_BASE_URL;
 const generatedImagePaths: string[] = [];
 
@@ -29,8 +31,24 @@ afterEach(async () => {
 	} else {
 		Bun.env.OPENAI_BASE_URL = originalOpenAIBaseUrl;
 	}
+	if (originalGeminiKey === undefined) {
+		delete Bun.env.GEMINI_API_KEY;
+	} else {
+		Bun.env.GEMINI_API_KEY = originalGeminiKey;
+	}
+	if (originalGoogleKey === undefined) {
+		delete Bun.env.GOOGLE_API_KEY;
+	} else {
+		Bun.env.GOOGLE_API_KEY = originalGoogleKey;
+	}
 	setPreferredImageProvider("auto");
 });
+
+function clearFallbackImageProviderEnv(): void {
+	delete Bun.env.OPENROUTER_API_KEY;
+	delete Bun.env.GEMINI_API_KEY;
+	delete Bun.env.GOOGLE_API_KEY;
+}
 
 describe("imageGenTool", () => {
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {
@@ -313,6 +331,7 @@ describe("imageGenTool antigravity provider", () => {
 
 	it("does not register for malformed JSON credentials without a token field", async () => {
 		setPreferredImageProvider("antigravity");
+		clearFallbackImageProviderEnv();
 
 		const modelRegistry = {
 			authStorage: {
@@ -327,6 +346,7 @@ describe("imageGenTool antigravity provider", () => {
 
 	it("does not register for empty or whitespace antigravity credentials", async () => {
 		setPreferredImageProvider("antigravity");
+		clearFallbackImageProviderEnv();
 
 		for (const credential of ["", "   \n\t  "]) {
 			const modelRegistry = {

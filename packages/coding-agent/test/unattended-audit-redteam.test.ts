@@ -214,8 +214,18 @@ describe("UnattendedAuditLog red-team coverage", () => {
 		const root = tempDir();
 		const auditPath = defaultAuditPath("../run with/slashes and spaces", root);
 		const relative = path.relative(root, auditPath);
-		expect(relative).toBe(path.join(".gjc", "audit", "unattended", ".._run_with_slashes_and_spaces.jsonl"));
-		expect(path.dirname(auditPath)).toBe(path.join(root, ".gjc", "audit", "unattended"));
+		expect(relative).toBe(
+			path.join(
+				".gjc",
+				"_session-%2E%2E%2Frun%20with%2Fslashes%20and%20spaces",
+				"audit",
+				"unattended",
+				".._run_with_slashes_and_spaces.jsonl",
+			),
+		);
+		expect(path.dirname(auditPath)).toBe(
+			path.join(root, ".gjc", "_session-%2E%2E%2Frun%20with%2Fslashes%20and%20spaces", "audit", "unattended"),
+		);
 		expect(path.basename(auditPath)).not.toContain("/");
 		expect(path.basename(auditPath)).not.toContain(" ");
 	});
