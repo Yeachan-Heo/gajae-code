@@ -478,6 +478,8 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_COORD_INVALID");
 		expect(result.details?.steps?.[1]?.message).toContain("outside the latest screenshot bounds");
 		expect(result.details?.code).toBe("COMPUTER_COORD_INVALID");
+		expect(result.details?.screenshot?.path).toBeTruthy();
+		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot"]);
 	});
 

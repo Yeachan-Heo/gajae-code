@@ -284,6 +284,9 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 				if (batchResult.failedStep) {
 					details.code = batchResult.failedStep.code;
 					details.message = batchResult.failedStep.message;
+					if (batchResult.screenshotSource !== undefined) {
+						await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
+					}
 					await writeComputerAuditLog(this.session, details);
 					return {
 						...toolResult(details).text(`${details.code}: ${details.message}`).done(),
