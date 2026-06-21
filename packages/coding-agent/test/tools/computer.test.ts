@@ -270,7 +270,9 @@ describe("computer tool dispatch", () => {
 				calls.push({ method: "scroll", args });
 			},
 		}));
-		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.screenshotMaxBytes": 500 * 1024 })),
+		);
 		const shot = await tool.execute("shot", { action: "screenshot", timeout: 2 });
 		await tool.execute("dbl", { action: "double_click", x: 1, y: 2, button: "right" });
 		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 });
@@ -297,7 +299,9 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => ({ widthPx: 1024, heightPx: 1024, png }),
 		}));
-		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.screenshotMaxBytes": 500 * 1024 })),
+		);
 
 		const result = await tool.execute("oversized-shot", { action: "screenshot" });
 
@@ -313,6 +317,26 @@ describe("computer tool dispatch", () => {
 		expect(Buffer.byteLength(image.data, "base64")).toBeLessThanOrEqual(500 * 1024);
 	});
 
+	it("honors computer.screenshotMaxBytes for the inline screenshot budget", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeNoisePng(1024, 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 1024, heightPx: 1024, png }),
+		}));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.screenshotMaxBytes": 300 * 1024 })),
+		);
+
+		const result = await tool.execute("setting-budget-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(Buffer.byteLength(image.data, "base64")).toBeLessThanOrEqual(300 * 1024);
+	});
+
 	it("omits an oversized inline screenshot safely if resizing cannot decode it", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -320,7 +344,9 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => ({ widthPx: 10, heightPx: 10, png: invalidPngBase64 }),
 		}));
-		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.screenshotMaxBytes": 500 * 1024 })),
+		);
 
 		const result = await tool.execute("invalid-oversized-shot", { action: "screenshot" });
 

@@ -177,7 +177,7 @@ const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
 
 const COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH = 1568;
 const COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT = 1568;
-const COMPUTER_INLINE_SCREENSHOT_MAX_BYTES = 500 * 1024;
+const COMPUTER_INLINE_SCREENSHOT_PROVIDER_MAX_BYTES = 5 * 1024 * 1024;
 const COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY = 70;
 
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
@@ -295,7 +295,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
 					details.message = describeComputerSuccess(details);
 				}
-				const image = await inlineImageContentFromNativeResult(batchResult.screenshotSource, details);
+				const image = await inlineImageContentFromNativeResult(batchResult.screenshotSource, details, this.session);
 				await writeComputerAuditLog(this.session, details);
 				return image
 					? toolResult(details)
@@ -312,7 +312,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 				await persistScreenshotFallback(result, details.screenshot, this.session);
 				details.message = describeComputerSuccess(details);
 			}
-			const image = await inlineImageContentFromNativeResult(result, details);
+			const image = await inlineImageContentFromNativeResult(result, details, this.session);
 			await writeComputerAuditLog(this.session, details);
 			return image
 				? toolResult(details)
@@ -492,27 +492,29 @@ function fullResolutionImageContentFromNativeResult(value: unknown): ImageConten
 async function inlineImageContentFromNativeResult(
 	value: unknown,
 	details: ComputerToolDetails,
+	session: ToolSession,
 ): Promise<ImageContent | undefined> {
 	const image = fullResolutionImageContentFromNativeResult(value);
 	if (!image) return undefined;
+	const maxBytes = getInlineScreenshotMaxBytes(session);
 	const originalBytes = Buffer.byteLength(image.data, "base64");
-	if (originalBytes <= COMPUTER_INLINE_SCREENSHOT_MAX_BYTES) return image;
+	if (originalBytes <= maxBytes) return image;
 
 	try {
 		const resized = await resizeImage(image, {
 			maxWidth: COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH,
 			maxHeight: COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT,
-			maxBytes: COMPUTER_INLINE_SCREENSHOT_MAX_BYTES,
+			maxBytes,
 			jpegQuality: COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY,
 		});
-		if (resized.buffer.length <= COMPUTER_INLINE_SCREENSHOT_MAX_BYTES) {
+		if (resized.buffer.length <= maxBytes) {
 			return { type: "image", data: resized.data, mimeType: resized.mimeType };
 		}
 	} catch {
 		// Keep the action successful and rely on the full-resolution artifact path below.
 	}
 
-	details.message = `${details.message} Inline screenshot omitted because it could not be bounded below ${formatByteCount(COMPUTER_INLINE_SCREENSHOT_MAX_BYTES)}; use the saved screenshot artifact instead.`;
+	details.message = `${details.message} Inline screenshot omitted because it could not be bounded below ${formatByteCount(maxBytes)}; use the saved screenshot artifact instead.`;
 	return undefined;
 }
 
@@ -557,6 +559,15 @@ function getPngByteLength(png: NativeScreenshot["png"]): number | undefined {
 	if (typeof png === "string") return Buffer.byteLength(png, "base64");
 	if (png instanceof ArrayBuffer) return png.byteLength;
 	return png.byteLength;
+}
+
+function getInlineScreenshotMaxBytes(session: Pick<ToolSession, "settings">): number {
+	const configured = Number(session.settings.get("computer.screenshotMaxBytes"));
+	const finiteConfigured =
+		Number.isFinite(configured) && configured > 0
+			? Math.floor(configured)
+			: COMPUTER_INLINE_SCREENSHOT_PROVIDER_MAX_BYTES;
+	return Math.min(finiteConfigured, COMPUTER_INLINE_SCREENSHOT_PROVIDER_MAX_BYTES);
 }
 
 function formatByteCount(bytes: number): string {
