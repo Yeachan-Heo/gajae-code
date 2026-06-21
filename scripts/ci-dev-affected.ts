@@ -754,8 +754,12 @@ function isReleaseHarnessScriptPath(changedPath: string): boolean {
 	].includes(changedPath);
 }
 
+function isPythonStaticAssetPath(changedPath: string): boolean {
+	return changedPath.startsWith("python/robogjc/assets/");
+}
+
 function isPythonPath(changedPath: string): boolean {
-	return changedPath.startsWith("python/robogjc/") && !changedPath.startsWith("python/robogjc/web/");
+	return changedPath.startsWith("python/robogjc/") && !changedPath.startsWith("python/robogjc/web/") && !isPythonStaticAssetPath(changedPath);
 }
 
 function isRustPath(changedPath: string): boolean {
