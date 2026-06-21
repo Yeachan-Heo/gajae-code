@@ -48,7 +48,7 @@ describe("G2 gjc ACL gate", () => {
 		});
 	});
 
-	it("allows sanctioned gjc bash commands and non-.gjc writes", async () => {
+	it("allows sanctioned gjc bash commands, bash mutations, and non-.gjc writes", async () => {
 		await withTempCwd(async cwd => {
 			const gjcCommand = await getDeepInterviewMutationDecision({
 				cwd,
@@ -56,6 +56,13 @@ describe("G2 gjc ACL gate", () => {
 				args: { command: "gjc state ralplan write --input '{}'" },
 			});
 			expect(gjcCommand.blocked).toBe(false);
+
+			const bashMutation = await getDeepInterviewMutationDecision({
+				cwd,
+				tool: tool("bash"),
+				args: { command: "rm -rf .gjc/specs" },
+			});
+			expect(bashMutation.blocked).toBe(false);
 
 			const productWrite = await getDeepInterviewMutationDecision({
 				cwd,

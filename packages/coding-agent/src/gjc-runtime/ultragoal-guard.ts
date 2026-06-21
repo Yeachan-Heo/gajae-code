@@ -288,14 +288,15 @@ export function validateCompletionReceipt(input: {
 export async function readUltragoalVerificationState(input: {
 	cwd: string;
 	currentGoal?: CurrentGoalLike | null;
+	sessionId?: string | null;
 }): Promise<UltragoalGuardDiagnostic> {
 	const currentObjective = input.currentGoal?.objective?.trim() ?? "";
 	if (!currentObjective) return { state: "inactive", message: "No current goal objective is active." };
 	let plan: UltragoalPlan | null;
 	let ledger: UltragoalLedgerEvent[];
 	try {
-		plan = await readUltragoalPlan(input.cwd);
-		ledger = await readUltragoalLedger(input.cwd);
+		plan = await readUltragoalPlan(input.cwd, input.sessionId ?? undefined);
+		ledger = await readUltragoalLedger(input.cwd, input.sessionId ?? undefined);
 	} catch (error) {
 		if (currentObjective === DEFAULT_ULTRAGOAL_OBJECTIVE) {
 			return {
@@ -479,6 +480,7 @@ export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBl
 export async function assertCanCompleteCurrentGoal(input: {
 	cwd: string;
 	currentGoal?: CurrentGoalLike | null;
+	sessionId?: string | null;
 }): Promise<void> {
 	if (!input.cwd) return;
 	const diagnostic = await readUltragoalVerificationState(input);

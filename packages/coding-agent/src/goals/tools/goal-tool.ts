@@ -102,7 +102,11 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 		return buildGoalToolResponse(dropped ?? null);
 	}
 	try {
-		await assertCanCompleteCurrentGoal({ cwd: session.cwd, currentGoal: session.getGoalModeState?.()?.goal ?? null });
+		await assertCanCompleteCurrentGoal({
+			cwd: session.cwd,
+			currentGoal: session.getGoalModeState?.()?.goal ?? null,
+			sessionId: session.getSessionId?.(),
+		});
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}

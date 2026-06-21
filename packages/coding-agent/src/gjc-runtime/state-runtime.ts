@@ -1403,20 +1403,18 @@ async function handleWrite(
 	const validation = validateWorkflowStateEnvelope(mode, merged);
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
-	const { warning: outOfBandWarning, stamped, revision: stampedRevision } = await writeJsonAtomic(
-		cwd,
-		filePath,
-		merged,
-		"write",
-		{
-			sessionId,
-			skill: mode,
-			mutationId,
-			force: forced,
-			fromPhase,
-			toPhase,
-		},
-	);
+	const {
+		warning: outOfBandWarning,
+		stamped,
+		revision: stampedRevision,
+	} = await writeJsonAtomic(cwd, filePath, merged, "write", {
+		sessionId,
+		skill: mode,
+		mutationId,
+		force: forced,
+		fromPhase,
+		toPhase,
+	});
 	const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
 
 	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;

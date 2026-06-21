@@ -472,20 +472,17 @@ async function findImageApiKey(
 		const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
 		if (openAI) return openAI;
 		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "antigravity" && modelRegistry) {
-		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
-		if (antigravity) return antigravity;
-		// Fall through to auto-detect if preferred provider key not found.
+	} else if (preferredImageProvider === "antigravity") {
+		if (!modelRegistry) return null;
+		return await findAntigravityCredentials(modelRegistry, sessionId);
 	} else if (preferredImageProvider === "gemini") {
 		const geminiKey = getEnvApiKey("google");
 		if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
 		const googleKey = $env.GOOGLE_API_KEY;
-		if (googleKey) return { provider: "gemini", apiKey: googleKey };
-		// Fall through to auto-detect if preferred provider key not found.
+		return googleKey ? { provider: "gemini", apiKey: googleKey } : null;
 	} else if (preferredImageProvider === "openrouter") {
 		const openRouterKey = getEnvApiKey("openrouter");
-		if (openRouterKey) return { provider: "openrouter", apiKey: openRouterKey };
-		// Fall through to auto-detect if preferred provider key not found.
+		return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
 	}
 
 	// Auto-detect: GPT hosted image generation, then Antigravity, OpenRouter, Gemini.
