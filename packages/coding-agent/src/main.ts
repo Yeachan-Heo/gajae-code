@@ -429,7 +429,6 @@ async function flushChangelogVersion(): Promise<void> {
 	}
 }
 
-
 async function createSessionManager(
 	parsed: Args,
 	cwd: string,
@@ -859,15 +858,11 @@ export async function runRootCommand(
 	);
 
 	const credentialAutoImportNotice = isInteractive
-		? await logger.time(
-				"credentialAutoImport",
-				runStartupCredentialAutoImportIfNeeded,
-				{
-					authStorage,
-					modelRegistry,
-					agentDir: settingsInstance.getAgentDir(),
-				},
-				)
+		? await logger.time("credentialAutoImport", runStartupCredentialAutoImportIfNeeded, {
+				authStorage,
+				modelRegistry,
+				agentDir: settingsInstance.getAgentDir(),
+			})
 		: undefined;
 
 	let scopedModels: ScopedModel[] = [];

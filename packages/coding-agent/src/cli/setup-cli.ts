@@ -526,12 +526,15 @@ export interface CredentialsSetupDependencies {
 	discover?: Parameters<typeof runExternalCredentialAutoImport>[0]["discover"];
 }
 
-export async function handleCredentialsSetup(flags: {
-	json?: boolean;
-	yes?: boolean;
-	dryRun?: boolean;
-	keychain?: boolean;
-}, deps: CredentialsSetupDependencies = {}): Promise<void> {
+export async function handleCredentialsSetup(
+	flags: {
+		json?: boolean;
+		yes?: boolean;
+		dryRun?: boolean;
+		keychain?: boolean;
+	},
+	deps: CredentialsSetupDependencies = {},
+): Promise<void> {
 	const discoveryOptions = flags.keychain ? undefined : { readClaudeKeychain: async () => null };
 	const store = await (deps.openStore ?? SqliteAuthCredentialStore.open)(getAgentDbPath());
 	const authStorage = deps.createAuthStorage?.(store) ?? new AuthStorage(store);
@@ -608,7 +611,12 @@ export async function handleCredentialsSetup(flags: {
 			return;
 		}
 
-		const summary = await runExternalCredentialAutoImport({ authStorage, discover: deps.discover, discoveryOptions, trigger: "setup-cli" });
+		const summary = await runExternalCredentialAutoImport({
+			authStorage,
+			discover: deps.discover,
+			discoveryOptions,
+			trigger: "setup-cli",
+		});
 
 		if (flags.json) {
 			process.stdout.write(

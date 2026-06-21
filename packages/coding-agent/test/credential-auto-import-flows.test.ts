@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { AuthCredentialIfAbsentSnapshotResult } from "@gajae-code/ai";
 import { VERSION } from "@gajae-code/utils";
 import { handleCredentialsSetup } from "../src/cli/setup-cli";
-import { runStartupCredentialAutoImportIfNeeded } from "../src/setup/credential-auto-import";
-import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import {
+	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,
+	runStartupCredentialAutoImportIfNeeded,
+} from "../src/setup/credential-auto-import";
+import type { CredentialDiscoveryResult, DiscoveryOptions, ImportableCredential } from "../src/setup/credential-import";
 import * as credentialImport from "../src/setup/credential-import";
-import { CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING } from "../src/setup/credential-auto-import";
-import type { ImportableCredential, CredentialDiscoveryResult, DiscoveryOptions } from "../src/setup/credential-import";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
 function oauthCredential(overrides: Partial<ImportableCredential> = {}): ImportableCredential {
 	return {
@@ -31,7 +33,10 @@ function apiKeyCredential(): ImportableCredential {
 	};
 }
 
-function discovery(importable: ImportableCredential[] = [], skipped: CredentialDiscoveryResult["skipped"] = []): CredentialDiscoveryResult {
+function discovery(
+	importable: ImportableCredential[] = [],
+	skipped: CredentialDiscoveryResult["skipped"] = [],
+): CredentialDiscoveryResult {
 	return { importable, skipped, environment: [] };
 }
 
@@ -137,7 +142,6 @@ describe("startup credential auto-import marker matrix", () => {
 		};
 	}
 
-
 	function authStorage(outcomes: Array<AuthCredentialIfAbsentSnapshotResult | Error>) {
 		const calls: string[] = [];
 		return {
@@ -189,7 +193,11 @@ describe("startup credential auto-import marker matrix", () => {
 	});
 
 	test("global discovery failure does not advance marker", async () => {
-		const result = await runCase({ discover: async () => { throw new Error("boom"); } });
+		const result = await runCase({
+			discover: async () => {
+				throw new Error("boom");
+			},
+		});
 		expect(result.marker.marker).toBeUndefined();
 		expect(result.marker.writes).toBe(0);
 		expect(result.refreshCalls).toHaveLength(0);
@@ -223,7 +231,8 @@ describe("startup credential auto-import marker matrix", () => {
 
 	test("partial import advances marker, refreshes registry, and emits exact rotation warning", async () => {
 		const result = await runCase({
-			discover: async () => discovery([oauthCredential(), oauthCredential({ provider: "openai-codex", origin: "codex-file" })]),
+			discover: async () =>
+				discovery([oauthCredential(), oauthCredential({ provider: "openai-codex", origin: "codex-file" })]),
 			outcomes: [inserted("anthropic"), skipped("openai-codex")],
 		});
 		expect(result.marker.marker).toBe(VERSION);
@@ -237,19 +246,16 @@ describe("startup credential auto-import marker matrix", () => {
 
 describe("setup credentials keychain and preview behavior", () => {
 	let stdout = "";
-	let stderr = "";
 	let exitCode: string | number | undefined | null;
 
 	beforeEach(() => {
 		stdout = "";
-		stderr = "";
 		exitCode = process.exitCode;
 		spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
 			stdout += String(chunk);
 			return true;
 		});
-		spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
-			stderr += String(chunk);
+		spyOn(process.stderr, "write").mockImplementation((_chunk: string | Uint8Array) => {
 			return true;
 		});
 	});
@@ -263,10 +269,11 @@ describe("setup credentials keychain and preview behavior", () => {
 	function deps(reads: { discover: number; keychain: number }, result: CredentialDiscoveryResult) {
 		return {
 			openStore: async () => ({ close: () => {} }) as never,
-			createAuthStorage: () => ({
-				reload: async () => {},
-				importCredentialIfAbsent: async (provider: string) => inserted(provider),
-			}) as never,
+			createAuthStorage: () =>
+				({
+					reload: async () => {},
+					importCredentialIfAbsent: async (provider: string) => inserted(provider),
+				}) as never,
 			discover: async (options?: DiscoveryOptions) => {
 				reads.discover += 1;
 				if (options?.readClaudeKeychain) {
@@ -293,7 +300,10 @@ describe("setup credentials keychain and preview behavior", () => {
 
 	test("setup credentials --keychain allows keychain discovery", async () => {
 		const reads = { discover: 0, keychain: 0 };
-		await handleCredentialsSetup({ keychain: true, dryRun: true, yes: true }, deps(reads, discovery([oauthCredential({ origin: "claude-code-keychain" })])));
+		await handleCredentialsSetup(
+			{ keychain: true, dryRun: true, yes: true },
+			deps(reads, discovery([oauthCredential({ origin: "claude-code-keychain" })])),
+		);
 		expect(reads.discover).toBe(1);
 		expect(reads.keychain).toBe(1);
 	});
@@ -312,13 +322,16 @@ describe("setup credentials keychain and preview behavior", () => {
 			{ keychain: true, json: true, dryRun: true },
 			deps(
 				reads,
-				discovery([], [
-					{
-						origin: "claude-code-keychain",
-						source: "Claude Code (macOS Keychain)",
-						reason: "unreadable credential file (Error: denied)",
-					},
-				]),
+				discovery(
+					[],
+					[
+						{
+							origin: "claude-code-keychain",
+							source: "Claude Code (macOS Keychain)",
+							reason: "unreadable credential file (Error: denied)",
+						},
+					],
+				),
 			),
 		);
 		const payload = JSON.parse(stdout.trim());

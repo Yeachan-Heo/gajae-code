@@ -218,7 +218,6 @@ export interface StartupCredentialAutoImportOptions {
 	markerStore?: CredentialImportMarkerStore;
 }
 
-
 export async function runStartupCredentialAutoImportIfNeeded({
 	authStorage: activeAuthStorage,
 	modelRegistry: activeModelRegistry,

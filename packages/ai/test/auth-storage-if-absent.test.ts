@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -209,7 +209,9 @@ try {
 				{ exitCode: 0, stderr: "" },
 				{ exitCode: 0, stderr: "" },
 			]);
-			const results = outputs.map(output => JSON.parse(output.stdout.trim()) as Pick<AuthCredentialIfAbsentResult, "inserted" | "reason">);
+			const results = outputs.map(
+				output => JSON.parse(output.stdout.trim()) as Pick<AuthCredentialIfAbsentResult, "inserted" | "reason">,
+			);
 			expect(results.filter(result => result.inserted && result.reason === "inserted")).toHaveLength(1);
 			expect(results.filter(result => !result.inserted && result.reason === "skipped-existing")).toHaveLength(1);
 		} finally {

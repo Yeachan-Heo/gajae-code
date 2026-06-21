@@ -1,11 +1,9 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { getAgentDbPath, setAgentDir } from "@gajae-code/utils";
-import { handleCredentialsSetup } from "../src/cli/setup-cli";
-import { runStartupCredentialAutoImportIfNeeded } from "../src/setup/credential-auto-import";
 import {
 	buildCredentialAutoImportNotice,
 	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,

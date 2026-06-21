@@ -32,7 +32,7 @@ import {
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
-import { formatCredentialAutoImportResult, runExternalCredentialAutoImport } from "../../setup/credential-auto-import";
+import { runExternalCredentialAutoImport } from "../../setup/credential-auto-import";
 import { filterAutoImportOAuthCredentials, formatDiscoverySummary } from "../../setup/credential-import";
 import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
@@ -159,7 +159,12 @@ export class SelectorController {
 		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI credentials…");
 		const preview = await runExternalCredentialAutoImport({
 			authStorage: {
-				importCredentialIfAbsent: async () => ({ inserted: false, reason: "skipped-existing", provider: "", entries: [] }),
+				importCredentialIfAbsent: async () => ({
+					inserted: false,
+					reason: "skipped-existing",
+					provider: "",
+					entries: [],
+				}),
 			},
 			trigger: "bare-login",
 		});
