@@ -245,6 +245,10 @@ export async function runStartupCredentialAutoImportIfNeeded({
 		return undefined;
 	}
 
+	const candidates = filterAutoImportOAuthCredentials(result.discovery?.importable ?? []);
+	if (candidates.length > 0 && result.imported.length === 0 && result.skipped.length === 0) {
+		return undefined;
+	}
 	await store.write(version);
 
 	if (result.imported.length > 0) {

@@ -1,7 +1,10 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AuthCredentialIfAbsentSnapshotResult } from "@gajae-code/ai";
+import { Container } from "@gajae-code/tui";
 import { VERSION } from "@gajae-code/utils";
 import { handleCredentialsSetup } from "../src/cli/setup-cli";
+import { SelectorController } from "../src/modes/controllers/selector-controller";
+import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 import {
 	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,
 	runStartupCredentialAutoImportIfNeeded,
@@ -9,6 +12,13 @@ import {
 import type { CredentialDiscoveryResult, DiscoveryOptions, ImportableCredential } from "../src/setup/credential-import";
 import * as credentialImport from "../src/setup/credential-import";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+
+const testTheme = await getThemeByName("red-claw");
+
+function installTestTheme(): void {
+	if (!testTheme) throw new Error("Failed to load test theme");
+	setThemeInstance(testTheme);
+}
 
 function oauthCredential(overrides: Partial<ImportableCredential> = {}): ImportableCredential {
 	return {
@@ -219,12 +229,13 @@ describe("startup credential auto-import marker matrix", () => {
 		expect(result.notice).toBeUndefined();
 	});
 
-	test("all failed advances marker without refresh or notice", async () => {
+	test("all failed does not advance marker or refresh", async () => {
 		const result = await runCase({
 			discover: async () => discovery([oauthCredential()]),
 			outcomes: [new Error("write conflict")],
 		});
-		expect(result.marker.marker).toBe(VERSION);
+		expect(result.marker.marker).toBeUndefined();
+		expect(result.marker.writes).toBe(0);
 		expect(result.refreshCalls).toHaveLength(0);
 		expect(result.notice).toBeUndefined();
 	});
@@ -338,5 +349,79 @@ describe("setup credentials keychain and preview behavior", () => {
 		expect(payload.skipped).toHaveLength(1);
 		expect(payload.skipped[0].reason).toContain("denied");
 		expect(payload.imported).toEqual([]);
+	});
+});
+
+describe("bare /login external credential import gate", () => {
+	function createControllerHarness(args: { confirm: boolean; importOutcome?: AuthCredentialIfAbsentSnapshotResult }) {
+		installTestTheme();
+		const importCalls: string[] = [];
+		const refreshCalls: string[] = [];
+		const confirmMessages: Array<{ title: string; message: string }> = [];
+		const ctx = {
+			ui: { setFocus: mock(() => {}), requestRender: mock(() => {}) },
+			editorContainer: new Container(),
+			editor: new Container(),
+			chatContainer: new Container(),
+			showHookConfirm: mock(async (title: string, message: string) => {
+				confirmMessages.push({ title, message });
+				return args.confirm;
+			}),
+			session: {
+				sessionId: "session-1",
+				modelRegistry: {
+					refresh: mock(async (mode?: string) => refreshCalls.push(mode ?? "")),
+					authStorage: {
+						hasAuth: () => false,
+						importCredentialIfAbsent: async (provider: string) => {
+							importCalls.push(provider);
+							return args.importOutcome ?? inserted(provider);
+						},
+					},
+					getApiKeyForProvider: mock(async () => undefined),
+				},
+			},
+		} as never;
+		return { controller: new SelectorController(ctx), importCalls, refreshCalls, confirmMessages };
+	}
+
+	function bareLoginOptions() {
+		return {
+			allowExternalCredentialDiscovery: true,
+			trigger: "bare-login" as const,
+			externalCredentialDiscover: async () => discovery([oauthCredential()]),
+		};
+	}
+
+	test("bare /login shows rotation warning before persisting imported OAuth credentials", async () => {
+		const harness = createControllerHarness({ confirm: true });
+
+		await harness.controller.showOAuthSelector("login", undefined, bareLoginOptions());
+
+		expect(harness.confirmMessages).toHaveLength(1);
+		expect(harness.confirmMessages[0]?.message).toContain("Claude Code (test)");
+		expect(harness.confirmMessages[0]?.message).toContain(CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING);
+		expect(harness.importCalls).toEqual(["anthropic"]);
+		expect(harness.refreshCalls).toEqual(["offline"]);
+	});
+
+	test("declining bare /login import does not persist discovered credentials", async () => {
+		const harness = createControllerHarness({ confirm: false });
+
+		await harness.controller.showOAuthSelector("login", undefined, bareLoginOptions());
+
+		expect(harness.confirmMessages).toHaveLength(1);
+		expect(harness.importCalls).toEqual([]);
+		expect(harness.refreshCalls).toEqual([]);
+	});
+
+	test("confirmed bare /login import remains idempotent when credential already exists", async () => {
+		const harness = createControllerHarness({ confirm: true, importOutcome: skipped() });
+
+		await harness.controller.showOAuthSelector("login", undefined, bareLoginOptions());
+
+		expect(harness.confirmMessages).toHaveLength(1);
+		expect(harness.importCalls).toEqual(["anthropic"]);
+		expect(harness.refreshCalls).toEqual([]);
 	});
 });

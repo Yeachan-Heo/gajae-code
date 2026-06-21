@@ -32,7 +32,10 @@ import {
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
-import { runExternalCredentialAutoImport } from "../../setup/credential-auto-import";
+import {
+	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,
+	runExternalCredentialAutoImport,
+} from "../../setup/credential-auto-import";
 import { filterAutoImportOAuthCredentials, formatDiscoverySummary } from "../../setup/credential-import";
 import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
@@ -1279,20 +1282,44 @@ export class SelectorController {
 			}
 		}
 
-		const externalCredentialCandidates =
+		let externalCredentialCandidates: ReturnType<typeof filterAutoImportOAuthCredentials> = [];
+		if (
 			mode === "login" &&
 			providerId === undefined &&
 			options?.allowExternalCredentialDiscovery === true &&
 			options.trigger === "bare-login"
-				? (
-						await runExternalCredentialAutoImport({
-							authStorage: this.ctx.session.modelRegistry.authStorage,
-							trigger: "bare-login",
-						})
-					).imported
-				: [];
-		if (externalCredentialCandidates.length > 0) {
-			await this.ctx.session.modelRegistry.refresh("offline");
+		) {
+			const preview = await runExternalCredentialAutoImport({
+				authStorage: {
+					importCredentialIfAbsent: async () => ({
+						inserted: false,
+						reason: "skipped-existing",
+						provider: "",
+						entries: [],
+					}),
+				},
+				trigger: "bare-login",
+				discover: options.externalCredentialDiscover,
+			});
+			const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
+			const candidates = filterAutoImportOAuthCredentials(result.importable);
+			if (candidates.length > 0) {
+				const confirmed = await this.ctx.showHookConfirm(
+					`Import ${candidates.length} external credential(s)?`,
+					`${formatDiscoverySummary({ ...result, importable: candidates }).join("\n")}\n\n${CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING}`,
+				);
+				if (confirmed) {
+					const summary = await runExternalCredentialAutoImport({
+						authStorage: this.ctx.session.modelRegistry.authStorage,
+						trigger: "bare-login",
+						discover: options.externalCredentialDiscover,
+					});
+					externalCredentialCandidates = summary.imported;
+					if (externalCredentialCandidates.length > 0) {
+						await this.ctx.session.modelRegistry.refresh("offline");
+					}
+				}
+			}
 		}
 		this.showSelector(done => {
 			let selector: OAuthSelectorComponent;

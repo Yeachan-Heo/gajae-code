@@ -66,15 +66,16 @@ describe("/login slash command", () => {
 		expect(await pending).toBe(callbackUrl);
 	});
 
-	it("opens provider onboarding selector when no args are provided", async () => {
+	it("opens login selector with external discovery gate when no args are provided", async () => {
 		const manualInput = new OAuthManualInputManager();
 		const harness = createRuntimeHarness(manualInput);
 
 		const handled = await executeBuiltinSlashCommand("/login", harness.runtime);
 
 		expect(handled).toBe(true);
-		expect(harness.getProviderOnboardingShown()).toBe(true);
-		expect(harness.getSelectorMode()).toBeUndefined();
+		expect(harness.getProviderOnboardingShown()).toBe(false);
+		expect(harness.getSelectorMode()).toBe("login");
+		expect(harness.getSelectorProvider()).toBeUndefined();
 	});
 
 	it("routes /login kagi to direct provider login", async () => {
