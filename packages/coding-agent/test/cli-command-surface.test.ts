@@ -33,6 +33,7 @@ describe("GJC public CLI command surface", () => {
 			"mcp-serve",
 			"contribute-pr",
 			"deep-interview",
+			"migrate",
 			"rlm",
 			"update",
 			"launch",
