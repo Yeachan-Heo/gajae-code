@@ -79,9 +79,9 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
-		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
-			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
+		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel; recordedRole?: string }>,
+		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel, options?: { recordedRole?: string }) {
+			this.setModelTemporaryCalls.push({ model: next, thinkingLevel, recordedRole: options?.recordedRole });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
 		},
@@ -180,6 +180,23 @@ describe("model profile activation", () => {
 		expect(setCalls).toEqual([]);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("activation records the profile default model under the default role for resume", async () => {
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+
+		// The profile's default model must be logged under the "default" role so
+		// `--continue`/`--resume` restores it. Recording it as "temporary" (the old
+		// behavior) made resume revert to the pre-activation fallback model.
+		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		expect(session.setModelTemporaryCalls[0].model.id).toBe("default");
+		expect(session.setModelTemporaryCalls[0].recordedRole).toBe("default");
 	});
 
 	test("--default persists only modelProfile.default and flushes", async () => {

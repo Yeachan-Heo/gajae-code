@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed session resume reverting the model to a fallback (e.g. `claude-3-5-sonnet`) when a model profile is active and no `modelRoles.default` is configured. Model-profile activation and explicit `--model` startup now record the session's effective model under the `default` role so `--continue`/`--resume` restores it, while runtime temporary switches (Ctrl+P cycling, retry fallback, context promotion) still stay session-local (#947).
+
 ## [0.6.4] - 2026-06-20
 
 ### Changed

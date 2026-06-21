@@ -60,6 +60,23 @@ function modelChange(id: string, parentId: string | null, provider: string, mode
 	return { type: "model_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", model: `${provider}/${modelId}` };
 }
 
+function modelChangeRole(
+	id: string,
+	parentId: string | null,
+	provider: string,
+	modelId: string,
+	role: string,
+): ModelChangeEntry {
+	return {
+		type: "model_change",
+		id,
+		parentId,
+		timestamp: "2025-01-01T00:00:00Z",
+		model: `${provider}/${modelId}`,
+		role,
+	};
+}
+
 describe("buildSessionContext", () => {
 	describe("trivial cases", () => {
 		it("empty entries returns empty context", () => {
@@ -156,6 +173,30 @@ describe("buildSessionContext", () => {
 			// different model id. Temporary fallbacks and provider-side
 			// downgrades both produce such mismatched messages.
 			expect(ctx.models.default).toBe("openai/gpt-4");
+		});
+
+		it("restores the last default-role model on resume (model profile activation)", () => {
+			// Model-profile activation records its default model under the "default"
+			// role, so the most recent default wins on resume even when an earlier
+			// fallback default was recorded at session creation.
+			const entries: SessionEntry[] = [
+				modelChange("1", null, "anthropic", "claude-3-5-sonnet-20240620"),
+				modelChangeRole("2", "1", "anthropic", "claude-opus-4-8", "default"),
+			];
+			expect(buildSessionContext(entries).models.default).toBe("anthropic/claude-opus-4-8");
+		});
+
+		it("does not restore a temporary-role model as the session default", () => {
+			// Regression guard for the resume-reverts-to-Sonnet bug: a "temporary"
+			// model change (Ctrl+P cycle, retry fallback, context promotion) must not
+			// become the restored default; the prior default is kept instead.
+			const entries: SessionEntry[] = [
+				modelChange("1", null, "anthropic", "claude-3-5-sonnet-20240620"),
+				modelChangeRole("2", "1", "anthropic", "claude-opus-4-8", "temporary"),
+			];
+			const ctx = buildSessionContext(entries);
+			expect(ctx.models.default).toBe("anthropic/claude-3-5-sonnet-20240620");
+			expect(ctx.models.temporary).toBe("anthropic/claude-opus-4-8");
 		});
 	});
 

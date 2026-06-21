@@ -5863,11 +5863,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set model temporarily (for this session only).
-	 * Validates API key, saves to session log but NOT to settings.
+	 * Set the model for this session only.
+	 * Validates API key, saves to the session log but NOT to settings (modelRoles).
+	 *
+	 * By default the change is logged under the "temporary" role, which session
+	 * resume intentionally drops (Ctrl+P cycling, retry fallback, context
+	 * promotion). Pass `recordedRole: "default"` when the model is the session's
+	 * effective default — model-profile activation and explicit `--model` startup —
+	 * so `--continue`/`--resume` restores it instead of the pre-activation fallback
+	 * model recorded at session creation.
 	 * @throws Error if no API key available for the model
 	 */
-	async setModelTemporary(model: Model, thinkingLevel?: ThinkingLevel): Promise<void> {
+	async setModelTemporary(
+		model: Model,
+		thinkingLevel?: ThinkingLevel,
+		options?: { recordedRole?: string },
+	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
 		if (!apiKey) {
@@ -5876,7 +5887,7 @@ export class AgentSession {
 
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
-		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
+		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, options?.recordedRole ?? "temporary");
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
 		// Apply explicit thinking level if given; otherwise prefer the model's

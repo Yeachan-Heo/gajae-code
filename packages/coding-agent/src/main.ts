@@ -229,9 +229,13 @@ export async function applyStartupModelProfiles(args: {
 		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
 	}
 
-	// Explicit CLI --model/--thinking must win over any activated profile.
+	// Explicit CLI --model/--thinking must win over any activated profile. Record
+	// it under the "default" role so resume restores the explicit model rather than
+	// a model profile's default (which is applied earlier in this function).
 	if (explicitModel) {
-		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking);
+		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
+			recordedRole: "default",
+		});
 	} else if (args.parsedArgs.thinking && args.session.model) {
 		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking);
 	}
