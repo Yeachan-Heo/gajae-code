@@ -139,18 +139,26 @@ export function evaluateResearchLedger(
 			unresolvedUnknowns: item.unknowns,
 		};
 	}
-	const dropReason = matchesDropCondition(item, relevantEvidence) ?? sourceConflictReason(item, relevantEvidence);
+	const supporting = relevantEvidence.filter(entry => entry.verdict === "support");
+	const firstContradiction = relevantEvidence.find(entry => entry.verdict === "contradict");
+	let dropReason = matchesDropCondition(item, relevantEvidence) ?? sourceConflictReason(item, relevantEvidence);
+	// A counterexample with no surviving support falsifies the claim regardless of how the
+	// dropCondition / sourceConflictPolicy prose is worded. Without this, a purely contradicted
+	// claim would slip through as "uncertain" and reopen the hallucination survival path the
+	// evidence ledger exists to close (a contested claim already rejects via sourceConflictReason).
+	if (!dropReason && firstContradiction && supporting.length === 0) {
+		dropReason = `claim contradicted by counterexample with no supporting evidence: ${firstContradiction.source}`;
+	}
 	if (dropReason) {
 		return {
 			claim: item.claim,
 			finalVerdict: "rejected",
-			survivingSources: relevantEvidence.filter(entry => entry.verdict === "support"),
+			survivingSources: supporting,
 			rejectReason: dropReason,
 			unresolvedUnknowns: item.unknowns,
 		};
 	}
 	const uncertain = relevantEvidence.some(entry => entry.verdict === "uncertain");
-	const supporting = relevantEvidence.filter(entry => entry.verdict === "support");
 	if (uncertain || supporting.length === 0) {
 		return {
 			claim: item.claim,
