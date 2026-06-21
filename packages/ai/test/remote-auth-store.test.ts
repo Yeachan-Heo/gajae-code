@@ -148,6 +148,9 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			/read-only/,
 		);
 		expect(() => remoteStore.deleteAuthCredentialsForProvider("anthropic", "x")).toThrow(/read-only/);
+		expect(() =>
+			remoteStore.upsertAuthCredentialForProviderIfAbsent("anthropic", { type: "api_key", key: "x" }),
+		).toThrow(/read-only/);
 		remoteStore.close();
 	});
 
@@ -236,6 +239,37 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 
 		// Client reflects the new key through the broker's `POST /v1/credential`
 		// response without waiting for the long-poll snapshot tick.
+		expect(clientStorage.get("kagi")).toEqual({ type: "api_key", key: "new-key" });
+		clientStorage.close();
+	});
+
+	test("client AuthStorage.importCredentialIfAbsent uses broker if-absent endpoint", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await brokerClient.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: initialResult.snapshot,
+		});
+		const clientStorage = new AuthStorage(remoteStore);
+		await clientStorage.reload();
+
+		const skipped = await clientStorage.importCredentialIfAbsent("anthropic", {
+			type: "oauth",
+			access: "client-access-skipped",
+			refresh: "client-refresh-skipped",
+			expires: Date.now() + 60_000,
+			email: "skipped@example.com",
+		});
+		expect(skipped.inserted).toBe(false);
+		expect(skipped.reason).toBe("skipped-existing");
+		expect(serverStore!.listAuthCredentials("anthropic")).toHaveLength(1);
+
+		const inserted = await clientStorage.importCredentialIfAbsent("kagi", { type: "api_key", key: "new-key" });
+		expect(inserted.inserted).toBe(true);
+		expect(inserted.reason).toBe("inserted");
+		expect(inserted.entries).toHaveLength(1);
+		expect(serverStore!.listAuthCredentials("kagi")).toHaveLength(1);
 		expect(clientStorage.get("kagi")).toEqual({ type: "api_key", key: "new-key" });
 		clientStorage.close();
 	});

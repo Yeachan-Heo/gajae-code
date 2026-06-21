@@ -4,6 +4,7 @@ import { Container, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
 import { theme } from "../../modes/theme/theme";
 import { matchesSelectCancel } from "../../modes/utils/keybinding-matchers";
 import type { AuthStorage } from "../../session/auth-storage";
+import type { ImportableCredential } from "../../setup/credential-import";
 import { DynamicBorder } from "./dynamic-border";
 
 const OAUTH_SELECTOR_MAX_VISIBLE = 10;
@@ -22,6 +23,7 @@ export class OAuthSelectorComponent extends Container {
 	#validateAuthCallback?: (providerId: string) => Promise<boolean>;
 	#requestRenderCallback?: () => void;
 	#authState: Map<string, "checking" | "valid" | "invalid"> = new Map();
+	#externalCredentialCandidates: ImportableCredential[] = [];
 	#spinnerFrame: number = 0;
 	#spinnerInterval?: NodeJS.Timeout;
 	#validationGeneration: number = 0;
@@ -33,6 +35,7 @@ export class OAuthSelectorComponent extends Container {
 		options?: {
 			validateAuth?: (providerId: string) => Promise<boolean>;
 			requestRender?: () => void;
+			externalCredentialCandidates?: ImportableCredential[];
 		},
 	) {
 		super();
@@ -42,6 +45,7 @@ export class OAuthSelectorComponent extends Container {
 		this.#onCancelCallback = onCancel;
 		this.#validateAuthCallback = options?.validateAuth;
 		this.#requestRenderCallback = options?.requestRender;
+		this.#externalCredentialCandidates = options?.externalCredentialCandidates ?? [];
 		// Load all OAuth providers
 		this.#loadProviders();
 		this.addChild(new DynamicBorder());
@@ -194,6 +198,21 @@ export class OAuthSelectorComponent extends Container {
 		if (this.#statusMessage) {
 			this.#listContainer.addChild(new Spacer(1));
 			this.#listContainer.addChild(new TruncatedText(theme.fg("warning", `  ${this.#statusMessage}`), 0, 0));
+		}
+		if (this.#mode === "login" && this.#externalCredentialCandidates.length > 0) {
+			this.#listContainer.addChild(new Spacer(1));
+			for (const credential of this.#externalCredentialCandidates) {
+				this.#listContainer.addChild(
+					new TruncatedText(
+						theme.fg(
+							"success",
+							`  ${theme.status.success} Imported ${credential.provider} from ${credential.source}`,
+						),
+						0,
+						0,
+					),
+				);
+			}
 		}
 	}
 	handleInput(keyData: string): void {

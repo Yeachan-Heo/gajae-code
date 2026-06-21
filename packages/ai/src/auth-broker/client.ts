@@ -11,6 +11,7 @@ import type { AuthCredential } from "../auth-storage";
 import type {
 	CredentialDisableRequest,
 	CredentialDisableResponse,
+	CredentialIfAbsentUploadResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
@@ -21,6 +22,7 @@ import type {
 } from "./types";
 import {
 	credentialDisableResponseSchema,
+	credentialIfAbsentUploadResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
 	healthzResponseSchema,
@@ -260,6 +262,19 @@ export class AuthBrokerClient {
 			schema: credentialUploadResponseSchema,
 			signal,
 		}) as Promise<CredentialUploadResponse>;
+	}
+
+	async uploadCredentialIfAbsent(
+		provider: string,
+		credential: AuthCredential,
+		signal?: AbortSignal,
+	): Promise<CredentialIfAbsentUploadResponse> {
+		const body: CredentialUploadRequest = { provider, credential };
+		return this.#request("POST", "/v1/credential/if-absent", {
+			body,
+			schema: credentialIfAbsentUploadResponseSchema,
+			signal,
+		}) as Promise<CredentialIfAbsentUploadResponse>;
 	}
 
 	async #request<TSchema extends ZodType>(

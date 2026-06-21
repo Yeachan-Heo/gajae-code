@@ -247,7 +247,7 @@ export interface InteractiveModeContext {
 	showSessionSelector(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
-	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
+	showOAuthSelector(mode: "login" | "logout", providerId?: string, options?: OAuthSelectorOptions): Promise<void>;
 	showHookConfirm(title: string, message: string): Promise<boolean>;
 	showDebugSelector(): void;
 	showSessionObserver(): void;
@@ -310,4 +310,8 @@ export interface InteractiveModeContext {
 	): Promise<T>;
 	showExtensionError(extensionPath: string, error: string): void;
 	showToolError(toolName: string, error: string): void;
+}
+export interface OAuthSelectorOptions {
+	allowExternalCredentialDiscovery?: boolean;
+	trigger?: "bare-login";
 }

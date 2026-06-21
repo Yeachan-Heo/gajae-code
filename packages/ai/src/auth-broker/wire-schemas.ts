@@ -185,6 +185,15 @@ export const credentialDisableResponseSchema = z
 	.strict();
 
 // ─── Upload ────────────────────────────────────────────────────────────────
+const credentialIfAbsentReasonSchema = z.enum([
+	"inserted",
+	"skipped-existing",
+	"skipped-existing-runtime",
+	"skipped-existing-config",
+	"skipped-existing-env",
+	"skipped-existing-fallback",
+	"skipped-invalid",
+]);
 
 export const credentialUploadRequestSchema = z
 	.object({
@@ -195,6 +204,14 @@ export const credentialUploadRequestSchema = z
 
 export const credentialUploadResponseSchema = z
 	.object({
+		entries: z.array(credentialSnapshotEntrySchema),
+	})
+	.strict();
+
+export const credentialIfAbsentUploadResponseSchema = z
+	.object({
+		inserted: z.boolean(),
+		reason: credentialIfAbsentReasonSchema,
 		entries: z.array(credentialSnapshotEntrySchema),
 	})
 	.strict();

@@ -80,6 +80,14 @@ class MemoryAuthCredentialStore implements AuthCredentialStore {
 		return this.replaceAuthCredentialsForProvider(provider, [credential]);
 	}
 
+	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential) {
+		const entries = this.listAuthCredentials(provider);
+		if (entries.length > 0)
+			return { inserted: false as const, reason: "skipped-existing" as const, provider, entries };
+		const inserted = this.replaceAuthCredentialsForProvider(provider, [credential]);
+		return { inserted: true as const, reason: "inserted" as const, provider, entries: inserted };
+	}
+
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
 		for (const row of this.#rows) {
 			if (row.provider === provider && row.disabledCause === null) row.disabledCause = disabledCause;

@@ -797,7 +797,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 
-			runtime.ctx.showProviderOnboarding();
+			runtime.ctx.showOAuthSelector("login", undefined, {
+				allowExternalCredentialDiscovery: true,
+				trigger: "bare-login",
+			});
 			runtime.ctx.editor.setText("");
 		},
 	},

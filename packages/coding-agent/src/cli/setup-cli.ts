@@ -6,7 +6,7 @@
 
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { SqliteAuthCredentialStore } from "@gajae-code/ai";
+import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { $which, APP_NAME, getAgentDbPath, getPythonEnvDir } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
@@ -17,7 +17,8 @@ import {
 	readGjcManagedCodexHooksStatus,
 } from "../hooks/codex-native-hooks-config";
 import { theme } from "../modes/theme/theme";
-import { discoverExternalCredentials, formatDiscoverySummary, importCredentials } from "../setup/credential-import";
+import { formatCredentialAutoImportResult, runExternalCredentialAutoImport } from "../setup/credential-auto-import";
+import { filterAutoImportOAuthCredentials, formatDiscoverySummary } from "../setup/credential-import";
 import {
 	formatHermesSetupResult,
 	type HermesSetupFlags,
@@ -63,6 +64,7 @@ export interface SetupCommandArgs {
 		profileDir?: string;
 		yes?: boolean;
 		dryRun?: boolean;
+		keychain?: boolean;
 	};
 }
 
@@ -123,6 +125,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.yes = true;
 		} else if (arg === "--dry-run") {
 			flags.dryRun = true;
+		} else if (arg === "--keychain") {
+			flags.keychain = true;
 		} else if (arg === "--root") {
 			flags.root = [...(flags.root ?? []), args[++i] ?? ""];
 		} else if (arg === "--repo") {
@@ -516,99 +520,133 @@ async function confirmImport(count: number): Promise<boolean> {
  * gjc credential store after a redacted preview + confirmation. Falls back to
  * manual-setup guidance when nothing importable is found.
  */
-async function handleCredentialsSetup(flags: { json?: boolean; yes?: boolean; dryRun?: boolean }): Promise<void> {
-	const result = await discoverExternalCredentials();
-	const redactedPlan = {
-		importable: result.importable.map(c => ({
-			provider: c.provider,
-			kind: c.kind,
-			source: c.source,
-			identity: c.identity,
-			expiresAt: c.expiresAt,
-			redactedToken: c.redactedToken,
-		})),
-		skipped: result.skipped,
-		environment: result.environment,
-	};
+export interface CredentialsSetupDependencies {
+	openStore?: typeof SqliteAuthCredentialStore.open;
+	createAuthStorage?: (store: Awaited<ReturnType<typeof SqliteAuthCredentialStore.open>>) => AuthStorage;
+	discover?: Parameters<typeof runExternalCredentialAutoImport>[0]["discover"];
+}
 
-	if (result.importable.length === 0) {
-		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
-			return;
-		}
-		for (const line of formatDiscoverySummary(result)) process.stdout.write(`  ${line}\n`);
-		process.stdout.write(
-			chalk.yellow(
-				`\nNo importable Claude/Codex credentials found. Continue with manual setup:\n` +
-					`  ${APP_NAME} setup provider   (add an API-compatible provider)\n` +
-					`  ${APP_NAME} (then /login)     (interactive OAuth/subscription login)\n`,
-			),
-		);
-		return;
-	}
-
-	if (!flags.json) {
-		process.stdout.write(chalk.bold("Discovered credentials (redacted):\n"));
-		for (const line of formatDiscoverySummary(result)) process.stdout.write(`  ${line}\n`);
-	}
-
-	if (flags.dryRun) {
-		if (flags.json) process.stdout.write(`${JSON.stringify({ ...redactedPlan, dryRun: true, imported: [] })}\n`);
-		else process.stdout.write(chalk.dim(`\nDry run — no credentials imported.\n`));
-		return;
-	}
-
-	const confirmed = flags.yes || (await confirmImport(result.importable.length));
-	if (!confirmed) {
-		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
-			return;
-		}
-		process.stdout.write(chalk.dim(`\nImport cancelled. Re-run with --yes to import non-interactively.\n`));
-		return;
-	}
-
-	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
-	let summary: Awaited<ReturnType<typeof importCredentials>>;
+export async function handleCredentialsSetup(flags: {
+	json?: boolean;
+	yes?: boolean;
+	dryRun?: boolean;
+	keychain?: boolean;
+}, deps: CredentialsSetupDependencies = {}): Promise<void> {
+	const discoveryOptions = flags.keychain ? undefined : { readClaudeKeychain: async () => null };
+	const store = await (deps.openStore ?? SqliteAuthCredentialStore.open)(getAgentDbPath());
+	const authStorage = deps.createAuthStorage?.(store) ?? new AuthStorage(store);
+	await authStorage.reload();
 	try {
-		summary = await importCredentials(result.importable, (provider, credential) =>
-			store.upsertAuthCredentialForProvider(provider, credential),
-		);
+		const preview = await runExternalCredentialAutoImport({
+			authStorage: {
+				importCredentialIfAbsent: async () => ({
+					inserted: false,
+					reason: "skipped-existing",
+					provider: "",
+					entries: [],
+				}),
+			},
+			discover: deps.discover,
+			discoveryOptions,
+			trigger: "setup-cli",
+		});
+		const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
+		const candidates = filterAutoImportOAuthCredentials(result.importable);
+		const filteredResult = { ...result, importable: candidates };
+		const redactedPlan = {
+			importable: candidates.map(c => ({
+				provider: c.provider,
+				kind: c.kind,
+				source: c.source,
+				identity: c.identity,
+				expiresAt: c.expiresAt,
+				redactedToken: c.redactedToken,
+			})),
+			skipped: result.skipped,
+			environment: result.environment,
+			keychainChecked: flags.keychain === true,
+		};
+
+		if (!flags.keychain && !flags.json) {
+			process.stdout.write(chalk.dim("Claude Keychain not checked (pass --keychain to include it)\n"));
+		}
+
+		if (candidates.length === 0) {
+			if (flags.json) {
+				process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
+				return;
+			}
+			for (const line of formatDiscoverySummary(filteredResult)) process.stdout.write(`  ${line}\n`);
+			process.stdout.write(
+				chalk.yellow(
+					`\nNo importable Claude/Codex credentials found. Continue with manual setup:\n` +
+						`  ${APP_NAME} setup provider   (add an API-compatible provider)\n` +
+						`  ${APP_NAME} (then /login)     (interactive OAuth/subscription login)\n`,
+				),
+			);
+			return;
+		}
+
+		if (!flags.json) {
+			process.stdout.write(chalk.bold("Discovered credentials (redacted):\n"));
+			for (const line of formatDiscoverySummary(filteredResult)) process.stdout.write(`  ${line}\n`);
+		}
+
+		if (flags.dryRun) {
+			if (flags.json) process.stdout.write(`${JSON.stringify({ ...redactedPlan, dryRun: true, imported: [] })}\n`);
+			else process.stdout.write(chalk.dim(`\nDry run — no credentials imported.\n`));
+			return;
+		}
+
+		const confirmed = flags.yes || (await confirmImport(candidates.length));
+		if (!confirmed) {
+			if (flags.json) {
+				process.stdout.write(`${JSON.stringify({ ...redactedPlan, imported: [] })}\n`);
+				return;
+			}
+			process.stdout.write(chalk.dim(`\nImport cancelled. Re-run with --yes to import non-interactively.\n`));
+			return;
+		}
+
+		const summary = await runExternalCredentialAutoImport({ authStorage, discover: deps.discover, discoveryOptions, trigger: "setup-cli" });
+
+		if (flags.json) {
+			process.stdout.write(
+				`${JSON.stringify({
+					...redactedPlan,
+					imported: summary.imported.map(c => ({ provider: c.provider, kind: c.kind, source: c.source })),
+					skippedImport: summary.skipped.map(s => ({
+						provider: s.credential.provider,
+						source: s.credential.source,
+						reason: s.reason,
+					})),
+					failed: summary.failures.map(f => ({
+						provider: f.credential?.provider,
+						source: f.credential?.source ?? f.source,
+						error: f.failureClass,
+					})),
+				})}\n`,
+			);
+			if (summary.failures.length > 0) process.exitCode = 1;
+			return;
+		}
+
+		for (const credential of summary.imported) {
+			process.stdout.write(
+				`${chalk.green(`${theme.status.success} imported`)} ${formatCredentialSummaryLine(credential)}\n`,
+			);
+		}
+		for (const line of formatCredentialAutoImportResult({ ...summary, imported: [], skipped: [] })) {
+			process.stdout.write(`${chalk.dim(line)}\n`);
+		}
+		if (summary.failures.length > 0) {
+			process.exitCode = 1;
+			return;
+		}
+		process.stdout.write(chalk.dim(`\nCredentials saved to ${getAgentDbPath()}\n`));
 	} finally {
 		store.close();
 	}
-
-	if (flags.json) {
-		process.stdout.write(
-			`${JSON.stringify({
-				...redactedPlan,
-				imported: summary.imported.map(c => ({ provider: c.provider, kind: c.kind, source: c.source })),
-				failed: summary.failed.map(f => ({
-					provider: f.credential.provider,
-					source: f.credential.source,
-					error: f.error,
-				})),
-			})}\n`,
-		);
-		if (summary.failed.length > 0) process.exitCode = 1;
-		return;
-	}
-
-	for (const credential of summary.imported) {
-		process.stdout.write(
-			`${chalk.green(`${theme.status.success} imported`)} ${formatCredentialSummaryLine(credential)}\n`,
-		);
-	}
-	for (const failure of summary.failed) {
-		process.stdout.write(
-			`${chalk.red(`${theme.status.error} failed`)} ${failure.credential.provider} (${failure.credential.source}): ${failure.error}\n`,
-		);
-	}
-	if (summary.failed.length > 0) {
-		process.exitCode = 1;
-		return;
-	}
-	process.stdout.write(chalk.dim(`\nCredentials saved to ${getAgentDbPath()}\n`));
 }
 
 function formatCredentialSummaryLine(credential: { provider: string; kind: string; source: string }): string {
@@ -669,6 +707,7 @@ ${chalk.bold("Options:")}
   --profile-dir     Hermes profile directory for full setup install
   --dry-run         Preview discovered credentials without importing (credentials)
   -y, --yes         Import discovered credentials without an interactive prompt (credentials)
+  --keychain        Include Claude macOS Keychain when discovering credentials
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills

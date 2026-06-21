@@ -151,6 +151,29 @@ export interface AuthCredentialSnapshotEntry {
 	identityKey: string | null;
 }
 
+export type AuthCredentialIfAbsentReason =
+	| "inserted"
+	| "skipped-existing"
+	| "skipped-existing-runtime"
+	| "skipped-existing-config"
+	| "skipped-existing-env"
+	| "skipped-existing-fallback"
+	| "skipped-invalid";
+
+export interface AuthCredentialIfAbsentResult {
+	inserted: boolean;
+	reason: AuthCredentialIfAbsentReason;
+	provider: string;
+	entries: StoredAuthCredential[];
+}
+
+export interface AuthCredentialIfAbsentSnapshotResult {
+	inserted: boolean;
+	reason: AuthCredentialIfAbsentReason;
+	provider: string;
+	entries: AuthCredentialSnapshotEntry[];
+}
+
 /**
  * Wire-shaped snapshot exported by {@link AuthStorage.exportSnapshot} and
  * served by the auth-broker server on `GET /v1/snapshot`.
@@ -182,6 +205,7 @@ export interface AuthCredentialStore {
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
 	upsertAuthCredentialForProvider(provider: string, credential: AuthCredential): StoredAuthCredential[];
+	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult;
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
@@ -254,6 +278,10 @@ export interface AuthCredentialStore {
 	 * post-write read path is consistent.
 	 */
 	upsertAuthCredentialRemote?(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]>;
+	upsertAuthCredentialRemoteIfAbsent?(
+		provider: string,
+		credential: AuthCredential,
+	): Promise<AuthCredentialIfAbsentResult>;
 	/**
 	 * Optional async write hook for replace-all semantics (e.g. API-key login
 	 * overwriting any previous keys for the same provider). When present,
@@ -1232,6 +1260,56 @@ export class AuthStorage {
 			stored.map(record => ({ id: record.id, credential: record.credential })),
 		);
 		this.#resetProviderAssignments(provider);
+	}
+
+	#toSnapshotEntries(provider: string, stored: StoredAuthCredential[]): AuthCredentialSnapshotEntry[] {
+		return stored.map(entry => {
+			const persisted = entry.credential;
+			const redacted: SnapshotCredential =
+				persisted.type === "api_key" ? persisted : { ...persisted, refresh: REMOTE_REFRESH_SENTINEL };
+			return {
+				id: entry.id,
+				provider: entry.provider,
+				credential: redacted,
+				identityKey: resolveCredentialIdentityKey(provider, persisted),
+			};
+		});
+	}
+
+	#snapshotSkipResult(provider: string, reason: AuthCredentialIfAbsentReason): AuthCredentialIfAbsentSnapshotResult {
+		return {
+			inserted: false,
+			reason,
+			provider,
+			entries: this.exportSnapshot().credentials.filter(entry => entry.provider === provider),
+		};
+	}
+
+	async importCredentialIfAbsent(
+		provider: string,
+		credential: AuthCredential,
+	): Promise<AuthCredentialIfAbsentSnapshotResult> {
+		if (this.#runtimeOverrides.has(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-runtime");
+		if (this.#configOverrides.has(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-config");
+		if (this.#getCredentialsForProvider(provider).length > 0)
+			return this.#snapshotSkipResult(provider, "skipped-existing");
+		if (getEnvApiKey(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-env");
+		if (this.#fallbackResolver?.(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-fallback");
+
+		const result = this.#store.upsertAuthCredentialRemoteIfAbsent
+			? await this.#store.upsertAuthCredentialRemoteIfAbsent(provider, credential)
+			: this.#store.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+		this.#setStoredCredentials(
+			provider,
+			result.entries.map(entry => ({ id: entry.id, credential: entry.credential })),
+		);
+		this.#resetProviderAssignments(provider);
+		return {
+			inserted: result.inserted,
+			reason: result.reason,
+			provider: result.provider,
+			entries: this.#toSnapshotEntries(provider, result.entries),
+		};
 	}
 
 	async #upsertOAuthCredential(provider: string, credential: OAuthCredential): Promise<void> {
@@ -3343,17 +3421,7 @@ export class AuthStorage {
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
 		this.#resetProviderAssignments(provider);
-		return stored.map(entry => {
-			const persisted = entry.credential;
-			const redacted: SnapshotCredential =
-				persisted.type === "api_key" ? persisted : { ...persisted, refresh: REMOTE_REFRESH_SENTINEL };
-			return {
-				id: entry.id,
-				provider: entry.provider,
-				credential: redacted,
-				identityKey: resolveCredentialIdentityKey(provider, persisted),
-			};
-		});
+		return this.#toSnapshotEntries(provider, stored);
 	}
 
 	/**
@@ -3987,6 +4055,48 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const result = upsert(provider, credential);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
+	}
+
+	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult {
+		let serialized: SerializedCredentialRecord | null;
+		try {
+			serialized = serializeCredential(provider, credential);
+		} catch {
+			serialized = null;
+		}
+		if (!serialized) {
+			return {
+				inserted: false,
+				reason: "skipped-invalid",
+				provider,
+				entries: this.listAuthCredentials(provider),
+			};
+		}
+
+		const writeIfAbsent = this.#db.transaction(
+			(providerName: string, record: SerializedCredentialRecord): AuthCredentialIfAbsentResult => {
+				const existingRows = this.#listActiveByProviderStmt.all(providerName) as AuthRow[];
+				const existing: StoredAuthCredential[] = [];
+				for (const row of existingRows) {
+					const activeCredential = deserializeCredential(row);
+					if (!activeCredential) continue;
+					existing.push(toStoredAuthCredential(row, activeCredential));
+				}
+				if (existing.length > 0) {
+					return { inserted: false, reason: "skipped-existing", provider: providerName, entries: existing };
+				}
+
+				this.#insertStmt.get(providerName, record.credentialType, record.data, record.identityKey);
+				return {
+					inserted: true,
+					reason: "inserted",
+					provider: providerName,
+					entries: this.listAuthCredentials(providerName),
+				};
+			},
+		);
+
+		return writeIfAbsent.immediate(provider, serialized);
 	}
 
 	/**

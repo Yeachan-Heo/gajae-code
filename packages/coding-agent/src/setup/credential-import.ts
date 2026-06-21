@@ -25,6 +25,11 @@ export type ExternalProvider = "anthropic" | "openai-codex";
 /** Where a discovered credential came from. */
 export type CredentialOrigin = "claude-code-file" | "claude-code-keychain" | "codex-file";
 
+export const AUTO_IMPORT_OAUTH_PROVIDER_ORIGINS: Record<ExternalProvider, ReadonlySet<CredentialOrigin>> = {
+	anthropic: new Set<CredentialOrigin>(["claude-code-file", "claude-code-keychain"]),
+	"openai-codex": new Set<CredentialOrigin>(["codex-file"]),
+};
+
 /** Human labels for providers, used in redacted summaries. */
 export const EXTERNAL_PROVIDER_LABELS: Record<ExternalProvider, string> = {
 	anthropic: "Claude (Anthropic)",
@@ -406,6 +411,18 @@ export function formatDiscoverySummary(result: CredentialDiscoveryResult): strin
 		);
 	}
 	return lines;
+}
+
+export function isAutoImportOAuthCredential(credential: ImportableCredential): boolean {
+	return (
+		AUTO_IMPORT_OAUTH_PROVIDER_ORIGINS[credential.provider]?.has(credential.origin) === true &&
+		credential.kind === "oauth" &&
+		credential.credential.type === "oauth"
+	);
+}
+
+export function filterAutoImportOAuthCredentials(credentials: readonly ImportableCredential[]): ImportableCredential[] {
+	return credentials.filter(isAutoImportOAuthCredential);
 }
 
 /**

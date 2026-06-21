@@ -15,6 +15,7 @@ import { parseBind } from "../utils/parse-bind";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
 	CredentialDisableResponse,
+	CredentialIfAbsentUploadResponse,
 	CredentialRefreshResponse,
 	CredentialUploadResponse,
 	HealthzResponse,
@@ -591,6 +592,32 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					logger.info("auth-broker credential disabled", { id, peer, cause });
 					const response: CredentialDisableResponse = { ok: true };
 					return json(200, response);
+				}
+				if (req.method === "POST" && pathname === "/v1/credential/if-absent") {
+					const parsed = await parseBody(req, credentialUploadRequestSchema);
+					if (!parsed.ok) return parsed.response;
+					const { provider, credential } = parsed.data;
+					try {
+						const result = await opts.storage.importCredentialIfAbsent(provider, credential);
+						logger.info("auth-broker credential import-if-absent", {
+							provider,
+							type: credential.type,
+							inserted: result.inserted,
+							reason: result.reason,
+							providerTotal: result.entries.length,
+							peer,
+						});
+						const response: CredentialIfAbsentUploadResponse = {
+							inserted: result.inserted,
+							reason: result.reason,
+							entries: result.entries,
+						};
+						return json(200, response);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						logger.warn("auth-broker upload-if-absent failed", { provider, type: credential.type, peer });
+						return json(500, { error: message });
+					}
 				}
 				if (req.method === "POST" && pathname === "/v1/credential") {
 					const parsed = await parseBody(req, credentialUploadRequestSchema);

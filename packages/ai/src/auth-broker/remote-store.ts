@@ -11,6 +11,7 @@ import { scheduler } from "node:timers/promises";
 import { logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
+	type AuthCredentialIfAbsentResult,
 	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	type OAuthCredential,
@@ -308,6 +309,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		);
 	}
 
+	upsertAuthCredentialForProviderIfAbsent(
+		_provider: string,
+		_credential: AuthCredential,
+	): AuthCredentialIfAbsentResult {
+		throw new Error(
+			"RemoteAuthCredentialStore is read-only on the client. Use `gjc auth-broker login <provider>` to mutate credentials.",
+		);
+	}
+
 	deleteAuthCredentialsForProvider(_provider: string, _disabledCause: string): void {
 		throw new Error(
 			"RemoteAuthCredentialStore is read-only on the client. Use `gjc auth-broker logout <provider>` to mutate credentials.",
@@ -326,6 +336,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#applyProviderEntries(provider, entries);
 		this.#maybeRefreshSnapshot("upload");
 		return this.listAuthCredentials(provider);
+	}
+
+	async upsertAuthCredentialRemoteIfAbsent(
+		provider: string,
+		credential: AuthCredential,
+	): Promise<AuthCredentialIfAbsentResult> {
+		const { inserted, reason, entries } = await this.#client.uploadCredentialIfAbsent(provider, credential);
+		this.#applyProviderEntries(provider, entries);
+		this.#maybeRefreshSnapshot("upload-if-absent");
+		return { inserted, reason, provider, entries: this.listAuthCredentials(provider) };
 	}
 
 	/**

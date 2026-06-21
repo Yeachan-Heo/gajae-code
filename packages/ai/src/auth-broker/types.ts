@@ -6,7 +6,12 @@
  * credential expires or a 401 surfaces on a supposedly-fresh credential.
  */
 
-import type { AuthCredential, AuthCredentialSnapshot, AuthCredentialSnapshotEntry } from "../auth-storage";
+import type {
+	AuthCredential,
+	AuthCredentialIfAbsentReason,
+	AuthCredentialSnapshot,
+	AuthCredentialSnapshotEntry,
+} from "../auth-storage";
 import type { UsageReport } from "../usage";
 
 /** GET /v1/healthz response body. */
@@ -65,6 +70,12 @@ export interface CredentialUploadRequest {
 
 /** POST /v1/credential response body — redacted snapshot of the provider's rows after upsert. */
 export interface CredentialUploadResponse {
+	entries: AuthCredentialSnapshotEntry[];
+}
+
+export interface CredentialIfAbsentUploadResponse {
+	inserted: boolean;
+	reason: AuthCredentialIfAbsentReason;
 	entries: AuthCredentialSnapshotEntry[];
 }
 

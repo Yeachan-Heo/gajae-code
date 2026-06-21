@@ -76,6 +76,9 @@ function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 		upsertAuthCredentialForProvider() {
 			return rows;
 		},
+		upsertAuthCredentialForProviderIfAbsent() {
+			return { inserted: false, reason: "skipped-existing", provider: "anthropic", entries: rows };
+		},
 		deleteAuthCredentialsForProvider() {},
 		getCache(key) {
 			const entry = cache.get(key);

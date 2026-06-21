@@ -1,15 +1,25 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { getAgentDbPath, setAgentDir } from "@gajae-code/utils";
+import { handleCredentialsSetup } from "../src/cli/setup-cli";
+import { runStartupCredentialAutoImportIfNeeded } from "../src/setup/credential-auto-import";
+import {
+	buildCredentialAutoImportNotice,
+	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,
+	CredentialAutoImportFailureClass,
+	runExternalCredentialAutoImport,
+} from "../src/setup/credential-auto-import";
 import {
 	type CredentialDiscoveryResult,
 	discoverExternalCredentials,
+	filterAutoImportOAuthCredentials,
 	formatCredentialSummary,
 	formatDiscoverySummary,
 	importCredentials,
+	isAutoImportOAuthCredential,
 } from "../src/setup/credential-import";
 
 const CLAUDE_ACCESS = "sk-ant-oat01-claude-access-token-value";
@@ -402,5 +412,129 @@ describe("importCredentials", () => {
 		expect(summary.failed).toHaveLength(1);
 		expect(summary.failed[0]!.credential.provider).toBe("openai-codex");
 		expect(summary.failed[0]!.error).toContain("boom");
+	});
+});
+describe("auto-import OAuth filter and orchestrator", () => {
+	function oauthCredential(overrides: Partial<Parameters<typeof isAutoImportOAuthCredential>[0]> = {}) {
+		return {
+			provider: "anthropic" as const,
+			origin: "claude-code-file" as const,
+			source: "Claude Code (test)",
+			kind: "oauth" as const,
+			redactedToken: "sk-a…oken",
+			credential: { type: "oauth" as const, access: "a", refresh: "r", expires: Date.now() },
+			...overrides,
+		};
+	}
+
+	test("OAuth-only accept/reject matrix", () => {
+		const accepted = [
+			oauthCredential(),
+			oauthCredential({ origin: "claude-code-keychain", source: "Claude Code (macOS Keychain)" }),
+			oauthCredential({ provider: "openai-codex", origin: "codex-file", source: "Codex CLI (~/.codex/auth.json)" }),
+		];
+		const rejected = [
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				kind: "api_key",
+				credential: { type: "api_key", key: "k" },
+			}),
+			oauthCredential({
+				provider: "anthropic",
+				origin: "claude-code-file",
+				kind: "oauth",
+				credential: { type: "api_key", key: "k" },
+			}),
+			oauthCredential({
+				provider: "anthropic",
+				origin: "claude-code-keychain",
+				kind: "api_key",
+				credential: { type: "api_key", key: "k" },
+			}),
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				kind: "oauth",
+				credential: { type: "api_key", key: "k" },
+			}),
+		];
+		for (const credential of accepted) expect(isAutoImportOAuthCredential(credential)).toBe(true);
+		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential)).toBe(false);
+		expect(filterAutoImportOAuthCredentials([...accepted, ...rejected])).toEqual(accepted);
+	});
+
+	test("provider-origin pairings reject impossible source/provider combinations", () => {
+		const validAnthropicFile = oauthCredential({ provider: "anthropic", origin: "claude-code-file" });
+		const validAnthropicKeychain = oauthCredential({ provider: "anthropic", origin: "claude-code-keychain" });
+		const validCodexFile = oauthCredential({ provider: "openai-codex", origin: "codex-file" });
+		const invalidAnthropicCodexFile = oauthCredential({ provider: "anthropic", origin: "codex-file" });
+		const invalidCodexClaudeFile = oauthCredential({ provider: "openai-codex", origin: "claude-code-file" });
+		const invalidCodexClaudeKeychain = oauthCredential({ provider: "openai-codex", origin: "claude-code-keychain" });
+
+		expect(isAutoImportOAuthCredential(validAnthropicFile)).toBe(true);
+		expect(isAutoImportOAuthCredential(validAnthropicKeychain)).toBe(true);
+		expect(isAutoImportOAuthCredential(validCodexFile)).toBe(true);
+		expect(isAutoImportOAuthCredential(invalidAnthropicCodexFile)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeFile)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeKeychain)).toBe(false);
+		expect(
+			filterAutoImportOAuthCredentials([
+				validAnthropicFile,
+				validAnthropicKeychain,
+				validCodexFile,
+				invalidAnthropicCodexFile,
+				invalidCodexClaudeFile,
+				invalidCodexClaudeKeychain,
+			]),
+		).toEqual([validAnthropicFile, validAnthropicKeychain, validCodexFile]);
+	});
+
+	test("orchestrator imports through importCredentialIfAbsent", async () => {
+		const credential = oauthCredential();
+		const calls: string[] = [];
+		const result = await runExternalCredentialAutoImport({
+			authStorage: {
+				importCredentialIfAbsent: async (provider: string, _credential: unknown) => {
+					calls.push(provider);
+					return { inserted: true, reason: "inserted", provider, entries: [] };
+				},
+			},
+			discover: async () => ({ importable: [credential], skipped: [], environment: [] }),
+			trigger: "startup",
+		});
+		expect(calls).toEqual(["anthropic"]);
+		expect(result.imported).toEqual([credential]);
+		expect(result.discovered).toBe(true);
+	});
+
+	test("notice is emitted only when imported and includes exact rotation warning", () => {
+		expect(buildCredentialAutoImportNotice({ imported: [] })).toBeUndefined();
+		const notice = buildCredentialAutoImportNotice({ imported: [oauthCredential()] });
+		expect(notice).toContain("Imported 1 external OAuth credential(s) into gjc");
+		expect(notice).toContain(CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING);
+		expect(CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING).toBe(
+			"Refreshing in gjc may log out the Claude/Codex CLI because OAuth refresh tokens can rotate.",
+		);
+	});
+
+	test("global discovery failure does not mark discovered", async () => {
+		const result = await runExternalCredentialAutoImport({
+			authStorage: {
+				importCredentialIfAbsent: async () => ({
+					inserted: true,
+					reason: "inserted",
+					provider: "anthropic",
+					entries: [],
+				}),
+			},
+			discover: async () => {
+				throw new Error("boom");
+			},
+			trigger: "startup",
+		});
+		expect(result.discovered).toBe(false);
+		expect(result.imported).toHaveLength(0);
+		expect(result.globalDiscoveryFailure?.failureClass).toBe(CredentialAutoImportFailureClass.DiscoveryUnavailable);
 	});
 });

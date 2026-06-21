@@ -47,6 +47,7 @@ import {
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
 import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
+import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
@@ -427,6 +428,7 @@ async function flushChangelogVersion(): Promise<void> {
 		logger.warn("Failed to persist lastChangelogVersion", { error });
 	}
 }
+
 
 async function createSessionManager(
 	parsed: Args,
@@ -856,6 +858,18 @@ export async function runRootCommand(
 		settingsInstance.get("theme.light"),
 	);
 
+	const credentialAutoImportNotice = isInteractive
+		? await logger.time(
+				"credentialAutoImport",
+				runStartupCredentialAutoImportIfNeeded,
+				{
+					authStorage,
+					modelRegistry,
+					agentDir: settingsInstance.getAgentDir(),
+				},
+				)
+		: undefined;
+
 	let scopedModels: ScopedModel[] = [];
 	const modelPatterns = parsedArgs.models ?? settingsInstance.get("enabledModels");
 	const modelMatchPreferences = {
@@ -975,6 +989,9 @@ export async function runRootCommand(
 		const modelRegistryError = modelRegistry.getError();
 		if (modelRegistryError) {
 			notifs.push({ kind: "error", message: modelRegistryError.message });
+		}
+		if (credentialAutoImportNotice) {
+			notifs.push({ kind: "info", message: credentialAutoImportNotice });
 		}
 
 		if (isInteractive && !session.model && !modelFallbackMessage) {
