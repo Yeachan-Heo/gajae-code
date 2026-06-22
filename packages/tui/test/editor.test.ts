@@ -520,7 +520,7 @@ describe("Editor component", () => {
 			}
 		});
 
-		it("submits raw LF as Enter on Windows instead of inserting newline", () => {
+		it("inserts a newline for raw LF on Windows terminal sendInput mappings", () => {
 			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 			Object.defineProperty(process, "platform", { value: "win32" });
 			try {
@@ -532,6 +532,27 @@ describe("Editor component", () => {
 
 				editor.handleInput("a");
 				editor.handleInput("\n");
+				editor.handleInput("b");
+
+				expect(submitted).toBe("");
+				expect(editor.getText()).toBe("a\nb");
+			} finally {
+				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+			}
+		});
+
+		it("still submits plain CR Enter on Windows", () => {
+			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+			Object.defineProperty(process, "platform", { value: "win32" });
+			try {
+				const editor = new Editor(defaultEditorTheme);
+				let submitted = "";
+				editor.onSubmit = text => {
+					submitted = text;
+				};
+
+				editor.handleInput("a");
+				editor.handleInput("\r");
 
 				expect(submitted).toBe("a");
 				expect(editor.getText()).toBe("");
