@@ -107,6 +107,14 @@ Mutating tools:
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
 
+High-level delegation tools:
+
+- `gjc_delegate_plan`
+- `gjc_delegate_execute`
+- `gjc_delegate_team`
+
+The `gjc_delegate_*` tools package common GJC workflows for hosts that want to delegate an entire planning, execution, or team turn without manually composing `start_session` and `send_prompt`. They use the same coordinator mutation gates and workdir allowlists as the lower-level session tools.
+
 ### Start a managed GJC session
 
 Call `gjc_coordinator_start_session` with a canonical workdir inside `GJC_COORDINATOR_MCP_WORKDIR_ROOTS`:
