@@ -49,6 +49,10 @@
 					"type": "boolean",
 					"default": false
 				},
+				"verbosity": {
+					"type": "string",
+					"default": "lean"
+				},
 				"daemon": {
 					"type": "object",
 					"properties": {

@@ -34,6 +34,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				default: "provider-a/default:high",
 				executor: "provider-b/executor",
 				architect: "provider-a/architect",
+				vision: "provider-a/architect",
 			},
 			source: "user" as const,
 		},
@@ -106,6 +107,9 @@ describe("model profile activation", () => {
 		expect(prepared.defaultModel?.provider).toBe("provider-a");
 		expect(prepared.defaultModel?.id).toBe("default");
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.High);
+		expect(prepared.modelRoles).toEqual({
+			vision: "provider-a/architect",
+		});
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
@@ -172,6 +176,9 @@ describe("model profile activation", () => {
 
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model?.id).toBe("default");
+		expect(settings.get("modelRoles")).toEqual({
+			vision: "provider-a/architect",
+		});
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			critic: "provider-a/old",
 			executor: "provider-b/executor",

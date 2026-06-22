@@ -78,21 +78,26 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		};
 
 		const activeModelPattern = this.session.getActiveModelString?.() ?? this.session.getModelString?.();
-		let model = resolvePattern("pi/default") ?? resolvePattern(activeModelPattern) ?? availableModels[0];
+		const configuredVisionPattern = this.session.settings.getModelRole("vision")?.trim();
+		const configuredVisionModel = configuredVisionPattern ? resolvePattern("pi/vision") : undefined;
+		if (configuredVisionPattern && !configuredVisionModel) {
+			throw new ToolError(
+				`Configured modelRoles.vision (${configuredVisionPattern}) did not resolve to an available model. Configure modelRoles.vision with a vision-capable model.`,
+			);
+		}
+		const model = configuredVisionModel ?? resolvePattern("pi/default") ?? resolvePattern(activeModelPattern);
 		if (!model) {
-			throw new ToolError("Unable to resolve a model for inspect_image.");
+			throw new ToolError(
+				"Unable to resolve a model for inspect_image. Configure modelRoles.vision with a vision-capable model or select a vision-capable active/default model.",
+			);
 		}
 
-		// inspect_image requires image input; if the resolved model is text-only,
-		// fall back to any available vision-capable model before failing.
+		// inspect_image requires image input. A text-only selected model must be
+		// paired with an explicit vision role so the model/cost boundary is visible.
 		if (!model.input.includes("image")) {
-			const visionModel = availableModels.find(candidate => candidate.input.includes("image"));
-			if (!visionModel) {
-				throw new ToolError(
-					`Resolved model ${model.provider}/${model.id} does not support image input, and no vision-capable model is available. Configure a vision-capable model.`,
-				);
-			}
-			model = visionModel;
+			throw new ToolError(
+				`Resolved model ${model.provider}/${model.id} does not support image input. Configure modelRoles.vision with a vision-capable model.`,
+			);
 		}
 
 		const apiKey = await modelRegistry.getApiKey(model);

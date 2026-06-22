@@ -448,6 +448,7 @@ describe("built-in model profile catalog", () => {
 		});
 		expect(resolveProfileBindings(profile as ModelProfileDefinition)).toEqual({
 			defaultSelector: "custom/model",
+			modelRoles: {},
 			agentModelOverrides: {},
 		});
 	});

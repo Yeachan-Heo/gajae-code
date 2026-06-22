@@ -136,7 +136,7 @@ describe("model profile red-team schema and catalog cases", () => {
 			source: "user",
 		});
 
-		expect(resolved).toEqual({ defaultSelector: "provider/model", agentModelOverrides: {} });
+		expect(resolved).toEqual({ defaultSelector: "provider/model", modelRoles: {}, agentModelOverrides: {} });
 	});
 
 	test("resolveProfileBindings preserves effort suffixes verbatim", () => {
@@ -146,11 +146,13 @@ describe("model profile red-team schema and catalog cases", () => {
 			modelMapping: {
 				default: "provider/default:medium",
 				executor: "provider/executor:high",
+				vision: "provider/vision",
 			},
 			source: "user",
 		});
 
 		expect(resolved.defaultSelector).toBe("provider/default:medium");
+		expect(resolved.modelRoles).toEqual({ vision: "provider/vision" });
 		expect(resolved.agentModelOverrides).toEqual({ executor: "provider/executor:high" });
 	});
 

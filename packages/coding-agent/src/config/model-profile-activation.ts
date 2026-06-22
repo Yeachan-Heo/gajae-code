@@ -45,8 +45,10 @@ export interface PreparedModelProfileActivation {
 	previousModel: Model<Api> | undefined;
 	previousThinkingLevel: ThinkingLevel | undefined;
 	previousAgentModelOverrides: Record<string, string>;
+	previousModelRoles: Record<string, string>;
 	defaultModel: Model<Api> | undefined;
 	defaultThinkingLevel: ThinkingLevel | undefined;
+	modelRoles: Record<string, string>;
 	agentModelOverrides: Record<string, string>;
 	previousActiveModelProfile: string | undefined;
 	/**
@@ -97,14 +99,24 @@ function rewriteSelectorProvider(
 }
 
 function rewriteBindingsProviders(
-	bindings: { defaultSelector?: string; agentModelOverrides: Record<string, string> },
+	bindings: {
+		defaultSelector?: string;
+		modelRoles: Record<string, string>;
+		agentModelOverrides: Record<string, string>;
+	},
 	authenticatedProviders: ReadonlySet<string>,
 	alternativeGroups: readonly (readonly string[])[],
-): { defaultSelector?: string; agentModelOverrides: Record<string, string> } {
+): { defaultSelector?: string; modelRoles: Record<string, string>; agentModelOverrides: Record<string, string> } {
 	return {
 		defaultSelector: bindings.defaultSelector
 			? rewriteSelectorProvider(bindings.defaultSelector, authenticatedProviders, alternativeGroups)
 			: undefined,
+		modelRoles: Object.fromEntries(
+			Object.entries(bindings.modelRoles).map(([role, sel]) => [
+				role,
+				rewriteSelectorProvider(sel, authenticatedProviders, alternativeGroups),
+			]),
+		),
 		agentModelOverrides: Object.fromEntries(
 			Object.entries(bindings.agentModelOverrides).map(([role, sel]) => [
 				role,
@@ -175,6 +187,18 @@ export async function prepareModelProfileActivation(
 		);
 	}
 
+	const modelRoles: Record<string, string> = {};
+	for (const [role, selector] of Object.entries(bindings.modelRoles) as [GjcModelAssignmentTargetId, string][]) {
+		const resolved = resolveModelRoleValue(selector, availableModels, {
+			settings: options.settings as Settings,
+			modelRegistry: options.modelRegistry,
+		});
+		if (!resolved.model) {
+			throw new Error(`Model profile "${options.profileName}" ${role} selector did not resolve: ${selector}`);
+		}
+		modelRoles[role] = formatClampedModelSelector(selector, resolved.model);
+	}
+
 	const agentModelOverrides: Record<string, string> = {};
 	for (const [role, selector] of Object.entries(bindings.agentModelOverrides) as [
 		GjcModelAssignmentTargetId,
@@ -197,8 +221,10 @@ export async function prepareModelProfileActivation(
 		previousModel: options.session.model,
 		previousThinkingLevel: options.session.thinkingLevel,
 		previousAgentModelOverrides: { ...options.settings.get("task.agentModelOverrides") },
+		previousModelRoles: { ...options.settings.get("modelRoles") },
 		defaultModel: resolvedDefault?.model,
 		defaultThinkingLevel: resolvedDefault?.thinkingLevel,
+		modelRoles,
 		agentModelOverrides,
 		previousActiveModelProfile: options.session.getActiveModelProfile?.(),
 		previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
@@ -212,12 +238,14 @@ export async function applyPreparedModelProfileActivation(
 	const previousModel = prepared.previousModel;
 	const previousThinkingLevel = prepared.previousThinkingLevel;
 	const previousAgentModelOverrides = prepared.previousAgentModelOverrides;
+	const previousModelRoles = prepared.previousModelRoles;
 	const previousPersistedDefault = prepared.settings.get("modelProfile.default");
 	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	const previousSessionDefaultModel = prepared.previousSessionDefaultModel;
 	let modelChanged = false;
 	let overridesChanged = false;
 	let defaultChanged = false;
+	let modelRolesChanged = false;
 
 	try {
 		if (prepared.defaultModel) {
@@ -225,6 +253,13 @@ export async function applyPreparedModelProfileActivation(
 				persistAsSessionDefault: true,
 			});
 			modelChanged = true;
+		}
+		if (Object.keys(prepared.modelRoles).length > 0) {
+			prepared.settings.override("modelRoles", {
+				...prepared.settings.get("modelRoles"),
+				...prepared.modelRoles,
+			});
+			modelRolesChanged = true;
 		}
 		if (Object.keys(prepared.agentModelOverrides).length > 0) {
 			prepared.settings.override("task.agentModelOverrides", {
@@ -242,6 +277,9 @@ export async function applyPreparedModelProfileActivation(
 	} catch (error) {
 		if (defaultChanged) {
 			prepared.settings.set("modelProfile.default", previousPersistedDefault);
+		}
+		if (modelRolesChanged) {
+			prepared.settings.override("modelRoles", previousModelRoles);
 		}
 		if (overridesChanged) {
 			prepared.settings.override("task.agentModelOverrides", previousAgentModelOverrides);

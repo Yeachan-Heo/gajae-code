@@ -219,7 +219,7 @@ describe("InspectImageTool", () => {
 		expect(stub.calls).toHaveLength(0);
 	});
 
-	it("falls back to pi/default when vision role is unset", async () => {
+	it("uses pi/default when vision role is unset and default supports images", async () => {
 		const imagePath = path.join(testDir, "screen.png");
 		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
 
@@ -237,6 +237,100 @@ describe("InspectImageTool", () => {
 		);
 
 		const result = await tool.execute("call-1c", { path: imagePath, question: "What text is visible?" });
+		expect(result.details?.model).toBe("openai/gpt-4o");
+		expect(stub.calls).toHaveLength(1);
+		const selectedModel = stub.calls[0]?.[0] as { id?: string } | undefined;
+		expect(selectedModel?.id).toBe("gpt-4o");
+	});
+
+	it("does not fall back to an arbitrary vision model when vision role is unset", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const settings = Settings.isolated();
+		settings.setModelRole("default", `${textOnlyModel.provider}/${textOnlyModel.id}`);
+
+		const stub = createCompleteSimpleForbiddenStub();
+		const tool = new InspectImageTool(
+			createSession(testDir, textOnlyModel, "test-key", settings, {
+				configureVisionRole: false,
+				availableModels: [textOnlyModel, visionModel],
+				activeModel: textOnlyModel,
+			}),
+			stub.fn,
+		);
+
+		await expect(
+			tool.execute("call-no-roulette", { path: imagePath, question: "What text is visible?" }),
+		).rejects.toThrow(/modelRoles\.vision/);
+		expect(stub.calls).toHaveLength(0);
+	});
+
+	it("fails when configured vision role does not resolve", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const settings = Settings.isolated();
+		settings.setModelRole("vision", "openai/missing-vision-model");
+
+		const stub = createCompleteSimpleForbiddenStub();
+		const tool = new InspectImageTool(
+			createSession(testDir, visionModel, "test-key", settings, {
+				configureVisionRole: false,
+				availableModels: [visionModel],
+				activeModel: visionModel,
+			}),
+			stub.fn,
+		);
+
+		await expect(
+			tool.execute("call-missing-vision-role", { path: imagePath, question: "What text is visible?" }),
+		).rejects.toThrow(/Configured modelRoles\.vision .* did not resolve/);
+		expect(stub.calls).toHaveLength(0);
+	});
+
+	it("does not use registry-order fallback when no configured or selected model resolves", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const settings = Settings.isolated();
+		const stub = createCompleteSimpleForbiddenStub();
+		const tool = new InspectImageTool(
+			createSession(testDir, visionModel, "test-key", settings, {
+				configureVisionRole: false,
+				availableModels: [visionModel],
+				activeModel: textOnlyModel,
+			}),
+			stub.fn,
+		);
+
+		await expect(
+			tool.execute("call-no-registry-order-fallback", { path: imagePath, question: "What text is visible?" }),
+		).rejects.toThrow(/Unable to resolve a model for inspect_image/);
+		expect(stub.calls).toHaveLength(0);
+	});
+
+	it("uses configured vision role when active model is text-only", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const settings = Settings.isolated();
+		settings.setModelRole("default", `${textOnlyModel.provider}/${textOnlyModel.id}`);
+		settings.setModelRole("vision", `${visionModel.provider}/${visionModel.id}`);
+
+		const stub = createCompleteSimpleSuccessStub("Configured vision fallback used");
+		const tool = new InspectImageTool(
+			createSession(testDir, visionModel, "test-key", settings, {
+				configureVisionRole: false,
+				availableModels: [textOnlyModel, visionModel],
+				activeModel: textOnlyModel,
+			}),
+			stub.fn,
+		);
+
+		const result = await tool.execute("call-vision-role", { path: imagePath, question: "What text is visible?" });
+		expect(result.content).toEqual([{ type: "text", text: "Configured vision fallback used" }]);
+		expect((result.content as Array<{ type: string }>).some(c => c.type === "image")).toBe(false);
 		expect(result.details?.model).toBe("openai/gpt-4o");
 		expect(stub.calls).toHaveLength(1);
 		const selectedModel = stub.calls[0]?.[0] as { id?: string } | undefined;
