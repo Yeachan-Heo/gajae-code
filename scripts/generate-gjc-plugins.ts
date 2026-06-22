@@ -197,7 +197,7 @@ export function renderPluginFiles(): Map<string, string> {
 			version,
 			description: "Delegate Codex tasks to GJC workflows through coordinator MCP.",
 			skills: "./skills",
-			mcpServers: "./.mcp.json",
+			mcpServers: "./.codex.mcp.json",
 		}),
 	);
 	files.set(
@@ -208,8 +208,11 @@ export function renderPluginFiles(): Map<string, string> {
 		}),
 	);
 
-	// Shared MCP wiring + host docs
+	// Shared host docs + per-host MCP wiring. Claude uses its ${CLAUDE_PROJECT_DIR}
+	// token; Codex gets a host-neutral file that `gjc setup codex` rewrites with a
+	// concrete workdir root (Codex project-dir interpolation is unverified).
 	files.set(".mcp.json", json(sharedMcpServers("${CLAUDE_PROJECT_DIR}")));
+	files.set(".codex.mcp.json", json(sharedMcpServers("${PWD}")));
 	for (const meta of DELEGATE_META) {
 		files.set(path.join("commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
 	}

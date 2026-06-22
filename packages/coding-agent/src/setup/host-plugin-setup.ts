@@ -7,6 +7,7 @@
  * root and no mutation class is enabled until the user opts in.
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDir } from "@gajae-code/utils";
 
@@ -35,6 +36,7 @@ export interface HostPluginSetupResult {
 	};
 	mutationPolicy: string;
 	notes: string[];
+	check?: { ok: boolean; checked: string[]; missing: string[] };
 }
 
 const NAMESPACE_LABEL = "gajae-code-plugin";
@@ -42,6 +44,11 @@ const NAMESPACE_LABEL = "gajae-code-plugin";
 function resolveProjectRoot(flags: HostPluginSetupFlags): string {
 	const explicit = flags.root?.find(root => root.trim().length > 0);
 	return explicit ? path.resolve(explicit) : getProjectDir();
+}
+
+function verifyBundleFiles(files: string[]): { ok: boolean; checked: string[]; missing: string[] } {
+	const missing = files.filter(file => !fs.existsSync(file));
+	return { ok: missing.length === 0, checked: files, missing };
 }
 
 export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetupFlags = {}): HostPluginSetupResult {
@@ -76,6 +83,9 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 			mutationPolicy:
 				"Fail-closed: delegation is read-only until you set GJC_COORDINATOR_MCP_MUTATIONS=sessions and pass allow_mutation:true per call.",
 			notes: [],
+			...(flags.check
+				? { check: verifyBundleFiles([manifestPath, marketplacePath, path.join(pluginPath, ".mcp.json")]) }
+				: {}),
 		};
 	}
 
@@ -102,6 +112,16 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 			"Codex acceptance is gated on a versioned local marketplace smoke: record the Codex version and confirm `tools/list` exposes the three delegate tools before claiming Codex support.",
 			"If the target Codex version rejects the shared mcpServers .mcp.json wrapper, emit a Codex-specific root MCP file only after the smoke verifies the accepted shape.",
 		],
+		...(flags.check
+			? {
+					check: verifyBundleFiles([
+						manifestPath,
+						marketplacePath,
+						path.join(pluginPath, ".codex.mcp.json"),
+						path.join(pluginPath, "skills", "gjc-delegation", "SKILL.md"),
+					]),
+				}
+			: {}),
 	};
 }
 

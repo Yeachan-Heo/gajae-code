@@ -440,14 +440,6 @@ function toolSchema(name: CoordinatorToolName): {
 						type: "boolean",
 						description: "When reusing a session with an active turn, supersede it before sending.",
 					},
-					worktree: {
-						type: "boolean",
-						description: "Reserved session-start knob; defaults true and cannot disable configured roots.",
-					},
-					worktree_name: {
-						type: "string",
-						description: "Optional requested worktree or session label, metadata-only in the first release.",
-					},
 					model: {
 						type: "string",
 						description: "Optional model hint passed in prompt metadata; no provider default is implied.",
@@ -1853,6 +1845,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					if (payload.ok === true) {
 						base.session_state = payload.session_state;
 						base.advisory_status = payload.advisory_status;
+					}
+					// Mirror gjc_coordinator_await_turn timeout semantics: a still-active
+					// turn at the deadline is a bounded timeout, not a completion.
+					if (!TERMINAL_TURN_STATUSES.has(awaitedTurn.status)) {
+						base.timed_out = true;
+						base.reason = "timeout";
 					}
 				}
 				return base;

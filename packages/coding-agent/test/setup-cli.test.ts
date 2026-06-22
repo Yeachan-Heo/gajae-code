@@ -387,4 +387,20 @@ describe("setup CLI host plugins", () => {
 			stdout.mockRestore();
 		}
 	});
+
+	it("performs a real non-mutating check against the generated bundle on disk", async () => {
+		const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
+		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		try {
+			await runSetupCommand({ component: "claude", flags: { json: true, check: true, root: [repoRoot] } });
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			const parsed = JSON.parse(output) as { check?: { ok: boolean; checked: string[]; missing: string[] } };
+			expect(parsed.check).toBeDefined();
+			expect(parsed.check?.checked.length).toBeGreaterThan(0);
+			expect(parsed.check?.ok).toBe(true);
+			expect(parsed.check?.missing).toEqual([]);
+		} finally {
+			stdout.mockRestore();
+		}
+	});
 });

@@ -569,4 +569,23 @@ describe("coordinator delegate tools", () => {
 			expect(delegation?.metadata).toMatchObject({ workflow: "team", tool_name: "gjc_delegate_team" });
 		});
 	});
+	it("surfaces a bounded timeout from await_completion when the turn stays active", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const result = await server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "Long task.",
+				allow_mutation: true,
+				await_completion: true,
+				timeout_ms: 0,
+			});
+			expect(result.awaited).toBe(true);
+			expect(result.timed_out).toBe(true);
+			expect(result.reason).toBe("timeout");
+		});
+	});
 });
