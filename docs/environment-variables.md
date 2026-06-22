@@ -234,18 +234,18 @@ providers:
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
-`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. When GJC creates that session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
+`gjc --tmux` launches the interactive TUI inside a GJC-managed tmux session. GJC may reuse a scoped managed session from the same project/branch when that session is tagged with the current GJC version; older-version sessions are not auto-attached after upgrades. When GJC creates a session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
 
 - `mouse on` — enables mouse-wheel scrolling into tmux copy-mode (history/scrollback).
 - `set-clipboard on` and a readable copy-mode `mode-style`.
-- GJC ownership/identity tags (`@gjc-profile`, branch/project markers).
+- GJC ownership/identity tags (`@gjc-profile`, version, branch/project markers).
 
 This profile is applied on macOS, Linux, and WSL (Linux) alike; only native Windows (`win32`) skips the tmux launch. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched — add `set -g mouse on` to your own `~/.tmux.conf`, or relaunch with `gjc --tmux` to get the managed profile.
 
 | Variable | Behavior |
 | --- | --- |
 | `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |
-| `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup |
+| `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup. Use a unique value (for example `GJC_TMUX_SESSION=gjc-fresh-$(date +%s) gjc --tmux`) to force a fresh named session. |
 | `GJC_TMUX_COMMAND` | tmux binary/command override for every GJC tmux flow (`GJC_TEAM_TMUX_COMMAND` is honored as a team-path alias) |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
 | `GJC_MOUSE` | Set `0`/`false`/`off` to skip `mouse on`, leaving wheel scrolling to the host terminal instead of tmux copy-mode |

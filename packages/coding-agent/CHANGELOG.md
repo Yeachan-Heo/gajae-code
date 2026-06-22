@@ -23,6 +23,9 @@
 - Free-text answers resolve pending asks and ask choices remain unredacted (#998, #1001).
 - Recover in-flight sessions after a connection drop and connect new sessions during the `getUpdates` long-poll (#988, #990).
 - Daemon hardening: deliver ask buttons at invocation, fix the topic-reuse race, write daemon logs to file with resilient frame handling, and de-duplicate idle output (#985, #991, and related).
+### Fixed
+
+- Avoided automatically reusing stale GJC-managed tmux sessions from older GJC versions after an upgrade; scoped `gjc --tmux` reuse now only auto-attaches sessions tagged with the current version.
 
 ## [0.6.5] - 2026-06-21
 

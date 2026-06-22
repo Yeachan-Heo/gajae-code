@@ -13,6 +13,7 @@ import {
 	type TmuxSpawnOptions,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { VERSION } from "@gajae-code/utils/dirs";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -341,6 +342,54 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.attachSessionName).toBe("custom-gjc");
 		expect(plan?.newSessionArgs.slice(0, 6)).toEqual(["new-session", "-d", "-s", "custom-gjc", "-c", "/repo"]);
 	});
+	it("does not auto-reuse scoped sessions from another GJC version", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				"old-gjc\t1\t0\t1770000000\t1\troot\t1\t12345\tfeature/demo\tfeature-demo\t/repo\told-session\t/state\t0.0.0",
+			),
+		);
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			project: "/repo",
+		});
+
+		expect(plan?.attachSessionName).toBeUndefined();
+		expect(plan?.newSessionArgs.slice(0, 2)).toEqual(["new-session", "-d"]);
+	});
+
+	it("auto-reuses scoped sessions from the current GJC version", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				`current-gjc\t1\t0\t1770000000\t1\troot\t1\t12345\tfeature/demo\tfeature-demo\t/repo\tcurrent-session\t/state\t${VERSION}`,
+			),
+		);
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			project: "/repo",
+		});
+
+		expect(plan?.attachSessionName).toBe("current-gjc");
+	});
 
 	it("does not reuse a same-branch session from another worktree path in the same project", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
@@ -423,6 +472,7 @@ describe("default GJC tmux launch", () => {
 			{
 				sessionId: "session-123",
 				sessionStateFile: "/tmp/gjc-state/session.json",
+				version: VERSION,
 			},
 		);
 		const args = commands.map(command => command.args);
@@ -435,6 +485,7 @@ describe("default GJC tmux launch", () => {
 			"@gjc-session-state-file",
 			"/tmp/gjc-state/session.json",
 		]);
+		expect(args).toContainEqual(["set-option", "-t", "gjc-session:0", "@gjc-version", VERSION]);
 	});
 
 	it("plans matching tmux marker tags and inner process marker env", () => {
@@ -476,6 +527,7 @@ describe("default GJC tmux launch", () => {
 			platform: "darwin",
 			tty: interactiveTty,
 			tmuxAvailable: true,
+			existingBranchSessionName: null,
 		});
 		expect(plan).toBeDefined();
 		if (!plan?.sessionStateFile) throw new Error("expected tmux plan with state file");
@@ -864,6 +916,7 @@ describe("default GJC tmux launch", () => {
 		// The GJC-launched tmux/profile path must not bypass mouse scrolling on WSL.
 		expect(calls.some(call => call.command === "tmux")).toBe(true);
 		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "mouse", "on"]);
+		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "@gjc-version", VERSION]);
 		// All profile mutations stay scoped to the GJC session, never global tmux state.
 		expect(calls.flatMap(call => call.args)).not.toContain("-g");
 	});
@@ -893,5 +946,6 @@ describe("default GJC tmux launch", () => {
 		const sessionName = created?.args[3] ?? "";
 		expect(calls.flatMap(call => call.args)).not.toContain("mouse");
 		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "@gjc-profile", "1"]);
+		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "@gjc-version", VERSION]);
 	});
 });
