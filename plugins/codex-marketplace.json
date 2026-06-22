@@ -1,0 +1,11 @@
+{
+  "name": "gajae-code-local",
+  "plugins": [
+    {
+      "name": "gajae-code",
+      "source": {
+        "path": "./plugins"
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "gjc-coordinator": {
+      "command": "gjc",
+      "args": [
+        "mcp-serve",
+        "coordinator"
+      ],
+      "env": {
+        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "${CLAUDE_PROJECT_DIR}",
+        "GJC_COORDINATOR_MCP_REPO": "gajae-code-plugin",
+        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "gjc --worktree"
+      }
+    }
+  }
+}

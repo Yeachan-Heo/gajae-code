@@ -1,0 +1,28 @@
+{
+  "name": "gajae-code",
+  "owner": {
+    "name": "Gajae Code"
+  },
+  "metadata": {
+    "description": "GJC delegation plugin",
+    "version": "0.6.5"
+  },
+  "plugins": [
+    {
+      "name": "gajae-code",
+      "source": "..",
+      "description": "Delegate GJC planning/execution/team workflows via coordinator MCP.",
+      "version": "0.6.5",
+      "author": {
+        "name": "Gajae Code"
+      },
+      "keywords": [
+        "gjc",
+        "delegation",
+        "mcp",
+        "planning",
+        "agents"
+      ]
+    }
+  ]
+}
