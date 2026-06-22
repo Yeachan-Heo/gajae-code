@@ -285,7 +285,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 							steerMessage: message,
 							steerState: steerStates.get(record.subagentId) ?? "queued",
 							steerPauseRequested: params.pause === true,
-							guidance: snapshot.guidance ? `${snapshot.guidance} ${STEER_QUEUED_GUIDANCE}` : STEER_QUEUED_GUIDANCE,
+							guidance: snapshot.guidance
+								? `${snapshot.guidance} ${STEER_QUEUED_GUIDANCE}`
+								: STEER_QUEUED_GUIDANCE,
 						};
 					}),
 					...missing,

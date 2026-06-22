@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
-import { AgentSession, type AgentSessionConfig, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionConfig,
+	type AgentSessionEvent,
+} from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 type SteerDetails = {
@@ -49,7 +53,11 @@ describe("AgentSession subagent steer observation", () => {
 	it("emits a UI-only child steer message and relays it to the main session", async () => {
 		const registry = new AgentRegistry();
 		const mainSessionManager = SessionManager.inMemory();
-		const mainSession = createSession({ agentId: MAIN_AGENT_ID, agentRegistry: registry, sessionManager: mainSessionManager });
+		const mainSession = createSession({
+			agentId: MAIN_AGENT_ID,
+			agentRegistry: registry,
+			sessionManager: mainSessionManager,
+		});
 		const childSession = createSession({ agentId: "5-ClusterB", agentRegistry: registry });
 		sessions.push(mainSession, childSession);
 		registry.register({ id: MAIN_AGENT_ID, displayName: "Main", kind: "main", session: mainSession });
@@ -63,7 +71,12 @@ describe("AgentSession subagent steer observation", () => {
 		const mainAppendCustomSpy = vi.spyOn(mainSessionManager, "appendCustomMessageEntry");
 		const mainMessageCount = mainSession.messages.length;
 
-		childSession.emitSubagentSteerObservation({ from: "0-Main", to: "5-ClusterB", body: "Please check this.", timestamp: 123 });
+		childSession.emitSubagentSteerObservation({
+			from: "0-Main",
+			to: "5-ClusterB",
+			body: "Please check this.",
+			timestamp: 123,
+		});
 
 		await new Promise(resolve => setTimeout(resolve, 20));
 
