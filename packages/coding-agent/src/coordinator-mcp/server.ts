@@ -1851,6 +1851,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					if (!TERMINAL_TURN_STATUSES.has(awaitedTurn.status)) {
 						base.timed_out = true;
 						base.reason = "timeout";
+						base.ok = false;
 					}
 				}
 				return base;

@@ -84,14 +84,23 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 				"Fail-closed: delegation is read-only until you set GJC_COORDINATOR_MCP_MUTATIONS=sessions and pass allow_mutation:true per call.",
 			notes: [],
 			...(flags.check
-				? { check: verifyBundleFiles([manifestPath, marketplacePath, path.join(pluginPath, ".mcp.json")]) }
+				? {
+						check: verifyBundleFiles([
+							manifestPath,
+							marketplacePath,
+							path.join(pluginPath, ".claude-plugin", ".mcp.json"),
+							path.join(pluginPath, ".claude-plugin", "commands", "delegate_execute.md"),
+							path.join(pluginPath, ".claude-plugin", "skills", "gjc-delegation", "SKILL.md"),
+						]),
+					}
 				: {}),
 		};
 	}
 
-	// Codex is gated on a versioned local marketplace smoke.
+	// Codex remains preview-only until the operator proves the target Codex build
+	// can install and activate personal marketplace plugins at runtime.
 	const manifestPath = path.join(pluginPath, ".codex-plugin", "plugin.json");
-	const marketplacePath = path.join(pluginPath, "codex-marketplace.json");
+	const marketplacePath = path.join(pluginPath, ".agents", "plugins", "marketplace.json");
 	return {
 		ok: true,
 		host,
@@ -101,22 +110,23 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 		manifestPath,
 		marketplacePath,
 		installGuidance: [
-			`Add the local marketplace: codex plugin marketplace add ${pluginPath}`,
-			"Install the plugin: codex plugin install gajae-code",
-			"Then call gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team from Codex.",
+			`Preview the documented personal marketplace file: ${marketplacePath}`,
+			"Do not run `codex plugin install gajae-code`; this setup is fail-closed until a versioned Codex smoke proves install and runtime activation for the target build.",
+			"Smoke by registering the personal marketplace, then confirm a fresh Codex runtime exposes gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team before claiming support.",
 		],
 		coordinatorConfigPreview: { command: "gjc", args: ["mcp-serve", "coordinator"], env },
 		mutationPolicy:
 			"Fail-closed: delegation is read-only until you set GJC_COORDINATOR_MCP_MUTATIONS=sessions and pass allow_mutation:true per call.",
 		notes: [
-			"Codex acceptance is gated on a versioned local marketplace smoke: record the Codex version and confirm `tools/list` exposes the three delegate tools before claiming Codex support.",
-			"If the target Codex version rejects the shared mcpServers .mcp.json wrapper, emit a Codex-specific root MCP file only after the smoke verifies the accepted shape.",
+			"Codex setup is preview-only: generated files follow the documented ~/.agents/plugins/marketplace.json personal marketplace shape and plugin.json uses mcp_servers, but runtime install/activation is not claimed without a versioned local smoke.",
+			"The legacy top-level plugins/codex-marketplace.json is generated only as a compatibility copy of the documented .agents/plugins marketplace file.",
 		],
 		...(flags.check
 			? {
 					check: verifyBundleFiles([
 						manifestPath,
 						marketplacePath,
+						path.join(pluginPath, "codex-marketplace.json"),
 						path.join(pluginPath, ".codex.mcp.json"),
 						path.join(pluginPath, "skills", "gjc-delegation", "SKILL.md"),
 					]),

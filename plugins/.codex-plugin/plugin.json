@@ -3,5 +3,18 @@
   "version": "0.6.5",
   "description": "Delegate Codex tasks to GJC workflows through coordinator MCP.",
   "skills": "./skills",
-  "mcpServers": "./.codex.mcp.json"
+  "mcp_servers": {
+    "gjc-coordinator": {
+      "command": "gjc",
+      "args": [
+        "mcp-serve",
+        "coordinator"
+      ],
+      "env": {
+        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "${PWD}",
+        "GJC_COORDINATOR_MCP_REPO": "gajae-code-plugin",
+        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "gjc --worktree"
+      }
+    }
+  }
 }

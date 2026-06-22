@@ -54,6 +54,24 @@ for (const [rel, content] of files) {
 	else if (actual !== content) driftProblems.push(`drift plugins/${rel}`);
 }
 gate("committed bundle matches renderer", driftProblems.length === 0, driftProblems.join("; ") || "in sync");
+const claudeMarketplace = JSON.parse(files.get(path.join(".claude-plugin", "marketplace.json")) ?? "{}") as {
+	plugins?: Array<{ source?: unknown }>;
+};
+const claudeSources = claudeMarketplace.plugins?.map(plugin => plugin.source) ?? [];
+const claudeSourcesStayInsideRoot = claudeSources.every(source => typeof source === "string" && !source.includes(".."));
+gate(
+	"Claude marketplace source stays inside root",
+	claudeSources.length > 0 && claudeSourcesStayInsideRoot,
+	`sources: ${claudeSources.map(source => JSON.stringify(source)).join(", ") || "none"}`,
+);
+gate(
+	"Claude marketplace source has bundled assets",
+	files.has(path.join(".claude-plugin", ".mcp.json")) &&
+		files.has(path.join(".claude-plugin", "commands", "delegate_execute.md")) &&
+		files.has(path.join(".claude-plugin", "skills", "gjc-delegation", "SKILL.md")),
+	"manifest assets are present below .claude-plugin",
+);
+
 
 // Fail-closed env invariants across every generated .mcp.json.
 const mcpFiles = [...files.keys()].filter(rel => rel.endsWith(".mcp.json"));
@@ -72,6 +90,23 @@ gate("at least one generated MCP config", mcpChecked > 0, `mcp files: ${mcpCheck
 gate("MCP config uses WORKDIR_ROOTS", workdirRootsOk, "all generated MCP configs set the allowlist var");
 gate("MCP config omits invalid ROOTS var", noBadRoots, "no GJC_COORDINATOR_MCP_ROOTS present");
 gate("MCP config omits MUTATIONS by default", noMutations, "fail-closed: mutations off until opt-in");
+const codexMarketplaceRel = path.join(".agents", "plugins", "marketplace.json");
+const codexMarketplaceText = files.get(codexMarketplaceRel) ?? "";
+const codexMarketplace = JSON.parse(codexMarketplaceText || "{}") as {
+	plugins?: Array<{ source?: { source?: string; path?: string }; policy?: { installation?: string } }>;
+};
+const codexPlugin = JSON.parse(files.get(path.join(".codex-plugin", "plugin.json")) ?? "{}") as Record<string, unknown>;
+gate("Codex marketplace uses documented path", files.has(codexMarketplaceRel), codexMarketplaceRel);
+gate(
+	"Codex marketplace uses local source shape",
+	codexMarketplace.plugins?.some(plugin => plugin.source?.source === "local" && plugin.source.path === "./plugins") === true,
+	codexMarketplaceText.trim(),
+);
+gate(
+	"Codex plugin uses mcp_servers",
+	"mcp_servers" in codexPlugin && !("mcpServers" in codexPlugin),
+	Object.keys(codexPlugin).join(", "),
+);
 
 // Command/skill docs reference the delegate tools.
 let docsReferenceTools = true;

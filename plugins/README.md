@@ -5,8 +5,11 @@ coordinator contract and the coding-agent package version. Do not edit them by
 hand; run `bun run generate-plugins` and commit the result. CI runs
 `bun run check:plugins` to fail on drift.
 
-- `.claude-plugin/` — Claude Code manifest + marketplace entry.
-- `.codex-plugin/` — Codex manifest (Codex acceptance is gated on a versioned
-  local marketplace smoke; see `codex-marketplace.json`).
-- `.mcp.json` — shared fail-closed coordinator MCP wiring.
+- `.claude-plugin/` — Claude Code manifest, marketplace entry, and copied
+  command/skill/MCP assets so the marketplace source stays inside its root.
+- `.agents/plugins/marketplace.json` — Codex personal marketplace preview in
+  the documented layout; Codex runtime activation remains gated on a versioned
+  local smoke.
+- `.codex-plugin/` — Codex manifest using the documented `mcp_servers` key.
+- `.mcp.json` / `.codex.mcp.json` — shared fail-closed coordinator MCP wiring.
 - `commands/`, `skills/` — host-facing delegate command + skill docs.

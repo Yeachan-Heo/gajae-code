@@ -583,6 +583,7 @@ describe("coordinator delegate tools", () => {
 				await_completion: true,
 				timeout_ms: 0,
 			});
+			expect(result.ok).toBe(false);
 			expect(result.awaited).toBe(true);
 			expect(result.timed_out).toBe(true);
 			expect(result.reason).toBe("timeout");
