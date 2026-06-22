@@ -134,6 +134,11 @@ Mutating tools:
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
+- `gjc_delegate_plan`
+- `gjc_delegate_execute`
+- `gjc_delegate_team`
+
+The `gjc_delegate_*` tools are high-level, session-level delegation: each starts (or reuses) a session and sends one workflow-tagged turn that runs `/skill:ralplan`, `/skill:ultragoal`, or `/skill:team` to completion, returning a durable `turn_id`, status, and artifact references. They use the same `sessions` mutation class and fail-closed workdir gating as `gjc_coordinator_start_session`, and emit a `delegation.started` event. Pass `cwd` and `task`; set `allow_mutation: true` only with startup mutation opt-in plus per-call consent. Prefer these over manual `start_session` + `send_prompt` when delegating a whole workflow.
 
 
 `gjc_coordinator_register_session` registers an existing visible tmux-backed GJC pane as the coordinator-authoritative session. Use it when an operator has already launched a visible terminal/tmux lane and the external coordinator must send prompts to that same pane instead of creating a hidden `gjc-coordinator-*` session. The tool validates the workdir allowlist, safe session/target tokens, and tmux target liveness before writing session state.

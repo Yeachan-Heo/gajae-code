@@ -20,6 +20,7 @@ Normal standalone GJC (`gjc`, `gjc --tmux`, and print-mode prompts) does not inh
 ### Coordinator MCP
 
 Coordinator MCP is the default answer for external bot and orchestration integrations. It exposes a transport-level MCP tool contract for session discovery, managed session start, visible tmux registration, prompt delivery, bounded turn waiting, structured question answering, artifact reads, and explicit completion/failure/cancellation reports.
+It also exposes high-level `gjc_delegate_plan` / `gjc_delegate_execute` / `gjc_delegate_team` tools so a host can delegate a whole GJC workflow (ralplan/ultragoal/team) in one call and consume the durable turn result. The canonical gajae-code plugin bundles under `plugins/` (installable in Claude Code and, gated, Codex) and `gjc setup claude|codex|hermes` package this surface with fail-closed defaults (workdir-scoped roots, mutations off until opt-in).
 
 Readiness claim:
 
