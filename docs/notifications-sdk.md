@@ -1,5 +1,9 @@
 # Notifications SDK
 
+<p align="center">
+  <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code 0.7.0 mobile answers for coding agents hero illustration" width="100%" />
+</p>
+
 A small, transport-agnostic way to get **action-needed** signals out of a GJC
 session and deliver **replies** back — without scraping the terminal and without
 the depth of the RPC / Coordinator / Bridge surfaces.
