@@ -176,9 +176,7 @@ async function runSmokeTest(): Promise<void> {
 	// the COMPILED single binary (dev runs only load the on-disk .node). Loading the
 	// natives module triggers loadNative()/embedded extraction; calling each new
 	// export confirms the symbols are present in the shipped binary.
-	const { h06FormatHashLines, h02ScoreSequenceFuzzy, h01FindBestFuzzyMatch } = await import(
-		"../../natives/native/index.js"
-	);
+	const { h06FormatHashLines, h02ScoreSequenceFuzzy, h01FindBestFuzzyMatch } = await import("@gajae-code/natives");
 	const hashed = h06FormatHashLines("a\nb", 1);
 	if (hashed.split("\n").length !== 2) {
 		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);

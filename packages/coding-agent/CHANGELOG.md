@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed packaged source installs (`gajae-code` wrapper) failing `gjc --smoke-test` because native smoke/fallback imports used monorepo-relative paths instead of the `@gajae-code/natives` package export.
 
 ## [0.7.0] - 2026-06-22
 
