@@ -1128,3 +1128,228 @@ describe("telegram daemon reconnect answer routing", () => {
 		expect(replyFrame).toEqual({ type: "reply", id: "ask1", answer: 0, token: "ts" });
 	});
 });
+
+test("pollOnce resolves to 0 when the in-flight getUpdates is aborted", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const bot = {
+		call: (_method: string, _body: unknown, opts?: { signal?: AbortSignal }) =>
+			new Promise((_resolve, reject) => {
+				opts?.signal?.addEventListener("abort", () =>
+					reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" })),
+				);
+			}),
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const ac = new AbortController();
+	const pending = daemon.pollOnce(ac.signal);
+	ac.abort();
+	expect(await pending).toBe(0);
+});
+
+test("pollOnce backs off on a Telegram 409 conflict instead of processing updates", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let slept = 0;
+	const bot = {
+		call: async () => ({
+			ok: false,
+			error_code: 409,
+			description: "Conflict: terminated by other getUpdates request",
+		}),
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		setTimeoutImpl: ((cb: () => void) => {
+			slept++;
+			cb();
+			return 0;
+		}) as any,
+	});
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(slept).toBe(1);
+});
+
+test("requestStop aborts the active long poll and run() exits, releasing ownership", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "e60b05c186ca",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	const bot = {
+		call: (method: string, _body: unknown, opts?: { signal?: AbortSignal }) => {
+			if (method === "getUpdates") {
+				return new Promise((_resolve, reject) => {
+					opts?.signal?.addEventListener("abort", () =>
+						reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+					);
+				});
+			}
+			return Promise.resolve({ ok: true, result: true });
+		},
+	};
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		setTimeoutImpl: ((cb: () => void) => {
+			cb();
+			return 0;
+		}) as any,
+	});
+	daemon.connectSession("S", "ws://s", "t");
+	const runPromise = daemon.run();
+	await new Promise(resolve => setTimeout(resolve, 5));
+	daemon.requestStop("signal");
+	await runPromise;
+	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+});
+
+test("run() loop exits when an owner-scoped control request asks it to stop", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "e60b05c186ca",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	let cleared = false;
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		control: {
+			shouldStop: async owner => owner === "owner",
+			clear: async () => {
+				cleared = true;
+			},
+		},
+		setTimeoutImpl: ((cb: () => void) => {
+			cb();
+			return 0;
+		}) as any,
+	});
+	await daemon.run();
+	expect(cleared).toBe(true);
+	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+});
+
+test("run() persists aliases before releasing ownership on exit", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "e60b05c186ca",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	let now = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		idleTimeoutMs: 10,
+		now: () => (now += 11),
+		setTimeoutImpl: ((cb: () => void) => {
+			cb();
+			return 0;
+		}) as any,
+	});
+	daemon.aliasTable.put({ sessionId: "S", actionId: "ask", answer: 0 });
+	await daemon.run();
+	expect(fs.existsSync(daemonPaths(agentDir).aliases)).toBe(true);
+});
+
+test("a fresh daemon scanRoots reconnects an existing session endpoint", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "live-session" });
+	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(path.join(endpointDir, "live-session.json"), JSON.stringify({ url: "ws://live", token: "tok" }));
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+	});
+	await daemon.scanRoots();
+	expect(daemon.sessions.has("live-session")).toBe(true);
+	expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
+});
+
+test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let stopped = false;
+	let resolveRun: (() => void) | undefined;
+	class StubDaemon {
+		constructor(public opts: unknown) {}
+		requestStop(): void {
+			stopped = true;
+			resolveRun?.();
+		}
+		run(): Promise<void> {
+			return new Promise<void>(resolve => {
+				resolveRun = resolve;
+			});
+		}
+	}
+	const originalOnce = process.once.bind(process);
+	const originalOff = process.off.bind(process);
+	let sigtermHandler: (() => void) | undefined;
+	(process as any).once = (event: string, handler: () => void) => {
+		if (event === "SIGTERM") sigtermHandler = handler;
+		// Do not register real signal handlers in-process; just capture them.
+		return process;
+	};
+	(process as any).off = () => process;
+	try {
+		const runPromise = runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
+			SettingsImpl: { init: async () => s },
+			DaemonImpl: StubDaemon as any,
+		});
+		await new Promise(resolve => setTimeout(resolve, 5));
+		expect(sigtermHandler).toBeTruthy();
+		sigtermHandler?.();
+		await runPromise;
+		expect(stopped).toBe(true);
+	} finally {
+		(process as any).once = originalOnce;
+		(process as any).off = originalOff;
+	}
+});

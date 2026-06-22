@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
+import type { DaemonRuntimeInfo } from "../daemon/control-types";
+import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
@@ -19,7 +21,7 @@ import {
 } from "./telegram-reference";
 import { decideThreadedInbound } from "./threaded-inbound";
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
-import { TopicRegistry } from "./topic-registry";
+import { TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
 export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled";
 
@@ -370,6 +372,20 @@ export async function releaseDaemonOwnership(input: {
 	await fsImpl.unlink(paths.lock).catch(() => undefined);
 }
 
+/** Read the persisted daemon ownership state (or undefined when absent). */
+export async function readDaemonState(
+	settings: Settings,
+	fs: TelegramDaemonFs = nodeFs,
+): Promise<DaemonState | undefined> {
+	return readJson<DaemonState>(fs, daemonPaths(settings.getAgentDir()).state);
+}
+
+/** Read the persisted notification roots list. */
+export async function readDaemonRoots(settings: Settings, fs: TelegramDaemonFs = nodeFs): Promise<string[]> {
+	const roots = await readJson<{ roots?: string[] }>(fs, daemonPaths(settings.getAgentDir()).roots);
+	return roots?.roots ?? [];
+}
+
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -377,6 +393,11 @@ function defaultPidAlive(pid: number): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/** True for AbortError-shaped rejections raised when an in-flight fetch is aborted. */
+function isAbortError(err: unknown): boolean {
+	return err instanceof Error && (err.name === "AbortError" || /\baborted\b/i.test(err.message));
 }
 
 function defaultDaemonSpawn(
@@ -402,6 +423,89 @@ function defaultDaemonSpawn(
 	return { unref: () => child.unref() };
 }
 
+export interface TelegramSpawnOwnerInput {
+	settings: Settings;
+	roots?: string[];
+	tokenFingerprint: string;
+	chatId: string;
+}
+
+export interface TelegramSpawnOwnerResult {
+	result: EnsureDaemonResult;
+	ownerId?: string;
+	runtime: DaemonRuntimeInfo;
+	warnings: string[];
+}
+
+/**
+ * Build the detached spawn command/args for the daemon-internal entrypoint.
+ * Source mode prepends the entry script so the respawn loads edited source;
+ * a compiled binary self-spawns its own subcommand directly.
+ */
+export function buildTelegramDaemonSpawnArgs(input: { execPath?: string; ownerId: string; agentDir: string }): {
+	command: string;
+	args: string[];
+	runtime: DaemonRuntimeInfo;
+} {
+	const rt = resolveGjcRuntimeSpawnInfo(input.execPath ?? process.execPath);
+	const args = [
+		...rt.argsPrefix,
+		"notify",
+		"daemon-internal",
+		"--owner-id",
+		input.ownerId,
+		"--agent-dir",
+		input.agentDir,
+	];
+	const runtime: DaemonRuntimeInfo = {
+		mode: rt.mode,
+		execPath: rt.execPath,
+		reloadPicksUpSourceEdits: rt.reloadPicksUpSourceEdits,
+		warning: rt.warning,
+	};
+	return { command: rt.execPath, args, runtime };
+}
+
+/**
+ * Acquire ownership for the given Telegram identity and, if acquired, spawn a
+ * fresh detached daemon process. Does NOT register notification roots; callers
+ * that own a session (autostart) register roots separately, while reload reuses
+ * already-persisted roots.
+ */
+export async function spawnTelegramDaemonOwner(
+	input: TelegramSpawnOwnerInput,
+	deps: TelegramDaemonDeps = {},
+): Promise<TelegramSpawnOwnerResult> {
+	const agentDir = input.settings.getAgentDir();
+	const execPath = deps.execPath ?? process.execPath;
+	const ownership = await acquireDaemonOwnership({
+		settings: input.settings,
+		roots: input.roots,
+		tokenFingerprint: input.tokenFingerprint,
+		chatId: input.chatId,
+		fs: deps.fs,
+		now: deps.now,
+		pid: deps.pid,
+		pidAlive: deps.pidAlive,
+		randomId: deps.randomId,
+	});
+	// One source of truth for runtime detection + spawn args (no duplicate resolve).
+	const { command, args, runtime } = buildTelegramDaemonSpawnArgs({
+		execPath,
+		ownerId: ownership.ownerId ?? "",
+		agentDir,
+	});
+	if (!ownership.acquired) return { result: "attached", runtime, warnings: [] };
+	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
+	const child = spawnImpl(command, args, {
+		detached: true,
+		stdio: "ignore",
+		logPath: path.join(daemonPaths(agentDir).dir, "daemon.log"),
+	});
+	child?.unref?.();
+	return { result: "owner_spawned", ownerId: ownership.ownerId, runtime, warnings: [] };
+}
+
 export async function ensureTelegramDaemonRunning(
 	input: { settings: Settings; cwd: string; sessionId: string },
 	deps: TelegramDaemonDeps = {},
@@ -410,45 +514,27 @@ export async function ensureTelegramDaemonRunning(
 	if (!isGloballyConfigured(cfg) || !cfg.botToken || !cfg.chatId) return "disabled";
 	const root = await registerNotificationRoot({ ...input, fs: deps.fs });
 	const fp = tokenFingerprint(cfg.botToken);
-	const ownership = await acquireDaemonOwnership({
-		settings: input.settings,
-		roots: [root],
-		tokenFingerprint: fp,
-		chatId: cfg.chatId,
-		fs: deps.fs,
-		now: deps.now,
-		pid: deps.pid,
-		pidAlive: deps.pidAlive,
-		randomId: deps.randomId,
-	});
-	if (!ownership.acquired) return "attached";
-	const execPath = deps.execPath ?? process.execPath;
-	// Source mode (bun/node) needs the entry script prepended; a compiled single-file
-	// binary (basename gjc/etc.) self-spawns its own subcommand directly.
-	const base = path.basename(execPath).toLowerCase();
-	const fromSource = base === "bun" || base === "node" || base.startsWith("bun") || base.startsWith("node");
-	const mainScript = fromSource && typeof Bun !== "undefined" ? (Bun as unknown as { main?: string }).main : undefined;
-	const args = [
-		...(mainScript ? [mainScript] : []),
-		"notify",
-		"daemon-internal",
-		"--owner-id",
-		ownership.ownerId!,
-		"--agent-dir",
-		input.settings.getAgentDir(),
-	];
-	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
-	const child = spawnImpl(execPath, args, {
-		detached: true,
-		stdio: "ignore",
-		logPath: path.join(daemonPaths(input.settings.getAgentDir()).dir, "daemon.log"),
-	});
-	child?.unref?.();
-	return "owner_spawned";
+	const spawned = await spawnTelegramDaemonOwner(
+		{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
+		deps,
+	);
+	return spawned.result;
 }
 
 export interface BotApi {
-	call(method: string, body: unknown): Promise<unknown>;
+	call(method: string, body: unknown, opts?: { signal?: AbortSignal }): Promise<unknown>;
+}
+
+/**
+ * Cooperative control seam for the daemon run loop. Implemented by the
+ * daemon-internal CLI / controller against the owner-scoped control-request
+ * file so the daemon does not import the control module directly.
+ */
+export interface DaemonControlHooks {
+	/** Returns true when a stop/reload has been requested for this owner. */
+	shouldStop(ownerId: string): Promise<boolean>;
+	/** Clear a consumed control request (best-effort). */
+	clear?(ownerId: string): Promise<void>;
 }
 
 export interface TelegramDaemonOptions {
@@ -469,6 +555,7 @@ export interface TelegramDaemonOptions {
 	scanIntervalMs?: number;
 	pid?: number;
 	botApi?: BotApi;
+	control?: DaemonControlHooks;
 }
 
 interface SessionSocket {
@@ -505,12 +592,29 @@ export class TelegramNotificationDaemon {
 	private readonly busy = new Set<string>();
 	/** Inbound update id → originating Telegram message, for delivery reactions. */
 	private readonly inboundReactions = new Map<number, { messageId: number }>();
+	/** AbortController for the in-flight long poll; aborted by requestStop() to wake the loop. */
+	private activePoll: AbortController | undefined;
+	/** Set when a cooperative stop has been requested (signal or control request). */
+	private stopRequested = false;
+	/** Current bounded backoff after a Telegram getUpdates 409 conflict (0 when healthy). */
+	private pollConflictBackoffMs = 0;
+
+	/**
+	 * Cooperatively stop the daemon: set the stop flag and abort the in-flight
+	 * long poll so the run loop wakes immediately instead of waiting out the
+	 * ~25s getUpdates timeout. Safe to call from a signal handler.
+	 */
+	requestStop(_reason?: "reload" | "stop" | "signal"): void {
+		this.stopRequested = true;
+		this.running = false;
+		this.activePoll?.abort();
+	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
 		this.aliasTable = createAliasTable();
 		this.botApi = opts.botApi ?? {
-			call: async (method, body) => {
+			call: async (method, body, callOpts) => {
 				const apiBase = opts.apiBase ?? "https://api.telegram.org";
 				const url = `${apiBase}/bot${opts.botToken}/${method}`;
 				const fetchImpl = opts.fetchImpl ?? fetch;
@@ -534,7 +638,12 @@ export class TelegramNotificationDaemon {
 					if (b.caption) form.set("caption", b.caption);
 					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
 					form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
-					const res = await fetchWithRetry(fetchImpl, url, { method: "POST", body: form }, sleep);
+					const res = await fetchWithRetry(
+						fetchImpl,
+						url,
+						{ method: "POST", body: form, signal: callOpts?.signal },
+						sleep,
+					);
 					return res.json();
 				}
 				const res = await fetchWithRetry(
@@ -544,6 +653,7 @@ export class TelegramNotificationDaemon {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify(body),
+						signal: callOpts?.signal,
 					},
 					sleep,
 				);
@@ -741,18 +851,10 @@ export class TelegramNotificationDaemon {
 
 	async loadTopics(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const raw = await readJson<{ topics?: Record<string, unknown> }>(
-			this.fsImpl,
-			path.join(paths.dir, "telegram-topics.json"),
-		);
-		if (raw && typeof raw === "object") {
-			// Reconstruct via a fresh registry then copy in (TopicRegistry loads from state in ctor).
-			const restored = new TopicRegistry(raw as never);
-			for (const sid of Object.keys(raw.topics ?? {})) {
-				const rec = restored.get(sid);
-				if (rec) await this.topics.getOrCreateTopic(sid, async () => rec.topicId, this.opts.now);
-			}
-		}
+		const raw = await readJson<TopicRegistryState>(this.fsImpl, path.join(paths.dir, "telegram-topics.json"));
+		// Restore the full serialized registry (topicId + identitySent + name) so a
+		// fresh daemon after reload does not resend identity headers or lose renames.
+		if (raw && typeof raw === "object") this.topics.load(raw);
 	}
 
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
@@ -1085,22 +1187,43 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	async pollOnce(): Promise<number> {
-		let body: { result?: Array<{ update_id: number } & Record<string, unknown>> };
+	async pollOnce(signal?: AbortSignal): Promise<number> {
+		let body: {
+			ok?: boolean;
+			error_code?: number;
+			description?: string;
+			result?: Array<{ update_id: number } & Record<string, unknown>>;
+		};
 		try {
-			body = (await this.botApi.call("getUpdates", {
-				offset: this.offset,
-				timeout: 25,
-				allowed_updates: ["message", "callback_query"],
-			})) as { result?: Array<{ update_id: number } & Record<string, unknown>> };
+			body = (await this.botApi.call(
+				"getUpdates",
+				{ offset: this.offset, timeout: 25, allowed_updates: ["message", "callback_query"] },
+				{ signal },
+			)) as typeof body;
 		} catch (err) {
+			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
+			if (isAbortError(err)) return 0;
 			// A transient Telegram API failure (e.g. ECONNRESET on the long-poll) must
 			// never crash the daemon — that silently stops all delivery, including ask
 			// notifications. Log, back off, and let the run loop retry.
 			console.error("notifications daemon: getUpdates failed:", err);
-			await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, POLL_BACKOFF_MS));
+			await this.sleep(POLL_BACKOFF_MS, signal);
 			return 0;
 		}
+		// Telegram allows only one active getUpdates poller per bot. A 409 means
+		// another poller is live; back off boundedly instead of hot-looping.
+		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
+			this.pollConflictBackoffMs = Math.min(
+				this.pollConflictBackoffMs ? this.pollConflictBackoffMs * 2 : 500,
+				5_000,
+			);
+			console.error(
+				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${this.pollConflictBackoffMs}ms`,
+			);
+			await this.sleep(this.pollConflictBackoffMs, signal);
+			return 0;
+		}
+		this.pollConflictBackoffMs = 0;
 		for (const update of body.result ?? []) {
 			this.offset = update.update_id + 1;
 			try {
@@ -1110,6 +1233,22 @@ export class TelegramNotificationDaemon {
 			}
 		}
 		return body.result?.length ?? 0;
+	}
+
+	/** Abortable sleep honoring the injected timer; resolves early on abort. */
+	private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+		return new Promise<void>(resolve => {
+			if (signal?.aborted) return resolve();
+			const timer = (this.opts.setTimeoutImpl ?? setTimeout)(() => resolve(), ms);
+			signal?.addEventListener(
+				"abort",
+				() => {
+					(this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
+					resolve();
+				},
+				{ once: true },
+			);
+		});
 	}
 
 	/** Sync the bot's Telegram command menu to what the daemon actually handles. */
@@ -1147,6 +1286,7 @@ export class TelegramNotificationDaemon {
 			let idleSince = (this.opts.now ?? Date.now)();
 			let pollBackoffMs = 0;
 			while (this.running) {
+				if (await this.controlStopRequested()) break;
 				if (
 					!(await renewDaemonHeartbeat({
 						settings: this.opts.settings,
@@ -1158,12 +1298,14 @@ export class TelegramNotificationDaemon {
 				)
 					break;
 				await this.runScan();
+				if (await this.controlStopRequested()) break;
 				if (this.sessions.size === 0) {
 					if ((this.opts.now ?? Date.now)() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000)) break;
 				} else {
 					idleSince = (this.opts.now ?? Date.now)();
+					this.activePoll = new AbortController();
 					try {
-						await this.pollOnce();
+						await this.pollOnce(this.activePoll.signal);
 						pollBackoffMs = 0;
 					} catch (e) {
 						// A transient getUpdates/network failure must not kill the
@@ -1173,20 +1315,39 @@ export class TelegramNotificationDaemon {
 						logger.warn(`notifications: getUpdates failed, backing off ${pollBackoffMs}ms: ${String(e)}`);
 						await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, pollBackoffMs));
 						continue;
+					} finally {
+						this.activePoll = undefined;
 					}
 				}
+				if (await this.controlStopRequested()) break;
 				await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, 10));
 			}
 		} finally {
 			this.stopFlushTimer();
 			this.stopScanTimer();
 			this.stopTypingTimer();
+			// Persist durable state before releasing ownership so a fresh daemon
+			// (e.g. after reload) reloads aliases/topics seamlessly.
+			await this.persistAliases().catch(() => undefined);
+			await this.persistTopics().catch(() => undefined);
+			await this.opts.control?.clear?.(this.opts.ownerId).catch(() => undefined);
 			await releaseDaemonOwnership({
 				settings: this.opts.settings,
 				ownerId: this.opts.ownerId,
 				fs: this.fsImpl,
 				now: this.opts.now,
 			});
+		}
+	}
+
+	/** True when a signal-driven stop or an owner-scoped control request asks the loop to exit. */
+	private async controlStopRequested(): Promise<boolean> {
+		if (this.stopRequested) return true;
+		if (!this.opts.control) return false;
+		try {
+			return await this.opts.control.shouldStop(this.opts.ownerId);
+		} catch {
+			return false;
 		}
 	}
 }

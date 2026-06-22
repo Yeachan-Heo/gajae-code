@@ -52,6 +52,14 @@ export class TopicRegistry {
 		for (const [sessionId, record] of this.topics) this.byTopic.set(record.topicId, sessionId);
 	}
 
+	/** Merge a serialized state into this registry, preserving all persisted fields. */
+	load(state: TopicRegistryState): void {
+		for (const [sessionId, record] of Object.entries(state.topics ?? {})) {
+			this.topics.set(sessionId, record);
+			this.byTopic.set(record.topicId, sessionId);
+		}
+	}
+
 	/** Resolve the owning session for a topic id (for fail-closed inbound routing). */
 	sessionForTopic(topicId: string): string | undefined {
 		return this.byTopic.get(topicId);

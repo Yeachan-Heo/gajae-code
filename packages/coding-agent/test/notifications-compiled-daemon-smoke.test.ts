@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { daemonPaths } from "../src/notifications/telegram-daemon";
+import { buildTelegramDaemonSpawnArgs, daemonPaths } from "../src/notifications/telegram-daemon";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 
@@ -55,5 +55,21 @@ describe("compiled daemon smoke coverage", () => {
 	test("build script preserves the dynamic daemon entrypoint for compiled binaries", () => {
 		const buildScript = fs.readFileSync(path.join(repoRoot, "packages/coding-agent/scripts/build-binary.ts"), "utf8");
 		expect(buildScript).toContain("telegram-daemon-cli.ts");
+	});
+
+	test("compiled-mode spawn args self-spawn the binary without a script prefix and carry a reload warning", () => {
+		const { command, args, runtime } = buildTelegramDaemonSpawnArgs({
+			execPath: "/opt/gjc/gjc",
+			ownerId: "owner-1",
+			agentDir: "/tmp/agent",
+		});
+		expect(command).toBe("/opt/gjc/gjc");
+		// No bun/node entry-script prefix in compiled mode: the binary self-spawns its subcommand.
+		expect(args[0]).toBe("notify");
+		expect(args).toContain("daemon-internal");
+		expect(args).toEqual(expect.arrayContaining(["--owner-id", "owner-1", "--agent-dir", "/tmp/agent"]));
+		expect(runtime.mode).toBe("compiled");
+		expect(runtime.reloadPicksUpSourceEdits).toBe(false);
+		expect(runtime.warning).toContain("Rebuild");
 	});
 });
