@@ -244,6 +244,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "retry_fallback_succeeded":
 		case "ttsr_triggered":
 		case "irc_message":
+		case "subagent_steer_message":
 		case "notice":
 		case "thinking_level_changed":
 		case "goal_updated":

@@ -17,6 +17,8 @@ const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
 const PREVIEW_WIDTH = 2_000;
 const FULL_PREVIEW_WIDTH = 12_000;
+const STEER_QUEUED_GUIDANCE =
+	"The steer message is queued for the subagent's next steering boundary and has not necessarily taken effect yet.";
 
 const subagentSchema = z.object({
 	action: z
@@ -63,6 +65,9 @@ export interface SubagentSnapshot {
 	outputRef?: string;
 	truncated?: boolean;
 	guidance?: string;
+	steerMessage?: string;
+	steerState?: "queued" | "resume_queued" | "resume_started";
+	steerPauseRequested?: boolean;
 	/** Live streaming progress for the awaited subagent (await panel only; UI detail). */
 	progress?: AgentProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
@@ -240,6 +245,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			}
 			const records: SubagentRecord[] = [];
 			const missing: SubagentSnapshot[] = [];
+			const steerStates = new Map<string, NonNullable<SubagentSnapshot["steerState"]>>();
 			const record = this.#findVisibleRecord(manager, id, ownerFilter);
 			const verifiedOutputIds = await this.#verifiedOutputIds(record ? [record] : []);
 			if (!record) {
@@ -249,23 +255,39 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
 					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
-					await handle.injectMessage(message, "steer");
+					const fromAgentId = this.session.getAgentId?.() ?? undefined;
+					await handle.injectMessage(message, "steer", { fromAgentId });
 					if (params.pause === true) manager.pauseSubagent(record.subagentId, ownerFilter);
+					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
+					steerStates.set(record.subagentId, "queued");
 				} else {
 					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
-					if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 					if (!result.ok && result.reason === "not_found") {
 						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+					} else if (!result.ok) {
+						throw new ToolError(`Failed to resume subagent ${record.subagentId}: ${result.reason ?? "unknown"}.`);
 					} else {
-						records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
+						const snapshotRecord = manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record;
+						records.push(snapshotRecord);
+						steerStates.set(
+							snapshotRecord.subagentId,
+							result.queued === true || result.status === "queued" ? "resume_queued" : "resume_started",
+						);
 					}
 				}
-				if (record.status === "running")
-					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 			}
 			return this.#buildSnapshotResult(
 				[
-					...records.map(record => this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds)),
+					...records.map(record => {
+						const snapshot = this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds);
+						return {
+							...snapshot,
+							steerMessage: message,
+							steerState: steerStates.get(record.subagentId) ?? "queued",
+							steerPauseRequested: params.pause === true,
+							guidance: snapshot.guidance ? `${snapshot.guidance} ${STEER_QUEUED_GUIDANCE}` : STEER_QUEUED_GUIDANCE,
+						};
+					}),
 					...missing,
 				],
 				"Subagent steer",
@@ -288,7 +310,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (ids.length === 1) return ids[0]!;
 		if (ids.length > 1) {
 			throw new ToolError(
-				`\`${action}\` accepts exactly one target because \`message\` is delivered to one subagent.`,
+				`\`${action}\` accepts exactly one target because \`message\` can be queued for only one subagent.`,
 			);
 		}
 		throw new ToolError(`\`${action}\` requires a single subagent id via \`id\`.`);
@@ -533,6 +555,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
+			if (snapshot.steerMessage) {
+				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
+				lines.push(STEER_QUEUED_GUIDANCE);
+			}
 			if (snapshot.resultPreview) {
 				lines.push(snapshot.errorText ? "Error preview:" : "Result preview:", "```", snapshot.resultPreview, "```");
 				if (snapshot.truncated)
@@ -770,6 +796,9 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		outputRef: snapshot.outputRef ?? null,
 		truncated: snapshot.truncated ?? false,
 		guidance: snapshot.guidance ?? null,
+		steerMessage: snapshot.steerMessage ?? null,
+		steerState: snapshot.steerState ?? null,
+		steerPauseRequested: snapshot.steerPauseRequested ?? false,
 		liveProgressAvailable: snapshot.liveProgressAvailable ?? null,
 		effectiveModel: snapshot.effectiveModel ?? null,
 		requestedModel: snapshot.requestedModel ?? null,

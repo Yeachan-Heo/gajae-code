@@ -160,6 +160,13 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		lines.push(`  ${theme.fg("dim", "Assignment:")}`);
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
 	}
+	if (snapshot.steerMessage) {
+		lines.push(`  ${theme.fg("accent", `Steer (${snapshot.steerState ?? "queued"})`)}`);
+		const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
+		for (const pl of getPreviewLines(snapshot.steerMessage, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
+			lines.push(`    ${theme.fg("toolOutput", replaceTabs(pl))}`);
+		}
+	}
 
 	// Defense in depth: the producer only attaches `progress` when a live producer
 	// exists (subagent.ts #liveProgressFields), but the renderer also honors an

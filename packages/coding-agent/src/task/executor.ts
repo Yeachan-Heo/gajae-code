@@ -1298,10 +1298,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					requestPause: () => {
 						pauseRequested = true;
 					},
-					injectMessage: async (content, deliverAs) => {
+					injectMessage: async (content, deliverAs, opts) => {
 						if (deliverAs === "nextTurn") {
 							await session.prompt(content, { attribution: "agent" });
 							return;
+						}
+						if (deliverAs === "steer") {
+							const from = opts?.fromAgentId ?? manager.getSubagentRecord(liveSubagentId)?.ownerId ?? "?";
+							session.emitSubagentSteerObservation({ from, to: liveSubagentId, body: content });
 						}
 						await session.sendUserMessage(content, { deliverAs });
 					},

@@ -74,6 +74,15 @@ export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 	todo_reminder: ev({ type: "todo_reminder", todos: [], attempt: 1, maxAttempts: 3 }),
 	todo_auto_clear: ev({ type: "todo_auto_clear" }),
 	irc_message: ev({ type: "irc_message", message: { type: "custom", text: RAW_SECRET } }),
+	subagent_steer_message: ev({
+		type: "subagent_steer_message",
+		message: {
+			type: "custom",
+			customType: "subagent:steer",
+			text: RAW_SECRET,
+			details: { observationId: "obs-1", from: "1-Parent", to: "2-Child", body: RAW_SECRET, state: "queued" },
+		},
+	}),
 	notice: ev({ type: "notice", level: "error", message: RAW_SECRET, source: "tool" }),
 	thinking_level_changed: ev({ type: "thinking_level_changed", thinkingLevel: "high" }),
 	goal_updated: ev({ type: "goal_updated", goal: { objective: RAW_SECRET } }),

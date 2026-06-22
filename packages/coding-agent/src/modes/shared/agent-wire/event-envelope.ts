@@ -50,6 +50,7 @@ export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventT
 		case "todo_reminder":
 		case "todo_auto_clear":
 		case "irc_message":
+		case "subagent_steer_message":
 		case "notice":
 		case "thinking_level_changed":
 		case "goal_updated":

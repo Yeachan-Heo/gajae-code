@@ -84,7 +84,11 @@ export interface SubagentLiveHandle {
 	/** Request a cooperative safe-boundary pause (never aborts the in-flight tool). */
 	requestPause(): void;
 	/** Inject a steering message into the live session. */
-	injectMessage(content: string, deliverAs: "steer" | "followUp" | "nextTurn"): Promise<void>;
+	injectMessage(
+		content: string,
+		deliverAs: "steer" | "followUp" | "nextTurn",
+		opts?: { fromAgentId?: string },
+	): Promise<void>;
 }
 
 /**

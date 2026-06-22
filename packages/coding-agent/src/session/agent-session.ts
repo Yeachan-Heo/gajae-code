@@ -314,6 +314,7 @@ export type AgentSessionEvent =
 	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
 	| { type: "todo_auto_clear" }
 	| { type: "irc_message"; message: CustomMessage }
+	| { type: "subagent_steer_message"; message: CustomMessage }
 	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
@@ -9129,6 +9130,63 @@ export class AgentSession {
 	 */
 	emitIrcRelayObservation(record: CustomMessage): void {
 		void this.#emitSessionEvent({ type: "irc_message", message: record });
+	}
+
+	emitSubagentSteerObservation(args: { from: string; to: string; body: string; timestamp?: number }): void {
+		const timestamp = args.timestamp ?? Date.now();
+		const observationId = crypto.randomUUID();
+		const message: CustomMessage = {
+			role: "custom",
+			customType: "subagent:steer",
+			content: `[Steer \`${args.from}\` ⇨ \`${args.to}\` (queued)]\n\n${args.body}`,
+			display: true,
+			details: { observationId, from: args.from, to: args.to, body: args.body, state: "queued" },
+			attribution: "agent",
+			timestamp,
+		};
+		void this.#emitSessionEvent({ type: "subagent_steer_message", message });
+		this.#forwardSubagentSteerRelayToMain({
+			from: args.from,
+			to: args.to,
+			body: args.body,
+			observationId,
+			timestamp,
+		});
+	}
+
+	#forwardSubagentSteerRelayToMain(args: {
+		from: string;
+		to: string;
+		body: string;
+		observationId: string;
+		timestamp: number;
+	}): void {
+		const registry = this.#agentRegistry;
+		if (!registry) return;
+		if (this.#agentId === MAIN_AGENT_ID) return;
+		const mainRef = registry.get(MAIN_AGENT_ID);
+		const mainSession = mainRef?.session;
+		if (!mainSession || mainSession === this) return;
+		const record: CustomMessage = {
+			role: "custom",
+			customType: "subagent:steer:relay",
+			content: `[Steer \`${args.from}\` ⇨ \`${args.to}\` (queued)]\n\n${args.body}`,
+			display: true,
+			details: {
+				observationId: args.observationId,
+				from: args.from,
+				to: args.to,
+				body: args.body,
+				state: "queued",
+			},
+			attribution: "agent",
+			timestamp: args.timestamp,
+		};
+		mainSession.emitSubagentSteerRelayObservation(record);
+	}
+
+	emitSubagentSteerRelayObservation(record: CustomMessage): void {
+		void this.#emitSessionEvent({ type: "subagent_steer_message", message: record });
 	}
 
 	/**

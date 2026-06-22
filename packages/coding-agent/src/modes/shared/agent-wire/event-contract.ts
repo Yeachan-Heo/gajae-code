@@ -49,6 +49,7 @@ const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	todo_reminder: true,
 	todo_auto_clear: true,
 	irc_message: true,
+	subagent_steer_message: true,
 	notice: true,
 	thinking_level_changed: true,
 	goal_updated: true,

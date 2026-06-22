@@ -235,6 +235,22 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: false,
 				coalesceKey: null,
 			});
+		case "subagent_steer_message": {
+			const details = recordObject(event.message.details);
+			return obs(event, {
+				kind: "rpc_subagent_steer",
+				signal: null,
+				evidence: {
+					from: str(details?.from) ?? null,
+					to: str(details?.to) ?? null,
+					state: str(details?.state) ?? null,
+					observationId: str(details?.observationId) ?? null,
+				},
+				severity: "info",
+				semantic: false,
+				coalesceKey: null,
+			});
+		}
 		case "notice": {
 			const level = event.level;
 			return obs(event, {

@@ -290,6 +290,7 @@ describe("SubagentTool", () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
 		let injected: string | undefined;
+		let injectedFrom: string | undefined;
 		let pauseRequested = false;
 		manager.registerSubagentRecord({
 			subagentId: "0-Steer",
@@ -304,8 +305,9 @@ describe("SubagentTool", () => {
 			requestPause() {
 				pauseRequested = true;
 			},
-			async injectMessage(content) {
+			async injectMessage(content, _deliverAs, opts) {
 				injected = content;
+				injectedFrom = opts?.fromAgentId;
 			},
 		});
 
@@ -317,8 +319,50 @@ describe("SubagentTool", () => {
 		});
 
 		expect(injected).toBe("tighten scope");
+		expect(injectedFrom).toBe("0-Main");
 		expect(pauseRequested).toBe(true);
-		expect(result.details?.subagents[0]?.status).toBe("running");
+		const steerSnap = result.details?.subagents[0];
+		expect(steerSnap?.status).toBe("running");
+		expect(steerSnap?.steerMessage).toBe("tighten scope");
+		expect(steerSnap?.steerState).toBe("queued");
+		expect(steerSnap?.steerPauseRequested).toBe(true);
+		const steerText = getText(result).toLowerCase();
+		expect(steerText).toContain("tighten scope");
+		expect(steerText).toContain("queued");
+		expect(steerText).not.toContain("consumed");
+		expect(steerText).not.toContain("acted on");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer attributes the caller (nested parent) id, not main or the child id", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession("1-Parent"));
+		let injectedFrom: string | undefined;
+		manager.registerSubagentRecord({
+			subagentId: "2-Child",
+			ownerId: "1-Parent",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/2-Child.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("2-Child", {
+			requestPause() {},
+			async injectMessage(_content, _deliverAs, opts) {
+				injectedFrom = opts?.fromAgentId;
+			},
+		});
+
+		await tool.execute("subagent-steer-nested", {
+			action: "steer",
+			ids: ["2-Child"],
+			message: "nested steer",
+		});
+
+		expect(injectedFrom).toBe("1-Parent");
+		expect(injectedFrom).not.toBe("0-Main");
+		expect(injectedFrom).not.toBe("2-Child");
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
@@ -396,6 +440,56 @@ describe("SubagentTool", () => {
 		expect(resumedMessage).toBe("follow up");
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-auto-resumed");
+		expect(result.details?.subagents[0]?.steerMessage).toBe("follow up");
+		expect(result.details?.subagents[0]?.steerState).toBe("resume_started");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer a queued subagent labels steerState resume_queued", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.registerSubagentRecord({
+			subagentId: "0-Queued",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "queued",
+			sessionFile: "/tmp/0-Queued.jsonl",
+			resumable: true,
+			queued: { ownerId: "0-Main", seq: 1, createdAt: Date.now() },
+		});
+
+		const result = await tool.execute("subagent-steer-queued", {
+			action: "steer",
+			ids: ["0-Queued"],
+			message: "requeue",
+		});
+
+		expect(result.details?.subagents[0]?.steerState).toBe("resume_queued");
+		expect(result.details?.subagents[0]?.steerMessage).toBe("requeue");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer throws ToolError when a non-running resume fails (no runner)", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.registerSubagentRecord({
+			subagentId: "0-NoRunner",
+			ownerId: "0-Main",
+			currentJobId: "job-done",
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/0-NoRunner.jsonl",
+			resumable: true,
+		});
+
+		await expect(
+			tool.execute("subagent-steer-norunner", {
+				action: "steer",
+				ids: ["0-NoRunner"],
+				message: "go",
+			}),
+		).rejects.toThrow("no_runner");
 		await manager.dispose({ timeoutMs: 100 });
 	});
 	it("list and inspect default terminal subagents return receipt previews without bulk output and no unverified ref", async () => {

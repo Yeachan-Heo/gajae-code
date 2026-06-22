@@ -203,6 +203,29 @@ export class UiHelpers {
 						}
 						return components;
 					}
+					if (message.customType === "subagent:steer" || message.customType === "subagent:steer:relay") {
+						const details = (
+							message as CustomMessage<{
+								from?: string;
+								to?: string;
+								body?: string;
+								state?: string;
+							}>
+						).details;
+						const components: Component[] = [];
+						const header = `${theme.fg("accent", `[Steer ${details?.state ?? "queued"}] ${details?.from ?? "?"} ⇨ ${details?.to ?? "?"}`)}`;
+						const headerComponent = new Text(header, 1, 0);
+						this.ctx.chatContainer.addChild(headerComponent);
+						components.push(headerComponent);
+						if (details?.body) {
+							for (const line of details.body.split("\n")) {
+								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
+								this.ctx.chatContainer.addChild(lineComponent);
+								components.push(lineComponent);
+							}
+						}
+						return components;
+					}
 					const renderer = this.ctx.session.extensionRunner?.getMessageRenderer(message.customType);
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
 					const component = new CustomMessageComponent(message as CustomMessage<unknown>, renderer);

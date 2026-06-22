@@ -83,6 +83,7 @@ export class EventController {
 			todo_reminder: e => this.#handleTodoReminder(e),
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
+			subagent_steer_message: e => this.#handleSubagentSteerMessage(e),
 			notice: e => this.#handleNotice(e),
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
@@ -281,6 +282,25 @@ export class EventController {
 		this.#resetReadGroup();
 		const components = this.ctx.addMessageToChat(event.message);
 		this.#scheduleIrcExpiry(signature, components);
+		this.ctx.ui.requestRender();
+	}
+
+	async #handleSubagentSteerMessage(
+		event: Extract<AgentSessionEvent, { type: "subagent_steer_message" }>,
+	): Promise<void> {
+		const details = event.message.details as
+			| { observationId?: string; from?: string; to?: string; body?: string; state?: string }
+			| undefined;
+		const obsId = details?.observationId;
+		const signature = obsId
+			? `steer:${obsId}`
+			: `${event.message.role}:${event.message.customType}:${event.message.timestamp}:${details?.from}:${details?.to}:${details?.state}:${details?.body}`;
+		if (this.#renderedCustomMessages.has(signature)) {
+			return;
+		}
+		this.#renderedCustomMessages.add(signature);
+		this.#resetReadGroup();
+		this.ctx.addMessageToChat(event.message);
 		this.ctx.ui.requestRender();
 	}
 
