@@ -92,13 +92,16 @@ describe("button grid (AC6)", () => {
 		expect(buttonLabel("No", 1)).toBe("2. No");
 	});
 
-	test("buttonLabel does not double-number labels that already carry an index", () => {
+	test("buttonLabel strips an existing leading index and applies the canonical button number", () => {
 		// Deep-interview options arrive pre-numbered (e.g. "1. Foo"); the Telegram
-		// button must not prepend another index and render "1. 1. Foo".
+		// button must strip that and render a single, canonical one-based index
+		// instead of duplicated numbering like "1. 1. Foo".
 		expect(buttonLabel("1. Foo", 0)).toBe("1. Foo");
-		expect(buttonLabel("2) Bar", 1)).toBe("2) Bar");
-		expect(buttonLabel("  3.  Spaced", 2)).toBe("  3.  Spaced");
-		// A leading bare number without a dot/paren is real option text, still numbered.
+		expect(buttonLabel("2) Bar", 1)).toBe("2. Bar");
+		expect(buttonLabel("  3.  Spaced", 2)).toBe("3. Spaced");
+		// A stale/mismatched embedded index is replaced by the real button index.
+		expect(buttonLabel("5. Foo", 0)).toBe("1. Foo");
+		// A leading bare number without a dot/paren is real option text, kept as-is.
 		expect(buttonLabel("3 apples", 2)).toBe("3. 3 apples");
 	});
 

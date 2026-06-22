@@ -227,13 +227,14 @@ export function finalizeTelegramHtml(message?: string): string | undefined {
 /**
  * One-based, plain-text button label (Telegram does not parse HTML in labels).
  *
- * Idempotent: labels that already carry a leading `N.`/`N)` index (e.g.
- * deep-interview options pre-numbered by the ask tool) are left as-is so the
- * Telegram button does not show duplicated numbering like `1. 1. …`.
+ * Strips any leading `N.`/`N)` index already embedded in the label (e.g.
+ * deep-interview options pre-numbered by the ask tool) and applies the canonical
+ * one-based button index instead. This avoids duplicated numbering like
+ * `1. 1. …` and keeps the displayed number aligned with the button's real index.
  */
 export function buttonLabel(label: string, index: number): string {
-	if (/^\s*\d+[.)]\s+/.test(label)) return label;
-	return `${index + 1}. ${label}`;
+	const stripped = label.replace(/^\s*\d+[.)]\s+/, "");
+	return `${index + 1}. ${stripped}`;
 }
 
 export interface InlineButton {
