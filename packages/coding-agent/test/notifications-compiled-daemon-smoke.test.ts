@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { daemonPaths } from "../src/notifications/telegram-daemon";
 
+const repoRoot = path.resolve(import.meta.dir, "../../..");
+
 describe("compiled daemon smoke coverage", () => {
 	function tempDir(prefix: string): string {
 		return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -14,7 +16,7 @@ describe("compiled daemon smoke coverage", () => {
 		const cwd = tempDir("gjc-compiled-daemon-cwd-");
 		const token = "123456:super-secret-token";
 		const proc = Bun.spawn(
-			["bun", "run", path.resolve("packages/coding-agent/src/cli.ts"), "notify", "daemon-internal", "--smoke"],
+			["bun", "run", path.join(repoRoot, "packages/coding-agent/src/cli.ts"), "notify", "daemon-internal", "--smoke"],
 			{
 				cwd,
 				env: {
@@ -44,7 +46,7 @@ describe("compiled daemon smoke coverage", () => {
 	});
 
 	test("build script preserves the dynamic daemon entrypoint for compiled binaries", () => {
-		const buildScript = fs.readFileSync(path.resolve("packages/coding-agent/scripts/build-binary.ts"), "utf8");
+		const buildScript = fs.readFileSync(path.join(repoRoot, "packages/coding-agent/scripts/build-binary.ts"), "utf8");
 		expect(buildScript).toContain("telegram-daemon-cli.ts");
 	});
 });
