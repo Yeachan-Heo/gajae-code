@@ -2962,10 +2962,10 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 			if (!exists.ok) continue;
 			const mergeBase = await spawnText(["git", "merge-base", "HEAD", candidate], { cwd, timeoutMs: 3000 });
 			if (!mergeBase.ok || !mergeBase.stdout.trim()) continue;
-			const count = await spawnText(
-				["git", "rev-list", "--count", `${mergeBase.stdout.trim()}..HEAD`],
-				{ cwd, timeoutMs: 3000 },
-			);
+			const count = await spawnText(["git", "rev-list", "--count", `${mergeBase.stdout.trim()}..HEAD`], {
+				cwd,
+				timeoutMs: 3000,
+			});
 			const ahead = Number.parseInt(count.stdout.trim(), 10);
 			if (!Number.isFinite(ahead)) continue;
 			if (!best || ahead < best.ahead) best = { ref: candidate, ahead };
