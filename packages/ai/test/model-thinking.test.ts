@@ -285,7 +285,7 @@ describe("generated model policies", () => {
 		expect(models[1]?.contextPromotionTarget).toBeUndefined();
 	});
 
-	it("treats gpt-5.5 as a 400K-context model so it is not over-cap at ~272K", () => {
+	it("keeps Codex gpt-5.5 at the 272K prompt budget so compaction fires before the backend cap", () => {
 		const models: Model<Api>[] = [
 			{
 				...createModel({
@@ -301,7 +301,7 @@ describe("generated model policies", () => {
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models[0]?.contextWindow).toBe(400000);
+		expect(models[0]?.contextWindow).toBe(272000);
 	});
 
 	it("sets freeform apply_patch metadata for first-party GPT-5 Responses models", () => {
