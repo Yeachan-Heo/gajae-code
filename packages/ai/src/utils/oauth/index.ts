@@ -171,6 +171,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "glm-zcode",
+		name: "GLM ZCode OAuth (unofficial, opt-in)",
+		available: true,
+	},
+	{
 		id: "minimax-code",
 		name: "MiniMax Coding Plan (International)",
 		available: true,
@@ -333,6 +338,11 @@ export async function refreshOAuthToken(
 		case "xai": {
 			const { refreshXaiToken } = await import("./xai");
 			newCredentials = await refreshXaiToken(credentials.refresh);
+			break;
+		}
+		case "glm-zcode": {
+			const { refreshGlmZcodeToken } = await import("./glm-zcode");
+			newCredentials = await refreshGlmZcodeToken(credentials);
 			break;
 		}
 		case "kilo":

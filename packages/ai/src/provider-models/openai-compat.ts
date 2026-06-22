@@ -2278,6 +2278,12 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDescriptor[] = [
 	// --- zAI ---
 	anthropicMessagesDescriptor("zai-coding-plan", "zai", "https://api.z.ai/api/anthropic"),
+	// --- GLM ZCode (unofficial Z.AI OAuth) ---
+	anthropicMessagesDescriptor(
+		"glm-zcode-coding-plan",
+		"glm-zcode",
+		process.env.ZCODE_PLAN_ANTHROPIC_BASE_URL ?? "https://api.z.ai/api/anthropic",
+	),
 	// --- Xiaomi ---
 	openAiCompletionsDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/v1", {
 		defaultContextWindow: 262144,

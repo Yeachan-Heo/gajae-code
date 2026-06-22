@@ -65,3 +65,15 @@ export interface ZaiModelManagerConfig {}
 export function zaiModelManagerOptions(_config: ZaiModelManagerConfig = {}): ModelManagerOptions<"anthropic-messages"> {
 	return { providerId: "zai" };
 }
+
+// ---------------------------------------------------------------------------
+// GLM ZCode (unofficial Z.AI OAuth)
+// ---------------------------------------------------------------------------
+
+export interface GlmZcodeModelManagerConfig {}
+
+export function glmZcodeModelManagerOptions(
+	_config: GlmZcodeModelManagerConfig = {},
+): ModelManagerOptions<"anthropic-messages"> {
+	return { providerId: "glm-zcode" };
+}

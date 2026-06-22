@@ -109,6 +109,7 @@ Providers:
   kagi              Kagi
   tavily            Tavily
   zai               Z.AI (GLM Coding Plan)
+  glm-zcode         GLM ZCode OAuth (unofficial, opt-in; at your own risk)
   deepseek          DeepSeek
   xai               xAI
   nanogpt           NanoGPT

@@ -1593,6 +1593,14 @@ export class AuthStorage {
 				});
 				break;
 			}
+			case "glm-zcode": {
+				const { loginGlmZcode } = await import("./utils/oauth/glm-zcode");
+				credentials = await loginGlmZcode({
+					...ctrl,
+					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+				});
+				break;
+			}
 			case "fireworks": {
 				const { loginFireworks } = await import("./utils/oauth/fireworks");
 				const apiKey = await loginFireworks(ctrl);

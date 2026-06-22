@@ -2169,7 +2169,7 @@ function buildParams(
  * See: https://github.com/can1357/gajae-code/issues/814
  */
 function isZaiAnthropicEndpoint(model: Model<"anthropic-messages">): boolean {
-	if (model.provider === "zai") return true;
+	if (model.provider === "zai" || model.provider === "glm-zcode") return true;
 	const baseUrl = model.baseUrl;
 	if (!baseUrl) return false;
 	try {
@@ -2187,7 +2187,7 @@ function isZaiAnthropicEndpoint(model: Model<"anthropic-messages">): boolean {
  */
 function isNonSigningAnthropicEndpoint(model: Model<"anthropic-messages">): boolean {
 	// Known non-signing providers
-	if (model.provider === "zai" || model.provider === "deepseek") return true;
+	if (model.provider === "zai" || model.provider === "glm-zcode" || model.provider === "deepseek") return true;
 	const baseUrl = model.baseUrl;
 	if (!baseUrl) return false;
 	try {

@@ -49,6 +49,7 @@ export type OAuthProvider =
 	| "vercel-ai-gateway"
 	| "vllm"
 	| "xai"
+	| "glm-zcode"
 	| "xiaomi"
 	| "xiaomi-token-plan-sgp"
 	| "xiaomi-token-plan-ams"

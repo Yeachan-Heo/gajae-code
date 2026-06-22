@@ -122,6 +122,7 @@ export type KnownProvider =
 	| "kilo"
 	| "vercel-ai-gateway"
 	| "zai"
+	| "glm-zcode"
 	| "mistral"
 	| "minimax"
 	| "opencode-go"

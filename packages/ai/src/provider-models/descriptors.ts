@@ -43,7 +43,7 @@ import {
 	xiaomiModelManagerOptions,
 	zenmuxModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, zaiModelManagerOptions } from "./special";
+import { cursorModelManagerOptions, glmZcodeModelManagerOptions, zaiModelManagerOptions } from "./special";
 
 /** Catalog discovery configuration for providers that support endpoint-based model listing. */
 export interface CatalogDiscoveryConfig {
@@ -299,6 +299,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("ZenMux", ["ZENMUX_API_KEY"]),
 	),
 	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
+	catalogDescriptor(
+		"glm-zcode",
+		"glm-5.2",
+		config => glmZcodeModelManagerOptions(config),
+		catalog("GLM ZCode (unofficial)", ["GLM_ZCODE_API_KEY"], { oauthProvider: "glm-zcode" }),
+	),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(

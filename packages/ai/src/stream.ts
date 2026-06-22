@@ -88,6 +88,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	kilo: "KILO_API_KEY",
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
 	zai: "ZAI_API_KEY",
+	"glm-zcode": "GLM_ZCODE_API_KEY",
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
 	"minimax-code": "MINIMAX_CODE_API_KEY",
