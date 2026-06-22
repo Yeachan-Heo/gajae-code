@@ -134,6 +134,7 @@
 
 ### Fixed
 
+- Rendered `/dump` tool-call parameters with readable structured bodies, XML-safe text, and decoded Unicode escape sequences so `ask`/`proxy_ask` deep-interview payloads no longer show dense `questions` JSON or literal Korean `\u...` escapes.
 - Prevented `gjc --tmux` partial-launch diagnostics from throwing when stderr is already closed during shutdown.
 - Fixed v0.5.1-style macOS/Linux standalone binaries crashing before the first model request with `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc-*'` when pre-prompt context maintenance invokes the native tokenizer.
 - Mapped the retired `codex-standard` model profile name to `codex-medium` during profile activation, **as a fallback only** so a user-defined profile literally named `codex-standard` is never shadowed, letting stale `modelProfile.default: codex-standard` configs reach activation instead of blocking startup after the rebuilt profile catalog.

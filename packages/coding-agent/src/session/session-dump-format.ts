@@ -47,13 +47,49 @@ function stripTypeBoxFields(obj: unknown): unknown {
 	return obj;
 }
 
+function escapeXmlAttribute(input: string): string {
+	return input.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeXmlText(input: string): string {
+	return input.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function decodeCodePoint(hex: string): string {
+	const codePoint = Number.parseInt(hex, 16);
+	if (!Number.isFinite(codePoint) || codePoint < 0x20 || codePoint === 0x7f) {
+		return `\\u${hex}`;
+	}
+	return String.fromCharCode(codePoint);
+}
+
+function decodeUnicodeEscapeText(input: string): string {
+	return input
+		.replace(/\\\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => decodeCodePoint(hex))
+		.replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => decodeCodePoint(hex));
+}
+
+function formatParameterValue(value: unknown): string {
+	const raw = typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
+	return escapeXmlText(decodeUnicodeEscapeText(raw));
+}
+
 /** Serialize an object as XML parameter elements, one per key. */
 function formatArgsAsXml(args: Record<string, unknown>, indent = "\t"): string {
 	const parts: string[] = [];
 	for (const [key, value] of Object.entries(args)) {
 		if (key === INTENT_FIELD) continue;
-		const text = typeof value === "string" ? value : JSON.stringify(value);
-		parts.push(`${indent}<parameter name="${key}">${text}</parameter>`);
+		const escapedKey = escapeXmlAttribute(key);
+		const text = formatParameterValue(value);
+		if (text.includes("\n")) {
+			const indentedText = text
+				.split("\n")
+				.map(line => `${indent}\t${line}`)
+				.join("\n");
+			parts.push(`${indent}<parameter name="${escapedKey}">\n${indentedText}\n${indent}</parameter>`);
+		} else {
+			parts.push(`${indent}<parameter name="${escapedKey}">${text}</parameter>`);
+		}
 	}
 	return parts.join("\n");
 }
