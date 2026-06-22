@@ -84,10 +84,11 @@ export interface RedactableAction {
 
 /**
  * When redact is true, strip sensitive content for remote delivery:
- *  - ask: question -> `Session <tag> needs input: [Ask]`, options -> generic ["1","2",...] preserving COUNT/index, summary removed.
+ *  - ask: question -> `Session <tag> needs input: [Ask]`, summary removed. Option
+ *    labels are kept intact so the remote (e.g. Telegram inline-keyboard) buttons
+ *    remain answerable and readable — the choices are not the sensitive payload.
  *  - idle: summary removed, (no question/options).
  * When redact is false, return the action unchanged.
- * Index-based answers must still resolve: keep options.length identical.
  */
 export function buildRedactedAction(
 	action: RedactableAction,
@@ -95,12 +96,12 @@ export function buildRedactedAction(
 ): RedactableAction {
 	if (!opts.redact) return action;
 
-	const { summary: _summary, question: _question, options: _options, ...base } = action;
+	const { summary: _summary, question: _question, ...base } = action;
 	if (action.kind === "ask") {
 		return {
 			...base,
 			question: `Session ${opts.sessionTag} needs input: [Ask]`,
-			options: action.options?.map((_, index) => String(index + 1)),
+			options: action.options,
 		};
 	}
 

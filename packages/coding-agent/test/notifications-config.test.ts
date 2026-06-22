@@ -133,7 +133,7 @@ describe("notifications config", () => {
 		expect(sessionTag("abc")).toBe("abc");
 	});
 
-	test("buildRedactedAction strips ask content but preserves option count with numeric labels", () => {
+	test("buildRedactedAction redacts ask question/summary but keeps real option labels", () => {
 		const action: RedactableAction = {
 			id: "a1",
 			kind: "ask",
@@ -148,7 +148,7 @@ describe("notifications config", () => {
 			kind: "ask",
 			sessionId: "session-abcdef",
 			question: "Session abcdef needs input: [Ask]",
-			options: ["1", "2", "3"],
+			options: ["Yes, deploy", "No, stop", "Custom"],
 		});
 	});
 

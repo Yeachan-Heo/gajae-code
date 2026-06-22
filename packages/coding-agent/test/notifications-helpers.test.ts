@@ -113,7 +113,7 @@ describe("notifications helpers", () => {
 		expect(out?.endsWith("\u2026")).toBe(true);
 	});
 
-	test("notificationActionPayload delegates redaction while preserving option count", () => {
+	test("notificationActionPayload redacts the ask question but keeps real option labels", () => {
 		const ask = notificationActionPayload(
 			{
 				id: "ask-1",
@@ -126,7 +126,7 @@ describe("notifications helpers", () => {
 		);
 
 		expect(ask.question).not.toContain("TOKEN");
-		expect(ask.options).toEqual(["1", "2"]);
+		expect(ask.options).toEqual(["Deploy prod", "Cancel"]);
 
 		const idle = notificationActionPayload(
 			{ id: "idle-1", kind: "idle", sessionId: "session-secret", summary: "sensitive summary" },

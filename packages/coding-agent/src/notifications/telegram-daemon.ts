@@ -1139,6 +1139,23 @@ export class TelegramNotificationDaemon {
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const cfg = parseInThreadConfigCommand(inbound.text);
+					// A plain (non-config) message while an ask is pending for this session
+					// answers that ask as free-input — instead of starting a new user turn.
+					// Telegram asks always accept custom text (the SDK maps a string answer
+					// to the ask's custom-input slot), so route the latest pending ask here.
+					const pendingAsk = cfg ? undefined : [...session.pending.values()].at(-1);
+					if (pendingAsk) {
+						session.ws.send(
+							JSON.stringify({
+								type: "reply",
+								id: pendingAsk.actionId,
+								answer: inbound.text,
+								token: session.token,
+							}),
+						);
+						if (inbound.messageId !== undefined) await this.setReaction(inbound.messageId, QUEUED_REACTION);
+						return;
+					}
 					session.ws.send(
 						JSON.stringify(
 							cfg

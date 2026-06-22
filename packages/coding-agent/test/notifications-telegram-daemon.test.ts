@@ -411,6 +411,78 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toEqual({ type: "reply", id: "A", answer: "ok", token: "ts" });
 	});
 
+	test("plain text answers a pending ask as free-input instead of injecting a new turn", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		// Emit an ask: creates the forum topic, registers the pending ask, sends the message.
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const askSend = bot.calls.find(c => c.method === "sendMessage");
+		const threadId = askSend!.body.message_thread_id;
+
+		// A plain free-text message in that topic answers the pending ask...
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "my typed answer", message_id: 99 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent).toContainEqual({ type: "reply", id: "ask1", answer: "my typed answer", token: "ts" });
+		// ...and must NOT be injected as a new user turn.
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+	});
+
+	test("plain text injects a user turn when no ask is pending", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		// Create the topic + pending via an ask, then resolve it so nothing is pending.
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+
+		await daemon.handleTelegramUpdate({
+			update_id: 7,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "start a new task", message_id: 100 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "user_message" && frame.text === "start a new task")).toBe(true);
+		expect(sent.some(frame => frame.type === "reply")).toBe(false);
+	});
+
 	test("runDaemonSmoke exits without polling and emits no token", async () => {
 		const agentDir = tempAgentDir();
 		await runDaemonSmoke({ agentDir });
