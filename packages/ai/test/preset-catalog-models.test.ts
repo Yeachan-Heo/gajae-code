@@ -27,6 +27,21 @@ describe("preset catalog model entries", () => {
 		expect(model.thinking).toEqual({ mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
 	});
 
+	test("bundles google-gemini-cli/gemini-3.5-flash", () => {
+		const model = getBundledModel("google-gemini-cli", "gemini-3.5-flash");
+
+		expect(model.id).toBe("gemini-3.5-flash");
+		expect(model.provider).toBe("google-gemini-cli");
+		expect(model.api).toBe("google-gemini-cli");
+		expect(model.baseUrl).toBe("https://cloudcode-pa.googleapis.com");
+		expect(model.name).toBe("Gemini 3.5 Flash");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("image");
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(65_536);
+		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Minimal, maxLevel: Effort.High });
+	});
+
 	test("bundles minimax-code/minimax-v3", () => {
 		const model = getBundledModel("minimax-code", "minimax-v3");
 
