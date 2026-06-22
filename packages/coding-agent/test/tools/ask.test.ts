@@ -115,6 +115,62 @@ describe("AskTool cancellation", () => {
 		expect(abort).toHaveBeenCalledTimes(1);
 	});
 
+	it("registers the remote ask before opening the local selector (Telegram buttons at invocation)", async () => {
+		const order: string[] = [];
+		// Remote source never resolves on its own; we only assert it was invoked
+		// (i.e. action_needed was broadcast) BEFORE the local selector opened.
+		const source = {
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => {
+				order.push("remote");
+				return new Promise<string | undefined>(() => {});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		const context = createContext({
+			select: async () => {
+				order.push("local");
+				return "yes";
+			},
+		});
+
+		const result = await tool.execute(
+			"call-remote-emit",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		// The remote ask must be registered first so the notification is emitted at
+		// invocation, not only after the ask is finalized locally.
+		expect(order[0]).toBe("remote");
+		expect(order).toContain("local");
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
+	});
+
+	it("resolves the ask from a remote (Telegram) answer that wins the race", async () => {
+		const source = {
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => Promise.resolve("yes"),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		const context = createContext({
+			// Local selector never resolves: only the remote answer can finish the ask.
+			select: () => new Promise<string | undefined>(() => {}),
+		});
+
+		const result = await tool.execute(
+			"call-remote-answer",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
+	});
+
 	it("defaults to no timeout when ask.timeout is unset", async () => {
 		// Regression for the surprise-auto-select report: a fresh install must let the user
 		// deliberate indefinitely. The dialog timeout is opt-in via the `ask.timeout` setting.

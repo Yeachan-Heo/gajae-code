@@ -515,6 +515,70 @@ describe("telegram daemon", () => {
 		releasePoll();
 		await runPromise;
 	});
+
+	test("pollOnce survives a transient getUpdates failure instead of crashing", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let calls = 0;
+		const bot = {
+			async call(method: string): Promise<unknown> {
+				if (method === "getUpdates") {
+					calls++;
+					const err = new Error("The socket connection was closed unexpectedly.") as Error & { code?: string };
+					err.code = "ECONNRESET";
+					throw err;
+				}
+				return { ok: true, result: [] };
+			},
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			setTimeoutImpl: ((cb: () => void) => {
+				cb();
+				return 0;
+			}) as any,
+		});
+		// Must resolve (not reject): the run loop relies on this never throwing.
+		await expect(daemon.pollOnce()).resolves.toBe(0);
+		expect(calls).toBe(1);
+	});
+
+	test("default botApi retries transient network failures before delivering", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let attempts = 0;
+		const fetchImpl = (async () => {
+			attempts++;
+			if (attempts < 3) {
+				const err = new Error("socket reset") as Error & { code?: string };
+				err.code = "ECONNRESET";
+				throw err;
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			fetchImpl,
+			setTimeoutImpl: ((cb: () => void) => {
+				cb();
+				return 0;
+			}) as any,
+		});
+		const res = (await (daemon as any).botApi.call("sendMessage", { chat_id: 42, text: "hi" })) as {
+			result?: { message_id?: number };
+		};
+		expect(attempts).toBe(3);
+		expect(res.result?.message_id).toBe(7);
+	});
 });
 
 test("daemon registers in-thread config commands and drops stale rpc/answer commands", async () => {

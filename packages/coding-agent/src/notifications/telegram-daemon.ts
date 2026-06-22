@@ -84,6 +84,64 @@ const RATE_LIMIT_FLUSH_INTERVAL_MS = 1_000;
 // buffered ask is delivered up to 25s late — or never, if the user answers the
 // local ask first (which clears the buffered ask).
 const SESSION_SCAN_INTERVAL_MS = 1_000;
+// Transient Telegram API delivery is retried this many times before giving up.
+const BOT_API_RETRY_ATTEMPTS = 3;
+// Backoff after a failed getUpdates long-poll so a persistent outage does not
+// busy-loop the daemon.
+const POLL_BACKOFF_MS = 1_000;
+
+/**
+ * Whether `err` is a transient network failure worth retrying. Telegram API
+ * calls over HTTP/2 occasionally surface mid-stream `ECONNRESET` (and similar)
+ * that the global h2 fallback does not catch; treating these as fatal drops ask
+ * notifications and (in the polling loop) crashes the daemon.
+ */
+function isTransientNetworkError(err: unknown): boolean {
+	const code = (err as { code?: unknown } | null)?.code;
+	if (typeof code === "string") {
+		const transient = new Set([
+			"ECONNRESET",
+			"ECONNREFUSED",
+			"ETIMEDOUT",
+			"EPIPE",
+			"ENOTFOUND",
+			"EAI_AGAIN",
+			"UND_ERR_SOCKET",
+			"ConnectionClosed",
+			"ConnectionReset",
+			"ConnectionRefused",
+			"ConnectionTimeout",
+			"FailedToOpenSocket",
+		]);
+		if (transient.has(code)) return true;
+	}
+	const message = (err as { message?: unknown } | null)?.message;
+	return (
+		typeof message === "string" &&
+		/socket connection was closed|econnreset|fetch failed|network|timed out|terminated/i.test(message)
+	);
+}
+
+/** `fetch` with bounded retries on transient network failures. */
+async function fetchWithRetry(
+	fetchImpl: typeof fetch,
+	url: string,
+	init: RequestInit,
+	sleep: (ms: number) => Promise<void>,
+	attempts: number = BOT_API_RETRY_ATTEMPTS,
+): Promise<Response> {
+	let lastErr: unknown;
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		try {
+			return await fetchImpl(url, init);
+		} catch (err) {
+			lastErr = err;
+			if (!isTransientNetworkError(err) || attempt === attempts - 1) throw err;
+			await sleep(200 * 2 ** attempt);
+		}
+	}
+	throw lastErr;
+}
 
 export function daemonPaths(agentDir: string): DaemonPaths {
 	const dir = path.join(agentDir, "notifications");
@@ -431,6 +489,8 @@ export class TelegramNotificationDaemon {
 				const apiBase = opts.apiBase ?? "https://api.telegram.org";
 				const url = `${apiBase}/bot${opts.botToken}/${method}`;
 				const fetchImpl = opts.fetchImpl ?? fetch;
+				const setTimeoutImpl = opts.setTimeoutImpl ?? setTimeout;
+				const sleep = (ms: number) => new Promise<void>(resolve => setTimeoutImpl(resolve, ms));
 				// sendPhoto with base64 bytes must be a multipart upload (Telegram does
 				// not accept base64 in JSON). Other methods stay JSON.
 				const photoBody = body as { photo?: unknown; mime?: unknown } | null;
@@ -449,14 +509,19 @@ export class TelegramNotificationDaemon {
 					if (b.caption) form.set("caption", b.caption);
 					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
 					form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
-					const res = await fetchImpl(url, { method: "POST", body: form });
+					const res = await fetchWithRetry(fetchImpl, url, { method: "POST", body: form }, sleep);
 					return res.json();
 				}
-				const res = await fetchImpl(url, {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify(body),
-				});
+				const res = await fetchWithRetry(
+					fetchImpl,
+					url,
+					{
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(body),
+					},
+					sleep,
+				);
 				return res.json();
 			},
 		};
@@ -830,14 +895,28 @@ export class TelegramNotificationDaemon {
 	}
 
 	async pollOnce(): Promise<number> {
-		const body = (await this.botApi.call("getUpdates", {
-			offset: this.offset,
-			timeout: 25,
-			allowed_updates: ["message", "callback_query"],
-		})) as { result?: Array<{ update_id: number } & Record<string, unknown>> };
+		let body: { result?: Array<{ update_id: number } & Record<string, unknown>> };
+		try {
+			body = (await this.botApi.call("getUpdates", {
+				offset: this.offset,
+				timeout: 25,
+				allowed_updates: ["message", "callback_query"],
+			})) as { result?: Array<{ update_id: number } & Record<string, unknown>> };
+		} catch (err) {
+			// A transient Telegram API failure (e.g. ECONNRESET on the long-poll) must
+			// never crash the daemon — that silently stops all delivery, including ask
+			// notifications. Log, back off, and let the run loop retry.
+			console.error("notifications daemon: getUpdates failed:", err);
+			await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, POLL_BACKOFF_MS));
+			return 0;
+		}
 		for (const update of body.result ?? []) {
 			this.offset = update.update_id + 1;
-			await this.handleTelegramUpdate(update);
+			try {
+				await this.handleTelegramUpdate(update);
+			} catch (err) {
+				console.error("notifications daemon: handleTelegramUpdate failed:", err);
+			}
 		}
 		return body.result?.length ?? 0;
 	}

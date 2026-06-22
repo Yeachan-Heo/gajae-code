@@ -558,11 +558,15 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				// local UI wins, abort the remote source so it stops waiting and marks the
 				// action resolved-locally. First valid answer wins.
 				const controller = new AbortController();
+				// Register the remote ask FIRST so the `action_needed` frame (the Telegram
+				// inline-keyboard message) is broadcast at invocation — before the local
+				// selector opens — instead of only after the ask is finalized locally.
+				const remote = source.awaitAnswer(prompt, options, controller.signal);
 				const local = extensionUi.select(prompt, options, dialogOptions).then(answer => {
 					controller.abort();
 					return answer;
 				});
-				return Promise.race([local, source.awaitAnswer(prompt, options, controller.signal)]);
+				return Promise.race([local, remote]);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
