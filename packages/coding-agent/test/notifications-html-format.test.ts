@@ -92,6 +92,16 @@ describe("button grid (AC6)", () => {
 		expect(buttonLabel("No", 1)).toBe("2. No");
 	});
 
+	test("buttonLabel does not double-number labels that already carry an index", () => {
+		// Deep-interview options arrive pre-numbered (e.g. "1. Foo"); the Telegram
+		// button must not prepend another index and render "1. 1. Foo".
+		expect(buttonLabel("1. Foo", 0)).toBe("1. Foo");
+		expect(buttonLabel("2) Bar", 1)).toBe("2) Bar");
+		expect(buttonLabel("  3.  Spaced", 2)).toBe("  3.  Spaced");
+		// A leading bare number without a dot/paren is real option text, still numbered.
+		expect(buttonLabel("3 apples", 2)).toBe("3. 3 apples");
+	});
+
 	test("short options pack into rows of three; callback index stays zero-based", () => {
 		const grid = buildButtonGrid(["Yes", "No", "Maybe", "Later"], i => `cb:${i}`);
 		expect(grid).toEqual([

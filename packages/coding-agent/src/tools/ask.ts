@@ -557,15 +557,36 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				// notifications SDK) so asks can be answered without RPC mode. When the
 				// local UI wins, abort the remote source so it stops waiting and marks the
 				// action resolved-locally. First valid answer wins.
-				const controller = new AbortController();
-				// Register the remote ask FIRST so the `action_needed` frame (the Telegram
-				// inline-keyboard message) is broadcast at invocation — before the local
-				// selector opens — instead of only after the ask is finalized locally.
-				const remote = source.awaitAnswer(prompt, options, controller.signal);
-				const local = extensionUi.select(prompt, options, dialogOptions).then(answer => {
-					controller.abort();
+				// Race the local UI against a remote answer (e.g. a Telegram reply via the
+				// notifications SDK) so asks can be answered without RPC mode. First valid
+				// answer wins; the loser is aborted so neither side is left hanging:
+				//   - local wins  -> abort the remote source (marks the action resolved-locally)
+				//   - remote wins -> abort the local selector so the TUI dialog actually closes
+				const remoteController = new AbortController();
+				const localController = new AbortController();
+				// Propagate an external cancel (the tool's signal) to the local selector too.
+				const toolSignal = dialogOptions?.signal;
+				if (toolSignal) {
+					if (toolSignal.aborted) localController.abort();
+					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
+				}
+				const remote = source.awaitAnswer(prompt, options, remoteController.signal).then(answer => {
+					// undefined is not a valid remote answer (registration failed, or the local
+					// UI already won and aborted us): never settle the race, let the local
+					// selector decide instead of cancelling the ask.
+					if (answer === undefined) return new Promise<string | undefined>(() => {});
+					localController.abort();
 					return answer;
 				});
+				const local = extensionUi
+					.select(prompt, options, { ...dialogOptions, signal: localController.signal })
+					.then(answer => {
+						remoteController.abort();
+						return answer;
+					});
+				// The losing selector may reject when aborted after the race already settled;
+				// swallow that so it is not an unhandled rejection (the race result is unaffected).
+				void local.catch(() => undefined);
 				return Promise.race([local, remote]);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {

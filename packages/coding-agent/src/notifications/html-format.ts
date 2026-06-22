@@ -224,8 +224,15 @@ export function finalizeTelegramHtml(message?: string): string | undefined {
 	return truncateTelegramHtml(message);
 }
 
-/** One-based, plain-text button label (Telegram does not parse HTML in labels). */
+/**
+ * One-based, plain-text button label (Telegram does not parse HTML in labels).
+ *
+ * Idempotent: labels that already carry a leading `N.`/`N)` index (e.g.
+ * deep-interview options pre-numbered by the ask tool) are left as-is so the
+ * Telegram button does not show duplicated numbering like `1. 1. …`.
+ */
 export function buttonLabel(label: string, index: number): string {
+	if (/^\s*\d+[.)]\s+/.test(label)) return label;
 	return `${index + 1}. ${label}`;
 }
 

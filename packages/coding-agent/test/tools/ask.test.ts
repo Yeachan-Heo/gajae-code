@@ -171,6 +171,37 @@ describe("AskTool cancellation", () => {
 		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
 	});
 
+	it("closes (aborts) the local selector when a remote answer wins the race", async () => {
+		const source = {
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => Promise.resolve("yes"),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		let localAborted = false;
+		const context = createContext({
+			// The local selector only ends when its signal is aborted — proving the
+			// remote win actually tears the TUI dialog down instead of leaving it open.
+			select: (_prompt, _options, dialogOptions) =>
+				new Promise<string | undefined>(resolve => {
+					dialogOptions?.signal?.addEventListener("abort", () => {
+						localAborted = true;
+						resolve(undefined);
+					});
+				}),
+		});
+
+		const result = await tool.execute(
+			"call-remote-closes-local",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(localAborted).toBe(true);
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
+	});
+
 	it("defaults to no timeout when ask.timeout is unset", async () => {
 		// Regression for the surprise-auto-select report: a fresh install must let the user
 		// deliberate indefinitely. The dialog timeout is opt-in via the `ask.timeout` setting.
