@@ -311,7 +311,12 @@ async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
 }
 
 function handleHostPluginSetup(host: HostPluginKind, flags: SetupCommandArgs["flags"]): void {
-	const result = buildHostPluginSetup(host, { json: flags.json, check: flags.check, root: flags.root, repo: flags.repo });
+	const result = buildHostPluginSetup(host, {
+		json: flags.json,
+		check: flags.check,
+		root: flags.root,
+		repo: flags.repo,
+	});
 	if (flags.json) {
 		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 		return;

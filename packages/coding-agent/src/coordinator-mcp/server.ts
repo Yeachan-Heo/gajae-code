@@ -432,8 +432,14 @@ function toolSchema(name: CoordinatorToolName): {
 						description:
 							"Optional existing GJC coordinator bridge session id to reuse; omitted starts a fresh session.",
 					},
-					queue: { type: "boolean", description: "When reusing a session with an active turn, queue instead of failing." },
-					force: { type: "boolean", description: "When reusing a session with an active turn, supersede it before sending." },
+					queue: {
+						type: "boolean",
+						description: "When reusing a session with an active turn, queue instead of failing.",
+					},
+					force: {
+						type: "boolean",
+						description: "When reusing a session with an active turn, supersede it before sending.",
+					},
 					worktree: {
 						type: "boolean",
 						description: "Reserved session-start knob; defaults true and cannot disable configured roots.",
@@ -447,7 +453,10 @@ function toolSchema(name: CoordinatorToolName): {
 						description: "Optional model hint passed in prompt metadata; no provider default is implied.",
 					},
 					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
-					timeout_ms: { type: "number", description: "Bounded await timeout; same cap semantics as gjc_coordinator_await_turn." },
+					timeout_ms: {
+						type: "number",
+						description: "Bounded await timeout; same cap semantics as gjc_coordinator_await_turn.",
+					},
 					poll_interval_ms: { type: "number", description: "Bounded await polling interval." },
 					lines: { type: "number", description: "Bounded advisory tail lines returned with await/read payloads." },
 				},

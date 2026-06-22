@@ -400,7 +400,11 @@ describe("coordinator delegate tools", () => {
 				},
 				services: delegateServices(),
 			});
-			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, task: "Plan it", allow_mutation: true });
+			const denied = await server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				task: "Plan it",
+				allow_mutation: true,
+			});
 			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
 		});
 	});
@@ -441,7 +445,11 @@ describe("coordinator delegate tools", () => {
 				env: delegateEnv(root, stateRoot),
 				services: delegateServices(),
 			});
-			const denied = await server.callTool("gjc_delegate_plan", { cwd: os.tmpdir(), task: "x", allow_mutation: true });
+			const denied = await server.callTool("gjc_delegate_plan", {
+				cwd: os.tmpdir(),
+				task: "x",
+				allow_mutation: true,
+			});
 			expect(denied.ok).toBe(false);
 			expect(String(denied.reason)).toContain("coordinator_workdir_outside_allowed_roots");
 		});

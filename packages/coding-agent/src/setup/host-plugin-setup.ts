@@ -112,7 +112,9 @@ export function formatHostPluginSetup(result: HostPluginSetupResult): string {
 	lines.push("install:");
 	for (const step of result.installGuidance) lines.push(`  - ${step}`);
 	lines.push(`mcp: ${result.coordinatorConfigPreview.command} ${result.coordinatorConfigPreview.args.join(" ")}`);
-	lines.push(`  GJC_COORDINATOR_MCP_WORKDIR_ROOTS=${result.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS}`);
+	lines.push(
+		`  GJC_COORDINATOR_MCP_WORKDIR_ROOTS=${result.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS}`,
+	);
 	lines.push(result.mutationPolicy);
 	for (const note of result.notes) lines.push(`note: ${note}`);
 	return lines.join("\n");
