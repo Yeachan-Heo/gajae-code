@@ -1,0 +1,25 @@
+/**
+ * Process-wide registry mapping a session id to its active {@link AskAnswerSource}.
+ *
+ * Decouples the `ask` tool (which reads the source via `AgentSession`) from the
+ * notifications extension (which registers one), without threading a new method
+ * through the extension/runner/controller wiring. A session has at most one
+ * source; registering returns a disposer.
+ */
+
+import type { AskAnswerSource } from "./index";
+
+const sources = new Map<string, AskAnswerSource>();
+
+/** Register `source` for `sessionId`. Returns a disposer that clears it. */
+export function registerAskAnswerSource(sessionId: string, source: AskAnswerSource): () => void {
+	sources.set(sessionId, source);
+	return () => {
+		if (sources.get(sessionId) === source) sources.delete(sessionId);
+	};
+}
+
+/** The answer source for `sessionId`, if one is registered. */
+export function getAskAnswerSource(sessionId: string): AskAnswerSource | undefined {
+	return sources.get(sessionId);
+}

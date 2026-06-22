@@ -32,6 +32,7 @@ import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
 import type { Theme } from "../../modes/theme/theme";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -310,6 +311,11 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
+	/**
+	 * Unattended workflow-gate bridge. Present only when the session runs in
+	 * unattended/RPC mode; `undefined` in interactive/TUI mode (notify-only).
+	 */
+	workflowGate?: WorkflowGateEmitter;
 }
 
 /**
@@ -1234,6 +1240,8 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	/** Unattended workflow-gate bridge (present only in unattended/RPC mode). */
+	getWorkflowGate?: () => WorkflowGateEmitter | undefined;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

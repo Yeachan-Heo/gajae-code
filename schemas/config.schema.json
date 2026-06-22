@@ -26,6 +26,42 @@
 			},
 			"additionalProperties": false
 		},
+		"notifications": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"telegram": {
+					"type": "object",
+					"properties": {
+						"botToken": {
+							"type": "string"
+						},
+						"chatId": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				"redact": {
+					"type": "boolean",
+					"default": false
+				},
+				"daemon": {
+					"type": "object",
+					"properties": {
+						"idleTimeoutMs": {
+							"type": "number",
+							"default": 60000
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"autoResume": {
 			"type": "boolean",
 			"description": "Automatically resume the most recent session in the current directory",

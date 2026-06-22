@@ -2427,20 +2427,22 @@ mod tests {
 		})
 		.await
 		.expect("grandchild pid marker");
+		let parent_pid = parse_marker_pid(&output, "parent=").expect("parent pid marker");
 		let command_pgid = process::Process::from_pid(grandchild_pid)
 			.and_then(|process| process.group_id())
 			.expect("grandchild pgid should be visible");
 
 		for _ in 0..50 {
-			if process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid()) == Some(1)
+			if process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid())
+				!= Some(parent_pid)
 			{
 				break;
 			}
 			time::sleep(Duration::from_millis(20)).await;
 		}
-		assert_eq!(
+		assert_ne!(
 			process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid()),
-			Some(1),
+			Some(parent_pid),
 			"grandchild should reparent away from shell before cancellation; output={output:?}",
 		);
 

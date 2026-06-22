@@ -6,6 +6,7 @@ import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMeta
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
 import type {
@@ -180,6 +181,7 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
+	#getWorkflowGateFn: () => WorkflowGateEmitter | undefined = () => undefined;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -234,6 +236,7 @@ export class ExtensionRunner {
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#getWorkflowGateFn = contextActions.getWorkflowGate ?? (() => undefined);
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -463,6 +466,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
+			workflowGate: this.#getWorkflowGateFn(),
 		};
 	}
 

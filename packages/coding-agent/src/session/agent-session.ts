@@ -238,8 +238,9 @@ import {
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
 } from "../tool-discovery/tool-index";
-import type { ToolSession } from "../tools";
+import type { AskAnswerSource, ToolSession } from "../tools";
 import { AskTool } from "../tools/ask";
+import { getAskAnswerSource as getAskAnswerSourceFromRegistry } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
@@ -4383,6 +4384,10 @@ export class AgentSession {
 
 	getWorkflowGateEmitter(): WorkflowGateEmitter | undefined {
 		return this.#workflowGateEmitter;
+	}
+
+	getAskAnswerSource(): AskAnswerSource | undefined {
+		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
 	setWorkflowGateEmitter(emitter: WorkflowGateEmitter | undefined): void {

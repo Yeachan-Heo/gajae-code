@@ -170,12 +170,13 @@ mod platform {
 					}
 					return ProcessStatus::Running;
 				}
-				if ready == 0 {
-					return ProcessStatus::Running;
-				}
-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
-					!= 0
+				if ready > 0
+					&& (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+						!= 0
 				{
+					return ProcessStatus::Exited;
+				}
+				if read_process_state(self.pid) == Some('Z') {
 					return ProcessStatus::Exited;
 				}
 				return ProcessStatus::Running;
@@ -234,6 +235,20 @@ mod platform {
 		let last_paren = content.rfind(')')?;
 		let rest = &content[last_paren + 1..];
 		rest.split_whitespace().nth(19)?.parse().ok()
+	}
+
+	fn read_process_state(pid: i32) -> Option<char> {
+		// `/proc/[pid]/stat` field 3 is the process state. The comm field
+		// (between parens) may itself contain spaces and parens, so locate the
+		// *last* `)` and read the first trailing field.
+		let stat_path = format!("/proc/{pid}/stat");
+		let content = fs::read_to_string(stat_path).ok()?;
+		let last_paren = content.rfind(')')?;
+		content[last_paren + 1..]
+			.split_whitespace()
+			.next()?
+			.chars()
+			.next()
 	}
 
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {

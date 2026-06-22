@@ -66,6 +66,9 @@ async function main(): Promise<void> {
 					"../stats/src/sync-worker.ts",
 					"./src/tools/browser/tab-worker-entry.ts",
 					"./src/eval/js/worker-entry.ts",
+					// Hidden notify daemon CLI (loaded via dynamic import from notify-cli); list it
+					// explicitly so Bun standalone keeps `gjc notify daemon-internal` usable.
+					"./src/notifications/telegram-daemon-cli.ts",
 					"--outfile",
 					"dist/gjc",
 				],

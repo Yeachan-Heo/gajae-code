@@ -78,6 +78,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			shutdown,
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
+			getWorkflowGate: () => session.getWorkflowGateEmitter(),
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")

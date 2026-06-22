@@ -38,6 +38,7 @@ pub mod highlight;
 pub mod html;
 pub mod keys;
 pub mod linediff;
+pub mod notifications;
 pub mod sixel;
 pub use pi_ast::language;
 

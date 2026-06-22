@@ -551,7 +551,18 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		const ui: UIContext = {
 			select: (prompt, options, dialogOptions) => {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-				return extensionUi.select(prompt, options, dialogOptions);
+				const source = this.session.getAskAnswerSource?.();
+				if (!source) return extensionUi.select(prompt, options, dialogOptions);
+				// Race the local UI against a remote answer (e.g. a Telegram reply via the
+				// notifications SDK) so asks can be answered without RPC mode. When the
+				// local UI wins, abort the remote source so it stops waiting and marks the
+				// action resolved-locally. First valid answer wins.
+				const controller = new AbortController();
+				const local = extensionUi.select(prompt, options, dialogOptions).then(answer => {
+					controller.abort();
+					return answer;
+				});
+				return Promise.race([local, source.awaitAnswer(prompt, options, controller.signal)]);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");

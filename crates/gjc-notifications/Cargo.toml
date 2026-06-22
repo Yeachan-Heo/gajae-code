@@ -1,0 +1,34 @@
+[package]
+name = "gjc-notifications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# Pure domain core (protocol + action lifecycle). The N-API/WS server layers are
+# added in later stories; keeping this an rlib makes the core independently
+# unit-testable without native build tooling.
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

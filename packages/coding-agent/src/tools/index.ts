@@ -118,6 +118,18 @@ export type {
 	DiscoverableToolSource,
 } from "../tool-discovery/tool-index";
 
+/**
+ * Source of remote answers for interactive asks (e.g. a Telegram reply routed
+ * through the notifications SDK). Lets a pending ask resolve without RPC mode.
+ */
+export interface AskAnswerSource {
+	/**
+	 * Race a remote answer against the local UI for one question. Resolves with the
+	 * chosen option label or free-text answer, or `undefined` to defer to local UI.
+	 */
+	awaitAnswer(question: string, options: string[], signal?: AbortSignal): Promise<string | undefined>;
+}
+
 /** Session context for tool factories */
 export interface ToolSession {
 	/** Current working directory */
@@ -214,6 +226,13 @@ export interface ToolSession {
 	getGoalModeState?: () => GoalModeState | undefined;
 	/** Unattended workflow-gate emitter (present only when unattended mode is negotiated). */
 	getWorkflowGateEmitter?: () => WorkflowGateEmitter | undefined;
+	/**
+	 * Optional remote answer source for interactive asks. When present, the ask
+	 * tool races the local UI selection against a remote answer (e.g. a Telegram
+	 * reply via the notifications SDK) so asks can be answered without RPC mode.
+	 * No-op when undefined: the ask path behaves exactly as before.
+	 */
+	getAskAnswerSource?: () => AskAnswerSource | undefined;
 	/** Optional per-session restriction for goal tool operations. */
 	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop" | "pause")[];
 	/** Goal runtime for the active agent session. */

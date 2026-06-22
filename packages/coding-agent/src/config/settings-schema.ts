@@ -254,6 +254,17 @@ export const SETTINGS_SCHEMA = {
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
 
+	// Notifications (Telegram bundled reference client)
+	"notifications.enabled": { type: "boolean", default: false },
+	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.chatId": { type: "string", default: undefined },
+	"notifications.redact": { type: "boolean", default: false },
+	"notifications.daemon.idleTimeoutMs": {
+		type: "number",
+		default: 60000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+	},
+
 	autoResume: {
 		type: "boolean",
 		default: false,
@@ -3155,6 +3166,18 @@ export interface ShellMinimizerSettings {
 	maxCaptureBytes: number;
 }
 
+export interface NotificationsSettings {
+	enabled: boolean;
+	telegram: {
+		botToken: string | undefined;
+		chatId: string | undefined;
+	};
+	redact: boolean;
+	daemon: {
+		idleTimeoutMs: number;
+	};
+}
+
 /** Map group prefix -> typed settings interface */
 export interface GroupTypeMap {
 	compaction: CompactionSettings;
@@ -3173,6 +3196,7 @@ export interface GroupTypeMap {
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;
+	notifications: NotificationsSettings;
 }
 
 export type GroupPrefix = keyof GroupTypeMap;

@@ -59,6 +59,14 @@ export interface WorkflowGateEmitter {
 	isUnattended(): boolean;
 	/** Open + emit a gate; resolves with the agent's answer (from workflow_gate_response). */
 	emitGate(input: OpenGateInput): Promise<unknown>;
+	/**
+	 * Optional bridge surface (present on {@link UnattendedSessionControlPlane}) that
+	 * lets an in-process extension observe emitted gates and answer them — used by
+	 * the notifications SDK to resolve a real ask gate from a remote reply.
+	 */
+	onGateEmitted?(listener: (gate: RpcWorkflowGate) => void): () => void;
+	resolveGate?(response: RpcWorkflowGateResponse): Promise<RpcWorkflowGateResolution>;
+	listPendingGates?(): RpcWorkflowGate[];
 }
 
 export interface UnattendedSessionOptions {
@@ -82,11 +90,18 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 	#broker: WorkflowGateBroker | undefined;
 	readonly #pending = new Map<string, { resolve: (answer: unknown) => void; reject: (err: Error) => void }>();
 	readonly #earlyAnswers = new Map<string, unknown>();
+	readonly #gateListeners = new Set<(gate: RpcWorkflowGate) => void>();
 
 	constructor(private readonly opts: UnattendedSessionOptions) {}
 
 	isUnattended(): boolean {
 		return this.#controller !== undefined;
+	}
+
+	/** Observe every emitted gate (e.g. so an extension can map an ask to its gate_id). */
+	onGateEmitted(listener: (gate: RpcWorkflowGate) => void): () => void {
+		this.#gateListeners.add(listener);
+		return () => this.#gateListeners.delete(listener);
 	}
 
 	get controller(): UnattendedRunController | undefined {
@@ -195,6 +210,13 @@ export class UnattendedSessionControlPlane implements RpcUnattendedControlPlane,
 			return Promise.reject(new Error("cannot emit a workflow gate before unattended mode is negotiated"));
 		}
 		const gate = this.#broker.openGate(input);
+		for (const listener of this.#gateListeners) {
+			try {
+				listener(gate);
+			} catch {
+				// A misbehaving observer must never break gate emission.
+			}
+		}
 		if (this.#earlyAnswers.has(gate.gate_id)) {
 			const answer = this.#earlyAnswers.get(gate.gate_id);
 			this.#earlyAnswers.delete(gate.gate_id);
