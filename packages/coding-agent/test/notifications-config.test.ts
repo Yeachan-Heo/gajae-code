@@ -133,7 +133,7 @@ describe("notifications config", () => {
 		expect(sessionTag("abc")).toBe("abc");
 	});
 
-	test("buildRedactedAction redacts ask question/summary but keeps real option labels", () => {
+	test("buildRedactedAction does NOT redact asks (they must stay answerable remotely)", () => {
 		const action: RedactableAction = {
 			id: "a1",
 			kind: "ask",
@@ -143,13 +143,8 @@ describe("notifications config", () => {
 			summary: "Sensitive summary",
 		};
 
-		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual({
-			id: "a1",
-			kind: "ask",
-			sessionId: "session-abcdef",
-			question: "Session abcdef needs input: [Ask]",
-			options: ["Yes, deploy", "No, stop", "Custom"],
-		});
+		// Asks are exempt from redaction: question and options are preserved.
+		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual(action);
 	});
 
 	test("buildRedactedAction returns unchanged action when redact is false", () => {

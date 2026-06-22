@@ -113,7 +113,7 @@ describe("notifications helpers", () => {
 		expect(out?.endsWith("\u2026")).toBe(true);
 	});
 
-	test("notificationActionPayload redacts the ask question but keeps real option labels", () => {
+	test("notificationActionPayload does not redact asks (question and options preserved)", () => {
 		const ask = notificationActionPayload(
 			{
 				id: "ask-1",
@@ -125,7 +125,8 @@ describe("notifications helpers", () => {
 			{ redact: true, sessionTag: "secret" },
 		);
 
-		expect(ask.question).not.toContain("TOKEN");
+		// Asks must stay readable/answerable on the remote surface even under redaction.
+		expect(ask.question).toBe("Deploy prod with secret TOKEN?");
 		expect(ask.options).toEqual(["Deploy prod", "Cancel"]);
 
 		const idle = notificationActionPayload(

@@ -176,7 +176,7 @@ test("interactive ask answered remotely via answer source (no RPC)", async () =>
 	srv.stop();
 }, 30000);
 
-test("redacted ask frame hides question text but keeps answerable option labels", async () => {
+test("ask frames are exempt from redaction so they stay readable and answerable", async () => {
 	const stateRoot = `/tmp/notif-e2e-redact-${process.pid}-${Date.now()}`;
 	const srv = new NotificationServer("redact", "tok", stateRoot, true);
 	const options = ["Ship secret alpha", "Abort secret beta"];
@@ -223,10 +223,10 @@ test("redacted ask frame hides question text but keeps answerable option labels"
 		true,
 	);
 
-	await waitFor(() => actionFrame !== undefined, 4000, "redacted action frame");
-	// Question text is redacted...
-	expect(String(actionFrame?.question)).not.toContain("Alpha");
-	// ...but the choices are NOT redacted, so the remote buttons stay readable/answerable.
+	await waitFor(() => actionFrame !== undefined, 4000, "ask action frame");
+	// Asks are exempt from redaction even with redact:true — both the question and
+	// the options reach the remote intact so the prompt is readable and answerable.
+	expect(String(actionFrame?.question)).toBe("Deploy secret project Alpha?");
 	expect(actionFrame?.options).toEqual(options);
 	await waitFor(() => resolvedBroadcast, 3000, "redacted action resolved");
 	expect(resolvedLabel).toBe("Ship secret alpha");

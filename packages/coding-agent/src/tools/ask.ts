@@ -601,7 +601,31 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-				return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				const source = this.session.getAskAnswerSource?.();
+				if (!source) return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				// Race the local editor against a remote free-text answer so "Other / type
+				// your own" custom input can be provided remotely (e.g. a typed Telegram
+				// reply) instead of blocking on the local-only editor. Mirrors `select`.
+				const remoteController = new AbortController();
+				const localController = new AbortController();
+				const toolSignal = dialogOptions?.signal;
+				if (toolSignal) {
+					if (toolSignal.aborted) localController.abort();
+					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
+				}
+				const remote = source.awaitAnswer(title, [], remoteController.signal).then(answer => {
+					if (answer === undefined) return new Promise<string | undefined>(() => {});
+					localController.abort();
+					return answer;
+				});
+				const local = extensionUi
+					.editor(title, prefill, { ...(dialogOptions ?? {}), signal: localController.signal }, editorOptions)
+					.then(answer => {
+						remoteController.abort();
+						return answer;
+					});
+				void local.catch(() => undefined);
+				return Promise.race([local, remote]);
 			},
 		};
 

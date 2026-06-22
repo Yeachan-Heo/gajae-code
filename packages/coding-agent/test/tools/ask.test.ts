@@ -858,6 +858,36 @@ describe("AskTool custom input", () => {
 		expect(result.content[0].text).toContain("User selected: alpha");
 		expect(editor).toHaveBeenCalledTimes(1);
 	});
+
+	it("fills the Other/custom-input editor from a remote free-text answer", async () => {
+		let calls = 0;
+		const source = {
+			// 1st call = the select step (local picks Other); 2nd call = the editor step,
+			// which a remote (e.g. Telegram) reply fills instead of blocking locally.
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => {
+				calls++;
+				return calls === 1 ? new Promise<string | undefined>(() => {}) : Promise.resolve("remote typed answer");
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		const context = createContext({
+			// Local selector picks the last entry — the "Other / type your own" option.
+			select: (_prompt, options) => Promise.resolve(options[options.length - 1]),
+			// Local editor never resolves; only the remote answer can complete it.
+			editor: () => new Promise<string | undefined>(() => {}),
+		});
+
+		const result = await tool.execute(
+			"call-remote-editor",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.customInput).toBe("remote typed answer");
+		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("remote typed answer");
+	});
 });
 
 describe("AskTool option rendering", () => {

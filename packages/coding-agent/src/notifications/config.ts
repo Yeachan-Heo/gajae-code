@@ -84,11 +84,14 @@ export interface RedactableAction {
 
 /**
  * When redact is true, strip sensitive content for remote delivery:
- *  - ask: question -> `Session <tag> needs input: [Ask]`, summary removed. Option
- *    labels are kept intact so the remote (e.g. Telegram inline-keyboard) buttons
- *    remain answerable and readable — the choices are not the sensitive payload.
+ *  - ask: NOT redacted. An ask is an interactive prompt the human must read and
+ *    answer on the remote surface; redacting its question/options would make it
+ *    unanswerable, defeating remote answering. Asks are returned unchanged.
  *  - idle: summary removed, (no question/options).
  * When redact is false, return the action unchanged.
+ *
+ * Redaction still applies to streamed content frames (turn_stream, context_update,
+ * image_attachment) which are suppressed at their emit sites, not here.
  */
 export function buildRedactedAction(
 	action: RedactableAction,
@@ -96,14 +99,9 @@ export function buildRedactedAction(
 ): RedactableAction {
 	if (!opts.redact) return action;
 
-	const { summary: _summary, question: _question, ...base } = action;
-	if (action.kind === "ask") {
-		return {
-			...base,
-			question: `Session ${opts.sessionTag} needs input: [Ask]`,
-			options: action.options,
-		};
-	}
+	// Asks stay fully readable/answerable even under redaction.
+	if (action.kind === "ask") return action;
 
+	const { summary: _summary, question: _question, ...base } = action;
 	return base;
 }
