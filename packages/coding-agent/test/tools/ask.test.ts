@@ -202,6 +202,50 @@ describe("AskTool cancellation", () => {
 		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("yes");
 	});
 
+	it("treats an unmatched remote answer as provide-my-own custom input", async () => {
+		const source = {
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => Promise.resolve("ship it tomorrow"),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		const context = createContext({
+			// Local selector never resolves; the remote free-text answer wins.
+			select: () => new Promise<string | undefined>(() => {}),
+		});
+
+		const result = await tool.execute(
+			"call-remote-custom",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.customInput).toBe("ship it tomorrow");
+		expect(result.details?.selectedOptions).toEqual([]);
+		if (result.content[0]?.type === "text") expect(result.content[0].text).toContain("custom input");
+	});
+
+	it("treats a remote answer that matches an option as a selection (not custom input)", async () => {
+		const source = {
+			awaitAnswer: (_q: string, _opts: string[], _signal?: AbortSignal) => Promise.resolve("no"),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source } as Partial<ToolSession>));
+		const context = createContext({
+			select: () => new Promise<string | undefined>(() => {}),
+		});
+
+		const result = await tool.execute(
+			"call-remote-match",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.selectedOptions).toEqual(["no"]);
+		expect(result.details?.customInput).toBeUndefined();
+	});
+
 	it("defaults to no timeout when ask.timeout is unset", async () => {
 		// Regression for the surprise-auto-select report: a fresh install must let the user
 		// deliberate indefinitely. The dialog timeout is opt-in via the `ask.timeout` setting.

@@ -430,8 +430,18 @@ async function askSingleQuestion(
 				// If input was dismissed (undefined), keep prior selectedOptions/customInput intact
 			}
 		} else {
-			selectedOptions = [stripRecommendedSuffix(choice)];
-			customInput = undefined;
+			const stripped = stripRecommendedSuffix(choice);
+			if (optionLabels.includes(stripped)) {
+				selectedOptions = [stripped];
+				customInput = undefined;
+			} else {
+				// A remote answer (e.g. a typed Telegram reply) that is not one of the
+				// listed options is the "provide my own" custom input — recorded the same
+				// as picking Other and typing it. The local selector can only ever return
+				// a listed entry, so this branch is reached only for free-text answers.
+				customInput = choice;
+				selectedOptions = [];
+			}
 		}
 		if (navigation?.allowForward) {
 			return { selectedOptions, customInput, timedOut, navigation: "forward" };
