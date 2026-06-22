@@ -98,13 +98,22 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 ): OpenAIResponsesReplayItem | undefined {
 	if (item.type === "item_reference") return undefined;
 
-	// providerPayload stores raw output items; replay strips item ids and keeps only normalized call_id.
-	const { id: _id, ...sanitizedItem } = item;
+	// providerPayload stores raw output items; replay strips fields that are output-only.
+	const { id: _id, ...itemWithoutId } = item;
+	const sanitizedItem =
+		item.type === "computer_call" ? sanitizeComputerCallForResponsesInput(itemWithoutId) : itemWithoutId;
 	if (typeof item.call_id === "string") {
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
 
 	return sanitizedItem as unknown as OpenAIResponsesReplayItem;
+}
+
+function sanitizeComputerCallForResponsesInput(item: Record<string, unknown>): Record<string, unknown> {
+	// The Responses stream includes the performed computer action on output items,
+	// but the create input accepts only the call identity/status fields on replay.
+	const { action: _action, actions: _actions, ...inputSafeItem } = item;
+	return inputSafeItem;
 }
 
 function normalizeReplayedResponsesHistoryCallId(value: string, normalizedValues: Map<string, string>): string {

@@ -5459,6 +5459,16 @@ export class AgentSession {
 			return;
 		}
 
+		// No explicit delivery mode: only a live stream makes prompt() throw
+		// AgentBusyError, so queue the message as steering while streaming.
+		// Compaction is intentionally NOT diverted here: prompt() handles an
+		// in-flight compaction internally, and #queueSteer would otherwise park
+		// the message in the steering queue with no turn to consume it.
+		if (this.isStreaming) {
+			await this.#queueSteer(text, images);
+			return;
+		}
+
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
 		await this.prompt(text, {
 			expandPromptTemplates: false,

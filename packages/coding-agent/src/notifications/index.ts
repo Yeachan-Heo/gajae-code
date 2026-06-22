@@ -36,12 +36,7 @@ import {
 	type NotificationConfig,
 	sessionTag,
 } from "./config";
-import {
-	imageAttachmentsFromMessage,
-	notificationActionPayload,
-	summaryFromMessage,
-	summaryFromMessages,
-} from "./helpers";
+import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
 import { ensureTelegramDaemonRunning } from "./telegram-daemon";
 
 /** Resolve the git dir for `cwd`, handling worktrees where `.git` is a file. */
@@ -71,16 +66,46 @@ function readGitBranch(cwd: string): string | undefined {
 	}
 }
 
+/** Resolve the shared git dir (the main repo's `.git`) for a possibly-linked worktree. */
+function gitCommonDir(gd: string): string {
+	try {
+		const raw = fs.readFileSync(path.join(gd, "commondir"), "utf8").trim();
+		if (raw) return path.resolve(gd, raw);
+	} catch {}
+	return gd;
+}
+
+/**
+ * Best-effort real repository name (no git spawn): resolves the main worktree
+ * root directory so linked worktrees report the repo (e.g. `gajae-code`)
+ * instead of the worktree directory (e.g. `feat-foo-01047f11`).
+ */
+export function readGitRepoName(cwd: string): string | undefined {
+	const gd = gitDir(cwd);
+	if (!gd) return undefined;
+	const commonDir = gitCommonDir(gd);
+	// Strip the trailing `.git` to land on the main worktree root directory.
+	const repoRoot = path.basename(commonDir) === ".git" ? path.dirname(commonDir) : commonDir;
+	const name = path.basename(repoRoot);
+	return name && name !== ".git" ? name : undefined;
+}
+
 /** Build the one-time identity header fields for a session thread. */
-function buildIdentity(cwd: string): {
+function buildIdentity(
+	cwd: string,
+	sessionName?: string,
+): {
 	repo: string;
 	branch: string;
 	machine: string;
-	title: string;
+	title?: string;
 } {
-	const repo = path.basename(cwd) || cwd;
+	const repo = readGitRepoName(cwd) ?? (path.basename(cwd) || cwd);
 	const branch = readGitBranch(cwd) ?? "(detached)";
-	return { repo, branch, machine: os.hostname(), title: `${repo} · ${branch}` };
+	// Send repo/branch and the raw session title separately; the consumer
+	// composes the topic name ("{repo}/{branch}" before the session title is
+	// auto-generated, then "{repo}/{branch} - {session title}" once it exists).
+	return { repo, branch, machine: os.hostname(), title: sessionName };
 }
 
 const execFileAsync = promisify(execFile);
@@ -356,7 +381,13 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			// One-time identity header (repo/branch/machine/session) pinned at the top
 			// of the session thread by the daemon.
 			try {
-				server.pushFrame(JSON.stringify({ type: "identity_header", sessionId: id, ...buildIdentity(ctx.cwd) }));
+				server.pushFrame(
+					JSON.stringify({
+						type: "identity_header",
+						sessionId: id,
+						...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+					}),
+				);
 			} catch (e) {
 				logger.warn(`notifications: identity_header failed: ${String(e)}`);
 			}
@@ -470,11 +501,23 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (event, ctx) => {
+	api.on("agent_end", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		const seq = rt.idleSeq++;
+		// Re-assert the identity header so the daemon renames the topic once the
+		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
+		// daemon only renames when the title actually changed.
+		try {
+			rt.server.pushFrame(
+				JSON.stringify({
+					type: "identity_header",
+					sessionId: id,
+					...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+				}),
+			);
+		} catch {}
 		try {
 			rt.server.noteIdle(
 				JSON.stringify(
@@ -483,7 +526,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 							id: `idle:${id}#${seq}`,
 							kind: "idle",
 							sessionId: id,
-							summary: summaryFromMessages(event.messages),
+							summary: undefined,
 						},
 						{ redact: rt.redact, sessionTag: rt.sessionTag },
 					),
@@ -493,10 +536,10 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			logger.warn(`notifications: noteIdle failed: ${String(e)}`);
 		}
 
-		// On idle, also stream a context update (last message + working-tree diff
-		// stat) unless redaction is on. Best-effort + async; never blocks.
+		// On idle, stream a context update with metadata (token/model usage +
+		// working-tree diff) unless redaction is on. The agent's last message is
+		// NOT repeated here — it is already streamed once via `turn_stream`.
 		if (!rt.redact) {
-			const last = summaryFromMessages(event.messages, 600);
 			const usage = (
 				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
 			).getContextUsage?.();
@@ -504,13 +547,12 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const tokenUsage = usage && usage.tokens != null ? `${usage.tokens}/${usage.contextWindow}` : undefined;
 			const modelId = model?.id;
 			void readGitDiffStat(ctx.cwd).then(diff => {
-				if (!last && !diff && !tokenUsage && !modelId) return;
+				if (!diff && !tokenUsage && !modelId) return;
 				try {
 					rt.server.pushFrame(
 						JSON.stringify({
 							type: "context_update",
 							sessionId: id,
-							lastMessage: last,
 							tokenUsage,
 							model: modelId,
 							diff,

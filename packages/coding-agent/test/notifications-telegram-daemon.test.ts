@@ -511,3 +511,83 @@ test("image_attachment frame uploads via sendPhoto into the session topic", asyn
 	expect(photo!.body.photo).toBe("AAAA");
 	expect(Number(photo!.body.message_thread_id)).toBeGreaterThan(0);
 });
+
+test("identity_header without a title names the topic repo/branch", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+	});
+	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
+	expect(createTopic).toBeTruthy();
+	expect(createTopic!.body.name).toBe("gajae-code/dev");
+});
+
+test("identity_header with repo/branch and a title composes repo/branch - title", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Rebuild notifications",
+	});
+	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
+	expect(createTopic).toBeTruthy();
+	expect(createTopic!.body.name).toBe("gajae-code/dev - Rebuild notifications");
+});
+
+test("identity_header without title or repo falls back to the GJC session label", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "abcdef123456",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "abcdef123456",
+	});
+	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
+	expect(createTopic).toBeTruthy();
+	expect(createTopic!.body.name).toBe("GJC 123456");
+});

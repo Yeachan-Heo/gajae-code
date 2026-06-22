@@ -122,7 +122,7 @@ export function buildActionMessage(action: {
 	summary?: string;
 }): RenderedMessage {
 	if (action.kind === "idle") {
-		return { text: `🟢 Agent idle\n${action.summary ?? "(no summary)"}` };
+		return { text: action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle" };
 	}
 	const text = `❓ ${action.question ?? "Question"}`;
 	const options = action.options ?? [];

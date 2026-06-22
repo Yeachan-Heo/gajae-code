@@ -159,6 +159,37 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("sendUserMessage with no deliverAs steers while streaming instead of throwing", async () => {
+		await createSession();
+
+		// Start first prompt (blocks until abort)
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// With no explicit deliverAs, a busy session should queue as steering
+		// rather than throw AgentBusyError.
+		const send = session.sendUserMessage("Busy message");
+		expect(session.getQueuedMessages()).toEqual({ steering: ["Busy message"], followUp: [] });
+		await expect(send).resolves.toBeUndefined();
+
+		// Cleanup
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("sendUserMessage with no deliverAs starts a fresh turn when idle", async () => {
+		await createSession();
+
+		expect(session.isStreaming).toBe(false);
+		const send = session.sendUserMessage("Idle message");
+		await waitFor(() => session.isStreaming);
+		expect(session.queuedMessageCount).toBe(0);
+
+		// Cleanup
+		await session.abort();
+		await send.catch(() => {});
+	});
+
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let firstStream: AssistantMessageEventStream | undefined;

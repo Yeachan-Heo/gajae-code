@@ -21,6 +21,8 @@ export interface TopicRecord {
 	identitySent: boolean;
 	/** Creation timestamp (ms epoch). */
 	createdAt: number;
+	/** Last applied topic title (for rename detection). */
+	name?: string;
 }
 
 /** Serialisable shape persisted to disk. */
@@ -42,6 +44,8 @@ export class TopicRegistry {
 	private readonly topics: Map<string, TopicRecord>;
 	/** Maps topicId -> sessionId for fast inbound routing. */
 	private readonly byTopic = new Map<string, string>();
+	/** In-flight create promises, keyed by session, to dedupe concurrent creates. */
+	private readonly inflight = new Map<string, Promise<TopicRecord>>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map(Object.entries(state.topics ?? {}));
@@ -70,11 +74,25 @@ export class TopicRegistry {
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing) return existing;
-		const topicId = await create();
-		const record: TopicRecord = { topicId, identitySent: false, createdAt: now() };
-		this.topics.set(sessionId, record);
-		this.byTopic.set(topicId, sessionId);
-		return record;
+		// Concurrency guard: many session frames (identity/idle/turn/ask) can race
+		// to first-use the same session. Without this, each call passes the
+		// `existing` check before `create()` resolves and creates a DUPLICATE
+		// forum topic. Share a single in-flight create per session id.
+		const pending = this.inflight.get(sessionId);
+		if (pending) return pending;
+		const promise = (async () => {
+			const topicId = await create();
+			const record: TopicRecord = { topicId, identitySent: false, createdAt: now() };
+			this.topics.set(sessionId, record);
+			this.byTopic.set(topicId, sessionId);
+			return record;
+		})();
+		this.inflight.set(sessionId, promise);
+		try {
+			return await promise;
+		} finally {
+			this.inflight.delete(sessionId);
+		}
 	}
 
 	/** Mark the identity header as sent for a session. Idempotent. */
@@ -87,6 +105,17 @@ export class TopicRegistry {
 	needsIdentity(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
 		return record ? !record.identitySent : true;
+	}
+
+	/**
+	 * Record the topic's applied title. Returns `true` when it changed (so the
+	 * caller should `editForumTopic`), `false` when already current or unknown.
+	 */
+	applyName(sessionId: string, name: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.name === name) return false;
+		record.name = name;
+		return true;
 	}
 
 	/** Serialise for atomic persistence beside the daemon state. */

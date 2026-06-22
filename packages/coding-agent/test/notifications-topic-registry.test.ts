@@ -60,4 +60,22 @@ describe("TopicRegistry", () => {
 		expect(reloaded.needsIdentity("s1")).toBe(false);
 		expect(reloaded.sessionForTopic("t1")).toBe("s1");
 	});
+	test("concurrent getOrCreateTopic for one session creates exactly one topic (no race)", async () => {
+		const reg = new TopicRegistry();
+		let creates = 0;
+		const create = async () => {
+			creates++;
+			await new Promise(r => setTimeout(r, 5));
+			return `topic-${creates}`;
+		};
+		// identity + idle + turn frames all first-touch the session concurrently.
+		const results = await Promise.all([
+			reg.getOrCreateTopic("s1", create),
+			reg.getOrCreateTopic("s1", create),
+			reg.getOrCreateTopic("s1", create),
+		]);
+		expect(creates).toBe(1);
+		expect(results.map(r => r.topicId)).toEqual(["topic-1", "topic-1", "topic-1"]);
+		expect(reg.sessionForTopic("topic-1")).toBe("s1");
+	});
 });

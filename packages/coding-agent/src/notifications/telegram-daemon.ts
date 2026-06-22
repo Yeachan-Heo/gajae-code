@@ -62,7 +62,11 @@ export interface TelegramDaemonDeps {
 	now?: () => number;
 	pid?: number;
 	pidAlive?: (pid: number) => boolean;
-	spawn?: (command: string, args: string[], opts: { detached: boolean; stdio: "ignore" }) => SpawnResult;
+	spawn?: (
+		command: string,
+		args: string[],
+		opts: { detached: boolean; stdio: "ignore"; logPath?: string },
+	) => SpawnResult;
 	execPath?: string;
 	randomId?: () => string;
 }
@@ -301,9 +305,21 @@ function defaultPidAlive(pid: number): boolean {
 function defaultDaemonSpawn(
 	command: string,
 	args: string[],
-	opts: { detached: boolean; stdio: "ignore" },
+	opts: { detached: boolean; stdio: "ignore"; logPath?: string },
 ): SpawnResult {
-	const child = childProcessSpawn(command, args, { detached: opts.detached, stdio: opts.stdio });
+	// Redirect the detached daemon's stdout/stderr to a log file so failures
+	// (e.g. a rejected sendMessage) are diagnosable instead of vanishing.
+	let stdio: "ignore" | ["ignore", number, number] = opts.stdio;
+	if (opts.logPath) {
+		try {
+			fs.mkdirSync(path.dirname(opts.logPath), { recursive: true, mode: 0o700 });
+			const fd = fs.openSync(opts.logPath, "a", 0o600);
+			stdio = ["ignore", fd, fd];
+		} catch {
+			// Fall back to ignoring output if the log file cannot be opened.
+		}
+	}
+	const child = childProcessSpawn(command, args, { detached: opts.detached, stdio });
 	// Best-effort autostart: a spawn failure must never crash the host session.
 	child.on("error", () => undefined);
 	return { unref: () => child.unref() };
@@ -345,7 +361,11 @@ export async function ensureTelegramDaemonRunning(
 		input.settings.getAgentDir(),
 	];
 	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
-	const child = spawnImpl(execPath, args, { detached: true, stdio: "ignore" });
+	const child = spawnImpl(execPath, args, {
+		detached: true,
+		stdio: "ignore",
+		logPath: path.join(daemonPaths(input.settings.getAgentDir()).dir, "daemon.log"),
+	});
 	child?.unref?.();
 	return "owner_spawned";
 }
@@ -470,7 +490,11 @@ export class TelegramNotificationDaemon {
 		const session: SessionSocket = { sessionId, token, ws, pending: new Map() };
 		this.sessions.set(sessionId, session);
 		ws.addEventListener("message", ev => {
-			void this.handleSessionMessage(session, JSON.parse(String(ev.data)));
+			void this.handleSessionMessage(session, JSON.parse(String(ev.data))).catch(err => {
+				// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
+				// the daemon log instead of an invisible unhandled rejection.
+				console.error("notifications daemon: handleSessionMessage failed:", err);
+			});
 		});
 		ws.addEventListener("close", () => {
 			this.sessions.delete(sessionId);
@@ -485,8 +509,17 @@ export class TelegramNotificationDaemon {
 		"config_update",
 	]);
 
-	private topicNameFor(sessionId: string, msg: { title?: unknown }): string {
-		return typeof msg?.title === "string" && msg.title ? msg.title : `GJC ${sessionId.slice(-6)}`;
+	private topicNameFor(sessionId: string, msg: { title?: unknown; repo?: unknown; branch?: unknown }): string {
+		const repo = typeof msg?.repo === "string" && msg.repo ? msg.repo : undefined;
+		const branch = typeof msg?.branch === "string" && msg.branch ? msg.branch : undefined;
+		const title = typeof msg?.title === "string" && msg.title ? msg.title : undefined;
+		// Name the topic "{repo}/{branch}" before a session title exists, then
+		// "{repo}/{branch} - {title}" once it does. Fall back to the session id
+		// only when no repo identity is available.
+		const base = repo ? (branch ? `${repo}/${branch}` : repo) : undefined;
+		if (base) return title ? `${base} - ${title}` : base;
+		if (title) return title;
+		return `GJC ${sessionId.slice(-6)}`;
 	}
 
 	/**
@@ -511,6 +544,7 @@ export class TelegramNotificationDaemon {
 				},
 				this.opts.now,
 			);
+			this.topics.applyName(sessionId, name);
 			await this.persistTopics();
 			return rec.topicId;
 		} catch {
@@ -590,6 +624,36 @@ export class TelegramNotificationDaemon {
 			if (!send) return;
 			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
 			if (!topicId) return;
+			if (send.identity) {
+				// Rename the topic if the title changed (e.g. the session title was
+				// auto-generated after the topic was first created). This runs on
+				// every identity frame, but does NOT re-send the bulleted message.
+				const name = this.topicNameFor(session.sessionId, msg);
+				if (this.topics.applyName(session.sessionId, name)) {
+					try {
+						await this.botApi.call("editForumTopic", {
+							chat_id: this.opts.chatId,
+							message_thread_id: Number(topicId),
+							name,
+						});
+					} catch {
+						// Best-effort rename; never block delivery.
+					}
+				}
+				// Send the full bulleted identity header EXACTLY ONCE per topic.
+				if (this.topics.needsIdentity(session.sessionId)) {
+					this.pool.submit({
+						sessionId: session.sessionId,
+						lane: send.lane,
+						coalesceKey: send.coalesceKey,
+						payload: { send, topicId },
+					});
+					await this.flushPool();
+					this.topics.markIdentitySent(session.sessionId);
+				}
+				await this.persistTopics();
+				return;
+			}
 			this.pool.submit({
 				sessionId: session.sessionId,
 				lane: send.lane,
@@ -597,15 +661,11 @@ export class TelegramNotificationDaemon {
 				payload: { send, topicId },
 			});
 			await this.flushPool();
-			if (send.identity) {
-				this.topics.markIdentitySent(session.sessionId);
-				await this.persistTopics();
-			}
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {
 			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: session.sessionId, actionId: msg.id });
-			const topicId = await this.ensureTopic(session.sessionId, `GJC ${session.sessionId.slice(-6)}`);
+			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
 			if (!topicId) return;
 			const rendered = buildActionMessage({
 				kind: msg.kind ?? "ask",
@@ -666,9 +726,15 @@ export class TelegramNotificationDaemon {
 		// update_id dedupe are all enforced by decideThreadedInbound.
 		const raw = update as {
 			callback_query?: unknown;
-			message?: { reply_to_message?: unknown };
+			message?: { reply_to_message?: { message_id?: unknown } };
 		};
-		if (!raw.callback_query && !raw.message?.reply_to_message) {
+		// A reply to a known ask message routes to that ask (below). Any OTHER
+		// message in a topic (plain text, or a reply to a non-ask message) is a
+		// free-text injection. Previously replies bypassed injection entirely.
+		const replyTo = raw.message?.reply_to_message?.message_id;
+		const isAskReply =
+			replyTo !== undefined && (this.messageRoutes.has(String(replyTo)) || this.messageRoutes.has(Number(replyTo)));
+		if (!raw.callback_query && !isAskReply) {
 			const inbound = decideThreadedInbound(update as never, {
 				pairedChatId: this.opts.chatId,
 				topicToSession: t => this.topics.sessionForTopic(t),
