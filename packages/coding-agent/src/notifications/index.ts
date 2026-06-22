@@ -501,7 +501,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (event, ctx) => {
+	api.on("agent_end", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;

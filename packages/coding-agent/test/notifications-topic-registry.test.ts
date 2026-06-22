@@ -78,5 +78,4 @@ describe("TopicRegistry", () => {
 		expect(results.map(r => r.topicId)).toEqual(["topic-1", "topic-1", "topic-1"]);
 		expect(reg.sessionForTopic("topic-1")).toBe("s1");
 	});
-
 });
