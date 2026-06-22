@@ -1,6 +1,7 @@
 import { spawn as childProcessSpawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
@@ -75,6 +76,10 @@ export interface TelegramDaemonDeps {
 export const HEARTBEAT_INTERVAL_MS = 5_000;
 export const HEARTBEAT_TTL_MS = 20_000;
 export const DAEMON_VERSION = 1;
+/** Capability token advertised when the server supports app-level ping/pong. */
+export const CLIENT_PING_PONG_CAPABILITY = "client_ping_pong";
+/** Protocol version the daemon advertises in its ClientHello. */
+export const NOTIFICATION_PROTOCOL_VERSION = 2;
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 const RATE_LIMIT_FLUSH_INTERVAL_MS = 1_000;
@@ -471,6 +476,14 @@ interface SessionSocket {
 	token: string;
 	ws: WebSocket;
 	pending: Map<string, { sessionId: string; actionId: string }>;
+	/** True once the server advertised the `client_ping_pong` capability. */
+	capable: boolean;
+	/** Timestamp (via opts.now) of the last received pong; seeds the TTL window. */
+	lastPongAt: number;
+	/** Nonce of the most recent in-flight ping, if any. */
+	awaitingNonce: string | undefined;
+	/** Per-session liveness interval handle (only set for capable sessions). */
+	pingTimer: ReturnType<typeof setInterval> | undefined;
 }
 
 export class TelegramNotificationDaemon {
@@ -576,9 +589,37 @@ export class TelegramNotificationDaemon {
 	connectSession(sessionId: string, url: string, token: string): void {
 		const WS = this.opts.WebSocketImpl ?? WebSocket;
 		const ws = new WS(`${url}/?token=${encodeURIComponent(token)}`);
-		const session: SessionSocket = { sessionId, token, ws, pending: new Map() };
+		const session: SessionSocket = {
+			sessionId,
+			token,
+			ws,
+			pending: new Map(),
+			capable: false,
+			lastPongAt: 0,
+			awaitingNonce: undefined,
+			pingTimer: undefined,
+		};
 		this.sessions.set(sessionId, session);
+		// Bidirectional capability advertisement: announce client_ping_pong once the
+		// socket is open. Sent on "open" only — a real WHATWG WebSocket cannot send
+		// while CONNECTING — and liveness starts only after a capable ServerHello.
+		ws.addEventListener("open", () => {
+			if (session.ws.readyState === WebSocket.OPEN) {
+				try {
+					session.ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
+							capabilities: [CLIENT_PING_PONG_CAPABILITY],
+						}),
+					);
+				} catch {}
+			}
+		});
 		ws.addEventListener("message", ev => {
+			// Identity guard: a delayed frame from a superseded socket must not act
+			// through the replacement session.
+			if (this.sessions.get(sessionId) !== session) return;
 			void this.handleSessionMessage(session, JSON.parse(String(ev.data))).catch(err => {
 				// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
 				// the daemon log instead of an invisible unhandled rejection.
@@ -586,9 +627,59 @@ export class TelegramNotificationDaemon {
 			});
 		});
 		ws.addEventListener("close", () => {
-			this.sessions.delete(sessionId);
-			this.busy.delete(sessionId);
+			this.dropSession(session, "socket_closed");
 		});
+	}
+
+	/**
+	 * Start ack-based liveness for a session whose server advertised the
+	 * `client_ping_pong` capability. Each interval drops the session when no pong
+	 * has arrived within the TTL (the half-open case the socket never signals via
+	 * `close`), otherwise sends a fresh application-level ping. The timer is bound
+	 * to this exact session object.
+	 */
+	private startLiveness(session: SessionSocket): void {
+		if (session.pingTimer) return;
+		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
+		const now = () => (this.opts.now ?? Date.now)();
+		session.lastPongAt = now();
+		session.pingTimer = setIntervalImpl(() => {
+			if (this.sessions.get(session.sessionId) !== session) return;
+			const t = now();
+			if (t - session.lastPongAt >= HEARTBEAT_TTL_MS) {
+				this.dropSession(session, "liveness_timeout");
+				return;
+			}
+			if (session.ws.readyState === WebSocket.OPEN) {
+				const nonce = `${session.sessionId}:${t}:${Math.random().toString(36).slice(2)}`;
+				session.awaitingNonce = nonce;
+				try {
+					session.ws.send(JSON.stringify({ type: "ping", nonce }));
+				} catch {}
+			}
+		}, HEARTBEAT_INTERVAL_MS);
+	}
+
+	/**
+	 * Idempotent, identity-guarded session teardown. Clears the liveness timer,
+	 * removes the map entry only when it still points at this exact session object
+	 * (so a delayed old close cannot delete a replacement), and best-effort closes
+	 * the socket. `scanRoots()` then reconnects the session.
+	 */
+	private dropSession(session: SessionSocket, _reason: string): void {
+		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
+		if (session.pingTimer) {
+			clearIntervalImpl(session.pingTimer);
+			session.pingTimer = undefined;
+		}
+		if (this.sessions.get(session.sessionId) === session) {
+			this.sessions.delete(session.sessionId);
+		}
+		if (session.ws.readyState !== WebSocket.CLOSED) {
+			try {
+				session.ws.close();
+			} catch {}
+		}
 	}
 
 	private static readonly THREADED_FRAMES = new Set([
@@ -782,6 +873,21 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
+		if (msg?.type === "hello") {
+			const caps = Array.isArray(msg.capabilities) ? msg.capabilities : [];
+			if (caps.includes(CLIENT_PING_PONG_CAPABILITY)) {
+				session.capable = true;
+				this.startLiveness(session);
+			}
+			return;
+		}
+		if (msg?.type === "pong") {
+			if (typeof msg.nonce === "string" && msg.nonce === session.awaitingNonce) {
+				session.awaitingNonce = undefined;
+				session.lastPongAt = (this.opts.now ?? Date.now)();
+			}
+			return;
+		}
 		// Live typing indicator: track busy/idle per session and push an immediate
 		// chat action so "typing…" appears without waiting for the refresh tick.
 		if (msg?.type === "activity") {
@@ -1039,6 +1145,7 @@ export class TelegramNotificationDaemon {
 			await this.loadTopics();
 			await this.runScan();
 			let idleSince = (this.opts.now ?? Date.now)();
+			let pollBackoffMs = 0;
 			while (this.running) {
 				if (
 					!(await renewDaemonHeartbeat({
@@ -1055,7 +1162,18 @@ export class TelegramNotificationDaemon {
 					if ((this.opts.now ?? Date.now)() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000)) break;
 				} else {
 					idleSince = (this.opts.now ?? Date.now)();
-					await this.pollOnce();
+					try {
+						await this.pollOnce();
+						pollBackoffMs = 0;
+					} catch (e) {
+						// A transient getUpdates/network failure must not kill the
+						// daemon. Back off (bounded, below the heartbeat TTL) and keep
+						// renewing ownership at the loop top.
+						pollBackoffMs = pollBackoffMs === 0 ? 250 : Math.min(pollBackoffMs * 2, 4_000);
+						logger.warn(`notifications: getUpdates failed, backing off ${pollBackoffMs}ms: ${String(e)}`);
+						await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, pollBackoffMs));
+						continue;
+					}
 				}
 				await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, 10));
 			}

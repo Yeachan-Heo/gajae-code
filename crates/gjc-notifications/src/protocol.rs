@@ -174,6 +174,8 @@ pub enum ServerMessage {
 	Activity(Activity),
 	/// Inbound user-message delivery acknowledgement (native double-check UX).
 	InboundAck(InboundAck),
+	/// Application-level liveness response to a client ping.
+	Pong(Pong),
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
 	#[serde(other)]
 	Unknown,
@@ -191,6 +193,8 @@ pub enum ClientMessage {
 	UserMessage(UserMessage),
 	/// An in-thread configuration command (verbosity/redact toggles).
 	ConfigCommand(ConfigCommand),
+	/// Application-level liveness ping from a client.
+	Ping(Ping),
 	/// Forward-compat: an unrecognized frame type. Tolerated, ignored.
 	#[serde(other)]
 	Unknown,
@@ -325,6 +329,22 @@ pub struct ClientHello {
 	pub capabilities:     Vec<String>,
 }
 
+/// Application-level liveness ping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ping {
+	/// Opaque client nonce echoed in the response.
+	pub nonce: String,
+}
+
+/// Application-level liveness pong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pong {
+	/// Opaque client nonce from the ping.
+	pub nonce: String,
+}
+
 /// An inbound free-text user message injecting/steering a session turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -423,6 +443,8 @@ pub mod capabilities {
 	pub const TYPING: &str = "typing";
 	/// Inbound user-message delivery acknowledgements (double-check UX).
 	pub const INBOUND_ACK: &str = "inbound_ack";
+	/// Application-level client ping/server pong.
+	pub const CLIENT_PING_PONG: &str = "client_ping_pong";
 }
 
 #[cfg(test)]
@@ -624,6 +646,38 @@ mod tests {
 		assert_eq!(v["type"], "hello");
 		assert_eq!(v["protocolVersion"], 2);
 		assert_eq!(v["capabilities"][0], "threaded");
+	}
+
+	#[test]
+	fn ping_roundtrips() {
+		let raw = r#"{"type":"ping","nonce":"n1"}"#;
+		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
+		assert_eq!(msg, ClientMessage::Ping(Ping { nonce: "n1".into() }));
+		assert_eq!(serde_json::to_string(&msg).unwrap(), raw);
+	}
+
+	#[test]
+	fn pong_serializes() {
+		let msg = ServerMessage::Pong(Pong { nonce: "n1".into() });
+		assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"pong","nonce":"n1"}"#);
+	}
+
+	#[test]
+	fn server_hello_serializes_client_ping_pong_capability() {
+		let msg = ServerMessage::Hello(ServerHello {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities:     vec![capabilities::CLIENT_PING_PONG.into()],
+		});
+		let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(v["type"], "hello");
+		assert_eq!(v["protocolVersion"], 2);
+		assert!(
+			v["capabilities"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|cap| cap == capabilities::CLIENT_PING_PONG)
+		);
 	}
 
 	#[test]

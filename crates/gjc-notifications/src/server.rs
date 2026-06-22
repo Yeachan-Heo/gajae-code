@@ -37,7 +37,8 @@ use crate::{
 	actions::{ActionRegistry, ReplyClassification, ReplyOutcome},
 	discovery::EndpointRecord,
 	protocol::{
-		ActionNeeded, ClientMessage, RejectReason, Reply, ReplyAnswer, ReplyRejected, ServerMessage,
+		ActionNeeded, ClientMessage, PROTOCOL_VERSION, Pong, RejectReason, Reply, ReplyAnswer,
+		ReplyRejected, ServerHello, ServerMessage, capabilities,
 	},
 };
 
@@ -331,6 +332,20 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 
 	let mut rx = state.tx.subscribe();
 	let (mut write, mut read) = ws.split();
+	let hello = ServerMessage::Hello(ServerHello {
+		protocol_version: PROTOCOL_VERSION,
+		capabilities:     vec![
+			capabilities::THREADED.into(),
+			capabilities::CONTEXT.into(),
+			capabilities::TURN_STREAM.into(),
+			capabilities::IMAGES.into(),
+			capabilities::CONFIG.into(),
+			capabilities::CLIENT_PING_PONG.into(),
+		],
+	});
+	if send_msg(&mut write, &hello).await.is_err() {
+		return;
+	}
 
 	// Replay the buffered ask (if any) to this freshly-connected client.
 	let replay = state.registry.lock().replay_for_new_client().cloned();
@@ -401,6 +416,11 @@ where
 				let _ = state.inbound_tx.send(ClientMessage::ConfigCommand(c));
 			}
 			return true;
+		},
+		ClientMessage::Ping(p) => {
+			return send_msg(write, &ServerMessage::Pong(Pong { nonce: p.nonce }))
+				.await
+				.is_ok();
 		},
 		// Capability handshake / forward-compat: nothing to do server-side yet.
 		ClientMessage::Hello(_) | ClientMessage::Unknown => return true,
@@ -485,7 +505,7 @@ mod tests {
 	use tokio_tungstenite::connect_async;
 
 	use super::*;
-	use crate::protocol::{ActionKind, Reply};
+	use crate::protocol::{ActionKind, Ping, Reply};
 
 	fn ask(id: &str) -> ActionNeeded {
 		ActionNeeded {
@@ -511,6 +531,24 @@ mod tests {
 			if let Message::Text(t) = msg {
 				return serde_json::from_str(t.as_str()).expect("valid server message");
 			}
+		}
+	}
+
+	async fn next_server_hello<S>(read: &mut S) -> ServerHello
+	where
+		S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+	{
+		match next_server_msg(read).await {
+			ServerMessage::Hello(hello) => {
+				assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
+				assert!(
+					hello
+						.capabilities
+						.contains(&capabilities::CLIENT_PING_PONG.into())
+				);
+				hello
+			},
+			other => panic!("expected hello, got {other:?}"),
 		}
 	}
 
@@ -543,6 +581,7 @@ mod tests {
 	async fn ask_broadcast_then_reply_resolves() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		// wait for the client to be subscribed before broadcasting
 		wait_for_clients(&handle, 1).await;
 
@@ -578,6 +617,7 @@ mod tests {
 		use crate::protocol::{IdentityHeader, TurnPhase, TurnStream};
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
 		handle.push_frame(ServerMessage::IdentityHeader(IdentityHeader {
@@ -619,6 +659,7 @@ mod tests {
 	async fn unknown_action_reply_is_rejected_to_sender() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
 		let reply = Reply {
@@ -649,8 +690,59 @@ mod tests {
 		handle.register_ask(ask("a1"), true);
 		// connect afterwards: should receive the buffered ask on connect
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		let got = next_server_msg(&mut ws).await;
 		assert!(matches!(got, ServerMessage::ActionNeeded(a) if a.id == "a1"));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn hello_before_replay() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		handle.register_ask(ask("a1"), true);
+
+		let mut ws = connect(&handle, "secret").await;
+		let hello = next_server_hello(&mut ws).await;
+		assert_eq!(hello.capabilities, vec![
+			capabilities::THREADED,
+			capabilities::CONTEXT,
+			capabilities::TURN_STREAM,
+			capabilities::IMAGES,
+			capabilities::CONFIG,
+			capabilities::CLIENT_PING_PONG,
+		]);
+
+		match next_server_msg(&mut ws).await {
+			ServerMessage::ActionNeeded(a) => assert_eq!(a.id, "a1"),
+			other => panic!("expected replayed action_needed, got {other:?}"),
+		}
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn ping_gets_pong() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut sender = connect(&handle, "secret").await;
+		next_server_hello(&mut sender).await;
+		let mut other = connect(&handle, "secret").await;
+		next_server_hello(&mut other).await;
+		wait_for_clients(&handle, 2).await;
+
+		sender
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "n1".into() })).unwrap(),
+			))
+			.await
+			.unwrap();
+
+		match next_server_msg(&mut sender).await {
+			ServerMessage::Pong(p) => assert_eq!(p.nonce, "n1"),
+			other => panic!("expected pong, got {other:?}"),
+		}
+		let broadcast =
+			tokio::time::timeout(std::time::Duration::from_millis(300), next_server_msg(&mut other))
+				.await;
+		assert!(broadcast.is_err(), "pong must not be broadcast");
 		handle.stop();
 	}
 
@@ -658,6 +750,7 @@ mod tests {
 	async fn resolve_local_broadcasts_resolved() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 		handle.register_ask(ask("a1"), true);
 		let _needed = next_server_msg(&mut ws).await;
@@ -691,6 +784,7 @@ mod tests {
 		assert!(handle.take_reply_receiver().is_none(), "receiver is take-once");
 
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 		handle.register_ask(ask("a1"), true);
 		let _needed = next_server_msg(&mut ws).await;
@@ -727,6 +821,7 @@ mod tests {
 		let handle = start(config).await.unwrap();
 		let _rx = handle.take_reply_receiver();
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
 		let reply = Reply {
@@ -787,6 +882,7 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::UserMessage(crate::protocol::UserMessage {
@@ -821,6 +917,7 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::UserMessage(crate::protocol::UserMessage {

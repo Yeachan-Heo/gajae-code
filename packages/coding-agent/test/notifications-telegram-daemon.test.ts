@@ -581,6 +581,121 @@ describe("telegram daemon", () => {
 	});
 });
 
+describe("telegram daemon connection-drop resilience (repro-first)", () => {
+	// Phase 1 / AC-1: half-open daemon->session WebSocket. The socket stays
+	// readyState OPEN, accepts send(), and never dispatches 'close'. On current
+	// code there is no per-session liveness, so a stale half-open socket lives in
+	// the sessions map forever and scanRoots() (which skips when sessions.has(id))
+	// never reconnects. This test asserts the DESIRED post-fix recovery and is
+	// therefore RED on current code.
+	test("AC-1/AC-2: half-open session socket is detected and reconnected", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "sess-cwd");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
+		const endpointDir = path.join(roots.roots[0]!, "notifications");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://s", token: "ts" }));
+
+		let now = 0;
+		const liveness: Array<() => void> = [];
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+			setIntervalImpl: ((cb: () => void) => {
+				liveness.push(cb);
+				return 0;
+			}) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+
+		await daemon.scanRoots();
+		expect(FakeWs.instances).toHaveLength(1);
+		expect(daemon.sessions.has("S")).toBe(true);
+
+		// The native server advertises the ping/pong capability so ack-based
+		// liveness can start; then the link goes half-open (no further frames,
+		// socket never closes, no pong will arrive).
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+
+		// Advance past the heartbeat TTL and fire any liveness probe. Post-fix this
+		// detects the missing pong, drops the stale session, and reconnects.
+		now += 25_000;
+		for (const cb of liveness) cb();
+		await Promise.resolve();
+		await daemon.scanRoots();
+
+		expect(FakeWs.instances).toHaveLength(2);
+		expect(daemon.sessions.get("S")?.ws).toBe(FakeWs.instances[1] as unknown as WebSocket);
+		expect(FakeWs.instances[1]!.readyState).toBe(FakeWs.OPEN);
+	});
+
+	// Phase 1 / AC-7: a getUpdates rejection during an internet outage must not
+	// kill the daemon. On current code run() awaits pollOnce() with no try/catch,
+	// so the rejection unwinds run() and releases ownership. This asserts the
+	// DESIRED survival (run resolves) and is RED on current code (run rejects).
+	test("AC-7: getUpdates rejection during outage does not terminate the daemon", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+			randomId: () => "owner",
+		});
+
+		let now = 0;
+		let getUpdatesCalls = 0;
+		const bot = {
+			calls: [] as Array<{ method: string; body: any }>,
+			async call(method: string, body: unknown): Promise<unknown> {
+				this.calls.push({ method, body });
+				if (method === "getUpdates") {
+					getUpdatesCalls++;
+					if (getUpdatesCalls === 1) {
+						// Drop the only session so the next loop iteration idle-exits
+						// once the daemon survives the rejection (post-fix path).
+						daemon.sessions.get("S")?.ws.close();
+						throw new Error("network down: getUpdates rejected");
+					}
+					return { ok: true, result: [] };
+				}
+				return { ok: true, result: true };
+			},
+		};
+
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			idleTimeoutMs: 10,
+			now: () => (now += 1000),
+			setTimeoutImpl: ((cb: () => void) => {
+				cb();
+				return 0;
+			}) as any,
+			setIntervalImpl: (() => 0) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+
+		await expect(daemon.run()).resolves.toBeUndefined();
+		expect(getUpdatesCalls).toBeGreaterThanOrEqual(1);
+	});
+});
+
 test("daemon registers in-thread config commands and drops stale rpc/answer commands", async () => {
 	const s = settings(tempAgentDir());
 	const bot = new FakeBotApi();
@@ -807,4 +922,209 @@ test("inbound thread message gets a queued reaction, flipped to consumed on ack"
 	expect(consumed).toBeTruthy();
 	expect(consumed!.body.message_id).toBe(555);
 	expect(consumed!.body.reaction[0].emoji).toBe("✅");
+});
+
+describe("telegram daemon reconnect reconciliation", () => {
+	function endpointFor(agentDir: string, cwd: string, s: Settings, sessionId: string) {
+		return (async () => {
+			await registerNotificationRoot({ settings: s, cwd, sessionId });
+			const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
+			const dir = path.join(roots.roots[0]!, "notifications");
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ url: "ws://s", token: "ts" }));
+		})();
+	}
+
+	test("identity-guarded replacement survives delayed old close and old message", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await endpointFor(agentDir, path.join(agentDir, "cwd"), s, "S");
+
+		let now = 0;
+		const liveness: Array<() => void> = [];
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+			setIntervalImpl: ((cb: () => void) => {
+				liveness.push(cb);
+				return 0;
+			}) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+		await daemon.scanRoots();
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		now += 25_000;
+		for (const cb of liveness) cb();
+		await daemon.scanRoots();
+		const replacement = daemon.sessions.get("S");
+		expect(FakeWs.instances).toHaveLength(2);
+		expect(replacement?.ws).toBe(FakeWs.instances[1] as unknown as WebSocket);
+
+		// Delayed old close from the superseded socket must not delete the replacement.
+		FakeWs.instances[0]!.dispatchEvent(new Event("close"));
+		expect(daemon.sessions.get("S")).toBe(replacement);
+
+		// Delayed old message from the superseded socket must not produce a send.
+		bot.calls = [];
+		FakeWs.instances[0]!.emit({ type: "action_needed", kind: "ask", id: "old", question: "Q", options: ["Y"] });
+		await Promise.resolve();
+		expect(bot.calls).toHaveLength(0);
+	});
+
+	test("legacy server without ping/pong capability does not start ack liveness", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await endpointFor(agentDir, path.join(agentDir, "cwd"), s, "S");
+
+		let now = 0;
+		const liveness: Array<() => void> = [];
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+			setIntervalImpl: ((cb: () => void) => {
+				liveness.push(cb);
+				return 0;
+			}) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+		await daemon.scanRoots();
+		// Legacy server: advertises capabilities WITHOUT client_ping_pong.
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 1, capabilities: ["threaded"] });
+		expect(liveness).toHaveLength(0);
+		now += 100_000;
+		for (const cb of liveness) cb();
+		await daemon.scanRoots();
+		// No ack-based force-drop: the single original socket remains; half-open ack
+		// recovery is simply unavailable for a non-capable server.
+		expect(FakeWs.instances).toHaveLength(1);
+		expect(daemon.sessions.has("S")).toBe(true);
+	});
+
+	test("AC-3/AC-5: after reconnect a replayed ask renders one re-ask and future frames flow", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await endpointFor(agentDir, path.join(agentDir, "cwd"), s, "S");
+
+		let now = 0;
+		const liveness: Array<() => void> = [];
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+			setIntervalImpl: ((cb: () => void) => {
+				liveness.push(cb);
+				return 0;
+			}) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+		await daemon.scanRoots();
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		now += 25_000;
+		for (const cb of liveness) cb();
+		await daemon.scanRoots();
+		const replacement = daemon.sessions.get("S")!;
+		expect(replacement.ws).toBe(FakeWs.instances[1] as unknown as WebSocket);
+
+		// AC-3: the native server replays its single buffered ask to the fresh
+		// client; the daemon renders exactly one fresh re-ask in the topic.
+		bot.calls = [];
+		await daemon.handleSessionMessage(replacement, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Resume?",
+			options: ["Yes", "No"],
+		});
+		const reAsks = bot.calls.filter(c => c.method === "sendMessage" && c.body.reply_markup?.inline_keyboard);
+		expect(reAsks).toHaveLength(1);
+
+		// AC-5: future streamed frames after reconnect are delivered to the topic.
+		bot.calls = [];
+		await daemon.handleSessionMessage(replacement, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "post-reconnect output",
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("post-reconnect"))).toBe(
+			true,
+		);
+	});
+});
+
+describe("telegram daemon reconnect answer routing", () => {
+	test("AC-4: a button tap after reconnect routes a reply through the replacement socket", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "cwd");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
+		const dir = path.join(roots.roots[0]!, "notifications");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "S.json"), JSON.stringify({ url: "ws://s", token: "ts" }));
+
+		let now = 0;
+		const liveness: Array<() => void> = [];
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+			setIntervalImpl: ((cb: () => void) => {
+				liveness.push(cb);
+				return 0;
+			}) as any,
+			clearIntervalImpl: (() => {}) as any,
+		});
+		await daemon.scanRoots();
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		now += 25_000;
+		for (const cb of liveness) cb();
+		await daemon.scanRoots();
+		const replacement = daemon.sessions.get("S")!;
+
+		// The native server replays the buffered ask to the reconnected client.
+		await daemon.handleSessionMessage(replacement, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Resume?",
+			options: ["Yes", "No"],
+		});
+		const alias = bot.calls.find(c => c.method === "sendMessage" && c.body.reply_markup)!.body.reply_markup
+			.inline_keyboard[0][0].callback_data;
+
+		// A button tap on the fresh re-ask must route a reply over the new socket.
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+		const sent = (replacement.ws as unknown as { sent: string[] }).sent;
+		const replyFrame = sent.map(x => JSON.parse(x)).find(m => m.type === "reply");
+		expect(replyFrame).toEqual({ type: "reply", id: "ask1", answer: 0, token: "ts" });
+	});
 });
