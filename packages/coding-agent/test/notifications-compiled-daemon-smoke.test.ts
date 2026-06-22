@@ -16,7 +16,14 @@ describe("compiled daemon smoke coverage", () => {
 		const cwd = tempDir("gjc-compiled-daemon-cwd-");
 		const token = "123456:super-secret-token";
 		const proc = Bun.spawn(
-			["bun", "run", path.join(repoRoot, "packages/coding-agent/src/cli.ts"), "notify", "daemon-internal", "--smoke"],
+			[
+				"bun",
+				"run",
+				path.join(repoRoot, "packages/coding-agent/src/cli.ts"),
+				"notify",
+				"daemon-internal",
+				"--smoke",
+			],
 			{
 				cwd,
 				env: {
