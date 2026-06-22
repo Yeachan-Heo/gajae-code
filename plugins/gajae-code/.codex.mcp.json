@@ -1,16 +1,14 @@
 {
-  "mcpServers": {
-    "gjc-coordinator": {
-      "command": "gjc",
-      "args": [
-        "mcp-serve",
-        "coordinator"
-      ],
-      "env": {
-        "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "${PWD}",
-        "GJC_COORDINATOR_MCP_REPO": "gajae-code-plugin",
-        "GJC_COORDINATOR_MCP_SESSION_COMMAND": "gjc --worktree"
-      }
+  "gjc-coordinator": {
+    "command": "gjc",
+    "args": [
+      "mcp-serve",
+      "coordinator"
+    ],
+    "env": {
+      "GJC_COORDINATOR_MCP_WORKDIR_ROOTS": "${PWD}",
+      "GJC_COORDINATOR_MCP_REPO": "gajae-code-plugin",
+      "GJC_COORDINATOR_MCP_SESSION_COMMAND": "gjc --worktree"
     }
   }
 }

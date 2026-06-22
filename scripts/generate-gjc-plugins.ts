@@ -64,22 +64,31 @@ function json(value: unknown): string {
 	return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function sharedMcpServers(projectDirToken: string): Record<string, unknown> {
-	// Fail-closed by default: the workdir allowlist is scoped to the host project
-	// directory and mutations are intentionally omitted until the user opts in.
+function coordinatorServer(projectDirToken: string): Record<string, unknown> {
 	return {
-		mcpServers: {
-			"gjc-coordinator": {
-				command: "gjc",
-				args: ["mcp-serve", "coordinator"],
-				env: {
-					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: projectDirToken,
-					GJC_COORDINATOR_MCP_REPO: NAMESPACE_LABEL,
-					GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
-				},
+		"gjc-coordinator": {
+			command: "gjc",
+			args: ["mcp-serve", "coordinator"],
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: projectDirToken,
+				GJC_COORDINATOR_MCP_REPO: NAMESPACE_LABEL,
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
 			},
 		},
 	};
+}
+
+// Claude Code expects an `mcpServers` wrapper in .mcp.json.
+function claudeMcpServers(projectDirToken: string): Record<string, unknown> {
+	// Fail-closed: workdir allowlist scoped to the host project; mutations omitted.
+	return { mcpServers: coordinatorServer(projectDirToken) };
+}
+
+// Codex accepts a direct server map or an `mcp_servers` wrapper. Verified on
+// Codex CLI 0.139.0, the direct map registers the server (an `mcp_servers`
+// wrapper did not), so emit the direct, docs-blessed map.
+function codexMcpServers(projectDirToken: string): Record<string, unknown> {
+	return coordinatorServer(projectDirToken);
 }
 
 function commandDoc(meta: DelegateMeta): string {
@@ -227,8 +236,8 @@ export function renderPluginFiles(): Map<string, string> {
 
 	// Per-host MCP wiring. Claude uses its ${CLAUDE_PROJECT_DIR} token; Codex gets a
 	// host-neutral file that `gjc setup codex` rewrites with a concrete workdir root.
-	files.set(path.join(dir, ".mcp.json"), json(sharedMcpServers("${CLAUDE_PROJECT_DIR}")));
-	files.set(path.join(dir, ".codex.mcp.json"), json(sharedMcpServers("${PWD}")));
+	files.set(path.join(dir, ".mcp.json"), json(claudeMcpServers("${CLAUDE_PROJECT_DIR}")));
+	files.set(path.join(dir, ".codex.mcp.json"), json(codexMcpServers("${PWD}")));
 	for (const meta of DELEGATE_META) {
 		files.set(path.join(dir, "commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
 	}

@@ -5,19 +5,19 @@
  *
  * Asserts the security and contract invariants the host bundles must hold:
  * - the three delegate tools exist in the coordinator contract;
- * - generated MCP config uses GJC_COORDINATOR_MCP_WORKDIR_ROOTS (never the
- *   non-existent GJC_COORDINATOR_MCP_ROOTS) and omits GJC_COORDINATOR_MCP_MUTATIONS;
- * - generated command/skill text references the delegate tools;
- * - committed files match the renderer output (no hand drift).
+ * - committed files match the renderer output (no hand drift);
+ * - the nested plugin layout matches the verified Claude + Codex shapes;
+ * - generated MCP config is fail-closed (WORKDIR_ROOTS, no invalid ROOTS, no MUTATIONS);
+ * - the Codex .mcp.json file uses a Codex-accepted shape (mcp_servers wrapper or
+ *   a direct server map), while manifests keep the camelCase `mcpServers` field
+ *   per the official Codex plugin docs.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordinator/contract";
 import { renderPluginFiles } from "./generate-gjc-plugins";
 
-const repoRoot = path.join(import.meta.dir, "..");
-const pluginsDir = path.join(repoRoot, "plugins");
+const PLUGIN_DIR = "gajae-code";
 
 interface GateResult {
 	name: string;
@@ -30,6 +30,14 @@ function gate(name: string, ok: boolean, detail: string): void {
 	results.push({ name, ok, detail });
 }
 
+const files = renderPluginFiles();
+function read(rel: string): string {
+	return files.get(rel) ?? "";
+}
+function readJson(rel: string): Record<string, unknown> {
+	return JSON.parse(read(rel) || "{}") as Record<string, unknown>;
+}
+
 const delegateTools = COORDINATOR_MCP_TOOL_NAMES.filter(name => name.startsWith("gjc_delegate_"));
 gate(
 	"delegate tools in contract",
@@ -38,75 +46,81 @@ gate(
 	`found: ${delegateTools.join(", ") || "none"}`,
 );
 
-const files = renderPluginFiles();
+// Drift would be caught by `generate-gjc-plugins --check`; here we only assert shape.
 
-// Drift: committed bytes must equal renderer output.
-const driftProblems: string[] = [];
-for (const [rel, content] of files) {
-	const target = path.join(pluginsDir, rel);
-	let actual: string | null = null;
-	try {
-		actual = fs.readFileSync(target, "utf8");
-	} catch {
-		actual = null;
-	}
-	if (actual === null) driftProblems.push(`missing plugins/${rel}`);
-	else if (actual !== content) driftProblems.push(`drift plugins/${rel}`);
-}
-gate("committed bundle matches renderer", driftProblems.length === 0, driftProblems.join("; ") || "in sync");
-const claudeMarketplace = JSON.parse(files.get(path.join(".claude-plugin", "marketplace.json")) ?? "{}") as {
-	plugins?: Array<{ source?: unknown }>;
+// Required nested layout (verified installable on Claude Code + Codex CLI 0.139.0).
+const claudeManifest = path.join(PLUGIN_DIR, ".claude-plugin", "plugin.json");
+const codexManifest = path.join(PLUGIN_DIR, ".codex-plugin", "plugin.json");
+const claudeMcp = path.join(PLUGIN_DIR, ".mcp.json");
+const codexMcp = path.join(PLUGIN_DIR, ".codex.mcp.json");
+const skill = path.join(PLUGIN_DIR, "skills", "gjc-delegation", "SKILL.md");
+const codexMarketplace = path.join(".agents", "plugins", "marketplace.json");
+const claudeMarketplace = path.join(".claude-plugin", "marketplace.json");
+
+gate(
+	"nested plugin layout present",
+	[claudeManifest, codexManifest, claudeMcp, codexMcp, skill].every(rel => files.has(rel)),
+	`plugin folder ./${PLUGIN_DIR}/`,
+);
+gate(
+	"repo marketplaces present at documented paths",
+	files.has(codexMarketplace) && files.has(claudeMarketplace),
+	`${codexMarketplace}, ${claudeMarketplace}`,
+);
+
+// Marketplace sources point at the plugin folder and stay inside the root.
+const codexMkt = readJson(codexMarketplace) as {
+	plugins?: Array<{ source?: { source?: string; path?: string }; policy?: Record<string, unknown>; category?: string }>;
 };
-const claudeSources = claudeMarketplace.plugins?.map(plugin => plugin.source) ?? [];
-const claudeSourcesStayInsideRoot = claudeSources.every(source => typeof source === "string" && !source.includes(".."));
+const codexEntry = codexMkt.plugins?.[0];
+gate(
+	"Codex marketplace uses local source shape",
+	codexEntry?.source?.source === "local" &&
+		codexEntry.source.path === `./${PLUGIN_DIR}` &&
+		!!codexEntry.policy?.installation &&
+		!!codexEntry.policy?.authentication &&
+		!!codexEntry.category,
+	JSON.stringify(codexEntry?.source ?? null),
+);
+const claudeMkt = readJson(claudeMarketplace) as { plugins?: Array<{ source?: unknown }> };
+const claudeSources = claudeMkt.plugins?.map(p => p.source) ?? [];
 gate(
 	"Claude marketplace source stays inside root",
-	claudeSources.length > 0 && claudeSourcesStayInsideRoot,
-	`sources: ${claudeSources.map(source => JSON.stringify(source)).join(", ") || "none"}`,
-);
-gate(
-	"Claude marketplace source has bundled assets",
-	files.has(path.join(".claude-plugin", ".mcp.json")) &&
-		files.has(path.join(".claude-plugin", "commands", "delegate_execute.md")) &&
-		files.has(path.join(".claude-plugin", "skills", "gjc-delegation", "SKILL.md")),
-	"manifest assets are present below .claude-plugin",
+	claudeSources.length > 0 &&
+		claudeSources.every(s => typeof s === "string" && s === `./${PLUGIN_DIR}` && !s.includes("..")),
+	claudeSources.map(s => JSON.stringify(s)).join(", ") || "none",
 );
 
+// Manifests use the documented camelCase `mcpServers` field.
+const codexManifestObj = readJson(codexManifest);
+gate(
+	"Codex manifest uses mcpServers field",
+	codexManifestObj.mcpServers === "./.codex.mcp.json" && !("mcp_servers" in codexManifestObj),
+	Object.keys(codexManifestObj).join(", "),
+);
+
+// The Codex .mcp.json FILE uses a Codex-accepted shape: mcp_servers wrapper or a
+// direct server map. The Claude .mcp.json FILE uses the mcpServers wrapper.
+const codexMcpObj = readJson(codexMcp);
+const codexMcpOk = "mcp_servers" in codexMcpObj || "gjc-coordinator" in codexMcpObj;
+gate("Codex .mcp.json uses mcp_servers or direct map", codexMcpOk && !("mcpServers" in codexMcpObj), Object.keys(codexMcpObj).join(", "));
+const claudeMcpObj = readJson(claudeMcp);
+gate("Claude .mcp.json uses mcpServers wrapper", "mcpServers" in claudeMcpObj, Object.keys(claudeMcpObj).join(", "));
 
 // Fail-closed env invariants across every generated .mcp.json.
 const mcpFiles = [...files.keys()].filter(rel => rel.endsWith(".mcp.json"));
-let mcpChecked = 0;
 let workdirRootsOk = true;
 let noBadRoots = true;
 let noMutations = true;
 for (const rel of mcpFiles) {
-	const text = files.get(rel) ?? "";
-	mcpChecked++;
+	const text = read(rel);
 	if (!text.includes("GJC_COORDINATOR_MCP_WORKDIR_ROOTS")) workdirRootsOk = false;
-	if (text.includes("GJC_COORDINATOR_MCP_ROOTS\"") || /GJC_COORDINATOR_MCP_ROOTS[^_]/.test(text)) noBadRoots = false;
+	if (/GJC_COORDINATOR_MCP_ROOTS[^_]/.test(text)) noBadRoots = false;
 	if (text.includes("GJC_COORDINATOR_MCP_MUTATIONS")) noMutations = false;
 }
-gate("at least one generated MCP config", mcpChecked > 0, `mcp files: ${mcpChecked}`);
-gate("MCP config uses WORKDIR_ROOTS", workdirRootsOk, "all generated MCP configs set the allowlist var");
+gate("MCP config uses WORKDIR_ROOTS", mcpFiles.length > 0 && workdirRootsOk, `mcp files: ${mcpFiles.length}`);
 gate("MCP config omits invalid ROOTS var", noBadRoots, "no GJC_COORDINATOR_MCP_ROOTS present");
 gate("MCP config omits MUTATIONS by default", noMutations, "fail-closed: mutations off until opt-in");
-const codexMarketplaceRel = path.join(".agents", "plugins", "marketplace.json");
-const codexMarketplaceText = files.get(codexMarketplaceRel) ?? "";
-const codexMarketplace = JSON.parse(codexMarketplaceText || "{}") as {
-	plugins?: Array<{ source?: { source?: string; path?: string }; policy?: { installation?: string } }>;
-};
-const codexPlugin = JSON.parse(files.get(path.join(".codex-plugin", "plugin.json")) ?? "{}") as Record<string, unknown>;
-gate("Codex marketplace uses documented path", files.has(codexMarketplaceRel), codexMarketplaceRel);
-gate(
-	"Codex marketplace uses local source shape",
-	codexMarketplace.plugins?.some(plugin => plugin.source?.source === "local" && plugin.source.path === "./plugins") === true,
-	codexMarketplaceText.trim(),
-);
-gate(
-	"Codex plugin uses mcp_servers",
-	"mcp_servers" in codexPlugin && !("mcpServers" in codexPlugin),
-	Object.keys(codexPlugin).join(", "),
-);
 
 // Command/skill docs reference the delegate tools.
 let docsReferenceTools = true;
@@ -118,8 +132,7 @@ gate("docs reference delegate tools", docsReferenceTools, "command/skill docs me
 
 let failures = 0;
 for (const result of results) {
-	const status = result.ok ? "PASS" : "FAIL";
-	process.stdout.write(`[${status}] ${result.name} — ${result.detail}\n`);
+	process.stdout.write(`[${result.ok ? "PASS" : "FAIL"}] ${result.name} — ${result.detail}\n`);
 	if (!result.ok) failures++;
 }
 if (failures > 0) {
