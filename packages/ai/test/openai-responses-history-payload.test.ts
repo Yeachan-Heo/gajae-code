@@ -223,6 +223,18 @@ const incrementalItems2 = [
 	},
 ];
 
+const computerCallHistoryItems = [
+	{
+		type: "computer_call",
+		id: "cu_1",
+		call_id: "call_computer_1",
+		status: "completed",
+		pending_safety_checks: [],
+		action: { type: "screenshot" },
+		actions: [{ type: "screenshot" }],
+	},
+];
+
 function makeAssistantMessage(
 	items: Record<string, unknown>[],
 	incremental = false,
@@ -475,6 +487,28 @@ describe("OpenAI responses history payload", () => {
 			{ role: "user", content: [{ type: "input_text", text: "second question" }] },
 			...incrementalItems2.map(({ id: _id, ...item }) => item),
 			{ role: "user", content: [{ type: "input_text", text: "third question" }] },
+		]);
+	});
+
+	it("strips computer_call actions from replayed native history", async () => {
+		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
+		const payload = (await captureResponsesPayload(model, {
+			messages: [
+				{ role: "user", content: "inspect", timestamp: Date.now() },
+				makeAssistantMessage(computerCallHistoryItems, true),
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		})) as { input?: unknown[] };
+
+		expect(payload.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "inspect" }] },
+			{
+				type: "computer_call",
+				call_id: "call_computer_1",
+				status: "completed",
+				pending_safety_checks: [],
+			},
+			{ role: "user", content: [{ type: "input_text", text: "continue" }] },
 		]);
 	});
 
