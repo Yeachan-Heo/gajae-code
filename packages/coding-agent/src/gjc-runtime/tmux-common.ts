@@ -10,6 +10,7 @@ export const GJC_TMUX_BRANCH_SLUG_OPTION = "@gjc-branch-slug";
 export const GJC_TMUX_PROJECT_OPTION = "@gjc-project";
 export const GJC_TMUX_SESSION_ID_OPTION = "@gjc-session-id";
 export const GJC_TMUX_SESSION_STATE_FILE_OPTION = "@gjc-session-state-file";
+export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
 
 export interface GjcTmuxProfileCommand {
 	description: string;
@@ -101,6 +102,7 @@ export function buildGjcTmuxRequiredProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		version?: string | null;
 	} = {},
 ): GjcTmuxProfileCommand[] {
 	const commands: GjcTmuxProfileCommand[] = [
@@ -134,6 +136,11 @@ export function buildGjcTmuxRequiredProfileCommands(
 			description: "record GJC session state marker",
 			args: ["set-option", "-t", target, GJC_TMUX_SESSION_STATE_FILE_OPTION, metadata.sessionStateFile],
 		});
+	if (metadata.version)
+		commands.push({
+			description: "record GJC version identity",
+			args: ["set-option", "-t", target, GJC_TMUX_VERSION_OPTION, metadata.version],
+		});
 	return commands;
 }
 
@@ -146,6 +153,7 @@ export function buildGjcTmuxProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		version?: string | null;
 	} = {},
 ): GjcTmuxProfileCommand[] {
 	const commands = buildGjcTmuxRequiredProfileCommands(target, metadata);

@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import * as path from "node:path";
 import { safeStderrWrite } from "@gajae-code/utils";
+import { VERSION } from "@gajae-code/utils/dirs";
 import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
@@ -16,7 +17,7 @@ import {
 	type GjcTmuxProfileCommand,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
-import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope } from "./tmux-sessions";
+import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope, type GjcTmuxSessionStatus } from "./tmux-sessions";
 
 export {
 	buildGjcTmuxProfileCommands,
@@ -88,6 +89,9 @@ export interface TmuxLaunchPlan {
 function explicitTmuxSessionName(env: NodeJS.ProcessEnv): string | undefined {
 	return env.GJC_TMUX_SESSION?.trim() || undefined;
 }
+function hasCurrentGjcVersion(session: GjcTmuxSessionStatus | undefined): boolean {
+	return session?.version === VERSION;
+}
 
 function findExistingSessionForLaunch(context: {
 	env: NodeJS.ProcessEnv;
@@ -96,7 +100,8 @@ function findExistingSessionForLaunch(context: {
 }): string | undefined {
 	const explicit = explicitTmuxSessionName(context.env);
 	if (explicit) return findGjcTmuxSessionByName(explicit, context.env)?.name;
-	return findGjcTmuxSessionByScope(context.project, context.branch, context.env)?.name;
+	const scoped = findGjcTmuxSessionByScope(context.project, context.branch, context.env);
+	return hasCurrentGjcVersion(scoped) ? scoped?.name : undefined;
 }
 
 export interface GjcTmuxProfileResult {
@@ -116,6 +121,7 @@ export interface GjcTmuxProfileContext {
 	project?: string | null;
 	sessionId?: string | null;
 	sessionStateFile?: string | null;
+	version?: string | null;
 }
 
 interface CommandResolutionContext {
@@ -457,6 +463,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			project: plan.project,
 			sessionId: plan.sessionId ?? null,
 			sessionStateFile: plan.sessionStateFile ?? null,
+			version: VERSION,
 		});
 		const ownershipFailure = profile.failures.find(item => item.command.args.includes("@gjc-profile"));
 		if (ownershipFailure) {

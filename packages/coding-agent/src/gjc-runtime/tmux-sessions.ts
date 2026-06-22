@@ -10,6 +10,7 @@ import {
 	GJC_TMUX_PROJECT_OPTION,
 	GJC_TMUX_SESSION_ID_OPTION,
 	GJC_TMUX_SESSION_STATE_FILE_OPTION,
+	GJC_TMUX_VERSION_OPTION,
 	normalizeTmuxCreatedAt,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
@@ -26,6 +27,7 @@ export interface GjcTmuxSessionStatus {
 	project?: string;
 	sessionId?: string;
 	sessionStateFile?: string;
+	version?: string;
 	panePids: number[];
 	profile?: string;
 }
@@ -37,6 +39,7 @@ export interface GjcTmuxSessionTagsForGc {
 	branchSlug?: string;
 	sessionId?: string;
 	sessionStateFile?: string;
+	version?: string;
 	createdAt?: string;
 	attached?: boolean;
 	panePids?: number[];
@@ -86,6 +89,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		project = "",
 		sessionId = "",
 		sessionStateFile = "",
+		version = "",
 	] = line.split("\t");
 	if (!name) return null;
 	return {
@@ -105,6 +109,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		profile: profile || undefined,
 		sessionId: sessionId || undefined,
 		sessionStateFile: sessionStateFile || undefined,
+		version: version || undefined,
 	};
 }
 
@@ -131,7 +136,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 
 function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 	return runListSessions(
-		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}`,
+		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}`,
 		env,
 	);
 }
@@ -265,6 +270,7 @@ function hydrateSessionFromExactOptions(session: GjcTmuxSessionStatus, env: Node
 		sessionId: session.sessionId ?? readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, env),
 		sessionStateFile:
 			session.sessionStateFile ?? readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
+		version: session.version ?? readExactOptionForGc(session.name, GJC_TMUX_VERSION_OPTION, env),
 	};
 }
 
@@ -281,6 +287,7 @@ export function readTmuxSessionTagsForGc(
 		branchSlug: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_SLUG_OPTION, env),
 		sessionId: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_ID_OPTION, env),
 		sessionStateFile: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
+		version: readExactOptionForGc(sessionName, GJC_TMUX_VERSION_OPTION, env),
 		createdAt: session?.createdAt,
 		attached: session?.attached,
 		panePids: session?.panePids,

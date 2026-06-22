@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Avoided automatically reusing stale GJC-managed tmux sessions from older GJC versions after an upgrade; scoped `gjc --tmux` reuse now only auto-attaches sessions tagged with the current version.
+
 ## [0.6.5] - 2026-06-21
 
 ### Changed
