@@ -28,6 +28,7 @@ import {
 	toError,
 } from "@gajae-code/utils";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
+import * as git from "../utils/git";
 import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
@@ -792,6 +793,25 @@ function writeTerminalBreadcrumb(cwd: string, sessionFile: string): void {
 }
 
 /**
+ * Two paths belong to linked worktrees of the same repository when they share a
+ * git common dir but resolve to different git dirs (i.e. one is a `git worktree`
+ * of the other). `--worktree` sessions run from such a linked worktree, so a
+ * `--continue` from the main checkout should still resolve their breadcrumb.
+ */
+function isLinkedWorktreePeer(a: string, b: string): boolean {
+	const ra = git.repo.resolveSync(a);
+	const rb = git.repo.resolveSync(b);
+	if (ra === null || rb === null) return false;
+	// Canonicalize: a worktree's commondir is stored as an absolute path that may
+	// differ from the main checkout only by a symlink prefix (e.g. macOS
+	// /tmp -> /private/tmp), so compare resolved-equivalent paths.
+	return (
+		resolveEquivalentPath(ra.commonDir) === resolveEquivalentPath(rb.commonDir) &&
+		resolveEquivalentPath(ra.gitDir) !== resolveEquivalentPath(rb.gitDir)
+	);
+}
+
+/**
  * Read the terminal breadcrumb for the current terminal, scoped to a cwd.
  * Returns the session file path if it exists and matches the cwd, null otherwise.
  */
@@ -808,8 +828,12 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 		const breadcrumbCwd = lines[0];
 		const sessionFile = lines[1];
 
-		// Only return if cwd matches (user might have cd'd)
-		if (path.resolve(breadcrumbCwd) !== path.resolve(cwd)) return null;
+		// Honor the breadcrumb when the cwd matches, or when it points to a linked
+		// worktree of the same repository (e.g. a `--worktree` session resumed from
+		// the main checkout). A genuinely different project is still ignored.
+		if (path.resolve(breadcrumbCwd) !== path.resolve(cwd) && !isLinkedWorktreePeer(breadcrumbCwd, cwd)) {
+			return null;
+		}
 
 		// Verify the session file still exists
 		const stat = fs.statSync(sessionFile, { throwIfNoEntry: false });
@@ -4010,12 +4034,22 @@ export class SessionManager {
 		// Prefer terminal-scoped breadcrumb (handles concurrent sessions correctly)
 		const terminalSession = await readTerminalBreadcrumb(cwd);
 		const mostRecent = terminalSession ?? (await findMostRecentSession(dir, storage));
-		const manager = new SessionManager(cwd, dir, true, storage);
 		if (mostRecent) {
+			// Adopt the resumed session's recorded cwd and its own directory. A
+			// `--worktree` session lives in a linked worktree whose path differs from
+			// the invocation cwd; binding the manager (and HUD) to `cwd` would leave
+			// it on the main checkout instead of the worktree it was created in.
+			const header = (await loadEntriesFromFile(mostRecent, storage)).find(e => e.type === "session") as
+				| SessionHeader
+				| undefined;
+			const resumeCwd = header?.cwd || cwd;
+			const resumeDir = sessionDir ?? path.resolve(mostRecent, "..");
+			const manager = new SessionManager(resumeCwd, resumeDir, true, storage);
 			await manager.#initSessionFile(mostRecent);
-		} else {
-			manager.#initNewSession();
+			return manager;
 		}
+		const manager = new SessionManager(cwd, dir, true, storage);
+		manager.#initNewSession();
 		return manager;
 	}
 

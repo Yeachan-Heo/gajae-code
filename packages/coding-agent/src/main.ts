@@ -904,6 +904,24 @@ export async function runRootCommand(
 		sessionManager = await SessionManager.open(selectedPath);
 	}
 
+	// Restore the resumed session's working directory so the HUD branch, the
+	// project path, and the agent's tools all match where the session was
+	// created. A `--worktree` session lives in a linked worktree whose path
+	// differs from where `--continue`/`--resume` is invoked, which would
+	// otherwise leave the HUD pinned to the main checkout's branch.
+	if (sessionManager && !parsedArgs.cwd) {
+		const sessionCwd = sessionManager.getCwd();
+		if (sessionCwd && normalizePathForComparison(sessionCwd) !== normalizePathForComparison(getProjectDir())) {
+			try {
+				if ((await fs.stat(sessionCwd)).isDirectory()) {
+					setProjectDir(sessionCwd);
+				}
+			} catch {
+				// Session cwd no longer exists (e.g. worktree removed); keep current dir.
+			}
+		}
+	}
+
 	const { options: sessionOptions } = await logger.time(
 		"buildSessionOptions",
 		buildSessionOptions,
