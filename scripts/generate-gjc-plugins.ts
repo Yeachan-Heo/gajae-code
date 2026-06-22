@@ -81,11 +81,6 @@ function sharedMcpServers(projectDirToken: string): Record<string, unknown> {
 		},
 	};
 }
-function sharedCodexMcpServers(projectDirToken: string): Record<string, unknown> {
-	const config = sharedMcpServers(projectDirToken) as { mcpServers: Record<string, unknown> };
-	return { mcp_servers: config.mcpServers };
-}
-
 
 function commandDoc(meta: DelegateMeta): string {
 	return `---
@@ -151,33 +146,40 @@ coordinator contract and the coding-agent package version. Do not edit them by
 hand; run \`bun run generate-plugins\` and commit the result. CI runs
 \`bun run check:plugins\` to fail on drift.
 
-- \`.claude-plugin/\` — Claude Code manifest, marketplace entry, and copied
-  command/skill/MCP assets so the marketplace source stays inside its root.
-- \`.agents/plugins/marketplace.json\` — Codex personal marketplace preview in
-  the documented layout; Codex runtime activation remains gated on a versioned
-  local smoke.
-- \`.codex-plugin/\` — Codex manifest using the documented \`mcp_servers\` key.
-- \`.mcp.json\` / \`.codex.mcp.json\` — shared fail-closed coordinator MCP wiring.
+- \`.claude-plugin/plugin.json\` — Claude Code manifest.
+- \`.codex-plugin/plugin.json\` — Codex manifest.
+- \`.mcp.json\` — Claude coordinator MCP wiring (\${CLAUDE_PROJECT_DIR}).
+- \`.codex.mcp.json\` — Codex coordinator MCP wiring (host-neutral; \`gjc setup codex\` rewrites concrete roots).
 - \`commands/\`, \`skills/\` — host-facing delegate command + skill docs.
+
+Install: \`codex plugin marketplace add ./plugins\` (Codex) or \`/plugin marketplace add ./plugins\` (Claude Code), then install the \`gajae-code\` plugin.
 `;
 }
 
 export function renderPluginFiles(): Map<string, string> {
 	const version = readPackageVersion();
 	const files = new Map<string, string>();
+	const dir = PLUGIN_NAME; // the plugin folder lives under plugins/<name>/
 
-	// Claude Code
+	// Codex repo marketplace (verified shape: source object + policy + category).
+	// `codex plugin marketplace add ./plugins` reads this and loads ./gajae-code.
 	files.set(
-		path.join(".claude-plugin", "plugin.json"),
+		path.join(".agents", "plugins", "marketplace.json"),
 		json({
-			name: PLUGIN_NAME,
-			description: "Delegate planning, execution, and team workflows to GJC through the coordinator MCP server.",
-			version,
-			commands: "./commands",
-			skills: "./skills",
-			mcpServers: "./.mcp.json",
+			name: `${PLUGIN_NAME}-local`,
+			interface: { displayName: "Gajae Code" },
+			plugins: [
+				{
+					name: PLUGIN_NAME,
+					source: { source: "local", path: `./${dir}` },
+					policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+					category: "Productivity",
+				},
+			],
 		}),
 	);
+
+	// Claude Code marketplace (legacy-compatible; Codex can also read this).
 	files.set(
 		path.join(".claude-plugin", "marketplace.json"),
 		json({
@@ -187,7 +189,7 @@ export function renderPluginFiles(): Map<string, string> {
 			plugins: [
 				{
 					name: PLUGIN_NAME,
-					source: ".",
+					source: `./${dir}`,
 					description: "Delegate GJC planning/execution/team workflows via coordinator MCP.",
 					version,
 					author: { name: "Gajae Code" },
@@ -197,56 +199,48 @@ export function renderPluginFiles(): Map<string, string> {
 		}),
 	);
 
-	// Codex (gated): generated in Codex's documented personal marketplace shape,
-	// but setup remains preview-only until a versioned local smoke proves runtime
-	// install/activation for the target Codex build.
+	// Plugin folder: Claude manifest
 	files.set(
-		path.join(".codex-plugin", "plugin.json"),
+		path.join(dir, ".claude-plugin", "plugin.json"),
+		json({
+			name: PLUGIN_NAME,
+			description: "Delegate planning, execution, and team workflows to GJC through the coordinator MCP server.",
+			version,
+			commands: "./commands",
+			skills: "./skills",
+			mcpServers: "./.mcp.json",
+		}),
+	);
+
+	// Plugin folder: Codex manifest (only plugin.json lives under .codex-plugin;
+	// skills/.mcp.json live at the plugin root per Codex plugin anatomy).
+	files.set(
+		path.join(dir, ".codex-plugin", "plugin.json"),
 		json({
 			name: PLUGIN_NAME,
 			version,
 			description: "Delegate Codex tasks to GJC workflows through coordinator MCP.",
-			skills: "./skills",
-			...sharedCodexMcpServers("${PWD}"),
+			skills: "./skills/",
+			mcpServers: "./.codex.mcp.json",
 		}),
 	);
-	const codexMarketplace = {
-		name: `${PLUGIN_NAME}-local`,
-		interface: { displayName: "Gajae Code local" },
-		plugins: [
-			{
-				name: PLUGIN_NAME,
-				source: { source: "local", path: "./plugins" },
-				policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
-				category: "Productivity",
-				description: "Preview-only local GJC delegation plugin; smoke before enabling Codex support.",
-			},
-		],
-	};
-	files.set(path.join(".agents", "plugins", "marketplace.json"), json(codexMarketplace));
-	files.set("codex-marketplace.json", json(codexMarketplace));
 
-	// Shared host docs + per-host MCP wiring. Claude uses its ${CLAUDE_PROJECT_DIR}
-	// token; Codex setup previews concrete workdir roots because Codex project-dir
-	// interpolation and runtime plugin activation remain smoke-gated.
-	files.set(".mcp.json", json(sharedMcpServers("${CLAUDE_PROJECT_DIR}")));
-	files.set(".codex.mcp.json", json(sharedCodexMcpServers("${PWD}")));
-
+	// Per-host MCP wiring. Claude uses its ${CLAUDE_PROJECT_DIR} token; Codex gets a
+	// host-neutral file that `gjc setup codex` rewrites with a concrete workdir root.
+	files.set(path.join(dir, ".mcp.json"), json(sharedMcpServers("${CLAUDE_PROJECT_DIR}")));
+	files.set(path.join(dir, ".codex.mcp.json"), json(sharedMcpServers("${PWD}")));
 	for (const meta of DELEGATE_META) {
-		files.set(path.join("commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
+		files.set(path.join(dir, "commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
 	}
-	files.set(path.join("skills", "gjc-delegation", "SKILL.md"), skillDoc());
-	files.set(path.join(".claude-plugin", ".mcp.json"), files.get(".mcp.json") ?? "");
-	for (const meta of DELEGATE_META) {
-		files.set(path.join(".claude-plugin", "commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
-	}
-	files.set(path.join(".claude-plugin", "skills", "gjc-delegation", "SKILL.md"), skillDoc());
-	files.set("README.md", readmeDoc());
+	files.set(path.join(dir, "skills", "gjc-delegation", "SKILL.md"), skillDoc());
+	files.set(path.join(dir, "README.md"), readmeDoc());
 
 	return files;
 }
 
 function writeFiles(files: Map<string, string>): void {
+	// Clean-generate: remove any stale generated files before writing.
+	fs.rmSync(pluginsDir, { recursive: true, force: true });
 	for (const [rel, content] of files) {
 		const target = path.join(pluginsDir, rel);
 		fs.mkdirSync(path.dirname(target), { recursive: true });

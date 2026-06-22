@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "gajae-code",
-      "source": ".",
+      "source": "./gajae-code",
       "description": "Delegate GJC planning/execution/team workflows via coordinator MCP.",
       "version": "0.6.5",
       "author": {

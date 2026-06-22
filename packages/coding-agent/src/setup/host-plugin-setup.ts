@@ -53,7 +53,8 @@ function verifyBundleFiles(files: string[]): { ok: boolean; checked: string[]; m
 
 export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetupFlags = {}): HostPluginSetupResult {
 	const projectRoot = resolveProjectRoot(flags);
-	const pluginPath = path.join(projectRoot, "plugins");
+	const marketplaceRoot = path.join(projectRoot, "plugins");
+	const pluginDir = path.join(marketplaceRoot, "gajae-code");
 	const repo = flags.repo && flags.repo.trim().length > 0 ? flags.repo.trim() : NAMESPACE_LABEL;
 
 	// Concrete, fail-closed env: workdir allowlist is the project root, no mutations.
@@ -64,18 +65,18 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 	};
 
 	if (host === "claude") {
-		const manifestPath = path.join(pluginPath, ".claude-plugin", "plugin.json");
-		const marketplacePath = path.join(pluginPath, ".claude-plugin", "marketplace.json");
+		const manifestPath = path.join(pluginDir, ".claude-plugin", "plugin.json");
+		const marketplacePath = path.join(marketplaceRoot, ".claude-plugin", "marketplace.json");
 		return {
 			ok: true,
 			host,
 			mode: "render",
 			gated: false,
-			pluginPath,
+			pluginPath: marketplaceRoot,
 			manifestPath,
 			marketplacePath,
 			installGuidance: [
-				`Add the local marketplace: /plugin marketplace add ${marketplacePath}`,
+				`Add the local marketplace: /plugin marketplace add ${marketplaceRoot}`,
 				"Install the plugin: /plugin install gajae-code",
 				"Then call gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team from Claude Code.",
 			],
@@ -84,51 +85,41 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 				"Fail-closed: delegation is read-only until you set GJC_COORDINATOR_MCP_MUTATIONS=sessions and pass allow_mutation:true per call.",
 			notes: [],
 			...(flags.check
-				? {
-						check: verifyBundleFiles([
-							manifestPath,
-							marketplacePath,
-							path.join(pluginPath, ".claude-plugin", ".mcp.json"),
-							path.join(pluginPath, ".claude-plugin", "commands", "delegate_execute.md"),
-							path.join(pluginPath, ".claude-plugin", "skills", "gjc-delegation", "SKILL.md"),
-						]),
-					}
+				? { check: verifyBundleFiles([manifestPath, marketplacePath, path.join(pluginDir, ".mcp.json")]) }
 				: {}),
 		};
 	}
 
-	// Codex remains preview-only until the operator proves the target Codex build
-	// can install and activate personal marketplace plugins at runtime.
-	const manifestPath = path.join(pluginPath, ".codex-plugin", "plugin.json");
-	const marketplacePath = path.join(pluginPath, ".agents", "plugins", "marketplace.json");
+	// Codex: verified installable on Codex CLI 0.139.0 via the local marketplace smoke.
+	const manifestPath = path.join(pluginDir, ".codex-plugin", "plugin.json");
+	const marketplacePath = path.join(marketplaceRoot, ".agents", "plugins", "marketplace.json");
 	return {
 		ok: true,
 		host,
 		mode: "render",
-		gated: true,
-		pluginPath,
+		gated: false,
+		pluginPath: marketplaceRoot,
 		manifestPath,
 		marketplacePath,
 		installGuidance: [
-			`Preview the documented personal marketplace file: ${marketplacePath}`,
-			"Do not run `codex plugin install gajae-code`; this setup is fail-closed until a versioned Codex smoke proves install and runtime activation for the target build.",
-			"Smoke by registering the personal marketplace, then confirm a fresh Codex runtime exposes gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team before claiming support.",
+			`Add the local marketplace: codex plugin marketplace add ${marketplaceRoot}`,
+			"Install the plugin: codex plugin add gajae-code@gajae-code-local",
+			"Then call gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team from Codex.",
 		],
 		coordinatorConfigPreview: { command: "gjc", args: ["mcp-serve", "coordinator"], env },
 		mutationPolicy:
 			"Fail-closed: delegation is read-only until you set GJC_COORDINATOR_MCP_MUTATIONS=sessions and pass allow_mutation:true per call.",
 		notes: [
-			"Codex setup is preview-only: generated files follow the documented ~/.agents/plugins/marketplace.json personal marketplace shape and plugin.json uses mcp_servers, but runtime install/activation is not claimed without a versioned local smoke.",
-			"The legacy top-level plugins/codex-marketplace.json is generated only as a compatibility copy of the documented .agents/plugins marketplace file.",
+			"Verified on Codex CLI 0.139.0: marketplace add + plugin add install the plugin (enabled) and `codex mcp list` registers gjc-coordinator with the fail-closed env.",
+			"The bundled .codex.mcp.json workdir root is host-neutral; `gjc setup codex` renders a concrete root, and operators should re-run the local marketplace smoke on their target Codex version.",
 		],
 		...(flags.check
 			? {
 					check: verifyBundleFiles([
 						manifestPath,
 						marketplacePath,
-						path.join(pluginPath, "codex-marketplace.json"),
-						path.join(pluginPath, ".codex.mcp.json"),
-						path.join(pluginPath, "skills", "gjc-delegation", "SKILL.md"),
+						path.join(pluginDir, ".codex.mcp.json"),
+						path.join(pluginDir, "skills", "gjc-delegation", "SKILL.md"),
 					]),
 				}
 			: {}),

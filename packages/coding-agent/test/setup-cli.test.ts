@@ -362,41 +362,27 @@ describe("setup CLI host plugins", () => {
 			const parsed = JSON.parse(output) as {
 				host: string;
 				gated: boolean;
-				marketplacePath: string;
-				check?: { checked: string[] };
 				coordinatorConfigPreview: { env: Record<string, string> };
 			};
-
 			expect(parsed.host).toBe("claude");
 			expect(parsed.gated).toBe(false);
 			expect(parsed.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).toBe("/tmp/example-repo");
 			expect(parsed.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_MUTATIONS).toBeUndefined();
 			expect("GJC_COORDINATOR_MCP_ROOTS" in parsed.coordinatorConfigPreview.env).toBe(false);
-			expect(parsed.marketplacePath).toEndWith(path.join("plugins", ".claude-plugin", "marketplace.json"));
 		} finally {
 			stdout.mockRestore();
 		}
 	});
 
-	it("renders Codex plugin setup gated on a versioned smoke", async () => {
+	it("renders Codex plugin setup verified on a local marketplace smoke", async () => {
 		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		try {
 			await runSetupCommand({ component: "codex", flags: { json: true, root: ["/tmp/example-repo"] } });
 			const output = stdout.mock.calls.map(call => String(call[0])).join("");
-			const parsed = JSON.parse(output) as {
-				host: string;
-				gated: boolean;
-				marketplacePath: string;
-				installGuidance: string[];
-				notes: string[];
-			};
+			const parsed = JSON.parse(output) as { host: string; gated: boolean; notes: string[]; installGuidance: string[] };
 			expect(parsed.host).toBe("codex");
-			expect(parsed.gated).toBe(true);
-			expect(parsed.marketplacePath).toEndWith(path.join("plugins", ".agents", "plugins", "marketplace.json"));
-			expect(parsed.installGuidance.join(" ")).toContain("Do not run `codex plugin install gajae-code`");
-			expect(parsed.installGuidance.join(" ")).not.toContain("Install the plugin: codex plugin install gajae-code");
-			expect(parsed.notes.join(" ")).toContain("preview-only");
-			expect(parsed.notes.join(" ")).toContain("mcp_servers");
+			expect(parsed.gated).toBe(false);
+			expect(parsed.installGuidance.join(" ")).toContain("codex plugin marketplace add");
 		} finally {
 			stdout.mockRestore();
 		}

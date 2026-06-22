@@ -1,5 +1,5 @@
 {
-  "mcp_servers": {
+  "mcpServers": {
     "gjc-coordinator": {
       "command": "gjc",
       "args": [

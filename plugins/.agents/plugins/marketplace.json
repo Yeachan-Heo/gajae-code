@@ -1,21 +1,20 @@
 {
   "name": "gajae-code-local",
   "interface": {
-    "displayName": "Gajae Code local"
+    "displayName": "Gajae Code"
   },
   "plugins": [
     {
       "name": "gajae-code",
       "source": {
         "source": "local",
-        "path": "./plugins"
+        "path": "./gajae-code"
       },
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "Productivity",
-      "description": "Preview-only local GJC delegation plugin; smoke before enabling Codex support."
+      "category": "Productivity"
     }
   ]
 }
