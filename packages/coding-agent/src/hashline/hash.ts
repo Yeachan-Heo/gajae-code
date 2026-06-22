@@ -9,7 +9,7 @@ import bigrams from "./bigrams.json" with { type: "json" };
 // module evaluation so this core module (and its re-exported helpers) stays
 // usable and falls back to the TS loop if the native addon is unavailable.
 let formatHashLinesNative: ((text: string, startLine?: number) => string) | undefined;
-void import("../../../natives/native/index.js")
+void import("@gajae-code/natives")
 	.then(mod => {
 		if (typeof mod.h06FormatHashLines === "function") {
 			formatHashLinesNative = mod.h06FormatHashLines;

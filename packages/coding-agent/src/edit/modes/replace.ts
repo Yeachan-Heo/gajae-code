@@ -42,7 +42,7 @@ let scoreSequenceFuzzyNative:
 let findBestFuzzyMatchNative:
 	| ((content: string, target: string, threshold: number) => NativeBestFuzzyMatchResult)
 	| undefined;
-void import("../../../../natives/native/index.js")
+void import("@gajae-code/natives")
 	.then(mod => {
 		if (typeof mod.h02ScoreSequenceFuzzy === "function") {
 			scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
