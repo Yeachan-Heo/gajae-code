@@ -455,10 +455,13 @@ function inferGeneratedApplyPatchToolType(
 }
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
-	// gpt-5.5 is a 400K-context model. OpenAI code backend discovery can omit the
-	// context window, falling back to the 272K default, which incorrectly trips
-	// context-cap / auto-promote thresholds (a ~272K session would look over-cap
-	// and demote to gpt-5.4). Pin gpt-5.5 to its true 400K window.
+	// OpenAI Codex reports GPT-5.5 with a 272K prompt budget. Keep the generated
+	// bundle aligned with the backend limit so compaction fires before the prompt
+	// crosses the usable Codex window instead of trusting stale 400K snapshots.
+	if (model.provider === "openai-codex" && parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
+		model.contextWindow = 272000;
+		return true;
+	}
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
 		model.contextWindow = 400000;
 		return true;
