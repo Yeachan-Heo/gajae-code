@@ -379,7 +379,12 @@ describe("setup CLI host plugins", () => {
 		try {
 			await runSetupCommand({ component: "codex", flags: { json: true, root: ["/tmp/example-repo"] } });
 			const output = stdout.mock.calls.map(call => String(call[0])).join("");
-			const parsed = JSON.parse(output) as { host: string; gated: boolean; notes: string[]; installGuidance: string[] };
+			const parsed = JSON.parse(output) as {
+				host: string;
+				gated: boolean;
+				notes: string[];
+				installGuidance: string[];
+			};
 			expect(parsed.host).toBe("codex");
 			expect(parsed.gated).toBe(false);
 			expect(parsed.installGuidance.join(" ")).toContain("codex plugin marketplace add");
