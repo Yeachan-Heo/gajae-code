@@ -78,6 +78,12 @@ export const DAEMON_VERSION = 1;
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 const RATE_LIMIT_FLUSH_INTERVAL_MS = 1_000;
+// How often the daemon rescans for newly-started sessions. This MUST run
+// independently of the Telegram getUpdates long-poll (up to 25s): otherwise a
+// session that starts mid-poll is not connected until the poll returns, so its
+// buffered ask is delivered up to 25s late — or never, if the user answers the
+// local ask first (which clears the buffered ask).
+const SESSION_SCAN_INTERVAL_MS = 1_000;
 
 export function daemonPaths(agentDir: string): DaemonPaths {
 	const dir = path.join(agentDir, "notifications");
@@ -390,6 +396,7 @@ export interface TelegramDaemonOptions {
 	setIntervalImpl?: typeof setInterval;
 	clearIntervalImpl?: typeof clearInterval;
 	idleTimeoutMs?: number;
+	scanIntervalMs?: number;
 	pid?: number;
 	botApi?: BotApi;
 }
@@ -413,6 +420,8 @@ export class TelegramNotificationDaemon {
 	private readonly pool: RateLimitPool<{ send: ThreadedSend; topicId: string }>;
 	private readonly seenUpdateIds = new Set<number>();
 	private flushTimer: ReturnType<typeof setInterval> | undefined;
+	private scanTimer: ReturnType<typeof setInterval> | undefined;
+	private scanning = false;
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
@@ -623,6 +632,33 @@ export class TelegramNotificationDaemon {
 		this.flushTimer = undefined;
 	}
 
+	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
+	private async runScan(): Promise<void> {
+		if (this.scanning) return;
+		this.scanning = true;
+		try {
+			await this.scanRoots();
+		} finally {
+			this.scanning = false;
+		}
+	}
+
+	private startScanTimer(): void {
+		if (this.scanTimer) return;
+		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
+		this.scanTimer = setIntervalImpl(() => {
+			if (!this.running) return;
+			void this.runScan();
+		}, this.opts.scanIntervalMs ?? SESSION_SCAN_INTERVAL_MS);
+	}
+
+	private stopScanTimer(): void {
+		if (!this.scanTimer) return;
+		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
+		clearIntervalImpl(this.scanTimer);
+		this.scanTimer = undefined;
+	}
+
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);
@@ -831,11 +867,12 @@ export class TelegramNotificationDaemon {
 		});
 		if (!this.running) return;
 		this.startFlushTimer();
+		this.startScanTimer();
 		try {
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
-			await this.scanRoots();
+			await this.runScan();
 			let idleSince = (this.opts.now ?? Date.now)();
 			while (this.running) {
 				if (
@@ -848,7 +885,7 @@ export class TelegramNotificationDaemon {
 					}))
 				)
 					break;
-				await this.scanRoots();
+				await this.runScan();
 				if (this.sessions.size === 0) {
 					if ((this.opts.now ?? Date.now)() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000)) break;
 				} else {
@@ -859,6 +896,7 @@ export class TelegramNotificationDaemon {
 			}
 		} finally {
 			this.stopFlushTimer();
+			this.stopScanTimer();
 			await releaseDaemonOwnership({
 				settings: this.opts.settings,
 				ownerId: this.opts.ownerId,

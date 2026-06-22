@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Settings } from "../src/config/settings";
 import {
 	acquireDaemonOwnership,
+	DAEMON_VERSION,
 	daemonPaths,
 	ensureTelegramDaemonRunning,
 	registerNotificationRoot,
@@ -432,6 +433,87 @@ describe("telegram daemon", () => {
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
 		await releaseDaemonOwnership({ settings: s, ownerId: "owner" });
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+	});
+
+	test("scan timer connects new sessions while a getUpdates long-poll is in flight", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+			randomId: () => "owner",
+		});
+
+		// Endpoint discovery files live at <cwd>/.gjc/state/notifications/<sessionId>.json.
+		const writeEndpoint = async (cwd: string, sessionId: string, url: string) => {
+			await registerNotificationRoot({ settings: s, cwd, sessionId });
+			const dir = path.join(cwd, ".gjc", "state", "notifications");
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ url, token: "tok" }));
+		};
+
+		// Session A exists from the start so the run loop reaches the long-poll branch.
+		await writeEndpoint(path.join(agentDir, "cwd-a"), "A", "ws://a");
+
+		// getUpdates blocks (simulating the 25s long-poll) until released, so the
+		// run loop's own scanRoots call cannot pick up session B.
+		let releasePoll: () => void = () => {};
+		const pollGate = new Promise<void>(resolve => {
+			releasePoll = resolve;
+		});
+		const inner = new FakeBotApi();
+		const gatedBot = {
+			get calls() {
+				return inner.calls;
+			},
+			async call(method: string, body: unknown): Promise<unknown> {
+				if (method === "getUpdates") {
+					await pollGate;
+					return { ok: true, result: [] };
+				}
+				return inner.call(method, body);
+			},
+		};
+
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: gatedBot,
+			WebSocketImpl: FakeWs as any,
+			scanIntervalMs: 5,
+			idleTimeoutMs: 60_000,
+		});
+
+		const until = async (pred: () => boolean, ms = 2000) => {
+			const start = Date.now();
+			while (!pred()) {
+				if (Date.now() - start > ms) throw new Error("condition not met in time");
+				await new Promise(r => setTimeout(r, 5));
+			}
+		};
+
+		const runPromise = daemon.run();
+		await until(() => daemon.sessions.has("A"));
+
+		// Session B starts AFTER the loop is blocked in the long-poll. The scan timer
+		// (not the long-poll-gated loop scan) must connect it promptly.
+		await writeEndpoint(path.join(agentDir, "cwd-b"), "B", "ws://b");
+		await until(() => daemon.sessions.has("B"));
+		expect(daemon.sessions.has("B")).toBe(true);
+
+		// Stop: hand ownership to another owner so the next heartbeat renew fails,
+		// then release the long-poll so the loop can observe it and exit.
+		fs.writeFileSync(
+			daemonPaths(agentDir).state,
+			JSON.stringify({ version: DAEMON_VERSION, ownerId: "other", pid: 1, heartbeatAt: 0 }),
+		);
+		releasePoll();
+		await runPromise;
 	});
 });
 
