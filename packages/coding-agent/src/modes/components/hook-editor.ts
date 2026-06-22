@@ -17,6 +17,10 @@ export interface HookEditorOptions {
 	promptStyle?: boolean;
 }
 
+function isWindowsRawLfNewlineInput(keyData: string): boolean {
+	return process.platform === "win32" && keyData === "\n";
+}
+
 export class HookEditorComponent extends Container {
 	#editor: Editor;
 	#onSubmitCallback: (value: string) => void;
@@ -92,8 +96,9 @@ export class HookEditorComponent extends Container {
 			return;
 		}
 
-		// Submit on any plain Enter encoding, including terminals that report unmodified Enter as LF.
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
+		// Submit on plain Enter encodings. On Windows, raw LF is reserved for terminal
+		// newline mappings (Shift+Enter/Ctrl+J/Ctrl+Enter); plain Enter reports CR.
+		if (!isWindowsRawLfNewlineInput(keyData) && (matchesKey(keyData, "enter") || matchesKey(keyData, "return"))) {
 			this.#onSubmitCallback(this.#editor.getText());
 			return;
 		}

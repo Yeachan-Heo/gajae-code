@@ -177,19 +177,48 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
-	it("submits when a terminal reports plain Enter as LF", () => {
-		const onSubmit = vi.fn();
-		const onCancel = vi.fn();
-		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
-			promptStyle: true,
-		});
+	it("submits when a non-Windows terminal reports plain Enter as LF", () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "linux" });
+		try {
+			const onSubmit = vi.fn();
+			const onCancel = vi.fn();
+			const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
+				promptStyle: true,
+			});
 
-		component.handleInput("a");
-		component.handleInput("\n");
+			component.handleInput("a");
+			component.handleInput("\n");
 
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("a");
-		expect(onCancel).not.toHaveBeenCalled();
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit).toHaveBeenCalledWith("a");
+			expect(onCancel).not.toHaveBeenCalled();
+		} finally {
+			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+		}
+	});
+
+	it("inserts newline for Windows PowerShell raw LF newline chords", () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		try {
+			const onSubmit = vi.fn();
+			const onCancel = vi.fn();
+			const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
+				promptStyle: true,
+			});
+
+			component.handleInput("a");
+			component.handleInput("\n");
+			component.handleInput("b");
+			component.handleInput("\r");
+
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit).toHaveBeenCalledWith("a\nb");
+			expect(onCancel).not.toHaveBeenCalled();
+		} finally {
+			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+		}
 	});
 
 	it("inserts newline on Shift+Enter instead of submitting", () => {
