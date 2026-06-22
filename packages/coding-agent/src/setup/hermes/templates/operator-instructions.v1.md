@@ -15,6 +15,16 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 6. Use `{{TOOL_PREFIX}}_report_status` for coordinator-visible status and final reports.
 7. Use `{{TOOL_PREFIX}}_read_tail` only as advisory debug output when structured turn state is insufficient.
 
+## Prefer high-level delegation
+
+When the goal is to hand GJC a whole workflow rather than micro-manage one prompt, prefer the first-class delegate tools over manual `{{TOOL_PREFIX}}_start_session` + `{{TOOL_PREFIX}}_send_prompt` sequencing:
+
+- `gjc_delegate_plan` — run consensus planning (`/skill:ralplan`) to a pending-approval plan.
+- `gjc_delegate_execute` — run execution (`/skill:ultragoal`) to completion with verification.
+- `gjc_delegate_team` — run parallel team execution (`/skill:team`) with internal tmux workers.
+
+Each delegate starts (or reuses) a session, sends one workflow-tagged turn, and returns a durable `turn_id`. Pass `cwd` and `task`; set `allow_mutation: true` only when the bridge startup mutation class is enabled and the user has approved changes. Poll the returned `turn_id` with `{{TOOL_PREFIX}}_await_turn` or watch for the `delegation.started` event, exactly as with `send_prompt`. Drop to the manual start/send tools only for fine-grained control the delegate tools do not cover.
+
 ## Event watch
 
 `{{TOOL_PREFIX}}_watch_events` is a bounded long-poll read tool. Call it with `after_seq` set to the last stored sequence number, optional `session_id` or `event_types`, `timeout_ms` up to 30000, and `limit` up to 100. Store the returned `latest_seq` before the next wait. A timeout with no events is not failure; call again or use the turn/status read tools for a snapshot.

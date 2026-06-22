@@ -347,3 +347,44 @@ describe("setup CLI parsing", () => {
 		});
 	});
 });
+
+describe("setup CLI host plugins", () => {
+	it("parses claude and codex components", () => {
+		expect(parseSetupArgs(["setup", "claude", "--json"])).toEqual({ component: "claude", flags: { json: true } });
+		expect(parseSetupArgs(["setup", "codex", "--json"])).toEqual({ component: "codex", flags: { json: true } });
+	});
+
+	it("renders a fail-closed Claude plugin setup with concrete workdir roots", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		try {
+			await runSetupCommand({ component: "claude", flags: { json: true, root: ["/tmp/example-repo"] } });
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			const parsed = JSON.parse(output) as {
+				host: string;
+				gated: boolean;
+				coordinatorConfigPreview: { env: Record<string, string> };
+			};
+			expect(parsed.host).toBe("claude");
+			expect(parsed.gated).toBe(false);
+			expect(parsed.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).toBe("/tmp/example-repo");
+			expect(parsed.coordinatorConfigPreview.env.GJC_COORDINATOR_MCP_MUTATIONS).toBeUndefined();
+			expect("GJC_COORDINATOR_MCP_ROOTS" in parsed.coordinatorConfigPreview.env).toBe(false);
+		} finally {
+			stdout.mockRestore();
+		}
+	});
+
+	it("renders Codex plugin setup gated on a versioned smoke", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		try {
+			await runSetupCommand({ component: "codex", flags: { json: true, root: ["/tmp/example-repo"] } });
+			const output = stdout.mock.calls.map(call => String(call[0])).join("");
+			const parsed = JSON.parse(output) as { host: string; gated: boolean; notes: string[] };
+			expect(parsed.host).toBe("codex");
+			expect(parsed.gated).toBe(true);
+			expect(parsed.notes.join(" ")).toContain("gated");
+		} finally {
+			stdout.mockRestore();
+		}
+	});
+});

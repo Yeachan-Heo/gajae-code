@@ -5,7 +5,17 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
+const COMPONENTS: SetupComponent[] = [
+	"claude",
+	"codex",
+	"credentials",
+	"defaults",
+	"hermes",
+	"hooks",
+	"provider",
+	"python",
+	"stt",
+];
 
 export default class Setup extends Command {
 	static description = "Install GJC defaults or optional feature dependencies";

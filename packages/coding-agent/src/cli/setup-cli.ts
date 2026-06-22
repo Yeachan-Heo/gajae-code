@@ -25,6 +25,7 @@ import {
 	hermesSetupExitCode,
 	runHermesSetup,
 } from "../setup/hermes-setup";
+import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
@@ -32,7 +33,16 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 
-export type SetupComponent = "credentials" | "defaults" | "hermes" | "hooks" | "provider" | "python" | "stt";
+export type SetupComponent =
+	| "claude"
+	| "codex"
+	| "credentials"
+	| "defaults"
+	| "hermes"
+	| "hooks"
+	| "provider"
+	| "python"
+	| "stt";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -68,7 +78,17 @@ export interface SetupCommandArgs {
 	};
 }
 
-const VALID_COMPONENTS: SetupComponent[] = ["credentials", "defaults", "hermes", "hooks", "provider", "python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = [
+	"claude",
+	"codex",
+	"credentials",
+	"defaults",
+	"hermes",
+	"hooks",
+	"provider",
+	"python",
+	"stt",
+];
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -239,6 +259,12 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
 export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	rejectProviderFlagsOutsideProvider(cmd.component, cmd.flags);
 	switch (cmd.component) {
+		case "claude":
+			handleHostPluginSetup("claude", cmd.flags);
+			break;
+		case "codex":
+			handleHostPluginSetup("codex", cmd.flags);
+			break;
 		case "defaults":
 			await handleDefaultsSetup(cmd.flags);
 			break;
@@ -282,6 +308,17 @@ async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
 		}
 		process.exit(hermesSetupExitCode(error));
 	}
+}
+
+function handleHostPluginSetup(host: HostPluginKind, flags: SetupCommandArgs["flags"]): void {
+	const result = buildHostPluginSetup(host, { json: flags.json, check: flags.check, root: flags.root, repo: flags.repo });
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+		return;
+	}
+	const label = host === "claude" ? "Claude Code" : "Codex";
+	process.stdout.write(`${chalk.green(`${theme.status.success} ${label} plugin setup ready`)}\n`);
+	process.stdout.write(`${chalk.dim(formatHostPluginSetup(result))}\n`);
 }
 async function handleProviderSetup(flags: {
 	json?: boolean;
