@@ -142,6 +142,11 @@ interface SessionRuntime {
 	busy: boolean;
 	/** Inbound Telegram update ids injected but not yet consumed by a turn. */
 	pendingInbound: Set<number>;
+	/** Latest assistant text of the in-flight turn (from message_update). */
+	currentTurnText?: string;
+	/** Assistant text already flushed before an ask this turn (turn-scoped dedupe
+	 * so turn_end does not re-emit the pre-ask lead-in). Reset each turn. */
+	preAskFlushedText?: string;
 }
 
 interface ResolvedSettings {
@@ -620,18 +625,42 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 	// Redaction suppresses streamed content (only the one-time identity header
 	// survives redaction). The daemon coalesces/throttles these via its shared
 	// rate-limit pool before sending to Telegram.
-	api.on("turn_end", (event, ctx) => {
-		const id = sessionId(ctx);
-		const rt = runtimes.get(id);
-		if (!rt) return;
-		if (rt.redact) return;
-		const text = summaryFromMessage(event.message, 3500);
-		if (!text) return;
+	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
+	// against what was already flushed for this turn (the pre-ask lead-in).
+	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined): void => {
+		if (!text || text === rt.preAskFlushedText) return;
+		rt.preAskFlushedText = text;
 		try {
 			rt.server.pushFrame(JSON.stringify({ type: "turn_stream", sessionId: id, phase: "finalized", text }));
 		} catch (e) {
 			logger.warn(`notifications: pushFrame (turn) failed: ${String(e)}`);
 		}
+	};
+
+	// Emit the assistant text that precedes an ask BEFORE the ask's action_needed
+	// is broadcast, so the remote (e.g. Telegram) shows the lead-in first instead
+	// of only after the ask resolves at turn_end. The text is captured on
+	// message_end (which, like tool_execution_start, is on the awaited extension
+	// path and ordered before it — unlike message_update, which is queued async),
+	// then flushed here before the ask tool's execute calls registerAsk.
+	api.on("tool_execution_start", (event, ctx) => {
+		if (event.toolName !== "ask") return;
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt || rt.redact) return;
+		flushTurnText(rt, id, rt.currentTurnText);
+	});
+
+	api.on("turn_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const text = rt.redact ? undefined : summaryFromMessage(event.message, 3500);
+		if (text) flushTurnText(rt, id, text);
+		// Reset per-turn streaming state so the next turn starts fresh and a later
+		// turn with identical text is not falsely deduped.
+		rt.currentTurnText = undefined;
+		rt.preAskFlushedText = undefined;
 	});
 
 	// Stream agent-produced images (computer/browser/tool screenshots) as
@@ -640,6 +669,11 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt || rt.redact) return;
+		// Capture the in-flight assistant text here (message_end is on the awaited
+		// extension path and ordered before tool_execution_start) so the pre-ask
+		// flush can emit it before the ask prompt.
+		const turnText = summaryFromMessage(event.message, 3500);
+		if (turnText) rt.currentTurnText = turnText;
 		for (const img of imageAttachmentsFromMessage(event.message)) {
 			try {
 				rt.server.pushFrame(
