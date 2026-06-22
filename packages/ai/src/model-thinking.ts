@@ -404,13 +404,11 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
-	// MiniMax-M3: official MiniMax docs (platform.minimax.io/docs/guides/models-intro)
-	// document a 1M context window, but models.dev and the bundled catalog both report
-	// 512K. The stale 512K survives generate-models (provider-scoped models bypass the
-	// models.dev refresh in applyGlobalModelsDevFallback), tripping auto-compaction /
-	// context-cap thresholds 2x early on MiniMax sessions. Pin to the true 1M.
+	// MiniMax-M3: MiniMax exposes a 1M context tier, but usage beyond 512K is
+	// billed separately. Keep bundled/default metadata at the billing-safe 512K
+	// unless an explicit paid-tier contract is added.
 	if (model.provider !== "opencode-go" && model.id === "minimax-m3") {
-		model.contextWindow = 1_000_000;
+		model.contextWindow = 512_000;
 	}
 }
 
