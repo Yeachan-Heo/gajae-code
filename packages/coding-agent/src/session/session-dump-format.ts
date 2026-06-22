@@ -57,7 +57,12 @@ function escapeXmlText(input: string): string {
 
 function decodeCodePoint(hex: string): string {
 	const codePoint = Number.parseInt(hex, 16);
-	if (!Number.isFinite(codePoint) || codePoint < 0x20 || codePoint === 0x7f) {
+	if (
+		!Number.isFinite(codePoint) ||
+		codePoint < 0x20 ||
+		(codePoint >= 0x7f && codePoint <= 0x9f) ||
+		(codePoint >= 0xd800 && codePoint <= 0xdfff)
+	) {
 		return `\\u${hex}`;
 	}
 	return String.fromCharCode(codePoint);

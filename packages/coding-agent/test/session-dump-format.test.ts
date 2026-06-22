@@ -72,7 +72,7 @@ describe("formatSessionDumpText tool calls", () => {
 		expect(dumped).toContain('"deepInterview": {\n');
 	});
 
-	it("keeps escaped control codes structural instead of injecting raw control text", () => {
+	it("keeps escaped control and surrogate codes structural instead of injecting raw control text", () => {
 		const dumped = formatSessionDumpText({
 			messages: [
 				{
@@ -83,7 +83,7 @@ describe("formatSessionDumpText tool calls", () => {
 							id: "ask-2",
 							name: "proxy_ask",
 							arguments: {
-								note: "literal control marker: \\u000a",
+								note: "literal control marker: \\u000a, c1 marker: \\u0085, surrogate marker: \\ud800",
 							},
 						},
 					],
@@ -94,5 +94,33 @@ describe("formatSessionDumpText tool calls", () => {
 		});
 
 		expect(dumped).toContain("literal control marker: \\u000a");
+		expect(dumped).toContain("c1 marker: \\u0085");
+		expect(dumped).toContain("surrogate marker: \\ud800");
+	});
+
+	it("applies XML escaping after decoding readable Unicode escapes", () => {
+		const dumped = formatSessionDumpText({
+			messages: [
+				{
+					...assistantWithProxyAsk(),
+					content: [
+						{
+							type: "toolCall",
+							id: "ask-3",
+							name: "proxy_ask",
+							arguments: {
+								"unsafe<key": "readable Korean: \\ud55c\\uae00 & raw <tag>",
+							},
+						},
+					],
+				},
+			],
+			model: null,
+			thinkingLevel: null,
+		});
+
+		expect(dumped).toContain('name="unsafe&lt;key"');
+		expect(dumped).toContain("readable Korean: 한글 &amp; raw &lt;tag&gt;");
+		expect(dumped).not.toContain("\\ud55c");
 	});
 });
