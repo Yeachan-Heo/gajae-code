@@ -2944,11 +2944,33 @@ async function spawnText(
 	}
 }
 
-async function resolveGitBase(cwd: string, branch?: string): Promise<string> {
-	const candidates = branch ? [branch] : ["origin/main", "origin/master", "main", "master"];
-	for (const candidate of candidates) {
-		const exists = await spawnText(["git", "rev-parse", "--verify", candidate], { cwd, timeoutMs: 3000 });
-		if (exists.ok) return candidate;
+export async function resolveGitBase(cwd: string, branch?: string): Promise<string> {
+	if (branch) {
+		const exists = await spawnText(["git", "rev-parse", "--verify", branch], { cwd, timeoutMs: 3000 });
+		if (exists.ok) return branch;
+	} else {
+		// Prefer the NEAREST integration base (the branch this work actually forks
+		// from) rather than always `main`. A branch opened against `dev` must be
+		// scoped to `dev`; using a stale `main` sweeps in unrelated trunk history
+		// and mis-attributes other people's changes to this story (e.g. falsely
+		// tripping change-scoped gates). Among existing candidates, pick the one
+		// whose merge-base with HEAD is closest to HEAD (fewest commits ahead).
+		const candidates = ["origin/dev", "dev", "origin/main", "origin/master", "main", "master"];
+		let best: { ref: string; ahead: number } | undefined;
+		for (const candidate of candidates) {
+			const exists = await spawnText(["git", "rev-parse", "--verify", candidate], { cwd, timeoutMs: 3000 });
+			if (!exists.ok) continue;
+			const mergeBase = await spawnText(["git", "merge-base", "HEAD", candidate], { cwd, timeoutMs: 3000 });
+			if (!mergeBase.ok || !mergeBase.stdout.trim()) continue;
+			const count = await spawnText(
+				["git", "rev-list", "--count", `${mergeBase.stdout.trim()}..HEAD`],
+				{ cwd, timeoutMs: 3000 },
+			);
+			const ahead = Number.parseInt(count.stdout.trim(), 10);
+			if (!Number.isFinite(ahead)) continue;
+			if (!best || ahead < best.ahead) best = { ref: candidate, ahead };
+		}
+		if (best) return best.ref;
 	}
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", "origin/main"], { cwd, timeoutMs: 3000 });
 	if (mergeBase.ok && mergeBase.stdout.trim()) return mergeBase.stdout.trim();
