@@ -353,3 +353,212 @@ describe("gjc mcp-serve coordinator", () => {
 		});
 	});
 });
+
+describe("coordinator delegate tools", () => {
+	const delegateNames = ["gjc_delegate_plan", "gjc_delegate_execute", "gjc_delegate_team"] as const;
+
+	function delegateEnv(root: string, stateRoot: string, mutations = "sessions") {
+		return {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_MUTATIONS: mutations,
+			GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+			GJC_COORDINATOR_MCP_PROFILE: "delegate",
+			GJC_COORDINATOR_MCP_REPO: "repo-a",
+		};
+	}
+
+	function delegateServices() {
+		return {
+			startSession: (input: { cwd: string }) => ({
+				name: "delegate-session",
+				cwd: input.cwd,
+				createdAt: "now",
+			}),
+		};
+	}
+
+	it("lists the three delegate tools in tools/list without provider credentials", async () => {
+		await withTempRoot(async root => {
+			const server = await createCoordinatorMcpServer({ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } });
+			const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+			const names = (listed.result.tools as Array<{ name: string }>).map(tool => tool.name);
+			for (const delegate of delegateNames) {
+				expect(names).toContain(delegate);
+			}
+		});
+	});
+
+	it("rejects delegate when startup mutation class is disabled", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_PROFILE: "delegate",
+					GJC_COORDINATOR_MCP_REPO: "repo-a",
+				},
+				services: delegateServices(),
+			});
+			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, task: "Plan it", allow_mutation: true });
+			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
+		});
+	});
+
+	it("rejects delegate when per-call allow_mutation is missing", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const denied = await server.callTool("gjc_delegate_execute", { cwd: root, task: "Run it" });
+			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
+		});
+	});
+
+	it("rejects delegate when no workdir roots are configured", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_PROFILE: "delegate",
+					GJC_COORDINATOR_MCP_REPO: "repo-a",
+				},
+				services: delegateServices(),
+			});
+			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, task: "x", allow_mutation: true });
+			expect(denied).toEqual({ ok: false, reason: "coordinator_workdir_roots_required" });
+		});
+	});
+
+	it("rejects delegate when cwd is outside allowed roots", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const denied = await server.callTool("gjc_delegate_plan", { cwd: os.tmpdir(), task: "x", allow_mutation: true });
+			expect(denied.ok).toBe(false);
+			expect(String(denied.reason)).toContain("coordinator_workdir_outside_allowed_roots");
+		});
+	});
+
+	it("rejects delegate when neither task nor prompt is provided", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, allow_mutation: true });
+			expect(denied).toEqual({ ok: false, reason: "task_required" });
+		});
+	});
+
+	it("starts a fresh session and sends a workflow-tagged turn", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const result = await server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				task: "Draft a plan for the parser.",
+				allow_mutation: true,
+			});
+			expect(result).toMatchObject({
+				ok: true,
+				workflow: "plan",
+				tool_name: "gjc_delegate_plan",
+				session_id: "delegate-session",
+				status: "active",
+			});
+			expect(String((result.turn as { prompt?: { text?: string } }).prompt?.text)).toContain("/skill:ralplan");
+			expect(String((result.turn as { prompt?: { text?: string } }).prompt?.text)).toContain(
+				"Draft a plan for the parser.",
+			);
+		});
+	});
+
+	it("returns session_cwd_mismatch when reusing a session from a different cwd", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const sub = path.join(root, "sub");
+			await fs.mkdir(sub, { recursive: true });
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const fresh = await server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				task: "First task.",
+				allow_mutation: true,
+			});
+			const sessionId = String(fresh.session_id);
+			const mismatch = await server.callTool("gjc_delegate_execute", {
+				cwd: sub,
+				session_id: sessionId,
+				task: "Different cwd should be rejected.",
+				allow_mutation: true,
+			});
+			expect(mismatch).toEqual({ ok: false, reason: "session_cwd_mismatch", session_id: sessionId });
+		});
+	});
+
+	it("protects an active turn and supports queue and force on reuse", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			const first = await server.callTool("gjc_delegate_plan", { cwd: root, task: "First.", allow_mutation: true });
+			const sessionId = String(first.session_id);
+			const turnId = String(first.turn_id);
+
+			const conflict = await server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				session_id: sessionId,
+				task: "Second.",
+				allow_mutation: true,
+			});
+			expect(conflict).toMatchObject({ ok: false, reason: "active_turn_exists", active_turn_id: turnId });
+
+			const queued = await server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				session_id: sessionId,
+				task: "Queued.",
+				queue: true,
+				allow_mutation: true,
+			});
+			expect(queued).toMatchObject({ ok: true, status: "queued", queued: true, active_turn_id: turnId });
+		});
+	});
+
+	it("appends a delegation.started event visible and filterable via watch_events", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, ".state");
+			const server = await createCoordinatorMcpServer({
+				env: delegateEnv(root, stateRoot),
+				services: delegateServices(),
+			});
+			await server.callTool("gjc_delegate_team", { cwd: root, task: "Parallel work.", allow_mutation: true });
+			const events = await server.callTool("gjc_coordinator_watch_events", {
+				event_types: ["delegation.started"],
+				timeout_ms: 0,
+			});
+			expect(events.ok).toBe(true);
+			const kinds = (events.events as Array<{ kind: string; metadata?: Record<string, unknown> }>).map(e => e.kind);
+			expect(kinds).toContain("delegation.started");
+			const delegation = (events.events as Array<{ kind: string; metadata?: Record<string, unknown> }>).find(
+				e => e.kind === "delegation.started",
+			);
+			expect(delegation?.metadata).toMatchObject({ workflow: "team", tool_name: "gjc_delegate_team" });
+		});
+	});
+});

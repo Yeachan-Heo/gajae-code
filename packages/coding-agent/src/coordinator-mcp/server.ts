@@ -184,7 +184,8 @@ type CoordinatorEventKind =
 	| "question.answered"
 	| "report.written"
 	| "tmux.delivery_succeeded"
-	| "tmux.delivery_failed";
+	| "tmux.delivery_failed"
+	| "delegation.started";
 
 interface CoordinatorEvent {
 	schema_version: 1;
@@ -411,7 +412,113 @@ function toolSchema(name: CoordinatorToolName): {
 			},
 		};
 	}
+	const delegateWorkflow = workflowForDelegateTool(name);
+	if (delegateWorkflow) {
+		return {
+			name,
+			description: delegateToolDescription(delegateWorkflow),
+			inputSchema: {
+				type: "object",
+				properties: {
+					cwd,
+					task: {
+						type: "string",
+						description: "Delegated task or objective to run through the selected GJC workflow.",
+					},
+					prompt: { type: "string", description: "Alias for task; accepted when task is absent." },
+					allow_mutation: allowMutation,
+					session_id: {
+						type: "string",
+						description:
+							"Optional existing GJC coordinator bridge session id to reuse; omitted starts a fresh session.",
+					},
+					queue: { type: "boolean", description: "When reusing a session with an active turn, queue instead of failing." },
+					force: { type: "boolean", description: "When reusing a session with an active turn, supersede it before sending." },
+					worktree: {
+						type: "boolean",
+						description: "Reserved session-start knob; defaults true and cannot disable configured roots.",
+					},
+					worktree_name: {
+						type: "string",
+						description: "Optional requested worktree or session label, metadata-only in the first release.",
+					},
+					model: {
+						type: "string",
+						description: "Optional model hint passed in prompt metadata; no provider default is implied.",
+					},
+					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
+					timeout_ms: { type: "number", description: "Bounded await timeout; same cap semantics as gjc_coordinator_await_turn." },
+					poll_interval_ms: { type: "number", description: "Bounded await polling interval." },
+					lines: { type: "number", description: "Bounded advisory tail lines returned with await/read payloads." },
+				},
+				required: ["cwd", "allow_mutation"],
+			},
+		};
+	}
 	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
+}
+
+type DelegateWorkflow = "plan" | "execute" | "team";
+
+function workflowForDelegateTool(name: string): DelegateWorkflow | null {
+	switch (name) {
+		case "gjc_delegate_plan":
+			return "plan";
+		case "gjc_delegate_execute":
+			return "execute";
+		case "gjc_delegate_team":
+			return "team";
+		default:
+			return null;
+	}
+}
+
+function workflowSkill(workflow: DelegateWorkflow): "ralplan" | "ultragoal" | "team" {
+	switch (workflow) {
+		case "plan":
+			return "ralplan";
+		case "execute":
+			return "ultragoal";
+		case "team":
+			return "team";
+	}
+}
+
+function delegateToolDescription(workflow: DelegateWorkflow): string {
+	switch (workflow) {
+		case "plan":
+			return "Delegate consensus planning to GJC: start a session and run /skill:ralplan to completion, returning durable turn status and artifact references.";
+		case "execute":
+			return "Delegate execution to GJC: start a session and run /skill:ultragoal to completion, returning durable turn status and artifact references.";
+		case "team":
+			return "Delegate parallel team execution to GJC: start a session and run /skill:team to completion, returning durable turn status and artifact references.";
+	}
+}
+
+function workflowPrompt(
+	workflow: DelegateWorkflow,
+	toolName: string,
+	canonicalCwd: string,
+	task: string,
+	options: { mutationRequested: boolean; model?: string | null },
+): string {
+	const skill = workflowSkill(workflow);
+	const model = options.model && options.model.trim().length > 0 ? options.model.trim() : "none";
+	const mutationIntent = options.mutationRequested ? "mutation requested" : "read-only";
+	return [
+		`/skill:${skill}`,
+		"",
+		`Delegated by coordinator MCP tool: ${toolName}`,
+		`Workflow: ${workflow}`,
+		`CWD: ${canonicalCwd}`,
+		`Mutation intent: ${mutationIntent}; coordinator startup policy remains authoritative.`,
+		`Optional model hint: ${model}`,
+		"",
+		"Task:",
+		task,
+		"",
+		"Return durable status and artifact references through GJC runtime/coordinator state. Do not expose host-facing tmux controls.",
+	].join("\n");
 }
 
 function normalizeSession(session: Record<string, unknown>): Record<string, unknown> {
@@ -422,6 +529,14 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 		...(session.createdAt ? { created_at: session.createdAt } : {}),
 		...session,
 	};
+}
+
+async function canonicalizePath(value: string): Promise<string> {
+	try {
+		return await fs.realpath(value);
+	} catch {
+		return path.resolve(value);
+	}
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -1586,6 +1701,152 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					timed_out: timedOut,
 					transport: { mcp: "long_poll", push_subscriptions: false },
 				};
+			}
+			const delegateWorkflow = workflowForDelegateTool(name);
+			if (delegateWorkflow) {
+				requireCoordinatorMutation(config, "sessions", args);
+				const canonicalCwd = await assertCoordinatorWorkdir(config, args.cwd);
+				const hasTask = typeof args.task === "string" && args.task.trim().length > 0;
+				const hasPrompt = typeof args.prompt === "string" && args.prompt.trim().length > 0;
+				const task = hasTask ? String(args.task) : hasPrompt ? String(args.prompt) : null;
+				if (!task) return { ok: false, reason: "task_required" };
+				const promptAliasIgnored = hasTask && hasPrompt;
+				const mutationRequested = args.allow_mutation === true;
+				const taggedPrompt = workflowPrompt(delegateWorkflow, name, canonicalCwd, task, {
+					mutationRequested,
+					model: typeof args.model === "string" ? args.model : null,
+				});
+
+				let session: Record<string, unknown>;
+				let reusedSession = false;
+				if (args.session_id != null) {
+					const sessionId = safeExternalId("session", args.session_id);
+					const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+					if (!existing) return { ok: false, reason: "unknown_session", session_id: sessionId };
+					const storedCwd = typeof existing.cwd === "string" ? existing.cwd : null;
+					const canonicalStored = storedCwd ? await canonicalizePath(storedCwd) : null;
+					const canonicalRequested = await canonicalizePath(canonicalCwd);
+					if (!canonicalStored || canonicalStored !== canonicalRequested) {
+						return { ok: false, reason: "session_cwd_mismatch", session_id: sessionId };
+					}
+					session = existing;
+					reusedSession = true;
+				} else {
+					const input = {
+						cwd: canonicalCwd,
+						prompt: undefined,
+						namespace: config.namespace,
+						worktree: true as const,
+					};
+					const started = services.startSession
+						? await services.startSession(input)
+						: await startTmuxSession(config, input, namespaceDir, commandRunner);
+					const startedRecord = asRecord(started);
+					if (!startedRecord) throw new Error("coordinator_session_command_required");
+					session = normalizeSession(startedRecord);
+					await writeJsonFile(sessionFile(session.session_id), session);
+					await appendCoordinatorEvent(namespaceDir, {
+						kind: "session.started",
+						sessionId: String(session.session_id),
+						summary: `Session ${String(session.session_id)} started by coordinator delegate`,
+						payloadRef: path.relative(namespaceDir, sessionFile(session.session_id)),
+						metadata: { delegate: true, workflow: delegateWorkflow },
+					});
+					const live = hasTmuxIdentity(session) ? await hasTmuxSession(session, commandRunner) : null;
+					await writeSessionState(namespaceDir, String(session.session_id), "ready_for_input", {
+						live,
+						reason: null,
+					});
+				}
+
+				const sessionId = String(session.session_id);
+				const activeTurn = reusedSession ? await readActiveTurn(namespaceDir, sessionId) : null;
+				if (activeTurn && args.force !== true && args.queue !== true) {
+					return {
+						ok: false,
+						reason: "active_turn_exists",
+						session_id: sessionId,
+						active_turn_id: activeTurn.turn_id,
+					};
+				}
+				if (activeTurn && args.force === true) {
+					const timestamp = new Date().toISOString();
+					const superseded = {
+						...activeTurn,
+						status: "superseded" as const,
+						updated_at: timestamp,
+						completed_at: timestamp,
+					};
+					await writeTurnRecord(namespaceDir, superseded);
+					await clearActiveTurn(namespaceDir, superseded);
+				}
+				const shouldQueue = args.queue === true && args.force !== true && !!activeTurn;
+				const turn = shouldQueue
+					? makeTurnRecord(config, sessionId, taggedPrompt, "queued")
+					: await activateTurn(session, makeTurnRecord(config, sessionId, taggedPrompt, "active"));
+				if (shouldQueue) await writeTurnRecord(namespaceDir, turn);
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "delegation.started",
+					sessionId,
+					turnId: turn.turn_id,
+					summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
+					metadata: {
+						workflow: delegateWorkflow,
+						tool_name: name,
+						reused_session: reusedSession,
+						queued: shouldQueue,
+						allow_mutation: args.allow_mutation === true,
+					},
+				});
+				const sessionState = await readSessionState(namespaceDir, sessionId);
+				const base: Record<string, unknown> = {
+					ok: true,
+					workflow: delegateWorkflow,
+					tool_name: name,
+					session_id: sessionId,
+					turn_id: turn.turn_id,
+					active_turn_id: shouldQueue ? activeTurn?.turn_id : turn.turn_id,
+					status: turn.status,
+					queued: turn.delivery.queued,
+					delivered: turn.delivery.delivered,
+					delivery: turn.delivery,
+					session,
+					session_state: sessionState,
+					turn,
+					awaited: false,
+					artifacts: [],
+				};
+				if (promptAliasIgnored) base.prompt_alias_ignored = true;
+				if (args.await_completion === true && !shouldQueue) {
+					const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+					const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
+					const deadline = Date.now() + timeoutMs;
+					let payload = await readTurnPayload(turn.turn_id, sessionId, args.lines);
+					while (
+						payload.ok === true &&
+						!TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status) &&
+						Date.now() < deadline
+					) {
+						const remainingMs = deadline - Date.now();
+						await waitForTurnStateChange(
+							namespaceDir,
+							payload.turn as TurnRecord,
+							Math.min(pollIntervalMs, remainingMs),
+						);
+						payload = await readTurnPayload(turn.turn_id, sessionId, args.lines);
+					}
+					const awaitedTurn = (payload.ok === true ? payload.turn : turn) as TurnRecord;
+					base.awaited = true;
+					base.status = awaitedTurn.status;
+					base.turn = awaitedTurn;
+					base.final_response = (awaitedTurn as unknown as Record<string, unknown>).final_response ?? null;
+					base.evidence = (awaitedTurn as unknown as Record<string, unknown>).evidence ?? [];
+					if (payload.ok === true) {
+						base.session_state = payload.session_state;
+						base.advisory_status = payload.advisory_status;
+					}
+				}
+				return base;
 			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);

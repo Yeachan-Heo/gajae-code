@@ -17,6 +17,9 @@ export const COORDINATOR_MCP_TOOL_NAMES = [
 	"gjc_coordinator_read_turn",
 	"gjc_coordinator_await_turn",
 	"gjc_coordinator_report_status",
+	"gjc_delegate_plan",
+	"gjc_delegate_execute",
+	"gjc_delegate_team",
 ] as const;
 
 export type CoordinatorToolName = (typeof COORDINATOR_MCP_TOOL_NAMES)[number];
