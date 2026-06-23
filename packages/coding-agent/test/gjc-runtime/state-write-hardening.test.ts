@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -32,6 +32,14 @@ function receiptFrom(stdout: string | undefined): Record<string, unknown> {
 	const parsed = JSON.parse(stdout ?? "{}") as Record<string, unknown>;
 	expect(parsed.state).toBeUndefined();
 	return parsed;
+}
+function captureStderrWrites(): { writes: string[]; restore: () => void } {
+	const writes: string[] = [];
+	const spy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+		writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	});
+	return { writes, restore: () => spy.mockRestore() };
 }
 
 async function writeState(root: string, mode: string, state: Record<string, unknown>, extra: string[] = []) {
@@ -166,11 +174,16 @@ describe("gjc state write hardening", () => {
 	it("corrupt existing state fails open for read and status but write and clear require force", async () => {
 		const root = await tempDir();
 		await writeRawState(root, "ralplan", "{broken json");
-
-		const read = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
-		expect(read.status).toBe(0);
-		const status = await runNativeStateCommand(["status", "--mode", "ralplan", "--json"], root);
-		expect(status.status).toBe(0);
+		const stderr = captureStderrWrites();
+		try {
+			const read = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
+			expect(read.status).toBe(0);
+			const status = await runNativeStateCommand(["status", "--mode", "ralplan", "--json"], root);
+			expect(status.status).toBe(0);
+			expect(stderr.writes.join("")).toContain("ignoring corrupt state");
+		} finally {
+			stderr.restore();
+		}
 
 		const rejectedWrite = await writeState(root, "ralplan", { current_phase: "planner" });
 		expect(rejectedWrite.status).not.toBe(0);

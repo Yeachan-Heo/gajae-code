@@ -234,7 +234,6 @@ describe("resolveProviderChain — active-model-gated resolution", () => {
 		expect(await chainIds(fakeAuth({ oauth: ["openai-codex"] }), "auto", "openai")).toEqual(["codex", "duckduckgo"]);
 		expect(await chainIds(fakeAuth({ oauth: ["openai-codex"] }), "auto", "openai-codex")).toEqual([
 			"codex",
-			"openai-compatible",
 			"duckduckgo",
 		]);
 		expect(await chainIds(fakeAuth({ oauth: ["google-gemini-cli"] }), "auto", "google-gemini-cli")).toEqual([

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
@@ -25,6 +25,7 @@ import {
 	resolveGitBase,
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
+	type UltragoalCommandResult,
 	validateExecutorQaRedTeamEvidenceForReview,
 	waitForReplayProcessWithTimeout,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
@@ -51,6 +52,15 @@ afterEach(async () => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
+
+function captureStderrWrites(): { writes: string[]; restore: () => void } {
+	const writes: string[] = [];
+	const spy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+		writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	});
+	return { writes, restore: () => spy.mockRestore() };
+}
 
 function passingQualityGate(): string {
 	return JSON.stringify({
@@ -3147,11 +3157,18 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 			await fs.mkdir(p, { recursive: true });
 
 			const beforeGoals = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
-			const result = await runNativeUltragoalCommand(["status", "--json"], root);
+			const stderr = captureStderrWrites();
+			let result: UltragoalCommandResult | undefined;
+			try {
+				result = await runNativeUltragoalCommand(["status", "--json"], root);
+				expect(stderr.writes.join("")).toContain("ultragoal state reconciliation failed");
+			} finally {
+				stderr.restore();
+			}
 
 			// The triggering command still succeeds with an intact receipt.
-			expect(result.status).toBe(0);
-			expect(() => JSON.parse(result.stdout ?? "")).not.toThrow();
+			expect(result?.status).toBe(0);
+			expect(() => JSON.parse(result?.stdout ?? "")).not.toThrow();
 
 			// The plan is untouched and the failure is recorded in the audit trail.
 			expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text()).toBe(
@@ -3189,10 +3206,17 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 			await fs.mkdir(activePath, { recursive: true });
 
 			const beforeGoals = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
-			const result = await runNativeUltragoalCommand(["status", "--json"], root);
+			const stderr = captureStderrWrites();
+			let result: UltragoalCommandResult | undefined;
+			try {
+				result = await runNativeUltragoalCommand(["status", "--json"], root);
+				expect(stderr.writes.join("")).toContain("ultragoal state reconciliation failed");
+			} finally {
+				stderr.restore();
+			}
 
 			// Command still succeeds; the HUD-sync failure is diagnosable via the audit trail.
-			expect(result.status).toBe(0);
+			expect(result?.status).toBe(0);
 			expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text()).toBe(
 				beforeGoals,
 			);
