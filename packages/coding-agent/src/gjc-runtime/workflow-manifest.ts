@@ -172,12 +172,16 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ralplan: manifest({
 		skill: "ralplan",
-		states: ["planner", "architect", "critic", "revision", "adr", "final", "handoff"],
+		states: ["planner", "architect", "critic", "revision", "post-interview", "adr", "final", "handoff"],
 		terminalStates: ["final", "handoff"],
 		transitions: [
 			{ from: "planner", to: "architect", verb: "write-artifact" },
 			{ from: "architect", to: "critic", verb: "write-artifact" },
 			{ from: "critic", to: "revision", verb: "write-artifact" },
+			{ from: "revision", to: "post-interview", verb: "write-artifact" },
+			{ from: "critic", to: "post-interview", verb: "write-artifact" },
+			{ from: "post-interview", to: "revision", verb: "write-artifact" },
+			{ from: "post-interview", to: "adr", verb: "write-artifact" },
 			{ from: "revision", to: "adr", verb: "write-artifact" },
 			{ from: "adr", to: "final", verb: "write-artifact" },
 			{ from: "planner", to: "handoff", verb: "handoff" },
@@ -185,6 +189,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "critic", to: "handoff", verb: "handoff" },
 			{ from: "revision", to: "handoff", verb: "handoff" },
 			{ from: "adr", to: "handoff", verb: "handoff" },
+			{ from: "post-interview", to: "handoff", verb: "handoff" },
 		],
 		verbs: [...stateVerbs(), ...flagVerbs(["kickoff", "write-artifact"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
 		typedArgs: [
@@ -196,7 +201,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "stage",
 				type: "enum",
-				enumValues: ["planner", "architect", "critic", "revision", "adr", "final"],
+				enumValues: ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"],
 				appliesToVerbs: ["write-artifact"],
 			},
 			{ name: "stage_n", type: "number", appliesToVerbs: ["write-artifact"] },

@@ -93,6 +93,7 @@ const RALPLAN_STAGE_CODES: Record<string, string> = {
 	architect: "A",
 	critic: "C",
 	adr: "D",
+	"post-interview": "I",
 	final: "F",
 };
 

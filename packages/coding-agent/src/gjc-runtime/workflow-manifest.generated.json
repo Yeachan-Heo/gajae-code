@@ -370,6 +370,9 @@
         "id": "revision"
       },
       {
+        "id": "post-interview"
+      },
+      {
         "id": "adr"
       },
       {
@@ -399,6 +402,26 @@
       {
         "from": "critic",
         "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "revision",
+        "to": "post-interview",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "critic",
+        "to": "post-interview",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "post-interview",
+        "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "post-interview",
+        "to": "adr",
         "verb": "write-artifact"
       },
       {
@@ -433,6 +456,11 @@
       },
       {
         "from": "adr",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "post-interview",
         "to": "handoff",
         "verb": "handoff"
       }
@@ -592,6 +620,7 @@
           "architect",
           "critic",
           "revision",
+          "post-interview",
           "adr",
           "final"
         ],

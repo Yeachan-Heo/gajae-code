@@ -461,7 +461,8 @@ describe("native gjc ralplan runtime — run-state phase coherence", () => {
 			["architect", "2"],
 			["critic", "3"],
 			["revision", "4"],
-			["adr", "5"],
+			["post-interview", "5"],
+			["adr", "6"],
 		] as const) {
 			const result = await runNativeRalplanCommand(
 				["--write", "--stage", stage, "--stage_n", stageN, "--artifact", `# ${stage}`, "--run-id", runId],

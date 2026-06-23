@@ -37,7 +37,7 @@ import {
  *
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N> --artifact
  *    <path-or-string> [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
- *    / Critic / revision / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
+ *    / Critic / revision / post-interview / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
  *    an `index.jsonl` audit log, copies `final` stages to `pending-approval.md`, and advances
  *    the HUD chip to reflect the latest persisted stage.
  */
@@ -48,7 +48,7 @@ export interface RalplanCommandResult {
 	stderr?: string;
 }
 
-const KNOWN_STAGES = ["planner", "architect", "critic", "revision", "adr", "final"] as const;
+const KNOWN_STAGES = ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"] as const;
 type RalplanStage = (typeof KNOWN_STAGES)[number];
 
 const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
