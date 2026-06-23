@@ -21,6 +21,7 @@ import {
 import type { AgentMessage } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, Model, ProviderSessionState, SimpleStreamOptions, Usage } from "@gajae-code/ai";
 import * as ai from "@gajae-code/ai";
+import { Effort } from "@gajae-code/ai";
 
 const MODEL: Model = {
 	id: "mock-model",
@@ -269,5 +270,32 @@ describe("split-turn compaction sequencing (#736)", () => {
 		await compact(splitPreparation(), MODEL, "k", undefined, undefined, {});
 
 		expect(tracker.peak()).toBe(2);
+	});
+});
+
+describe("compaction summary reasoning effort", () => {
+	it("defaults summarization to Effort.Low", async () => {
+		const captured = spyCompleteSimple();
+		await generateSummary([makeUserMessage("Hi")], MODEL, 4096, "k");
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.reasoning).toBe(Effort.Low);
+	});
+
+	it("respects an explicit reasoning override", async () => {
+		const captured = spyCompleteSimple();
+		await generateSummary([makeUserMessage("Hi")], MODEL, 4096, "k", undefined, undefined, undefined, {
+			reasoning: Effort.High,
+		});
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.reasoning).toBe(Effort.High);
+	});
+
+	it("compact() defaults both history and short summaries to Effort.Low", async () => {
+		const captured = spyCompleteSimple();
+		await compact(makePreparation(), MODEL, "k");
+		expect(captured.length).toBeGreaterThanOrEqual(1);
+		for (const options of captured) {
+			expect(options.reasoning).toBe(Effort.Low);
+		}
 	});
 });

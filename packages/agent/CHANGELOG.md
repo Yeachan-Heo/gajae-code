@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Compaction summary calls (`generateSummary`, `generateShortSummary`, `generateTurnPrefixSummary`) now default to `Effort.Low` thinking instead of a hardcoded `Effort.High`, and accept a `reasoning?: Effort` override via `SummaryOptions`. Compaction summarization is a mechanical text-summarization task over a large serialized-conversation input; forcing maximum extended-thinking effort inflated latency, token cost, and the request's server-side failure surface (auto-compaction one-shots intermittently failing with `overloaded_error`/`Internal server error`) with no summary-quality benefit. Embedders can pass `reasoning: Effort.High` to restore the previous behavior. Handoff generation is unchanged.
+
 ## [0.6.2] - 2026-06-19
 
 ### Changed

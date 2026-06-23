@@ -677,6 +677,15 @@ export interface SummaryOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/**
+	 * Reasoning/thinking effort for the summarization call. Compaction summaries
+	 * are a mechanical text-summarization task over a large serialized-conversation
+	 * input, so they default to {@link Effort.Low} rather than the model's normal
+	 * turn effort: forcing high extended-thinking effort inflates latency/cost and
+	 * the request's failure surface with no summary-quality benefit. Embedders may
+	 * override (e.g. {@link Effort.High}) when they want richer summaries.
+	 */
+	reasoning?: Effort;
 }
 
 export async function generateSummary(
@@ -740,7 +749,7 @@ export async function generateSummary(
 			maxTokens,
 			signal,
 			apiKey,
-			reasoning: Effort.High,
+			reasoning: options?.reasoning ?? Effort.Low,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
@@ -890,7 +899,7 @@ async function generateShortSummary(
 			maxTokens,
 			signal,
 			apiKey,
-			reasoning: Effort.High,
+			reasoning: options?.reasoning ?? Effort.Low,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
@@ -1252,7 +1261,7 @@ async function generateTurnPrefixSummary(
 			maxTokens,
 			signal,
 			apiKey,
-			reasoning: Effort.High,
+			reasoning: options?.reasoning ?? Effort.Low,
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
