@@ -65,7 +65,8 @@ pub struct InboundEvent {
 	pub verbosity:  Option<String>,
 	/// Requested redaction state (`config_command` only).
 	pub redact:     Option<bool>,
-	/// Inline image attachments forwarded with the message (`user_message` only).
+	/// Inline image attachments forwarded with the message (`user_message`
+	/// only).
 	pub images:     Option<Vec<InboundImageEvent>>,
 }
 
