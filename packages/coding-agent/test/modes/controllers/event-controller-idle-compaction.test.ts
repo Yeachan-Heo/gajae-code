@@ -59,6 +59,7 @@ describe("EventController idle compaction teardown", () => {
 			statusContainer: { clear: vi.fn() },
 			statusLine: { invalidate: vi.fn() },
 			updateEditorTopBorder: vi.fn(),
+			updateEditorBorderColor: vi.fn(),
 			editor: { getText: () => "" },
 			sessionManager: { getSessionName: () => undefined },
 			session: {
