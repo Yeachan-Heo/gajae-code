@@ -146,3 +146,21 @@ export function parseStreamingJson<T = Record<string, unknown>>(partialJson: str
 		}
 	}
 }
+
+/**
+ * Whether a string is a complete, well-formed JSON document (strict parse, no
+ * repair). Used to distinguish a tool-call argument blob that finished cleanly
+ * from one that was cut off mid-stream (truncation). An empty / whitespace-only
+ * string is treated as complete: a tool invoked with no arguments legitimately
+ * streams an empty buffer and must not be flagged as truncated.
+ */
+export function isCompleteJson(text: string | undefined): boolean {
+	const trimmed = text?.trim();
+	if (!trimmed) return true;
+	try {
+		JSON.parse(trimmed);
+		return true;
+	} catch {
+		return false;
+	}
+}

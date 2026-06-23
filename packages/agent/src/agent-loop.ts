@@ -1084,6 +1084,17 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
+				if (toolCall.incompleteArguments) {
+					// The provider flagged this call's argument JSON as truncated
+					// (the model hit its output-token limit mid-call). Executing the
+					// best-effort partial parse would run the tool on wrong input, so
+					// reject with a retryable, actionable error instead.
+					throw new Error(
+						`Tool call "${toolCall.name}" was cut off before its arguments finished streaming ` +
+							`(the response hit its output token limit). The partial arguments cannot be executed. ` +
+							`Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`,
+					);
+				}
 				if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
 
 				let effectiveArgs: Record<string, unknown>;

@@ -73,6 +73,8 @@ export type MockContent =
 			name: string;
 			/** Object form is preferred; strings are passed through verbatim. */
 			arguments: Record<string, unknown> | string;
+			/** Simulate a provider-flagged truncated call (cut off mid-arguments). */
+			incompleteArguments?: boolean;
 	  };
 
 /** One scripted response. */
@@ -416,6 +418,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
 			arguments: typeof input.arguments === "string" ? input.arguments : { ...input.arguments },
+			...(input.incompleteArguments ? { incompleteArguments: true } : {}),
 		} as ToolCall;
 	}
 	return input;

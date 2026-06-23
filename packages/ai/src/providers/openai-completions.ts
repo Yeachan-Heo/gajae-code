@@ -51,7 +51,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { parseStreamingJson } from "../utils/json-parse";
+import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -886,6 +886,17 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					// only that natural-completion finish — leave `error`,
 					// `length`, `aborted`, etc. untouched.
 					output.stopReason = "toolUse";
+				}
+			}
+
+			// A turn cut short for length may have stopped mid-tool-call. The open
+			// block's `partialArgs` would otherwise be repaired into a plausible-
+			// but-wrong object by `finishCurrentBlock`; flag it first so the agent
+			// loop rejects the truncated call instead of executing it.
+			if (output.stopReason === "length" && currentBlock?.type === "toolCall") {
+				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
+				if (partial !== undefined && !isCompleteJson(partial)) {
+					currentBlock.incompleteArguments = true;
 				}
 			}
 

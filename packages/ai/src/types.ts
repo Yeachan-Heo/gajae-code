@@ -490,6 +490,14 @@ export interface ToolCall {
 	 * JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Set when the provider detected the argument JSON was truncated — the model
+	 * hit its output-token limit (or the response was otherwise cut short) before
+	 * emitting a complete arguments object. The `arguments` field then holds a
+	 * best-effort partial parse and must not be executed as-is; the agent loop
+	 * rejects the call with a retryable error instead.
+	 */
+	incompleteArguments?: boolean;
 }
 
 export interface Usage {
