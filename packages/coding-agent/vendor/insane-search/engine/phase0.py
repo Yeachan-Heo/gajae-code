@@ -33,16 +33,37 @@ from urllib.parse import urlsplit
 # --- low-level helpers -------------------------------------------------------
 def _cffi_get(url: str, *, impersonate: str = "safari", timeout: int = 15):
     from curl_cffi import requests as r  # lazy: engine works even if missing
-    return r.get(
-        url,
-        impersonate=impersonate,  # type: ignore[arg-type]
-        timeout=timeout,
-        headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-        },
-        allow_redirects=True,
-    )
+    from . import safety
+
+    allow_private = safety.allow_private_default()
+    ok, reason = safety.classify_url(url, allow_private)
+    if not ok:
+        raise RuntimeError(f"ssrf_blocked:{reason}")
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+    }
+    cur = url
+    for _ in range(safety.DEFAULT_MAX_REDIRECTS + 1):
+        resp = r.get(
+            cur,
+            impersonate=impersonate,  # type: ignore[arg-type]
+            timeout=timeout,
+            headers=headers,
+            allow_redirects=False,
+        )
+        if not safety.is_redirect(resp):
+            return resp
+        loc = safety.location_of(resp)
+        if not loc:
+            return resp
+        nxt = safety.resolve_redirect(cur, loc)
+        ok, reason = safety.classify_url(nxt, allow_private)
+        if not ok:
+            raise RuntimeError(f"ssrf_redirect_blocked:{reason}")
+        cur = nxt
+    raise RuntimeError("too_many_redirects")
 
 
 def _host(url: str) -> str:

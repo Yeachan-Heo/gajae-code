@@ -42,7 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-phase0", action="store_true",
                    help="Skip the Phase 0 official-API router (generic grid only).")
     p.add_argument("--json", action="store_true",
-                   help="Emit FetchResult as JSON to stdout (content omitted).")
+                   help="Emit FetchResult as JSON to stdout with bounded content included.")
+    p.add_argument("--json-content-limit", type=int, default=4_000_000,
+                   help="Maximum content characters to include in --json output (default 4000000).")
     p.add_argument("--trace", action="store_true",
                    help="Print per-attempt trace to stderr.")
     return p
@@ -110,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         print("════════════════════════════════════════════════════════════════", file=sys.stderr)
 
     if args.json:
-        payload = result.to_dict()
+        payload = result.to_dict(include_content=True, content_limit=args.json_content_limit)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         # Default: HTML to stdout, status to stderr.

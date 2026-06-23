@@ -99,15 +99,18 @@ class FetchResult:
     untried_routes: list[str] = field(default_factory=list)
     must_invoke_playwright_mcp: bool = False
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, *, include_content: bool = False, content_limit: int = 4_000_000) -> dict:
+        content = self.content or ""
+        bounded_content = content[:max(0, content_limit)]
+        payload = {
             "ok": self.ok,
             "final_url": self.final_url,
             "verdict": self.verdict,
             "profile_used": self.profile_used,
             "trace": [a.to_dict() for a in self.trace],
             "summary": self.summary,
-            "content_length": len(self.content),
+            "content_length": len(content),
+            "content_truncated": len(bounded_content) < len(content),
             "planned_attempts": self.planned_attempts,
             "executed_attempts": self.executed_attempts,
             "grid_exhausted": self.grid_exhausted,
@@ -115,6 +118,9 @@ class FetchResult:
             "untried_routes": self.untried_routes,
             "must_invoke_playwright_mcp": self.must_invoke_playwright_mcp,
         }
+        if include_content:
+            payload["content"] = bounded_content
+        return payload
 
 
 # --- curl_cffi probe executor ------------------------------------------------

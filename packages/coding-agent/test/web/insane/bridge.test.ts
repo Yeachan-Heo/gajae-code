@@ -73,6 +73,39 @@ describe("tryInsaneFetch JSON mapping", () => {
 		}
 	});
 
+	it("maps the real CLI JSON envelope with bounded content to success", async () => {
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps(),
+			runner: async () =>
+				rawOutput({
+					stdout: JSON.stringify({
+						ok: true,
+						content: "bounded recovered content",
+						content_length: 123456,
+						content_truncated: true,
+						profile_used: "phase0:reddit",
+					}),
+				}),
+		});
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.content).toBe("bounded recovered content");
+			expect(r.profileUsed).toBe("phase0:reddit");
+		}
+	});
+
+	it("does not fake success for legacy ok:true JSON that only reports content_length", async () => {
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps(),
+			runner: async () => rawOutput({ stdout: JSON.stringify({ ok: true, content_length: 42 }) }),
+		});
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.reason).toBe("empty-content");
+			expect(r.notes).toContain(INSANE_NOTES.emptyContent);
+		}
+	});
+
 	it("maps authentication required to failure without bypass", async () => {
 		const r = await tryInsaneFetch("https://example.com", {
 			prober: deps(),

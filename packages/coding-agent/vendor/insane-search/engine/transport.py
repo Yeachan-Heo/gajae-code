@@ -82,12 +82,10 @@ class SessionPool:
             ent.warmed = True   # don't retry a blocked root
             return False
         ent.warmed = True  # mark first to avoid duplicate warmups under race
-        try:
-            ent.session.get(root_url, timeout=timeout, allow_redirects=True)
-            ent.requests_made += 1
-            return True
-        except Exception:
-            return False
+        def _do_get(u):
+            return ent.session.get(u, timeout=timeout, allow_redirects=False)
+        resp, err = self._fetch_following(_do_get, root_url, allow_private, DEFAULT_MAX_REDIRECTS, ent)
+        return resp is not None and err is None
 
     def inject_cookies(self, host: str, impersonate: str,
                        cookies: list[dict], user_agent: Optional[str] = None) -> bool:
