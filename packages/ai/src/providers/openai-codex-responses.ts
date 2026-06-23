@@ -78,6 +78,7 @@ import {
 	convertResponsesInputContent,
 	encodeResponsesToolCallId,
 	encodeTextSignatureV1,
+	flagTruncatedToolCalls,
 	mapOpenAIResponsesStopReason,
 	populateResponsesUsageFromResponse,
 } from "./openai-responses-shared";
@@ -254,6 +255,8 @@ interface CodexStreamRuntime {
 	providerRetryAttempt: number;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
+	/** Ids of tool calls that received their terminal `output_item.done`. */
+	finalizedToolCallIds: Set<string>;
 }
 
 interface CodexStreamProcessingContext {
@@ -910,6 +913,7 @@ function createCodexStreamRuntime(initial: {
 		providerRetryAttempt: 0,
 		sawTerminalEvent: false,
 		canSafelyReplayWebsocketOverSse: true,
+		finalizedToolCallIds: new Set<string>(),
 	};
 }
 
@@ -1267,9 +1271,11 @@ function handleOutputItemDone(
 	}
 
 	if (item.type === "function_call") {
+		const id = encodeResponsesToolCallId(item.call_id, item.id);
+		runtime.finalizedToolCallIds.add(id);
 		const toolCall: ToolCall = {
 			type: "toolCall",
-			id: encodeResponsesToolCallId(item.call_id, item.id),
+			id,
 			name: item.name,
 			arguments: parseStreamingJson(item.arguments || "{}"),
 		};
@@ -1279,13 +1285,15 @@ function handleOutputItemDone(
 	}
 
 	if (item.type === "custom_tool_call") {
+		const id = encodeResponsesToolCallId(item.call_id, item.id);
+		runtime.finalizedToolCallIds.add(id);
 		const rawInput =
 			runtime.currentBlock?.type === "toolCall" && runtime.currentBlock.partialJson
 				? runtime.currentBlock.partialJson
 				: (item.input ?? "");
 		const toolCall: ToolCall = {
 			type: "toolCall",
-			id: encodeResponsesToolCallId(item.call_id, item.id),
+			id,
 			name: item.name,
 			arguments: { input: rawInput },
 			customWireName: item.name,
@@ -1349,6 +1357,10 @@ function handleResponseCompleted(
 	calculateCost(model, output.usage);
 	applyCodexServiceTierPricing(model, output.usage, response?.service_tier, runtime.requestBodyForState.service_tier);
 	output.stopReason = mapOpenAIResponsesStopReason(response?.status as OpenAI.Responses.ResponseStatus | undefined);
+	// A response cut short for length may have stopped mid-tool-call. Flag any
+	// call that never received its `output_item.done` so the agent loop rejects
+	// the truncated arguments instead of executing a best-effort partial parse.
+	flagTruncatedToolCalls(output, output.stopReason, block => runtime.finalizedToolCallIds.has(block.id));
 	if (output.content.some(block => block.type === "toolCall") && output.stopReason === "stop") {
 		output.stopReason = "toolUse";
 	}

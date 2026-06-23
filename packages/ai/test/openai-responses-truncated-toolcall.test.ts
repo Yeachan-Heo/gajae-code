@@ -153,6 +153,63 @@ describe("Responses provider: truncated tool-call detection", () => {
 		expect(output.stopReason).toBe("toolUse");
 		expect(toolBlocks(output)[0].incompleteArguments).toBeFalsy();
 	});
+
+	test("flags a custom tool whose raw input was cut off (status incomplete)", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "custom_tool_call", id: "ct_1", call_id: "call_1", name: "apply_patch", input: "" },
+			},
+			// Raw, non-JSON input that ends mid-stream.
+			{
+				type: "response.custom_tool_call_input.delta",
+				item_id: "ct_1",
+				output_index: 0,
+				delta: "*** Begin Patch\n*** Update File: a.ts\n@@\n+const x =",
+			},
+			{ type: "response.completed", response: { id: "resp_1", status: "incomplete" } },
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		expect(output.stopReason).toBe("length");
+		const tools = toolBlocks(output);
+		expect(tools).toHaveLength(1);
+		expect(tools[0].customWireName).toBe("apply_patch");
+		expect(tools[0].incompleteArguments).toBe(true);
+	});
+
+	test("does NOT flag a COMPLETED custom tool even when the turn truncates (no JSON false-positive)", async () => {
+		// Regression: the raw custom-tool input is not valid JSON, so a naive
+		// `isCompleteJson` check would wrongly flag a finished apply_patch call.
+		const fullPatch = "*** Begin Patch\n*** Update File: a.ts\n@@\n+const x = 1\n*** End Patch";
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "custom_tool_call", id: "ct_1", call_id: "call_1", name: "apply_patch", input: "" },
+			},
+			{ type: "response.custom_tool_call_input.delta", item_id: "ct_1", output_index: 0, delta: fullPatch },
+			{ type: "response.custom_tool_call_input.done", item_id: "ct_1", output_index: 0, input: fullPatch },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "custom_tool_call", id: "ct_1", call_id: "call_1", name: "apply_patch", input: fullPatch },
+			},
+			// Turn truncated on trailing content AFTER the tool call finished.
+			{ type: "response.completed", response: { id: "resp_1", status: "incomplete" } },
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const tools = toolBlocks(output);
+		expect(tools).toHaveLength(1);
+		expect(tools[0].arguments).toEqual({ input: fullPatch });
+		expect(tools[0].incompleteArguments).toBeFalsy();
+	});
 });
 
 describe("isCompleteJson", () => {

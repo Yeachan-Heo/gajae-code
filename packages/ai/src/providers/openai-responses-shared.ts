@@ -711,18 +711,12 @@ export async function processResponsesStream<TApi extends Api>(
 				throw new Error(message);
 			}
 			// A response cut short for length (`incomplete`) may have stopped
-			// mid-tool-call. `parseStreamingJson` would silently repair the partial
-			// arguments into a plausible-but-wrong object; flag those calls so the
-			// agent loop rejects them instead of executing truncated input.
-			if (output.stopReason === "length") {
-				for (const block of output.content) {
-					if (block.type !== "toolCall") continue;
-					const partial = (block as { partialJson?: string }).partialJson;
-					if (partial !== undefined && !isCompleteJson(partial)) {
-						block.incompleteArguments = true;
-					}
-				}
-			}
+			// mid-tool-call. Any tool-call item still tracked in `items` never
+			// received its terminal `output_item.done`, so it was cut off; flag it
+			// (along with any finalized-but-unparseable JSON call) so the agent loop
+			// rejects it instead of executing repaired/partial arguments.
+			const openBlocks = new Set<unknown>(Array.from(items.values(), entry => entry.block));
+			flagTruncatedToolCalls(output, output.stopReason, block => !openBlocks.has(block));
 			if (output.content.some(block => block.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse";
 			}
@@ -737,6 +731,41 @@ export async function processResponsesStream<TApi extends Api>(
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
 			throw new Error(message);
+		}
+	}
+}
+
+/**
+ * Mark tool-call blocks left incomplete by a length-truncated response so the
+ * agent loop rejects them instead of executing a best-effort partial parse.
+ *
+ * The universal signal is finalization: a call that never received its terminal
+ * `output_item.done` (passed in via `isFinalized`) was cut off mid-arguments.
+ * This covers both JSON function calls and raw-input custom tools without
+ * mis-flagging a *completed* custom tool whose raw input is not valid JSON. As a
+ * defensive secondary, a finalized JSON function call whose buffered arguments
+ * still don't parse (e.g. a misbehaving relay) is flagged too. No-op unless the
+ * turn stopped for length.
+ *
+ * Shared by both Responses providers (`openai-responses`, `openai-codex-responses`).
+ */
+export function flagTruncatedToolCalls(
+	output: AssistantMessage,
+	stopReason: StopReason,
+	isFinalized: (block: ToolCall) => boolean,
+): void {
+	if (stopReason !== "length") return;
+	for (const block of output.content) {
+		if (block.type !== "toolCall") continue;
+		if (!isFinalized(block)) {
+			block.incompleteArguments = true;
+			continue;
+		}
+		// Finalized: custom tools carry raw (non-JSON) input and are complete once
+		// finalized; only JSON function calls get the parse double-check.
+		if (!block.customWireName) {
+			const partial = (block as { partialJson?: string }).partialJson;
+			if (partial !== undefined && !isCompleteJson(partial)) block.incompleteArguments = true;
 		}
 	}
 }
