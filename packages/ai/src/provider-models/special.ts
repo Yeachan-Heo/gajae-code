@@ -77,3 +77,15 @@ export function glmZcodeModelManagerOptions(
 ): ModelManagerOptions<"anthropic-messages"> {
 	return { providerId: "glm-zcode" };
 }
+
+// ---------------------------------------------------------------------------
+// JetBrains Junie (JetBrains AI Service)
+// ---------------------------------------------------------------------------
+
+export interface JetBrainsJunieModelManagerConfig {}
+
+export function jetbrainsJunieModelManagerOptions(
+	_config: JetBrainsJunieModelManagerConfig = {},
+): ModelManagerOptions<"anthropic-messages"> {
+	return { providerId: "jetbrains-junie" };
+}

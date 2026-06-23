@@ -101,6 +101,7 @@ Commands:
 Providers:
   anthropic         Anthropic
   github-copilot    GitHub Copilot
+  jetbrains-junie   JetBrains AI (Junie; Claude via JetBrains Account)
   google-gemini-cli Google Gemini CLI
   google-antigravity Antigravity (Gemini 3, Anthropic, GPT-OSS)
   openai-codex      OpenAI code provider (ChatGPT Plus/Pro)

@@ -11408,6 +11408,77 @@
 			}
 		}
 	},
+	"jetbrains-junie": {
+		"claude-sonnet-4-6": {
+			"id": "claude-sonnet-4-6",
+			"name": "Junie · Claude Sonnet 4.6",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"headers": {
+				"Grazie-Agent": "{\"name\":\"junie:cli\",\"version\":\"888.219\"}",
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true",
+				"X-Accept-EAP-License": "false"
+			},
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"claude-opus-4-6": {
+			"id": "claude-opus-4-6",
+			"name": "Junie · Claude Opus 4.6",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"headers": {
+				"Grazie-Agent": "{\"name\":\"junie:cli\",\"version\":\"888.219\"}",
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true",
+				"X-Accept-EAP-License": "false"
+			},
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max",
+				"levels": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"max"
+				]
+			}
+		}
+	},
 	"kilo": {
 		"~anthropic/claude-haiku-latest": {
 			"id": "~anthropic/claude-haiku-latest",

@@ -1601,6 +1601,14 @@ export class AuthStorage {
 				});
 				break;
 			}
+			case "jetbrains-junie": {
+				const { loginJetBrainsJunie } = await import("./utils/oauth/jetbrains-junie");
+				credentials = await loginJetBrainsJunie({
+					...ctrl,
+					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+				});
+				break;
+			}
 			case "fireworks": {
 				const { loginFireworks } = await import("./utils/oauth/fireworks");
 				const apiKey = await loginFireworks(ctrl);

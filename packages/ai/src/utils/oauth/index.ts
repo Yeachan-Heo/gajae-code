@@ -81,6 +81,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "jetbrains-junie",
+		name: "JetBrains AI (Junie)",
+		available: true,
+	},
+	{
 		id: "google-gemini-cli",
 		name: "Google Cloud Code Assist (Gemini CLI)",
 		available: true,
@@ -343,6 +348,11 @@ export async function refreshOAuthToken(
 		case "glm-zcode": {
 			const { refreshGlmZcodeToken } = await import("./glm-zcode");
 			newCredentials = await refreshGlmZcodeToken(credentials);
+			break;
+		}
+		case "jetbrains-junie": {
+			const { refreshJetBrainsJunieToken } = await import("./jetbrains-junie");
+			newCredentials = await refreshJetBrainsJunieToken(credentials);
 			break;
 		}
 		case "kilo":

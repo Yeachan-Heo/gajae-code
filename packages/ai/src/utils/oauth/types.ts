@@ -22,6 +22,7 @@ export type OAuthProvider =
 	| "google-antigravity"
 	| "gitlab-duo"
 	| "huggingface"
+	| "jetbrains-junie"
 	| "kimi-code"
 	| "kilo"
 	| "kagi"

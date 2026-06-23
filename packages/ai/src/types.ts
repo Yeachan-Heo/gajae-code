@@ -123,6 +123,7 @@ export type KnownProvider =
 	| "vercel-ai-gateway"
 	| "zai"
 	| "glm-zcode"
+	| "jetbrains-junie"
 	| "mistral"
 	| "minimax"
 	| "opencode-go"
