@@ -201,6 +201,7 @@ export class EventController {
 			this.ctx.statusContainer.clear();
 		}
 		this.#cancelIdleCompaction();
+		this.ctx.updateEditorBorderColor();
 		this.ctx.ensureLoadingAnimation();
 		this.ctx.ui.requestRender();
 	}
@@ -633,6 +634,7 @@ export class EventController {
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
+		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		this.sendCompletionNotification();
@@ -642,6 +644,7 @@ export class EventController {
 		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" }>,
 	): Promise<void> {
 		this.#cancelIdleCompaction();
+		this.ctx.updateEditorBorderColor();
 		this.ctx.autoCompactionEscapeHandler = this.ctx.editor.onEscape;
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
@@ -672,6 +675,7 @@ export class EventController {
 			this.ctx.autoCompactionLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
+		this.ctx.updateEditorBorderColor();
 		const isHandoffAction = event.action === "handoff";
 		if (event.aborted) {
 			this.ctx.showStatus(isHandoffAction ? "Auto-handoff cancelled" : "Auto context-full maintenance cancelled");

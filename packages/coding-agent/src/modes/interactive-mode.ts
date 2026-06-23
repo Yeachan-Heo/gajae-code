@@ -84,6 +84,7 @@ import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
+import { appKey } from "./components/keybinding-hints";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -117,6 +118,7 @@ import type { CompactionQueuedMessage, InteractiveModeContext, SubmittedUserInpu
 import { UiHelpers } from "./utils/ui-helpers";
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+const DEFAULT_COMPOSER_PLACEHOLDER = "Type your message...";
 
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	low: "dim",
@@ -141,7 +143,7 @@ function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setClosedBorderBox(true);
 	editor.setPromptGutter(undefined);
 	editor.setInputPrefix(getDefaultInputPrefix());
-	editor.setPlaceholder("Type your message...");
+	editor.setPlaceholder(DEFAULT_COMPOSER_PLACEHOLDER);
 	editor.setPaddingX(1);
 	editor.setTopBorder(undefined);
 }
@@ -903,6 +905,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
 
+	#isPromptDeliveryBusy(): boolean {
+		return this.session.isStreaming || this.session.isCompacting;
+	}
+
+	#getComposerPlaceholder(): string {
+		if (!this.#isPromptDeliveryBusy()) return DEFAULT_COMPOSER_PLACEHOLDER;
+		const queueKey =
+			appKey(this.keybindings, "app.message.queue") || appKey(this.keybindings, "app.message.followUp");
+		const enterAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
+		const parts = [`Enter ${enterAction.toLowerCase()}`];
+		if (queueKey) parts.push(`${queueKey} queue`);
+		return `${DEFAULT_COMPOSER_PLACEHOLDER} ${parts.join(" · ")}`;
+	}
+
 	updateEditorChrome(): void {
 		if (this.isBashMode) {
 			this.editor.borderColor = this.isBashNoContext
@@ -926,6 +942,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.isBashMode) {
 			this.editor.setInputPrefix(getDefaultInputPrefix());
 		}
+		this.editor.setPlaceholder(this.#getComposerPlaceholder());
 		this.#setComposerTopBorder();
 		this.ui.requestRender();
 	}
