@@ -2255,21 +2255,43 @@ export async function handleCoordinatorMcpRequest(
 
 export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
 	const server = createCoordinatorMcpServer(options);
+	// A broken stdio pipe — e.g. the parent MCP client/gateway shutting down or
+	// restarting — must not crash the server. Treat EPIPE (and a destroyed stream)
+	// as a clean shutdown signal instead of letting it surface as an uncaught
+	// exception that takes the whole process down.
+	const isBrokenPipe = (err: unknown): boolean => {
+		const code = (err as NodeJS.ErrnoException | undefined)?.code;
+		return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+	};
+	// Defense in depth for runtimes that surface the write failure as an async
+	// 'error' event rather than a synchronous throw.
+	process.stdout.on("error", err => {
+		if (!isBrokenPipe(err)) throw err;
+	});
 	let buffer = "";
-	for await (const chunk of process.stdin) {
-		buffer += chunk.toString();
-		let newline = buffer.indexOf("\n");
-		while (newline >= 0) {
-			const line = buffer.slice(0, newline).trim();
-			buffer = buffer.slice(newline + 1);
-			if (line.length > 0) {
-				const request = JSON.parse(line) as JsonRpcRequest;
-				if (request.id !== undefined && request.id !== null) {
-					const response = await server.handleJsonRpc(request);
-					process.stdout.write(`${JSON.stringify(response)}\n`);
+	try {
+		for await (const chunk of process.stdin) {
+			buffer += chunk.toString();
+			let newline = buffer.indexOf("\n");
+			while (newline >= 0) {
+				const line = buffer.slice(0, newline).trim();
+				buffer = buffer.slice(newline + 1);
+				if (line.length > 0) {
+					const request = JSON.parse(line) as JsonRpcRequest;
+					if (request.id !== undefined && request.id !== null) {
+						const response = await server.handleJsonRpc(request);
+						try {
+							process.stdout.write(`${JSON.stringify(response)}\n`);
+						} catch (err) {
+							if (isBrokenPipe(err)) return;
+							throw err;
+						}
+					}
 				}
+				newline = buffer.indexOf("\n");
 			}
-			newline = buffer.indexOf("\n");
 		}
+	} catch (err) {
+		if (!isBrokenPipe(err)) throw err;
 	}
 }
