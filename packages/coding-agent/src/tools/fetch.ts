@@ -16,9 +16,9 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { ensureTool } from "../utils/tools-manager";
-import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../web/parallel";
 import { INSANE_NOTES, tryInsaneFetch } from "../web/insane/bridge";
 import { validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
+import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../web/parallel";
 import { specialHandlers } from "../web/scrapers";
 import type { RenderResult } from "../web/scrapers/types";
 import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
@@ -1188,7 +1188,16 @@ async function renderUrl(
 				};
 			}
 
-			const insaneLowQuality = await tryInsaneFallback({ url, finalUrl, timeout, raw, settings, signal, fetchedAt, notes });
+			const insaneLowQuality = await tryInsaneFallback({
+				url,
+				finalUrl,
+				timeout,
+				raw,
+				settings,
+				signal,
+				fetchedAt,
+				notes,
+			});
 			if (insaneLowQuality) return insaneLowQuality;
 			notes.push("Page appears to require JavaScript or is mostly navigation");
 		}

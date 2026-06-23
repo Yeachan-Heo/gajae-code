@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { tryInsaneFallback } from "@gajae-code/coding-agent/tools/fetch";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import * as bridge from "@gajae-code/coding-agent/web/insane/bridge";
 import * as urlGuard from "@gajae-code/coding-agent/web/insane/url-guard";
 import * as scrapers from "@gajae-code/coding-agent/web/scrapers/types";
@@ -137,7 +137,7 @@ describe("renderUrl hard-fail hook (integration via ReadTool)", () => {
 			getSessionFile: () => sessionFile,
 			getArtifactsDir: () => artifactsDir,
 			getSessionSpawns: () => null,
-			allocateOutputArtifact: async toolType => ({
+			allocateOutputArtifact: async (toolType: string) => ({
 				id: String(nextArtifactId++),
 				path: path.join(artifactsDir, `${nextArtifactId}.${toolType}.log`),
 			}),

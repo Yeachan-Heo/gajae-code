@@ -137,7 +137,10 @@ function killChild(child: ChildProcess): void {
 }
 
 /** Real engine runner: `python3 -m engine "<url>" --json`. */
-export function runEngineSubprocess(inv: EngineInvocation, options: { spawnImpl?: SpawnImpl } = {}): Promise<EngineRawOutput> {
+export function runEngineSubprocess(
+	inv: EngineInvocation,
+	options: { spawnImpl?: SpawnImpl } = {},
+): Promise<EngineRawOutput> {
 	const spawnImpl = options.spawnImpl ?? nodeSpawn;
 	return new Promise<EngineRawOutput>(resolve => {
 		let stdout = "";

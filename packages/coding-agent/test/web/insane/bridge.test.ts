@@ -23,25 +23,37 @@ afterEach(() => resetInsaneConcurrencyForTest());
 
 describe("tryInsaneFetch dependency gating", () => {
 	it("fails closed when vendor is missing", async () => {
-		const r = await tryInsaneFetch("https://example.com", { prober: deps({ vendorPresent: false }), runner: async () => rawOutput() });
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps({ vendorPresent: false }),
+			runner: async () => rawOutput(),
+		});
 		expect(r.ok).toBe(false);
 		if (!r.ok) expect(r.notes).toContain(INSANE_NOTES.vendorMissing);
 	});
 
 	it("fails closed when python3 is missing", async () => {
-		const r = await tryInsaneFetch("https://example.com", { prober: deps({ python: false }), runner: async () => rawOutput() });
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps({ python: false }),
+			runner: async () => rawOutput(),
+		});
 		expect(r.ok).toBe(false);
 		if (!r.ok) expect(r.notes).toContain(INSANE_NOTES.noPython);
 	});
 
 	it("fails closed when curl_cffi is missing", async () => {
-		const r = await tryInsaneFetch("https://example.com", { prober: deps({ curlCffi: false }), runner: async () => rawOutput() });
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps({ curlCffi: false }),
+			runner: async () => rawOutput(),
+		});
 		expect(r.ok).toBe(false);
 		if (!r.ok) expect(r.notes).toContain(INSANE_NOTES.noCurlCffi);
 	});
 
 	it("fails closed when node/playwright/stealth are missing", async () => {
-		const r = await tryInsaneFetch("https://example.com", { prober: deps({ browser: false }), runner: async () => rawOutput() });
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps({ browser: false }),
+			runner: async () => rawOutput(),
+		});
 		expect(r.ok).toBe(false);
 		if (!r.ok) expect(r.notes).toContain(INSANE_NOTES.noBrowser);
 	});
@@ -51,7 +63,8 @@ describe("tryInsaneFetch JSON mapping", () => {
 	it("maps ok:true content to success and preserves profile", async () => {
 		const r = await tryInsaneFetch("https://example.com", {
 			prober: deps(),
-			runner: async () => rawOutput({ stdout: JSON.stringify({ ok: true, content: "hello world", profile_used: "chrome" }) }),
+			runner: async () =>
+				rawOutput({ stdout: JSON.stringify({ ok: true, content: "hello world", profile_used: "chrome" }) }),
 		});
 		expect(r.ok).toBe(true);
 		if (r.ok) {
@@ -113,7 +126,12 @@ describe("tryInsaneFetch JSON mapping", () => {
 			prober: deps(),
 			runner: async () =>
 				rawOutput({
-					stdout: JSON.stringify({ ok: false, verdict: "blocked", untried_routes: ["mobile", "rss"], must_invoke_playwright_mcp: true }),
+					stdout: JSON.stringify({
+						ok: false,
+						verdict: "blocked",
+						untried_routes: ["mobile", "rss"],
+						must_invoke_playwright_mcp: true,
+					}),
 				}),
 		});
 		expect(r.ok).toBe(false);
@@ -138,7 +156,11 @@ describe("tryInsaneFetch concurrency cap", () => {
 		const first = tryInsaneFetch("https://example.com", { prober: deps(), runner: slowRunner, concurrencyLimit: 1 });
 		// Give the first call a tick to increment in-flight.
 		await new Promise(r => setTimeout(r, 5));
-		const second = await tryInsaneFetch("https://example.com", { prober: deps(), runner: slowRunner, concurrencyLimit: 1 });
+		const second = await tryInsaneFetch("https://example.com", {
+			prober: deps(),
+			runner: slowRunner,
+			concurrencyLimit: 1,
+		});
 		expect(second.ok).toBe(false);
 		if (!second.ok) expect(second.notes).toContain(INSANE_NOTES.concurrency);
 		release();
