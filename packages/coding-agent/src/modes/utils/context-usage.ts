@@ -204,14 +204,14 @@ export function computeContextBreakdown(
 	if (contextWindow > 0) {
 		const compactionSettings = session.settings.getGroup("compaction") as CompactionSettings;
 		if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-			const threshold = resolveThresholdTokens(contextWindow, compactionSettings, model?.maxTokens ?? 0);
+			const threshold = resolveThresholdTokens(contextWindow, compactionSettings);
 			autoCompactBufferTokens = Math.max(0, contextWindow - threshold);
 		} else {
 			autoCompactBufferTokens = 0;
 		}
 		// Even when fully disabled, fall back to a sensible reserve floor for display.
 		if (autoCompactBufferTokens === 0 && compactionSettings.enabled) {
-			autoCompactBufferTokens = effectiveReserveTokens(contextWindow, compactionSettings, model?.maxTokens ?? 0);
+			autoCompactBufferTokens = effectiveReserveTokens(contextWindow, compactionSettings);
 		}
 	}
 	autoCompactBufferTokens = Math.min(autoCompactBufferTokens, Math.max(0, contextWindow - usedTokens));

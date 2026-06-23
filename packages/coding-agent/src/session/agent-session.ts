@@ -6732,17 +6732,19 @@ export class AgentSession {
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return;
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
-		const maxOutputTokens = this.model?.maxTokens ?? 0;
+		// Model maxTokens is a capability ceiling, not a per-turn reservation.
+		// Auto maintenance should track actual context fullness.
+		const autoCompactionOutputReserveTokens = 0;
 		// Cache-epoch invariant: pruning rewrites already-sent toolResult history,
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
 		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {
@@ -6820,14 +6822,16 @@ export class AgentSession {
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
 
 		let contextTokens = this.#estimateContextTokensForCompaction(pendingMessages).tokens;
-		const maxOutputTokens = model.maxTokens ?? 0;
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) return;
+		// Model maxTokens is a capability ceiling, not a per-turn reservation.
+		// Auto maintenance should track actual context fullness.
+		const autoCompactionOutputReserveTokens = 0;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
 
 		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)) {
+		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
