@@ -12,9 +12,10 @@ reference daemon:
 - each GJC session publishes a local notification endpoint under
   `.gjc/state/notifications/<sessionId>.json`;
 - the managed Telegram daemon scans those endpoints, connects to them, and sends
-  action-needed events to one paired private Telegram chat;
-- replies, inline button taps, and threaded messages route back to the exact
-  session/action through the same notification protocol.
+  action-needed events to the configured Telegram chat;
+- replies and inline button taps route back to the exact session/action through
+  the same notification protocol. When the configured chat supports Telegram
+  forum topics, each session is routed through its own topic.
 
 The setup command stores global notification settings in your GJC agent config
 and later sessions auto-connect when notifications are enabled.
@@ -140,7 +141,14 @@ active `getUpdates` long-poll owner for a bot token, so GJC keeps a local daemon
 lock/state file and makes later sessions attach to the fresh owner instead of
 starting a second poller. This avoids Telegram `409 Conflict` failures.
 
-## 7. Use the Telegram thread
+## 7. Use the Telegram chat
+
+The current managed daemon uses Telegram forum-topic delivery for per-session
+routing. Pairing still discovers a private chat id for the local setup path, but
+threaded per-session delivery requires a configured chat that supports
+`createForumTopic`/`message_thread_id`; if Telegram refuses topic creation, the
+daemon drops remote sends fail-closed instead of falling back to a flat shared
+chat.
 
 The managed daemon can render:
 
@@ -155,15 +163,17 @@ The managed daemon can render:
 Reply paths:
 
 - tap an inline button on an ask notification;
-- reply in the session thread/topic with free text;
-- send in-thread config commands:
+- reply in the session topic with free text when forum-topic routing is
+  available;
+- send in-topic config commands:
   - `/verbose`
   - `/lean`
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
 
 The removed legacy `/answer <session-tag> <answer>` flow is not the primary UX;
-thread/topic routing identifies the target session.
+Telegram topic routing identifies the target session when the configured chat
+supports it.
 
 ## 8. Local `/notify` inside a session
 
