@@ -500,6 +500,9 @@ async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<
 		if (!searchQueries.includes(q)) searchQueries.push(q);
 	}
 
+	if (sources.length === 0) {
+		throw new SearchProviderError("gemini", "Gemini native search returned no grounding sources", 424);
+	}
 	const limit = params.numSearchResults ?? params.limit;
 	return {
 		provider: "gemini",
