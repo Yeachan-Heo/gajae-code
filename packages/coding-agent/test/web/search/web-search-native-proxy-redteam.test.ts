@@ -108,6 +108,18 @@ describe("native-over-proxy provider-chain red-team", () => {
 			"duckduckgo",
 		]);
 	});
+
+	it("does not claim openai-compatible for azure wire the adapter cannot service", async () => {
+		const ctx: ActiveSearchModelContext = {
+			provider: "proxy",
+			modelId: "gpt-4o",
+			api: "azure-openai-responses",
+			baseUrl: "https://proxy.example",
+		};
+
+		expect(activeContextNativeId(ctx)).toBeUndefined();
+		await expect(chainIds(ctx, keyAuth({ proxy: "sk-proxy" }))).resolves.toEqual(["duckduckgo"]);
+	});
 });
 
 describe("native-over-proxy provider red-team", () => {
@@ -247,5 +259,36 @@ describe("native-over-proxy provider red-team", () => {
 
 		expect(capturedUrl).toContain("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent");
 		expect(capturedUrl).not.toContain("proxy.example/v1beta");
+	});
+
+	it("does not double-append the version when the active baseUrl is already versioned", async () => {
+		let capturedUrl = "";
+		using _hook = hookFetch(async input => {
+			capturedUrl = String(input);
+			return Response.json({
+				modelVersion: "gemini-2.5-pro",
+				candidates: [
+					{
+						content: { parts: [{ text: "Answer." }] },
+						groundingMetadata: { groundingChunks: [{ web: { uri: "https://example.com/g", title: "G" } }] },
+					},
+				],
+			});
+		});
+
+		await new GeminiProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: keyAuth({ proxy: "sk-active" }),
+			activeModelContext: {
+				provider: "proxy",
+				modelId: "gemini-2.5-pro",
+				api: "google-generative-ai",
+				baseUrl: "https://proxy.example/v1beta",
+			},
+		});
+
+		expect(capturedUrl).toBe("https://proxy.example/v1beta/models/gemini-2.5-pro:generateContent");
+		expect(capturedUrl).not.toContain("/v1beta/v1beta");
 	});
 });

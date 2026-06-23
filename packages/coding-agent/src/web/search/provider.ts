@@ -294,9 +294,14 @@ export async function canUseGenericCredentials(
 export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined): SearchProviderId | undefined {
 	if (!ctx || ctx.webSearch === "off") return undefined;
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
+	// Dispatch must match exactly what each provider can service by reusing the
+	// active credential: the OpenAI-compatible adapter only speaks the two plain
+	// OpenAI wires (not azure), and the Gemini active path only speaks the public
+	// Generative Language wire (not vertex/cloud-code). Returning an id the
+	// provider would reject just wastes a guaranteed-fail attempt before DuckDuckGo.
 	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
-	if (isOpenAICompatWire(ctx.api)) return "openai-compatible";
-	if (isGoogleWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
+	if (ctx.api === "openai-responses" || ctx.api === "openai-completions") return "openai-compatible";
+	if (ctx.api === "google-generative-ai" && modelId.startsWith("gemini-")) return "gemini";
 	return undefined;
 }
 

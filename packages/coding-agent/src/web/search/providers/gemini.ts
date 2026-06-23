@@ -445,7 +445,10 @@ async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<
 
 	const model = ctx.wireModelId ?? ctx.modelId;
 	const base = (ctx.baseUrl ?? "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
-	const url = `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+	// Respect an already-versioned active baseUrl (e.g. a proxy exposing `…/v1beta`)
+	// instead of double-appending the version segment.
+	const versionedBase = /\/v1(beta|alpha)?$/.test(base) ? base : `${base}/v1beta`;
+	const url = `${versionedBase}/models/${encodeURIComponent(model)}:generateContent`;
 	const systemPrompt = params.systemPrompt?.toWellFormed();
 	const body: Record<string, unknown> = {
 		contents: [{ role: "user", parts: [{ text: params.query }] }],
