@@ -17,6 +17,14 @@ const BASE_CFG: NotificationConfig = {
 	enabled: false,
 	botToken: undefined,
 	chatId: undefined,
+	discord: {
+		botToken: undefined,
+		channelId: undefined,
+	},
+	slack: {
+		botToken: undefined,
+		channelId: undefined,
+	},
 	redact: false,
 	verbosity: "lean",
 	idleTimeoutMs: 60000,
@@ -39,6 +47,10 @@ describe("notifications config", () => {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": "token-1",
 			"notifications.telegram.chatId": "chat-1",
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.channelId": "discord-channel",
+			"notifications.slack.botToken": "slack-token",
+			"notifications.slack.channelId": "slack-channel",
 			"notifications.redact": true,
 			"notifications.daemon.idleTimeoutMs": 1234,
 		});
@@ -47,19 +59,48 @@ describe("notifications config", () => {
 			enabled: true,
 			botToken: "token-1",
 			chatId: "chat-1",
+			discord: {
+				botToken: "discord-token",
+				channelId: "discord-channel",
+			},
+			slack: {
+				botToken: "slack-token",
+				channelId: "slack-channel",
+			},
 			redact: true,
 			verbosity: "lean",
 			idleTimeoutMs: 1234,
 		});
 	});
 
-	test("isGloballyConfigured is true only when enabled with bot token and chat id", () => {
+	test("isGloballyConfigured is true when enabled with any complete adapter", () => {
 		expect(isGloballyConfigured(GLOBAL_CFG)).toBe(true);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, enabled: false })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: undefined })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: "" })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: undefined })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "" })).toBe(false);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				discord: { botToken: "discord-token", channelId: "discord-channel" },
+			}),
+		).toBe(true);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				slack: { botToken: "slack-token", channelId: "slack-channel" },
+			}),
+		).toBe(true);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				discord: { botToken: "discord-token", channelId: undefined },
+			}),
+		).toBe(false);
 	});
 
 	test("isSessionNotificationsEnabled applies precedence", () => {

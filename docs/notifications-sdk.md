@@ -198,7 +198,7 @@ ws.on("message", (data) => {
 Swap `ws` for a Telegram bot's long-poll loop, a Discord gateway client, or a
 Slack socket-mode app — the contract above is all you implement.
 
-## Telegram onboarding
+## Managed notification adapters
 
 For the exact user setup flow (`gjc notify setup`, BotFather token, private-chat pairing, status, and troubleshooting), see [Telegram notification onboarding](./telegram-onboarding.md).
 
@@ -208,6 +208,13 @@ GJC also ships a managed Telegram reference client for the common phone-notify
 workflow. It remains a client of the generic SDK: it scans session discovery
 files, opens each session WebSocket, and routes Telegram replies back to the
 matching endpoint.
+
+The daemon/session engine is shared. Session discovery, WebSocket protocol,
+redaction decisions, rate-limit pooling, reply routing, singleton ownership, and
+lifecycle control are not reimplemented by each chat surface. Telegram, Discord,
+and Slack adapters are thin presentation layers: they render internal notification
+events into transport payloads and map transport interactions back to `{sessionId,
+actionId,answer}` replies.
 
 ### Setup and auto-connect
 
@@ -226,6 +233,8 @@ directory. It enables:
 - `notifications.telegram.botToken`
 - `notifications.telegram.chatId`
 - `notifications.redact` (optional; default false)
+- `notifications.discord.botToken` / `notifications.discord.channelId` (optional Discord adapter)
+- `notifications.slack.botToken` / `notifications.slack.channelId` (optional Slack adapter)
 
 After setup, sessions auto-connect when notifications are enabled. Each session
 still publishes its own loopback endpoint; the daemon is only the Telegram-side
@@ -277,6 +286,32 @@ removed — replies are routed by the topic they arrive in.
 Unknown, expired, or restart-unvalidated callback aliases fail closed: the daemon
 sends guidance and does not guess a target session or action.
 
+### Discord and Slack setup
+
+Discord and Slack use the same internal notification events and reply protocol as
+Telegram. Store only runtime credentials in local GJC settings or environment;
+never paste bot tokens, webhook URLs, transcripts, prompts, host paths, or raw logs
+into docs, tests, issues, or PR comments.
+
+Configuration keys:
+
+```yaml
+notifications:
+  enabled: true
+  discord:
+    botToken: "<local Discord bot token>"
+    channelId: "<Discord channel id>"
+  slack:
+    botToken: "<local Slack bot token>"
+    channelId: "<Slack channel id>"
+  redact: true
+```
+
+The bundled adapters intentionally render public-safe message bodies and return
+route metadata only for pending internal actions. They do not own polling,
+session scans, daemon locks, rate limits, or SDK lifecycle. Production transport
+senders should consume the adapter payloads and keep all credential-bearing HTTP
+or gateway details outside logged payloads.
 ### Redaction
 
 `notifications.redact` strips sensitive content before remote delivery, but

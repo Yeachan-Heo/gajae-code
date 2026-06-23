@@ -5,6 +5,14 @@ export interface NotificationConfig {
 	enabled: boolean;
 	botToken?: string;
 	chatId?: string;
+	discord: {
+		botToken?: string;
+		channelId?: string;
+	};
+	slack: {
+		botToken?: string;
+		channelId?: string;
+	};
 	redact: boolean;
 	verbosity: "lean" | "verbose";
 	idleTimeoutMs: number;
@@ -16,15 +24,28 @@ export function getNotificationConfig(settings: Settings): NotificationConfig {
 		enabled: settings.get("notifications.enabled"),
 		botToken: settings.get("notifications.telegram.botToken"),
 		chatId: settings.get("notifications.telegram.chatId"),
+		discord: {
+			botToken: settings.get("notifications.discord.botToken"),
+			channelId: settings.get("notifications.discord.channelId"),
+		},
+		slack: {
+			botToken: settings.get("notifications.slack.botToken"),
+			channelId: settings.get("notifications.slack.channelId"),
+		},
 		redact: settings.get("notifications.redact"),
 		verbosity: settings.get("notifications.verbosity") === "verbose" ? "verbose" : "lean",
 		idleTimeoutMs: settings.get("notifications.daemon.idleTimeoutMs"),
 	};
 }
 
-/** Is global config sufficient for auto-on (enabled + botToken + chatId all present)? */
+/** Is global config sufficient for auto-on (enabled + at least one configured adapter)? */
 export function isGloballyConfigured(cfg: NotificationConfig): boolean {
-	return cfg.enabled && Boolean(cfg.botToken) && Boolean(cfg.chatId);
+	return (
+		cfg.enabled &&
+		((Boolean(cfg.botToken) && Boolean(cfg.chatId)) ||
+			(Boolean(cfg.discord.botToken) && Boolean(cfg.discord.channelId)) ||
+			(Boolean(cfg.slack.botToken) && Boolean(cfg.slack.channelId)))
+	);
 }
 
 /** Resolve whether the notifications extension should be registered at SDK startup. */

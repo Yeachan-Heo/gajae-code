@@ -45,6 +45,30 @@
 					},
 					"additionalProperties": false
 				},
+				"discord": {
+					"type": "object",
+					"properties": {
+						"botToken": {
+							"type": "string"
+						},
+						"channelId": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				"slack": {
+					"type": "object",
+					"properties": {
+						"botToken": {
+							"type": "string"
+						},
+						"channelId": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
 				"redact": {
 					"type": "boolean",
 					"default": false

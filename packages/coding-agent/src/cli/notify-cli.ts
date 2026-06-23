@@ -303,8 +303,12 @@ async function runStatus(deps: NotifyCommandDeps): Promise<void> {
 	process.stdout.write(
 		`${chalk.bold("Notifications")}\n` +
 			`  enabled: ${cfg.enabled}\n` +
-			`  botToken: ${maskToken(cfg.botToken)}\n` +
-			`  chatId: ${cfg.chatId ?? "(unset)"}\n` +
+			`  telegram.botToken: ${maskToken(cfg.botToken)}\n` +
+			`  telegram.chatId: ${cfg.chatId ?? "(unset)"}\n` +
+			`  discord.botToken: ${maskToken(cfg.discord.botToken)}\n` +
+			`  discord.channelId: ${cfg.discord.channelId ?? "(unset)"}\n` +
+			`  slack.botToken: ${maskToken(cfg.slack.botToken)}\n` +
+			`  slack.channelId: ${cfg.slack.channelId ?? "(unset)"}\n` +
 			`  redact: ${cfg.redact}\n`,
 	);
 }

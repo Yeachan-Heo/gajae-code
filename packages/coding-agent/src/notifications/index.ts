@@ -157,6 +157,16 @@ interface ResolvedSettings {
 
 const defaultConfig: NotificationConfig = {
 	enabled: false,
+	botToken: undefined,
+	chatId: undefined,
+	discord: {
+		botToken: undefined,
+		channelId: undefined,
+	},
+	slack: {
+		botToken: undefined,
+		channelId: undefined,
+	},
 	redact: false,
 	verbosity: "lean",
 	idleTimeoutMs: 60_000,

@@ -254,10 +254,14 @@ export const SETTINGS_SCHEMA = {
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
 
-	// Notifications (Telegram bundled reference client)
+	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
 	"notifications.telegram.botToken": { type: "string", default: undefined },
 	"notifications.telegram.chatId": { type: "string", default: undefined },
+	"notifications.discord.botToken": { type: "string", default: undefined },
+	"notifications.discord.channelId": { type: "string", default: undefined },
+	"notifications.slack.botToken": { type: "string", default: undefined },
+	"notifications.slack.channelId": { type: "string", default: undefined },
 	"notifications.redact": { type: "boolean", default: false },
 	"notifications.verbosity": {
 		type: "string",
@@ -3182,6 +3186,14 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+	};
+	discord: {
+		botToken: string | undefined;
+		channelId: string | undefined;
+	};
+	slack: {
+		botToken: string | undefined;
+		channelId: string | undefined;
 	};
 	redact: boolean;
 	daemon: {
