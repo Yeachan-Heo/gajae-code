@@ -29,7 +29,7 @@ import {
 import { APP_NAME, adjustHsv, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
-import { KeybindingsManager } from "../config/keybindings";
+import { type AppKeybinding, KeybindingsManager } from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
@@ -84,7 +84,6 @@ import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import { appKey } from "./components/keybinding-hints";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -119,6 +118,23 @@ import { UiHelpers } from "./utils/ui-helpers";
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const DEFAULT_COMPOSER_PLACEHOLDER = "Type your message...";
+const FRIENDLY_KEY_PARTS: Record<string, string> = {
+	alt: "Alt",
+	cmd: "Command",
+	command: "Command",
+	ctrl: "Control",
+	enter: "Enter",
+	meta: process.platform === "darwin" ? "Command" : "Meta",
+	option: "Option",
+	shift: "Shift",
+};
+
+function formatShortcutForPlaceholder(key: string): string {
+	return key
+		.split("+")
+		.map(part => FRIENDLY_KEY_PARTS[part.toLowerCase()] ?? part)
+		.join("+");
+}
 
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	low: "dim",
@@ -909,13 +925,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.session.isStreaming || this.session.isCompacting;
 	}
 
+	#getFirstKeyForAction(action: AppKeybinding): string | undefined {
+		return this.keybindings.getKeys(action)[0];
+	}
+
+	#getMessageQueueShortcut(): string | undefined {
+		const preferredAction: AppKeybinding =
+			process.platform === "darwin" ? "app.message.followUp" : "app.message.queue";
+		const fallbackAction: AppKeybinding =
+			process.platform === "darwin" ? "app.message.queue" : "app.message.followUp";
+		return this.#getFirstKeyForAction(preferredAction) ?? this.#getFirstKeyForAction(fallbackAction);
+	}
+
 	#getComposerPlaceholder(): string {
 		if (!this.#isPromptDeliveryBusy()) return DEFAULT_COMPOSER_PLACEHOLDER;
-		const queueKey =
-			appKey(this.keybindings, "app.message.queue") || appKey(this.keybindings, "app.message.followUp");
-		const enterAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
-		const parts = [`Enter ${enterAction.toLowerCase()}`];
-		if (queueKey) parts.push(`${queueKey} queue`);
+		const enterAction = this.settings.get("busyPromptMode") === "steer" ? "Steering" : "Message Queueing";
+		const parts = [`Enter: ${enterAction}`];
+		const queueKey = this.#getMessageQueueShortcut();
+		if (queueKey) parts.push(`${formatShortcutForPlaceholder(queueKey)}: Message Queueing`);
 		return `${DEFAULT_COMPOSER_PLACEHOLDER} ${parts.join(" · ")}`;
 	}
 
