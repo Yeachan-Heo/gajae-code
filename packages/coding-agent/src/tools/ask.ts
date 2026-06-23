@@ -675,8 +675,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			}
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
+				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
 				const displayQuestion = deepInterviewPrompt ?? q.question;
-				const shouldNumberOptions = isDeepInterviewAskQuestion(q.question);
+				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
 				const initialSelection =
 					shouldNumberOptions && options?.previous
@@ -700,7 +701,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					signal,
 					initialSelection,
 					navigation: options?.navigation,
-					scrollTitleRows: deepInterviewPrompt === null ? undefined : DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
+					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
 					otherOptionLabel: shouldNumberOptions
 						? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
 						: undefined,

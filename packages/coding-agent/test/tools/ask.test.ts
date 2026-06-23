@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -1437,6 +1438,51 @@ describe("AskTool deep-interview rendering middleware", () => {
 						id: "round-4",
 						question: rawQuestion,
 						options: [{ label: "Visible options" }, { label: "Scrollable prompt" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		const dialogOptions = select.mock.calls[0]?.[2];
+		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
+		expect(dialogOptions?.helpText).toContain("wheel/PgUp/PgDn scroll question");
+	});
+
+	it("opts structured deep-interview questions into local prompt scrolling", async () => {
+		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
+		const tool = new AskTool(createSession({ getSessionId: () => "session-structured-scroll" }));
+		const rawQuestion = [
+			"The user-facing context is long enough that answer options can be pushed off screen.",
+			"",
+			"Which answer should prove the question area remains scrollable?",
+		].join("\n");
+		const select = vi.fn(
+			async (_prompt: string, options: string[], _dialogOptions?: { scrollTitleRows?: number; helpText?: string }) =>
+				options[0],
+		);
+		const context = createContext({ select });
+
+		await tool.execute(
+			"call-structured-deep-interview-scroll",
+			{
+				questions: [
+					{
+						id: "round-6",
+						question: rawQuestion,
+						options: [{ label: "Keep question scrolling" }, { label: "Regular selection" }],
+						deepInterview: {
+							round: 6,
+							component: "Selector UI",
+							dimension: "Readability",
+							ambiguity: 0.41,
+						},
 					},
 				],
 			},
