@@ -8,10 +8,10 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getProjectAgentDir, logger, TempDir } from "@gajae-code/utils";
+import { getProjectAgentDir, logger, TempDir, withTimeout } from "@gajae-code/utils";
 
 const runtimeSignalStoreKey = "__gjcAutoContinueSignals";
 type RuntimeSignalGlobal = typeof globalThis & { [runtimeSignalStoreKey]?: string[] };
@@ -149,19 +149,25 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy.mock.invocationCallOrder[0]).toBeGreaterThan(0);
 	});
 
-	it("overflow with non-resumable tail logs not_resumable_tail and does not continue", async () => {
+	it("overflow with non-resumable tail starts one synthetic auto-continue prompt", async () => {
 		const warnSpy = vi.spyOn(logger, "warn");
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const { promise: promptCalled, resolve: onPromptCalled } = Promise.withResolvers<void>();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			onPromptCalled();
+		});
 		const overflow = assistantMessage({
 			stopReason: "error",
 			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
 		});
 		await driveCompaction(overflow);
-		await advancePostPrompt(200);
+		await withTimeout(promptCalled, 1000, "Overflow auto-continue prompt timed out");
 		await session.waitForIdle();
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(promptSpy).not.toHaveBeenCalled();
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy.mock.calls[0]?.[0]).toEqual(
+			expect.arrayContaining([expect.objectContaining({ role: "developer", attribution: "agent" })]),
+		);
 		expect(
 			warnSpy.mock.calls.some(call => String(call[0]).includes("Cannot continue from message role: assistant")),
 		).toBe(false);
@@ -170,7 +176,63 @@ describe("AgentSession auto-compaction continuation", () => {
 				call =>
 					call[0] === "Auto-compaction continuation skipped" &&
 					JSON.stringify(call[1]).includes('"source":"overflow_retry"') &&
-					JSON.stringify(call[1]).includes('"reason":"not_resumable_tail"'),
+					JSON.stringify(call[1]).includes('"reason":"auto_continue_disabled_non_resumable_tail"'),
+			),
+		).toBe(false);
+	});
+
+	it("overflow with compaction disabled skips compaction and starts one synthetic auto-continue prompt", async () => {
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		await createSession({ "compaction.enabled": false });
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const { promise: promptCalled, resolve: onPromptCalled } = Promise.withResolvers<void>();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			onPromptCalled();
+		});
+		const overflow = assistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+		});
+		await driveCompaction(overflow);
+		await withTimeout(promptCalled, 1000, "Disabled-compaction overflow prompt timed out");
+		await session.waitForIdle();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(getRuntimeSignals().some(signal => signal.startsWith("compaction:start:"))).toBe(false);
+	});
+
+	it("overflow with autoContinue false and non-resumable tail logs disabled skip reason", async () => {
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		await createSession({ "compaction.autoContinue": false });
+		const warnSpy = vi.spyOn(logger, "warn");
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const endEvents: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") endEvents.push(event);
+		});
+		const overflow = assistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+		});
+		await driveCompaction(overflow);
+		await session.waitForIdle();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(endEvents.at(-1)).toMatchObject({
+			continuationSkipReason: "auto_continue_disabled_non_resumable_tail",
+			willRetry: false,
+		});
+		expect(
+			warnSpy.mock.calls.some(
+				call =>
+					call[0] === "Auto-compaction continuation skipped" &&
+					JSON.stringify(call[1]).includes('"source":"overflow_retry"') &&
+					JSON.stringify(call[1]).includes('"reason":"auto_continue_disabled_non_resumable_tail"'),
 			),
 		).toBe(true);
 	});

@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { estimateEntriesTokens, estimateEntryTokens, findCutPoint } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
-import { estimateOpenAiCompactInputTokens, trimOpenAiCompactInput } from "@gajae-code/agent-core/compaction/openai";
+import {
+	estimateOpenAiCompactInputTokens,
+	resolveOpenAiCompactInputBudget,
+	trimOpenAiCompactInput,
+} from "@gajae-code/agent-core/compaction/openai";
 import { type PruneConfig, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
 import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai/types";
 
@@ -344,6 +348,35 @@ describe("digest pruning notices", () => {
 });
 
 describe("OpenAI trim sizing", () => {
+	test("resolveOpenAiCompactInputBudget reserves output and clamps tiny positive windows", () => {
+		expect(resolveOpenAiCompactInputBudget(100, 0)).toBe(85);
+		expect(resolveOpenAiCompactInputBudget(100, 20)).toBe(80);
+		expect(resolveOpenAiCompactInputBudget(2, 0)).toBe(1);
+		expect(resolveOpenAiCompactInputBudget(1, 0)).toBe(1);
+		expect(resolveOpenAiCompactInputBudget(10, 20)).toBe(1);
+		expect(resolveOpenAiCompactInputBudget(0, 0)).toBe(0);
+		expect(resolveOpenAiCompactInputBudget(-5, 0)).toBe(0);
+	});
+
+	test("trimOpenAiCompactInput removes suffix items when resolved budget is below full context window", () => {
+		const instructions = "compact";
+		const contextWindow = 100;
+		const budget = resolveOpenAiCompactInputBudget(contextWindow, 20);
+		const items: Array<Record<string, unknown>> = [
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "keep user message" }] },
+			{
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: "remove developer message ".repeat(8) }],
+			},
+		];
+
+		expect(estimateOpenAiCompactInputTokens(items, instructions)).toBeLessThanOrEqual(contextWindow);
+		expect(estimateOpenAiCompactInputTokens(items, instructions)).toBeGreaterThan(budget);
+		expect(trimOpenAiCompactInput(items, contextWindow, instructions)).toEqual(items);
+		expect(trimOpenAiCompactInput(items, budget, instructions)).toEqual([items[0]]);
+	});
+
 	test("trimOpenAiCompactInput matches full recount across removable scenarios", () => {
 		const instructions = "compact these items";
 		const scenarios: Array<{ name: string; items: Array<Record<string, unknown>>; budget: number }> = [

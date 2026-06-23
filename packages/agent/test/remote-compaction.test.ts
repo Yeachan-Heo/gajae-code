@@ -118,6 +118,34 @@ describe("buildOpenAiNativeHistory custom tool calls", () => {
 });
 
 describe("remote compaction input trimming", () => {
+	test("trims removable items against reserved input budget when input fits full context window", async () => {
+		let requestInput: Array<Record<string, unknown>> | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			const body = JSON.parse(String(init?.body)) as { input: Array<Record<string, unknown>> };
+			requestInput = body.input;
+			return Response.json({
+				output: [{ type: "compaction_summary", summary: "compact" }],
+			});
+		});
+
+		await requestOpenAiRemoteCompaction(
+			makeOpenAiModel({ contextWindow: 100, maxTokens: 20 }),
+			"test-key",
+			[
+				{ type: "message", role: "user", content: [{ type: "input_text", text: "keep user message" }] },
+				{
+					type: "message",
+					role: "developer",
+					content: [{ type: "input_text", text: "remove developer message ".repeat(8) }],
+				},
+			],
+			"compact",
+		);
+
+		expect(requestInput?.some(item => item.type === "message" && item.role === "developer")).toBe(false);
+		expect(requestInput?.some(item => item.type === "message" && item.role === "user")).toBe(true);
+	});
+
 	test("trims custom tool outputs with their matching custom calls", async () => {
 		let requestInput: Array<Record<string, unknown>> | undefined;
 		using _hook = hookFetch(async (_input, init) => {

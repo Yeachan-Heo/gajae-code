@@ -286,6 +286,8 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { YieldQueue } from "./yield-queue";
 
 /** Session-specific events that extend the core AgentEvent */
+export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
+
 export type AgentSessionEvent =
 	| AgentEvent
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
@@ -298,6 +300,7 @@ export type AgentSessionEvent =
 			errorMessage?: string;
 			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 			skipped?: boolean;
+			continuationSkipReason?: AutoCompactionContinuationSkipReason;
 	  }
 	| {
 			type: "auto_retry_start";
@@ -1869,7 +1872,6 @@ export class AgentSession {
 										this.#resolveTtsrResume();
 										return;
 									}
-									this.#ttsrAbortPending = false;
 									this.#perToolTtsrInjections.clear();
 									const ttsrSettings = this.#ttsrManager?.getSettings();
 									if (ttsrSettings?.contextMode === "discard" && targetAssistantIndex !== -1) {
@@ -1898,11 +1900,22 @@ export class AgentSession {
 										);
 										this.#markTtsrInjected(details.rules);
 									}
-									try {
-										await this.agent.continue();
-									} catch {
-										this.#resolveTtsrResume();
-									}
+									await this.#scheduleAgentContinue({
+										delayMs: 0,
+										generation,
+										shouldContinue: () => {
+											this.#ttsrAbortPending = false;
+											return true;
+										},
+										onSkip: () => {
+											this.#ttsrAbortPending = false;
+											this.#resolveTtsrResume();
+										},
+										onError: () => {
+											this.#ttsrAbortPending = false;
+											this.#resolveTtsrResume();
+										},
+									});
 								},
 								{ delayMs: 50 },
 							);
@@ -2214,7 +2227,7 @@ export class AgentSession {
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
 		options?: { delayMs?: number; generation?: number; onSkip?: () => void },
-	): void {
+	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
 		const scheduled = (async () => {
@@ -2236,18 +2249,20 @@ export class AgentSession {
 			await task(signal);
 		})();
 		this.#trackPostPromptTask(scheduled);
+		return scheduled;
 	}
 
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
+		skipCompactionCheck?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
 		onError?: (error: unknown) => void;
-	}): void {
+	}): Promise<void> {
 		const scheduledGeneration = options?.generation;
 		const signal = this.#postPromptTasksAbortController.signal;
-		this.#schedulePostPromptTask(
+		return this.#schedulePostPromptTask(
 			async () => {
 				if (signal.aborted) {
 					options?.onSkip?.("aborted_signal");
@@ -2263,6 +2278,9 @@ export class AgentSession {
 				}
 				try {
 					await this.#maybeRestoreRetryFallbackPrimary();
+					if (!options?.skipCompactionCheck) {
+						await this.#checkEstimatedContextBeforePrompt();
+					}
 					await this.agent.continue();
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
@@ -2305,6 +2323,34 @@ export class AgentSession {
 		if (lastMsg?.role === "assistant" && isContextOverflow(lastMsg as AssistantMessage, contextWindow)) {
 			this.agent.replaceMessages(messages.slice(0, -1));
 		}
+	}
+
+	#detectOverflowRetryContinuationSkip(): AutoCompactionContinuationSkipReason | undefined {
+		this.#stripOverflowFailedTurnForRetry();
+		if (this.#isResumableAgentTail()) return undefined;
+		const compactionSettings = this.settings.getGroup("compaction");
+		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
+	}
+
+	#scheduleOverflowRetryContinuation(generation: number): void {
+		this.#stripOverflowFailedTurnForRetry();
+		if (this.#isResumableAgentTail()) {
+			this.#scheduleAgentContinue({
+				delayMs: 100,
+				generation,
+				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
+				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+			});
+			return;
+		}
+
+		const compactionSettings = this.settings.getGroup("compaction");
+		if (compactionSettings.autoContinue !== false) {
+			this.#scheduleAutoContinuePrompt(generation);
+			return;
+		}
+
+		this.#logCompactionContinuationSkipped("overflow_retry", "auto_continue_disabled_non_resumable_tail");
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
@@ -3052,6 +3098,7 @@ export class AgentSession {
 				willRetry: event.willRetry,
 				errorMessage: event.errorMessage,
 				skipped: event.skipped,
+				continuationSkipReason: event.continuationSkipReason,
 			});
 		} else if (event.type === "auto_retry_start") {
 			await this.#extensionRunner.emit({
@@ -6722,6 +6769,8 @@ export class AgentSession {
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
 				await this.#runAutoCompaction("overflow", true);
+			} else {
+				this.#scheduleOverflowRetryContinuation(generation);
 			}
 			return;
 		}
@@ -7734,32 +7783,18 @@ export class AgentSession {
 
 			const preparation = prepareCompaction(pathEntries, compactionSettings);
 			if (!preparation) {
+				const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
 					result: undefined,
 					aborted: false,
-					willRetry: false,
+					willRetry: willRetry && !continuationSkipReason,
 					skipped: true,
+					continuationSkipReason,
 				});
 				if (willRetry) {
-					this.#stripOverflowFailedTurnForRetry();
-					if (this.#isResumableAgentTail()) {
-						this.#scheduleAgentContinue({
-							delayMs: 100,
-							generation,
-							onSkip: skipReason => this.#logCompactionContinuationSkipped("overflow_retry", skipReason),
-							onError: error => this.#logCompactionContinuationError("overflow_retry", error),
-						});
-					} else {
-						const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
-						logger.warn("Auto-compaction continuation skipped", {
-							source: "overflow_retry",
-							reason: "not_resumable_tail",
-							role: tail?.role,
-							stopReason: tail?.stopReason,
-						});
-					}
+					this.#scheduleOverflowRetryContinuation(generation);
 				} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
@@ -7970,26 +8005,18 @@ export class AgentSession {
 				details,
 				preserveData,
 			};
-			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
+			const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+			await this.#emitSessionEvent({
+				type: "auto_compaction_end",
+				action,
+				result,
+				aborted: false,
+				willRetry: willRetry && !continuationSkipReason,
+				continuationSkipReason,
+			});
 
 			if (willRetry) {
-				this.#stripOverflowFailedTurnForRetry();
-				if (!this.#isResumableAgentTail()) {
-					const tail = this.agent.state.messages.at(-1) as AssistantMessage | undefined;
-					logger.warn("Auto-compaction continuation skipped", {
-						source: "overflow_retry",
-						reason: "not_resumable_tail",
-						role: tail?.role,
-						stopReason: tail?.stopReason,
-					});
-				} else {
-					this.#scheduleAgentContinue({
-						delayMs: 100,
-						generation,
-						onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
-						onError: error => this.#logCompactionContinuationError("overflow_retry", error),
-					});
-				}
+				this.#scheduleOverflowRetryContinuation(generation);
 			} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.

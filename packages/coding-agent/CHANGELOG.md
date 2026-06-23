@@ -6,6 +6,10 @@
 - Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
 - `web_search` `auto` mode now drives native provider search over proxies/custom endpoints by reusing the active model's own credential + baseUrl when canonical native creds are absent: `activeContextNativeId()` matches the model's wire api (+ model-id family) to `anthropic` (anthropic-messages), `openai-compatible` (openai-responses/completions), or `gemini` (google-generative-ai Generative Language), each falling back to DuckDuckGo if the endpoint does not support web search.
 
+### Fixed
+
+- Hardened context-overflow recovery so automatic maintenance clears the TUI loader, surfaces overflow completion/skip status, retries resumable tails safely, and falls back to the synthetic auto-continue prompt for non-resumable tails when enabled.
+
 ## [0.7.1] - 2026-06-23
 ### Fixed
 

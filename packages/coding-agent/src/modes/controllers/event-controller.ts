@@ -677,12 +677,18 @@ export class EventController {
 		}
 		this.ctx.updateEditorBorderColor();
 		const isHandoffAction = event.action === "handoff";
+		const continuationDisabled = event.continuationSkipReason === "auto_continue_disabled_non_resumable_tail";
 		if (event.aborted) {
 			this.ctx.showStatus(isHandoffAction ? "Auto-handoff cancelled" : "Auto context-full maintenance cancelled");
 		} else if (event.result) {
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
+			if (continuationDisabled && !isHandoffAction) {
+				this.ctx.showStatus("Context overflow recovery skipped: auto_continue_disabled_non_resumable_tail");
+			} else if (event.willRetry && !isHandoffAction) {
+				this.ctx.showStatus("Context overflow maintenance completed");
+			}
 		} else if (event.errorMessage) {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
@@ -695,6 +701,11 @@ export class EventController {
 		} else if (event.skipped) {
 			// Benign skip: no model selected, no candidate models available, or nothing
 			// to compact yet. Not a failure — suppress the warning.
+			if (continuationDisabled) {
+				this.ctx.showStatus("Context overflow recovery skipped: auto_continue_disabled_non_resumable_tail");
+			} else if (event.willRetry && !isHandoffAction) {
+				this.ctx.showStatus("Context overflow maintenance skipped");
+			}
 		} else {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
