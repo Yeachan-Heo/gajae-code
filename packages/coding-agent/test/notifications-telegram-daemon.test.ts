@@ -845,6 +845,198 @@ test("image_attachment frame uploads via sendPhoto into the session topic", asyn
 	expect(Number(photo!.body.message_thread_id)).toBeGreaterThan(0);
 });
 
+test("threaded mode off: frames fall back to the flat paired chat with a one-time notice", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	// Threaded Mode is off: createForumTopic yields no message_thread_id, so
+	// ensureTopic fails and the daemon must route flat instead of dropping.
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "hello world",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "action_needed",
+		sessionId: "S",
+		id: "ask1",
+		kind: "ask",
+		question: "Proceed?",
+		options: ["Yes", "No"],
+	});
+
+	const sends = bot.calls.filter(c => c.method === "sendMessage");
+	// Everything is delivered flat (no message_thread_id) since topics are unavailable.
+	expect(sends.length).toBeGreaterThan(0);
+	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
+	// The nudge is sent exactly once with the requested copy.
+	const notices = sends.filter(c =>
+		String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
+	);
+	expect(notices).toHaveLength(1);
+	// The ask still carries its inline keyboard in flat mode.
+	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
+	expect(ask).toBeTruthy();
+	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
+});
+
+test("threaded mode off: multiple sessions share a single fallback notice", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	for (const sessionId of ["A", "B", "C"]) {
+		await daemon.handleSessionMessage(
+			{ sessionId, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() } as any,
+			{ type: "identity_header", sessionId, repo: "r", branch: sessionId },
+		);
+	}
+	const sends = bot.calls.filter(c => c.method === "sendMessage");
+	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
+	expect(
+		sends.filter(c =>
+			String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
+		),
+	).toHaveLength(1);
+});
+
+test("threaded mode off: image_attachment uploads flat without message_thread_id", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendPhoto") return { ok: true, result: { message_id: bot.calls.length } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	await daemon.handleSessionMessage(
+		{ sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() } as any,
+		{ type: "image_attachment", sessionId: "S", source: "computer", mime: "image/png", data: "AAAA" },
+	);
+	const photo = bot.calls.find(c => c.method === "sendPhoto");
+	expect(photo).toBeTruthy();
+	expect(photo!.body.photo).toBe("AAAA");
+	expect(photo!.body.message_thread_id).toBeUndefined();
+	const notice = bot.calls.filter(
+		c =>
+			c.method === "sendMessage" &&
+			String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
+	);
+	expect(notice).toHaveLength(1);
+});
+
+test("threaded off + non-private chat: fails closed (no flat send, no notice)", async () => {
+	for (const chatType of ["supergroup", "group", "channel"]) {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		// Topics off AND the paired chat is not a private DM: must drop fail-closed
+		// so session content never lands in a shared chat.
+		bot.call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "createForumTopic") return { ok: true, result: {} };
+			if (method === "getChat") return { ok: true, result: { type: chatType } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+			return { ok: true, result: true };
+		}) as any;
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+		});
+		const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		await daemon.handleSessionMessage(session as any, {
+			type: "context_update",
+			sessionId: "S",
+			lastMessage: "secret",
+		});
+		await daemon.handleSessionMessage(session as any, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask1",
+			kind: "ask",
+			question: "Proceed?",
+			options: ["Yes"],
+		});
+
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends).toHaveLength(0);
+	}
+});
+
+test("threaded off + unresolvable getChat: fails closed", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "getChat") throw new Error("getChat failed");
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, { type: "context_update", sessionId: "S", lastMessage: "secret" });
+	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+});
+
 test("identity_header without a title names the topic repo/branch", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();

@@ -582,8 +582,14 @@ export class TelegramNotificationDaemon {
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly topics = new TopicRegistry();
-	private readonly pool: RateLimitPool<{ send: ThreadedSend; topicId: string }>;
+	private readonly pool: RateLimitPool<{ send: ThreadedSend; topicId?: string }>;
 	private readonly seenUpdateIds = new Set<number>();
+	/** True once the daemon has nudged the user to enable Threaded Mode. */
+	private threadedFallbackNoticeSent = false;
+	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
+	private readonly flatIdentitySent = new Set<string>();
+	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
+	private pairedChatPrivate: boolean | undefined;
 	private flushTimer: ReturnType<typeof setInterval> | undefined;
 	private scanTimer: ReturnType<typeof setInterval> | undefined;
 	private scanning = false;
@@ -660,7 +666,7 @@ export class TelegramNotificationDaemon {
 				return res.json();
 			},
 		};
-		this.pool = new RateLimitPool<{ send: ThreadedSend; topicId: string }>({ now: opts.now });
+		this.pool = new RateLimitPool<{ send: ThreadedSend; topicId?: string }>({ now: opts.now });
 	}
 
 	async loadAliases(): Promise<void> {
@@ -815,8 +821,9 @@ export class TelegramNotificationDaemon {
 
 	/**
 	 * Resolve (creating once via `createForumTopic`) the forum topic for a
-	 * session. Threaded mode is required: on capability failure this returns
-	 * `undefined` and the caller drops the send (no flat fallback).
+	 * session. On capability failure (e.g. Threaded Mode off) this returns
+	 * `undefined`; callers then flat-deliver to a private paired chat (with a
+	 * one-time nudge) or drop fail-closed for a non-private chat.
 	 */
 	private async ensureTopic(sessionId: string, name: string): Promise<string | undefined> {
 		const existing = this.topics.get(sessionId);
@@ -861,13 +868,14 @@ export class TelegramNotificationDaemon {
 	private async flushPool(): Promise<void> {
 		for (const item of this.pool.drain()) {
 			const { send, topicId } = item.payload;
-			const thread = Number(topicId);
+			// Threaded topic when available; otherwise deliver flat to the paired chat.
+			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
 			try {
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
 					await this.botApi.call("sendPhoto", {
 						chat_id: this.opts.chatId,
-						message_thread_id: thread,
+						...threadField,
 						photo: send.photoBase64,
 						mime: send.mime,
 						caption: send.text,
@@ -876,7 +884,7 @@ export class TelegramNotificationDaemon {
 				} else if (send.text) {
 					await this.botApi.call("sendMessage", {
 						chat_id: this.opts.chatId,
-						message_thread_id: thread,
+						...threadField,
 						text: send.text,
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
@@ -884,6 +892,57 @@ export class TelegramNotificationDaemon {
 			} catch {
 				// Best-effort: a failed send must never stop the daemon.
 			}
+		}
+	}
+
+	/**
+	 * Threaded Mode is unavailable (the bot owner has not enabled forum topics in
+	 * @BotFather, so `createForumTopic` fails). Deliver the rendered frame flat to
+	 * the paired chat instead of dropping it, and nudge the user once. Flat delivery
+	 * is gated on the paired chat being a private chat: for a group/supergroup/channel
+	 * (e.g. a legacy or hand-edited `chatId`) we keep dropping fail-closed so session
+	 * content never lands in a shared chat. Identity headers are sent at most once per
+	 * session in flat mode.
+	 */
+	private async deliverFlatFallback(sessionId: string, send: ThreadedSend): Promise<void> {
+		if (!(await this.pairedChatIsPrivate())) return;
+		await this.notifyThreadedFallback();
+		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
+		this.pool.submit({ sessionId, lane: send.lane, coalesceKey: send.coalesceKey, payload: { send } });
+		await this.flushPool();
+		if (send.identity) this.flatIdentitySent.add(sessionId);
+	}
+
+	/**
+	 * Resolve once (cached) whether the paired `chatId` is a private chat. Flat
+	 * fallback is only safe in a private DM; any non-private chat or an unresolvable
+	 * `getChat` is treated as not-private so delivery fails closed.
+	 */
+	private async pairedChatIsPrivate(): Promise<boolean> {
+		if (this.pairedChatPrivate !== undefined) return this.pairedChatPrivate;
+		try {
+			const res = (await this.botApi.call("getChat", { chat_id: this.opts.chatId })) as {
+				result?: { type?: string };
+			};
+			this.pairedChatPrivate = res.result?.type === "private";
+		} catch {
+			this.pairedChatPrivate = false;
+		}
+		return this.pairedChatPrivate;
+	}
+
+	/** Tell the user once (per daemon run) how to enable Threaded Mode. */
+	private async notifyThreadedFallback(): Promise<void> {
+		if (this.threadedFallbackNoticeSent) return;
+		this.threadedFallbackNoticeSent = true;
+		try {
+			await this.botApi.call("sendMessage", {
+				chat_id: this.opts.chatId,
+				text: "turn on threaded mode from botfather miniapp to receive gjc notification!",
+				parse_mode: TELEGRAM_PARSE_MODE,
+			});
+		} catch {
+			// Best-effort nudge; never block delivery.
 		}
 	}
 
@@ -1015,7 +1074,10 @@ export class TelegramNotificationDaemon {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
 			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
-			if (!topicId) return;
+			if (!topicId) {
+				await this.deliverFlatFallback(session.sessionId, send);
+				return;
+			}
 			if (send.identity) {
 				// Rename the topic if the title changed (e.g. the session title was
 				// auto-generated after the topic was first created). This runs on
@@ -1058,7 +1120,12 @@ export class TelegramNotificationDaemon {
 		if (msg.type === "action_needed" && msg.id) {
 			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: session.sessionId, actionId: msg.id });
 			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
-			if (!topicId) return;
+			if (!topicId) {
+				// Fail closed for non-private chats; only nudge + flat-deliver in a private DM.
+				if (!(await this.pairedChatIsPrivate())) return;
+				await this.notifyThreadedFallback();
+			}
+			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
 			const rendered = buildActionMessage({
 				kind: msg.kind ?? "ask",
 				id: msg.id,
@@ -1074,7 +1141,7 @@ export class TelegramNotificationDaemon {
 			);
 			const result = (await this.botApi.call("sendMessage", {
 				chat_id: this.opts.chatId,
-				message_thread_id: Number(topicId),
+				...threadField,
 				text: rendered.text,
 				parse_mode: TELEGRAM_PARSE_MODE,
 				...(inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),

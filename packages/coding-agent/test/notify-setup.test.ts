@@ -209,3 +209,301 @@ test("non-interactive setup with --token and --chat-id writes config without pol
 	expect(cfg.botToken).toBe("123:abc");
 	expect(getUpdatesCalls).toBe(0);
 });
+
+function privateUpdates(chatId = 555111): unknown[] {
+	return [
+		{ ok: true, result: [] },
+		{ ok: true, result: [{ update_id: 7, message: { chat: { id: chatId, type: "private" } } }] },
+	];
+}
+
+function makePrompt(answers: string[]): { prompt: (message: string) => Promise<string>; asked: string[] } {
+	const asked: string[] = [];
+	const queue = [...answers];
+	const prompt = async (message: string): Promise<string> => {
+		asked.push(message);
+		return queue.length > 0 ? (queue.shift() as string) : "skip";
+	};
+	return { prompt, asked };
+}
+
+const userOn = { id: 1, username: "bot", has_topics_enabled: true };
+const userOff = { id: 1, username: "bot", has_topics_enabled: false };
+const userMissing = { id: 1, username: "bot" };
+
+describe("notify setup threaded mode verification", () => {
+	test("threaded ON interactive verifies capability and pairs", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [{ ok: true, result: userOn }],
+			getUpdates: privateUpdates(),
+		});
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{ fetchImpl, settings, setupToken: token, setupInteractive: true, pollTimeoutMs: 50, pollIntervalMs: 0 },
+			),
+		);
+		expect(stdout).toContain("Threaded Mode capability verified");
+		expect(stdout).toContain("threaded=verified");
+		expect(stdout).toContain(maskToken(token));
+		expect(stdout).not.toContain(token);
+		expect(getNotificationConfig(settings).chatId).toBe("555111");
+		expect(calls.filter(c => c.method === "getMe")).toHaveLength(1);
+	});
+
+	test("threaded ON non-interactive verifies without polling", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+		const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "999", "--redact"]);
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(cmd!, { fetchImpl, settings, setupInteractive: false }),
+		);
+		expect(stdout).toContain("threaded=verified");
+		expect(calls.filter(c => c.method === "getUpdates")).toHaveLength(0);
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+		expect(getNotificationConfig(settings).chatId).toBe("999");
+		expect(stdout).not.toContain("123:abc");
+	});
+
+	test("missing field interactive warns unknown and proceeds", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl } = makeFetch({
+			getMe: [{ ok: true, result: userMissing }],
+			getUpdates: privateUpdates(),
+		});
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{ fetchImpl, settings, setupToken: token, setupInteractive: true, pollTimeoutMs: 50, pollIntervalMs: 0 },
+			),
+		);
+		expect(stdout).toContain("has_topics_enabled");
+		expect(stdout).toContain("threaded=unknown");
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+		expect(stdout).not.toContain(token);
+	});
+
+	test("missing field non-interactive warns unknown without polling", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userMissing }] });
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{ fetchImpl, settings, setupToken: token, setupChatId: "888", setupInteractive: false },
+			),
+		);
+		expect(stdout).toContain("has_topics_enabled");
+		expect(stdout).toContain("threaded=unknown");
+		expect(calls.filter(c => c.method === "getUpdates")).toHaveLength(0);
+		expect(getNotificationConfig(settings).chatId).toBe("888");
+	});
+
+	test("non-boolean has_topics_enabled is unknown, not verified", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl } = makeFetch({
+			getMe: [{ ok: true, result: { id: 1, username: "bot", has_topics_enabled: "true" } }],
+			getUpdates: privateUpdates(),
+		});
+		const { stdout, stderr } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{ fetchImpl, settings, setupToken: token, setupInteractive: true, pollTimeoutMs: 50, pollIntervalMs: 0 },
+			),
+		);
+		expect(stdout).toContain("threaded=unknown");
+		expect(stdout).not.toContain("threaded=verified");
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+		expect(`${stdout}\n${stderr}`).not.toContain(token);
+	});
+
+	test("getMe missing id rejects even when has_topics_enabled is present", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: { username: "bot", has_topics_enabled: true } }] });
+		const { stdout, stderr } = await captureOutput(async () => {
+			await expect(
+				runNotifyCommand(
+					{ action: "setup", rawArgs: [] },
+					{ fetchImpl, settings, setupToken: token, setupChatId: "555", setupInteractive: false },
+				),
+			).rejects.toThrow("invalid Telegram response");
+		});
+		expect(getNotificationConfig(settings).enabled).toBe(false);
+		expect(getNotificationConfig(settings).botToken).toBeUndefined();
+		expect(getNotificationConfig(settings).chatId).toBeUndefined();
+		expect(`${stdout}\n${stderr}`).not.toContain(token);
+	});
+
+	test("malformed getMe result rejects without writing settings", async () => {
+		for (const result of [null, {}, { username: "bot" }]) {
+			const settings = Settings.isolated();
+			const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result }] });
+			await expect(
+				captureOutput(() =>
+					runNotifyCommand(
+						{ action: "setup", rawArgs: [] },
+						{ fetchImpl, settings, setupToken: token, setupInteractive: false },
+					),
+				),
+			).rejects.toThrow("invalid Telegram response");
+			expect(getNotificationConfig(settings).enabled).toBe(false);
+			expect(getNotificationConfig(settings).botToken).toBeUndefined();
+			expect(getNotificationConfig(settings).chatId).toBeUndefined();
+		}
+	});
+
+	test("threaded OFF interactive retry then enabled verifies", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [
+				{ ok: true, result: userOff },
+				{ ok: true, result: userOn },
+			],
+			getUpdates: privateUpdates(),
+		});
+		const { prompt } = makePrompt([""]);
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					fetchImpl,
+					settings,
+					setupToken: token,
+					setupInteractive: true,
+					threadedModePrompt: prompt,
+					pollTimeoutMs: 50,
+					pollIntervalMs: 0,
+				},
+			),
+		);
+		expect(stdout).toContain("Threaded Mode is OFF");
+		expect(stdout).toContain("@BotFather");
+		expect(stdout).toContain("threaded=verified");
+		expect(calls.filter(c => c.method === "getMe")).toHaveLength(2);
+	});
+
+	test("threaded OFF interactive skip completes with unverified warning", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [{ ok: true, result: userOff }],
+			getUpdates: privateUpdates(),
+		});
+		const { prompt } = makePrompt(["skip"]);
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					fetchImpl,
+					settings,
+					setupToken: token,
+					setupInteractive: true,
+					threadedModePrompt: prompt,
+					pollTimeoutMs: 50,
+					pollIntervalMs: 0,
+				},
+			),
+		);
+		expect(stdout).toContain("continuing without verified");
+		expect(stdout).toContain("threaded=unverified");
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+		expect(getNotificationConfig(settings).chatId).toBe("555111");
+		expect(calls.filter(c => c.method === "getMe")).toHaveLength(1);
+		expect(stdout).not.toContain(token);
+	});
+
+	test("threaded OFF non-interactive warns and completes unverified", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userOff }] });
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{ fetchImpl, settings, setupToken: token, setupChatId: "777", setupInteractive: false },
+			),
+		);
+		expect(stdout).toContain("non-interactive");
+		expect(stdout).toContain("threaded=unverified");
+		expect(calls.filter(c => c.method === "getUpdates")).toHaveLength(0);
+		expect(getNotificationConfig(settings).chatId).toBe("777");
+		expect(stdout).not.toContain(token);
+	});
+
+	test("threaded OFF interactive invalid input then skip does not re-check", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [{ ok: true, result: userOff }],
+			getUpdates: privateUpdates(),
+		});
+		const { prompt, asked } = makePrompt(["wat", "skip"]);
+		const { stdout } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					fetchImpl,
+					settings,
+					setupToken: token,
+					setupInteractive: true,
+					threadedModePrompt: prompt,
+					pollTimeoutMs: 50,
+					pollIntervalMs: 0,
+				},
+			),
+		);
+		expect(stdout).toContain("Type Enter to retry or skip");
+		expect(stdout).toContain("threaded=unverified");
+		expect(asked).toHaveLength(2);
+		expect(calls.filter(c => c.method === "getMe")).toHaveLength(1);
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+	});
+
+	test("threaded OFF interactive invalid inputs then retry re-checks once and verifies", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [
+				{ ok: true, result: userOff },
+				{ ok: true, result: userOn },
+			],
+			getUpdates: privateUpdates(),
+		});
+		const { prompt, asked } = makePrompt(["wat", "still bad", ""]);
+		const { stdout, stderr } = await captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					fetchImpl,
+					settings,
+					setupToken: token,
+					setupInteractive: true,
+					threadedModePrompt: prompt,
+					pollTimeoutMs: 50,
+					pollIntervalMs: 0,
+				},
+			),
+		);
+		expect(stdout.match(/Type Enter to retry or skip/g)).toHaveLength(2);
+		expect(stdout).toContain("threaded=verified");
+		expect(asked).toHaveLength(3);
+		expect(calls.filter(c => c.method === "getMe")).toHaveLength(2);
+		expect(getNotificationConfig(settings).enabled).toBe(true);
+		expect(`${stdout}\n${stderr}`).not.toContain(token);
+	});
+
+	test("group rejection still holds with threaded enabled bot", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl } = makeFetch({
+			getMe: [{ ok: true, result: userOn }],
+			getUpdates: [
+				{ ok: true, result: [] },
+				{ ok: true, result: [{ update_id: 1, message: { chat: { id: -100, type: "supergroup" } } }] },
+			],
+		});
+		await expect(
+			captureOutput(() =>
+				runNotifyCommand(
+					{ action: "setup", rawArgs: [] },
+					{ fetchImpl, settings, setupToken: token, setupInteractive: true, pollTimeoutMs: 5, pollIntervalMs: 0 },
+				),
+			),
+		).rejects.toThrow("Pairing rejected supergroup chat");
+		expect(getNotificationConfig(settings).enabled).toBe(false);
+	});
+});

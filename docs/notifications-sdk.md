@@ -217,8 +217,9 @@ Run the setup command once:
 gjc notify setup
 ```
 
-The wizard validates the bot token with Telegram, waits for a private DM to the
-bot, and writes canonical global Settings under `config.yml` in the GJC agent
+The wizard validates the bot token with Telegram, verifies private-chat Threaded
+Mode capability via `getMe.has_topics_enabled`, waits for a private DM to the bot,
+and writes canonical global Settings under `config.yml` in the GJC agent
 directory. It enables:
 
 - `notifications.enabled`
@@ -246,11 +247,21 @@ The trust model is intentionally strict:
   action ids, pending status, or configuration hints;
 - daemon state stores a token fingerprint, not the raw bot token.
 
-### Routing in shared chats
+### Routing in private-chat topics
 
-A single paired chat can receive actions from multiple sessions. The daemon tags
-messages by session, stores compact callback aliases for inline buttons, and
-routes replies back to the exact session/action.
+The paired private chat receives actions from multiple sessions through
+per-session Telegram topics (Threaded Mode). The daemon tags messages by session,
+stores compact callback aliases for inline buttons, and routes replies back to the
+exact session/action. A forum-enabled supergroup is no longer required: once the
+bot owner enables Threaded Mode in @BotFather, the daemon creates one topic per
+session in the paired private chat. GJC cannot enable Threaded Mode through the Bot
+API; setup only verifies the capability and guides the manual BotFather toggle.
+Even after setup verifies `has_topics_enabled`, the first runtime
+`createForumTopic` for the paired chat can still be refused by Telegram. When that
+happens the daemon does not drop the send: it routes the notification to the normal
+(flat) paired chat and posts a one-time `turn on threaded mode from botfather
+miniapp to receive gjc notification!` nudge. Pairing is private-only, so flat
+delivery stays within the user's own private DM.
 
 Supported reply paths:
 

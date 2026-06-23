@@ -29,6 +29,8 @@ export interface NotifyCommandDeps {
 	pollIntervalMs?: number;
 	setupChatId?: string;
 	setupRedact?: boolean;
+	setupInteractive?: boolean;
+	threadedModePrompt?: (message: string) => Promise<string>;
 }
 
 interface TelegramApiResponse<T> {
@@ -46,6 +48,18 @@ interface TelegramUpdate {
 		};
 	};
 }
+
+interface TelegramUser {
+	id: number;
+	is_bot?: boolean;
+	first_name?: string;
+	username?: string;
+	has_topics_enabled?: boolean;
+	allows_users_to_create_topics?: boolean;
+}
+
+type ThreadedModeState = "enabled" | "disabled" | "unknown";
+type ThreadedModeFinalLabel = "verified" | "unverified" | "unknown";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 const DEFAULT_POLL_TIMEOUT_MS = 60_000;
@@ -120,7 +134,11 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 		throw new Error("Telegram bot token is required.");
 	}
 
-	await callTelegram(fetchImpl, apiBase, token, "getMe", {});
+	const user = await getMe(fetchImpl, apiBase, token);
+	const threadedState = await verifyThreadedMode(fetchImpl, apiBase, token, user, {
+		interactive: resolveSetupInteractive(deps),
+		prompt: deps.threadedModePrompt ?? promptForThreadedMode,
+	});
 	process.stdout.write(
 		"Token validated. Message your bot now from the private Telegram chat to pair notifications.\n",
 	);
@@ -145,7 +163,9 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 	if (deps.setupRedact) settings.set("notifications.redact", true);
 	await settings.flush();
 
-	process.stdout.write(`Notifications enabled. botToken=${maskToken(token)} chatId=${chatId}\n`);
+	process.stdout.write(
+		`Notifications enabled. botToken=${maskToken(token)} chatId=${chatId} threaded=${threadedLabel(threadedState)}\n`,
+	);
 }
 
 async function promptForToken(): Promise<string> {
@@ -157,6 +177,123 @@ async function promptForToken(): Promise<string> {
 		return (await rl.question("Telegram BotFather token: ")).trim();
 	} finally {
 		rl.close();
+	}
+}
+
+const THREADED_ENABLED_SUCCESS =
+	"Telegram Threaded Mode capability verified for this bot. GJC will request a private-chat topic per session; if Telegram ever refuses topic creation, notifications fall back to this flat chat with a one-time nudge.\n";
+
+const THREADED_MISSING_WARNING =
+	"Warning: Telegram getMe did not include has_topics_enabled, so GJC cannot verify private-chat Threaded Mode capability for this bot. Setup will continue; update Telegram/Bot API support or re-run setup if per-session topics fail.\n";
+
+const THREADED_NONINTERACTIVE_WARNING =
+	"Warning: Telegram Threaded Mode capability is OFF for this bot. Setup will be saved because this run is non-interactive, but per-session Telegram delivery may fail closed until the bot owner enables Threaded Mode in @BotFather. GJC cannot enable it through the Bot API.\n";
+
+const THREADED_DISABLED_GUIDANCE =
+	"Telegram Threaded Mode is OFF for this bot. GJC needs Telegram private-chat topics so each session can use its own thread.\n" +
+	"GJC cannot enable this through the Bot API. Open @BotFather, select this bot, enable Threaded Mode / forum topics for private chats, then return here.\n" +
+	"Telegram may require an additional Stars purchase fee for private-chat topics.\n";
+
+const THREADED_DISABLED_PROMPT =
+	"Press Enter after enabling Threaded Mode, or type skip to finish setup with a warning: ";
+
+const THREADED_STILL_OFF = "Telegram still reports Threaded Mode OFF for this bot.\n";
+
+const THREADED_RETRY_PROMPT = "Press Enter to check again, or type skip to finish setup with a warning: ";
+
+const THREADED_SKIP_WARNING =
+	"Warning: continuing without verified Telegram Threaded Mode capability. Setup will be saved, but per-session Telegram delivery may fail closed until Threaded Mode is enabled in BotFather.\n";
+
+const THREADED_INVALID_INPUT = "Type Enter to retry or skip to continue with a warning.\n";
+
+const THREADED_RETRY_INPUTS = new Set(["", "y", "yes", "r", "retry"]);
+const THREADED_SKIP_INPUTS = new Set(["s", "skip", "n", "no"]);
+
+function isTelegramUser(value: unknown): value is TelegramUser {
+	return Boolean(value) && typeof value === "object" && typeof (value as { id?: unknown }).id === "number";
+}
+
+async function getMe(fetchImpl: typeof fetch, apiBase: string, token: string): Promise<TelegramUser> {
+	const user = await callTelegram<unknown>(fetchImpl, apiBase, token, "getMe", {});
+	if (!isTelegramUser(user)) {
+		throw new Error("Telegram getMe returned invalid Telegram response: missing valid User result.");
+	}
+	return user;
+}
+
+function threadedModeState(user: TelegramUser): ThreadedModeState {
+	if (user.has_topics_enabled === true) return "enabled";
+	if (user.has_topics_enabled === false) return "disabled";
+	return "unknown";
+}
+
+function threadedLabel(state: ThreadedModeState): ThreadedModeFinalLabel {
+	if (state === "enabled") return "verified";
+	if (state === "disabled") return "unverified";
+	return "unknown";
+}
+
+function resolveSetupInteractive(deps: NotifyCommandDeps): boolean {
+	if (deps.setupInteractive !== undefined) return deps.setupInteractive;
+	return Boolean(process.stdin.isTTY) && !deps.setupChatId?.trim();
+}
+
+async function promptForThreadedMode(message: string): Promise<string> {
+	if (!process.stdin.isTTY) return "skip";
+	const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+	try {
+		return (await rl.question(message)).trim();
+	} finally {
+		rl.close();
+	}
+}
+
+async function verifyThreadedMode(
+	fetchImpl: typeof fetch,
+	apiBase: string,
+	token: string,
+	initialUser: TelegramUser,
+	opts: { interactive: boolean; prompt: (message: string) => Promise<string> },
+): Promise<ThreadedModeState> {
+	const classify = (user: TelegramUser): ThreadedModeState | undefined => {
+		const state = threadedModeState(user);
+		if (state === "enabled") {
+			process.stdout.write(THREADED_ENABLED_SUCCESS);
+			return "enabled";
+		}
+		if (state === "unknown") {
+			process.stdout.write(THREADED_MISSING_WARNING);
+			return "unknown";
+		}
+		return undefined;
+	};
+
+	const initial = classify(initialUser);
+	if (initial) return initial;
+
+	if (!opts.interactive) {
+		process.stdout.write(THREADED_NONINTERACTIVE_WARNING);
+		return "disabled";
+	}
+
+	process.stdout.write(THREADED_DISABLED_GUIDANCE);
+	let firstPrompt = true;
+	for (;;) {
+		const answer = (await opts.prompt(firstPrompt ? THREADED_DISABLED_PROMPT : THREADED_RETRY_PROMPT))
+			.trim()
+			.toLowerCase();
+		firstPrompt = false;
+		if (THREADED_SKIP_INPUTS.has(answer)) {
+			process.stdout.write(THREADED_SKIP_WARNING);
+			return "disabled";
+		}
+		if (!THREADED_RETRY_INPUTS.has(answer)) {
+			process.stdout.write(THREADED_INVALID_INPUT);
+			continue;
+		}
+		const resolved = classify(await getMe(fetchImpl, apiBase, token));
+		if (resolved) return resolved;
+		process.stdout.write(THREADED_STILL_OFF);
 	}
 }
 
@@ -263,12 +400,18 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} notify status
 
 ${chalk.bold("Subcommands:")}
-  setup     Pair a Telegram bot token with a private chat
+  setup     Pair a Telegram bot token with a private chat and verify Threaded Mode capability
   status    Show notification configuration without secrets
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} notify setup
   ${APP_NAME} notify setup --token <botToken> --chat-id <chatId> [--redact]
   ${APP_NAME} notify status
+
+${chalk.bold("Threaded Mode:")}
+  GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot
+  capability via getMe.has_topics_enabled. If it is off, enable Threaded Mode in @BotFather;
+  bots cannot toggle it through the Bot API. If Telegram refuses topic creation at runtime,
+  GJC delivers flat to the paired private chat and nudges you to enable Threaded Mode.
 `);
 }
