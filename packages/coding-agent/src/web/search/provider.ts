@@ -274,17 +274,30 @@ export async function canUseGenericCredentials(
 	return Boolean(key);
 }
 
-export async function shouldTryGenericOpenAICompat(
-	authStorage: AuthStorage,
-	ctx: ActiveSearchModelContext | undefined,
-	sessionId?: string,
-	signal?: AbortSignal,
-): Promise<boolean> {
-	if (!ctx || ctx.webSearch === "off" || !isOpenAICompatWire(ctx.api)) return false;
-	const autoAllowed =
-		ctx.webSearch === "on" ||
-		((ctx.api === "openai-responses" || looksOpenAIFamilyModelId(ctx)) && !isLocalBaseUrl(ctx.baseUrl));
-	return autoAllowed && (await canUseGenericCredentials(authStorage, ctx, sessionId, signal));
+/**
+ * Native web-search provider to attempt by reusing the ACTIVE model's own
+ * credentials + baseUrl, dispatched by the model's wire protocol.
+ *
+ * This is the "native search over a proxy" path: when a model is served through
+ * a proxy/custom endpoint, its canonical search credentials (e.g. a dedicated
+ * `anthropic` key, or ChatGPT OAuth for `codex`) are usually absent, but the
+ * credential that authenticates the model itself — stored under the active
+ * provider id and aimed at `ctx.baseUrl` — can drive native web search just as
+ * well. Each provider's `search()` falls back to those active credentials when
+ * its canonical ones are missing.
+ *
+ * Returned ids are matched purely from the wire `api` (+ model-id family where a
+ * native tool only makes sense for that family); the providers themselves fail
+ * closed (and the chain falls through to DuckDuckGo) if the endpoint does not
+ * actually support web search.
+ */
+export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined): SearchProviderId | undefined {
+	if (!ctx || ctx.webSearch === "off") return undefined;
+	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
+	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
+	if (isOpenAICompatWire(ctx.api)) return "openai-compatible";
+	if (isGoogleWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
+	return undefined;
 }
 
 export async function resolveProviderChain(options: ResolveProviderChainOptions): Promise<SearchProvider[]> {
@@ -310,9 +323,16 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 			await appendAvailable(chain, directId, authStorage);
 		const inferred = inferNativeProviderFromModel(activeModelContext);
 		if (inferred) await appendAvailable(chain, inferred, authStorage);
-		const hasNativeXai = chain.includes("xai");
-		if (!hasNativeXai && (await shouldTryGenericOpenAICompat(authStorage, activeModelContext, sessionId, signal)))
-			appendDeduped(chain, "openai-compatible");
+		// Native-over-proxy: when no canonical native provider was selected above,
+		// fall back to the model's own credentials (resolved under the active
+		// provider id against its baseUrl) to drive native web search. Gated on
+		// those credentials actually resolving; otherwise the chain ends at the
+		// keyless DuckDuckGo terminal fallback.
+		if (chain.length === 0) {
+			const activeNativeId = activeContextNativeId(activeModelContext);
+			if (activeNativeId && (await canUseGenericCredentials(authStorage, activeModelContext, sessionId, signal)))
+				chain.push(activeNativeId);
+		}
 	}
 
 	// Configured fallbacks are user-facing only: the internal `openai-compatible`

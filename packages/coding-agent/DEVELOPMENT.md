@@ -1049,7 +1049,8 @@ Provider registry (`PROVIDER_META`) and the explicit-selection/label/CLI order (
 `resolveProviderChain(authStorage, preferredProvider, activeModelProvider?)` is active-model-gated, not credential-scanning:
 
 - If `preferredProvider` is explicit (not `auto`) and `isAvailable()` is true, it becomes the primary.
-- Otherwise the active model's own native search (`MODEL_PROVIDER_TO_SEARCH`: `openai|openai-codex→codex`, `anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`) becomes the primary, but only when that provider's own creds exist (`isAvailable()`).
+- Otherwise the active model's own native search (`MODEL_PROVIDER_TO_SEARCH`: `openai|openai-codex→codex`, `anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`) becomes the primary when that provider's canonical creds exist (`isAvailable()`).
+- Native-over-proxy: when no canonical native is selected, `activeContextNativeId(ctx)` maps the active model's wire `api` (+ model-id family) to a native provider, and — gated on the active model's OWN credential resolving (`getApiKey(ctx.provider, { baseUrl, modelId })`) — attempts it reusing those credentials and `ctx.baseUrl`. Dispatch: `anthropic-messages`+`claude-*`→`anthropic`, `openai-responses`/`openai-completions`→`openai-compatible`, `google-generative-ai`+`gemini-*`→`gemini`. `searchAnthropic`/`GeminiProvider.search` fall back to the active credential when their canonical creds are absent; all fail closed to `duckduckgo` if the endpoint ignores the web-search tool.
 - Keyed standalone providers (brave/tavily/exa/kagi/jina/parallel/searxng) are never auto-selected — explicit selection only.
 - `duckduckgo` (keyless, always available) is appended as the terminal fallback, so a missing primary or a primary runtime failure still returns results with zero configuration.
 

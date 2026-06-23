@@ -425,6 +425,92 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 	};
 }
 
+/**
+ * Native Gemini web search over the public Generative Language REST API
+ * (`{baseUrl}/v1beta/models/{model}:generateContent`), reusing the ACTIVE
+ * model's own API key + baseUrl. This is the "native search over a proxy" path
+ * for `google-generative-ai` wire models whose canonical gemini-cli/antigravity
+ * OAuth is absent. Distinct from {@link searchGemini}, which speaks the Cloud
+ * Code Assist API with OAuth.
+ */
+async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<SearchResponse> {
+	const ctx = params.activeModelContext;
+	if (!ctx) throw new SearchProviderError("gemini", "Gemini web search requires active model context", 400);
+	const apiKey = await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
+		baseUrl: ctx.baseUrl,
+		modelId: ctx.modelId,
+		signal: params.signal,
+	});
+	if (!apiKey) throw new SearchProviderError("gemini", `No credentials for ${ctx.provider}`, 401);
+
+	const model = ctx.wireModelId ?? ctx.modelId;
+	const base = (ctx.baseUrl ?? "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+	const url = `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+	const systemPrompt = params.systemPrompt?.toWellFormed();
+	const body: Record<string, unknown> = {
+		contents: [{ role: "user", parts: [{ text: params.query }] }],
+		tools: buildGeminiRequestTools({ google_search: params.googleSearch }),
+		...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
+	};
+	if (params.maxOutputTokens !== undefined || params.temperature !== undefined) {
+		const generationConfig: Record<string, number> = {};
+		if (params.maxOutputTokens !== undefined) generationConfig.maxOutputTokens = params.maxOutputTokens;
+		if (params.temperature !== undefined) generationConfig.temperature = params.temperature;
+		body.generationConfig = generationConfig;
+	}
+
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { ...(ctx.headers ?? {}), "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: withHardTimeout(params.signal),
+	});
+	const text = await response.text();
+	if (!response.ok) {
+		const classified = classifyProviderHttpError("gemini", response.status, text);
+		if (classified) throw classified;
+		throw new SearchProviderError("gemini", `Gemini API error (${response.status}): ${text}`, response.status);
+	}
+
+	const json = text ? JSON.parse(text) : {};
+	const candidate = json.candidates?.[0];
+	const grounding: GeminiGroundingMetadata | undefined = candidate?.groundingMetadata;
+	const answer = (candidate?.content?.parts ?? []).map((part: { text?: string }) => part.text ?? "").join("");
+
+	const sources: SearchSource[] = [];
+	const citations: SearchCitation[] = [];
+	const searchQueries: string[] = [];
+	const seenUrls = new Set<string>();
+	const chunks = grounding?.groundingChunks ?? [];
+	for (const grChunk of chunks) {
+		const uri = grChunk.web?.uri;
+		if (uri && !seenUrls.has(uri)) {
+			seenUrls.add(uri);
+			sources.push({ title: grChunk.web?.title ?? uri, url: uri });
+		}
+	}
+	for (const support of grounding?.groundingSupports ?? []) {
+		const citedText = support.segment?.text;
+		for (const idx of support.groundingChunkIndices ?? []) {
+			const uri = chunks[idx]?.web?.uri;
+			if (uri) citations.push({ url: uri, title: chunks[idx]?.web?.title ?? uri, citedText });
+		}
+	}
+	for (const q of grounding?.webSearchQueries ?? []) {
+		if (!searchQueries.includes(q)) searchQueries.push(q);
+	}
+
+	const limit = params.numSearchResults ?? params.limit;
+	return {
+		provider: "gemini",
+		answer: answer || undefined,
+		sources: limit && sources.length > limit ? sources.slice(0, limit) : sources,
+		citations: citations.length > 0 ? citations : undefined,
+		searchQueries: searchQueries.length > 0 ? searchQueries : undefined,
+		model: json.modelVersion ?? model,
+	};
+}
+
 /** Search provider for Google Gemini web search. */
 export class GeminiProvider extends SearchProvider {
 	readonly id = "gemini";
@@ -438,6 +524,13 @@ export class GeminiProvider extends SearchProvider {
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
+		// Native-over-proxy: when canonical gemini-cli/antigravity OAuth is
+		// absent but the active model speaks the Generative Language wire, reuse
+		// its own API key + baseUrl instead of failing closed.
+		const ctx = params.activeModelContext;
+		if (!hasGeminiOAuth(params.authStorage) && ctx?.api === "google-generative-ai") {
+			return searchGeminiViaGenerativeLanguage(params);
+		}
 		return searchGemini({
 			query: params.query,
 			system_prompt: params.systemPrompt,

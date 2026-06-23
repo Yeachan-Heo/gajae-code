@@ -87,9 +87,10 @@ async function callSearch(
 	maxTokens?: number,
 	temperature?: number,
 	signal?: AbortSignal,
+	extraHeaders?: Record<string, string>,
 ): Promise<AnthropicApiResponse> {
 	const url = buildAnthropicUrl(auth);
-	const headers = buildAnthropicSearchHeaders(auth);
+	const headers = { ...(extraHeaders ?? {}), ...buildAnthropicSearchHeaders(auth) };
 
 	const systemBlocks = buildSystemBlocks(auth, model, systemPrompt);
 
@@ -248,6 +249,10 @@ export async function searchAnthropic(
 	const searchApiKey = $env.ANTHROPIC_SEARCH_API_KEY;
 	const searchBaseUrl = $env.ANTHROPIC_SEARCH_BASE_URL;
 	let auth: AnthropicAuthConfig | undefined;
+	// When reusing the active model's own credentials (native search over a
+	// proxy), prefer its wire model id and carry its request headers through.
+	let modelOverride: string | undefined;
+	let extraHeaders: Record<string, string> | undefined;
 
 	if (searchApiKey) {
 		auth = buildAnthropicAuthConfig(searchApiKey, searchBaseUrl);
@@ -256,6 +261,23 @@ export async function searchAnthropic(
 			signal: params.signal,
 		});
 		if (apiKey) auth = buildAnthropicAuthConfig(apiKey);
+
+		// Fall back to the active model's own credentials + baseUrl when no
+		// canonical Anthropic key exists but the active model speaks the
+		// Anthropic wire (e.g. Claude served through a proxy).
+		const ctx = params.activeModelContext;
+		if (!auth && ctx && ctx.api === "anthropic-messages") {
+			const ctxKey = await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
+				baseUrl: ctx.baseUrl,
+				modelId: ctx.modelId,
+				signal: params.signal,
+			});
+			if (ctxKey) {
+				auth = buildAnthropicAuthConfig(ctxKey, ctx.baseUrl);
+				modelOverride = ctx.wireModelId ?? ctx.modelId;
+				extraHeaders = ctx.headers;
+			}
+		}
 	}
 
 	if (!auth) {
@@ -264,7 +286,7 @@ export async function searchAnthropic(
 		);
 	}
 
-	const model = getModel();
+	const model = modelOverride ?? getModel();
 	const systemPrompt = "authStorage" in params ? params.systemPrompt : params.system_prompt;
 	const maxTokens = "authStorage" in params ? params.maxOutputTokens : params.max_tokens;
 	const response = await callSearch(
@@ -275,6 +297,7 @@ export async function searchAnthropic(
 		maxTokens,
 		params.temperature,
 		params.signal,
+		extraHeaders,
 	);
 
 	const result = parseResponse(response);

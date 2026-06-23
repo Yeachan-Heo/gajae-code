@@ -207,11 +207,58 @@ describe("native web-search provider resolution", () => {
 				{ provider: "proxy", modelId: "gpt-5", api: "openai-responses", baseUrl: "https://models.example" },
 				{ auth: ["openai-codex", "proxy"] },
 			),
-		).resolves.toEqual(["codex", "openai-compatible", "duckduckgo"]);
+		).resolves.toEqual(["codex", "duckduckgo"]);
 		await expect(
 			ids(
 				{ provider: "proxy", modelId: "gpt-5", api: "anthropic-messages", baseUrl: "https://models.example" },
 				{ auth: ["openai-codex", "proxy"] },
+			),
+		).resolves.toEqual(["duckduckgo"]);
+	});
+	it("reuses the active model's own credentials for native search when canonical creds are absent", async () => {
+		// Claude over a proxy with no canonical anthropic creds — only the proxy's own key.
+		await expect(
+			ids(
+				{
+					provider: "proxy",
+					modelId: "claude-sonnet-4",
+					api: "anthropic-messages",
+					baseUrl: "https://proxy.example",
+				},
+				{ auth: ["proxy"] },
+			),
+		).resolves.toEqual(["anthropic", "duckduckgo"]);
+		// Gemini over a Generative Language proxy with only the proxy's own key.
+		await expect(
+			ids(
+				{
+					provider: "proxy",
+					modelId: "gemini-2.5-pro",
+					api: "google-generative-ai",
+					baseUrl: "https://proxy.example",
+				},
+				{ auth: ["proxy"] },
+			),
+		).resolves.toEqual(["gemini", "duckduckgo"]);
+		// Grok/OpenAI-compatible wire over a proxy with only the proxy's own key.
+		await expect(
+			ids(
+				{ provider: "proxy", modelId: "grok-4.3", api: "openai-completions", baseUrl: "https://proxy.example" },
+				{ auth: ["proxy"] },
+			),
+		).resolves.toEqual(["openai-compatible", "duckduckgo"]);
+	});
+
+	it("does not attempt native over a proxy without any resolvable active credential", async () => {
+		await expect(
+			ids(
+				{
+					provider: "proxy",
+					modelId: "claude-sonnet-4",
+					api: "anthropic-messages",
+					baseUrl: "https://proxy.example",
+				},
+				{ auth: [] },
 			),
 		).resolves.toEqual(["duckduckgo"]);
 	});
