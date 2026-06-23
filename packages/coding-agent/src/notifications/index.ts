@@ -24,11 +24,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
 import { registerAskAnswerSource } from "../tools/ask-answer-registry";
+import { registerTelegramFileSink } from "./attachment-registry";
 import {
 	getNotificationConfig,
 	isGloballyConfigured,
@@ -136,6 +138,8 @@ interface SessionRuntime {
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
 	/** Deregisters this session's ask answer source. */
 	disposeAnswerSource: () => void;
+	/** Deregisters this session's Telegram file sink. */
+	disposeFileSink: () => void;
 	redact: boolean;
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -299,6 +303,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		runtimes.delete(id);
 		try {
 			rt.disposeAnswerSource();
+			rt.disposeFileSink();
 		} catch {}
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
@@ -378,14 +383,27 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 		server.onInbound((err, inbound) => {
 			if (err || !inbound) return;
-			if (inbound.kind === "user_message" && inbound.text) {
+			if (inbound.kind === "user_message") {
 				// Inject as a user turn (steers/continues the agent; the resulting
 				// turn streams back via the turn_end handler even when not idle).
 				// Record the update id so it can be acked as "consumed" on the next
 				// turn_start, and steer (vs start a fresh turn) when already busy.
+				const text = inbound.text ?? "";
+				const images = inbound.images ?? [];
+				if (!text && images.length === 0) return;
 				if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+				const content: string | (TextContent | ImageContent)[] =
+					images.length > 0
+						? [
+								...(text ? [{ type: "text", text } as TextContent] : []),
+								...images.map(
+									img =>
+										({ type: "image", data: img.data, mimeType: img.mime ?? "image/jpeg" }) as ImageContent,
+								),
+							]
+						: text;
 				try {
-					api.sendUserMessage(inbound.text, runtime?.busy ? { deliverAs: "steer" } : undefined);
+					api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
 				} catch (e) {
 					logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
 				}
@@ -401,12 +419,30 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 
 			// Interactive answer source: the ask tool races the local UI against this.
 			const disposeAnswerSource = registerInteractiveAnswerSource(id, server, pendingInteractive, redact, tag);
+			const disposeFileSink = registerTelegramFileSink(id, async file => {
+				try {
+					const data = await fs.promises.readFile(file.path);
+					server.pushFrame(
+						JSON.stringify({
+							type: "file_attachment",
+							sessionId: id,
+							name: path.basename(file.path),
+							data: data.toString("base64"),
+							caption: file.caption,
+						}),
+					);
+					return { ok: true };
+				} catch (e) {
+					return { ok: false, error: e instanceof Error ? e.message : String(e) };
+				}
+			});
 
 			runtime = {
 				server,
 				idleSeq: 0,
 				pendingInteractive,
 				disposeAnswerSource,
+				disposeFileSink,
 				redact,
 				sessionTag: tag,
 				busy: false,
@@ -574,6 +610,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// source by the current session id, which just changed.
 		try {
 			rt.disposeAnswerSource();
+			rt.disposeFileSink();
 		} catch {}
 		rt.disposeAnswerSource = registerInteractiveAnswerSource(
 			newId,
@@ -582,6 +619,23 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			rt.redact,
 			rt.sessionTag,
 		);
+		rt.disposeFileSink = registerTelegramFileSink(newId, async file => {
+			try {
+				const data = await fs.promises.readFile(file.path);
+				rt.server.pushFrame(
+					JSON.stringify({
+						type: "file_attachment",
+						sessionId: newId,
+						name: path.basename(file.path),
+						data: data.toString("base64"),
+						caption: file.caption,
+					}),
+				);
+				return { ok: true };
+			} catch (e) {
+				return { ok: false, error: e instanceof Error ? e.message : String(e) };
+			}
+		});
 		// Rename the existing topic now when the new session already has a name; a
 		// fresh unnamed session is renamed on its next agent_end re-assert, which
 		// avoids a transient rename to bare "repo/branch".

@@ -80,6 +80,7 @@ class FakeBotApi {
 			this.updates = [];
 			return { ok: true, result };
 		}
+		if (method === "getFile") return { ok: true, result: { file_path: "docs/file_7.bin" } };
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
@@ -1186,6 +1187,125 @@ test("inbound thread message gets a queued reaction, flipped to consumed on ack"
 	expect(consumed).toBeTruthy();
 	expect(consumed!.body.message_id).toBe(555);
 	expect(consumed!.body.reaction[0].emoji).toBe("✅");
+});
+
+test("inbound photo is downloaded and forwarded as an image in the user_message", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const fetchImpl = (async () => ({
+		ok: true,
+		arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+	})) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fetchImpl,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+	await daemon.handleTelegramUpdate({
+		update_id: 11,
+		message: {
+			chat: { id: 42 },
+			message_thread_id: threadId,
+			message_id: 100,
+			photo: [{ file_id: "small" }, { file_id: "large" }],
+		},
+	});
+
+	const frame = JSON.parse(FakeWs.instances[0]!.sent[0]!);
+	expect(frame.type).toBe("user_message");
+	expect(frame.images).toHaveLength(1);
+	expect(frame.images[0].mime).toBe("image/jpeg");
+	expect(Buffer.from(frame.images[0].data, "base64")).toEqual(Buffer.from([1, 2, 3, 4]));
+	// The largest photo size is the one resolved/downloaded.
+	expect(bot.calls.some(c => c.method === "getFile" && c.body.file_id === "large")).toBe(true);
+});
+
+test("inbound document is saved to a tmp file and its path injected into the text", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const fetchImpl = (async () => ({
+		ok: true,
+		arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer,
+	})) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fetchImpl,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+	await daemon.handleTelegramUpdate({
+		update_id: 12,
+		message: {
+			chat: { id: 42 },
+			message_thread_id: threadId,
+			message_id: 101,
+			caption: "look",
+			document: { file_id: "doc-1", mime_type: "application/pdf", file_name: "report.pdf" },
+		},
+	});
+
+	const frame = JSON.parse(FakeWs.instances[0]!.sent[0]!);
+	expect(frame.type).toBe("user_message");
+	expect(frame.images).toHaveLength(0);
+	expect(frame.text).toContain("look");
+	const match = String(frame.text).match(/saved to (\S+report\.pdf)/);
+	expect(match).toBeTruthy();
+	expect(fs.existsSync(match![1]!)).toBe(true);
+	expect(fs.readFileSync(match![1]!)).toEqual(Buffer.from([9, 9, 9]));
+});
+
+test("outbound file_attachment frame triggers a sendDocument upload to the topic", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	bot.calls = [];
+
+	const data = Buffer.from([5, 6, 7]).toString("base64");
+	await daemon.handleSessionMessage(session, {
+		type: "file_attachment",
+		sessionId: "S",
+		name: "out.pdf",
+		mime: "application/pdf",
+		data,
+		caption: "here",
+	});
+
+	const doc = bot.calls.find(c => c.method === "sendDocument");
+	expect(doc).toBeTruthy();
+	expect(doc!.body.document).toBe(data);
+	expect(doc!.body.fileName).toBe("out.pdf");
+	expect(doc!.body.mime).toBe("application/pdf");
+	expect(Number(doc!.body.message_thread_id)).toBeGreaterThan(0);
 });
 
 describe("telegram daemon reconnect reconciliation", () => {

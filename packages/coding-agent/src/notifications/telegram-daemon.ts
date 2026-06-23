@@ -1,5 +1,6 @@
 import { spawn as childProcessSpawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
@@ -19,7 +20,7 @@ import {
 	readEndpoint,
 	routeInboundUpdate,
 } from "./telegram-reference";
-import { decideThreadedInbound } from "./threaded-inbound";
+import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
 import { TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
@@ -652,6 +653,35 @@ export class TelegramNotificationDaemon {
 					);
 					return res.json();
 				}
+				const docBody = body as { document?: unknown } | null;
+				if (method === "sendDocument" && docBody && typeof docBody.document === "string") {
+					const b = body as {
+						chat_id: unknown;
+						message_thread_id?: unknown;
+						document: string;
+						mime?: string;
+						fileName?: string;
+						caption?: string;
+						parse_mode?: string;
+					};
+					const form = new FormData();
+					form.set("chat_id", String(b.chat_id));
+					if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
+					if (b.caption) form.set("caption", b.caption);
+					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
+					form.set(
+						"document",
+						new Blob([Buffer.from(b.document, "base64")], { type: b.mime ?? "application/octet-stream" }),
+						b.fileName ?? "file",
+					);
+					const res = await fetchWithRetry(
+						fetchImpl,
+						url,
+						{ method: "POST", body: form, signal: callOpts?.signal },
+						sleep,
+					);
+					return res.json();
+				}
 				const res = await fetchWithRetry(
 					fetchImpl,
 					url,
@@ -803,6 +833,7 @@ export class TelegramNotificationDaemon {
 		"context_update",
 		"turn_stream",
 		"image_attachment",
+		"file_attachment",
 		"config_update",
 	]);
 
@@ -864,6 +895,65 @@ export class TelegramNotificationDaemon {
 		if (raw && typeof raw === "object") this.topics.load(raw);
 	}
 
+	/** Download a Telegram file by its file_path (from getFile) into memory. */
+	private async downloadTelegramFile(filePath: string): Promise<Buffer | undefined> {
+		const apiBase = this.opts.apiBase ?? "https://api.telegram.org";
+		const fetchImpl = this.opts.fetchImpl ?? fetch;
+		const url = `${apiBase}/file/bot${this.opts.botToken}/${filePath}`;
+		try {
+			const res = await fetchImpl(url);
+			if (!res.ok) return undefined;
+			return Buffer.from(await res.arrayBuffer());
+		} catch (e) {
+			logger.warn(`notifications: file download failed: ${String(e)}`);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Resolve an inbound attachment to inline image bytes (forwarded as images) or
+	 * a saved /tmp file path note (non-images). Returns base64 images to inline and
+	 * human-readable file notes to append to the injected text.
+	 */
+	private async resolveInboundAttachment(
+		att: InboundAttachment,
+	): Promise<{ images: { data: string; mime?: string }[]; fileNotes: string[] }> {
+		const images: { data: string; mime?: string }[] = [];
+		const fileNotes: string[] = [];
+		const label = att.fileName ?? att.kind;
+		try {
+			const got = (await this.botApi.call("getFile", { file_id: att.fileId })) as {
+				result?: { file_path?: unknown };
+			};
+			const filePath = typeof got?.result?.file_path === "string" ? got.result.file_path : undefined;
+			if (!filePath) {
+				fileNotes.push(`[attachment unavailable: ${label}]`);
+				return { images, fileNotes };
+			}
+			const bytes = await this.downloadTelegramFile(filePath);
+			if (!bytes) {
+				fileNotes.push(`[attachment download failed: ${label}]`);
+				return { images, fileNotes };
+			}
+			const isImage = att.kind === "photo" || (typeof att.mime === "string" && att.mime.startsWith("image/"));
+			if (isImage) {
+				images.push({ data: bytes.toString("base64"), mime: att.mime ?? "image/jpeg" });
+			} else {
+				const base =
+					(att.fileName?.trim() || path.basename(filePath) || `${att.kind}-${att.fileId}`)
+						.replace(/[^\w.-]+/g, "_")
+						.slice(-128) || "file";
+				const dest = path.join(os.tmpdir(), `gjc-telegram-${Date.now()}-${base}`);
+				await fs.promises.writeFile(dest, bytes);
+				fileNotes.push(`[user attached a file, saved to ${dest}${att.mime ? ` (${att.mime})` : ""}]`);
+			}
+		} catch (e) {
+			logger.warn(`notifications: inbound attachment failed: ${String(e)}`);
+			fileNotes.push(`[attachment error: ${label}]`);
+		}
+		return { images, fileNotes };
+	}
+
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
 	private async flushPool(): Promise<void> {
 		for (const item of this.pool.drain()) {
@@ -878,6 +968,16 @@ export class TelegramNotificationDaemon {
 						...threadField,
 						photo: send.photoBase64,
 						mime: send.mime,
+						caption: send.text,
+						parse_mode: TELEGRAM_PARSE_MODE,
+					});
+				} else if (send.method === "sendDocument" && send.documentBase64) {
+					await this.botApi.call("sendDocument", {
+						chat_id: this.opts.chatId,
+						...threadField,
+						document: send.documentBase64,
+						mime: send.mime,
+						fileName: send.fileName,
 						caption: send.text,
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
@@ -1205,12 +1305,19 @@ export class TelegramNotificationDaemon {
 				this.seenUpdateIds.add(inbound.updateId);
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
-					const cfg = parseInThreadConfigCommand(inbound.text);
+					const attachmentResult = inbound.attachment
+						? await this.resolveInboundAttachment(inbound.attachment)
+						: undefined;
+					const images = attachmentResult?.images ?? [];
+					const fileNotes = attachmentResult?.fileNotes ?? [];
+					const hasMedia = images.length > 0 || fileNotes.length > 0;
+					const injectedText = [inbound.text, ...fileNotes].filter(Boolean).join("\n");
+					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
 					// Telegram asks always accept custom text (the SDK maps a string answer
 					// to the ask's custom-input slot), so route the latest pending ask here.
-					const pendingAsk = cfg ? undefined : [...session.pending.values()].at(-1);
+					const pendingAsk = cfg || hasMedia ? undefined : [...session.pending.values()].at(-1);
 					if (pendingAsk) {
 						session.ws.send(
 							JSON.stringify({
@@ -1230,10 +1337,11 @@ export class TelegramNotificationDaemon {
 								: {
 										type: "user_message",
 										sessionId: inbound.sessionId,
-										text: inbound.text,
+										text: injectedText,
 										token: session.token,
 										updateId: inbound.updateId,
 										threadId: inbound.threadId,
+										images,
 									},
 						),
 					);

@@ -929,6 +929,16 @@ export interface InboundEvent {
   verbosity?: string
   /** Requested redaction state (`config_command` only). */
   redact?: boolean
+  /** Inline image attachments forwarded with the message (`user_message` only). */
+  images?: Array<InboundImageEvent>
+}
+
+/** One inline image attachment forwarded with an inbound user message. */
+export interface InboundImageEvent {
+  /** Base64-encoded image bytes. */
+  data: string
+  /** MIME type when known (e.g. "image/jpeg"). */
+  mime?: string
 }
 
 /**

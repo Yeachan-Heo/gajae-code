@@ -74,6 +74,29 @@ describe("renderThreadedFrame", () => {
 		expect(renderThreadedFrame({ type: "image_attachment", sessionId: "s", mime: "image/png" })).toBeUndefined();
 	});
 
+	test("file_attachment renders a sendDocument with filename, mime, and caption", () => {
+		const send = renderThreadedFrame({
+			type: "file_attachment",
+			sessionId: "s",
+			name: "report.pdf",
+			mime: "application/pdf",
+			data: "QkFTRTY0",
+			caption: "the report",
+		});
+		expect(send).toMatchObject({
+			method: "sendDocument",
+			lane: "finalized",
+			documentBase64: "QkFTRTY0",
+			fileName: "report.pdf",
+			mime: "application/pdf",
+			text: "the report",
+		});
+	});
+
+	test("file_attachment without data renders nothing", () => {
+		expect(renderThreadedFrame({ type: "file_attachment", sessionId: "s", name: "x.bin" })).toBeUndefined();
+	});
+
 	test("config_update renders a low-priority status line", () => {
 		const send = renderThreadedFrame({ type: "config_update", sessionId: "s", verbosity: "verbose", redact: false });
 		expect(send?.lane).toBe("idle");

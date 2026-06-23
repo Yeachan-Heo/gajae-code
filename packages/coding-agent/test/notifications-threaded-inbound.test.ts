@@ -77,4 +77,52 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 		);
 		expect(decision).toEqual({ kind: "inject", sessionId: "sess-x", text: "go", updateId: 8, threadId: "1" });
 	});
+
+	test("injects a photo-only message with an image attachment and empty text", () => {
+		const decision = decideThreadedInbound(
+			{
+				update_id: 9,
+				message: {
+					chat: { id: 42 },
+					message_thread_id: "topic-1",
+					photo: [
+						{ file_id: "small", width: 90, height: 90 },
+						{ file_id: "large", width: 1280, height: 1280 },
+					],
+				},
+			},
+			ctx(),
+		);
+		expect(decision).toEqual({
+			kind: "inject",
+			sessionId: "sess-1",
+			text: "",
+			updateId: 9,
+			threadId: "topic-1",
+			attachment: { fileId: "large", kind: "photo", mime: "image/jpeg" },
+		});
+	});
+
+	test("injects a document using its caption as text plus a document attachment", () => {
+		const decision = decideThreadedInbound(
+			{
+				update_id: 10,
+				message: {
+					chat: { id: 42 },
+					message_thread_id: "topic-1",
+					caption: "  see attached  ",
+					document: { file_id: "doc-1", mime_type: "application/pdf", file_name: "report.pdf" },
+				},
+			},
+			ctx(),
+		);
+		expect(decision).toEqual({
+			kind: "inject",
+			sessionId: "sess-1",
+			text: "see attached",
+			updateId: 10,
+			threadId: "topic-1",
+			attachment: { fileId: "doc-1", kind: "document", mime: "application/pdf", fileName: "report.pdf" },
+		});
+	});
 });

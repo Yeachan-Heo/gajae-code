@@ -166,6 +166,8 @@ pub enum ServerMessage {
 	TurnStream(TurnStream),
 	/// An agent-produced image artifact.
 	ImageAttachment(ImageAttachment),
+	/// An agent-produced file artifact delivered as a chat document.
+	FileAttachment(FileAttachment),
 	/// A pushed configuration update (verbosity/redact).
 	ConfigUpdate(ConfigUpdate),
 	/// Server capability/version advertisement for negotiation.
@@ -295,6 +297,24 @@ pub struct ImageAttachment {
 	pub caption:    Option<String>,
 }
 
+/// An agent-produced file artifact to deliver as a chat document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAttachment {
+	/// The session this file belongs to.
+	pub session_id: String,
+	/// Suggested file name (with extension when known).
+	pub name:       String,
+	/// MIME type, e.g. "application/pdf".
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mime:       Option<String>,
+	/// Base64-encoded file bytes.
+	pub data:       String,
+	/// Optional caption.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub caption:    Option<String>,
+}
+
 /// A pushed configuration update reflecting current verbosity/redaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -345,6 +365,17 @@ pub struct Pong {
 	pub nonce: String,
 }
 
+/// An inline image attachment carried by an inbound user message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundImage {
+	/// Base64-encoded image bytes.
+	pub data: String,
+	/// MIME type when known (e.g. "image/jpeg").
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mime: Option<String>,
+}
+
 /// An inbound free-text user message injecting/steering a session turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -361,6 +392,9 @@ pub struct UserMessage {
 	/// Originating thread/topic id, for fail-closed routing.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub thread_id:  Option<String>,
+	/// Inline image attachments to forward as image content blocks.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub images:     Vec<InboundImage>,
 }
 
 /// An in-thread configuration command (verbosity/redact toggles).

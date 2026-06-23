@@ -65,6 +65,17 @@ pub struct InboundEvent {
 	pub verbosity:  Option<String>,
 	/// Requested redaction state (`config_command` only).
 	pub redact:     Option<bool>,
+	/// Inline image attachments forwarded with the message (`user_message` only).
+	pub images:     Option<Vec<InboundImageEvent>>,
+}
+
+/// One inline image attachment forwarded with an inbound user message.
+#[napi(object)]
+pub struct InboundImageEvent {
+	/// Base64-encoded image bytes.
+	pub data: String,
+	/// MIME type when known (e.g. "image/jpeg").
+	pub mime: Option<String>,
 }
 
 /// In-process notification server handle exposed to TypeScript.
@@ -170,6 +181,16 @@ impl NotificationServer {
 							text:       Some(u.text),
 							update_id:  u.update_id,
 							thread_id:  u.thread_id,
+							images:     if u.images.is_empty() {
+								None
+							} else {
+								Some(
+									u.images
+										.into_iter()
+										.map(|i| InboundImageEvent { data: i.data, mime: i.mime })
+										.collect(),
+								)
+							},
 							verbosity:  None,
 							redact:     None,
 						},
@@ -184,6 +205,7 @@ impl NotificationServer {
 								Verbosity::Verbose => "verbose".to_owned(),
 							}),
 							redact:     c.redact,
+							images:     None,
 						},
 						_ => continue,
 					};

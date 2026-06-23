@@ -15,15 +15,19 @@ import type { RateLimitLane } from "./rate-limit-pool";
 
 /** A Telegram send derived from a threaded frame (topic id is applied by the daemon). */
 export interface ThreadedSend {
-	method: "sendMessage" | "sendPhoto";
+	method: "sendMessage" | "sendPhoto" | "sendDocument";
 	/** Rate-limit lane for prioritisation/fairness. */
 	lane: RateLimitLane;
 	/** Message text (sendMessage) or photo caption (sendPhoto). */
 	text?: string;
 	/** Base64 image bytes for sendPhoto. */
 	photoBase64?: string;
+	/** Base64 file bytes for sendDocument. */
+	documentBase64?: string;
 	/** Image MIME type for sendPhoto. */
 	mime?: string;
+	/** Suggested document filename. */
+	fileName?: string;
 	/** Coalesce key for live edits (same key collapses to the latest). */
 	coalesceKey?: string;
 	/** True for the one-time identity header (the daemon pins it once). */
@@ -49,11 +53,12 @@ interface ThreadedFrame {
 	phase?: unknown;
 	text?: unknown;
 	messageRef?: unknown;
-	// image_attachment
+	// image_attachment / file_attachment
 	source?: unknown;
 	data?: unknown;
 	mime?: unknown;
 	caption?: unknown;
+	name?: unknown;
 	// config_update
 	verbosity?: unknown;
 	redact?: unknown;
@@ -138,6 +143,19 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 				lane: "finalized",
 				photoBase64: data,
 				mime: str(frame.mime),
+				text: finalizeTelegramHtml(caption === undefined ? undefined : escapeHtml(caption)),
+			};
+		}
+		case "file_attachment": {
+			const data = str(frame.data);
+			if (!data) return undefined;
+			const caption = str(frame.caption);
+			return {
+				method: "sendDocument",
+				lane: "finalized",
+				documentBase64: data,
+				mime: str(frame.mime),
+				fileName: str(frame.name),
 				text: finalizeTelegramHtml(caption === undefined ? undefined : escapeHtml(caption)),
 			};
 		}

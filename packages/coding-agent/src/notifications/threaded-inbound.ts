@@ -21,9 +21,28 @@ export interface InboundUpdate {
 	message?: {
 		message_id?: unknown;
 		text?: unknown;
+		caption?: unknown;
+		photo?: unknown;
+		document?: unknown;
+		video?: unknown;
+		audio?: unknown;
+		voice?: unknown;
+		animation?: unknown;
 		chat?: { id?: unknown };
 		message_thread_id?: unknown;
 	};
+}
+
+/** A downloadable media attachment referenced by an inbound message. */
+export interface InboundAttachment {
+	/** Telegram file_id to resolve via getFile. */
+	fileId: string;
+	/** Source media kind; "photo" is always an image. */
+	kind: "photo" | "document" | "video" | "audio" | "voice" | "animation";
+	/** MIME type when Telegram provides one. */
+	mime?: string;
+	/** Original file name when provided. */
+	fileName?: string;
 }
 
 /** Context for {@link decideThreadedInbound}. All lookups are injected. */
@@ -38,13 +57,44 @@ export interface ThreadedInboundCtx {
 
 /** Outcome of routing an inbound update. */
 export type ThreadedInboundDecision =
-	| { kind: "inject"; sessionId: string; text: string; updateId: number; threadId: string; messageId?: number }
+	| {
+			kind: "inject";
+			sessionId: string;
+			text: string;
+			updateId: number;
+			threadId: string;
+			messageId?: number;
+			attachment?: InboundAttachment;
+	  }
 	| { kind: "duplicate"; updateId: number }
 	| { kind: "ignore"; reason: string };
 
 function asString(value: unknown): string | undefined {
 	if (typeof value === "string") return value;
 	if (typeof value === "number") return String(value);
+	return undefined;
+}
+
+function extractAttachment(message: NonNullable<InboundUpdate["message"]>): InboundAttachment | undefined {
+	if (Array.isArray(message.photo) && message.photo.length > 0) {
+		const photo = message.photo[message.photo.length - 1];
+		if (photo && typeof photo === "object" && "file_id" in photo && typeof photo.file_id === "string") {
+			return { fileId: photo.file_id, kind: "photo", mime: "image/jpeg" };
+		}
+	}
+
+	for (const kind of ["document", "video", "audio", "voice", "animation"] as const) {
+		const file = message[kind];
+		if (file && typeof file === "object" && "file_id" in file && typeof file.file_id === "string") {
+			return {
+				fileId: file.file_id,
+				kind,
+				mime: "mime_type" in file && typeof file.mime_type === "string" ? file.mime_type : undefined,
+				fileName: "file_name" in file && typeof file.file_name === "string" ? file.file_name : undefined,
+			};
+		}
+	}
+
 	return undefined;
 }
 
@@ -72,9 +122,15 @@ export function decideThreadedInbound(update: InboundUpdate, ctx: ThreadedInboun
 	const updateId = update.update_id;
 	if (ctx.isDuplicate(updateId)) return { kind: "duplicate", updateId };
 
-	const text = typeof message.text === "string" ? message.text.trim() : "";
-	if (!text) return { kind: "ignore", reason: "empty_text" };
+	const text =
+		typeof message.text === "string"
+			? message.text.trim()
+			: typeof message.caption === "string"
+				? message.caption.trim()
+				: "";
+	const attachment = extractAttachment(message);
+	if (!text && attachment === undefined) return { kind: "ignore", reason: "empty_text" };
 
 	const messageId = typeof message.message_id === "number" ? message.message_id : undefined;
-	return { kind: "inject", sessionId, text, updateId, threadId, messageId };
+	return { kind: "inject", sessionId, text, updateId, threadId, messageId, attachment };
 }
