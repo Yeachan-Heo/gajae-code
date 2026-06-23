@@ -198,6 +198,10 @@ ws.on("message", (data) => {
 Swap `ws` for a Telegram bot's long-poll loop, a Discord gateway client, or a
 Slack socket-mode app — the contract above is all you implement.
 
+## Telegram onboarding
+
+For the exact user setup flow (`gjc notify setup`, BotFather token, private-chat pairing, status, and troubleshooting), see [Telegram notification onboarding](./telegram-onboarding.md).
+
 ## Managed Telegram daemon (bundled reference client)
 
 GJC also ships a managed Telegram reference client for the common phone-notify
