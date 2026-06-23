@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 const CLOSED_STDERR_ERROR_CODES = new Set(["EIO", "EPIPE", "EBADF"]);
 
 function isClosedStderrWriteError(error: unknown): boolean {
@@ -6,8 +8,9 @@ function isClosedStderrWriteError(error: unknown): boolean {
 }
 
 export function safeStderrWrite(message: string): void {
+	if (!process.stderr.writable) return;
 	try {
-		process.stderr.write(message);
+		fs.writeSync(process.stderr.fd, message);
 	} catch (error) {
 		if (isClosedStderrWriteError(error)) return;
 		throw error;

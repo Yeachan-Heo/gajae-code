@@ -352,6 +352,11 @@ function readCurrentBranch(cwd: string): string | null {
 function cleanupCreatedTmuxSession(plan: TmuxLaunchPlan, spawnSync: TmuxSpawnSync, options: TmuxSpawnOptions): void {
 	spawnSync(plan.tmuxCommand, ["kill-session", "-t", `=${plan.sessionName}`], options);
 }
+function isTmuxAttachDisconnectError(result: TmuxSpawnResult): boolean {
+	if (result.signalCode === "SIGHUP") return true;
+	const stderr = result.stderr?.toLowerCase() ?? "";
+	return stderr.includes("eio") || stderr.includes("input/output error");
+}
 
 export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaunchPlan | undefined {
 	const env = context.env ?? process.env;
@@ -478,6 +483,10 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], options);
 	if (attached.exitCode === 0) return true;
+	if (isTmuxAttachDisconnectError(attached)) {
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
+		return true;
+	}
 	cleanupCreatedTmuxSession(plan, spawnSync, options);
 	(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
 	return true;

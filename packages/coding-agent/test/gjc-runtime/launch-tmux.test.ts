@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import { Buffer } from "node:buffer";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
@@ -842,12 +843,100 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0].length).toBeLessThan(320);
 	});
 
-	it("does not throw when the default tmux diagnostic write hits a closed stderr", () => {
-		const writes: string[] = [];
-		process.stderr.write = ((chunk: string | Uint8Array) => {
-			writes.push(String(chunk));
+	it("preserves a newly created managed session when attach reports SSH disconnect EIO", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				if (spawnArgs[0] === "attach-session")
+					return { exitCode: 1, stderr: "write /dev/tty: input/output error (EIO)" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
+	});
+
+	it("does not throw when reporting attach disconnect EIO to closed stderr", () => {
+		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
 			throw stderrError("EIO");
-		}) satisfies typeof process.stderr.write;
+		});
+
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			spawnSync: (_command, spawnArgs) => {
+				if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed: EIO" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(writeSpy).toHaveBeenCalledWith(process.stderr.fd, expect.stringContaining("attach disconnected"));
+	});
+
+	it("preserves a newly created managed session when attach receives SIGHUP", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				if (spawnArgs[0] === "attach-session") return { exitCode: null, signalCode: "SIGHUP" };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
+	});
+
+	it("does not throw when the default tmux diagnostic write hits a closed stderr", () => {
+		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
+			throw stderrError("EIO");
+		});
 
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
@@ -868,8 +957,7 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(true);
-		expect(writes).toHaveLength(1);
-		expect(writes[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+		expect(writeSpy).toHaveBeenCalledWith(process.stderr.fd, expect.stringContaining("attach failed"));
 	});
 
 	it("falls through to direct launch when tmux is unavailable", () => {
