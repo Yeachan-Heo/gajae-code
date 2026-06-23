@@ -2731,7 +2731,6 @@ export const SETTINGS_SCHEMA = {
 		values: [
 			"auto",
 			"duckduckgo",
-			"insane",
 			"exa",
 			"brave",
 			"jina",
@@ -2763,11 +2762,6 @@ export const SETTINGS_SCHEMA = {
 					value: "duckduckgo",
 					label: "DuckDuckGo",
 					description: "Keyless default — no API key or OAuth required",
-				},
-				{
-					value: "insane",
-					label: "Insane Search",
-					description: "Keyless public-route search and safe URL enrichment — no auth or bypass",
 				},
 				{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set" },
 				{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },

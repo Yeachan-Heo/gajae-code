@@ -1679,7 +1679,6 @@
 						"type": "string",
 						"enum": [
 							"duckduckgo",
-							"insane",
 							"exa",
 							"brave",
 							"jina",
@@ -1957,7 +1956,6 @@
 					"enum": [
 						"auto",
 						"duckduckgo",
-						"insane",
 						"exa",
 						"brave",
 						"jina",

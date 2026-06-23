@@ -157,13 +157,6 @@ describe("native web-search provider resolution", () => {
 		]);
 	});
 
-	it("accepts insane as an explicit keyless provider before terminal DuckDuckGo", async () => {
-		await expect(ids(undefined, { preferred: "insane", fallback: ["duckduckgo"] })).resolves.toEqual([
-			"insane",
-			"duckduckgo",
-		]);
-	});
-
 	it("falls back to DuckDuckGo when nothing is known or credentialed", async () => {
 		await expect(
 			ids({ provider: "unknown", modelId: "mystery", api: "openai-completions", baseUrl: "https://models.example" }),

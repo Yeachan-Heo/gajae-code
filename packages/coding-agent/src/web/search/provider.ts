@@ -72,11 +72,6 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		label: "DuckDuckGo",
 		load: async () => new (await import("./providers/duckduckgo")).DuckDuckGoProvider(),
 	},
-	insane: {
-		id: "insane",
-		label: "Insane Search",
-		load: async () => new (await import("./providers/insane")).InsaneProvider(),
-	},
 	"openai-compatible": {
 		id: "openai-compatible",
 		label: "OpenAI-compatible",
@@ -102,7 +97,6 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 
 export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"duckduckgo",
-	"insane",
 	"tavily",
 	"perplexity",
 	"brave",

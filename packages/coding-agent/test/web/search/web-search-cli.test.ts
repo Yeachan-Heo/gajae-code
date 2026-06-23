@@ -33,14 +33,6 @@ describe("web search CLI args", () => {
 		});
 	});
 
-	it("parses the keyless insane provider", () => {
-		expect(parseSearchArgs(["web-search", "--provider=insane", "resilient public search"])).toMatchObject({
-			query: "resilient public search",
-			provider: "insane",
-		});
-		expect(Search.flags.provider?.options).toContain("insane");
-	});
-
 	it("parses separate, repeated, singular, and plural xAI list flags", () => {
 		expect(
 			parseSearchArgs([

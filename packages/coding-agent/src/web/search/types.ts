@@ -7,7 +7,6 @@
 /** Supported web search providers */
 export type SearchProviderId =
 	| "duckduckgo"
-	| "insane"
 	| "exa"
 	| "brave"
 	| "jina"
@@ -39,7 +38,6 @@ export interface ActiveSearchModelContext {
 
 export const CONFIGURABLE_SEARCH_PROVIDER_IDS = [
 	"duckduckgo",
-	"insane",
 	"exa",
 	"brave",
 	"jina",

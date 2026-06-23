@@ -14,7 +14,6 @@
   - `packages/coding-agent/src/web/search/providers/anthropic.ts` — Anthropic model web-search provider.
   - `packages/coding-agent/src/web/search/providers/brave.ts` — Brave Search API adapter.
   - `packages/coding-agent/src/web/search/providers/duckduckgo.ts` — keyless DuckDuckGo html/lite scrape adapter (permissionless default/fallback).
-  - `packages/coding-agent/src/web/search/providers/insane.ts` — keyless Insane Search-inspired public-route adapter with SSRF-safe URL enrichment (no credentials, cookies, subprocess, or bypass).
   - `packages/coding-agent/src/web/search/providers/openai-code.ts` — OpenAI code provider SSE adapter.
   - `packages/coding-agent/src/web/search/providers/exa.ts` — Exa API adapter.
   - `packages/coding-agent/src/web/search/providers/gemini.ts` — Gemini grounding SSE adapter.
@@ -76,7 +75,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
    - an explicitly preferred/selected provider that is `isAvailable()` becomes the primary;
    - otherwise the active model's own native search (`MODEL_PROVIDER_TO_SEARCH`) becomes the primary, but only when that provider's own credentials exist (`isAvailable()`);
    - keyed standalone providers are never auto-selected — explicit selection only.
-4. DuckDuckGo (keyless, `isAvailable()` always true) is always appended as the terminal fallback, so a missing primary — or a primary runtime failure — still returns results with zero configuration. `insane` is also keyless and selectable, but it is not auto-appended; it is used only when explicitly selected or configured. There is no longer a "No web search provider configured" path.
+4. DuckDuckGo (keyless, `isAvailable()` always true) is always appended as the terminal fallback, so a missing primary — or a primary runtime failure — still returns results with zero configuration. There is no longer a "No web search provider configured" path.
 5. For each provider in order, `executeSearch()` calls `provider.search()` with:
    - `query` after year-rewrite,
    - `limit`, `recency`, `temperature`, `maxOutputTokens`, `numSearchResults`,
@@ -101,14 +100,6 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - `recency` maps to Tavily `time_range`; code explicitly keeps `topic` at default general scope instead of narrowing to news.
     - `limit` / `num_search_results`: adapter uses `params.numSearchResults ?? params.limit`, clamped to `5..20` with default `5`.
     - Output: `answer`, `sources`, `requestId`, `authMode: "api_key"`.
-  - **Insane Search** — `packages/coding-agent/src/web/search/providers/insane.ts`
-    - Availability: keyless and always available; no API key, OAuth, cookies, credential storage, Python subprocess, browser fallback, or TLS impersonation.
-    - Querying: normal search queries delegate to the public DuckDuckGo html/lite route and return unified sources with provider `insane`. URL-shaped queries use public URL enrichment instead of search.
-    - URL enrichment: accepts only public `http`/`https` URLs without embedded credentials; rejects localhost, private, link-local, multicast, reserved, and metadata-style IP targets; resolves hostnames and rejects any private/special address; validates each redirect before following it.
-    - Public-boundary behavior: fails closed on auth walls, paywalls, CAPTCHA/block pages, non-text content, unsafe redirects, and too many redirects. It never attempts login, cookie reuse, paywall bypass, or private network fetching.
-    - `limit` / `num_search_results`: clamped to `1..20`, default `10`; URL enrichment returns one source.
-    - Output: `sources` only. `formatForLLM()` is unchanged.
-    - Scope note: inspired by fivetaku/insane-search public-route resilience, but this MVP intentionally does not vendor upstream Python wrappers or implement Phase 2 curl_cffi / Phase 3 browser behavior.
   - **Perplexity** — `packages/coding-agent/src/web/search/providers/perplexity.ts`
     - Availability: auth precedence is `PERPLEXITY_COOKIES` -> OAuth token in `agent.db` -> `PERPLEXITY_API_KEY` / `PPLX_API_KEY`.
     - OAuth/cookie mode: POSTs to `https://www.perplexity.ai/rest/sse/perplexity_ask`, consumes SSE, merges partial events, extracts answer and source URLs, sets `authMode: "oauth"`.
@@ -199,7 +190,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
   - Many provider adapters accept `AbortSignal`, but `WebSearchTool.execute()` does not pass its `_signal` into `executeSearch()`. Internal callers can still use cancellation by calling `runSearchQuery()` / `executeSearch()` with `signal` embedded in params.
 
 ## Limits & Caps
-- Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable keyless `insane` provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
+- Provider registry size: 15 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
 - `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).
@@ -208,7 +199,6 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - Parallel result count: default `10`, max `40`; per-result excerpt cap `10_000` chars (`packages/coding-agent/src/web/search/providers/parallel.ts`, `packages/coding-agent/src/web/parallel.ts`).
 - Kagi result count: default `10`, max `40` (`packages/coding-agent/src/web/search/providers/kagi.ts`).
 - SearXNG result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/searxng.ts`).
-- Insane Search result count: default `10`, max `20`; safe URL enrichment returns one public source (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - Perplexity API-key mode defaults: `max_tokens = 8192`, `temperature = 0.2`, `num_search_results = 10` (`packages/coding-agent/src/web/search/providers/perplexity.ts`).
 - Anthropic defaults: model `anthropic-model-haiku-4-5`, `DEFAULT_MAX_TOKENS = 4096` when the provider omits `max_tokens` (`packages/coding-agent/src/web/search/providers/anthropic.ts`).
 - Gemini retries: up to `3` retries per endpoint, base delay `1000` ms, rate-limit delay budget `5 * 60 * 1000` ms (`packages/coding-agent/src/web/search/providers/gemini.ts`).
