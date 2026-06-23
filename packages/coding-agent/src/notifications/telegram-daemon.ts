@@ -1,4 +1,5 @@
 import { spawn as childProcessSpawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -911,12 +912,43 @@ export class TelegramNotificationDaemon {
 	}
 
 	/**
+	 * Per-session private temp directories (mode 0700) holding inbound non-image
+	 * attachments. Keyed by session id and reused across transient reconnects;
+	 * removed when the daemon stops (see {@link cleanupAllAttachmentDirs}).
+	 */
+	private readonly attachmentDirs = new Map<string, string>();
+
+	/** Lazily create a private, unguessable 0700 temp dir for `sessionId`. */
+	private async ensureAttachmentDir(sessionId: string): Promise<string> {
+		const existing = this.attachmentDirs.get(sessionId);
+		if (existing) return existing;
+		// mkdtemp creates a directory with an unguessable suffix and 0700 perms;
+		// chmod defensively in case of an unusual platform/umask.
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-telegram-"));
+		await fs.promises.chmod(dir, 0o700).catch(() => undefined);
+		this.attachmentDirs.set(sessionId, dir);
+		return dir;
+	}
+
+	/** Remove all per-session attachment directories. Called on daemon shutdown. */
+	private async cleanupAllAttachmentDirs(): Promise<void> {
+		const dirs = [...this.attachmentDirs.values()];
+		this.attachmentDirs.clear();
+		await Promise.all(dirs.map(dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined)));
+	}
+
+	/**
 	 * Resolve an inbound attachment to inline image bytes (forwarded as images) or
-	 * a saved /tmp file path note (non-images). Returns base64 images to inline and
-	 * human-readable file notes to append to the injected text.
+	 * a securely-saved file path note (non-images). Non-image bytes are written
+	 * into a private per-session temp dir (0700) under an unguessable name via an
+	 * exclusive 0600 create (`wx`), so the files are not world-readable and the
+	 * write never follows a pre-existing symlink. The directory is removed when the
+	 * daemon stops. Returns base64 images to inline plus human-readable file notes
+	 * to append to the injected text.
 	 */
 	private async resolveInboundAttachment(
 		att: InboundAttachment,
+		sessionId: string,
 	): Promise<{ images: { data: string; mime?: string }[]; fileNotes: string[] }> {
 		const images: { data: string; mime?: string }[] = [];
 		const fileNotes: string[] = [];
@@ -939,12 +971,16 @@ export class TelegramNotificationDaemon {
 			if (isImage) {
 				images.push({ data: bytes.toString("base64"), mime: att.mime ?? "image/jpeg" });
 			} else {
-				const base =
+				const safeBase =
 					(att.fileName?.trim() || path.basename(filePath) || `${att.kind}-${att.fileId}`)
 						.replace(/[^\w.-]+/g, "_")
+						.replace(/^\.+/, "_")
 						.slice(-128) || "file";
-				const dest = path.join(os.tmpdir(), `gjc-telegram-${Date.now()}-${base}`);
-				await fs.promises.writeFile(dest, bytes);
+				const dir = await this.ensureAttachmentDir(sessionId);
+				// Unguessable, non-colliding name inside the private 0700 dir; the
+				// exclusive 0600 create (`wx`) refuses to follow a pre-existing file/symlink.
+				const dest = path.join(dir, `${crypto.randomBytes(8).toString("hex")}-${safeBase}`);
+				await fs.promises.writeFile(dest, bytes, { flag: "wx", mode: 0o600 });
 				fileNotes.push(`[user attached a file, saved to ${dest}${att.mime ? ` (${att.mime})` : ""}]`);
 			}
 		} catch (e) {
@@ -1306,7 +1342,7 @@ export class TelegramNotificationDaemon {
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const attachmentResult = inbound.attachment
-						? await this.resolveInboundAttachment(inbound.attachment)
+						? await this.resolveInboundAttachment(inbound.attachment, inbound.sessionId)
 						: undefined;
 					const images = attachmentResult?.images ?? [];
 					const fileNotes = attachmentResult?.fileNotes ?? [];
@@ -1518,6 +1554,7 @@ export class TelegramNotificationDaemon {
 			this.stopFlushTimer();
 			this.stopScanTimer();
 			this.stopTypingTimer();
+			await this.cleanupAllAttachmentDirs();
 			// Persist durable state before releasing ownership so a fresh daemon
 			// (e.g. after reload) reloads aliases/topics seamlessly.
 			await this.persistAliases().catch(() => undefined);

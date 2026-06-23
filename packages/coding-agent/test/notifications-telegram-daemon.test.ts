@@ -1271,6 +1271,16 @@ test("inbound document is saved to a tmp file and its path injected into the tex
 	expect(match).toBeTruthy();
 	expect(fs.existsSync(match![1]!)).toBe(true);
 	expect(fs.readFileSync(match![1]!)).toEqual(Buffer.from([9, 9, 9]));
+	// Security: the saved file must be private (0600, no group/other access) inside
+	// a private 0700 per-session directory under the system temp root — not a
+	// predictable, world-readable /tmp path.
+	const dest = match![1]!;
+	const fileMode = fs.statSync(dest).mode & 0o777;
+	const dirMode = fs.statSync(path.dirname(dest)).mode & 0o777;
+	expect(fileMode).toBe(0o600);
+	expect(fileMode & 0o077).toBe(0);
+	expect(dirMode & 0o077).toBe(0);
+	expect(dest.startsWith(os.tmpdir())).toBe(true);
 });
 
 test("outbound file_attachment frame triggers a sendDocument upload to the topic", async () => {
