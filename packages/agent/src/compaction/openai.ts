@@ -237,6 +237,12 @@ export function trimOpenAiCompactInput(
 	return trimmed;
 }
 
+export function resolveOpenAiCompactInputBudget(contextWindow: number, maxOutputTokens = 0): number {
+	if (contextWindow <= 0) return 0;
+	const reservedTokens = Math.max(Math.floor(contextWindow * 0.15), maxOutputTokens, 1);
+	return Math.max(1, contextWindow - reservedTokens);
+}
+
 function collectKnownOpenAiCallIds(items: Array<Record<string, unknown>>): Set<string> {
 	const knownCallIds = new Set<string>();
 	for (const item of items) {
@@ -473,7 +479,11 @@ export async function requestOpenAiRemoteCompaction(
 	const endpoint = resolveOpenAiCompactEndpoint(model, options?.authCredentialType);
 	const request: OpenAiRemoteCompactionRequest = {
 		model: model.id,
-		input: trimOpenAiCompactInput(compactInput, model.contextWindow, instructions),
+		input: trimOpenAiCompactInput(
+			compactInput,
+			resolveOpenAiCompactInputBudget(model.contextWindow, model.maxTokens),
+			instructions,
+		),
 		instructions,
 	};
 	const headers: Record<string, string> = {

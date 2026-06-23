@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hardened context-overflow recovery so automatic maintenance clears the TUI loader, surfaces overflow completion/skip status, retries resumable tails safely, and falls back to the synthetic auto-continue prompt for non-resumable tails when enabled.
+
 ## [0.7.1] - 2026-06-23
 ### Fixed
 
