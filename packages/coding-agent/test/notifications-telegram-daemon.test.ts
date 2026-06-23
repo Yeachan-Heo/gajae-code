@@ -1283,6 +1283,97 @@ test("inbound document is saved to a tmp file and its path injected into the tex
 	expect(dest.startsWith(os.tmpdir())).toBe(true);
 });
 
+test("inbound document with a path-traversal filename stays sandboxed in the private temp dir", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const fetchImpl = (async () => ({
+		ok: true,
+		arrayBuffer: async () => new Uint8Array([7]).buffer,
+	})) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fetchImpl,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+	await daemon.handleTelegramUpdate({
+		update_id: 21,
+		message: {
+			chat: { id: 42 },
+			message_thread_id: threadId,
+			message_id: 200,
+			document: { file_id: "doc-evil", mime_type: "application/octet-stream", file_name: "../../../etc/passwd" },
+		},
+	});
+
+	const frame = JSON.parse(FakeWs.instances[0]!.sent[0]!);
+	const match = String(frame.text).match(/saved to (\S+)/);
+	expect(match).toBeTruthy();
+	const dest = match![1]!;
+	const base = path.basename(dest);
+	const dir = path.dirname(dest);
+	// The attacker-controlled name must be sanitized so it cannot traverse:
+	// no path separators and no ".." segments survive.
+	expect(base.includes("/")).toBe(false);
+	expect(base.includes("\\")).toBe(false);
+	expect(base).not.toContain("..");
+	// The real saved file lives directly inside the private per-session temp dir
+	// (under the system temp root), not at the attacker-referenced location.
+	expect(path.dirname(fs.realpathSync(dest))).toBe(fs.realpathSync(dir));
+	expect(dir.startsWith(os.tmpdir())).toBe(true);
+	expect(fs.realpathSync(dest)).not.toBe("/etc/passwd");
+});
+
+test("daemon attachment temp dirs are removed by the shutdown cleanup path", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const fetchImpl = (async () => ({
+		ok: true,
+		arrayBuffer: async () => new Uint8Array([1, 1]).buffer,
+	})) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fetchImpl,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+	await daemon.handleTelegramUpdate({
+		update_id: 22,
+		message: {
+			chat: { id: 42 },
+			message_thread_id: threadId,
+			message_id: 201,
+			document: { file_id: "doc-x", mime_type: "application/pdf", file_name: "keep.pdf" },
+		},
+	});
+
+	const frame = JSON.parse(FakeWs.instances[0]!.sent[0]!);
+	const dir = path.dirname(String(frame.text).match(/saved to (\S+)/)![1]!);
+	expect(fs.existsSync(dir)).toBe(true);
+	// run()'s `finally` invokes cleanupAllAttachmentDirs() on daemon shutdown;
+	// exercise that exact cleanup path here.
+	await (daemon as any).cleanupAllAttachmentDirs();
+	expect(fs.existsSync(dir)).toBe(false);
+});
+
 test("outbound file_attachment frame triggers a sendDocument upload to the topic", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();

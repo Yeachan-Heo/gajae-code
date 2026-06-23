@@ -900,7 +900,15 @@ export class TelegramNotificationDaemon {
 	private async downloadTelegramFile(filePath: string): Promise<Buffer | undefined> {
 		const apiBase = this.opts.apiBase ?? "https://api.telegram.org";
 		const fetchImpl = this.opts.fetchImpl ?? fetch;
-		const url = `${apiBase}/file/bot${this.opts.botToken}/${filePath}`;
+		// `filePath` is remote metadata from getFile; reject suspicious segments
+		// (traversal/absolute/backslash) and percent-encode each component before
+		// composing the download URL.
+		if (filePath.includes("..") || filePath.startsWith("/") || filePath.includes("\\")) {
+			logger.warn("notifications: rejecting suspicious Telegram file_path");
+			return undefined;
+		}
+		const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+		const url = `${apiBase}/file/bot${this.opts.botToken}/${encodedPath}`;
 		try {
 			const res = await fetchImpl(url);
 			if (!res.ok) return undefined;
@@ -973,8 +981,9 @@ export class TelegramNotificationDaemon {
 			} else {
 				const safeBase =
 					(att.fileName?.trim() || path.basename(filePath) || `${att.kind}-${att.fileId}`)
-						.replace(/[^\w.-]+/g, "_")
-						.replace(/^\.+/, "_")
+						.replace(/[^\w.-]+/g, "_") // drop path separators and unusual chars
+						.replace(/\.\.+/g, "_") // neutralize any ".." traversal-looking runs
+						.replace(/^[.-]+/, "_") // no leading dot/hyphen
 						.slice(-128) || "file";
 				const dir = await this.ensureAttachmentDir(sessionId);
 				// Unguessable, non-colliding name inside the private 0700 dir; the
