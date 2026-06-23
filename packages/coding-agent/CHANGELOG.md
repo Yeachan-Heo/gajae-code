@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
 ### Fixed
 
 - Fixed packaged source installs (`gajae-code` wrapper) failing `gjc --smoke-test` because native smoke/fallback imports used monorepo-relative paths instead of the `@gajae-code/natives` package export.

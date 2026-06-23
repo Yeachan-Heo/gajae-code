@@ -21,12 +21,14 @@ describe("web search config schema", () => {
 		expect(fallback.type).toBe("array");
 		expect(fallback.items?.enum).toContain("exa");
 		expect(fallback.items?.enum).toContain("xai");
+		expect(fallback.items?.enum).toContain("insane");
 		expect(fallback.items?.enum).not.toContain("openai-compatible");
 		expect(isConfigurableSearchProviderId("openai-compatible")).toBe(false);
 		expect(isSearchProviderPreference("openai-compatible")).toBe(false);
 		expect(isConfigurableSearchProviderId("xai")).toBe(true);
 		expect(isSearchProviderPreference("xai")).toBe(true);
 		expect(CONFIGURABLE_SEARCH_PROVIDER_IDS).toContain("xai");
+		expect(CONFIGURABLE_SEARCH_PROVIDER_IDS).toContain("insane");
 		expect(isSearchProviderId("xai")).toBe(true);
 		expect(isSearchProviderId("openai-compatible")).toBe(true);
 	});
@@ -36,5 +38,7 @@ describe("web search config schema", () => {
 		expect(webSearch.type).toBe("enum");
 		expect(webSearch.values).toContain("xai");
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "xai", label: "xAI" }));
+		expect(webSearch.values).toContain("insane");
+		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "insane", label: "Insane" }));
 	});
 });
