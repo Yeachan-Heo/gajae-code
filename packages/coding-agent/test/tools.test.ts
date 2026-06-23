@@ -1349,7 +1349,7 @@ function b() {
 			const controller = new AbortController();
 			const promise = bashTool.execute(
 				"test-call-10-abort",
-				{ command: "printf 'started\\n'; sleep 60" },
+				{ command: "printf 'started\\n'; sleep 60", timeout: 3 },
 				controller.signal,
 				update => {
 					if (update.content?.some(content => content.type === "text" && content.text.includes("started"))) {
