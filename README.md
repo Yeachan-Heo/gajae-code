@@ -164,6 +164,7 @@ Add `gjc team ...` only when coordinated tmux workers materially help.
 - **Execute with evidence**: `ultragoal` tracks goals, revisions, checks, and completion evidence.
 - **Parallelize when useful**: `team` coordinates tmux-backed workers for larger tasks.
 - **Stay external and reviewable**: run from a chosen repo or worktree without patching another agent runtime.
+- **Query the codebase as a graph (optional)**: install [CodeGraph](https://github.com/colbymchenry/codegraph) and `codegraph init` a project to unlock the read-only `codegraph` tool — `explore` for surgical "how does X work" context plus `search`/`callers`/`callees`/`impact` queries. See [`docs/tools/codegraph.md`](docs/tools/codegraph.md).
 
 ## Workflow surface
 

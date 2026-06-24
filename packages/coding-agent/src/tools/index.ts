@@ -37,6 +37,7 @@ import type { BashRestrictionProfile } from "./bash-allowed-prefixes";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { CodegraphTool } from "./codegraph";
 import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
 import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
@@ -76,6 +77,7 @@ export * from "./bash";
 export * from "./browser";
 export * from "./calculator";
 export * from "./checkpoint";
+export * from "./codegraph";
 export * from "./computer";
 export * from "./cron";
 export * from "./debug";
@@ -384,6 +386,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	calc: s => new CalculatorTool(s),
 	ssh: loadSshTool,
 	github: GithubTool.createIf,
+	codegraph: CodegraphTool.createIf,
 	find: s => new FindTool(s),
 	search: s => new SearchTool(s),
 	lsp: LspTool.createIf,

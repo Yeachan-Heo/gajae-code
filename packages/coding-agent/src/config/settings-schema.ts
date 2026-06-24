@@ -2071,6 +2071,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"codegraph.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "CodeGraph",
+			description:
+				"Enable the codegraph tool when the `codegraph` CLI is installed and the project has been indexed (a .codegraph/ directory exists)",
+		},
+	},
+
 	"inspect_image.enabled": {
 		type: "boolean",
 		default: false,

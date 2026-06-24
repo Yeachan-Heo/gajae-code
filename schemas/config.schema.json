@@ -1613,6 +1613,17 @@
 			},
 			"additionalProperties": false
 		},
+		"codegraph": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the codegraph tool when the `codegraph` CLI is installed and the project has been indexed (a .codegraph/ directory exists)",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"inspect_image": {
 			"type": "object",
 			"properties": {

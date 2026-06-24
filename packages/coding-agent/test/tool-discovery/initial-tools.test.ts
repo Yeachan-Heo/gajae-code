@@ -7,6 +7,7 @@ import {
 	AskTool,
 	BUILTIN_CAPABILITY_CATALOG,
 	BUILTIN_TOOLS,
+	CodegraphTool,
 	ComputerTool,
 	computeEssentialBuiltinNames,
 	createTools,
@@ -99,6 +100,7 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 		new RecipeTool(toolSession, []),
 		new IrcTool(toolSession),
 		new TelegramSendTool(toolSession),
+		new CodegraphTool(toolSession),
 	]) {
 		metadata.set(tool.name, { loadMode: tool.loadMode, summary: tool.summary });
 	}

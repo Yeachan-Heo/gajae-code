@@ -9,6 +9,7 @@
 - Added Discord and Slack notification adapters alongside the existing Telegram surface, so action-needed signals and replies can be routed to those clients (#1043).
 - Telegram daemon now supports inbound and outbound photo/file attachments, forwarding agent images and accepting user-sent media (#1053).
 - `gjc` verifies Telegram Threaded Mode during notification setup and falls back to a flat private chat when topics are unavailable (#1029).
+- Added a read-only `codegraph` tool that integrates [CodeGraph](https://github.com/colbymchenry/codegraph), a local code knowledge graph, by wrapping its CLI. Exposes `explore` (surgical "how does X work" context — relevant source plus call paths and blast radius in one call), plus `search`/`callers`/`callees`/`impact`/`status` queries, so the agent can answer structural questions with far fewer `grep`/`read` calls. Registers only when the `codegraph` binary is on `PATH` and the project has a `.codegraph/` index; gated by the `codegraph.enabled` setting (default true).
 
 ### Fixed
 
