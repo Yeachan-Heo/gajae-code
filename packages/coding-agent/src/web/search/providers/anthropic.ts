@@ -193,7 +193,7 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 			if (block.input?.query) {
 				searchQueries.push(block.input.query);
 			}
-		} else if (block.type === "web_search_tool_result" && block.content) {
+		} else if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
 			// Search results
 			for (const result of block.content) {
 				if (result.type === "web_search_result") {
@@ -245,7 +245,15 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 function anthropicSearchPerformed(response: AnthropicApiResponse): boolean {
 	if (response.usage?.server_tool_use?.web_search_requests) return true;
 	for (const block of response.content ?? []) {
-		if (block.type === "web_search_tool_result") return true;
+		if (block.type === "web_search_tool_result") {
+			// `content` is an array of results on success but an error OBJECT
+			// (`web_search_tool_result_error`) on failure; only count a result
+			// array with at least one real result as proof of search.
+			if (Array.isArray(block.content) && block.content.some(result => result.type === "web_search_result")) {
+				return true;
+			}
+			continue;
+		}
 		if (
 			block.type === "server_tool_use" &&
 			block.name &&

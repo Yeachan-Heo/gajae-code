@@ -164,6 +164,15 @@ export interface AnthropicCitation {
 	encrypted_index: string;
 }
 
+/**
+ * Error payload returned in `web_search_tool_result.content` when a server-side
+ * web search fails. Unlike the success case, this is an object, not an array.
+ */
+export interface AnthropicWebSearchToolResultError {
+	type: "web_search_tool_result_error";
+	error_code?: string;
+}
+
 export interface AnthropicContentBlock {
 	type: string;
 	/** Text content (for type="text") */
@@ -174,8 +183,8 @@ export interface AnthropicContentBlock {
 	name?: string;
 	/** Tool input (for type="server_tool_use") */
 	input?: { query: string };
-	/** Search results (for type="web_search_tool_result") */
-	content?: AnthropicSearchResult[];
+	/** Search results array on success, or an error object on failure (type="web_search_tool_result") */
+	content?: AnthropicSearchResult[] | AnthropicWebSearchToolResultError;
 }
 
 export interface AnthropicApiResponse {
