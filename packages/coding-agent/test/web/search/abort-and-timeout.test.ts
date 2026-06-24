@@ -74,7 +74,9 @@ describe("Anthropic provider hard-timeout wiring", () => {
 			});
 		});
 
-		await searchAnthropic({ query: "ping", system_prompt: "" }, fakeStorage);
+		// The non-search "ok" response now fails closed (424) after fetch; the
+		// captured signal is set during fetch, so swallow the throw here.
+		await searchAnthropic({ query: "ping", system_prompt: "" }, fakeStorage).catch(() => {});
 
 		// Without the hard-timeout wrapper, init.signal would be undefined when
 		// the caller didn't supply one — leaving fetch with no cancellation at
@@ -96,7 +98,7 @@ describe("Anthropic provider hard-timeout wiring", () => {
 			});
 		});
 
-		await searchAnthropic({ query: "ping", system_prompt: "", signal: ac.signal }, fakeStorage);
+		await searchAnthropic({ query: "ping", system_prompt: "", signal: ac.signal }, fakeStorage).catch(() => {});
 
 		// The signal handed to fetch must be a *composed* one, not the raw
 		// caller signal: that's what guarantees the hard timeout fires even

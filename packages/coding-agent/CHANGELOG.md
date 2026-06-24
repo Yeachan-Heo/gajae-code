@@ -10,6 +10,7 @@
 ### Fixed
 
 - Hardened context-overflow recovery so automatic maintenance clears the TUI loader, surfaces overflow completion/skip status, retries resumable tails safely, and falls back to the synthetic auto-continue prompt for non-resumable tails when enabled.
+- `web_search` native providers no longer discard genuinely grounded answers that omit structured `url_citation` annotations: when a search demonstrably ran — Responses `web_search_call` / `tool_usage.web_search`, a Chat Completions search request, or Anthropic `web_search_tool_result` / `server_tool_use` / `server_tool_use.web_search_requests` — sources are recovered from inline markdown links and bare URLs. Inline recovery is gated on that real-search signal so a stray prose URL in a non-search answer is never promoted to a citation, and Anthropic now fails closed to DuckDuckGo when Claude answers from stable knowledge without searching. Inline-citation helpers are shared via `providers/text-citations.ts`.
 
 ## [0.7.1] - 2026-06-23
 ### Fixed

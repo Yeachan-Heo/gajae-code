@@ -139,6 +139,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - `max_tokens` and `temperature` pass through.
     - `limit` and `num_search_results` are collapsed together before dispatch: `num_results = params.numSearchResults ?? params.limit`.
     - Output may include `answer`, `sources`, `citations`, `searchQueries`, `usage.searchRequests`, `model`, `requestId`.
+    - When a search ran (`web_search_tool_result` / `server_tool_use` / `usage.server_tool_use.web_search_requests`) but only inline citations were emitted, sources are recovered from the answer text via `providers/text-citations.ts`. If no search ran and nothing is grounded, it fails closed (`424`) so the chain falls through to DuckDuckGo.
   - **Gemini** — `packages/coding-agent/src/web/search/providers/gemini.ts`
     - Availability: OAuth credentials in `agent.db` for `google-gemini-cli` or `google-antigravity`.
     - Querying: SSE `streamGenerateContent` call with Google Search grounding enabled. Antigravity auth tries two fallback endpoints and retries `401/403/400 invalid auth` once after token refresh; `429/5xx` retry with exponential backoff and server-provided retry delay, capped by a `5 * 60 * 1000` ms rate-limit budget.

@@ -2,7 +2,21 @@ import type { SearchCitation, SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
+import { extractTextSources } from "./text-citations";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
+
+/**
+ * Whether the response carries independent proof that a web search ran. Used to
+ * gate inline-citation recovery so a stray prose URL in a non-search answer is
+ * never promoted to a citation.
+ */
+function webSearchPerformed(json: any): boolean {
+	if (Array.isArray(json?.output) && json.output.some((item: any) => item?.type === "web_search_call")) {
+		return true;
+	}
+	const numRequests = json?.tool_usage?.web_search?.num_requests;
+	return typeof numRequests === "number" && numRequests > 0;
+}
 
 function endpoint(baseUrl: string, api: string): string {
 	const base = baseUrl.replace(/\/+$/, "");
@@ -135,14 +149,26 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 		}
 		const json = text ? JSON.parse(text) : {};
 		const citations = parseCitations(json);
-		if (citations.length === 0) {
+		const answer = textFromResponse(json);
+		const limit = params.limit ?? params.numSearchResults ?? 10;
+		let sources = toSources(citations, limit);
+		const searched = webSearchPerformed(json);
+		// When a search demonstrably ran (Responses `web_search_call` / `tool_usage`)
+		// or this is a Chat Completions search request, recover inline-cited sources
+		// from the answer text if the model omitted structured `url_citation`
+		// annotations. Gating on a real search signal preserves the guard against
+		// promoting a stray prose URL in a non-search answer to a citation.
+		if (sources.length === 0 && answer && (searched || ctx.api === "openai-completions")) {
+			sources = extractTextSources(answer).slice(0, limit);
+		}
+		if (sources.length === 0 && !searched) {
 			throw new SearchProviderError(this.id, "OpenAI-compatible web search returned no citations", 424);
 		}
 		return {
 			provider: this.id,
-			answer: textFromResponse(json),
-			sources: toSources(citations, params.limit ?? params.numSearchResults ?? 10),
-			citations,
+			answer,
+			sources,
+			citations: citations.length > 0 ? citations : undefined,
 			model,
 			requestId: json.id,
 			authMode: "api-key",

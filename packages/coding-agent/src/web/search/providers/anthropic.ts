@@ -25,6 +25,7 @@ import type {
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
+import { extractTextSources } from "./text-citations";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const DEFAULT_MODEL = "claude-haiku-4-5";
@@ -237,6 +238,26 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 }
 
 /**
+ * Whether the response carries proof that a web search actually ran: a
+ * `web_search_tool_result` block, a `web_search` server tool call, or a
+ * non-zero `server_tool_use.web_search_requests` usage counter.
+ */
+function anthropicSearchPerformed(response: AnthropicApiResponse): boolean {
+	if (response.usage?.server_tool_use?.web_search_requests) return true;
+	for (const block of response.content ?? []) {
+		if (block.type === "web_search_tool_result") return true;
+		if (
+			block.type === "server_tool_use" &&
+			block.name &&
+			stripClaudeToolPrefix(block.name) === WEB_SEARCH_TOOL_NAME
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Executes a web search using Anthropic's Anthropic model with built-in web search tool.
  * @param params - Search parameters including query and optional settings
  * @returns Search response with synthesized answer, sources, and citations
@@ -301,6 +322,21 @@ export async function searchAnthropic(
 	);
 
 	const result = parseResponse(response);
+	const searched = anthropicSearchPerformed(response);
+
+	// When a search ran but the model wrote its citations inline instead of as
+	// structured `web_search_result_location` blocks, recover sources from the
+	// answer text so a genuinely grounded result is not discarded.
+	if (result.sources.length === 0 && searched && result.answer) {
+		const inline = extractTextSources(result.answer);
+		if (inline.length > 0) result.sources = inline;
+	}
+
+	// Fail closed so the chain falls through to DuckDuckGo when Claude answered
+	// from stable knowledge without running a web search.
+	if (result.sources.length === 0 && !(result.citations && result.citations.length > 0) && !searched) {
+		throw new SearchProviderError("anthropic", "Anthropic web search returned no grounded sources", 424);
+	}
 
 	const numResults = "authStorage" in params ? (params.numSearchResults ?? params.limit) : params.num_results;
 	if (numResults && result.sources.length > numResults) {
