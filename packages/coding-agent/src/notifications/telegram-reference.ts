@@ -172,6 +172,8 @@ export type RouteDecision =
 export interface PendingAsk {
 	sessionId: string;
 	actionId: string;
+	/** True for synthetic menu asks (`menu:`, `submenu:`, `model:`) that accept button taps only. */
+	buttonOnly?: boolean;
 }
 
 export interface RouteInboundContext {
@@ -224,12 +226,12 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 	}
 
 	if (text) {
-		const allPending = ctx.pendingBySession(undefined);
-		if (allPending.length === 1) {
-			const [pending] = allPending;
+		const textReplyable = ctx.pendingBySession(undefined).filter(pending => !pending.buttonOnly);
+		if (textReplyable.length === 1) {
+			const [pending] = textReplyable;
 			return { kind: "reply", sessionId: pending!.sessionId, actionId: pending!.actionId, answer: text };
 		}
-		if (allPending.length > 1) return { kind: "stale", reason: "ambiguous_plain_text" };
+		if (textReplyable.length > 1) return { kind: "stale", reason: "ambiguous_plain_text" };
 	}
 
 	return { kind: "ignore" };

@@ -105,6 +105,16 @@ describe("telegram reference client helpers", () => {
 		});
 	});
 
+	test("routeInboundUpdate ignores plain text for button-only synthetic asks", () => {
+		const ctx = {
+			aliasTable: createAliasTable(),
+			messageRoutes: new Map(),
+			pendingBySession: () => [{ sessionId: "only", actionId: "submenu:abc", buttonOnly: true }],
+			pairedChatId: "42",
+		};
+		expect(routeInboundUpdate({ message: { chat: { id: 42 }, text: "typed" } }, ctx)).toEqual({ kind: "ignore" });
+	});
+
 	test("buildActionMessage renders ask with an inline keyboard", () => {
 		const m = buildActionMessage({ kind: "ask", id: "a1", question: "Proceed?", options: ["Yes", "No"] });
 		expect(m.text).toContain("Proceed?");

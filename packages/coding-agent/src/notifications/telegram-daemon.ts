@@ -6,6 +6,7 @@ import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
+import { isSyntheticActionId } from "./command-menu";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
@@ -562,7 +563,7 @@ interface SessionSocket {
 	sessionId: string;
 	token: string;
 	ws: WebSocket;
-	pending: Map<string, { sessionId: string; actionId: string }>;
+	pending: Map<string, { sessionId: string; actionId: string; buttonOnly?: boolean }>;
 	/** True once the server advertised the `client_ping_pong` capability. */
 	capable: boolean;
 	/** Timestamp (via opts.now) of the last received pong; seeds the TTL window. */
@@ -1056,7 +1057,12 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {
-			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: session.sessionId, actionId: msg.id });
+			if (msg.kind === "ask")
+				session.pending.set(msg.id, {
+					sessionId: session.sessionId,
+					actionId: msg.id,
+					buttonOnly: isSyntheticActionId(msg.id),
+				});
 			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
 			if (!topicId) return;
 			const rendered = buildActionMessage({
@@ -1139,11 +1145,13 @@ export class TelegramNotificationDaemon {
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const cfg = parseInThreadConfigCommand(inbound.text);
-					// A plain (non-config) message while an ask is pending for this session
-					// answers that ask as free-input — instead of starting a new user turn.
-					// Telegram asks always accept custom text (the SDK maps a string answer
-					// to the ask's custom-input slot), so route the latest pending ask here.
-					const pendingAsk = cfg ? undefined : [...session.pending.values()].at(-1);
+					// A plain (non-config) message while a free-text ask is pending answers
+					// that ask instead of starting a new user turn. Synthetic menu asks
+					// (`menu:`, `submenu:`, `model:`) are button-only and fall through to
+					// user_message injection below.
+					const pendingAsk = cfg
+						? undefined
+						: [...session.pending.values()].findLast(pending => !pending.buttonOnly);
 					if (pendingAsk) {
 						session.ws.send(
 							JSON.stringify({

@@ -448,6 +448,46 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 	});
 
+	test("plain text injects a user turn when a button-only menu ask is pending", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "submenu:test",
+			question: "Skills",
+			options: ["ralplan", "ultragoal"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 2,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "hello there", message_id: 101 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent).toContainEqual({
+			type: "user_message",
+			sessionId: "S",
+			text: "hello there",
+			token: "ts",
+			updateId: 2,
+			threadId: String(threadId),
+		});
+		expect(sent.some(frame => frame.type === "reply")).toBe(false);
+	});
+
 	test("plain text injects a user turn when no ask is pending", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();

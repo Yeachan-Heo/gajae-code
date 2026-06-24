@@ -17,6 +17,12 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import {
+	getMenuModelOptions,
+	getMenuSkillIds,
+	runMenuSkill,
+	setMenuModelByRef,
+} from "../../extensibility/extensions/menu-actions";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
@@ -131,6 +137,10 @@ export class ExtensionUiController {
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
+			getMenuSkillIds: () => getMenuSkillIds(this.ctx.session),
+			getMenuModelOptions: () => getMenuModelOptions(this.ctx.session),
+			runMenuSkill: (skillName, prompt) => runMenuSkill(this.ctx.session, skillName, prompt),
+			setMenuModelByRef: ref => setMenuModelByRef(this.ctx.session, ref),
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
@@ -375,6 +385,10 @@ export class ExtensionUiController {
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
+			getMenuSkillIds: () => getMenuSkillIds(this.ctx.session),
+			getMenuModelOptions: () => getMenuModelOptions(this.ctx.session),
+			runMenuSkill: (skillName, prompt) => runMenuSkill(this.ctx.session, skillName, prompt),
+			setMenuModelByRef: ref => setMenuModelByRef(this.ctx.session, ref),
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,

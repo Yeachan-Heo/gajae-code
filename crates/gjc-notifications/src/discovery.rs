@@ -209,6 +209,10 @@ fn now_millis() -> u64 {
 
 /// Whether a process id is currently alive (best-effort; `true` on non-unix).
 #[must_use]
+#[allow(
+	clippy::missing_const_for_fn,
+	reason = "Unix process probing calls libc::kill and cannot be const."
+)]
 pub fn is_process_alive(pid: u32) -> bool {
 	#[cfg(unix)]
 	{
@@ -256,6 +260,11 @@ fn harden_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+	clippy::missing_const_for_fn,
+	clippy::unnecessary_wraps,
+	reason = "Non-Unix hardening is a no-op but keeps the shared fallible call-site contract."
+)]
 fn harden_dir(_dir: &Path) -> std::io::Result<()> {
 	Ok(())
 }
@@ -267,6 +276,11 @@ fn harden_file(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+	clippy::missing_const_for_fn,
+	clippy::unnecessary_wraps,
+	reason = "Non-Unix hardening is a no-op but keeps the shared fallible call-site contract."
+)]
 fn harden_file(_path: &Path) -> std::io::Result<()> {
 	Ok(())
 }

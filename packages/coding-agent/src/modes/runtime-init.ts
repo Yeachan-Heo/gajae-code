@@ -8,6 +8,12 @@
  */
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import {
+	getMenuModelOptions,
+	getMenuSkillIds,
+	runMenuSkill,
+	setMenuModelByRef,
+} from "../extensibility/extensions/menu-actions";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
 
@@ -68,6 +74,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSessionName: async name => {
 				await session.sessionManager.setSessionName(name, "user");
 			},
+			getMenuSkillIds: () => getMenuSkillIds(session),
+			getMenuModelOptions: () => getMenuModelOptions(session),
+			runMenuSkill: (skillName, prompt) => runMenuSkill(session, skillName, prompt),
+			setMenuModelByRef: ref => setMenuModelByRef(session, ref),
 		},
 		// ExtensionContextActions
 		{

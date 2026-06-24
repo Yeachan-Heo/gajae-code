@@ -29,6 +29,8 @@ import { logger } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
 import { registerAskAnswerSource } from "../tools/ask-answer-registry";
+import { decideMenuInbound } from "./command-menu";
+import { CommandMenuRuntime } from "./command-menu-runtime";
 import {
 	getNotificationConfig,
 	isGloballyConfigured,
@@ -147,6 +149,8 @@ interface SessionRuntime {
 	/** Assistant text already flushed before an ask this turn (turn-scoped dedupe
 	 * so turn_end does not re-emit the pre-ask lead-in). Reset each turn. */
 	preAskFlushedText?: string;
+	/** Telegram `/menu` button-surface runtime (G004/G005); routes synthetic-action replies. */
+	menuRuntime?: CommandMenuRuntime;
 }
 
 interface ResolvedSettings {
@@ -276,8 +280,75 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// unattended gate), so the endpoint advertises a resolver.
 		const server = new NotificationServer(id, resolveToken(), stateRoot, true);
 
+		// Telegram `/menu` button surface. Hosts with an AgentSession wire skill/model
+		// actions; other hosts get a plain "not wired" message.
+		const postThreadMessage = (text: string): void => {
+			try {
+				server.pushFrame(JSON.stringify({ type: "turn_stream", sessionId: id, phase: "finalized", text }));
+			} catch (e) {
+				logger.warn(`notifications: menu postMessage failed: ${String(e)}`);
+			}
+		};
+		const menuRuntime = new CommandMenuRuntime({
+			allowedSkillIds: () => api.getMenuSkillIds?.() ?? [],
+			recentModels: () => api.getMenuModelOptions?.() ?? [],
+			registerAsk: (actionId, question, options) => {
+				server.registerAsk(
+					JSON.stringify(
+						notificationActionPayload(
+							{ id: actionId, kind: "ask", sessionId: id, question, options },
+							{ redact, sessionTag: tag },
+						),
+					),
+					true,
+				);
+			},
+			postMessage: postThreadMessage,
+			runSkill: async (skillName, prompt) => {
+				if (api.runMenuSkill) {
+					await api.runMenuSkill(skillName, prompt);
+					return;
+				}
+				postThreadMessage(
+					`Skill execution over Telegram is not wired in this runtime yet. Run /skill:${skillName} locally.`,
+				);
+			},
+			setModelTemporary: async ref => {
+				if (api.setMenuModelByRef) return api.setMenuModelByRef(ref);
+				postThreadMessage("Temporary model switching over Telegram is not wired in this runtime yet.");
+				throw new Error("setModelTemporary not available in this runtime");
+			},
+		});
+
 		server.onReply((err, reply) => {
 			if (err || !reply) return;
+			// 0) Telegram `/menu` synthetic action (namespaced id; never collides
+			// with a real workflow ask). Routed BEFORE interactive-ask/gate handling.
+			if (menuRuntime.owns(reply.id)) {
+				const parsed = parseAnswer(reply.answerJson);
+				const answer: number | string =
+					typeof parsed === "number" || typeof parsed === "string" ? parsed : String(parsed);
+				menuRuntime
+					.handleReply(reply.id, answer)
+					.then(outcome => {
+						try {
+							if (outcome.kind === "resolved") {
+								server.resolveClient(reply.id, reply.answerJson, reply.idempotencyKey ?? undefined);
+							} else {
+								server.reject(reply.id, "invalid_answer");
+							}
+						} catch (e) {
+							logger.warn(`notifications: menu resolve failed: ${String(e)}`);
+						}
+					})
+					.catch(e => {
+						logger.warn(`notifications: menu handleReply failed: ${String(e)}`);
+						try {
+							server.reject(reply.id, "invalid_answer");
+						} catch {}
+					});
+				return;
+			}
 			// 1) Interactive ask awaiting a remote answer.
 			const pending = pendingInteractive.get(reply.id);
 			if (pending) {
@@ -318,6 +389,23 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		server.onInbound((err, inbound) => {
 			if (err || !inbound) return;
 			if (inbound.kind === "user_message" && inbound.text) {
+				// `/menu` button surface: open the palette, redirect a raw typed
+				// command to menu guidance, or pass ordinary text through to the
+				// agent as a user turn. Synthetic-action button taps come back via
+				// onReply (handled above), not here.
+				const menuDecision = decideMenuInbound(inbound.text);
+				if (menuDecision.kind === "open_menu") {
+					menuRuntime.openTopLevelMenu();
+					return;
+				}
+				if (menuDecision.kind === "guidance") {
+					postThreadMessage(menuDecision.message);
+					return;
+				}
+				if (menuRuntime.hasPendingSkillPrompt) {
+					void menuRuntime.consumePendingSkillPrompt(inbound.text);
+					return;
+				}
 				// Inject as a user turn (steers/continues the agent; the resulting
 				// turn streams back via the turn_end handler even when not idle).
 				// Record the update id so it can be acked as "consumed" on the next
@@ -382,6 +470,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 				sessionTag: tag,
 				busy: false,
 				pendingInbound: new Set<number>(),
+				menuRuntime,
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url} (unattended=${unattended})`);
 

@@ -1028,6 +1028,16 @@ export interface ExtensionAPI {
 	/** Set the current model. Returns false if no API key available. */
 	setModel(model: Model): Promise<boolean>;
 
+	/**
+	 * Telegram `/menu` button surface (optional; present when the host wires a
+	 * session into the extension runtime). The notifications extension
+	 * feature-detects these to execute skills and switch the temporary model.
+	 */
+	getMenuSkillIds?(): string[];
+	getMenuModelOptions?(): MenuModelOption[];
+	runMenuSkill?(skillName: string, prompt: string): Promise<void>;
+	setMenuModelByRef?(ref: string): Promise<{ previous?: string; next: string }>;
+
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel | undefined;
 
@@ -1213,6 +1223,13 @@ export interface ExtensionRuntimeState {
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
 }
 
+/** A model option shown in the Telegram `/menu` model picker. */
+export interface MenuModelOption {
+	ref: string;
+	label: string;
+	current?: boolean;
+}
+
 /** Action implementations for ExtensionAPI methods. */
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
@@ -1228,6 +1245,11 @@ export interface ExtensionActions {
 	setThinkingLevel: SetThinkingLevelHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
+	/** Telegram `/menu` button surface (optional; present when the host wires a session). */
+	getMenuSkillIds?: () => string[];
+	getMenuModelOptions?: () => MenuModelOption[];
+	runMenuSkill?: (skillName: string, prompt: string) => Promise<void>;
+	setMenuModelByRef?: (ref: string) => Promise<{ previous?: string; next: string }>;
 }
 
 /** Actions for ExtensionContext (ctx.* in event handlers). */

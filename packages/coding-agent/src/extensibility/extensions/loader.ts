@@ -237,6 +237,22 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setModel(model);
 	}
 
+	getMenuSkillIds(): string[] {
+		return this.runtime.getMenuSkillIds?.() ?? [];
+	}
+
+	getMenuModelOptions(): import("./types").MenuModelOption[] {
+		return this.runtime.getMenuModelOptions?.() ?? [];
+	}
+
+	runMenuSkill(skillName: string, prompt: string): Promise<void> {
+		return this.runtime.runMenuSkill?.(skillName, prompt) ?? Promise.resolve();
+	}
+
+	setMenuModelByRef(ref: string): Promise<{ previous?: string; next: string }> {
+		return this.runtime.setMenuModelByRef?.(ref) ?? Promise.reject(new Error("model switching not available"));
+	}
+
 	getThinkingLevel(): ThinkingLevel | undefined {
 		return this.runtime.getThinkingLevel();
 	}

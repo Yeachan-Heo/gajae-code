@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a Telegram `/menu` button-first command surface for Skills, Model, and Notify actions while redirecting unsafe typed slash commands to guided menu choices.
+
+## [0.7.2] - 2026-06-24
+### Added
+
+- Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
+- `web_search` `auto` mode now drives native provider search over proxies/custom endpoints by reusing the active model's own credential + baseUrl when canonical native creds are absent: `activeContextNativeId()` matches the model's wire api (+ model-id family) to `anthropic` (anthropic-messages), `openai-compatible` (openai-responses/completions), or `gemini` (google-generative-ai Generative Language), each falling back to DuckDuckGo if the endpoint does not support web search.
+- Added built-in C# LSP detection for `csharp-ls`, with `omnisharp` preserved as a fallback when `csharp-ls` is unavailable (#1054).
+- Added Discord and Slack notification adapters alongside the existing Telegram surface, so action-needed signals and replies can be routed to those clients (#1043).
+- Telegram daemon now supports inbound and outbound photo/file attachments, forwarding agent images and accepting user-sent media (#1053).
+- `gjc` verifies Telegram Threaded Mode during notification setup and falls back to a flat private chat when topics are unavailable (#1029).
+
+### Fixed
+
+- Hardened context-overflow recovery so automatic maintenance clears the TUI loader, surfaces overflow completion/skip status, retries resumable tails safely, and falls back to the synthetic auto-continue prompt for non-resumable tails when enabled.
+- `web_search` native providers no longer discard genuinely grounded answers that omit structured `url_citation` annotations: when a search demonstrably ran — Responses `web_search_call` / `tool_usage.web_search`, a Chat Completions search request, or Anthropic `web_search_tool_result` / `server_tool_use` / `server_tool_use.web_search_requests` — sources are recovered from inline markdown links and bare URLs. Inline recovery is gated on that real-search signal so a stray prose URL in a non-search answer is never promoted to a citation, and Anthropic now fails closed to DuckDuckGo when Claude answers from stable knowledge without searching. Inline-citation helpers are shared via `providers/text-citations.ts`.
+- Preserve GJC-managed tmux sessions on attach/disconnect instead of tearing them down, and stop implicitly attaching on launch (#1063).
+- Corrected the auto-compaction output reserve so post-compaction responses keep adequate headroom (#1021).
+- Improved active-input shortcut hints and the busy-input queueing hint for clearer in-session guidance (#1022, #1024).
+
 ## [0.7.1] - 2026-06-23
 ### Fixed
 

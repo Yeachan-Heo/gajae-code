@@ -228,6 +228,11 @@ export class ExtensionRunner {
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setSessionName = actions.setSessionName;
+		// Telegram /menu surface (optional; no-op when the host does not provide them).
+		this.runtime.getMenuSkillIds = actions.getMenuSkillIds;
+		this.runtime.getMenuModelOptions = actions.getMenuModelOptions;
+		this.runtime.runMenuSkill = actions.runMenuSkill;
+		this.runtime.setMenuModelByRef = actions.setMenuModelByRef;
 
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;

@@ -111,9 +111,7 @@ mod imp {
 		let resolved = if path.is_absolute() {
 			path.to_path_buf()
 		} else {
-			std::env::current_dir()
-				.map(|cwd| cwd.join(path))
-				.unwrap_or_else(|_| path.to_path_buf())
+			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 		};
 		let meta = fs::metadata(&resolved).map_err(|err| {
 			IsoError::other(format!("invalid block-clone source {}: {err}", resolved.display()))
@@ -158,6 +156,11 @@ mod imp {
 		}
 	}
 
+	#[allow(
+		clippy::permissions_set_readonly_false,
+		reason = "Windows-only cleanup must clear FILE_ATTRIBUTE_READONLY before removing files and \
+		          directories."
+	)]
 	fn clear_readonly(path: &Path, meta: &fs::Metadata) {
 		if meta.file_type().is_symlink() {
 			return;

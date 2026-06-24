@@ -553,7 +553,7 @@ mod imp {
 			};
 
 			if matched {
-				let extended_info = symlink_extended_info(entry.symlink_target.as_deref());
+				let extended_info = entry.symlink_target.as_deref().map(symlink_extended_info);
 				let extended_info_ptr = extended_info
 					.as_ref()
 					.map_or(std::ptr::null(), |info| info as *const _);
@@ -599,7 +599,7 @@ mod imp {
 			Ok(target) => target,
 			Err(err) => return io_error_to_hresult(&err),
 		};
-		let extended_info = symlink_extended_info(symlink_target.as_deref());
+		let extended_info = symlink_target.as_deref().map(symlink_extended_info);
 		let extended_info_ptr = extended_info
 			.as_ref()
 			.map_or(std::ptr::null(), |info| info as *const _);
@@ -782,14 +782,14 @@ mod imp {
 		Ok(Some(target))
 	}
 
-	fn symlink_extended_info(target: Option<&[u16]>) -> Option<PRJ_EXTENDED_INFO> {
-		target.map(|target| PRJ_EXTENDED_INFO {
+	const fn symlink_extended_info(target: &[u16]) -> PRJ_EXTENDED_INFO {
+		PRJ_EXTENDED_INFO {
 			InfoType:       PRJ_EXT_INFO_TYPE_SYMLINK,
 			NextInfoOffset: 0,
 			Anonymous:      PRJ_EXTENDED_INFO_0 {
 				Symlink: PRJ_EXTENDED_INFO_0_0 { TargetName: target.as_ptr() },
 			},
-		})
+		}
 	}
 
 	fn callback_relative_path(callback_data: &PRJ_CALLBACK_DATA) -> PathBuf {

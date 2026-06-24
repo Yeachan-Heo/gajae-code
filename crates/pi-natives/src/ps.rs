@@ -166,7 +166,7 @@ impl Process {
 
 	/// Process group id for this process, when supported by the platform.
 	#[napi]
-	pub fn group_id(&self) -> Option<i32> {
+	pub const fn group_id(&self) -> Option<i32> {
 		self.inner.group_id()
 	}
 
