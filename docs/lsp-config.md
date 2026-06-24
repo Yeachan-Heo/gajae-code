@@ -179,6 +179,8 @@ Place the override in `<project>/.gjc/lsp.json`:
 
 The user-level config in `~/.gjc/agent/lsp.json` is unaffected; pylsp is only suppressed in this project.
 
+When multiple built-in primary servers support the same file, a default server can list lower-precedence servers in `supersedes`. For example, `csharp-ls` supersedes `omnisharp` only when both C# servers are installed and detected; if `csharp-ls` is unavailable, `omnisharp` remains the fallback.
+
 ## Built-in server list
 
 The following servers ship in `defaults.json` and are eligible for auto-detection:
@@ -219,6 +221,7 @@ The following servers ship in `defaults.json` and are eligible for auto-detectio
 | `lua-language-server` | Lua | `lua-language-server` |
 | `intelephense` | PHP | `intelephense` |
 | `phpactor` | PHP | `phpactor` |
+| `csharp-ls` | C# | `csharp-ls` |
 | `omnisharp` | C# | `omnisharp` |
 | `yamlls` | YAML | `yaml-language-server` |
 | `terraformls` | Terraform | `terraform-ls` |

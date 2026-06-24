@@ -88,6 +88,7 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 		: isRecord(config.initializationOptions)
 			? config.initializationOptions
 			: undefined;
+	const supersedes = normalizeStringArray(config.supersedes);
 
 	return {
 		...config,
@@ -96,6 +97,7 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 		fileTypes,
 		rootMarkers,
 		...(initOptions ? { initOptions } : {}),
+		...(supersedes ? { supersedes } : {}),
 	};
 }
 
@@ -142,6 +144,18 @@ function mergeServers(
 		}
 	}
 	return merged;
+}
+
+function applyServerPrecedence(servers: Record<string, ServerConfig>): Record<string, ServerConfig> {
+	const suppressed = new Set<string>();
+	for (const config of Object.values(servers)) {
+		for (const serverName of config.supersedes ?? []) {
+			suppressed.add(serverName);
+		}
+	}
+	if (suppressed.size === 0) return servers;
+
+	return Object.fromEntries(Object.entries(servers).filter(([name]) => !suppressed.has(name)));
 }
 
 function applyRuntimeDefaults(servers: Record<string, ServerConfig>): Record<string, ServerConfig> {
@@ -422,9 +436,8 @@ export function loadConfig(cwd: string): LspConfig {
 			detected[name] = { ...config, resolvedCommand: resolved };
 		}
 
-		return { servers: detected, idleTimeoutMs };
+		return { servers: applyServerPrecedence(detected), idleTimeoutMs };
 	}
-
 	// Merge overrides with defaults and filter to available servers
 	const mergedWithRuntime = applyRuntimeDefaults(mergedServers);
 	const available: Record<string, ServerConfig> = {};
@@ -437,7 +450,7 @@ export function loadConfig(cwd: string): LspConfig {
 		available[name] = { ...config, resolvedCommand: resolved };
 	}
 
-	return { servers: available, idleTimeoutMs };
+	return { servers: applyServerPrecedence(available), idleTimeoutMs };
 }
 
 // =============================================================================

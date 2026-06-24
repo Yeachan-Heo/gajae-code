@@ -358,6 +358,8 @@ export interface ServerConfig {
 	/** Per-server warmup timeout in milliseconds. Overrides the global WARMUP_TIMEOUT_MS for this server during startup. */
 	warmupTimeoutMs?: number;
 	capabilities?: ServerCapabilities;
+	/** Names of lower-precedence servers to drop when this server is available. */
+	supersedes?: string[];
 	/** If true, this is a linter/formatter server (e.g., Biome) - used only for diagnostics/actions, not type intelligence */
 	isLinter?: boolean;
 	/** Resolved absolute path to the command binary (set during config loading) */

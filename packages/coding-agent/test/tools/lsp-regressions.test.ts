@@ -423,17 +423,47 @@ describe("lsp regressions", () => {
 		}
 	});
 
-	it("keeps config-only marketplace LSP servers quarantined from default loading", async () => {
-		const tempDir = TempDir.createSync("@gjc-lsp-marketplace-config-");
+	it("detects csharp-ls as the preferred C# LSP when installed", async () => {
+		const tempDir = TempDir.createSync("@gjc-lsp-csharp-ls-");
 		const cwd = path.join(tempDir.path(), "repo");
 		try {
 			await fs.promises.mkdir(cwd, { recursive: true });
 			await Bun.write(path.join(cwd, "Example.csproj"), "<Project />\n");
 
+			const whichSpy = vi.spyOn(piUtils, "$which").mockImplementation(command => {
+				if (command === "csharp-ls") return "/usr/local/bin/csharp-ls";
+				if (command === "omnisharp") return "/usr/local/bin/omnisharp";
+				return null;
+			});
+
+			const config = loadConfig(cwd);
+
+			expect(config.servers["csharp-ls"]?.resolvedCommand).toBe("/usr/local/bin/csharp-ls");
+			expect(config.servers.omnisharp).toBeUndefined();
+			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual(["csharp-ls"]);
+			expect(whichSpy).toHaveBeenCalledWith("csharp-ls");
+			expect(whichSpy).toHaveBeenCalledWith("omnisharp");
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("keeps omnisharp as the C# fallback when csharp-ls is unavailable", async () => {
+		const tempDir = TempDir.createSync("@gjc-lsp-omnisharp-fallback-");
+		const cwd = path.join(tempDir.path(), "repo");
+		try {
+			await fs.promises.mkdir(cwd, { recursive: true });
+			await Bun.write(path.join(cwd, "Example.csproj"), "<Project />\n");
+
+			vi.spyOn(piUtils, "$which").mockImplementation(command =>
+				command === "omnisharp" ? "/usr/local/bin/omnisharp" : null,
+			);
+
 			const config = loadConfig(cwd);
 
 			expect(config.servers["csharp-ls"]).toBeUndefined();
-			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual([]);
+			expect(config.servers.omnisharp?.resolvedCommand).toBe("/usr/local/bin/omnisharp");
+			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual(["omnisharp"]);
 		} finally {
 			tempDir.removeSync();
 		}

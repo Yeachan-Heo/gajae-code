@@ -342,6 +342,13 @@
 		"fileTypes": [".php"],
 		"rootMarkers": ["composer.json", ".phpactor.json", ".phpactor.yml"]
 	},
+	"csharp-ls": {
+		"command": "csharp-ls",
+		"args": [],
+		"fileTypes": [".cs", ".csx"],
+		"rootMarkers": ["*.sln", "*.slnx", "*.csproj", "global.json"],
+		"supersedes": ["omnisharp"]
+	},
 	"omnisharp": {
 		"command": "omnisharp",
 		"args": ["-z", "--hostPID", "$PID", "--encoding", "utf-8", "--languageserver"],
