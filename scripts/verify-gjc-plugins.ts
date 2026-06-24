@@ -54,12 +54,13 @@ const codexManifest = path.join(PLUGIN_DIR, ".codex-plugin", "plugin.json");
 const claudeMcp = path.join(PLUGIN_DIR, ".mcp.json");
 const codexMcp = path.join(PLUGIN_DIR, ".codex.mcp.json");
 const skill = path.join(PLUGIN_DIR, "skills", "gjc-delegation", "SKILL.md");
+const sessionSkill = path.join(PLUGIN_DIR, "skills", "gjc-session", "SKILL.md");
 const codexMarketplace = path.join(".agents", "plugins", "marketplace.json");
 const claudeMarketplace = path.join(".claude-plugin", "marketplace.json");
 
 gate(
 	"nested plugin layout present",
-	[claudeManifest, codexManifest, claudeMcp, codexMcp, skill].every(rel => files.has(rel)),
+	[claudeManifest, codexManifest, claudeMcp, codexMcp, skill, sessionSkill].every(rel => files.has(rel)),
 	`plugin folder ./${PLUGIN_DIR}/`,
 );
 gate(
@@ -129,6 +130,27 @@ for (const tool of delegateTools) {
 	if (!referenced) docsReferenceTools = false;
 }
 gate("docs reference delegate tools", docsReferenceTools, "command/skill docs mention each delegate tool");
+
+const sessionSkillText = read(sessionSkill);
+const sessionHelperRefs = [
+	"scripts/gjc-session/create.sh",
+	"scripts/gjc-session/prompt.sh",
+	"scripts/gjc-session/tail.sh",
+	"scripts/gjc-session/harness-tmux-owner-start.sh",
+	"docs/gjc-session-clawhip-routing.md",
+];
+gate(
+	"gjc-session skill references public helpers",
+	sessionHelperRefs.every(ref => sessionSkillText.includes(ref)),
+	sessionHelperRefs.join(", "),
+);
+gate(
+	"gjc-session skill keeps routing values runtime-owned",
+	sessionSkillText.includes("runtime inputs") &&
+		sessionSkillText.includes("Never hard-code private ids") &&
+		!/[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/u.test(sessionSkillText),
+	"no embedded credentials or private routing values",
+);
 
 let failures = 0;
 for (const result of results) {
