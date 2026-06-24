@@ -8,6 +8,7 @@ import { shortenPath } from "../../tools/render-utils";
 import * as git from "../../utils/git";
 import { sanitizeStatusText } from "../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./status-line/context-thresholds";
+import { resolveCurrentBranch } from "./status-line/git-utils";
 
 /**
  * Footer component that shows pwd, token stats, and context usage
@@ -103,9 +104,7 @@ export class FooterComponent implements Component {
 			return this.#cachedBranch;
 		}
 
-		const headState = git.head.resolveSync(getProjectDir());
-		this.#cachedBranch =
-			headState === null ? null : headState.kind === "ref" ? (headState.branchName ?? headState.ref) : "detached";
+		this.#cachedBranch = resolveCurrentBranch(getProjectDir()).branch;
 		return this.#cachedBranch;
 	}
 

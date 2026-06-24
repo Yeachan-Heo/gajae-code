@@ -20,6 +20,7 @@ import {
 	createPrCacheContext,
 	isSamePrCacheContext,
 	type PrCacheContext,
+	resolveCurrentBranch,
 } from "./status-line/git-utils";
 import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
@@ -303,19 +304,13 @@ export class StatusLineComponent implements Component {
 		this.#cachedPrContext = undefined;
 	}
 	#getCurrentBranch(): string | null {
-		const head = git.head.resolveSync(getProjectDir());
-		const gitHeadPath = head?.headPath ?? null;
-		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === gitHeadPath) {
+		const current = resolveCurrentBranch(getProjectDir());
+		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === current.repoId) {
 			return this.#cachedBranch;
 		}
 
-		this.#cachedBranchRepoId = gitHeadPath;
-		if (!head) {
-			this.#cachedBranch = null;
-			return null;
-		}
-
-		this.#cachedBranch = head.kind === "ref" ? (head.branchName ?? head.ref) : "detached";
+		this.#cachedBranchRepoId = current.repoId;
+		this.#cachedBranch = current.branch;
 
 		return this.#cachedBranch ?? null;
 	}
