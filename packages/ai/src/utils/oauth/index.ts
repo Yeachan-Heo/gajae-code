@@ -358,6 +358,7 @@ export async function refreshOAuthToken(
 		case "cerebras":
 		case "fireworks":
 		case "firepass":
+		case "fugu":
 		case "nvidia":
 		case "nanogpt":
 		case "synthetic":

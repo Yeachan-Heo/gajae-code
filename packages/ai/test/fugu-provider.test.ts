@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { getBundledModel } from "../src/models";
 import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { fuguModelManagerOptions } from "../src/provider-models/openai-compat";
 import { getEnvApiKey } from "../src/stream";
-import { getOAuthProviders } from "../src/utils/oauth";
+import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
 
 const originalFuguApiKey = Bun.env.FUGU_API_KEY;
 const originalFetch = global.fetch;
@@ -47,6 +51,48 @@ describe("Sakana Fugu provider support", () => {
 		expect((fugu.compat as { maxTokensField?: string } | undefined)?.maxTokensField).toBe("max_tokens");
 		expect(ultra.name).toBe("Sakana Fugu Ultra");
 		expect(ultra.reasoning).toBe(true);
+	});
+
+	test("stores Fugu login as a built-in API key credential", async () => {
+		global.fetch = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ data: [{ id: "fugu" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-fugu-auth-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			const authStorage = new AuthStorage(store);
+			await authStorage.login("fugu", {
+				onAuth: info => {
+					expect(info.url).toBe("https://fugu.sakana.ai/");
+				},
+				onPrompt: async prompt => {
+					expect(prompt.message).toContain("Sakana Fugu");
+					return " fugu-test-key ";
+				},
+			});
+
+			expect(global.fetch).toHaveBeenCalledWith(
+				"https://api.sakana.ai/v1/models",
+				expect.objectContaining({
+					method: "GET",
+					headers: { Authorization: "Bearer fugu-test-key" },
+				}),
+			);
+			expect(await authStorage.getApiKey("fugu")).toBe("fugu-test-key");
+		} finally {
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("treats Fugu API-key OAuth credentials as non-expiring refresh credentials", async () => {
+		const credential = { access: "fugu-test-key", refresh: "fugu-test-key", expires: Date.now() - 1 };
+		await expect(refreshOAuthToken("fugu", credential)).resolves.toBe(credential);
 	});
 
 	test("discovers OpenAI-compatible models with configurable base URL", async () => {
