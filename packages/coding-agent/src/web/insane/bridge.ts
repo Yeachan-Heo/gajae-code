@@ -294,7 +294,9 @@ function mapEngineOutput(raw: EngineRawOutput, timeoutMs: number): InsaneBridgeR
 	}
 
 	const verdict = parsed.verdict?.trim();
-	if (verdict && /^authentication required$/i.test(verdict)) {
+	// The engine emits the Verdict enum value `auth_required` (401/407); also tolerate
+	// the human-readable phrase defensively. Either is a terminal public-content boundary.
+	if (verdict && /^(?:auth_required|authentication required)$/i.test(verdict)) {
 		notes.push(INSANE_NOTES.authRequired);
 		return { ok: false, reason: "auth-required", verdict, notes };
 	}

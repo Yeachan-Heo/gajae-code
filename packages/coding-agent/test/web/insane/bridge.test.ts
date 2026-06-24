@@ -106,16 +106,25 @@ describe("tryInsaneFetch JSON mapping", () => {
 		}
 	});
 
-	it("maps authentication required to failure without bypass", async () => {
+	it("maps the engine auth_required verdict token to failure without bypass", async () => {
 		const r = await tryInsaneFetch("https://example.com", {
 			prober: deps(),
-			runner: async () => rawOutput({ stdout: JSON.stringify({ ok: false, verdict: "authentication required" }) }),
+			runner: async () => rawOutput({ stdout: JSON.stringify({ ok: false, verdict: "auth_required" }) }),
 		});
 		expect(r.ok).toBe(false);
 		if (!r.ok) {
 			expect(r.reason).toBe("auth-required");
 			expect(r.notes).toContain(INSANE_NOTES.authRequired);
 		}
+	});
+
+	it("also tolerates the human-readable authentication-required phrase", async () => {
+		const r = await tryInsaneFetch("https://example.com", {
+			prober: deps(),
+			runner: async () => rawOutput({ stdout: JSON.stringify({ ok: false, verdict: "authentication required" }) }),
+		});
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.reason).toBe("auth-required");
 	});
 
 	it("maps invalid JSON to a controlled failure", async () => {
