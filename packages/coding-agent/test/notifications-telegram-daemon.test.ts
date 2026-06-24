@@ -1346,9 +1346,11 @@ test("inbound document is saved to a tmp file and its path injected into the tex
 	const dest = match![1]!;
 	const fileMode = fs.statSync(dest).mode & 0o777;
 	const dirMode = fs.statSync(path.dirname(dest)).mode & 0o777;
-	expect(fileMode).toBe(0o600);
-	expect(fileMode & 0o077).toBe(0);
-	expect(dirMode & 0o077).toBe(0);
+	if (process.platform !== "win32") {
+		expect(fileMode).toBe(0o600);
+		expect(fileMode & 0o077).toBe(0);
+		expect(dirMode & 0o077).toBe(0);
+	}
 	expect(dest.startsWith(os.tmpdir())).toBe(true);
 });
 
@@ -1749,14 +1751,19 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 		pid: process.pid,
 		randomId: () => "owner",
 	});
+	const pollStarted = Promise.withResolvers<void>();
 	const bot = {
 		call: (method: string, _body: unknown, opts?: { signal?: AbortSignal }) => {
 			if (method === "getUpdates") {
-				return new Promise((_resolve, reject) => {
-					opts?.signal?.addEventListener("abort", () =>
-						reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
-					);
-				});
+				pollStarted.resolve();
+				if (opts?.signal?.aborted) {
+					return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+				}
+				const abort = Promise.withResolvers<never>();
+				opts?.signal?.addEventListener("abort", () =>
+					abort.reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+				);
+				return abort.promise;
 			}
 			return Promise.resolve({ ok: true, result: true });
 		},
@@ -1778,7 +1785,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 	});
 	daemon.connectSession("S", "ws://s", "t");
 	const runPromise = daemon.run();
-	await new Promise(resolve => setTimeout(resolve, 5));
+	await pollStarted.promise;
 	daemon.requestStop("signal");
 	await runPromise;
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);

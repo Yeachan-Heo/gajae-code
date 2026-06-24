@@ -1130,6 +1130,7 @@ export class TelegramNotificationDaemon {
 				// exclusive 0600 create (`wx`) refuses to follow a pre-existing file/symlink.
 				const dest = path.join(dir, `${crypto.randomBytes(8).toString("hex")}-${safeBase}`);
 				await fs.promises.writeFile(dest, bytes, { flag: "wx", mode: 0o600 });
+				await fs.promises.chmod(dest, 0o600).catch(() => undefined);
 				fileNotes.push(`[user attached a file, saved to ${dest}${att.mime ? ` (${att.mime})` : ""}]`);
 			}
 		} catch (e) {
