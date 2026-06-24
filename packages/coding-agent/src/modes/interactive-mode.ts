@@ -155,7 +155,7 @@ function getShellInputPrefix(isNoContext: boolean): string {
 
 function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setBorderVisible(true);
-	editor.setBorderStyle("sharp");
+	editor.setBorderStyle("round");
 	editor.setClosedBorderBox(true);
 	editor.setPromptGutter(undefined);
 	editor.setInputPrefix(getDefaultInputPrefix());

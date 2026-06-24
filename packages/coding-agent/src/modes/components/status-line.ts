@@ -675,7 +675,11 @@ export class StatusLineComponent implements Component {
 		const effectiveSettings = this.#resolveSettings();
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
-		const bgAnsi = theme.getBgAnsi("statusLineBg");
+		// Use the subtle surface tone (the same elevated background as user-message
+		// bubbles) instead of the heavy `statusLineBg` block, so the rail layers
+		// just above the base background as a quiet zone rather than a solid bar.
+		// Resolving through a semantic slot keeps it correct across every theme.
+		const bgAnsi = theme.getBgAnsi("userMessageBg");
 		const fgAnsi = theme.getFgAnsi("text");
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 
