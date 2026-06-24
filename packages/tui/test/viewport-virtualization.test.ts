@@ -173,4 +173,122 @@ describe("virtual viewport rendering (W1b / F1)", () => {
 			if (!wasEnabled) renderMetrics.disable();
 		}
 	});
+	it("auto-enables virtualization for a long transcript with no flag set", async () => {
+		delete Bun.env[FLAG];
+		const wasEnabled = renderMetrics.enabled;
+		renderMetrics.reset();
+		renderMetrics.enable();
+		const term = new VirtualTerminal(40, 40);
+		const tui = new TUI(term);
+		// 600 lines > max(height*4, 256) auto-enable threshold.
+		const big = Array.from({ length: 600 }, (_v, i) => `row-${i}`);
+		const content = new CachedLines(big);
+		tui.addChild(content);
+		try {
+			tui.start();
+			await settle(term);
+			content.setLine(599, "row-599-edited");
+			tui.requestRender();
+			await settle(term);
+			const lc = renderMetrics.snapshot().lineCounts;
+			// Bottom-line edit must re-normalize ~viewport, not the whole 600-line transcript,
+			// even though PI_TUI_VIRTUAL_VIEWPORT was never set.
+			expect(lc.normalized?.last).toBeLessThanOrEqual(60);
+			expect(lc.offscreenScan?.last).toBeGreaterThan(500);
+		} finally {
+			tui.stop();
+			renderMetrics.reset();
+			if (!wasEnabled) renderMetrics.disable();
+		}
+	});
+
+	it("does not auto-virtualize a short transcript (below threshold)", async () => {
+		delete Bun.env[FLAG];
+		const wasEnabled = renderMetrics.enabled;
+		renderMetrics.reset();
+		renderMetrics.enable();
+		const term = new VirtualTerminal(40, 40);
+		const tui = new TUI(term);
+		const small = Array.from({ length: 100 }, (_v, i) => `row-${i}`);
+		const content = new CachedLines(small);
+		tui.addChild(content);
+		try {
+			tui.start();
+			await settle(term);
+			content.setLine(99, "row-99-edited");
+			tui.requestRender();
+			await settle(term);
+			const lc = renderMetrics.snapshot().lineCounts;
+			// Short transcripts stay on the original full-normalize path: no windowed reuse.
+			expect(lc.offscreenScan?.last ?? 0).toBe(0);
+		} finally {
+			tui.stop();
+			renderMetrics.reset();
+			if (!wasEnabled) renderMetrics.disable();
+		}
+	});
+
+	it("PI_TUI_VIRTUAL_VIEWPORT=0 opts out of auto-virtualization", async () => {
+		Bun.env[FLAG] = "0";
+		const wasEnabled = renderMetrics.enabled;
+		renderMetrics.reset();
+		renderMetrics.enable();
+		const term = new VirtualTerminal(40, 40);
+		const tui = new TUI(term);
+		const big = Array.from({ length: 600 }, (_v, i) => `row-${i}`);
+		const content = new CachedLines(big);
+		tui.addChild(content);
+		try {
+			tui.start();
+			await settle(term);
+			content.setLine(599, "row-599-edited");
+			tui.requestRender();
+			await settle(term);
+			const lc = renderMetrics.snapshot().lineCounts;
+			// Disabled: every frame normalizes the full transcript, no windowed reuse.
+			expect(lc.offscreenScan?.last ?? 0).toBe(0);
+			expect(lc.normalized?.last).toBeGreaterThanOrEqual(600);
+		} finally {
+			tui.stop();
+			renderMetrics.reset();
+			if (!wasEnabled) renderMetrics.disable();
+		}
+	});
+
+	it("auto-virtualized output is byte-identical to the opt-out path", async () => {
+		const render = async (mode: "auto" | "off"): Promise<string[][]> => {
+			if (mode === "off") Bun.env[FLAG] = "0";
+			else delete Bun.env[FLAG];
+			const term = new VirtualTerminal(50, 20);
+			const tui = new TUI(term);
+			const rows = Array.from({ length: 400 }, (_v, i) => `line-${i}`);
+			const content = new CachedLines(rows);
+			tui.addChild(content);
+			const snaps: string[][] = [];
+			try {
+				tui.start();
+				await settle(term);
+				snaps.push(visible(term));
+				content.append("appended-A");
+				content.append("appended-B");
+				tui.requestRender();
+				await settle(term);
+				snaps.push(visible(term));
+				content.setLine(401, "appended-A-edited");
+				tui.requestRender();
+				await settle(term);
+				snaps.push(visible(term));
+				content.setLine(0, "line-0-edited-offscreen");
+				tui.requestRender();
+				await settle(term);
+				snaps.push(visible(term));
+			} finally {
+				tui.stop();
+			}
+			return snaps;
+		};
+		const auto = await render("auto");
+		const off = await render("off");
+		expect(auto).toEqual(off);
+	});
 });

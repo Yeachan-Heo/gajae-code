@@ -149,6 +149,24 @@ function useLegacyMultiplexerFullRender(): boolean {
 }
 
 /**
+ * Viewport virtualization auto-enable thresholds. The windowed-normalize path
+ * (see {@link TUI.#doRender}) bounds the expensive per-frame normalize/diff work
+ * to roughly the visible window instead of the whole transcript. It is byte-identical
+ * to the full path, so we turn it on automatically once a transcript grows past a few
+ * screens — which is exactly when a long session starts to feel slow — while leaving
+ * short sessions on the original path (no behavior change, no extra bookkeeping).
+ */
+const VIRTUAL_VIEWPORT_AUTO_FACTOR = 4; // content taller than N screens auto-virtualizes
+const VIRTUAL_VIEWPORT_AUTO_MIN = 256; // ...but never below this many lines
+
+const FALSY_ENV = new Set(["0", "false", "off", "no", "n"]);
+/** Explicit opt-out: `PI_TUI_VIRTUAL_VIEWPORT=0` (or false/off/no) disables auto-virtualization too. */
+function isVirtualViewportDisabled(): boolean {
+	const raw = Bun.env.PI_TUI_VIRTUAL_VIEWPORT;
+	return raw !== undefined && FALSY_ENV.has(raw.trim().toLowerCase());
+}
+
+/**
  * Options for overlay positioning and sizing.
  * Values can be absolute numbers or percentage strings (e.g., "50%").
  */
@@ -278,10 +296,11 @@ export class TUI extends Container {
 	terminal: Terminal;
 	#previousLines: string[] = [];
 	/**
-	 * Raw (pre-normalization) lines from the previous frame, kept only when the
-	 * virtual-viewport flag is on. Used to detect whether the off-screen prefix is
-	 * unchanged (by raw value equality, with a fast reference short-circuit when components
-	 * return stable string instances) so its normalized form can be reused (bounded normalize).
+	 * Raw (pre-normalization) lines from the previous frame, kept whenever viewport
+	 * virtualization was active last frame (forced via env or auto-enabled for a long
+	 * transcript). Used to detect whether the off-screen prefix is unchanged (by raw
+	 * value equality, with a fast reference short-circuit when components return stable
+	 * string instances) so its normalized form can be reused (bounded normalize).
 	 */
 	#previousRaw: string[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
@@ -314,9 +333,13 @@ export class TUI extends Container {
 	#sixelProbeUnsubscribe?: () => void;
 	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
 	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
-	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
-	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
-	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT");
+	// Viewport virtualization: reuse the previous normalized off-screen prefix and only
+	// normalize/diff the visible window, bounding per-frame work on huge transcripts.
+	// Output stays byte-identical. Forced on with PI_TUI_VIRTUAL_VIEWPORT=1; otherwise
+	// auto-enabled per frame once the transcript grows past a few screens (see
+	// VIRTUAL_VIEWPORT_AUTO_*). Set PI_TUI_VIRTUAL_VIEWPORT=0 to disable entirely.
+	#virtualViewportForced = $flag("PI_TUI_VIRTUAL_VIEWPORT");
+	#virtualViewportDisabled = isVirtualViewportDisabled();
 	#maxLinesRendered = 0; // Line count from last render, used for viewport calculation
 	#fullRedrawCount = 0;
 	#stopped = false;
@@ -1261,12 +1284,18 @@ export class TUI extends Container {
 		return this.#lineFitsWidth(normalized, width) ? terminated : this.#truncateNormalizedLine(normalized, width);
 	}
 
+	/**
+	 * Normalize + width-fit every line for emission. Non-mutating: returns a fresh array
+	 * and never writes back into `lines`, so a cached raw frame (reused next frame by the
+	 * virtualization path) is never corrupted.
+	 */
 	#applyLineResetsAndTruncate(lines: string[], width: number): string[] {
+		const out = new Array<string>(lines.length);
 		for (let i = 0; i < lines.length; i++) {
-			lines[i] = this.#normalizeLineForEmit(lines[i], width);
+			out[i] = this.#normalizeLineForEmit(lines[i], width);
 		}
 		this.#trimLineCachesForRender(lines.length);
-		return lines;
+		return out;
 	}
 
 	#doRender(): void {
@@ -1303,19 +1332,25 @@ export class TUI extends Container {
 		const widthChanged = this.#previousWidth !== 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
 
-		// Normalize/truncate lines for emission. With the opt-in virtual-viewport flag
-		// (PI_TUI_VIRTUAL_VIEWPORT) we reuse the previous frame's normalized prefix when the
-		// off-screen raw prefix is unchanged (raw value equality per line; fast reference
-		// short-circuit for cached components), so only the visible window is
-		// re-normalized and the diff starts at the window. Output is byte-identical to the
-		// full path (reused entries are deterministic normalizations of identical raw lines).
+		// Normalize/truncate lines for emission. Viewport virtualization reuses the previous
+		// frame's normalized prefix when the off-screen raw prefix is unchanged (raw value
+		// equality per line; fast reference short-circuit for cached components), so only the
+		// visible window is re-normalized and the diff starts at the window. Output is
+		// byte-identical to the full path (reused entries are deterministic normalizations of
+		// identical raw lines). It is forced on with PI_TUI_VIRTUAL_VIEWPORT=1 and otherwise
+		// auto-enabled once the transcript grows past a few screens — bounding the expensive
+		// per-frame work exactly when a long session would otherwise get slow.
 		const VIEWPORT_NORMALIZE_OVERSCAN = 8;
 		const rawLines = newLines;
 		const total = rawLines.length;
+		const virtualViewport =
+			!this.#virtualViewportDisabled &&
+			(this.#virtualViewportForced ||
+				total >= Math.max(height * VIRTUAL_VIEWPORT_AUTO_FACTOR, VIRTUAL_VIEWPORT_AUTO_MIN));
 		let diffStart = 0;
 		let usedWindowNormalize = false;
 		if (
-			this.#virtualViewport &&
+			virtualViewport &&
 			!widthChanged &&
 			this.#previousRaw.length > 0 &&
 			this.#previousLines.length === this.#previousRaw.length
@@ -1342,11 +1377,11 @@ export class TUI extends Container {
 			}
 		}
 		if (!usedWindowNormalize) {
-			newLines = this.#applyLineResetsAndTruncate(this.#virtualViewport ? rawLines.slice() : rawLines, width);
+			newLines = this.#applyLineResetsAndTruncate(rawLines, width);
 		}
-		if (this.#virtualViewport) {
-			this.#previousRaw = rawLines;
-		}
+		// Retain the raw frame only while virtualization is active so a later re-enable never
+		// reuses a stale prefix; clearing it keeps the windowed-path guard honest.
+		this.#previousRaw = virtualViewport ? rawLines : [];
 		if (renderMetrics.enabled) {
 			renderMetrics.recordLineCount("rendered", total);
 			renderMetrics.recordLineCount("normalized", total - diffStart);

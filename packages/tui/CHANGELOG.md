@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Viewport-windowed normalize/diff (`PI_TUI_VIRTUAL_VIEWPORT`) is now **auto-enabled per frame** once the rendered transcript grows past a few screens (`>= max(rows * 4, 256)` lines), instead of being opt-in only. This keeps per-frame render cost ~O(rows) on long/resumed sessions — where it previously grew O(total lines) and made long sessions feel sluggish — while staying byte-identical to the full path and leaving short transcripts untouched. `PI_TUI_VIRTUAL_VIEWPORT=1` still forces it on for every frame; `PI_TUI_VIRTUAL_VIEWPORT=0` (or `false`/`off`/`no`) disables it. The per-frame line normalization step is now non-mutating so the reused raw frame is never corrupted.
+
 ## [0.6.0] - 2026-06-18
 
 ### Fixed
