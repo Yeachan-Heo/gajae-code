@@ -351,6 +351,8 @@ Project executor override body.
 		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
 		expect(content).toContain("translated/localized according to `language.instruction`");
+		expect(content).toContain("must not print `Question:`/`Options:` blocks as assistant prose");
+		expect(content).toContain("call `ask` with the same question/options");
 		expect(content).not.toContain("default `0.2`");
 		expect(content).not.toContain("20%");
 

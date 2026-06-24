@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
+import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
@@ -675,6 +676,52 @@ async function readCurrentGoalObjectiveFromSessionFile(sessionFile: string | und
 	return typeof objective === "string" && objective.trim().length > 0 ? objective.trim() : null;
 }
 
+async function readLatestAssistantTextFromSessionFile(sessionFile: string | undefined): Promise<string | null> {
+	const trimmed = sessionFile?.trim();
+	if (!trimmed) return null;
+	let entries: SessionEntry[];
+	try {
+		entries = (await loadEntriesFromFile(trimmed)).filter((entry): entry is SessionEntry => entry.type !== "session");
+	} catch {
+		return null;
+	}
+	if (entries.length === 0) return null;
+	const context = buildSessionContext(entries);
+	for (let index = context.messages.length - 1; index >= 0; index--) {
+		const message = context.messages[index];
+		if (message?.role !== "assistant") continue;
+		const text = message.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("");
+		const trimmedText = text.trim();
+		return trimmedText.length > 0 ? trimmedText : null;
+	}
+	return null;
+}
+
+async function shouldRescueDeepInterviewPlaintextAskLeak(
+	skill: GjcWorkflowSkill,
+	state: ModeState | null,
+	cwd: string,
+	sessionFile: string | undefined,
+): Promise<boolean> {
+	if (skill !== "deep-interview") return false;
+	if (state?.active !== true) return false;
+	const phase = String(state.current_phase ?? "")
+		.trim()
+		.toLowerCase();
+	if (DEEP_INTERVIEW_ABORT_PHASES.has(phase)) return false;
+	if (await deepInterviewSpecCrystallized(state, cwd)) return false;
+	const latestAssistantText = await readLatestAssistantTextFromSessionFile(sessionFile);
+	if (!latestAssistantText) return false;
+	return detectDeepInterviewPlaintextAskLeak(latestAssistantText) !== null;
+}
+
+function buildDeepInterviewPlaintextAskLeakMessage(statePath: string): string {
+	return `GJC deep-interview emitted a Deep Interview question/options block as plain text (${statePath}). It must not wait for a prose answer. Continue immediately by calling the ask tool with the Restate gate question and options: Yes, crystallize; Adjust wording; Missing scope; plus free text/custom input.`;
+}
+
 export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitStateInput): Promise<string | null> {
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const visibleModeState = await readVisibleModeState(input.cwd, "ultragoal", resolvedSessionId, input.stateDir);
@@ -754,6 +801,16 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 				reason: recoveryMessage,
 				stopReason: `gjc_skill_${entry.skill.replace(/-/g, "_")}_mode_state_recovery`,
 				systemMessage: recoveryMessage,
+			};
+		}
+		if (await shouldRescueDeepInterviewPlaintextAskLeak(entry.skill, modeState, input.cwd, input.sessionFile)) {
+			const statePath = modeStatePath(input.cwd, entry.skill, resolvedSessionId);
+			const rescueMessage = buildDeepInterviewPlaintextAskLeakMessage(statePath);
+			return {
+				decision: "block",
+				reason: rescueMessage,
+				stopReason: "gjc_skill_deep_interview_plaintext_ask_leak",
+				systemMessage: rescueMessage,
 			};
 		}
 		if (modeStateReleasesStop(modeState, handoffRequired)) {
