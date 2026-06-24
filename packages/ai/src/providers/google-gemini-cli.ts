@@ -30,7 +30,11 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
-import { ANTIGRAVITY_SYSTEM_INSTRUCTION, getAntigravityUserAgent, getGeminiCliHeaders } from "./google-gemini-headers";
+import {
+	ANTIGRAVITY_SYSTEM_INSTRUCTION,
+	getAntigravityRequestHeaders,
+	getGeminiCliHeaders,
+} from "./google-gemini-headers";
 import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "./google-shared";
 import {
 	convertMessages,
@@ -78,7 +82,7 @@ const ANTIGRAVITY_ENDPOINT_FALLBACKS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_
 
 export {
 	ANTIGRAVITY_SYSTEM_INSTRUCTION,
-	getAntigravityUserAgent,
+	getAntigravityRequestHeaders,
 	getGeminiCliHeaders,
 	getGeminiCliUserAgent,
 } from "./google-gemini-headers";
@@ -220,6 +224,13 @@ interface CloudCodeAssistRequest {
 				mode: FunctionCallingConfigMode;
 			};
 		};
+		// Evidence: Real Antigravity IDE sends preambleConfig with
+		// SYSTEM_INSTRUCTION_MODE_REPLACE to control how the server
+		// interprets the system instruction (replace vs append).
+		// Confirmed via network interception of official IDE traffic.
+		preambleConfig?: {
+			mode: "SYSTEM_INSTRUCTION_MODE_REPLACE";
+		};
 	};
 	requestType?: string;
 	userAgent?: string;
@@ -319,7 +330,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}
-			const headers = isAntigravity ? { "User-Agent": getAntigravityUserAgent() } : getGeminiCliHeaders(model.id);
+			const headers = isAntigravity
+				? getAntigravityRequestHeaders() // Evidence: UA = "antigravity-ide" (disassembly 0x5ecb1dd)
+				: getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {
 				Authorization: `Bearer ${accessToken}`,
@@ -786,9 +799,13 @@ export function buildRequest(
 		request.sessionId = deriveAntigravitySessionId(context);
 	}
 
-	// System instruction must be object with parts, not plain string
+	// System instruction must be object with parts, not plain string.
+	// Evidence: Real Antigravity IDE sets role: "user" on systemInstruction
+	// (confirmed in request body dumps from network interception).
+	// Only applied for Antigravity path — standard gemini-cli omits role.
 	if (systemPrompts.length > 0) {
 		request.systemInstruction = {
+			...(isAntigravity && { role: "user" }),
 			parts: systemPrompts.map(text => ({ text })),
 		};
 	}
@@ -818,26 +835,55 @@ export function buildRequest(
 		}
 	}
 
-	if (isAntigravity && isClaudeModel(model.id)) {
-		const resolvedLevel = resolvedToolChoice.resolvedLevel;
-		if (resolvedLevel === "named" || resolvedLevel === "required") {
-			request.toolConfig = {
-				functionCallingConfig: {
-					mode: "VALIDATED" as FunctionCallingConfigMode,
-				},
-			};
-		}
+	// Claude Antigravity: use VALIDATED mode only when tools are present
+	// and the caller hasn't explicitly requested "none" tool choice.
+	//
+	// Evidence:
+	// - Real Antigravity IDE sends VALIDATED for Claude requests with tools
+	//   (confirmed via network interception of official IDE traffic)
+	// - The original GJC code used resolvedToolChoice.resolvedLevel to gate
+	//   VALIDATED, but the real IDE doesn't check tool choice resolution —
+	//   it sends VALIDATED whenever tools exist and toolChoice != "none"
+	// - omp reference: packages/ai/src/providers/google-gemini-cli.ts
+	//   `antigravityClaudeToolConfig` guard pattern
+	if (
+		isAntigravity &&
+		isClaudeModel(model.id) &&
+		context.tools &&
+		context.tools.length > 0 &&
+		options?.toolChoice !== "none"
+	) {
+		request.toolConfig = {
+			functionCallingConfig: {
+				mode: "VALIDATED" as FunctionCallingConfigMode,
+			},
+		};
 	}
 
+	// Stateless system instruction injection: send on EVERY Antigravity request.
+	// This is safer than client-side session dedup because:
+	// - preambleConfig server-side persistence is unproven
+	// - A failed first request would poison the session if we skipped injection
+	// - Token cost is acceptable for Antigravity's long-context models
+	//
+	// Evidence:
+	// - Real Antigravity IDE sends the full system prompt on every request
+	//   (confirmed via repeated request dumps — no client-side dedup observed)
+	// - The [ignore] wrapper was a GJC-original addition not present in the
+	//   real IDE wire format. Removed for byte-faithful emulation.
+	// - preambleConfig: { mode: "SYSTEM_INSTRUCTION_MODE_REPLACE" } is the
+	//   mechanism the real IDE uses to deliver system instructions. Without it,
+	//   the server may append (not replace) the system prompt.
+	// - omp reference: `sessionSystemInstructionSent` Map was omp's approach;
+	//   we chose stateless injection for simplicity and safety.
 	if (isAntigravity && shouldInjectAntigravitySystemInstruction(model.id)) {
 		const existingParts = request.systemInstruction?.parts ?? [];
 		request.systemInstruction = {
 			role: "user",
-			parts: [
-				{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION },
-				{ text: `Please ignore following [ignore]${ANTIGRAVITY_SYSTEM_INSTRUCTION}[/ignore]` },
-				...existingParts,
-			],
+			parts: [{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION }, ...existingParts],
+		};
+		request.preambleConfig = {
+			mode: "SYSTEM_INSTRUCTION_MODE_REPLACE",
 		};
 	}
 

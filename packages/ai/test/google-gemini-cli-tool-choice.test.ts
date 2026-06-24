@@ -65,7 +65,12 @@ describe("Google Gemini CLI tool choice", () => {
 		expect(request.request.toolConfig).toBeUndefined();
 	});
 
-	it("does not force VALIDATED for Antigravity Claude after resolved omission", () => {
+	// Test updated: Real Antigravity IDE sends VALIDATED for Claude requests
+	// whenever tools are present, regardless of tool choice resolution.
+	// Evidence: network interception of official IDE traffic + disassembly.
+	// The old test expected toolConfig to be undefined when toolChoiceSupport
+	// was "auto", but the real IDE doesn't check tool choice capability.
+	it("forces VALIDATED for Antigravity Claude when tools are present", () => {
 		const request = buildRequest(
 			{ ...model, id: "claude-test", provider: "google-antigravity", compat: { toolChoiceSupport: "auto" } },
 			context,
@@ -75,7 +80,7 @@ describe("Google Gemini CLI tool choice", () => {
 		);
 
 		expect(request.request.tools).toBeDefined();
-		expect(request.request.toolConfig).toBeUndefined();
+		expect(request.request.toolConfig?.functionCallingConfig?.mode).toBe("VALIDATED");
 	});
 
 	it("retries from post-onPayload request body and strips only request.toolConfig", async () => {
