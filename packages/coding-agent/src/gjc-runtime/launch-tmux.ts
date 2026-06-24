@@ -93,6 +93,10 @@ function hasCurrentGjcVersion(session: GjcTmuxSessionStatus | undefined): boolea
 	return session?.version === VERSION;
 }
 
+function allowsExistingTmuxAttach(parsed: Args, env: NodeJS.ProcessEnv): boolean {
+	return Boolean(parsed.continue || parsed.resume || explicitTmuxSessionName(env));
+}
+
 function findExistingSessionForLaunch(context: {
 	env: NodeJS.ProcessEnv;
 	project: string;
@@ -382,14 +386,15 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) return undefined;
-	const existingSessionName =
-		"existingBranchSessionName" in context
+	const existingSessionName = allowsExistingTmuxAttach(context.parsed, env)
+		? "existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
 			: findExistingSessionForLaunch({
 					env,
 					project,
 					branch,
-				});
+				})
+		: undefined;
 	const innerCommand = buildInnerCommand(
 		{
 			cwd,

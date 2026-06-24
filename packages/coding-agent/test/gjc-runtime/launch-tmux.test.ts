@@ -276,11 +276,63 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.innerCommand).toContain("'gjc'");
 	});
 
-	it("attaches existing tagged session for matching worktree branch", () => {
+	it("does not implicitly attach existing tagged session for plain worktree branch launch", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			worktreeBranch: "feature/demo",
+			existingBranchSessionName: "gajae_code_feature",
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session" && call.args[2] === "=gajae_code_feature")).toBe(
+			false,
+		);
+	});
+
+	it("explicit continue attaches existing tagged session for matching worktree branch", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			worktreeBranch: "feature/demo",
+			existingBranchSessionName: "gajae_code_feature",
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
+		expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
+	});
+
+	it("explicit resume attaches existing tagged session for matching worktree branch", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
+			rawArgs: ["--tmux", "--resume", "hello world"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -368,7 +420,7 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.newSessionArgs.slice(0, 2)).toEqual(["new-session", "-d"]);
 	});
 
-	it("auto-reuses scoped sessions from the current GJC version", () => {
+	it("does not auto-reuse scoped sessions from the current GJC version without explicit resume", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(
 			spawnResult(
 				0,
@@ -378,6 +430,30 @@ describe("default GJC tmux launch", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "feature/demo",
+			project: "/repo",
+		});
+
+		expect(plan?.attachSessionName).toBeUndefined();
+	});
+
+	it("auto-reuses scoped sessions from the current GJC version for explicit continue", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				`current-gjc\t1\t0\t1770000000\t1\troot\t1\t12345\tfeature/demo\tfeature-demo\t/repo\tcurrent-session\t/state\t${VERSION}`,
+			),
+		);
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],

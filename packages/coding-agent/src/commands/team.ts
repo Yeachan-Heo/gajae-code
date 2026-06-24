@@ -95,7 +95,7 @@ export default class Team extends Command {
 	};
 
 	static examples = [
-		"gjc --tmux  # start/attach the required tmux-backed leader session first",
+		"gjc --tmux  # start the required tmux-backed leader session first",
 		'gjc team 3:executor "Implement the approved plan"',
 		"gjc team status <team-name> --json",
 		"gjc team monitor <team-name> --json",

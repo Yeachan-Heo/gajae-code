@@ -265,7 +265,7 @@ export function getExtraHelpText(): string {
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
   GJC_NO_PTY                  - Disable PTY-based interactive bash execution
-  --tmux                       - Launch interactive startup inside a new tmux session
+  --tmux                       - Launch interactive startup inside a fresh tmux session
   gjc session                  - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
