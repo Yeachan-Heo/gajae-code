@@ -112,6 +112,7 @@ export type KnownProvider =
 	| "github-copilot"
 	| "fireworks"
 	| "firepass"
+	| "fugu"
 	| "gitlab-duo"
 	| "cursor"
 	| "deepseek"

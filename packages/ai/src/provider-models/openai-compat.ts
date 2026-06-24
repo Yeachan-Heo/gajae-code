@@ -785,6 +785,15 @@ export function firepassModelManagerOptions(
 // 7. Mistral
 // ---------------------------------------------------------------------------
 
+export interface FuguModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function fuguModelManagerOptions(config?: FuguModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("fugu", config?.baseUrl ?? "https://api.sakana.ai/v1", config);
+}
+
 export interface MistralModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
