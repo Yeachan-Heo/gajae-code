@@ -109,6 +109,22 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	setSessionName(): Promise<void> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
+
+	getMenuSkillIds(): string[] {
+		return [];
+	}
+
+	getMenuModelOptions(): import("./types").MenuModelOption[] {
+		return [];
+	}
+
+	runMenuSkill(): Promise<void> {
+		return Promise.resolve();
+	}
+
+	setMenuModelByRef(): Promise<{ previous?: string; next: string }> {
+		return Promise.reject(new Error("model switching not available"));
+	}
 }
 
 /**
@@ -251,6 +267,22 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	setSessionName(name: string): Promise<void> {
 		return this.runtime.setSessionName(name);
+	}
+
+	getMenuSkillIds(): string[] {
+		return this.runtime.getMenuSkillIds?.() ?? [];
+	}
+
+	getMenuModelOptions(): import("./types").MenuModelOption[] {
+		return this.runtime.getMenuModelOptions?.() ?? [];
+	}
+
+	runMenuSkill(skillName: string, prompt: string): Promise<void> {
+		return this.runtime.runMenuSkill?.(skillName, prompt) ?? Promise.resolve();
+	}
+
+	setMenuModelByRef(ref: string): Promise<{ previous?: string; next: string }> {
+		return this.runtime.setMenuModelByRef?.(ref) ?? Promise.reject(new Error("model switching not available"));
 	}
 
 	registerProvider(name: string, config: import("./types").ProviderConfig): void {

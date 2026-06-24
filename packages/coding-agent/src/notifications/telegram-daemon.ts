@@ -8,6 +8,7 @@ import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
+import { isSyntheticActionId } from "./command-menu";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
@@ -713,7 +714,7 @@ interface SessionSocket {
 	sessionId: string;
 	token: string;
 	ws: WebSocket;
-	pending: Map<string, { sessionId: string; actionId: string }>;
+	pending: Map<string, PendingAsk>;
 	/** True once the server advertised the `client_ping_pong` capability. */
 	capable: boolean;
 	/** Timestamp (via opts.now) of the last received pong; seeds the TTL window. */
@@ -1349,7 +1350,12 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {
-			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: session.sessionId, actionId: msg.id });
+			if (msg.kind === "ask")
+				session.pending.set(msg.id, {
+					sessionId: session.sessionId,
+					actionId: msg.id,
+					buttonOnly: isSyntheticActionId(msg.id),
+				});
 			const topicId = await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg));
 			if (!topicId) {
 				// Fail closed for non-private chats; only nudge + flat-deliver in a private DM.

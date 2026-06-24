@@ -1040,6 +1040,12 @@ export interface ExtensionAPI {
 	/** Set the session name. Persists to the session file. */
 	setSessionName(name: string): Promise<void>;
 
+	/** Telegram `/menu` support hooks. */
+	getMenuSkillIds?(): string[];
+	getMenuModelOptions?(): MenuModelOption[];
+	runMenuSkill?(skillName: string, prompt: string): Promise<void>;
+	setMenuModelByRef?(ref: string): Promise<{ previous?: string; next: string }>;
+
 	// =========================================================================
 	// Provider Registration
 	// =========================================================================
@@ -1206,6 +1212,13 @@ export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
 
+/** A model option shown in the Telegram `/menu` model picker. */
+export interface MenuModelOption {
+	ref: string;
+	label: string;
+	current?: boolean;
+}
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
@@ -1228,6 +1241,10 @@ export interface ExtensionActions {
 	setThinkingLevel: SetThinkingLevelHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
+	getMenuSkillIds?: () => string[];
+	getMenuModelOptions?: () => MenuModelOption[];
+	runMenuSkill?: (skillName: string, prompt: string) => Promise<void>;
+	setMenuModelByRef?: (ref: string) => Promise<{ previous?: string; next: string }>;
 }
 
 /** Actions for ExtensionContext (ctx.* in event handlers). */

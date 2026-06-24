@@ -172,6 +172,7 @@ export type RouteDecision =
 export interface PendingAsk {
 	sessionId: string;
 	actionId: string;
+	buttonOnly?: boolean;
 }
 
 export interface RouteInboundContext {
@@ -227,6 +228,7 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 		const allPending = ctx.pendingBySession(undefined);
 		if (allPending.length === 1) {
 			const [pending] = allPending;
+			if (pending?.buttonOnly) return { kind: "ignore" };
 			return { kind: "reply", sessionId: pending!.sessionId, actionId: pending!.actionId, answer: text };
 		}
 		if (allPending.length > 1) return { kind: "stale", reason: "ambiguous_plain_text" };
