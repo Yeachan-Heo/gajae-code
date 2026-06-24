@@ -78,3 +78,28 @@ describe("deep-interview self-proofread output rule", () => {
 		expect(skill).toContain("was silently self-proofread once according to");
 	});
 });
+
+describe("deep-interview beginner comprehension contract", () => {
+	it("requires plain-language framing and consequence-aware options", () => {
+		expect(skill).toContain("Beginner comprehension is a first-class clarity dimension");
+		expect(skill).toContain("options to expose consequences");
+		expect(skill).toContain("Plain meaning:");
+		expect(skill).toContain("Why this matters:");
+		expect(skill).toContain("Choosing this means");
+	});
+
+	it("blocks crystallization when comprehension or informed consent is weak", () => {
+		expect(skill).toContain("Comprehension Guard");
+		expect(skill).toContain("Informed-Consent Guard");
+		expect(skill).toContain("E informed-consent gap");
+		expect(skill).toContain("confusion signals prevent crystallization until clarified");
+		expect(skill).toContain("recommended_option_streak");
+	});
+
+	it("requires beginner-friendly final spec sections and metadata", () => {
+		expect(skill).toContain("Beginner-Friendly Summary");
+		expect(skill).toContain("Glossary / Plain Meanings");
+		expect(skill).toContain("Comprehension Checks");
+		expect(skill).toContain("Recommended Option Streak Max");
+	});
+});

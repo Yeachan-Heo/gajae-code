@@ -39,6 +39,12 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 
 <Execution_Policy>
 - Ask ONE question at a time -- never batch multiple questions
+- Beginner comprehension is a first-class clarity dimension. Every user-facing question must include plain-language framing before specialized terms, and every option should expose its consequence in user-level language when the consequence materially affects scope, safety, or execution path.
+- Do not rely on the recommended option as informed consent. If the user repeatedly accepts recommended options without explanation, expresses confusion, or says they do not understand the terms, trigger the Comprehension Guard before scoring or crystallizing.
+- Prefer this visible shape for non-trivial questions: **Plain meaning** (what this question is about), **Why it matters** (what decision it affects), **Options** (each with “Choosing this means…”), and **Not happening yet** (what this choice does not authorize).
+- Every non-trivial question must require options to expose consequences in the option label or adjacent option description; a recommended option is only a convenience, not approval evidence.
+- Always offer an escape hatch such as “Explain this more simply” or “I am not sure” when the question contains workflow, architecture, execution, approval, or domain-specific terms.
+- When a user signals confusion, treat it as an ambiguity-raising trigger affecting comprehension/informed-consent clarity. Do not crystallize the spec until the user confirms a beginner-friendly recap; confusion signals prevent crystallization until clarified.
 - Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
 - Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
 - Target the WEAKEST clarity dimension with each question
@@ -56,7 +62,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - A multi-persona lateral-review panel convenes at ambiguity-milestone transitions (and before synthesizing any agent-supplied answer) to expose blind spots from independent perspectives
 - Refine free-text answers into a structured interpretation and confirm nothing is lost before scoring
 - After 3 consecutive agent-resolved answers (accepted auto-research candidates or auto-answers), route the next question to the user (dialectic rhythm guard)
-- Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
+- Run an independent closure audit, a beginner informed-consent recap, and a one-sentence goal restatement, each requiring explicit user confirmation before crystallizing the spec
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>
@@ -147,6 +153,16 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
     "threshold": <resolvedThreshold>,
     "threshold_source": "<resolvedThresholdSource>",
     "language": "<existing language object from active state, if present>",
+    "beginner_mode": {
+      "enabled": true,
+      "reason": "default",
+      "terms": [],
+      "last_plain_recap_round": null,
+      "recommended_option_streak": 0,
+      "recommended_option_streak_max": 0,
+      "confusion_signals": [],
+      "comprehension_checks": []
+    },
     "codebase_context": null,
     "topology": {
       "status": "pending|confirmed|legacy_missing",
@@ -197,14 +213,22 @@ Run this gate exactly once after Phase 1 initialization and before any Phase 2 a
 ```
 Round 0 | Topology confirmation | Ambiguity: not scored yet
 
+Plain meaning:
+Before asking details, I am checking the big pieces of the idea so we do not accidentally focus on one part and forget another.
+
+Why this matters:
+Only components confirmed here are scored and carried into the final spec; deferred components stay visible but are not secretly built.
+
 I'm reading this as {N} top-level component(s):
-1. {component_name}: {one_sentence_description}
+1. {component_name}: {technical_description}
+   Plain meaning: {everyday_words_for_this_part}
+   Choosing to include it means: {scope_or_work_this_adds}
 2. ...
 
 Is that topology right? Should any component be added, removed, merged, split, or explicitly deferred?
 ```
 
-Options should include contextually relevant choices such as **Looks right**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule.
+Options should include contextually relevant choices such as **Looks right — I understand these parts**, **Explain the parts more simply**, **I am not sure which parts belong here**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule. If the user chooses the simple-explanation or not-sure option, do not lock topology yet: re-explain every component in plainer language, update `beginner_mode.confusion_signals` or `comprehension_checks`, and ask exactly one topology confirmation question again.
 
 3. **Lock topology into state** after the answer. Store a normalized component list and confirmation timestamp:
 
@@ -297,10 +321,24 @@ Use the `ask` tool with the generated question. Before rendering the prompt/opti
 ```
 Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} | Why now: {one_sentence_targeting_rationale} | Ambiguity: {score}%
 
-{question}
+Plain meaning:
+{one or two sentences explaining the topic without jargon}
+
+Why this matters:
+{what this choice changes in scope, safety, execution, UX, or verification}
+
+Question:
+{the actual single question}
 ```
 
-Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present.
+Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present. Each option label must be understandable without hidden context. For complex or non-trivial choices, use consequence-aware labels in this shape: `{short answer}: Choosing this means {consequence}. It does not {non-authorized action}.` Include an escape hatch such as **Explain more simply** or **I am not sure yet** when the question uses workflow, architecture, execution, approval, or domain-specific terms.
+
+Examples of consequence-aware options:
+- **UI scaffold only:** Choosing this means we show a future Worklist area, but do not create real worklist files or run tools.
+- **Manual packet:** Choosing this means we create a local review-required packet the user can copy manually, but the system still does not launch any tool.
+- **Live orchestration:** Choosing this means tools may actually start later; this is high-risk and needs a separate plan.
+- **Explain more simply.**
+- **I am not sure yet.**
 
 After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only; preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
@@ -320,6 +358,27 @@ Offer options such as **Send as-is**, **Add a constraint**, **Mark something out
 
 Skip Refine for short answers with no attached reasoning (e.g. "Yes" / "No" / a single proper noun), for pre-built option picks where the structure is already explicit, for auto-confirmed code/brownfield facts, and for architect auto-answers (already structured by Step 2b′). A refined answer counts as direct user judgment: record the round in `refined_rounds` and reset `auto_answer_streak` to 0. Feed the confirmed structured interpretation — not the raw free text — into Step 2c scoring and established-facts maintenance.
 
+### Step 2b‴: Comprehension Guard
+
+If the user says they do not understand, asks for simpler wording, chooses an “I am not sure” option, provides a confusion signal, accepts a recommended option but later says it was unclear, or reaches 3 consecutive recommended-option selections without meaningful explanation on non-trivial choices:
+
+1. Pause normal scoring for that round.
+2. Produce a beginner-friendly recap with:
+   - **What we have decided so far**
+   - **Simple analogy**
+   - **What this does not authorize**
+   - **What the current question really decides**
+3. Ask exactly one confirmation question:
+   - `I understand — continue`
+   - `Explain again with a simpler analogy`
+   - `Change the decision`
+   - `Restart this part`
+4. If the user confirms understanding, score the round using the confirmed interpretation, reset `beginner_mode.recommended_option_streak` to 0, update `beginner_mode.last_plain_recap_round`, and append the confirmation to `beginner_mode.comprehension_checks`.
+5. If the user does not confirm understanding, record a comprehension gap in `beginner_mode.confusion_signals`, raise ambiguity through the normal trigger mechanism, and target the next question at the confusing component/dimension.
+6. Track `beginner_mode.recommended_option_streak` by incrementing it when the user chooses the recommended option with no extra explanation on non-trivial questions; reset it when the user gives a meaningful free-text answer or confirms understanding after a recap. Preserve `beginner_mode.recommended_option_streak_max` for final metadata.
+
+Do not let a recommended option streak silently drive a spec to approval. Recommended options are navigation aids; they are not informed consent.
+
 ### Step 2c: Score Ambiguity
 
 After receiving the user's answer, score clarity across all dimensions.
@@ -335,6 +394,7 @@ Ambiguity-raising triggers:
 - **B internal inconsistency**: two requirements that cannot co-hold are now present.
 - **C low-quality/evasive**: the answer avoids, hand-waves, or fails to resolve the targeted gap.
 - **D scope expansion**: the answer adds a component, entity, constraint, deliverable, or integration not already covered or explicitly deferred.
+- **E informed-consent gap**: the user accepted an option but later says they did not understand it, chooses an uncertainty/simplification path, or the transcript shows repeated recommended-option acceptance without comprehension confirmation.
 
 Use **mechanism A** for every ambiguity rise: a trigger LOWERS the affected component/dimension clarity score, and the existing weighted formula raises ambiguity. There is **no separate penalty term**; ambiguity remains bounded by the same greenfield/brownfield formula.
 
@@ -363,6 +423,9 @@ Locked topology:
 
 Established facts:
 {state.established_facts}
+
+Beginner/comprehension state:
+{state.beginner_mode, including confusion signals, comprehension checks, and recommended option streaks}
 
 Score each active component on each dimension, then provide the overall dimension scores as the minimum or coverage-weighted weakest score across active components. Deferred components are excluded from ambiguity math but must remain listed in topology and the final spec.
 
@@ -441,6 +504,9 @@ Round {n} complete.
 
 **Next target:** {target_component_name} / {weakest_dimension} — {weakest_dimension_rationale}
 
+Plain-language recap:
+{one or two sentences explaining what was just decided and what remains undecided}
+
 {score <= threshold ? "Clarity threshold met! Ready to proceed." : "Focusing next question on: {weakest_dimension}"}
 
 ```
@@ -452,7 +518,7 @@ Then apply the self-proofread once to narrative status text, generated prose cel
 ### Step 2e: Update State
 
 Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
-Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
+Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, `lateral_panel_failures`, and `beginner_mode` alongside the existing fields. Keep `beginner_mode.confusion_signals`, `beginner_mode.comprehension_checks`, `beginner_mode.terms`, `beginner_mode.recommended_option_streak`, and `beginner_mode.recommended_option_streak_max` synchronized with Step 2b‴.
 
 ### Step 2f: Check Soft Limits
 
@@ -491,11 +557,26 @@ A transition occurs whenever the band changes versus the prior scored round — 
 
 When ambiguity ≤ threshold (or hard cap / early exit):
 
-**Before generating the spec, two gates must pass, in order:**
+**Before generating the spec, three gates must pass, in order:**
 
 **4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
 
-**4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask`: "If someone read only this line, would they reach the same outcome you have in mind?" Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and ask the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
+**4a.5 Beginner / Informed-Consent Guard.** Before restating the goal, present a beginner-friendly recap of the whole agreed scope. Include:
+- simple analogy;
+- what will be built or specified;
+- what is explicitly not happening;
+- which choices were important;
+- any deferred future ideas.
+
+Ask one confirmation question: “Do you understand and agree with this scope?” Options:
+- `Yes, I understand — continue to final goal line`
+- `Explain this more simply`
+- `I misunderstood something`
+- `Change scope before crystallizing`
+
+Do not proceed to the Restate gate until the user confirms understanding. If the user chooses any non-confirming option, return to Phase 2 with the highest-impact clarification question and record the event in `beginner_mode.comprehension_checks`. User confusion signals prevent crystallization until clarified; mathematical clarity alone is insufficient when informed consent is weak.
+
+**4b. Restate gate.** Once closure and the Informed-Consent Guard pass, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask`: "If someone read only this line, would they reach the same outcome you have in mind?" Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and the Informed-Consent Guard before asking the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
 
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
    - Apply `language.instruction` when present so user-facing prose in the spec preserves the session language; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
@@ -529,6 +610,21 @@ Spec structure:
 - Refined Rounds: {refined_rounds}
 - Closure Overrides: {closure_overrides count, or none}
 - Restated Goal: {restated_goal}
+- Beginner Mode Enabled: {yes|no}
+- Comprehension Checks: {count}
+- Confusion Signals: {count}
+- Recommended Option Streak Max: {n}
+
+## Beginner-Friendly Summary
+{Explain the final spec in beginner-friendly language and one simple analogy.}
+
+## Glossary / Plain Meanings
+| Term | Plain meaning | What it does not mean |
+|------|---------------|-----------------------|
+| {term} | {plain meaning} | {non-authorized interpretation} |
+
+## Comprehension Checks
+{List confusion signals, recap rounds, and final understanding confirmation. If none occurred, state that no confusion signals were recorded.}
 
 ## Clarity Breakdown
 | Dimension | Score | Weight | Weighted |
@@ -626,20 +722,20 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 **Options:**
 
-1. **Refine with ralplan consensus (Recommended — default for almost all specs)**
+1. **Refine with ralplan consensus (Recommended — default for almost all specs): Choosing this means we improve the plan, but do not implement yet.**
    - Description: "Consensus-refine this spec with Planner/Architect/Critic, then stop for explicit execution approval. Maximum quality. Prefer this unless the spec is already implementation-ready and trivially simple."
    - Action: Only after the user selects this option, invoke `/skill:ralplan` with the spec file path as context. Ralplan is already the Planner → Architect → Critic consensus workflow, so no extra slash-skill flags are required or supported. When consensus completes and produces a plan in `.gjc/_session-{sessionid}/plans/`, stop with that plan marked `pending approval`; do not automatically invoke execution or any other execution skill.
    - Pipeline: `deep-interview spec → explicit approval to refine → ralplan → pending approval → separate execution approval`
 
-2. **Execute with ultragoal (only when spec is already implementation-ready and really simple)**
+2. **Execute with ultragoal (only when spec is already implementation-ready and really simple): Choosing this means implementation starts after explicit approval.**
    - Description: "Goal-tracked autonomous execution — drives the spec to completion with verification. Skip ralplan refinement only when the spec is concrete, low-risk, and trivially small."
    - Action: Invoke `/skill:ultragoal` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces ultragoal planning input. Recommend this only when the spec needs no further planning; otherwise route through ralplan refinement first.
 
-3. **Execute with team (only when implementation-ready, simple, AND tmux parallelization is required)**
+3. **Execute with team (only when implementation-ready, simple, AND tmux parallelization is required): Choosing this means tmux worker panes may be launched; use only when parallel visible workers are needed.**
    - Description: "N coordinated parallel agents in tmux — only when the spec is already implementation-ready and genuinely needs tmux-based interactive worker parallelization."
    - Action: Invoke `/skill:team` with the spec file path as the shared plan only after the user explicitly selects this option. Reserve this for the narrow case where the spec is simple/ready and tmux interactive parallel workers are actually needed; otherwise prefer ralplan refinement, then ultragoal.
 
-4. **Refine further**
+4. **Refine further: Choosing this means we keep asking questions.**
    - Description: "Continue interviewing to improve clarity (current: {score}%)"
    - Action: Return to Phase 2 interview loop.
 
@@ -698,7 +794,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
-- Apply the Refine gate (Step 2b″), the Dialectic Rhythm Guard (Step 2a), and the Closure + Restate gates (Phase 4) through the `ask` tool, preserving `language.instruction` for each
+- Apply the Refine gate (Step 2b″), the Comprehension Guard (Step 2b‴), the Dialectic Rhythm Guard (Step 2a), and the Closure + Informed-Consent + Restate gates (Phase 4) through the `ask` tool, preserving `language.instruction` for each
 - Use internal fragment auto-modes only at their documented hooks: `auto-research-greenfield.md` between Step 2a and 2b for greenfield `research: true` questions, `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring, and `lateral-review-panel.md` for the Phase 3 panel personas at ambiguity-milestone transitions and before synthesizing agent-supplied answers.
 - Fragment auto-modes are loaded on demand as `kind: "skill-fragment"`; they are not public workflow skills, not slash-command/discoverable, and not `skill://` registrations.
 </Tool_Usage>
@@ -805,7 +901,12 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Ambiguity scored and displayed every round, naming the weakest component/dimension target (rotating across active components when N > 1)
 - [ ] Lateral panel convened at milestone transitions (and before synthesizing agent-supplied answers) with parallel read-only personas
 - [ ] Free-text answers passed the Refine gate; dialectic rhythm guard forced a user question after 3 agent-resolved answers; any auto-answer threshold crossing explicitly confirmed
-- [ ] Closure / Acceptance Guard and the one-sentence Restate gate both passed before crystallization
+- [ ] Every non-trivial question included plain-language framing and consequence-aware options.
+- [ ] User confusion signals triggered the Comprehension Guard instead of being treated as approval.
+- [ ] Recommended option streaks were tracked and interrupted by a recap when needed.
+- [ ] Beginner-Friendly Summary, Glossary / Plain Meanings, and Comprehension Checks were included in the final spec.
+- [ ] The final Restate gate was preceded by an informed-consent recap.
+- [ ] Closure / Acceptance Guard, the Informed-Consent Guard, and the one-sentence Restate gate all passed before crystallization
 - [ ] Interview reached ambiguity ≤ threshold OR an explicit early exit with warning
 - [ ] Spec persisted to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly via the GJC CLI (no direct `.gjc/` edits without force override), covering every active topology component plus goal/constraints/acceptance criteria/clarity/ontology/transcript
 - [ ] Spec metadata includes the auto/lateral counters (`auto_researched_rounds`, `auto_answered_rounds`, `lateral_reviews`, `refined_rounds`, `architect_failures`, `lateral_panel_failures`)
