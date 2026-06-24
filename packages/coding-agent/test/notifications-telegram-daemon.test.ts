@@ -11,7 +11,10 @@ import {
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
+	TelegramBotTransport,
+	TelegramEventDispatchState,
 	TelegramNotificationDaemon,
+	TelegramUpdatePoller,
 } from "../src/notifications/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/notifications/telegram-daemon-cli";
 
@@ -145,6 +148,72 @@ describe("telegram daemon", () => {
 		await daemon.pollOnce();
 		await daemon.pollOnce();
 		expect(bot.maxConcurrentGetUpdates).toBe(1);
+	});
+
+	test("TelegramUpdatePoller owns offset and isolates update failures", async () => {
+		const calls: Array<{ method: string; body: any }> = [];
+		const processed: unknown[] = [];
+		const bot = {
+			async call(method: string, body: unknown): Promise<unknown> {
+				calls.push({ method, body });
+				if (calls.length === 1) {
+					return {
+						ok: true,
+						result: [
+							{ update_id: 10, value: "bad" },
+							{ update_id: 11, value: "good" },
+						],
+					};
+				}
+				return { ok: true, result: [] };
+			},
+		};
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async () => undefined } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async update => {
+				processed.push(update);
+				if ((update as { value?: string }).value === "bad") throw new Error("boom");
+			},
+		});
+
+		expect(await poller.pollOnce()).toBe(2);
+		expect(await poller.pollOnce()).toBe(0);
+		expect(calls.map(call => call.body.offset)).toEqual([0, 12]);
+		expect(processed).toHaveLength(2);
+	});
+
+	test("TelegramBotTransport keeps JSON and multipart Bot API details outside daemon", async () => {
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const transport = new TelegramBotTransport({
+			botToken: "tok",
+			apiBase: "https://telegram.test",
+			fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+				requests.push({ url: String(url), init: init ?? {} });
+				return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+			}) as typeof fetch,
+		});
+
+		await transport.call("sendMessage", { chat_id: "42", text: "hello" });
+		await transport.call("sendPhoto", { chat_id: "42", photo: Buffer.from("x").toString("base64") });
+
+		expect(requests[0].url).toBe("https://telegram.test/bottok/sendMessage");
+		expect(requests[0].init.headers).toEqual({ "content-type": "application/json" });
+		expect(requests[0].init.body).toBe(JSON.stringify({ chat_id: "42", text: "hello" }));
+		expect(requests[1].url).toBe("https://telegram.test/bottok/sendPhoto");
+		expect(requests[1].init.body).toBeInstanceOf(FormData);
+	});
+
+	test("TelegramEventDispatchState groups dispatch state without changing maps", () => {
+		const state = new TelegramEventDispatchState();
+		state.busy.add("S");
+		state.inboundReactions.set(7, { messageId: 70 });
+		state.seenUpdateIds.add(99);
+
+		expect([...state.busy]).toEqual(["S"]);
+		expect(state.inboundReactions.get(7)).toEqual({ messageId: 70 });
+		expect(state.seenUpdateIds.has(99)).toBe(true);
 	});
 
 	test("stale dead-pid lock is stolen by exactly one contender", async () => {

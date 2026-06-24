@@ -528,6 +528,154 @@ export interface BotApi {
 	call(method: string, body: unknown, opts?: { signal?: AbortSignal }): Promise<unknown>;
 }
 
+export interface TelegramTransportOptions {
+	botToken: string;
+	apiBase?: string;
+	fetchImpl?: typeof fetch;
+	setTimeoutImpl?: typeof setTimeout;
+}
+
+/** Telegram Bot API transport: HTTP JSON/multipart details stay out of daemon orchestration. */
+export class TelegramBotTransport implements BotApi {
+	#opts: TelegramTransportOptions;
+
+	constructor(opts: TelegramTransportOptions) {
+		this.#opts = opts;
+	}
+
+	async call(method: string, body: unknown, opts?: { signal?: AbortSignal }): Promise<unknown> {
+		const apiBase = this.#opts.apiBase ?? "https://api.telegram.org";
+		const url = `${apiBase}/bot${this.#opts.botToken}/${method}`;
+		const fetchImpl = this.#opts.fetchImpl ?? fetch;
+		const setTimeoutImpl = this.#opts.setTimeoutImpl ?? setTimeout;
+		const sleep = (ms: number) => new Promise<void>(resolve => setTimeoutImpl(resolve, ms));
+		// sendPhoto with base64 bytes must be a multipart upload (Telegram does
+		// not accept base64 in JSON). Other methods stay JSON.
+		const photoBody = body as { photo?: unknown; mime?: unknown } | null;
+		if (method === "sendPhoto" && photoBody && typeof photoBody.photo === "string") {
+			const b = body as {
+				chat_id: unknown;
+				message_thread_id?: unknown;
+				photo: string;
+				mime?: string;
+				caption?: string;
+				parse_mode?: string;
+			};
+			const form = new FormData();
+			form.set("chat_id", String(b.chat_id));
+			if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
+			if (b.caption) form.set("caption", b.caption);
+			if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
+			form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
+			const res = await fetchWithRetry(fetchImpl, url, { method: "POST", body: form, signal: opts?.signal }, sleep);
+			return res.json();
+		}
+		const docBody = body as { document?: unknown } | null;
+		if (method === "sendDocument" && docBody && typeof docBody.document === "string") {
+			const b = body as {
+				chat_id: unknown;
+				message_thread_id?: unknown;
+				document: string;
+				mime?: string;
+				fileName?: string;
+				caption?: string;
+				parse_mode?: string;
+			};
+			const form = new FormData();
+			form.set("chat_id", String(b.chat_id));
+			if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
+			if (b.caption) form.set("caption", b.caption);
+			if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
+			form.set(
+				"document",
+				new Blob([Buffer.from(b.document, "base64")], { type: b.mime ?? "application/octet-stream" }),
+				b.fileName ?? "file",
+			);
+			const res = await fetchWithRetry(fetchImpl, url, { method: "POST", body: form, signal: opts?.signal }, sleep);
+			return res.json();
+		}
+		const res = await fetchWithRetry(
+			fetchImpl,
+			url,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: opts?.signal,
+			},
+			sleep,
+		);
+		return res.json();
+	}
+}
+
+export interface TelegramUpdatePollerOptions {
+	botApi: BotApi;
+	runtime: NotificationOperatorRuntime;
+	backoff: OperatorBackoffPolicy;
+	processUpdate: (update: unknown) => Promise<void>;
+}
+
+/** Owns getUpdates offset, conflict backoff, and per-update error isolation. */
+export class TelegramUpdatePoller {
+	#offset = 0;
+	#opts: TelegramUpdatePollerOptions;
+
+	constructor(opts: TelegramUpdatePollerOptions) {
+		this.#opts = opts;
+	}
+
+	async pollOnce(signal?: AbortSignal): Promise<number> {
+		let body: {
+			ok?: boolean;
+			error_code?: number;
+			description?: string;
+			result?: Array<{ update_id: number } & Record<string, unknown>>;
+		};
+		try {
+			body = (await this.#opts.botApi.call(
+				"getUpdates",
+				{ offset: this.#offset, timeout: 25, allowed_updates: ["message", "callback_query"] },
+				{ signal },
+			)) as typeof body;
+		} catch (err) {
+			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
+			if (isAbortError(err)) return 0;
+			// A transient Telegram API failure must never crash the daemon.
+			logger.error("notifications daemon: getUpdates failed", { error: String(err) });
+			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
+			return 0;
+		}
+		// Telegram allows only one active getUpdates poller per bot. A 409 means
+		// another poller is live; back off boundedly instead of hot-looping.
+		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
+			const backoffMs = this.#opts.backoff.next();
+			logger.error(
+				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${backoffMs}ms`,
+			);
+			await this.#opts.runtime.sleep(backoffMs, signal);
+			return 0;
+		}
+		this.#opts.backoff.reset();
+		for (const update of body.result ?? []) {
+			this.#offset = update.update_id + 1;
+			try {
+				await this.#opts.processUpdate(update);
+			} catch (err) {
+				logger.error("notifications daemon: handleTelegramUpdate failed", { error: String(err) });
+			}
+		}
+		return body.result?.length ?? 0;
+	}
+}
+
+/** Mutable dispatch state shared by session frames and inbound Telegram updates. */
+export class TelegramEventDispatchState {
+	readonly busy = new Set<string>();
+	readonly inboundReactions = new Map<number, { messageId: number }>();
+	readonly seenUpdateIds = new Set<number>();
+}
+
 /**
  * Cooperative control seam for the daemon run loop. Implemented by the
  * daemon-internal CLI / controller against the owner-scoped control-request
@@ -585,12 +733,12 @@ export class TelegramNotificationDaemon {
 	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
-	private offset = 0;
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly topics = new TopicRegistry();
 	private readonly pool: RateLimitPool<{ send: ThreadedSend; topicId?: string }>;
-	private readonly seenUpdateIds = new Set<number>();
+	private readonly poller: TelegramUpdatePoller;
+	private readonly dispatchState = new TelegramEventDispatchState();
 	/** True once the daemon has nudged the user to enable Threaded Mode. */
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
@@ -598,9 +746,13 @@ export class TelegramNotificationDaemon {
 	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
 	private pairedChatPrivate: boolean | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
-	private readonly busy = new Set<string>();
+	private get busy(): Set<string> {
+		return this.dispatchState.busy;
+	}
 	/** Inbound update id → originating Telegram message, for delivery reactions. */
-	private readonly inboundReactions = new Map<number, { messageId: number }>();
+	private get inboundReactions(): Map<number, { messageId: number }> {
+		return this.dispatchState.inboundReactions;
+	}
 
 	/**
 	 * Cooperatively stop the daemon: set the stop flag and abort the in-flight
@@ -615,82 +767,14 @@ export class TelegramNotificationDaemon {
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
 		this.aliasTable = createAliasTable();
-		this.botApi = opts.botApi ?? {
-			call: async (method, body, callOpts) => {
-				const apiBase = opts.apiBase ?? "https://api.telegram.org";
-				const url = `${apiBase}/bot${opts.botToken}/${method}`;
-				const fetchImpl = opts.fetchImpl ?? fetch;
-				const setTimeoutImpl = opts.setTimeoutImpl ?? setTimeout;
-				const sleep = (ms: number) => new Promise<void>(resolve => setTimeoutImpl(resolve, ms));
-				// sendPhoto with base64 bytes must be a multipart upload (Telegram does
-				// not accept base64 in JSON). Other methods stay JSON.
-				const photoBody = body as { photo?: unknown; mime?: unknown } | null;
-				if (method === "sendPhoto" && photoBody && typeof photoBody.photo === "string") {
-					const b = body as {
-						chat_id: unknown;
-						message_thread_id?: unknown;
-						photo: string;
-						mime?: string;
-						caption?: string;
-						parse_mode?: string;
-					};
-					const form = new FormData();
-					form.set("chat_id", String(b.chat_id));
-					if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
-					if (b.caption) form.set("caption", b.caption);
-					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
-					form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
-					const res = await fetchWithRetry(
-						fetchImpl,
-						url,
-						{ method: "POST", body: form, signal: callOpts?.signal },
-						sleep,
-					);
-					return res.json();
-				}
-				const docBody = body as { document?: unknown } | null;
-				if (method === "sendDocument" && docBody && typeof docBody.document === "string") {
-					const b = body as {
-						chat_id: unknown;
-						message_thread_id?: unknown;
-						document: string;
-						mime?: string;
-						fileName?: string;
-						caption?: string;
-						parse_mode?: string;
-					};
-					const form = new FormData();
-					form.set("chat_id", String(b.chat_id));
-					if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
-					if (b.caption) form.set("caption", b.caption);
-					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
-					form.set(
-						"document",
-						new Blob([Buffer.from(b.document, "base64")], { type: b.mime ?? "application/octet-stream" }),
-						b.fileName ?? "file",
-					);
-					const res = await fetchWithRetry(
-						fetchImpl,
-						url,
-						{ method: "POST", body: form, signal: callOpts?.signal },
-						sleep,
-					);
-					return res.json();
-				}
-				const res = await fetchWithRetry(
-					fetchImpl,
-					url,
-					{
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: JSON.stringify(body),
-						signal: callOpts?.signal,
-					},
-					sleep,
-				);
-				return res.json();
-			},
-		};
+		this.botApi =
+			opts.botApi ??
+			new TelegramBotTransport({
+				botToken: opts.botToken,
+				apiBase: opts.apiBase,
+				fetchImpl: opts.fetchImpl,
+				setTimeoutImpl: opts.setTimeoutImpl,
+			});
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
 			setTimeoutImpl: opts.setTimeoutImpl,
@@ -700,6 +784,12 @@ export class TelegramNotificationDaemon {
 		});
 		this.sessionRouter = this.createSessionRouter();
 		this.pool = new RateLimitPool<{ send: ThreadedSend; topicId?: string }>({ now: opts.now });
+		this.poller = new TelegramUpdatePoller({
+			botApi: this.botApi,
+			runtime: this.runtime,
+			backoff: this.pollConflictBackoff,
+			processUpdate: update => this.handleTelegramUpdate(update),
+		});
 	}
 
 	private createSessionRouter(): OperatorEventRouter<SessionSocket> {
@@ -820,7 +910,7 @@ export class TelegramNotificationDaemon {
 			void this.handleSessionMessage(session, JSON.parse(String(ev.data))).catch(err => {
 				// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
 				// the daemon log instead of an invisible unhandled rejection.
-				console.error("notifications daemon: handleSessionMessage failed:", err);
+				logger.error("notifications daemon: handleSessionMessage failed", { error: String(err) });
 			});
 		});
 		ws.addEventListener("close", () => {
@@ -1339,11 +1429,11 @@ export class TelegramNotificationDaemon {
 			const inbound = decideThreadedInbound(update as never, {
 				pairedChatId: this.opts.chatId,
 				topicToSession: t => this.topics.sessionForTopic(t),
-				isDuplicate: id => this.seenUpdateIds.has(id),
+				isDuplicate: id => this.dispatchState.seenUpdateIds.has(id),
 			});
 			if (inbound.kind === "duplicate") return;
 			if (inbound.kind === "inject") {
-				this.seenUpdateIds.add(inbound.updateId);
+				this.dispatchState.seenUpdateIds.add(inbound.updateId);
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const attachmentResult = inbound.attachment
@@ -1421,48 +1511,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async pollOnce(signal?: AbortSignal): Promise<number> {
-		let body: {
-			ok?: boolean;
-			error_code?: number;
-			description?: string;
-			result?: Array<{ update_id: number } & Record<string, unknown>>;
-		};
-		try {
-			body = (await this.botApi.call(
-				"getUpdates",
-				{ offset: this.offset, timeout: 25, allowed_updates: ["message", "callback_query"] },
-				{ signal },
-			)) as typeof body;
-		} catch (err) {
-			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
-			if (isAbortError(err)) return 0;
-			// A transient Telegram API failure (e.g. ECONNRESET on the long-poll) must
-			// never crash the daemon — that silently stops all delivery, including ask
-			// notifications. Log, back off, and let the run loop retry.
-			console.error("notifications daemon: getUpdates failed:", err);
-			await this.runtime.sleep(POLL_BACKOFF_MS, signal);
-			return 0;
-		}
-		// Telegram allows only one active getUpdates poller per bot. A 409 means
-		// another poller is live; back off boundedly instead of hot-looping.
-		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
-			const backoffMs = this.pollConflictBackoff.next();
-			console.error(
-				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${backoffMs}ms`,
-			);
-			await this.runtime.sleep(backoffMs, signal);
-			return 0;
-		}
-		this.pollConflictBackoff.reset();
-		for (const update of body.result ?? []) {
-			this.offset = update.update_id + 1;
-			try {
-				await this.handleTelegramUpdate(update);
-			} catch (err) {
-				console.error("notifications daemon: handleTelegramUpdate failed:", err);
-			}
-		}
-		return body.result?.length ?? 0;
+		return this.poller.pollOnce(signal);
 	}
 
 	/** Sync the bot's Telegram command menu to what the daemon actually handles. */
