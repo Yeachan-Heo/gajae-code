@@ -60,13 +60,13 @@ describe("InteractiveMode.setEditorComponent", () => {
 		resetSettingsForTest();
 	});
 
-	it("renders the default composer as a closed square input box", () => {
+	it("renders the default composer as a closed rounded input box", () => {
 		const lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
 
-		expect(lines[0]).toStartWith("┌");
-		expect(lines[0]).toEndWith("┐");
-		expect(lines.at(-1)).toStartWith("└");
-		expect(lines.at(-1)).toEndWith("┘");
+		expect(lines[0]).toStartWith("╭");
+		expect(lines[0]).toEndWith("╮");
+		expect(lines.at(-1)).toStartWith("╰");
+		expect(lines.at(-1)).toEndWith("╯");
 		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
 		expect(lines.join("\n")).toContain("Type your message...");
 		expect(lines.join("\n")).not.toContain("›");
@@ -108,24 +108,20 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(rendered).not.toContain(expectedQueueShortcutHint());
 	});
 
-	it("renders one visible blank row between status line and composer without hook widgets", async () => {
+	it("renders one visible blank row above the composer without hook widgets", async () => {
 		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
 
 		await mode.init();
 
 		const rendered = mode.ui.render(48).map(line => stripVTControlCharacters(line));
-		const composerIndex = rendered.findIndex(line => line.startsWith("┌") && line.endsWith("┐"));
-		let lastStatusIndex = -1;
-		for (let index = 0; index < composerIndex; index += 1) {
-			if (rendered[index] !== "") lastStatusIndex = index;
-		}
+		const composerContentIndex = rendered.findIndex(line => line.includes("Type your message..."));
+		const composerIndex = composerContentIndex - 1;
 
 		expect(composerIndex).toBeGreaterThan(0);
-		expect(lastStatusIndex).toBeGreaterThanOrEqual(0);
-		expect(rendered.slice(lastStatusIndex + 1, composerIndex)).toEqual([""]);
+		expect(rendered[composerIndex - 1]).toBe("");
 	});
 
-	it("keeps closed square composer chrome for one-line, multiline, and narrow prompts", () => {
+	it("keeps closed rounded composer chrome for one-line, multiline, and narrow prompts", () => {
 		for (const [width, text] of [
 			[48, "Ask gjc to improve the composer"],
 			[48, "first line\nsecond line"],
@@ -134,10 +130,10 @@ describe("InteractiveMode.setEditorComponent", () => {
 			mode.editor.setText(text);
 			const lines = mode.editor.render(width).map(line => stripVTControlCharacters(line));
 
-			expect(lines[0]).toStartWith("┌");
-			expect(lines[0]).toEndWith("┐");
-			expect(lines.at(-1)).toStartWith("└");
-			expect(lines.at(-1)).toEndWith("┘");
+			expect(lines[0]).toStartWith("╭");
+			expect(lines[0]).toEndWith("╮");
+			expect(lines.at(-1)).toStartWith("╰");
+			expect(lines.at(-1)).toEndWith("╯");
 			expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
 			expect(lines.join("\n")).not.toContain("Type your message...");
 		}

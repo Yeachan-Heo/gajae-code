@@ -38,6 +38,7 @@ describe("GJC public CLI command surface", () => {
 			"migrate",
 			"rlm",
 			"update",
+			"plugin",
 			"launch",
 		]);
 	});
