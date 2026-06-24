@@ -28,7 +28,10 @@ async function chainIds(ctx?: ActiveSearchModelContext, providers: string[] = []
 	return chain.map(provider => provider.id);
 }
 
-function openAIContext(baseUrl: string | undefined, overrides: Partial<ActiveSearchModelContext> = {}): ActiveSearchModelContext {
+function openAIContext(
+	baseUrl: string | undefined,
+	overrides: Partial<ActiveSearchModelContext> = {},
+): ActiveSearchModelContext {
 	return {
 		provider: "openai",
 		modelId: "gpt-5",
