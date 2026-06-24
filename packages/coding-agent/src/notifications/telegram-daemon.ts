@@ -11,6 +11,7 @@ import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
+import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
 import {
 	type AliasTable,
@@ -579,6 +580,10 @@ export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
 	readonly messageRoutes = new Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>();
 	readonly sessions = new Map<string, SessionSocket>();
+	private readonly runtime: NotificationOperatorRuntime;
+	private readonly sessionRouter: OperatorEventRouter<SessionSocket>;
+	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
+	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
 	private offset = 0;
 	private readonly fsImpl: TelegramDaemonFs;
@@ -592,20 +597,10 @@ export class TelegramNotificationDaemon {
 	private readonly flatIdentitySent = new Set<string>();
 	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
 	private pairedChatPrivate: boolean | undefined;
-	private flushTimer: ReturnType<typeof setInterval> | undefined;
-	private scanTimer: ReturnType<typeof setInterval> | undefined;
-	private scanning = false;
-	private typingTimer: ReturnType<typeof setInterval> | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
 	private readonly busy = new Set<string>();
 	/** Inbound update id → originating Telegram message, for delivery reactions. */
 	private readonly inboundReactions = new Map<number, { messageId: number }>();
-	/** AbortController for the in-flight long poll; aborted by requestStop() to wake the loop. */
-	private activePoll: AbortController | undefined;
-	/** Set when a cooperative stop has been requested (signal or control request). */
-	private stopRequested = false;
-	/** Current bounded backoff after a Telegram getUpdates 409 conflict (0 when healthy). */
-	private pollConflictBackoffMs = 0;
 
 	/**
 	 * Cooperatively stop the daemon: set the stop flag and abort the in-flight
@@ -613,9 +608,8 @@ export class TelegramNotificationDaemon {
 	 * ~25s getUpdates timeout. Safe to call from a signal handler.
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
-		this.stopRequested = true;
+		this.runtime.requestStop();
 		this.running = false;
-		this.activePoll?.abort();
 	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
@@ -697,7 +691,63 @@ export class TelegramNotificationDaemon {
 				return res.json();
 			},
 		};
+		this.runtime = new NotificationOperatorRuntime({
+			now: opts.now,
+			setTimeoutImpl: opts.setTimeoutImpl,
+			clearTimeoutImpl: opts.clearTimeoutImpl,
+			setIntervalImpl: opts.setIntervalImpl,
+			clearIntervalImpl: opts.clearIntervalImpl,
+		});
+		this.sessionRouter = this.createSessionRouter();
 		this.pool = new RateLimitPool<{ send: ThreadedSend; topicId?: string }>({ now: opts.now });
+	}
+
+	private createSessionRouter(): OperatorEventRouter<SessionSocket> {
+		return new OperatorEventRouter<SessionSocket>()
+			.add({
+				name: "hello",
+				matches: msg => msg.type === "hello",
+				handle: (session, msg) => {
+					const caps = Array.isArray(msg.capabilities) ? msg.capabilities : [];
+					if (caps.includes(CLIENT_PING_PONG_CAPABILITY)) {
+						session.capable = true;
+						this.startLiveness(session);
+					}
+				},
+			})
+			.add({
+				name: "pong",
+				matches: msg => msg.type === "pong",
+				handle: (session, msg) => {
+					if (typeof msg.nonce === "string" && msg.nonce === session.awaitingNonce) {
+						session.awaitingNonce = undefined;
+						session.lastPongAt = this.runtime.now();
+					}
+				},
+			})
+			.add({
+				name: "activity",
+				matches: msg => msg.type === "activity",
+				handle: async (session, msg) => {
+					if (msg.state === "busy") {
+						this.busy.add(session.sessionId);
+						await this.sendTyping(session.sessionId);
+					} else {
+						this.busy.delete(session.sessionId);
+					}
+				},
+			})
+			.add({
+				name: "inbound_ack",
+				matches: msg => msg.type === "inbound_ack" && typeof msg.updateId === "number",
+				handle: async (_session, msg) => {
+					const target = this.inboundReactions.get(msg.updateId as number);
+					if (target && msg.state === "consumed") {
+						this.inboundReactions.delete(msg.updateId as number);
+						await this.setReaction(target.messageId, CONSUMED_REACTION);
+					}
+				},
+			});
 	}
 
 	async loadAliases(): Promise<void> {
@@ -788,7 +838,7 @@ export class TelegramNotificationDaemon {
 	private startLiveness(session: SessionSocket): void {
 		if (session.pingTimer) return;
 		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
-		const now = () => (this.opts.now ?? Date.now)();
+		const now = () => this.runtime.now();
 		session.lastPongAt = now();
 		session.pingTimer = setIntervalImpl(() => {
 			if (this.sessions.get(session.sessionId) !== session) return;
@@ -1092,46 +1142,32 @@ export class TelegramNotificationDaemon {
 	}
 
 	private startFlushTimer(): void {
-		if (this.flushTimer) return;
-		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
-		this.flushTimer = setIntervalImpl(() => {
+		this.runtime.startInterval("telegram-flush", RATE_LIMIT_FLUSH_INTERVAL_MS, () => {
 			if (!this.running || this.pool.pending === 0) return;
 			void this.flushPool();
-		}, RATE_LIMIT_FLUSH_INTERVAL_MS);
+		});
 	}
 
 	private stopFlushTimer(): void {
-		if (!this.flushTimer) return;
-		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
-		clearIntervalImpl(this.flushTimer);
-		this.flushTimer = undefined;
+		this.runtime.stopInterval("telegram-flush");
 	}
 
 	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
 	private async runScan(): Promise<void> {
-		if (this.scanning) return;
-		this.scanning = true;
-		try {
+		await this.runtime.runExclusive("telegram-scan", async () => {
 			await this.scanRoots();
-		} finally {
-			this.scanning = false;
-		}
+		});
 	}
 
 	private startScanTimer(): void {
-		if (this.scanTimer) return;
-		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
-		this.scanTimer = setIntervalImpl(() => {
+		this.runtime.startInterval("telegram-scan", this.opts.scanIntervalMs ?? SESSION_SCAN_INTERVAL_MS, () => {
 			if (!this.running) return;
 			void this.runScan();
-		}, this.opts.scanIntervalMs ?? SESSION_SCAN_INTERVAL_MS);
+		});
 	}
 
 	private stopScanTimer(): void {
-		if (!this.scanTimer) return;
-		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
-		clearIntervalImpl(this.scanTimer);
-		this.scanTimer = undefined;
+		this.runtime.stopInterval("telegram-scan");
 	}
 
 	/** Send a single `typing` chat action into a busy session's topic (best-effort). */
@@ -1163,58 +1199,18 @@ export class TelegramNotificationDaemon {
 	}
 
 	private startTypingTimer(): void {
-		if (this.typingTimer) return;
-		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
-		this.typingTimer = setIntervalImpl(() => {
+		this.runtime.startInterval("telegram-typing", TYPING_REFRESH_INTERVAL_MS, () => {
 			if (!this.running || this.busy.size === 0) return;
 			for (const sessionId of this.busy) void this.sendTyping(sessionId);
-		}, TYPING_REFRESH_INTERVAL_MS);
+		});
 	}
 
 	private stopTypingTimer(): void {
-		if (!this.typingTimer) return;
-		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
-		clearIntervalImpl(this.typingTimer);
-		this.typingTimer = undefined;
+		this.runtime.stopInterval("telegram-typing");
 	}
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
-		if (msg?.type === "hello") {
-			const caps = Array.isArray(msg.capabilities) ? msg.capabilities : [];
-			if (caps.includes(CLIENT_PING_PONG_CAPABILITY)) {
-				session.capable = true;
-				this.startLiveness(session);
-			}
-			return;
-		}
-		if (msg?.type === "pong") {
-			if (typeof msg.nonce === "string" && msg.nonce === session.awaitingNonce) {
-				session.awaitingNonce = undefined;
-				session.lastPongAt = (this.opts.now ?? Date.now)();
-			}
-			return;
-		}
-		// Live typing indicator: track busy/idle per session and push an immediate
-		// chat action so "typing…" appears without waiting for the refresh tick.
-		if (msg?.type === "activity") {
-			if (msg.state === "busy") {
-				this.busy.add(session.sessionId);
-				await this.sendTyping(session.sessionId);
-			} else {
-				this.busy.delete(session.sessionId);
-			}
-			return;
-		}
-		// Inbound delivery double-check: flip the queued reaction to the consumed
-		// reaction once the session reports a turn picked the message up.
-		if (msg?.type === "inbound_ack" && typeof msg.updateId === "number") {
-			const target = this.inboundReactions.get(msg.updateId);
-			if (target && msg.state === "consumed") {
-				this.inboundReactions.delete(msg.updateId);
-				await this.setReaction(target.messageId, CONSUMED_REACTION);
-			}
-			return;
-		}
+		if (await this.sessionRouter.dispatch(session, msg as Record<string, unknown>)) return;
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
@@ -1444,23 +1440,20 @@ export class TelegramNotificationDaemon {
 			// never crash the daemon — that silently stops all delivery, including ask
 			// notifications. Log, back off, and let the run loop retry.
 			console.error("notifications daemon: getUpdates failed:", err);
-			await this.sleep(POLL_BACKOFF_MS, signal);
+			await this.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return 0;
 		}
 		// Telegram allows only one active getUpdates poller per bot. A 409 means
 		// another poller is live; back off boundedly instead of hot-looping.
 		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
-			this.pollConflictBackoffMs = Math.min(
-				this.pollConflictBackoffMs ? this.pollConflictBackoffMs * 2 : 500,
-				5_000,
-			);
+			const backoffMs = this.pollConflictBackoff.next();
 			console.error(
-				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${this.pollConflictBackoffMs}ms`,
+				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${backoffMs}ms`,
 			);
-			await this.sleep(this.pollConflictBackoffMs, signal);
+			await this.runtime.sleep(backoffMs, signal);
 			return 0;
 		}
-		this.pollConflictBackoffMs = 0;
+		this.pollConflictBackoff.reset();
 		for (const update of body.result ?? []) {
 			this.offset = update.update_id + 1;
 			try {
@@ -1470,22 +1463,6 @@ export class TelegramNotificationDaemon {
 			}
 		}
 		return body.result?.length ?? 0;
-	}
-
-	/** Abortable sleep honoring the injected timer; resolves early on abort. */
-	private sleep(ms: number, signal?: AbortSignal): Promise<void> {
-		return new Promise<void>(resolve => {
-			if (signal?.aborted) return resolve();
-			const timer = (this.opts.setTimeoutImpl ?? setTimeout)(() => resolve(), ms);
-			signal?.addEventListener(
-				"abort",
-				() => {
-					(this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
-					resolve();
-				},
-				{ once: true },
-			);
-		});
 	}
 
 	/** Sync the bot's Telegram command menu to what the daemon actually handles. */
@@ -1512,6 +1489,7 @@ export class TelegramNotificationDaemon {
 			pid: this.opts.pid ?? process.pid,
 		});
 		if (!this.running) return;
+		this.runtime.start();
 		this.startFlushTimer();
 		this.startScanTimer();
 		this.startTypingTimer();
@@ -1520,8 +1498,7 @@ export class TelegramNotificationDaemon {
 			await this.loadAliases();
 			await this.loadTopics();
 			await this.runScan();
-			let idleSince = (this.opts.now ?? Date.now)();
-			let pollBackoffMs = 0;
+			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				if (
@@ -1537,29 +1514,30 @@ export class TelegramNotificationDaemon {
 				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				if (this.sessions.size === 0) {
-					if ((this.opts.now ?? Date.now)() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000)) break;
+					if (this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000)) break;
 				} else {
-					idleSince = (this.opts.now ?? Date.now)();
-					this.activePoll = new AbortController();
+					idleSince = this.runtime.now();
+					const activePoll = this.runtime.createAbortController();
 					try {
-						await this.pollOnce(this.activePoll.signal);
-						pollBackoffMs = 0;
+						await this.pollOnce(activePoll.signal);
+						this.loopBackoff.reset();
 					} catch (e) {
 						// A transient getUpdates/network failure must not kill the
 						// daemon. Back off (bounded, below the heartbeat TTL) and keep
 						// renewing ownership at the loop top.
-						pollBackoffMs = pollBackoffMs === 0 ? 250 : Math.min(pollBackoffMs * 2, 4_000);
-						logger.warn(`notifications: getUpdates failed, backing off ${pollBackoffMs}ms: ${String(e)}`);
-						await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, pollBackoffMs));
+						const backoffMs = this.loopBackoff.next();
+						logger.warn(`notifications: getUpdates failed, backing off ${backoffMs}ms: ${String(e)}`);
+						await this.runtime.sleep(backoffMs);
 						continue;
 					} finally {
-						this.activePoll = undefined;
+						this.runtime.clearAbortController(activePoll);
 					}
 				}
 				if (await this.controlStopRequested()) break;
-				await new Promise(resolve => (this.opts.setTimeoutImpl ?? setTimeout)(resolve, 10));
+				await this.runtime.sleep(10);
 			}
 		} finally {
+			this.runtime.stop();
 			this.stopFlushTimer();
 			this.stopScanTimer();
 			this.stopTypingTimer();
@@ -1580,7 +1558,7 @@ export class TelegramNotificationDaemon {
 
 	/** True when a signal-driven stop or an owner-scoped control request asks the loop to exit. */
 	private async controlStopRequested(): Promise<boolean> {
-		if (this.stopRequested) return true;
+		if (this.runtime.stopRequested) return true;
 		if (!this.opts.control) return false;
 		try {
 			return await this.opts.control.shouldStop(this.opts.ownerId);

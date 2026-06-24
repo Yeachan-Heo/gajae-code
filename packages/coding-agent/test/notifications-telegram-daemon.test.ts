@@ -1641,7 +1641,7 @@ test("pollOnce resolves to 0 when the in-flight getUpdates is aborted", async ()
 test("pollOnce backs off on a Telegram 409 conflict instead of processing updates", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
-	let slept = 0;
+	const sleeps: number[] = [];
 	const bot = {
 		call: async () => ({
 			ok: false,
@@ -1655,14 +1655,19 @@ test("pollOnce backs off on a Telegram 409 conflict instead of processing update
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		setTimeoutImpl: ((cb: () => void) => {
-			slept++;
+		setTimeoutImpl: ((cb: () => void, ms?: number) => {
+			sleeps.push(ms ?? 0);
 			cb();
 			return 0;
-		}) as any,
+		}) as unknown as typeof setTimeout,
 	});
 	expect(await daemon.pollOnce()).toBe(0);
-	expect(slept).toBe(1);
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(await daemon.pollOnce()).toBe(0);
+	expect(sleeps).toEqual([500, 1_000, 2_000, 4_000, 5_000, 5_000]);
 });
 
 test("requestStop aborts the active long poll and run() exits, releasing ownership", async () => {
