@@ -37,7 +37,7 @@ describe("buildHotkeysMarkdown", () => {
 		expect(markdown).toContain("| `Ctrl+Shift+P` | Copy whole prompt |");
 		expect(markdown).toContain("| `Enter` | Send / queue while busy |");
 		expect(markdown).toContain("| `Alt+Enter` | Queue message for next turn |");
-		expect(markdown).toContain("| `Shift+Enter` | New line |");
+		expect(markdown).toContain("| `Shift+Enter` / `Ctrl+J` | New line |");
 		expect(markdown).toContain("| `Ctrl+Shift+L` | Select model (temporary) |");
 		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 		expect(markdown).toContain("| `Alt+M` | Toggle plan mode |");
