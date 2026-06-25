@@ -55,6 +55,17 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("");
 	});
 
+	it("triggers explicit queue from legacy Alt+LF terminals", () => {
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		editor.onQueue = onQueue;
+
+		editor.handleInput("\x1b\n");
+
+		expect(onQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
 	it("leaves Ctrl+Enter for newline by default", () => {
 		const editor = createEditor();
 		const onQueue = vi.fn();

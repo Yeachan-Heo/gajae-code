@@ -8,6 +8,12 @@ describe("matchesKey", () => {
 		expect(matchesKey(ctrlC, "ctrl+c")).toBe(true);
 	});
 
+	it("matches legacy Alt+LF as Alt+Enter", () => {
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b\n", "alt+enter")).toBe(true);
+		expect(matchesKey("\x1b\n", "ctrl+alt+j")).toBe(false);
+	});
+
 	it("matches shifted tab", () => {
 		setKittyProtocolActive(false);
 		expect(matchesKey("\x1b[Z", "shift+tab")).toBe(true);
@@ -64,6 +70,7 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[13;6~", "ctrl+shift+enter")).toBe(true);
 		expect(matchesKey("\x1b[13;2~", "shift+enter")).toBe(true);
 		expect(matchesKey("\x1b[13;2u", "shift+enter")).toBe(true);
+		expect(matchesKey("\x1b[13;3~", "alt+enter")).toBe(true);
 		setKittyProtocolActive(false);
 	});
 
@@ -81,6 +88,11 @@ describe("parseKey", () => {
 		const dvorakCtrlK = "\x1b[107::118;5u";
 		expect(parseKey(dvorakCtrlK)).toBe("ctrl+k");
 		setKittyProtocolActive(false);
+	});
+
+	it("parses legacy Alt+LF as Alt+Enter", () => {
+		setKittyProtocolActive(false);
+		expect(parseKey("\x1b\n")).toBe("alt+enter");
 	});
 
 	it("ignores Kitty release events while still parsing repeats", () => {
@@ -118,6 +130,7 @@ describe("parseKey", () => {
 		expect(parseKey("\x1b[13;6~")).toBe("shift+ctrl+enter");
 		expect(parseKey("\x1b[13;2~")).toBe("shift+enter");
 		expect(parseKey("\x1b[13;2u")).toBe("shift+enter");
+		expect(parseKey("\x1b[13;3~")).toBe("alt+enter");
 		setKittyProtocolActive(false);
 	});
 
