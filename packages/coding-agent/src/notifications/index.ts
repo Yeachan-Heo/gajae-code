@@ -141,6 +141,7 @@ interface SessionRuntime {
 	/** Deregisters this session's Telegram file sink. */
 	disposeFileSink: () => void;
 	redact: boolean;
+	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
@@ -248,7 +249,7 @@ function registerInteractiveAnswerSource(
 	id: string,
 	server: NotificationServer,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
-	redact: boolean,
+	getRedact: () => boolean,
 	tag: string,
 ): () => void {
 	return registerAskAnswerSource(id, {
@@ -260,7 +261,7 @@ function registerInteractiveAnswerSource(
 					JSON.stringify(
 						notificationActionPayload(
 							{ id: askId, kind: "ask", sessionId: id, question, options },
-							{ redact, sessionTag: tag },
+							{ redact: getRedact(), sessionTag: tag },
 						),
 					),
 					true,
@@ -336,6 +337,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const tag = sessionTag(id);
 		const redact = cfg.redact;
+		const verbosity = cfg.verbosity;
 		let runtime: SessionRuntime | undefined;
 
 		// The SDK can always answer now (interactive via the answer source, or the
@@ -410,7 +412,31 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 				return;
 			}
 			if (inbound.kind === "config_command") {
-				if (runtime && typeof inbound.redact === "boolean") runtime.redact = inbound.redact;
+				if (!runtime) return;
+				const update: {
+					type: "config_update";
+					sessionId: string;
+					verbosity?: "lean" | "verbose";
+					redact?: boolean;
+				} = {
+					type: "config_update",
+					sessionId: id,
+				};
+				if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
+					runtime.verbosity = inbound.verbosity;
+					update.verbosity = inbound.verbosity;
+				}
+				if (typeof inbound.redact === "boolean") {
+					runtime.redact = inbound.redact;
+					update.redact = inbound.redact;
+				}
+				if (update.verbosity !== undefined || update.redact !== undefined) {
+					try {
+						runtime.server.pushFrame(JSON.stringify(update));
+					} catch (e) {
+						logger.warn(`notifications: config_update failed: ${String(e)}`);
+					}
+				}
 			}
 		});
 
@@ -418,7 +444,13 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const endpoint = await server.start();
 
 			// Interactive answer source: the ask tool races the local UI against this.
-			const disposeAnswerSource = registerInteractiveAnswerSource(id, server, pendingInteractive, redact, tag);
+			const disposeAnswerSource = registerInteractiveAnswerSource(
+				id,
+				server,
+				pendingInteractive,
+				() => runtime?.redact ?? redact,
+				tag,
+			);
 			const disposeFileSink = registerTelegramFileSink(id, async file => {
 				try {
 					const data = await fs.promises.readFile(file.path);
@@ -444,6 +476,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 				disposeAnswerSource,
 				disposeFileSink,
 				redact,
+				verbosity,
 				sessionTag: tag,
 				busy: false,
 				pendingInbound: new Set<number>(),
@@ -567,8 +600,9 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const running = runtimes.has(id);
 			const locallyDisabled = disabledSessions.has(id);
 			const enabled = isEnabledForSession(id, resolved.cfg);
+			const runtime = runtimes.get(id);
 			ctx.ui.notify(
-				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${resolved.cfg.redact ? "on" : "off"}${locallyDisabled ? "; locally off" : ""}.`,
+				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${locallyDisabled ? "; locally off" : ""}.`,
 				"info",
 			);
 		},
@@ -616,7 +650,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			newId,
 			rt.server,
 			rt.pendingInteractive,
-			rt.redact,
+			() => rt.redact,
 			rt.sessionTag,
 		);
 		rt.disposeFileSink = registerTelegramFileSink(newId, async file => {
@@ -735,7 +769,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// On idle, stream a context update with metadata (token/model usage +
 		// working-tree diff) unless redaction is on. The agent's last message is
 		// NOT repeated here — it is already streamed once via `turn_stream`.
-		if (!rt.redact) {
+		if (!rt.redact && rt.verbosity === "verbose") {
 			const usage = (
 				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
 			).getContextUsage?.();
