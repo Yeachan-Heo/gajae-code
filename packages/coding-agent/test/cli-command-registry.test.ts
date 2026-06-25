@@ -19,4 +19,16 @@ describe("CLI command registry", () => {
 		expect(cmd).toBeDefined();
 		expect(cmd?.description ?? "").toMatch(/plugin/i);
 	});
+
+	it("registers the `mcp` command so direct MCP config does not route to launch", () => {
+		const entry = commands.find(c => c.name === "mcp");
+		expect(entry).toBeDefined();
+	});
+
+	it("lazily resolves the registered `mcp` entry to the MCP command class", async () => {
+		const entry = commands.find(c => c.name === "mcp");
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/MCP/i);
+	});
 });
