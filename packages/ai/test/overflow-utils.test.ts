@@ -86,3 +86,56 @@ describe("isContextOverflow - 400/413 no-body (Cerebras, Mistral, proxy wrappers
 		expect(isContextOverflow(createErrorMessage("429 status code (no body)"))).toBe(false);
 	});
 });
+
+describe("isContextOverflow - empty response with low usage (proxy-level overflow)", () => {
+	function createEmptyStopMessage(input = 1, output = 1): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [],
+			api: "openai-completions",
+			provider: "spac-litellm",
+			model: "zai-org/GLM-5.2",
+			usage: {
+				input,
+				output,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: input + output,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+	}
+
+	it("detects empty content with fabricated near-zero usage (LiteLLM proxy)", () => {
+		const message = createEmptyStopMessage(1, 1);
+		expect(isContextOverflow(message)).toBe(true);
+	});
+
+	it("detects empty content at threshold boundary (total = 5)", () => {
+		const message = createEmptyStopMessage(3, 2);
+		expect(isContextOverflow(message)).toBe(true);
+	});
+
+	it("does not classify empty content with realistic usage as overflow", () => {
+		const message = createEmptyStopMessage(5000, 100);
+		expect(isContextOverflow(message)).toBe(false);
+	});
+
+	it("does not classify non-empty content with low usage as overflow", () => {
+		const message: AssistantMessage = {
+			...createEmptyStopMessage(1, 1),
+			content: [{ type: "text", text: "ok" }],
+		};
+		expect(isContextOverflow(message)).toBe(false);
+	});
+
+	it("does not classify empty content with non-stop stopReason as overflow", () => {
+		const message: AssistantMessage = {
+			...createEmptyStopMessage(1, 1),
+			stopReason: "length",
+		};
+		expect(isContextOverflow(message)).toBe(false);
+	});
+});

@@ -1058,3 +1058,69 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(messages[2]).toMatchObject({ role: "user", content: "follow-up" });
 	});
 });
+
+describe("agentLoop - empty response overflow detection", () => {
+	it("promotes empty stop response with low usage to error stopReason", async () => {
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [],
+		};
+
+		// Simulate a proxy (e.g. LiteLLM) returning an empty "successful" response
+		// with fabricated near-zero usage when the upstream model context window
+		// is exceeded.
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [],
+					stopReason: "stop",
+					usage: { input: 1, output: 1 },
+				},
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toBeDefined();
+		expect(assistantMessage!.stopReason).toBe("error");
+		expect(assistantMessage!.errorMessage).toContain("empty response");
+	});
+
+	it("does not promote empty stop response with realistic usage to error", async () => {
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [],
+		};
+
+		// An empty response with realistic usage should NOT be treated as overflow.
+		// (Some models legitimately return empty content with real token counts.)
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [],
+					stopReason: "stop",
+					usage: { input: 5000, output: 100 },
+				},
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toBeDefined();
+		expect(assistantMessage!.stopReason).toBe("stop");
+	});
+});
