@@ -298,6 +298,8 @@ bun scripts/rebrand-inventory.ts --strict
 bun test packages/coding-agent/test/default-gjc-definitions.test.ts
 ```
 
+For future UI, dashboard, terminal, and TUI visual work, follow the repo-owned [UI design and visual QA workflow](docs/ui-design-visual-qa.md) before broad product-screen implementation.
+
 For a package-by-package map, see [`docs/codebase-overview.md`](docs/codebase-overview.md).
 
 ## Contributors
