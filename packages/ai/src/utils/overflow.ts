@@ -53,13 +53,25 @@ const OVERFLOW_PATTERNS = [
 	/model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
 ];
 /**
+ * Threshold below which a "successful" (stopReason "stop") response with empty
+ * content is considered anomalous. Some proxies (notably LiteLLM) return an
+ * empty `choices[0].message.content` with a near-zero `usage` (e.g. input: 1,
+ * output: 1) when the upstream model context window is exceeded, instead of
+ * surfacing a proper error. The total token count for such a response is well
+ * below any realistic turn, so we treat it as a proxy-level overflow signal.
+ */
+const EMPTY_RESPONSE_USAGE_THRESHOLD = 5;
+/**
  * Check if an assistant message represents a context overflow error.
  *
- * This handles two cases:
+ * This handles three cases:
  * 1. Error-based overflow: Most providers return stopReason "error" with a
  *    specific error message pattern.
  * 2. Silent overflow: Some providers accept overflow requests and return
  *    successfully. For these, we check if usage.input exceeds the context window.
+ * 3. Proxy-level overflow: Some proxies (e.g. LiteLLM) return a "successful"
+ *    response with empty content and a fabricated near-zero usage when the
+ *    upstream model's context window is exceeded.
  *
  * ## Reliability by Provider
  *
@@ -83,6 +95,13 @@ const OVERFLOW_PATTERNS = [
  * - z.ai: Sometimes accepts overflow silently (detectable via usage.input > contextWindow),
  *   sometimes returns rate limit errors. Pass contextWindow param to detect silent overflow.
  * - Ollama: Silently truncates input without error. Cannot be detected via this function.
+ * - LiteLLM proxy: Returns a "successful" response with empty content and a
+ *   fabricated near-zero usage (e.g. input: 1, output: 1) when the upstream
+ *   model's context window is exceeded. Detected via Case 3 (empty content +
+ *   anomalously low usage). Note: the LiteLLM proxy's context limit may differ
+ *   from the underlying model's advertised contextWindow (e.g. configured via
+ *   `model_info.max_tokens` in LiteLLM's config.yaml), so Case 2 (which compares
+ *   usage.input against contextWindow) may not catch it.
  *   The response will have usage.input < expected, but we don't know the expected value.
  *
  * ## Custom Providers
@@ -124,6 +143,21 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		if (inputTokens > contextWindow) {
 			return true;
 		}
+	}
+
+	// Case 3: Empty response with anomalously low usage (proxy-level overflow)
+	// Some proxies (e.g. LiteLLM) return a "successful" response (stopReason "stop")
+	// with empty content and a near-zero token count when the upstream model's
+	// context window is exceeded. This is distinct from silent overflow (Case 2),
+	// where the provider reports the real input token count. Here the proxy
+	// fabricates a bogus usage (input: 1, output: 1) that is far below any
+	// realistic turn, so we detect it heuristically.
+	if (
+		message.stopReason === "stop" &&
+		message.content.length === 0 &&
+		message.usage.input + message.usage.output <= EMPTY_RESPONSE_USAGE_THRESHOLD
+	) {
+		return true;
 	}
 
 	return false;
