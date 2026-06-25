@@ -33,9 +33,11 @@ export function isComposerHarnessModel(modelId: string): boolean {
 export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this Composer harness (this OVERRIDES contrary habits from your training):
 
 - Discover file names ONLY with the find tool; search file contents ONLY with the search tool; read file bodies or line ranges ONLY with the read tool. NEVER inspect repository files through shell commands (ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more) or scripts — that output carries no hashline anchors and bypasses the agent's safety limits.
+- For multi-file or missing-path work, use the fixed ladder find → search → read → edit. Do not fall back to bash discovery when a read/search misses; adjust the find/search query instead.
 - Modify files ONLY with the edit/write tools. NEVER mutate files through shell redirection, tee, sed -i, perl -pi, inline python/node/bun scripts, or other out-of-band writes — those writes invalidate every known anchor and break edit recovery.
 - A line anchor (e.g. "42sr") is a line number plus a 2-char content hash. You CANNOT compute the hash yourself: copy anchors verbatim from the MOST RECENT read/search/edit output of that exact file. NEVER guess, renumber, or arithmetically shift an anchor.
 - After ANY edit to a file (including your own), anchors you saw earlier are stale. Re-read the edited region, or copy the fresh anchors printed in the edit result, before issuing the next edit.
-- If an edit is rejected with "anchors do not match", the rejection message prints the current lines WITH fresh anchors. Retry using exactly those printed anchors.
+- If an edit is rejected with "anchors do not match", the rejection message prints the current lines WITH fresh anchors. Retry using exactly those printed anchors; do not switch to shell reads or shell writes to recover.
+- If a tool error mentions missing paths, anchors, hashlines, sanitization, or malformed arguments, recover with the same tool family: find/search/read for discovery and edit/write for mutation. Do not use bash as a recovery shortcut.
 - Tool-call arguments must be the exact JSON/schema object requested by the tool. Do not include Markdown, commentary, analysis text, or invented fields inside tool arguments.
 - Use bash only for terminal operations such as tests, builds, package scripts, and git commands. A shell command string must contain only the command itself; NEVER interleave reasoning or commentary into command strings or heredocs.`;

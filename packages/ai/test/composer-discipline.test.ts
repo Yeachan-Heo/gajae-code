@@ -119,6 +119,8 @@ describe("COMPOSER_EDIT_DISCIPLINE_PROMPT", () => {
 			"ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more",
 		);
 		expect(COMPOSER_EDIT_DISCIPLINE_PROMPT).toContain("NEVER mutate files through shell redirection");
+		expect(COMPOSER_EDIT_DISCIPLINE_PROMPT).toContain("find → search → read → edit");
+		expect(COMPOSER_EDIT_DISCIPLINE_PROMPT).toContain("do not switch to shell reads or shell writes to recover");
 		expect(COMPOSER_EDIT_DISCIPLINE_PROMPT).toContain("Tool-call arguments must be the exact JSON/schema object");
 		expect(COMPOSER_EDIT_DISCIPLINE_PROMPT).toContain("A shell command string must contain only the command itself");
 	});
