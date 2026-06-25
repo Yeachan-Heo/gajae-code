@@ -60,7 +60,7 @@ describe("extension shortcut reservations", () => {
 		const runtime = {
 			flagValues: new Map(),
 			pendingProviderRegistrations: [],
-		} as ExtensionRuntime;
+		} as unknown as ExtensionRuntime;
 		const runner = new ExtensionRunner([extension], runtime, process.cwd(), {} as never, {} as never);
 
 		expect(runner.getShortcuts().has("ctrl+enter")).toBe(false);
