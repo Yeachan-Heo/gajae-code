@@ -1,2 +1,4 @@
 #!/usr/bin/env bun
-import "@gajae-code/coding-agent/cli";
+import { runCli } from "@gajae-code/coding-agent/cli";
+
+await runCli(process.argv.slice(2));
