@@ -349,14 +349,52 @@ export function buttonLabel(label: string, index: number): string {
 	return `${index + 1}. ${stripped}`;
 }
 
+/** Numbered, escaped option list for the Telegram message body. */
+export function numberedOptionList(labels: string[]): string {
+	return labels.map((label, i) => `${i + 1}. ${escapeHtml(label.replace(/^\s*\d+[.)]\s+/, ""))}`).join("\n");
+}
+
+/** Compact numeric button label; full option text belongs in the message body. */
+export function choiceButtonLabel(index: number): string {
+	return String(index + 1);
+}
+
 export interface InlineButton {
 	text: string;
 	callback_data: string;
 }
 
+const COMPACT_BUTTONS_PER_ROW = 5;
+
 /** A prefixed button label is "long" when it is wide or contains a newline. */
 function isLongLabel(label: string): boolean {
 	return label.length > 18 || /[\r\n]/.test(label);
+}
+
+/**
+ * Lay out option callbacks as compact numeric buttons. Telegram mobile clients
+ * ellipsize long inline-keyboard labels and tall keyboards can be obscured by
+ * the composer, so the full choice text is rendered in the message body while
+ * the keyboard keeps only stable one-based tap targets.
+ */
+export function buildCompactChoiceGrid(
+	labels: string[],
+	callbackForIndex: (index: number) => string,
+): InlineButton[][] {
+	const rows: InlineButton[][] = [];
+	let run: InlineButton[] = [];
+	const flush = () => {
+		if (run.length) {
+			rows.push(run);
+			run = [];
+		}
+	};
+	labels.forEach((_label, i) => {
+		run.push({ text: choiceButtonLabel(i), callback_data: callbackForIndex(i) });
+		if (run.length === COMPACT_BUTTONS_PER_ROW) flush();
+	});
+	flush();
+	return rows;
 }
 
 /**

@@ -3,10 +3,13 @@ import { Settings } from "../src/config/settings";
 import {
 	bold,
 	buildButtonGrid,
+	buildCompactChoiceGrid,
 	buttonLabel,
+	choiceButtonLabel,
 	code,
 	escapeHtml,
 	markdownToTelegramHtml,
+	numberedOptionList,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 	truncateTelegramHtml,
@@ -119,6 +122,41 @@ describe("button grid (AC6)", () => {
 		expect(buttonLabel("3 apples", 2)).toBe("3. 3 apples");
 	});
 
+	test("numberedOptionList renders full escaped choices in message body", () => {
+		expect(numberedOptionList(["1. Keep <alpha>", "Merge & continue"])).toBe(
+			"1. Keep &lt;alpha&gt;\n2. Merge &amp; continue",
+		);
+	});
+
+	test("compact choice grid uses numeric tap targets and preserves callback indexes", () => {
+		const grid = buildCompactChoiceGrid(
+			[
+				"A long Deep Interview clarify choice that would be clipped by Telegram mobile",
+				"Second",
+				"Third",
+				"Fourth",
+				"Fifth",
+				"Sixth",
+			],
+			i => `cb:${i}`,
+		);
+		expect(grid).toEqual([
+			[
+				{ text: "1", callback_data: "cb:0" },
+				{ text: "2", callback_data: "cb:1" },
+				{ text: "3", callback_data: "cb:2" },
+				{ text: "4", callback_data: "cb:3" },
+				{ text: "5", callback_data: "cb:4" },
+			],
+			[{ text: "6", callback_data: "cb:5" }],
+		]);
+	});
+
+	test("choiceButtonLabel is compact and one-based", () => {
+		expect(choiceButtonLabel(0)).toBe("1");
+		expect(choiceButtonLabel(9)).toBe("10");
+	});
+
 	test("short options pack into rows of three; callback index stays zero-based", () => {
 		const grid = buildButtonGrid(["Yes", "No", "Maybe", "Later"], i => `cb:${i}`);
 		expect(grid).toEqual([
@@ -142,11 +180,16 @@ describe("button grid (AC6)", () => {
 });
 
 describe("buildActionMessage (AC6)", () => {
-	test("ask bolds the escaped question, keeps emoji, and grids numbered options", () => {
-		const rendered = buildActionMessage({ kind: "ask", id: "a1", question: "Pick <one>", options: ["Yes", "No"] });
-		expect(rendered.text).toBe(`❓ ${bold("Pick <one>")}`);
-		expect(rendered.inline_keyboard?.[0]?.[0]?.text).toBe("1. Yes");
-		expect(rendered.inline_keyboard?.[0]?.[1]?.text).toBe("2. No");
+	test("ask puts full escaped options in the message body and compact numbers in the keyboard", () => {
+		const rendered = buildActionMessage({
+			kind: "ask",
+			id: "a1",
+			question: "Pick <one>",
+			options: ["1. Long <choice>", "No & wait"],
+		});
+		expect(rendered.text).toBe(`❓ ${bold("Pick <one>")}\n\n1. Long &lt;choice&gt;\n2. No &amp; wait`);
+		expect(rendered.inline_keyboard?.[0]?.[0]?.text).toBe("1");
+		expect(rendered.inline_keyboard?.[0]?.[1]?.text).toBe("2");
 	});
 
 	test("idle escapes the summary and keeps the emoji", () => {
@@ -274,7 +317,8 @@ describe("daemon send sites force parse_mode HTML (AC1)", () => {
 		const keyboard = send?.body.reply_markup?.inline_keyboard as Array<
 			Array<{ text: string; callback_data: string }>
 		>;
-		expect(keyboard[0]?.[0]?.text).toBe("1. Yes");
+		expect(keyboard[0]?.[0]?.text).toBe("1");
+		expect(send?.body.text).toContain("1. Yes\n2. No");
 		// The first button's alias must resolve to zero-based answer 0.
 		const alias = keyboard[0]?.[0]?.callback_data as string;
 		expect(daemon.aliasTable.get(alias)?.answer).toBe(0);

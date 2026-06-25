@@ -10,7 +10,7 @@ import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
-import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
+import { buildCompactChoiceGrid, TELEGRAM_PARSE_MODE } from "./html-format";
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
 import {
@@ -1434,9 +1434,9 @@ export class TelegramNotificationDaemon {
 				summary: msg.summary,
 			});
 			const options = Array.isArray(msg.options) ? msg.options : [];
-			// Daemon keyboards MUST use alias callback data (not reference encodeCallbackData).
-			// Labels show one-based numbers; the stored alias answer stays zero-based.
-			const inline_keyboard = buildButtonGrid(options, (i: number) =>
+			// Daemon keyboards use alias callback data with compact one-based tap targets;
+			// full option text is rendered in the message body by buildActionMessage.
+			const inline_keyboard = buildCompactChoiceGrid(options, (i: number) =>
 				this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
 			);
 			const result = (await this.botApi.call("sendMessage", {
