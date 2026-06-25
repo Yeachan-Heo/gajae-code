@@ -55,6 +55,19 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("");
 	});
 
+	it("leaves Ctrl+Enter for newline by default", () => {
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		editor.onQueue = onQueue;
+
+		editor.handleInput("a");
+		editor.handleInput("\x1b[13;5u");
+		editor.handleInput("b");
+
+		expect(onQueue).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("a\nb");
+	});
+
 	it("supports remapping the explicit queue key when Alt+Enter is unavailable", () => {
 		const editor = createEditor();
 		const onQueue = vi.fn();

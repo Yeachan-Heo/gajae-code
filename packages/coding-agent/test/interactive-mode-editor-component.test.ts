@@ -73,7 +73,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	});
 
 	function expectedQueueShortcutHint(): string {
-		return `${process.platform === "darwin" ? "Control+Enter" : "Alt+Enter"}: Message Queueing`;
+		return "Alt+Enter: Message Queueing";
 	}
 
 	it("shows busy steering and queueing hints only while work is active", () => {

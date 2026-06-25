@@ -36,14 +36,15 @@ type FakeEditor = {
 	clearCustomKeyHandlers(): void;
 };
 
-async function createContext(options?: { busyPromptMode?: "steer" | "queue" }) {
+async function createContext(options?: { busyPromptMode?: "steer" | "queue"; followUpKeys?: string[] }) {
 	let editorText = "";
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["ctrl+l"],
 		"app.message.queue": ["alt+enter"],
-		"app.message.followUp": ["ctrl+enter"],
+		"app.message.followUp": options?.followUpKeys ?? [],
 	};
+
 	const setActionKeys = vi.fn();
 	const showModelSelector = vi.fn();
 	const prompt = vi.fn(async () => {});
@@ -204,8 +205,17 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("lets idle Ctrl+Enter fall through to editor newline handling", async () => {
-		const { InputController, ctx, editor, spies } = await createContext();
+	it("does not register a default Ctrl+Enter follow-up handler", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("ctrl+enter", expect.any(Function));
+	});
+
+	it("lets an explicit Ctrl+Enter follow-up remap fall through while idle", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -220,7 +230,7 @@ describe("InputController keybinding setup", () => {
 	});
 
 	it("consumes Ctrl+Enter as follow-up while streaming", async () => {
-		const { InputController, ctx, editor, spies } = await createContext();
+		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
 		const session = ctx.session as unknown as { isStreaming: boolean };
 		session.isStreaming = true;
 		editor.setText("follow up from shortcut");
