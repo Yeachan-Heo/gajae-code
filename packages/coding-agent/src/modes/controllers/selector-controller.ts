@@ -745,6 +745,9 @@ export class SelectorController {
 				{
 					...options,
 					sessionId: this.ctx.session.sessionId,
+					currentThinkingLevel: this.ctx.session.thinkingLevel,
+					activeModelProfile:
+						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
 					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
 				},
