@@ -486,7 +486,7 @@ export class TUI extends Container {
 			data => this.#handleInput(data),
 			() => {
 				this.invalidate();
-				this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
+				this.requestRender(true, "resize");
 			},
 		);
 		this.#hideCursor();
