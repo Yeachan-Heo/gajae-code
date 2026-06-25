@@ -1060,7 +1060,8 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).toHaveBeenCalledWith(process.stderr.fd, expect.stringContaining("attach failed"));
 	});
 
-	it("falls through to direct launch when tmux is unavailable", () => {
+	it("falls through to direct launch with a diagnostic when tmux is unavailable", () => {
+		const diagnostics: string[] = [];
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
@@ -1071,9 +1072,35 @@ describe("default GJC tmux launch", () => {
 			platform: "darwin",
 			tty: interactiveTty,
 			tmuxAvailable: false,
+			diagnosticWriter: message => diagnostics.push(message),
 		});
 
 		expect(plan).toBeUndefined();
+		expect(diagnostics).toEqual([
+			"gjc --tmux requested but no tmux executable was found; starting without a tmux-backed session.\n",
+		]);
+	});
+
+	it("explains the native Windows psmux support boundary when tmux is unavailable", () => {
+		const diagnostics: string[] = [];
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "C:\\repo",
+			env: {},
+			argv: ["C:\\Program Files\\GJC\\gjc.exe"],
+			execPath: "C:\\Program Files\\GJC\\gjc.exe",
+			platform: "win32",
+			tty: interactiveTty,
+			tmuxAvailable: false,
+			diagnosticWriter: message => diagnostics.push(message),
+		});
+
+		expect(plan).toBeUndefined();
+		expect(diagnostics[0]).toContain("no tmux executable was found");
+		expect(diagnostics[0]).toContain("WSL with real tmux");
+		expect(diagnostics[0]).toContain("psmux");
+		expect(diagnostics[0]).toContain("not fully supported");
 	});
 
 	it("applies session-scoped mouse scrolling when launching tmux on WSL/Linux", () => {

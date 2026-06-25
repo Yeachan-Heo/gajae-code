@@ -121,6 +121,12 @@ Troubleshooting:
 - **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed
   but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in
   `echo $env:Path`, then restart the terminal.
+- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a
+  tmux-compatible executable on `PATH`. For GJC-managed session/team guarantees,
+  use WSL with real tmux, or another provider that round-trips tmux user options
+  such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux`
+  commands, but that path is not fully supported for GJC ownership tags and team
+  guarantees yet; see `docs/environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile`.
 
 ## Quick start
 

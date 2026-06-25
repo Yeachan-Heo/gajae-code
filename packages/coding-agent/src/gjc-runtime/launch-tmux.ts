@@ -166,6 +166,17 @@ function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
 	return `gjc --tmux failed after creating tmux session: ${stage}.${suffix}\n`;
 }
 
+function formatTmuxUnavailableDiagnostic(platform: NodeJS.Platform, tmuxCommand: string): string {
+	if (platform === "win32") {
+		return (
+			`gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session. ` +
+			"For managed GJC session/team flows on Windows, use WSL with real tmux, or another tmux provider that round-trips tmux user options. " +
+			"Native psmux can expose tmux-compatible commands, but it is not fully supported for GJC-managed ownership tags/team guarantees yet.\n"
+		);
+	}
+	return `gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session.\n`;
+}
+
 function shellQuote(value: string): string {
 	if (value.length === 0) return "''";
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -385,7 +396,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
-	if (!tmuxAvailable) return undefined;
+	if (!tmuxAvailable) {
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxUnavailableDiagnostic(platform, tmuxCommand));
+		return undefined;
+	}
 	const existingSessionName = allowsExistingTmuxAttach(context.parsed, env)
 		? "existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
