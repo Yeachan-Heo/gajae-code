@@ -431,6 +431,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#resizeHandler = () => {
 			this.#syncEditorMaxHeight();
 			this.updateEditorChrome();
+			this.editor.invalidate();
+			this.ui.requestRender(true, "resize");
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		try {

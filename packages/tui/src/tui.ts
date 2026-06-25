@@ -484,7 +484,10 @@ export class TUI extends Container {
 		this.#terminalUnavailable = false;
 		this.terminal.start(
 			data => this.#handleInput(data),
-			() => this.requestRender(),
+			() => {
+				this.invalidate();
+				this.requestRender(true, "resize");
+			},
 		);
 		this.#hideCursor();
 		this.#querySixelSupport();
