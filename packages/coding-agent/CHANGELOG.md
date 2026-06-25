@@ -5,6 +5,10 @@
 ### Changed
 
 - Refined the interactive composer chrome so the input box, status rail, and welcome banner share one visual language: the composer now uses a rounded border (matching the rounded welcome banner) instead of a sharp rectangle, and the status rail uses the subtle elevated `userMessageBg` surface tone instead of the heavy `statusLineBg` block, so it reads as a quiet layered zone rather than a solid bar. Both resolve through existing semantic theme slots, so every bundled theme tracks automatically.
+### Documentation
+
+- Documented the docs-only Aside evaluation boundary as an opt-in search/context retrieval sidecar using explicit user-provided MCP configuration, with browser actions, login flows, payments, internal tools, secrets, and raw browser/session payload logging out of scope by default (#1097).
+
 ### Fixed
 
 - Deep Interview Restate/option gates now recover through the ask selector path instead of waiting on plaintext `Options:` output.

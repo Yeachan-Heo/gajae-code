@@ -64,6 +64,32 @@ describe("external controller integration docs", () => {
 		expect(generated).toContain('"external-control-readiness.md"');
 	});
 
+	it("documents Aside as an opt-in search/context sidecar only", async () => {
+		const guide = await readRepoFile("docs", "aside-integration.md");
+		const readme = await readRepoFile("README.md");
+		const generated = await readRepoFile(
+			"packages",
+			"coding-agent",
+			"src",
+			"internal-urls",
+			"docs-index.generated.ts",
+		);
+
+		expect(guide).toContain("docs-only");
+		expect(guide).toContain("aside mcp");
+		expect(guide).toContain("gjc mcp add aside aside mcp --project");
+		expect(guide).toContain("browser actions and form submissions");
+		expect(guide).toContain("login flows, credential autofill, MFA");
+		expect(guide).toContain("payments, purchases, subscriptions, billing changes");
+		expect(guide).toContain("internal-tool workflows");
+		expect(guide).toContain("explicit user-provided endpoint, command, and credentials");
+		expect(guide).toContain("no raw browser/session/private payloads");
+		expect(guide).toContain("Benign smoke checklist");
+		expect(guide).toContain("secrets are redacted");
+		expect(readme).toContain("docs/aside-integration.md");
+		expect(generated).toContain('"aside-integration.md"');
+	});
+
 	it("classifies external control surface readiness against code and smoke coverage", async () => {
 		const readiness = await readRepoFile("docs", "external-control-readiness.md");
 		const cliArgs = await readRepoFile("packages", "coding-agent", "src", "cli", "args.ts");
