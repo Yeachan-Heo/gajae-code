@@ -836,6 +836,22 @@ describe("wave 5 — adapters and polish", () => {
 		}
 	});
 
+	it("/ssh remove parses quoted host names", async () => {
+		const spy = spyOn(sshConfig, "removeSSHHost").mockResolvedValue(undefined);
+		try {
+			const { output, runtime } = createRuntime();
+			const result = await executeAcpBuiltinSlashCommand('/ssh remove "work vm" --scope user', runtime);
+			expect(result).toEqual({ consumed: true });
+			expect(output[0]).toContain('Removed SSH host "work vm" from user config.');
+			expect(spy).toHaveBeenCalledTimes(1);
+			const [configPath, name] = spy.mock.calls[0]!;
+			expect(typeof configPath).toBe("string");
+			expect(name).toBe("work vm");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
 	// /model with unknown id
 	it("/model gpt-fake-9000: returns unknown-model message", async () => {
 		const { output, runtime } = createRuntime();
