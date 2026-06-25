@@ -70,7 +70,7 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[13;6~", "ctrl+shift+enter")).toBe(true);
 		expect(matchesKey("\x1b[13;2~", "shift+enter")).toBe(true);
 		expect(matchesKey("\x1b[13;2u", "shift+enter")).toBe(true);
-		expect(matchesKey("\x1b[13;3~", "alt+enter")).toBe(true);
+		expect(matchesKey("\x1b[13;3~", "alt+enter")).toBe(false);
 		setKittyProtocolActive(false);
 	});
 
@@ -130,7 +130,7 @@ describe("parseKey", () => {
 		expect(parseKey("\x1b[13;6~")).toBe("shift+ctrl+enter");
 		expect(parseKey("\x1b[13;2~")).toBe("shift+enter");
 		expect(parseKey("\x1b[13;2u")).toBe("shift+enter");
-		expect(parseKey("\x1b[13;3~")).toBe("alt+enter");
+		expect(parseKey("\x1b[13;3~")).toBe("alt+f3");
 		setKittyProtocolActive(false);
 	});
 

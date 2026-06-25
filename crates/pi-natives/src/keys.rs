@@ -1281,16 +1281,6 @@ fn parse_functional(bytes: &[u8]) -> Option<ParsedKittySequence> {
 		return None;
 	}
 
-	if key_num == 13 && mod_value != 1 {
-		return Some(ParsedKittySequence {
-			codepoint: CP_ENTER,
-			shifted_key: None,
-			base_layout_key: None,
-			text_codepoint: None,
-			modifier: mod_value - 1,
-			event_type,
-		});
-	}
 	let codepoint = match key_num {
 		// Common functional keys
 		2 => FUNC_INSERT,
@@ -1568,10 +1558,10 @@ mod tests {
 		assert!(!matches_key_inner(b"\x1b\r", "ctrl+alt+m", false));
 		assert!(matches_key_inner(b"\x1b\n", "alt+enter", false));
 		assert!(!matches_key_inner(b"\x1b\n", "ctrl+alt+j", false));
-		assert!(matches_key_inner(b"\x1b[13;3~", "alt+enter", false));
-		assert_eq!(parse_key_inner(b"\x1b[13;3~", false).as_deref(), Some("alt+enter"));
-		assert!(matches_key_inner(b"\x1b[13;7~", "ctrl+alt+enter", false));
-		assert_eq!(parse_key_inner(b"\x1b[13;7~", false).as_deref(), Some("ctrl+alt+enter"));
+		assert!(!matches_key_inner(b"\x1b[13;3~", "alt+enter", false));
+		assert_eq!(parse_key_inner(b"\x1b[13;3~", false).as_deref(), Some("alt+f3"));
+		assert!(!matches_key_inner(b"\x1b[13;7~", "ctrl+alt+enter", false));
+		assert_eq!(parse_key_inner(b"\x1b[13;7~", false).as_deref(), Some("ctrl+alt+f3"));
 		assert!(!matches_key_inner(b"\x1b\t", "ctrl+alt+i", false));
 		assert!(!matches_key_inner(b"\x1b\x08", "ctrl+alt+h", false));
 
