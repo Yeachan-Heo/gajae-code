@@ -113,6 +113,22 @@ describe("redesigned interactive shell chrome", () => {
 		}
 	});
 
+	it("uses a wider forge splash box on wide terminals", () => {
+		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai");
+		const narrowLines = component.render(100);
+		const wideLines = component.render(160);
+		const narrowTop = Bun.stripANSI(narrowLines[0] ?? "");
+		const wideTop = Bun.stripANSI(wideLines[0] ?? "");
+
+		expect(visibleWidth(narrowTop)).toBe(98);
+		expect(visibleWidth(wideTop)).toBe(132);
+		expect(visibleWidth(wideTop)).toBeGreaterThan(visibleWidth(narrowTop));
+		expect(wideTop).toContain("GJC forge");
+		for (const line of wideLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(160);
+		}
+	});
+
 	it("renders an ASCII-safe welcome logo when requested", () => {
 		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai", [], [], "ascii");
 		const lines = component.render(54);

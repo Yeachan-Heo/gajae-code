@@ -74,8 +74,8 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): string[] {
-		// Box dimensions - responsive with max width and small-terminal support
-		const maxWidth = 100;
+		// Box dimensions - responsive with a wider cap for modern launch surfaces while preserving small-terminal support
+		const maxWidth = 132;
 		const boxWidth = Math.min(maxWidth, Math.max(0, termWidth - 2));
 		if (boxWidth < 4) {
 			return [];
