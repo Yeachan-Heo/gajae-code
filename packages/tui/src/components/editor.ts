@@ -1385,7 +1385,11 @@ export class Editor implements Component, Focusable {
 		else {
 			const printableText = extractPrintableText(data);
 			if (printableText) {
-				if (process.platform === "darwin" && printableText.length === 1 && Date.now() - this.#lastLineDeleteAt < 50) {
+				if (
+					process.platform === "darwin" &&
+					printableText.length === 1 &&
+					Date.now() - this.#lastLineDeleteAt < 50
+				) {
 					const code = printableText.charCodeAt(0);
 					const isHangul =
 						(code >= 0xac00 && code <= 0xd7a3) ||
