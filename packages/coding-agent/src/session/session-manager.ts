@@ -2186,6 +2186,8 @@ interface SessionManagerStateSnapshot {
 
 export class SessionManager {
 	#sessionId: string = "";
+	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
+	#lifecycleIdAdopted: boolean = false;
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -2630,7 +2632,12 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
-		this.#sessionId = lifecyclePreallocatedSessionId() ?? createSessionId();
+		// Adopt a lifecycle pre-allocated id exactly once (the initial session of a
+		// /session_create child); later new-session paths (/new, fork, branch) get
+		// fresh ids so they cannot reuse the original GJC_SESSION_ID.
+		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		if (preallocated) this.#lifecycleIdAdopted = true;
+		this.#sessionId = preallocated ?? createSessionId();
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		const timestamp = new Date().toISOString();

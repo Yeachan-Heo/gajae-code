@@ -166,4 +166,21 @@ describe("SessionManager lifecycle-preallocated session id", () => {
 			expect(session.getSessionId()).not.toBe("../bad/id");
 		});
 	});
+	it("consumes the preallocated id exactly once (newSession gets a fresh id)", async () => {
+		const prevReq = process.env.GJC_LIFECYCLE_REQUEST_ID;
+		const prevId = process.env.GJC_SESSION_ID;
+		try {
+			process.env.GJC_LIFECYCLE_REQUEST_ID = "lc-test-3";
+			process.env.GJC_SESSION_ID = "s-once-1";
+			const session = SessionManager.inMemory();
+			expect(session.getSessionId()).toBe("s-once-1");
+			await session.newSession();
+			expect(session.getSessionId()).not.toBe("s-once-1");
+		} finally {
+			if (prevReq === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			else process.env.GJC_LIFECYCLE_REQUEST_ID = prevReq;
+			if (prevId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prevId;
+		}
+	});
 });

@@ -62,4 +62,13 @@ describe("recent-activity picker", () => {
 		expect(out).toHaveLength(1);
 		expect(out[0]?.path).toBeUndefined();
 	});
+	it("surfaces the authoritative header id (not the timestamped filename stem)", () => {
+		const root = tempSessionsRoot();
+		// SessionManager writes <isoTimestamp>_<id>.jsonl with the id in the header.
+		writeSession(root, "r", "2024-01-02T03-04-05-678Z_s-lifecycle-1", { id: "s-lifecycle-1", cwd: "/r" }, 9000);
+		// A timestamped file with no header id falls back to the stripped stem.
+		writeSession(root, "r", "2024-01-02T03-04-05-999Z_s-fallback-2", { cwd: "/r" }, 8000);
+		const out = listRecentSessions({ sessionsRoot: root });
+		expect(out.map(e => e.sessionId)).toEqual(["s-lifecycle-1", "s-fallback-2"]);
+	});
 });

@@ -49,19 +49,31 @@ function defaultReadFirstLine(file: string): string | undefined {
 }
 
 /** Best-effort header metadata extraction from a session file's first line. */
-function headerMeta(line: string | undefined): { path?: string; branch?: string; title?: string } {
+function headerMeta(line: string | undefined): { id?: string; path?: string; branch?: string; title?: string } {
 	if (!line) return {};
 	try {
 		const obj = JSON.parse(line) as Record<string, unknown>;
 		// Session headers vary; pull common fields defensively.
+		const id = typeof obj.id === "string" ? obj.id : undefined;
 		const cwd =
 			typeof obj.cwd === "string" ? obj.cwd : typeof obj.projectDir === "string" ? obj.projectDir : undefined;
 		const branch = typeof obj.branch === "string" ? obj.branch : undefined;
 		const title = typeof obj.title === "string" ? obj.title : undefined;
-		return { path: cwd, branch, title };
+		return { id, path: cwd, branch, title };
 	} catch {
 		return {};
 	}
+}
+
+/**
+ * The authoritative session id for a history file: the header `id` when present,
+ * else the filename stem with a leading `<timestamp>_` prefix stripped (matching
+ * SessionManager's `<isoTimestamp>_<id>.jsonl` naming), else the bare stem.
+ */
+function sessionIdForFile(stem: string, headerId: string | undefined): string {
+	if (headerId) return headerId;
+	const m = stem.match(/^\d{4}-\d{2}-\d{2}T[\d:.-]+Z?_(.+)$/);
+	return m?.[1] ?? stem;
 }
 
 /**
@@ -104,7 +116,7 @@ export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry
 			}
 			const meta = headerMeta(readFirstLine(file));
 			entries.push({
-				sessionId: name.slice(0, -".jsonl".length),
+				sessionId: sessionIdForFile(name.slice(0, -".jsonl".length), meta.id),
 				path: meta.path,
 				branch: meta.branch,
 				title: meta.title,
