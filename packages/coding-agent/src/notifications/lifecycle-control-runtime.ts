@@ -32,6 +32,7 @@ import {
 	type OrchestratorDeps,
 	type ResumeEffectResult,
 } from "./lifecycle-orchestrator";
+import { listRecentSessions } from "./recent-activity";
 
 /** Minimal view of the native control server this runtime depends on. */
 export interface ControlServerLike {
@@ -120,19 +121,20 @@ function tmuxSessionNameFor(sessionId: string): string {
 	return `gjc_lc_${sessionId}`;
 }
 
-/** Build the `gjc` argv for a create target (existing path / worktree / dir). */
+/** Build the `gjc` argv for a create target (existing path / worktree / dir).
+ *
+ *  The launched session id is carried via `GJC_SESSION_ID` in the child env (see
+ *  {@link daemonSpawnCreate}); the root `gjc` launcher has no `--session-id`
+ *  flag, so it must never appear in argv. Only flags the launch parser actually
+ *  supports are emitted (`--worktree <branch>` for worktree targets). */
 export function buildCreateArgv(
 	frame: SessionCreateFrame,
-	ids: { intendedSessionId: string; startupPromptRef?: string },
+	_ids: { intendedSessionId: string; startupPromptRef?: string },
 ): { cwd: string; args: string[] } {
-	const common = ["--session-id", ids.intendedSessionId];
 	if (frame.target.kind === "worktree") {
-		return { cwd: frame.target.repo, args: ["--worktree", "--branch", frame.target.branch, ...common] };
+		return { cwd: frame.target.repo, args: ["--worktree", frame.target.branch] };
 	}
-	if (frame.target.kind === "plain_dir") {
-		return { cwd: frame.target.path, args: [...common] };
-	}
-	return { cwd: frame.target.path, args: [...common] };
+	return { cwd: frame.target.path, args: [] };
 }
 
 /** Real daemon-safe tmux launcher: detached `tmux new-session -d` + GJC tags. */
@@ -197,13 +199,14 @@ export function daemonCloseSession(env: NodeJS.ProcessEnv = process.env) {
 	};
 }
 
-/** Real resume effect: reattach if a live GJC session matches, else fail-closed
- *  on ambiguity, else cold-restart via the daemon-safe launcher. */
-export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env) {
+/** Real resume effect: reattach if a live GJC session matches; else resolve the
+ *  prefix against saved history and fail closed (`ambiguous`/`notFound`) before
+ *  cold-restarting exactly one resolved session via the daemon-safe launcher. */
+export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env, opts: { sessionsRoot?: string } = {}) {
 	return async (target: {
 		sessionIdOrPrefix: string;
 		path?: string;
-	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] }> => {
+	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }> => {
 		const live = listGjcTmuxSessions(env).filter(
 			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
 		);
@@ -223,10 +226,26 @@ export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env) {
 				mode: "reattached",
 			};
 		}
-		// Dead: cold-restart via the daemon-safe launcher using `gjc launch --resume`.
+		// Dead: resolve the id/prefix against saved session history BEFORE cold
+		// restart, so an unknown or ambiguous prefix fails closed instead of
+		// blindly spawning `gjc --resume <prefix>` against a non-authoritative id.
+		let resumeId = target.sessionIdOrPrefix;
+		if (opts.sessionsRoot) {
+			const saved = listRecentSessions({ sessionsRoot: opts.sessionsRoot, limit: 1000 });
+			const prefixed = saved.filter(
+				s => s.sessionId === target.sessionIdOrPrefix || s.sessionId.startsWith(target.sessionIdOrPrefix),
+			);
+			const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
+			const resolved = exact.length > 0 ? exact : prefixed;
+			if (resolved.length === 0) return { notFound: true };
+			if (resolved.length > 1) {
+				return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
+			}
+			resumeId = resolved[0]!.sessionId;
+		}
 		const tmux = resolveGjcTmuxCommand(env);
-		const name = tmuxSessionNameFor(target.sessionIdOrPrefix);
-		const command = `exec env GJC_TMUX_LAUNCHED=1 GJC_NOTIFICATIONS=1 gjc --resume ${shellQuote(target.sessionIdOrPrefix)}`;
+		const name = tmuxSessionNameFor(resumeId);
+		const command = `exec env GJC_TMUX_LAUNCHED=1 GJC_NOTIFICATIONS=1 gjc --resume ${shellQuote(resumeId)}`;
 		const r = Bun.spawnSync([tmux, "new-session", "-d", "-s", name, "sh", "-c", command], {
 			stdout: "pipe",
 			stderr: "pipe",
@@ -234,11 +253,11 @@ export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env) {
 		});
 		if (r.exitCode !== 0) throw new Error(r.stderr.toString().trim() || "gjc_lifecycle_resume_failed");
 		const tgt = buildGjcTmuxExactOptionTarget(name);
-		for (const cmd of buildGjcTmuxProfileCommands(tgt, env, { sessionId: target.sessionIdOrPrefix })) {
+		for (const cmd of buildGjcTmuxProfileCommands(tgt, env, { sessionId: resumeId })) {
 			Bun.spawnSync([tmux, ...cmd.args], { stdout: "pipe", stderr: "pipe", env });
 		}
 		return {
-			sessionId: target.sessionIdOrPrefix,
+			sessionId: resumeId,
 			tmuxSession: name,
 			endpointUrl: "",
 			topicThreadId: "",
@@ -284,9 +303,11 @@ export function outcomeToResponse(frame: SessionLifecycleRequest, outcome: Lifec
 			requestId: frame.requestId,
 			status: "ok",
 			sessionId: e.sessionId ?? "",
-			processGone: true,
+			processGone: e.processGone ?? false,
 			historyPreserved: true,
-			endpointStale: true,
+			// The killed session's per-session endpoint record is reaped by the
+			// daemon's dead-PID scan (scanRoots), so it is effectively stale.
+			endpointStale: e.processGone ?? false,
 		};
 	}
 	return {
@@ -335,6 +356,8 @@ export function attachLifecycleControl(server: ControlServerLike, deps: Orchestr
 export function buildOrchestratorDeps(input: {
 	pairedChatId: string;
 	agentNotificationsDir: string;
+	/** Root of saved session histories (`<agentDir>/sessions`), for resume resolution. */
+	sessionsRoot?: string;
 	env?: NodeJS.ProcessEnv;
 }): OrchestratorDeps {
 	const env = input.env ?? process.env;
@@ -356,7 +379,7 @@ export function buildOrchestratorDeps(input: {
 		},
 		spawnCreate: daemonSpawnCreate(env),
 		closeSession: daemonCloseSession(env),
-		resumeSession: daemonResumeSession(env),
+		resumeSession: daemonResumeSession(env, { sessionsRoot: input.sessionsRoot }),
 		newLifecycleRequestId: () => `lc-${crypto.randomUUID()}`,
 		newSessionId: () => `s${crypto.randomUUID().slice(0, 8)}`,
 	};

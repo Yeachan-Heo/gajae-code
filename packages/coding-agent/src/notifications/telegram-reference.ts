@@ -243,13 +243,23 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 	return { kind: "ignore" };
 }
 
-/** Read `{url, token}` from an endpoint discovery file. */
-export function readEndpoint(path: string): { url: string; token: string } {
-	const raw = JSON.parse(fs.readFileSync(path, "utf8")) as { url?: unknown; token?: unknown };
+/** Read `{url, token, pid?, stale?}` from an endpoint discovery file. */
+export function readEndpoint(path: string): { url: string; token: string; pid?: number; stale?: boolean } {
+	const raw = JSON.parse(fs.readFileSync(path, "utf8")) as {
+		url?: unknown;
+		token?: unknown;
+		pid?: unknown;
+		stale?: unknown;
+	};
 	if (typeof raw.url !== "string" || typeof raw.token !== "string") {
 		throw new Error(`invalid endpoint file: ${path}`);
 	}
-	return { url: raw.url, token: raw.token };
+	return {
+		url: raw.url,
+		token: raw.token,
+		pid: typeof raw.pid === "number" ? raw.pid : undefined,
+		stale: raw.stale === true,
+	};
 }
 
 /** Options for {@link runTelegramReferenceClient}. */

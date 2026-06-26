@@ -163,8 +163,6 @@ pub struct ControlEndpointRecord {
 	pub port:       u16,
 	/// Full `ws://host:port` URL.
 	pub url:        String,
-	/// The control token. Required by the control client; never log it raw.
-	pub token:      String,
 	/// Identifier of the daemon that owns this endpoint.
 	pub owner_id:   String,
 	/// Epoch-millis when the control server started.
@@ -182,7 +180,7 @@ pub struct ControlEndpointRecord {
 impl ControlEndpointRecord {
 	/// Build a fresh control-endpoint record for a just-bound control server.
 	#[must_use]
-	pub fn new(host: &str, port: u16, token: impl Into<String>, owner_id: impl Into<String>) -> Self {
+	pub fn new(host: &str, port: u16, owner_id: impl Into<String>) -> Self {
 		let now = now_millis();
 		let host = host.to_owned();
 		Self {
@@ -191,7 +189,6 @@ impl ControlEndpointRecord {
 			url: format!("ws://{host}:{port}"),
 			host,
 			port,
-			token: token.into(),
 			owner_id: owner_id.into(),
 			started_at: now,
 			updated_at: now,
@@ -200,11 +197,6 @@ impl ControlEndpointRecord {
 		}
 	}
 
-	/// A log-safe clone with the token masked.
-	#[must_use]
-	pub fn redacted(&self) -> Self {
-		Self { token: redact_token(&self.token), ..self.clone() }
-	}
 }
 
 /// Path of the daemon-owned control-endpoint file under an agent dir.
@@ -317,16 +309,14 @@ fn mark_stale(path: &Path) -> std::io::Result<()> {
 	fs::write(path, json)
 }
 
-/// Mark a **control** endpoint file stale (token removed) when it cannot be
-/// deleted. Mirrors [`mark_stale`] but parses a [`ControlEndpointRecord`] so the
-/// raw control token is actually scrubbed from the on-disk file.
+/// Mark a **control** endpoint file stale when it cannot be deleted. The control
+/// record never persists a token, so this only flips the stale flag/timestamp.
 fn mark_control_stale(path: &Path) -> std::io::Result<()> {
 	let Some(mut record) = read_control_endpoint_at(path) else {
 		return fs::remove_file(path);
 	};
 	record.stale = true;
 	record.stopped_at = Some(now_millis());
-	record.token = String::new();
 	let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
 	fs::write(path, json)
 }
@@ -501,17 +491,18 @@ mod tests {
 	}
 
 	#[test]
-	fn control_endpoint_write_read_remove_and_redact() {
+	fn control_endpoint_write_read_remove_and_never_persists_token() {
 		let root = temp_root();
-		let rec = ControlEndpointRecord::new("127.0.0.1", 6000, "control-secret", "daemon-1");
+		let rec = ControlEndpointRecord::new("127.0.0.1", 6000, "daemon-1");
 		let path = write_control_endpoint(&root, &rec).unwrap();
 		assert_eq!(path, control_endpoint_path(&root));
 		let read = read_control_endpoint(&root).unwrap();
 		assert_eq!(read, rec);
-		// file contains the real token; redacted() never does.
-		let raw = fs::read_to_string(&path).unwrap();
-		assert!(raw.contains("control-secret"));
-		assert!(!rec.redacted().token.contains("control-secret"));
+		// The control discovery file MUST NOT carry any token: the daemon owns the
+		// in-memory secret and is the only client; persisting it would be a leak.
+		let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+		assert!(json.get("token").is_none(), "control.json must not contain a token field");
+		assert_eq!(json.get("url").and_then(|v| v.as_str()), Some("ws://127.0.0.1:6000"));
 		remove_control_endpoint(&root).unwrap();
 		assert!(read_control_endpoint(&root).is_none());
 		// idempotent remove.

@@ -67,7 +67,15 @@ async function main(): Promise<void> {
 	assert.ok(ep.url.startsWith("ws://127.0.0.1:"), `loopback url, got ${ep.url}`);
 	const controlJson = path.join(tmp, "notifications", "control.json");
 	assert.ok(fs.existsSync(controlJson), "control discovery must exist while running");
-	console.log(`[g011] live control endpoint ${ep.url}; discovery present`);
+	// The control discovery file MUST NOT persist the privileged control token:
+	// the daemon holds it in memory and is the only client.
+	const controlRaw = fs.readFileSync(controlJson, "utf8");
+	assert.ok(!controlRaw.includes(token), "control token MUST NOT be persisted in control.json");
+	assert.ok(
+		!("token" in (JSON.parse(controlRaw) as Record<string, unknown>)),
+		"control.json must omit any token field",
+	);
+	console.log(`[g011] live control endpoint ${ep.url}; discovery present, no persisted token`);
 
 	// 1. Wrong-token handshake must be rejected.
 	await new Promise<void>(resolve => {

@@ -109,6 +109,9 @@ describe("lifecycle command parser (G009)", () => {
 			target: { kind: "existing_path", path: "/repo" },
 		});
 		expect(create).toContain("sess-1");
+		// Honest MVP copy: we confirm the tmux launch was requested, not that the
+		// agent is ready or a Telegram topic was surfaced.
+		expect(create).toContain("Launching");
 		expect(create).not.toContain("session-token");
 
 		expect(
@@ -121,7 +124,7 @@ describe("lifecycle command parser (G009)", () => {
 				endpoint: { url: "", token: "" },
 				topic: { chatId: "42", threadId: "9" },
 			}),
-		).toContain("Cold-restarted");
+		).toContain("Cold-restarting");
 
 		const reasons = [
 			"unauthorized",

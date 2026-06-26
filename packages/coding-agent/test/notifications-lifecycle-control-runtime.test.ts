@@ -1,11 +1,15 @@
 import { describe, expect, it } from "bun:test";
-
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { parseLaunchWorktreeMode } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 import type { SessionCreateFrame } from "@gajae-code/coding-agent/notifications/index";
 import {
 	attachLifecycleControl,
 	buildCreateArgv,
 	type ControlServerLike,
 	createRateLimiter,
+	daemonResumeSession,
 	outcomeToResponse,
 } from "@gajae-code/coding-agent/notifications/lifecycle-control-runtime";
 import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/notifications/lifecycle-orchestrator";
@@ -55,19 +59,28 @@ function stubDeps(): OrchestratorDeps {
 }
 
 describe("lifecycle control runtime", () => {
-	it("buildCreateArgv handles all three target kinds", () => {
+	it("buildCreateArgv emits only launcher-supported flags (no --session-id)", () => {
 		expect(buildCreateArgv(createFrame(), { intendedSessionId: "x" })).toEqual({
 			cwd: "/repo",
-			args: ["--session-id", "x"],
+			args: [],
 		});
 		expect(
 			buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" } }), {
 				intendedSessionId: "x",
 			}),
-		).toEqual({ cwd: "/r", args: ["--worktree", "--branch", "feat/y", "--session-id", "x"] });
+		).toEqual({ cwd: "/r", args: ["--worktree", "feat/y"] });
 		expect(
 			buildCreateArgv(createFrame({ target: { kind: "plain_dir", path: "/new" } }), { intendedSessionId: "x" }),
-		).toEqual({ cwd: "/new", args: ["--session-id", "x"] });
+		).toEqual({ cwd: "/new", args: [] });
+	});
+
+	it("worktree argv parses as a NAMED (non-detached) worktree with no stray flags", () => {
+		const { args } = buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" } }), {
+			intendedSessionId: "x",
+		});
+		const { mode, remainingArgs } = parseLaunchWorktreeMode(args);
+		expect(mode).toEqual({ enabled: true, detached: false, name: "feat/y" });
+		expect(remainingArgs).toEqual([]);
 	});
 
 	it("outcomeToResponse maps ok create to a create_response frame", () => {
@@ -176,5 +189,28 @@ describe("lifecycle control runtime", () => {
 		expect(spawns).toBe(1); // serial queue + durable ledger => exactly one spawn
 		expect(responses).toHaveLength(2); // both get a response (one ok, one re-ack)
 		expect(responses.every(r => r.includes("session_create_response"))).toBe(true);
+	});
+
+	it("daemonResumeSession fails closed against saved history (notFound / ambiguous)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
+		const proj = path.join(root, "proj");
+		fs.mkdirSync(proj, { recursive: true });
+		// Two saved histories sharing the prefix "abc".
+		fs.writeFileSync(path.join(proj, "abc111.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
+		fs.writeFileSync(path.join(proj, "abc222.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
+
+		// No live tmux match for these unique ids, so resolution falls to history.
+		const resume = daemonResumeSession(process.env, { sessionsRoot: root });
+
+		const missing = await resume({ sessionIdOrPrefix: "zzz-no-such" });
+		expect(missing).toEqual({ notFound: true });
+
+		const ambiguous = await resume({ sessionIdOrPrefix: "abc" });
+		expect("ambiguous" in ambiguous).toBe(true);
+		if ("ambiguous" in ambiguous) {
+			expect(ambiguous.ambiguous.map(c => c.sessionId).sort()).toEqual(["abc111", "abc222"]);
+		}
+
+		fs.rmSync(root, { recursive: true, force: true });
 	});
 });

@@ -34,6 +34,8 @@ export interface LedgerEntry {
 	tmuxSession?: string;
 	sessionStateFile?: string;
 	endpointUrl?: string;
+	/** Close effect outcome: whether the tmux process is confirmed gone. */
+	processGone?: boolean;
 	reason?: LifecycleErrorReason;
 }
 
@@ -114,7 +116,7 @@ export interface OrchestratorDeps {
 	resumeSession: (target: {
 		sessionIdOrPrefix: string;
 		path?: string;
-	}) => Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] }>;
+	}) => Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }>;
 	newLifecycleRequestId: () => string;
 	newSessionId: () => string;
 }
@@ -305,10 +307,10 @@ export async function handleLifecycleRequest(
 				updatedAt: deps.now(),
 				sessionId: frame.target.sessionId,
 				tmuxSession: frame.target.tmuxSession,
+				processGone: closed.processGone,
 			});
 			await deps.store.write(doc);
 			await deps.audit({ ...baseAudit, event: "success", sessionId: frame.target.sessionId });
-			void closed;
 			return { status: "ok", entry };
 		}
 
@@ -324,6 +326,12 @@ export async function handleLifecycleRequest(
 				message: "multiple sessions match; pick one",
 				candidates: resumed.ambiguous,
 			};
+		}
+		if ("notFound" in resumed) {
+			Object.assign(entry, { state: "failure", updatedAt: deps.now(), reason: "not_found" });
+			await deps.store.write(doc);
+			await deps.audit({ ...baseAudit, event: "failure", reason: "not_found" });
+			return { status: "error", reason: "not_found", message: "no matching session found" };
 		}
 		Object.assign(entry, {
 			state: "success",

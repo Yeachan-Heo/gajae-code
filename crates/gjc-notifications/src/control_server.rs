@@ -169,7 +169,6 @@ pub async fn start_control(config: ControlServerConfig) -> std::io::Result<Contr
 		let record = ControlEndpointRecord::new(
 			&addr.ip().to_string(),
 			addr.port(),
-			config.token.as_str(),
 			config.owner_id.as_str(),
 		);
 		crate::discovery::write_control_endpoint(agent_dir, &record)?;

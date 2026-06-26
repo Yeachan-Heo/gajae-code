@@ -753,6 +753,8 @@ export interface TelegramDaemonOptions {
 	idleTimeoutMs?: number;
 	scanIntervalMs?: number;
 	pid?: number;
+	/** Liveness probe for skipping dead-PID endpoint records in {@link TelegramNotificationDaemon.scanRoots}. */
+	pidAlive?: (pid: number) => boolean;
 	botApi?: BotApi;
 	control?: DaemonControlHooks;
 	/**
@@ -869,6 +871,7 @@ export class TelegramNotificationDaemon {
 			const deps = buildOrchestratorDeps({
 				pairedChatId: this.opts.chatId,
 				agentNotificationsDir: daemonPaths(agentDir).dir,
+				sessionsRoot: path.join(agentDir, "sessions"),
 			});
 			// Register the lifecycle-request handler BEFORE start(): the native
 			// control server captures the callback at start time, so wiring must
@@ -1225,6 +1228,11 @@ export class TelegramNotificationDaemon {
 				if (this.sessions.has(sessionId)) continue;
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
+					// Skip endpoint files whose owning process is gone or that are
+					// explicitly stale (e.g. a hard-closed session): reconnecting
+					// would chase a dead, token-bearing record forever.
+					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
+					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) continue;
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
 				} catch {}
 			}

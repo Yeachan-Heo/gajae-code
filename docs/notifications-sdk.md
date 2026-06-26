@@ -379,18 +379,21 @@ The SDK now exposes **two distinct surfaces**. Do not confuse them:
 ### Lifecycle control endpoint
 
 - **Discovery:** `<agentDir>/notifications/control.json` (daemon-owned, mode
-  `0600`), distinct from per-session endpoint files. Contains its own high
-  entropy control token; never log it raw.
+  `0600`), distinct from per-session endpoint files. It carries only non-secret
+  endpoint metadata (url/host/port/pid/owner). The control token is held **in
+  memory** by the daemon (the sole client) and is **never** written to disk.
 - **Auth:** loopback-only bind (a non-loopback bind is refused). The WebSocket
   upgrade requires `?token=<control-token>` (HTTP `401` otherwise), and every
   lifecycle frame's `token` is re-checked (`unauthorized` on mismatch). The Rust
   ingress authenticates and forwards; it never spawns or applies policy.
-- **Frames:** `session_create` (target `existing_path` | `worktree` | `plain_dir`
-  + initial prompt), `session_close` (hard-kill, history preserved, recoverable),
+- **Frames:** `session_create` (target `existing_path` | `worktree` |
+  `plain_dir`), `session_close` (hard-kill, history preserved, recoverable),
   `session_resume` (reattach if alive, else cold-restart from history); responses
   `session_create_response` / `session_close_response` / `session_resume_response`
-  / `session_lifecycle_error`. A replayable `session_ready` per-session frame lets
-  a creator wait for genuine readiness instead of treating WS-open as success.
+  / `session_lifecycle_error`. The protocol also defines a replayable
+  `session_ready` per-session frame for readiness-gated creates; the current MVP
+  daemon replies once the tmux launch is requested (see the phone guide) rather
+  than waiting on it. Inline prompt text (`-- <prompt>`) is rejected in the MVP.
 
 ### Trust model and hardening (daemon side)
 
@@ -409,8 +412,9 @@ risk). It is hardened around that boundary:
 - **Audit log** — append-only `telegram-lifecycle-audit.jsonl` (`0600`) recording
   every accept/reject/duplicate/rate-limit/spawn/success/failure. Raw control
   tokens and raw prompts are never logged (prompt hash + byte length only).
-- **Initial prompt** — written to a private `0600` startup-prompt file consumed
-  once by the child, not passed as raw argv.
+- **Inline prompts rejected (MVP)** — `session_create` with `-- <prompt>` text is
+  rejected with usage; no prompt is ever placed in argv, audit, or responses. (A
+  redacted prompt-ref flow is reserved for a future revision.)
 - **GJC-managed-only close** — force-close re-reads the exact `@gjc-profile`
   immediately before kill and requires the `@gjc-session-id` (and optional
   `@gjc-session-state-file`) tag to match; it never touches non-GJC tmux.
@@ -424,11 +428,13 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
 1. **Pair + start.** Run `gjc notify setup` (BotFather token, DM the bot to pair).
    Start any GJC session with notifications enabled so the daemon owner is
    running (`gjc launch` in a repo, or `GJC_NOTIFICATIONS=1`). The owner starts
-   the loopback control endpoint and keeps polling even with zero sessions.
+   the loopback control endpoint and accepts `/session_*` while running; with zero
+   active sessions it still idle-exits after the inactivity timeout.
 2. **Create.** From your paired chat send `/session_create path <repo-dir>` (or
    `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
-   The bot replies once the session is created and surfaced in its thread.
-   (Initial prompts via `-- <text>` are rejected for now with usage text.)
+   The bot replies once the tmux launch is requested; the session shows up in
+   `/session_recent` once it is ready. (Inline prompts via `-- <text>` are
+   rejected for now with usage text.)
 3. **List.** `/session_recent` shows recent sessions (most-recent first) to copy
    an id from.
 4. **Close.** `/session_close <sessionId>` hard-kills the GJC-managed session

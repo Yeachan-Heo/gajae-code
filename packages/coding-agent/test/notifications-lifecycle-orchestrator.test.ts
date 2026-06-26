@@ -186,6 +186,24 @@ describe("lifecycle orchestrator", () => {
 		}
 	});
 
+	it("fails closed with not_found when resume resolves no saved session", async () => {
+		const { deps: d, audit } = deps({
+			resumeSession: async () => ({ notFound: true }),
+		});
+		const frame: SessionResumeFrame = {
+			type: "session_resume",
+			requestId: "lc_r2",
+			updateId: 201,
+			chatId: PAIRED,
+			token: "control-token",
+			target: { sessionIdOrPrefix: "nope" },
+		};
+		const out = await handleLifecycleRequest(frame, d);
+		expect(out.status).toBe("error");
+		if (out.status === "error") expect(out.reason).toBe("not_found");
+		expect(audit.some(e => e.event === "failure" && e.reason === "not_found")).toBe(true);
+	});
+
 	it("closes a session", async () => {
 		const { deps: d } = deps();
 		const frame: SessionCloseFrame = {
