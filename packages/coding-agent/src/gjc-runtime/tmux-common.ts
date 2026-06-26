@@ -35,8 +35,8 @@ export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): str
 	return env[GJC_TMUX_COMMAND_ENV]?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
 }
 
-export { resolveGjcTmuxBinary, detectPsmux, probePsmux, clearPsmuxDetectionCache } from "./psmux-detect";
-export type { ResolvedTmuxBinary, ResolveGjcTmuxBinaryOptions, PsmuxProbe } from "./psmux-detect";
+export type { PsmuxProbe, ResolvedTmuxBinary, ResolveGjcTmuxBinaryOptions } from "./psmux-detect";
+export { clearPsmuxDetectionCache, detectPsmux, probePsmux, resolveGjcTmuxBinary } from "./psmux-detect";
 
 /**
  * Build the exact-session target for tmux *option* commands

@@ -5,8 +5,8 @@ import {
 	GJC_PSMUX_COMMAND_ENV,
 	GJC_PSMUX_DETECTION_ENV,
 	GJC_PSMUX_FORCE_DETECT_ENV,
-	probePsmux,
 	PSMUX_BINARY_NAMES,
+	probePsmux,
 	resolveGjcTmuxBinary,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 
@@ -23,7 +23,7 @@ function failingRunner() {
 }
 
 function buildRunner(versionOutput: string | null) {
-	return (command: string, args: string[]) => {
+	return (_command: string, _args: string[]) => {
 		if (versionOutput === null) return { exitCode: 1, stdout: "", stderr: "missing" };
 		return { exitCode: 0, stdout: versionOutput, stderr: "" };
 	};
@@ -84,7 +84,7 @@ describe("detectPsmux", () => {
 
 	it("re-probes every call when GJC_PSMUX_FORCE_DETECT is set", () => {
 		let calls = 0;
-		const runner = (command: string, args: string[]) => {
+		const runner = (_command: string, _args: string[]) => {
 			calls += 1;
 			return { exitCode: 0, stdout: calls === 1 ? "tmux 3.3\n" : "psmux 3.3.0\n", stderr: "" };
 		};
@@ -103,7 +103,7 @@ describe("detectPsmux", () => {
 
 	it("caches the verdict for repeated identical probes", () => {
 		let calls = 0;
-		const runner = (command: string, args: string[]) => {
+		const runner = (_command: string, _args: string[]) => {
 			calls += 1;
 			return { exitCode: 0, stdout: "psmux 3.3.0\n", stderr: "" };
 		};

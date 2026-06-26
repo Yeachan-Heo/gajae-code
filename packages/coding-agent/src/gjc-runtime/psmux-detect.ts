@@ -80,7 +80,7 @@ function probeVersionOutput(command: string, runner: PsmuxSpawnRunner): string {
 	const flags = ["-V", "--version"];
 	for (const flag of flags) {
 		const result = runner(command, [flag]);
-		const text = ((result.stdout ?? "") + "\n" + (result.stderr ?? "")).toLowerCase();
+		const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
 		if (result.exitCode === 0 && text.trim().length > 0) return text;
 	}
 	return "";
@@ -152,9 +152,7 @@ export interface ResolvedTmuxBinary {
  * override is set, psmux (installed as psmux, pmux, or tmux) is picked
  * automatically so the default gjc --tmux flow lands on a real multiplexer.
  */
-export function resolveGjcTmuxBinary(
-	options: ResolveGjcTmuxBinaryOptions = {},
-): ResolvedTmuxBinary {
+export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}): ResolvedTmuxBinary {
 	const env = options.env ?? process.env;
 	const platform = options.platform ?? process.platform;
 	const runner = options.runner ?? readSpawnRunner();

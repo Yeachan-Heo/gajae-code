@@ -227,10 +227,7 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 	// env form so the launched gjc inherits GJC_TMUX_LAUNCHED without leaking
 	// into the parent tmux server.
 	const platform = process.platform;
-	const command =
-		platform === "win32"
-			? "$env:GJC_TMUX_LAUNCHED = '1'; gjc"
-			: "exec env GJC_TMUX_LAUNCHED=1 gjc";
+	const command = platform === "win32" ? "$env:GJC_TMUX_LAUNCHED = '1'; gjc" : "exec env GJC_TMUX_LAUNCHED=1 gjc";
 	const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, command], {
 		stdout: "pipe",
 		stderr: "pipe",

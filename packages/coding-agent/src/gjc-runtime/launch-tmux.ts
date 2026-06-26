@@ -359,7 +359,6 @@ function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 	if (!env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return;
 	if (parseLaunchPolicy(env) === "direct") return;
 
-	const platform = context.platform ?? process.platform;
 	// Note: Windows is intentionally allowed here. Psmux supports
 	// `rename-window` and we want the leader window to inherit the
 	// project:branch title even on native Windows, where gjc --tmux runs

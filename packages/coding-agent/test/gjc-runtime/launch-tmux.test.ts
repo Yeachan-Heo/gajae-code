@@ -633,7 +633,6 @@ describe("default GJC tmux launch", () => {
 		);
 	});
 
-
 	it("applies the tmux profile only to the requested target", () => {
 		const calls: { command: string; args: string[] }[] = [];
 		const result = applyGjcTmuxProfile({

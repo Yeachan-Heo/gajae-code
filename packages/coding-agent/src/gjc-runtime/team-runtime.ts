@@ -1913,9 +1913,7 @@ export function buildWorkerCommand(
 ): string {
 	const quote = platform === "win32" ? powershellQuote : shellQuote;
 	const envAssignment = (key: string, value: string): string =>
-		platform === "win32"
-			? `$env:${key} = ${quote(value)};`
-			: `${key}=${quote(value)}`;
+		platform === "win32" ? `$env:${key} = ${quote(value)};` : `${key}=${quote(value)}`;
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
 		: `Worker cwd: ${config.leader.cwd}.`;
@@ -2057,7 +2055,7 @@ async function startTmuxSession(
 					"#{pane_id}",
 					"-c",
 					worker.worktree_path ?? config.leader.cwd,
-					buildWorkerCommand(config, worker, (process.platform as NodeJS.Platform)),
+					buildWorkerCommand(config, worker),
 				],
 				{ stdout: "pipe", stderr: "pipe" },
 			);
