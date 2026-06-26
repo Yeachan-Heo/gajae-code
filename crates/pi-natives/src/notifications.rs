@@ -13,11 +13,10 @@
 
 use std::path::PathBuf;
 
-use gjc_notifications::protocol::SessionReady;
 use gjc_notifications::{
 	ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle, LifecycleClientMessage,
 	LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle, ServerMessage, Verbosity,
-	start_control,
+	protocol::SessionReady, start_control,
 };
 use napi::{
 	bindgen_prelude::*,
@@ -366,9 +365,9 @@ pub struct ControlEndpoint {
 #[napi(object)]
 pub struct LifecycleRequestEvent {
 	/// One of `"session_create"`, `"session_close"`, `"session_resume"`.
-	pub kind:        String,
+	pub kind:         String,
 	/// The request correlation id to echo in the response.
-	pub request_id:  String,
+	pub request_id:   String,
 	/// JSON-encoded `LifecycleClientMessage` with the control `token` stripped.
 	/// The ingress already authenticated the frame, so the secret is never
 	/// forwarded into JS; all other (non-token) fields are preserved.
@@ -378,8 +377,8 @@ pub struct LifecycleRequestEvent {
 /// In-process, session-independent lifecycle **control** server exposed to TS.
 ///
 /// Transport-only: it authenticates (handshake + per-frame), forwards valid
-/// lifecycle requests to the TS daemon, and routes TS-produced responses back by
-/// request id. All policy/spawn/idempotency/rate-limit/audit lives in TS.
+/// lifecycle requests to the TS daemon, and routes TS-produced responses back
+/// by request id. All policy/spawn/idempotency/rate-limit/audit lives in TS.
 ///
 /// Call order: construct, [`Self::on_lifecycle_request`] (before start), then
 /// [`Self::start`].
@@ -456,11 +455,8 @@ impl NotificationControlServer {
 					// The control token is authenticated at the ingress; never
 					// forward the raw secret into the JS layer (no-token-leak).
 					let payload_json = redact_lifecycle_token(&msg);
-					let event = LifecycleRequestEvent {
-						kind: kind.to_owned(),
-						request_id,
-						payload_json,
-					};
+					let event =
+						LifecycleRequestEvent { kind: kind.to_owned(), request_id, payload_json };
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
@@ -517,9 +513,8 @@ fn parse_needed(json: &str) -> Result<ActionNeeded> {
 /// stripped. The ingress already authenticated the frame, so the secret must
 /// never cross into the JS layer (or any logging there).
 fn redact_lifecycle_token(msg: &LifecycleClientMessage) -> String {
-	let mut value = match serde_json::to_value(msg) {
-		Ok(v) => v,
-		Err(_) => return "null".to_owned(),
+	let Ok(mut value) = serde_json::to_value(msg) else {
+		return "null".to_owned();
 	};
 	if let Some(obj) = value.as_object_mut() {
 		obj.remove("token");
