@@ -38,7 +38,7 @@ use crate::{
 	discovery::EndpointRecord,
 	protocol::{
 		ActionNeeded, ClientMessage, PROTOCOL_VERSION, Pong, RejectReason, Reply, ReplyAnswer,
-		ReplyRejected, ServerHello, ServerMessage, capabilities,
+		ReplyRejected, ServerHello, ServerMessage, SessionReady, capabilities,
 	},
 };
 
@@ -94,6 +94,9 @@ struct ServerState {
 	/// Always present: inbound free-text injections / in-thread config commands
 	/// forwarded to the host (token-authorized).
 	inbound_tx:         tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+	/// Buffered last readiness frame, replayed to late-connecting clients so a
+	/// lifecycle control client can wait for readiness deterministically.
+	session_ready:      Mutex<Option<SessionReady>>,
 }
 
 /// Handle to a running server. Dropping it does not stop the server; call
@@ -150,6 +153,17 @@ impl ServerHandle {
 	/// replay (see [`ServerHandle::register_ask`]) is unaffected.
 	pub fn push_frame(&self, msg: ServerMessage) {
 		let _ = self.state.tx.send(msg);
+	}
+
+	/// Publish a session-readiness signal: buffer it (so late-connecting clients
+	/// see it on connect) and broadcast it to currently-connected clients.
+	///
+	/// Unlike [`ServerHandle::push_frame`], this frame is replayed on reconnect,
+	/// so a lifecycle control client can wait for readiness deterministically
+	/// instead of treating WS-open as readiness.
+	pub fn push_session_ready(&self, ready: SessionReady) {
+		*self.state.session_ready.lock() = Some(ready.clone());
+		let _ = self.state.tx.send(ServerMessage::SessionReady(ready));
 	}
 
 	/// Resolve a pending action locally (e.g. the CLI/TUI answered it).
@@ -282,6 +296,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		resolver_available: AtomicBool::new(config.resolver_available),
 		reply_tx,
 		inbound_tx,
+		session_ready: Mutex::new(None),
 	});
 	let cancel = CancellationToken::new();
 	let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&state), cancel.clone()));
@@ -341,6 +356,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			capabilities::IMAGES.into(),
 			capabilities::CONFIG.into(),
 			capabilities::CLIENT_PING_PONG.into(),
+			capabilities::SESSION_READY.into(),
 		],
 	});
 	if send_msg(&mut write, &hello).await.is_err() {
@@ -351,6 +367,17 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 	let replay = state.registry.lock().replay_for_new_client().cloned();
 	if let Some(replay) = replay
 		&& send_msg(&mut write, &ServerMessage::ActionNeeded(replay))
+			.await
+			.is_err()
+	{
+		return;
+	}
+
+	// Replay the buffered readiness frame (if any) so a late-connecting control
+	// client observes readiness without relying on WS-open alone.
+	let ready_replay = state.session_ready.lock().clone();
+	if let Some(ready) = ready_replay
+		&& send_msg(&mut write, &ServerMessage::SessionReady(ready))
 			.await
 			.is_err()
 	{
@@ -478,7 +505,7 @@ where
 
 /// Extract the `token` query parameter value (no percent-decoding; tokens are
 /// generated URL-safe).
-fn token_from_query(query: Option<&str>) -> Option<String> {
+pub(crate) fn token_from_query(query: Option<&str>) -> Option<String> {
 	let query = query?;
 	query.split('&').find_map(|pair| {
 		let mut it = pair.splitn(2, '=');
@@ -487,7 +514,7 @@ fn token_from_query(query: Option<&str>) -> Option<String> {
 }
 
 /// Constant-time-ish token comparison (length is allowed to leak).
-fn tokens_match(a: &str, b: &str) -> bool {
+pub(crate) fn tokens_match(a: &str, b: &str) -> bool {
 	let (a, b) = (a.as_bytes(), b.as_bytes());
 	if a.len() != b.len() {
 		return false;
@@ -710,6 +737,7 @@ mod tests {
 			capabilities::IMAGES,
 			capabilities::CONFIG,
 			capabilities::CLIENT_PING_PONG,
+			capabilities::SESSION_READY,
 		]);
 
 		match next_server_msg(&mut ws).await {
@@ -936,6 +964,46 @@ mod tests {
 		.unwrap();
 		let r = tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv()).await;
 		assert!(r.is_err(), "wrong-token inbound must not forward");
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn session_ready_is_advertised_buffered_and_replayed() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+
+		// A client connected before readiness sees it broadcast live.
+		let mut early = connect(&handle, "secret").await;
+		let hello = next_server_hello(&mut early).await;
+		assert!(
+			hello
+				.capabilities
+				.contains(&capabilities::SESSION_READY.into())
+		);
+		wait_for_clients(&handle, 1).await;
+
+		handle.push_session_ready(SessionReady {
+			session_id:           "s".into(),
+			lifecycle_request_id: Some("lc_01".into()),
+			startup_prompt_ref:   Some("prompt_lc_01".into()),
+			repo:                 Some("gajae-code".into()),
+			branch:               Some("feat/x".into()),
+			title:                None,
+		});
+		match next_server_msg(&mut early).await {
+			ServerMessage::SessionReady(r) => {
+				assert_eq!(r.session_id, "s");
+				assert_eq!(r.lifecycle_request_id.as_deref(), Some("lc_01"));
+			},
+			other => panic!("expected session_ready broadcast, got {other:?}"),
+		}
+
+		// A client connecting AFTER readiness still gets it replayed on connect.
+		let mut late = connect(&handle, "secret").await;
+		next_server_hello(&mut late).await;
+		match next_server_msg(&mut late).await {
+			ServerMessage::SessionReady(r) => assert_eq!(r.session_id, "s"),
+			other => panic!("expected replayed session_ready, got {other:?}"),
+		}
 		handle.stop();
 	}
 }

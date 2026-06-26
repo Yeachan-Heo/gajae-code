@@ -40,6 +40,7 @@
       "@types/react": "^19.2.14",
       "@types/react-dom": "^19.2.3",
       "@types/turndown": "5.0.6",
+      "@types/ws": "^8.5.13",
       "@typescript/native-preview": "7.0.0-dev.20260505.1",
       "@xterm/headless": "^6.0.0",
       "beautiful-mermaid": "^1.1.3",

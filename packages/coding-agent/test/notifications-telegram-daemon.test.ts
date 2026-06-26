@@ -629,6 +629,7 @@ describe("telegram daemon", () => {
 			WebSocketImpl: FakeWs as any,
 			scanIntervalMs: 5,
 			idleTimeoutMs: 60_000,
+			createLifecycleControlServer: null,
 		});
 
 		const until = async (pred: () => boolean, ms = 2000) => {
@@ -1946,6 +1947,114 @@ test("a fresh daemon scanRoots reconnects an existing session endpoint", async (
 	await daemon.scanRoots();
 	expect(daemon.sessions.has("live-session")).toBe(true);
 	expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
+});
+
+test("connectSession eagerly creates a Telegram topic on connect (before any frame)", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("sess-abc123", "ws://x", "tok");
+	// FakeWs does not auto-dispatch "open"; fire it to exercise the connect hook.
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await new Promise(r => setTimeout(r, 10));
+	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
+	expect(createTopic).toBeTruthy();
+	// Provisional name uses the session id tail until identity_header renames it.
+	expect(createTopic!.body.name).toBe("GJC abc123");
+});
+
+test("identity_header during an in-flight eager create still renames the topic", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let releaseCreate: (tid: string) => void = () => {};
+	const createGate = new Promise<string>(r => {
+		releaseCreate = r;
+	});
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") {
+			const tid = await createGate; // stay in-flight until released
+			return { ok: true, result: { message_thread_id: Number(tid) } };
+		}
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "editForumTopic") return { ok: true, result: true };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("sess-xyz999", "ws://x", "tok");
+	// Eager create starts and blocks in-flight on createGate.
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await Promise.resolve();
+	// identity_header arrives while the create is still in flight -> joins it.
+	const session = daemon.sessions.get("sess-xyz999")!;
+	const identityP = daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "sess-xyz999",
+		repo: "myrepo",
+		branch: "mybranch",
+	});
+	await Promise.resolve();
+	releaseCreate("777"); // now resolve the single shared create
+	await identityP;
+	await new Promise(r => setTimeout(r, 10));
+	// Exactly one topic created (provisional name), then renamed to identity name.
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.find(c => c.method === "createForumTopic")!.body.name).toBe("GJC xyz999");
+	const edit = bot.calls.find(c => c.method === "editForumTopic");
+	expect(edit).toBeTruthy();
+	expect(edit!.body.name).toBe("myrepo/mybranch");
+});
+
+test("scanRoots connects only live endpoints (skips stale + dead-PID records)", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "live" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
+	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(path.join(endpointDir, "live.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }));
+	fs.writeFileSync(
+		path.join(endpointDir, "stale.json"),
+		JSON.stringify({ url: "ws://stale", token: "t", pid: 4242, stale: true }),
+	);
+	fs.writeFileSync(path.join(endpointDir, "dead.json"), JSON.stringify({ url: "ws://dead", token: "t", pid: 999999 }));
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+		// Only pid 4242 is "alive"; 999999 is dead.
+		pidAlive: (pid: number) => pid === 4242,
+	});
+	await daemon.scanRoots();
+	expect(daemon.sessions.has("live")).toBe(true);
+	expect(daemon.sessions.has("stale")).toBe(false);
+	expect(daemon.sessions.has("dead")).toBe(false);
+	expect(FakeWs.instances.every(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {

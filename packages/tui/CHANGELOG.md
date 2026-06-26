@@ -4,6 +4,10 @@
 
 ## [0.7.3] - 2026-06-25
 
+### Fixed
+
+- Fixed Korean IME ghost character on macOS: a Hangul syllable committed by the IME immediately after `ctrl+u` (line-delete) is now discarded, preventing it from appearing in the cleared buffer.
+- Fixed CJK IME composition overlay positioning on macOS: the TUI now shows a steady-block hardware cursor (`\x1b[2 q`) when the soft cursor is active, anchoring the IME overlay to the correct position. Removed the synchronized-output wrapper from standalone cursor nudges, which was flushing terminal state and dismissing the overlay on every keystroke.
 ### Added
 
 - Added bottom-pinned TUI layout support so short initial screens can pad above composer/status components and keep the prompt anchored to the terminal viewport bottom (#1120).

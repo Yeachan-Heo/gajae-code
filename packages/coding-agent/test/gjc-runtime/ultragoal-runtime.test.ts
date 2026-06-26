@@ -589,6 +589,10 @@ describe("ultragoal CLI replay validation", () => {
 			cliExecutorQa([cliReplayArtifact({ command: ["bun", "install"] })]),
 		);
 		expect(unallowlistedError).toContain("allowlist");
+		expect(unallowlistedError).toContain('command "bun" with 1 arg is blocked');
+		expect(unallowlistedError).not.toContain("install");
+		expect(unallowlistedError).toContain("Allowed replay commands");
+		expect(unallowlistedError).toContain("replayExempt metadata");
 	});
 
 	it("rejects execution-affecting env and git side-effect flags", async () => {
@@ -611,6 +615,8 @@ describe("ultragoal CLI replay validation", () => {
 			]),
 		);
 		expect(gitError).toContain("allowlist");
+		expect(gitError).toContain('command "git" with 2 args is blocked');
+		expect(gitError).not.toContain("--output=artifact.txt");
 	});
 
 	it("rejects path-qualified or case-spoofed replay executables", async () => {
@@ -2107,7 +2113,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(coverageError).toContain("executorQa.contractCoverage[0].surfaceEvidenceRefs");
 	});
 
-	it("enforces not-applicable and GUI/web artifact compatibility rules", async () => {
+	it("enforces not-applicable and surface artifact compatibility rules", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -2129,14 +2135,29 @@ describe("native GJC ultragoal runtime", () => {
 			refs[0]!.kind = "cli-log";
 			refs[1]!.kind = "terminal-transcript";
 		});
+		const apiWithFailureArtifact = await mutateLiveQualityGate(root, gate => {
+			const surfaceEvidence = gate.executorQa!.surfaceEvidence as Array<Record<string, unknown>>;
+			surfaceEvidence[0] = {
+				id: "surface-api",
+				surface: "api/package",
+				contractRef: "approved-plan:goal",
+				invocation: "Run package consumer verification",
+				verdict: "passed",
+				artifactRefs: ["adversarial-report"],
+			};
+		});
 
 		const notApplicableError = await expectRejectedCompleteGate(root, created, notApplicableWithoutReason);
 		const adversarialError = await expectRejectedCompleteGate(root, created, adversarialNotApplicable);
 		const guiError = await expectRejectedCompleteGate(root, created, guiWithCliOnlyArtifact);
+		const apiError = await expectRejectedCompleteGate(root, created, apiWithFailureArtifact);
 
 		expect(notApplicableError).toContain("executorQa.surfaceEvidence[0].reason");
 		expect(adversarialError).toContain("executorQa.adversarialCases[0].status");
 		expect(guiError).toContain("GUI/web surfaces");
+		expect(apiError).toContain("API/package surfaces");
+		expect(apiError).toContain("expected at least one artifact kind containing one of");
+		expect(apiError).toContain("adversarial-report=failure-mode-test");
 	});
 
 	it("rejects failed executor QA matrix row outcomes before mutation", async () => {

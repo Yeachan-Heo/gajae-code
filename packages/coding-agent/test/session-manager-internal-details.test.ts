@@ -127,3 +127,60 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 		}
 	});
 });
+
+describe("SessionManager lifecycle-preallocated session id", () => {
+	function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
+		const prev: Record<string, string | undefined> = {};
+		for (const k of Object.keys(vars)) prev[k] = process.env[k];
+		try {
+			for (const [k, v] of Object.entries(vars)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+			fn();
+		} finally {
+			for (const [k, v] of Object.entries(prev)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+		}
+	}
+
+	it("adopts GJC_SESSION_ID as its header id when spawned via /session_create", () => {
+		withEnv({ GJC_LIFECYCLE_REQUEST_ID: "lc-test-1", GJC_SESSION_ID: "s-preallocated-1" }, () => {
+			const session = SessionManager.inMemory();
+			expect(session.getSessionId()).toBe("s-preallocated-1");
+		});
+	});
+
+	it("ignores GJC_SESSION_ID for normal launches (no lifecycle request id)", () => {
+		withEnv({ GJC_LIFECYCLE_REQUEST_ID: undefined, GJC_SESSION_ID: "s-should-be-ignored" }, () => {
+			const session = SessionManager.inMemory();
+			expect(session.getSessionId()).not.toBe("s-should-be-ignored");
+		});
+	});
+
+	it("ignores an unsafe preallocated id even under a lifecycle request", () => {
+		withEnv({ GJC_LIFECYCLE_REQUEST_ID: "lc-test-2", GJC_SESSION_ID: "../bad/id" }, () => {
+			const session = SessionManager.inMemory();
+			expect(session.getSessionId()).not.toBe("../bad/id");
+		});
+	});
+	it("consumes the preallocated id exactly once (newSession gets a fresh id)", async () => {
+		const prevReq = process.env.GJC_LIFECYCLE_REQUEST_ID;
+		const prevId = process.env.GJC_SESSION_ID;
+		try {
+			process.env.GJC_LIFECYCLE_REQUEST_ID = "lc-test-3";
+			process.env.GJC_SESSION_ID = "s-once-1";
+			const session = SessionManager.inMemory();
+			expect(session.getSessionId()).toBe("s-once-1");
+			await session.newSession();
+			expect(session.getSessionId()).not.toBe("s-once-1");
+		} finally {
+			if (prevReq === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			else process.env.GJC_LIFECYCLE_REQUEST_ID = prevReq;
+			if (prevId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = prevId;
+		}
+	});
+});

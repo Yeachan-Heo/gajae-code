@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 
 use gjc_notifications::{
-	ActionNeeded, ClientMessage, ReplyAnswer, ServerConfig, ServerHandle, ServerMessage, Verbosity,
+	ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle, LifecycleClientMessage,
+	LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle, ServerMessage, Verbosity,
+	protocol::SessionReady, start_control,
 };
 use napi::{
 	bindgen_prelude::*,
@@ -255,6 +257,21 @@ impl NotificationServer {
 		self.with_handle(|h| h.push_frame(msg))
 	}
 
+	/// Publish a replayable `session_ready` readiness signal. `ready_json` is a
+	/// JSON `SessionReady`. Unlike [`Self::push_frame`], this frame is buffered
+	/// and replayed to late-connecting clients, so a lifecycle control client
+	/// can wait for readiness deterministically instead of treating WS-open as
+	/// readiness.
+	///
+	/// # Errors
+	/// Fails if not started or `ready_json` is not a valid `SessionReady`.
+	#[napi]
+	pub fn push_session_ready(&self, ready_json: String) -> Result<()> {
+		let ready: SessionReady = serde_json::from_str(&ready_json)
+			.map_err(|e| Error::from_reason(format!("invalid SessionReady json: {e}")))?;
+		self.with_handle(|h| h.push_session_ready(ready))
+	}
+
 	/// Resolve an action locally (the CLI/TUI answered). `answer_json` is an
 	/// optional JSON `ReplyAnswer`.
 	///
@@ -331,8 +348,178 @@ impl NotificationServer {
 	}
 }
 
+/// Bound endpoint info returned from [`NotificationControlServer::start`].
+#[napi(object)]
+pub struct ControlEndpoint {
+	/// Bind host (loopback).
+	pub host:     String,
+	/// Bound port.
+	pub port:     u32,
+	/// `ws://host:port` URL.
+	pub url:      String,
+	/// The daemon owner id this control endpoint serves.
+	pub owner_id: String,
+}
+
+/// A lifecycle request forwarded to the TypeScript daemon for orchestration.
+#[napi(object)]
+pub struct LifecycleRequestEvent {
+	/// One of `"session_create"`, `"session_close"`, `"session_resume"`.
+	pub kind:         String,
+	/// The request correlation id to echo in the response.
+	pub request_id:   String,
+	/// JSON-encoded `LifecycleClientMessage` with the control `token` stripped.
+	/// The ingress already authenticated the frame, so the secret is never
+	/// forwarded into JS; all other (non-token) fields are preserved.
+	pub payload_json: String,
+}
+
+/// In-process, session-independent lifecycle **control** server exposed to TS.
+///
+/// Transport-only: it authenticates (handshake + per-frame), forwards valid
+/// lifecycle requests to the TS daemon, and routes TS-produced responses back
+/// by request id. All policy/spawn/idempotency/rate-limit/audit lives in TS.
+///
+/// Call order: construct, [`Self::on_lifecycle_request`] (before start), then
+/// [`Self::start`].
+#[napi]
+pub struct NotificationControlServer {
+	config:     Mutex<Option<ControlServerConfig>>,
+	handle:     Mutex<Option<ControlServerHandle>>,
+	on_request: Mutex<Option<ThreadsafeFunction<LifecycleRequestEvent>>>,
+}
+
+#[napi]
+impl NotificationControlServer {
+	/// Create a control server authenticated by `token` and owned by `owner_id`.
+	///
+	/// `agent_dir` (when given) is where the control discovery file is written
+	/// (e.g. the daemon agent dir).
+	#[napi(constructor)]
+	#[must_use]
+	pub fn new(token: String, owner_id: String, agent_dir: Option<String>) -> Self {
+		let mut config = ControlServerConfig::new(token, owner_id);
+		config.agent_dir = agent_dir.map(PathBuf::from);
+		Self {
+			config:     Mutex::new(Some(config)),
+			handle:     Mutex::new(None),
+			on_request: Mutex::new(None),
+		}
+	}
+
+	/// Register the lifecycle-request callback. Must be called before
+	/// [`Self::start`].
+	#[napi(ts_args_type = "callback: (err: null | Error, req: LifecycleRequestEvent) => void")]
+	pub fn on_lifecycle_request(&self, callback: ThreadsafeFunction<LifecycleRequestEvent>) {
+		*self.on_request.lock() = Some(callback);
+	}
+
+	/// Bind the loopback control endpoint and start serving. Resolves with the
+	/// bound endpoint info once the socket is bound.
+	///
+	/// # Errors
+	/// Fails if already started, a non-loopback bind is requested, or the socket
+	/// cannot be bound.
+	#[napi]
+	pub async fn start(&self) -> Result<ControlEndpoint> {
+		let config = self
+			.config
+			.lock()
+			.take()
+			.ok_or_else(|| Error::from_reason("control server already started"))?;
+		let owner_id = config.owner_id.clone();
+		let handle = start_control(config)
+			.await
+			.map_err(|e| Error::from_reason(format!("control bind failed: {e}")))?;
+
+		let endpoint = ControlEndpoint {
+			host: handle.addr().ip().to_string(),
+			port: u32::from(handle.addr().port()),
+			url: handle.url(),
+			owner_id,
+		};
+
+		// Pump forwarded lifecycle requests to the TS daemon callback.
+		let tsfn = self.on_request.lock().take();
+		let req_rx = handle.take_lifecycle_receiver();
+		if let (Some(tsfn), Some(mut rx)) = (tsfn, req_rx) {
+			napi::tokio::spawn(async move {
+				while let Some(msg) = rx.recv().await {
+					let kind = match &msg {
+						LifecycleClientMessage::SessionCreate(_) => "session_create",
+						LifecycleClientMessage::SessionClose(_) => "session_close",
+						LifecycleClientMessage::SessionResume(_) => "session_resume",
+						LifecycleClientMessage::Unknown => continue,
+					};
+					let request_id = msg.request_id().unwrap_or("").to_owned();
+					// The control token is authenticated at the ingress; never
+					// forward the raw secret into the JS layer (no-token-leak).
+					let payload_json = redact_lifecycle_token(&msg);
+					let event =
+						LifecycleRequestEvent { kind: kind.to_owned(), request_id, payload_json };
+					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
+				}
+			});
+		}
+
+		*self.handle.lock() = Some(handle);
+		Ok(endpoint)
+	}
+
+	/// Send a host-produced lifecycle response, routed back to the originating
+	/// client by request id. `response_json` is a JSON `LifecycleServerMessage`.
+	///
+	/// # Errors
+	/// Fails if not started or `response_json` is not a valid
+	/// `LifecycleServerMessage`.
+	#[napi]
+	pub fn respond(&self, response_json: String) -> Result<()> {
+		let msg: LifecycleServerMessage = serde_json::from_str(&response_json)
+			.map_err(|e| Error::from_reason(format!("invalid lifecycle response json: {e}")))?;
+		let guard = self.handle.lock();
+		let handle = guard
+			.as_ref()
+			.ok_or_else(|| Error::from_reason("control server not started"))?;
+		handle.respond(msg);
+		Ok(())
+	}
+
+	/// Number of currently connected control clients.
+	#[must_use]
+	#[napi]
+	pub fn client_count(&self) -> u32 {
+		self
+			.handle
+			.lock()
+			.as_ref()
+			.map_or(0, |h| u32::try_from(h.client_count()).unwrap_or(u32::MAX))
+	}
+
+	/// Stop the control server (idempotent) and remove the control discovery
+	/// file.
+	#[napi]
+	pub fn stop(&self) {
+		if let Some(handle) = self.handle.lock().as_ref() {
+			handle.stop();
+		}
+	}
+}
+
 fn parse_needed(json: &str) -> Result<ActionNeeded> {
 	serde_json::from_str(json).map_err(|e| Error::from_reason(format!("invalid ActionNeeded: {e}")))
+}
+
+/// Serialize a lifecycle request for the JS callback with the raw control token
+/// stripped. The ingress already authenticated the frame, so the secret must
+/// never cross into the JS layer (or any logging there).
+fn redact_lifecycle_token(msg: &LifecycleClientMessage) -> String {
+	let Ok(mut value) = serde_json::to_value(msg) else {
+		return "null".to_owned();
+	};
+	if let Some(obj) = value.as_object_mut() {
+		obj.remove("token");
+	}
+	serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned())
 }
 
 fn parse_answer(json: Option<&str>) -> Result<Option<ReplyAnswer>> {

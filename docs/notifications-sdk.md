@@ -357,3 +357,95 @@ By default it refuses to start when a fresh managed daemon already owns the same
 bot token for the same paired chat, because a second poller will cause Telegram
 409 conflicts. Use `--force` only for deliberate debugging when you have stopped
 or intentionally want to override the daemon guard.
+## Two client surfaces: per-session vs daemon-owned lifecycle control
+
+The SDK now exposes **two distinct surfaces**. Do not confuse them:
+
+1. **Per-session notification clients (the normal, documented contract above).**
+   A client discovers `<repo>/.gjc/state/notifications/<sessionId>.json`, connects
+   to that session's loopback WebSocket, and handles `action_needed`,
+   `action_resolved`, `reply_rejected`, and the optional threaded frames. This is
+   all an ordinary integration (Telegram, Discord, Slack, mobile, local tools)
+   needs. It requires **zero** upstream changes.
+
+2. **The daemon-owned session *lifecycle* control endpoint (privileged).**
+   A separate, **session-independent**, loopback-only, authenticated control
+   endpoint that accepts `session_create` / `session_close` / `session_resume`
+   frames. It exists because creating a session cannot use a per-session socket
+   (none exists before the session does). It is **not** part of the normal
+   integration contract: ordinary clients never implement it. Only the bundled,
+   trusted daemon (e.g. the managed Telegram daemon) speaks it.
+
+### Lifecycle control endpoint
+
+- **Discovery:** `<agentDir>/notifications/control.json` (daemon-owned, mode
+  `0600`), distinct from per-session endpoint files. It carries only non-secret
+  endpoint metadata (url/host/port/pid/owner). The control token is held **in
+  memory** by the daemon (the sole client) and is **never** written to disk.
+- **Auth:** loopback-only bind (a non-loopback bind is refused). The WebSocket
+  upgrade requires `?token=<control-token>` (HTTP `401` otherwise), and every
+  lifecycle frame's `token` is re-checked (`unauthorized` on mismatch). The Rust
+  ingress authenticates and forwards; it never spawns or applies policy.
+- **Frames:** `session_create` (target `existing_path` | `worktree` |
+  `plain_dir`), `session_close` (hard-kill, history preserved, recoverable),
+  `session_resume` (reattach if alive, else cold-restart from history); responses
+  `session_create_response` / `session_close_response` / `session_resume_response`
+  / `session_lifecycle_error`. The protocol also defines a replayable
+  `session_ready` per-session frame for readiness-gated creates; the current MVP
+  daemon replies once the tmux launch is requested (see the phone guide) rather
+  than waiting on it. Inline prompt text (`-- <prompt>`) is rejected in the MVP.
+
+### Trust model and hardening (daemon side)
+
+The control endpoint trusts the configured paired chat for any path (an accepted
+risk). It is hardened around that boundary:
+
+- **Strict paired-chat gating** — non-paired chats are rejected *before* any path
+  parsing, filesystem, or process action.
+- **Durable idempotency** — a locked, atomic, fsynced ledger keyed by
+  `chatId:updateId` + request hash (`telegram-lifecycle-idempotency.json`).
+  Duplicate updates never repeat side effects, including across daemon restart; a
+  duplicate while in-progress reports pending (never a second spawn); a same id
+  with a different body is `duplicate_conflict`; an effect failure is recorded
+  `terminal_uncertain` (never auto-respawned).
+- **Per-chat create rate limit.**
+- **Audit log** — append-only `telegram-lifecycle-audit.jsonl` (`0600`) recording
+  every accept/reject/duplicate/rate-limit/spawn/success/failure. Raw control
+  tokens and raw prompts are never logged (prompt hash + byte length only).
+- **Inline prompts rejected (MVP)** — `session_create` with `-- <prompt>` text is
+  rejected with usage; no prompt is ever placed in argv, audit, or responses. (A
+  redacted prompt-ref flow is reserved for a future revision.)
+- **GJC-managed-only close** — force-close re-reads the exact `@gjc-profile`
+  immediately before kill and requires the `@gjc-session-id` (and optional
+  `@gjc-session-state-file`) tag to match; it never touches non-GJC tmux.
+- **Recent-activity picker** — sessions are ranked by history-file mtime and
+  enriched with terminal breadcrumbs so the operator picks a recent repo/session
+  instead of typing raw paths. Ambiguous resumes fail closed with candidates.
+### Phone test guide (create / close / resume from Telegram)
+
+End-to-end manual check once `gjc notify setup` has paired your private chat:
+
+1. **Pair + start.** Run `gjc notify setup` (BotFather token, DM the bot to pair).
+   Start any GJC session with notifications enabled so the daemon owner is
+   running (`gjc launch` in a repo, or `GJC_NOTIFICATIONS=1`). The owner starts
+   the loopback control endpoint and accepts `/session_*` while running; with zero
+   active sessions it still idle-exits after the inactivity timeout.
+2. **Create.** From your paired chat send `/session_create path <repo-dir>` (or
+   `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
+   The bot replies once the tmux launch is requested; the session shows up in
+   `/session_recent` once it is ready. (Inline prompts via `-- <text>` are
+   rejected for now with usage text.)
+3. **List.** `/session_recent` shows recent sessions (most-recent first) to copy
+   an id from.
+4. **Close.** `/session_close <sessionId>` hard-kills the GJC-managed session
+   (history is preserved); the bot confirms.
+5. **Resume.** `/session_resume <sessionId|prefix>` reattaches if it is still
+   alive, otherwise cold-restarts it from saved history. An ambiguous prefix
+   replies with the matching candidates instead of guessing.
+
+Commands are accepted **only** from the paired chat; **create** is rate-limited,
+and all lifecycle commands are idempotent per Telegram update id and audited (no
+tokens or prompts are logged).
+For an automated proof of the wire path without a real bot, see
+`packages/coding-agent/scripts/g011-daemon-path-smoke.ts` (real native control
+endpoint + loopback WebSocket).

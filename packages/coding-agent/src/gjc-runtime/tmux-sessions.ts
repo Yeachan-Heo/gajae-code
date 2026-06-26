@@ -306,6 +306,50 @@ export function removeGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv
 	return session;
 }
 
+/**
+ * Force-close a GJC-managed tmux session, even if a live pane is attached.
+ *
+ * This is the lifecycle-control counterpart to {@link removeGjcTmuxSession}: it
+ * intentionally does NOT refuse live/attached panes (hard-kill is the contract),
+ * but it keeps every safety check so it can only ever kill a genuinely
+ * GJC-managed session:
+ * - re-reads the exact tmux profile immediately before kill (never a non-GJC
+ *   session, even one that collides by name);
+ * - when `expectedSessionId` is given, requires the `@gjc-session-id` tag match;
+ * - when `expectedStateFile` is given, requires the `@gjc-session-state-file`
+ *   tag match.
+ *
+ * Returns the prior status (for audit). Throws a tagged error otherwise:
+ * `gjc_tmux_session_not_found`, `gjc_tmux_session_not_managed`,
+ * `gjc_tmux_session_id_mismatch`, or `gjc_tmux_session_state_file_mismatch`.
+ */
+export function forceCloseGjcTmuxSession(
+	sessionName: string,
+	env: NodeJS.ProcessEnv = process.env,
+	expectedSessionId?: string,
+	expectedStateFile?: string,
+): GjcTmuxSessionStatus {
+	const session = statusGjcTmuxSession(sessionName, env);
+	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE) {
+		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
+	}
+	if (expectedSessionId !== undefined) {
+		const actual = readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, env);
+		if (actual !== expectedSessionId) {
+			throw new Error(`gjc_tmux_session_id_mismatch:${sessionName}`);
+		}
+	}
+	if (expectedStateFile !== undefined) {
+		const actual = readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, env);
+		if (actual !== expectedStateFile) {
+			throw new Error(`gjc_tmux_session_state_file_mismatch:${sessionName}`);
+		}
+	}
+	// Intentionally NOT refusing live/attached panes — force-close is hard-kill.
+	runTmux(["kill-session", "-t", `=${session.name}`], env);
+	return session;
+}
+
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
 	const session = statusGjcTmuxSession(sessionName, env);
 	const tmuxCommand = resolveGjcTmuxCommand(env);

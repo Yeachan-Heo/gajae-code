@@ -415,14 +415,17 @@ describe("ExtensionUiController hook editor abort", () => {
 		const rendered = Bun.stripANSI(ctx.hookSelector!.render(80).join("\n"));
 		const lines = rendered.split("\n");
 		expect(lines).toHaveLength(30);
-		expect(rendered).toContain("Prompt row 18");
-		expect(rendered).not.toContain("Prompt row 19");
+		expect(rendered).toContain("Prompt row 17");
+		expect(rendered).not.toContain("Prompt row 18");
+		expect(rendered).toContain("▼ more");
 		expect(rendered).toContain("Alpha");
 		expect(rendered).toContain("Gamma");
-		expect(ui.terminal.write).toHaveBeenCalledWith("\x1b[?1006h\x1b[?1000h");
+		// Scrollable selectors must NOT enable SGR mouse reporting: doing so would hijack the
+		// terminal's native wheel/scrollbar scrollback. The question scrolls via PgUp/PgDn only.
+		expect(ui.terminal.write).not.toHaveBeenCalledWith("\x1b[?1006h\x1b[?1000h");
 
 		ctx.hookSelector!.handleInput("\n");
 		expect(await promise).toBe("Alpha");
-		expect(ui.terminal.write).toHaveBeenCalledWith("\x1b[?1000l\x1b[?1006l");
+		expect(ui.terminal.write).not.toHaveBeenCalledWith("\x1b[?1000l\x1b[?1006l");
 	});
 });

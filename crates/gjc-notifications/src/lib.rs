@@ -13,12 +13,25 @@
 //! without native build tooling or sockets.
 
 pub mod actions;
+pub mod control_server;
 pub mod discovery;
+pub mod lifecycle;
 pub mod protocol;
 pub mod server;
 
 pub use actions::{ActionRegistry, ReplyClassification, ReplyOutcome};
-pub use discovery::{EndpointRecord, clean_stale, endpoint_path, read_endpoint, write_endpoint};
+pub use control_server::{ControlServerConfig, ControlServerHandle, start_control};
+pub use discovery::{
+	ControlEndpointRecord, EndpointRecord, clean_stale, control_endpoint_path, endpoint_path,
+	read_control_endpoint, read_endpoint, remove_control_endpoint, write_control_endpoint,
+	write_endpoint,
+};
+pub use lifecycle::{
+	LifecycleClientMessage, LifecycleEndpoint, LifecycleErrorReason, LifecycleServerMessage,
+	LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose, SessionCloseResponse,
+	SessionCloseTarget, SessionCreate, SessionCreateResponse, SessionCreateTarget,
+	SessionLifecycleError, SessionResume, SessionResumeResponse, SessionResumeTarget,
+};
 pub use protocol::{
 	ActionKind, ActionNeeded, ActionResolved, AnswerSelector, ClientMessage, RejectReason, Reply,
 	ReplyAnswer, ReplyRejected, ResolvedBy, ServerMessage, Verbosity,

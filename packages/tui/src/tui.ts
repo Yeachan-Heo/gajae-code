@@ -313,6 +313,10 @@ export class TUI extends Container {
 	#sixelProbeTimeout?: NodeJS.Timeout;
 	#sixelProbeUnsubscribe?: () => void;
 	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
+	// macOS: steady-block cursor anchors CJK IME overlays; disable with GJC_TUI_IME_CURSOR=0.
+	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
+	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
+	#imeCursorActive = false;
 	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
 	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
@@ -337,6 +341,7 @@ export class TUI extends Container {
 		if (showHardwareCursor !== undefined) {
 			this.#showHardwareCursor = showHardwareCursor;
 		}
+		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
 	}
 
 	get fullRedraws(): number {
@@ -350,6 +355,7 @@ export class TUI extends Container {
 	setShowHardwareCursor(enabled: boolean): void {
 		if (this.#showHardwareCursor === enabled) return;
 		this.#showHardwareCursor = enabled;
+		this.#imeCursorActive = !enabled && this.#useImeBlockCursor;
 		if (!enabled) {
 			this.#hideCursor();
 		}
@@ -707,6 +713,9 @@ export class TUI extends Container {
 			this.#writeTerminal("\r\n");
 		}
 
+		if (this.#useImeBlockCursor) {
+			this.#writeTerminal("\x1b[0 q");
+		}
 		this.#showCursor();
 		try {
 			this.terminal.stop();
@@ -1765,8 +1774,10 @@ export class TUI extends Container {
 		totalLines: number,
 		fromRow: number,
 	): { seq: string; toRow: number } {
-		// No IME target or no content — hide cursor regardless of preference
-		if (!cursorPos || totalLines <= 0) return { seq: "\x1b[?25l", toRow: fromRow };
+		if (!cursorPos || totalLines <= 0) {
+			const hide = this.#useImeBlockCursor ? "\x1b[0 q\x1b[?25l" : "\x1b[?25l";
+			return { seq: hide, toRow: fromRow };
+		}
 
 		// Clamp cursor position to valid range
 		const targetRow = Math.max(0, Math.min(cursorPos.row, totalLines - 1));
@@ -1782,7 +1793,11 @@ export class TUI extends Container {
 		}
 		// Move to absolute column (1-indexed)
 		seq += `\x1b[${targetCol + 1}G`;
-		seq += this.#showHardwareCursor ? "\x1b[?25h" : "\x1b[?25l";
+		if (this.#showHardwareCursor || this.#imeCursorActive) {
+			seq += this.#useImeBlockCursor ? "\x1b[2 q\x1b[?25h" : "\x1b[?25h";
+		} else {
+			seq += "\x1b[?25l";
+		}
 
 		return { seq, toRow: targetRow };
 	}
@@ -1799,6 +1814,7 @@ export class TUI extends Container {
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		this.#hardwareCursorRow = toRow;
-		this.#writeTerminal(`\x1b[?2026h${seq}\x1b[?2026l`);
+		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
+		this.#writeTerminal(seq);
 	}
 }

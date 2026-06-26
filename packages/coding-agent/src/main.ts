@@ -429,7 +429,7 @@ async function flushChangelogVersion(): Promise<void> {
 	}
 }
 
-async function createSessionManager(
+export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
@@ -481,6 +481,17 @@ async function createSessionManager(
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
 		return SessionManager.create(cwd, parsed.sessionDir);
+	}
+	// A lifecycle `/session_create` child must start a FRESH session that adopts
+	// the pre-allocated id (GJC_SESSION_ID), never auto-resume existing history in
+	// the target cwd — otherwise the daemon/tmux id and the session header id
+	// diverge and close/resume-by-create-id break. Resume children are launched
+	// with `--resume <id>` (handled above) and carry no GJC_LIFECYCLE_REQUEST_ID.
+	if (
+		process.env.GJC_LIFECYCLE_REQUEST_ID &&
+		/^[A-Za-z0-9._-]{1,128}$/.test(process.env.GJC_SESSION_ID?.trim() ?? "")
+	) {
+		return undefined;
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so

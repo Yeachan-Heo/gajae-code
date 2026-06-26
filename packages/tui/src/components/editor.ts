@@ -385,6 +385,8 @@ export class Editor implements Component, Focusable {
 
 	#theme: EditorTheme;
 	#useTerminalCursor = false;
+	// macOS: Hangul arriving within 50ms of a line-delete is an IME ghost char — discard it.
+	#lastLineDeleteAt = 0;
 
 	/** When set, replaces the normal cursor glyph at end-of-text with this ANSI-styled string. */
 	cursorOverride: string | undefined;
@@ -849,10 +851,11 @@ export class Editor implements Component, Focusable {
 			const marker = emitCursorMarker ? CURSOR_MARKER : "";
 
 			if (showPlaceholder) {
-				const hintText = hintStyle(truncateToWidth(this.#placeholder ?? "", lineContentWidth));
-				displayText = hintText;
+				displayText = hintStyle(truncateToWidth(this.#placeholder ?? "", lineContentWidth));
 				displayWidth = Math.min(visibleWidth(this.#placeholder ?? ""), lineContentWidth);
-				hasCursor = false;
+				if (!this.#useTerminalCursor) {
+					hasCursor = false;
+				}
 			}
 
 			if (!borderVisible && displayWidth > lineContentWidth) {
@@ -1384,6 +1387,21 @@ export class Editor implements Component, Focusable {
 		else {
 			const printableText = extractPrintableText(data);
 			if (printableText) {
+				if (
+					process.platform === "darwin" &&
+					printableText.length === 1 &&
+					Date.now() - this.#lastLineDeleteAt < 50
+				) {
+					const code = printableText.charCodeAt(0);
+					const isHangul =
+						(code >= 0xac00 && code <= 0xd7a3) ||
+						(code >= 0x1100 && code <= 0x11ff) ||
+						(code >= 0x3130 && code <= 0x318f);
+					if (isHangul) {
+						this.#lastLineDeleteAt = 0;
+						return;
+					}
+				}
 				this.#insertCharacter(printableText);
 			}
 		}
@@ -2209,6 +2227,7 @@ export class Editor implements Component, Focusable {
 	#deleteToStartOfLine(): void {
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#recordUndoState();
+		if (process.platform === "darwin") this.#lastLineDeleteAt = Date.now();
 
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		let deletedText = "";

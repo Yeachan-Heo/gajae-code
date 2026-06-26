@@ -368,6 +368,21 @@ function createSessionId(): string {
 	return Bun.randomUUIDv7();
 }
 
+/**
+ * A session id pre-allocated by the notifications lifecycle subsystem, when this
+ * process was spawned by `/session_create`. Gated by `GJC_LIFECYCLE_REQUEST_ID`
+ * so it ONLY applies to lifecycle-launched sessions (never normal launches): the
+ * daemon tags the tmux session, endpoint discovery, and its `/session_recent`
+ * id with this value, so the agent MUST adopt it as its header id or those ids
+ * diverge (breaking close/resume-by-id after the session is gone).
+ */
+function lifecyclePreallocatedSessionId(): string | undefined {
+	if (!process.env.GJC_LIFECYCLE_REQUEST_ID) return undefined;
+	const id = process.env.GJC_SESSION_ID?.trim();
+	if (!id || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) return undefined;
+	return id;
+}
+
 /** Generate a unique short ID (8 hex chars, collision-checked) */
 function generateId(byId: { has(id: string): boolean }): string {
 	for (let i = 0; i < 100; i++) {
@@ -2535,6 +2550,8 @@ interface SessionManagerStateSnapshot {
 
 export class SessionManager {
 	#sessionId: string = "";
+	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
+	#lifecycleIdAdopted: boolean = false;
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -3002,7 +3019,12 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
-		this.#sessionId = createSessionId();
+		// Adopt a lifecycle pre-allocated id exactly once (the initial session of a
+		// /session_create child); later new-session paths (/new, fork, branch) get
+		// fresh ids so they cannot reuse the original GJC_SESSION_ID.
+		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		if (preallocated) this.#lifecycleIdAdopted = true;
+		this.#sessionId = preallocated ?? createSessionId();
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		const timestamp = new Date().toISOString();

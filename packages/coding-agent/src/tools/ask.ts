@@ -260,7 +260,11 @@ async function askSingleQuestion(
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
 			: "up/down navigate  enter select  esc cancel";
 		const helpText =
-			scrollTitleRows === undefined ? baseHelpText : `${baseHelpText}  wheel/PgUp/PgDn scroll question`;
+			scrollTitleRows === undefined
+				? baseHelpText
+				: navigation
+					? "↑/↓ select  enter  ←/→ question  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript"
+					: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript";
 		const dialogOptions = {
 			initialIndex,
 			timeout,

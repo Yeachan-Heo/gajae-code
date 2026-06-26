@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Deep Interview (and any scrollable `ask`/hook selector) no longer enables SGR mouse reporting, which was hijacking the mouse wheel and disabling the terminal's native scrollback while a question was on screen. The wheel now scrolls the terminal as usual; long questions still scroll inside the dialog via PgUp/PgDn.
+- Scrollable Deep Interview question boxes now show explicit `▲ more` / `▼ more` affordances when hidden question text exists, and selector mode also supports Ctrl+u/Ctrl+d as question-scroll aliases for PgUp/PgDn.
+
+## [0.7.3] - 2026-06-25
+
 ### Added
 
 - Added durable cold-spill eviction for compacted session history: after a compaction, `SessionManager.evictCompactedContent()` moves pre-`firstKeptEntryId` payloads (user/assistant text, thinking, tool-call arguments) out of the hot JSONL and resident heap into durable content-addressed sidecar blobs via `BlobStore.putImmutableSync`, keeping hot retained bytes bounded regardless of pre-compaction history size while preserving graph integrity and the compaction summary.
@@ -57,7 +64,7 @@
 ## [0.7.2] - 2026-06-24
 ### Added
 
-- Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
+- Added a keyless `insane` web search provider that safely ports upstream [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search) public-route fallbacks (MIT; vendored engine pinned in `packages/coding-agent/vendor/insane-search/`) without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
 - `web_search` `auto` mode now drives native provider search over proxies/custom endpoints by reusing the active model's own credential + baseUrl when canonical native creds are absent: `activeContextNativeId()` matches the model's wire api (+ model-id family) to `anthropic` (anthropic-messages), `openai-compatible` (openai-responses/completions), or `gemini` (google-generative-ai Generative Language), each falling back to DuckDuckGo if the endpoint does not support web search.
 - Added built-in C# LSP detection for `csharp-ls`, with `omnisharp` preserved as a fallback when `csharp-ls` is unavailable (#1054).
 - Added Discord and Slack notification adapters alongside the existing Telegram surface, so action-needed signals and replies can be routed to those clients (#1043).
