@@ -348,6 +348,7 @@ export class ExtensionRunner {
 		"ctrl+g",
 		"shift+tab",
 		"shift+ctrl+p",
+		"ctrl+enter",
 		"alt+enter",
 		"escape",
 		"enter",

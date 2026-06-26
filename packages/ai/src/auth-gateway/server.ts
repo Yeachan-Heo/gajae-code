@@ -27,7 +27,15 @@ import * as piNative from "../providers/pi-native-server";
 import { streamSimple } from "../stream";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
 import { parseBind } from "../utils/parse-bind";
-import { captureRequestHeaders, corsHeaders, isAuthorized, json, resolvePeer, withCors } from "./http";
+import {
+	captureRequestHeaders,
+	corsHeaders,
+	isAuthorized,
+	isNoAuthBrowserOriginRequest,
+	json,
+	resolvePeer,
+	withCors,
+} from "./http";
 import type {
 	AuthGatewayServerHandle,
 	AuthGatewayServerOptions,
@@ -640,6 +648,15 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			const url = new URL(req.url);
 			const pathname = url.pathname;
 			const peer = resolvePeer(req);
+			if (isNoAuthBrowserOriginRequest(req, tokens)) {
+				logger.info("auth-gateway no-auth browser-origin request rejected", {
+					method: req.method,
+					path: pathname,
+					peer,
+					origin: req.headers.get("origin"),
+				});
+				return json(403, { error: "browser origin requires bearer token" });
+			}
 			// CORS preflight is always answered without auth — browsers send
 			// preflights pre-authentication and a 401 here breaks the actual
 			// request before the bearer is ever attached.

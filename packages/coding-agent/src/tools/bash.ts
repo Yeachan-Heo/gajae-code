@@ -25,6 +25,7 @@ import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-intera
 import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
+import { checkComposerBashPolicy } from "./composer-bash-policy";
 import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
@@ -568,6 +569,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					throw new ToolError(interception.message ?? "Command blocked");
 				}
 			}
+		}
+
+		const composerPolicy = checkComposerBashPolicy({
+			modelId: this.session.getActiveModelString?.() ?? this.session.getModelString?.() ?? this.session.model?.id,
+			commands: rawCommand === command ? [command] : [rawCommand, command],
+		});
+		if (!composerPolicy.allowed) {
+			throw new ToolError(composerPolicy.message);
 		}
 
 		const internalUrlOptions: InternalUrlExpansionOptions = {

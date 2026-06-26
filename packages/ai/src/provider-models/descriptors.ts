@@ -16,6 +16,7 @@ import {
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
+	fuguModelManagerOptions,
 	githubCopilotModelManagerOptions,
 	groqModelManagerOptions,
 	huggingfaceModelManagerOptions,
@@ -154,6 +155,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("Fireworks", ["FIREWORKS_API_KEY"]),
 	),
 	descriptor("firepass", "kimi-k2.6-turbo", config => firepassModelManagerOptions(config)),
+	catalogDescriptor(
+		"fugu",
+		"fugu",
+		config => fuguModelManagerOptions(config),
+		catalog("Sakana Fugu", ["FUGU_API_KEY"]),
+	),
 	descriptor("xai", "grok-4-fast-non-reasoning", config => xaiModelManagerOptions(config)),
 	catalogDescriptor(
 		"deepseek",

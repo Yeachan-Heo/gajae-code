@@ -145,14 +145,34 @@ describe("renderUrl hard-fail hook (integration via ReadTool)", () => {
 		} as unknown as ToolSession;
 	};
 
-	const mock403 = () =>
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+	const mockPublicReadGuard = () =>
+		vi.spyOn(urlGuard, "validatePublicHttpUrl").mockResolvedValue({
+			ok: true,
+			url: new URL("https://blocked.example/x"),
+			addresses: ["93.184.216.34"],
+		});
+
+	const mock403 = () => {
+		mockPublicReadGuard();
+		return vi.spyOn(scrapers, "loadPage").mockResolvedValue({
 			ok: false,
 			status: 403,
 			contentType: "text/html",
 			finalUrl: "https://blocked.example/x",
 			content: "",
 		});
+	};
+
+	it("blocks private URL reads before loadPage or insane fallback", async () => {
+		const loadPageSpy = vi.spyOn(scrapers, "loadPage");
+		const bridgeSpy = vi.spyOn(bridge, "tryInsaneFetch");
+		const tool = new ReadTool(createSession({ "web.insaneFallback": true }));
+		const result = await tool.execute("r-private", { path: "http://127.0.0.1:8123/admin" });
+		expect(result.details?.method).toBe("failed");
+		expect((result.details?.notes ?? []).some(note => note.startsWith("Blocked URL fetch:"))).toBe(true);
+		expect(loadPageSpy).not.toHaveBeenCalled();
+		expect(bridgeSpy).not.toHaveBeenCalled();
+	});
 
 	it("does not invoke the bridge when the setting is off", async () => {
 		mock403();

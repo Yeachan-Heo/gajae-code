@@ -53,9 +53,7 @@ def parse_issue_ref(ref: str) -> tuple[str, int]:
     cleaned = ref.strip()
     match = _ISSUE_REF.match(cleaned) or _ISSUE_URL.match(cleaned)
     if match is None:
-        raise InvalidIssueRef(
-            f"expected owner/repo#NN or https://github.com/owner/repo/issues/NN, got {ref!r}"
-        )
+        raise InvalidIssueRef(f"expected owner/repo#NN or https://github.com/owner/repo/issues/NN, got {ref!r}")
     return f"{match.group('owner')}/{match.group('repo')}", int(match.group("number"))
 
 

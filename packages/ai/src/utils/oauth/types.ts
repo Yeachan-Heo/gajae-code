@@ -17,6 +17,7 @@ export type OAuthProvider =
 	| "deepseek"
 	| "fireworks"
 	| "firepass"
+	| "fugu"
 	| "github-copilot"
 	| "google-gemini-cli"
 	| "google-antigravity"

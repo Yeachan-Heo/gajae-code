@@ -38,9 +38,10 @@ Set an action to an empty array to disable it:
 | `app.thinking.toggle` | `Ctrl+T` | Toggle thinking-block visibility |
 | `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
-| `app.message.followUp` | `Ctrl+Enter` | Send a follow-up message |
+| `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
 | `app.message.queue` | `Alt+Enter` | Explicitly queue a message for the next turn |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
+
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
 | `app.clipboard.copyPrompt` | `Alt+Shift+C` | Copy the whole prompt |
 | `app.stt.toggle` | `Alt+H` | Toggle speech-to-text recording |
@@ -94,7 +95,8 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 
 | Action ID | Default | Notes |
 | --- | --- | --- |
-| `tui.input.newLine` | `shift+enter` | |
+| `tui.input.newLine` | `Shift+Enter` | `Ctrl+Enter` and `Ctrl+Shift+Enter` are also accepted by the editor when the terminal encodes them distinctly |
+
 | `tui.input.submit` | `enter` | also `tui.select.confirm` (other context) |
 | `tui.input.tab` | `tab` | |
 | `tui.input.copy` | `ctrl+c` | declared but not dispatched by `Editor.handleInput` |
@@ -127,7 +129,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.tools.expand` | `ctrl+o` | |
 | `app.tool.backgroundFold` | `ctrl+b` | |
 | `app.editor.external` | `ctrl+g` | |
-| `app.message.followUp` | `ctrl+enter` | |
+| `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |
 | `app.message.queue` | `alt+enter` | |
 | `app.message.dequeue` | `alt+up` | |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on win32) | platform-aware; single source of truth in `KEYBINDINGS` |

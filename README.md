@@ -121,6 +121,12 @@ Troubleshooting:
 - **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed
   but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in
   `echo $env:Path`, then restart the terminal.
+- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a
+  tmux-compatible executable on `PATH`. For GJC-managed session/team guarantees,
+  use WSL with real tmux, or another provider that round-trips tmux user options
+  such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux`
+  commands, but that path is not fully supported for GJC ownership tags and team
+  guarantees yet; see `docs/environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile`.
 
 ## Quick start
 
@@ -209,7 +215,7 @@ gjc setup defaults --check
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
 | External controller / bot | `gjc --mode rpc` for a subprocess worker, or Bridge/HTTPS surfaces where configured | External controllers drive GJC through generic RPC/bridge contracts, not scrollback scraping. |
 
-For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
+For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
 
 ## Configuration
 
@@ -297,6 +303,8 @@ bun scripts/verify-g002-gates.ts
 bun scripts/rebrand-inventory.ts --strict
 bun test packages/coding-agent/test/default-gjc-definitions.test.ts
 ```
+
+For future UI, dashboard, terminal, and TUI visual work, follow the repo-owned [UI design and visual QA workflow](docs/ui-design-visual-qa.md) before broad product-screen implementation.
 
 For a package-by-package map, see [`docs/codebase-overview.md`](docs/codebase-overview.md).
 

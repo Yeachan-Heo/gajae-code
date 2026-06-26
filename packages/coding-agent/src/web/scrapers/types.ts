@@ -6,6 +6,8 @@ import type TurndownService from "turndown";
 
 import type { AgentStorage } from "../../session/agent-storage";
 import { ToolAbortError } from "../../tools/tool-errors";
+import type { AddressResolver } from "../insane/url-guard";
+import { validatePublicHttpUrl } from "../insane/url-guard";
 
 export { formatNumber } from "@gajae-code/utils";
 
@@ -35,6 +37,7 @@ const USER_AGENTS = [
 	"Mozilla/5.0 (compatible; TextBot/1.0)",
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ];
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function isBotBlocked(status: number, content: string): boolean {
 	if (status === 403 || status === 503) {
@@ -70,6 +73,9 @@ export interface LoadPageOptions {
 	body?: string;
 	maxBytes?: number;
 	signal?: AbortSignal;
+	publicUrlGuard?: boolean;
+	resolver?: AddressResolver;
+	maxRedirects?: number;
 }
 
 export interface LoadPageResult {
@@ -78,87 +84,179 @@ export interface LoadPageResult {
 	finalUrl: string;
 	ok: boolean;
 	status?: number;
+	error?: string;
+}
+
+async function guardPublicFetchUrl(
+	rawUrl: string,
+	resolver: AddressResolver | undefined,
+	context: string,
+): Promise<{ ok: true; url: string } | { ok: false; error: string; finalUrl: string }> {
+	const guard = await validatePublicHttpUrl(rawUrl, { resolver });
+	if (guard.ok) return { ok: true, url: guard.url.toString() };
+	return {
+		ok: false,
+		error: `${context}: target URL is not public HTTP(S): ${guard.reason}`,
+		finalUrl: rawUrl,
+	};
+}
+
+function shouldRewriteRedirectMethod(status: number, method: string): boolean {
+	const normalized = method.toUpperCase();
+	return status === 303 || ((status === 301 || status === 302) && normalized === "POST");
 }
 
 /**
  * Fetch a page with timeout and size limit
  */
 export async function loadPage(url: string, options: LoadPageOptions = {}): Promise<LoadPageResult> {
-	const { timeout = 20, headers = {}, maxBytes = MAX_BYTES, signal, method = "GET", body } = options;
+	const {
+		timeout = 20,
+		headers = {},
+		maxBytes = MAX_BYTES,
+		signal,
+		method = "GET",
+		body,
+		publicUrlGuard = true,
+		resolver,
+		maxRedirects = 10,
+	} = options;
 
-	for (let attempt = 0; attempt < USER_AGENTS.length; attempt++) {
+	let initialUrl = url;
+	if (publicUrlGuard) {
+		const guarded = await guardPublicFetchUrl(url, resolver, "Blocked URL fetch");
+		if (!guarded.ok) {
+			return {
+				content: "",
+				contentType: "",
+				finalUrl: guarded.finalUrl,
+				ok: false,
+				error: guarded.error,
+			};
+		}
+		initialUrl = guarded.url;
+	}
+
+	attempts: for (let attempt = 0; attempt < USER_AGENTS.length; attempt++) {
 		if (signal?.aborted) {
 			throw new ToolAbortError();
 		}
 
 		const userAgent = USER_AGENTS[attempt];
 		const requestSignal = ptree.combineSignals(signal, timeout * 1000);
+		let currentUrl = initialUrl;
+		let currentMethod = method;
+		let currentBody = body;
 
 		try {
-			const requestInit: RequestInit = {
-				signal: requestSignal,
-				method,
-				headers: {
-					"User-Agent": userAgent,
-					Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.5",
-					"Accept-Encoding": "identity", // Cloudflare Markdown-for-Agents returns corrupted bytes when compression is negotiated
-					...headers,
-				},
-				redirect: "follow",
-			};
+			for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
+				const requestInit: RequestInit = {
+					signal: requestSignal,
+					method: currentMethod,
+					headers: {
+						"User-Agent": userAgent,
+						Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+						"Accept-Language": "en-US,en;q=0.5",
+						"Accept-Encoding": "identity", // Cloudflare Markdown-for-Agents returns corrupted bytes when compression is negotiated
+						...headers,
+					},
+					redirect: "manual",
+				};
 
-			if (body !== undefined) {
-				requestInit.body = body;
-			}
-
-			const response = await fetch(url, requestInit);
-
-			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
-			const finalUrl = response.url;
-
-			const reader = response.body?.getReader();
-			if (!reader) {
-				return { content: "", contentType, finalUrl, ok: false, status: response.status };
-			}
-
-			const chunks: Uint8Array[] = [];
-			let totalSize = 0;
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-
-				chunks.push(value);
-				totalSize += value.length;
-
-				if (totalSize > maxBytes) {
-					reader.cancel();
-					break;
+				if (currentBody !== undefined) {
+					requestInit.body = currentBody;
 				}
-			}
 
-			const content = Buffer.concat(chunks).toString("utf-8");
-			if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
-				continue;
-			}
+				const response = await fetch(currentUrl, requestInit);
+				if (REDIRECT_STATUSES.has(response.status)) {
+					const location = response.headers.get("location");
+					if (!location) {
+						return {
+							content: "",
+							contentType: "",
+							finalUrl: currentUrl,
+							ok: false,
+							status: response.status,
+							error: "Redirect response missing Location header",
+						};
+					}
+					const redirectUrl = new URL(location, currentUrl).toString();
+					if (publicUrlGuard) {
+						const guarded = await guardPublicFetchUrl(redirectUrl, resolver, "Blocked URL redirect");
+						if (!guarded.ok) {
+							return {
+								content: "",
+								contentType: "",
+								finalUrl: guarded.finalUrl,
+								ok: false,
+								status: response.status,
+								error: guarded.error,
+							};
+						}
+						currentUrl = guarded.url;
+					} else {
+						currentUrl = redirectUrl;
+					}
+					if (shouldRewriteRedirectMethod(response.status, currentMethod)) {
+						currentMethod = "GET";
+						currentBody = undefined;
+					}
+					continue;
+				}
 
-			if (!response.ok) {
-				return { content, contentType, finalUrl, ok: false, status: response.status };
-			}
+				const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+				const finalUrl = response.url || currentUrl;
 
-			return { content, contentType, finalUrl, ok: true, status: response.status };
+				const reader = response.body?.getReader();
+				if (!reader) {
+					return { content: "", contentType, finalUrl, ok: false, status: response.status };
+				}
+
+				const chunks: Uint8Array[] = [];
+				let totalSize = 0;
+
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					chunks.push(value);
+					totalSize += value.length;
+
+					if (totalSize > maxBytes) {
+						reader.cancel();
+						break;
+					}
+				}
+
+				const content = Buffer.concat(chunks).toString("utf-8");
+				if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
+					continue attempts;
+				}
+
+				if (!response.ok) {
+					return { content, contentType, finalUrl, ok: false, status: response.status };
+				}
+
+				return { content, contentType, finalUrl, ok: true, status: response.status };
+			}
+			return {
+				content: "",
+				contentType: "",
+				finalUrl: currentUrl,
+				ok: false,
+				error: `Too many redirects (${maxRedirects})`,
+			};
 		} catch {
 			if (signal?.aborted) {
 				throw new ToolAbortError();
 			}
 			if (attempt === USER_AGENTS.length - 1) {
-				return { content: "", contentType: "", finalUrl: url, ok: false };
+				return { content: "", contentType: "", finalUrl: currentUrl, ok: false };
 			}
 		}
 	}
 
-	return { content: "", contentType: "", finalUrl: url, ok: false };
+	return { content: "", contentType: "", finalUrl: initialUrl, ok: false };
 }
 
 /** Module-level Turndown instance — built lazily on first use. */

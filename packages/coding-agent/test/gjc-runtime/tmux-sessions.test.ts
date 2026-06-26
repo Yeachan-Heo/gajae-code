@@ -111,6 +111,12 @@ describe("GJC tmux session management", () => {
 		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(
 			"gjc_tmux_session_untagged:psmux_session",
 		);
+		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(
+			/cwd\/start-directory flags such as `-c` do not isolate the server namespace/,
+		);
+		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(
+			/GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines/,
+		);
 		expect(() => statusGjcTmuxSession("psmux_session", { GJC_TMUX_COMMAND: "psmux" })).toThrow(/not fully supported/);
 	});
 

@@ -1613,6 +1613,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "fugu": {
+				const { loginFugu } = await import("./utils/oauth/fugu");
+				const apiKey = await loginFugu(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "zai": {
 				const { loginZai } = await import("./utils/oauth/zai");
 				const apiKey = await loginZai(ctrl);

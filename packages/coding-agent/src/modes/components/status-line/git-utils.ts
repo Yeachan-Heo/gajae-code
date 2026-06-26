@@ -1,3 +1,6 @@
+import type { GitHeadState } from "../../../utils/git";
+import * as git from "../../../utils/git";
+
 /**
  * Extract "owner/repo" from a GitHub remote URL.
  * Handles HTTPS, SSH (scp-style), and git:// protocols.
@@ -39,4 +42,26 @@ export function canReuseCachedPr(
 	currentContext: PrCacheContext | null,
 ): boolean {
 	return cachedPr !== undefined && currentContext !== null && isSamePrCacheContext(cachedContext, currentContext);
+}
+
+export interface CurrentBranchState {
+	readonly branch: string | null;
+	readonly repoId: string | null;
+}
+
+export function resolveCurrentBranch(
+	cwd: string,
+	resolveHead: (cwd: string) => GitHeadState | null = git.head.resolveSync,
+): CurrentBranchState {
+	try {
+		const head = resolveHead(cwd);
+		if (!head) return { branch: null, repoId: null };
+		return {
+			branch: head.kind === "ref" ? (head.branchName ?? head.ref) : "detached",
+			repoId: head.headPath,
+		};
+	} catch (error) {
+		if (error instanceof Error) return { branch: null, repoId: null };
+		throw error;
+	}
 }

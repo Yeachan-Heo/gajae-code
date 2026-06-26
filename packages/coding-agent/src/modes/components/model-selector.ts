@@ -221,6 +221,8 @@ export class ModelSelectorComponent extends Container {
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
 	#currentModel?: Model;
+	#currentThinkingLevel?: ThinkingLevel;
+	#activeModelProfile?: string;
 	#isFastForProvider: (provider?: string) => boolean = () => false;
 	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
@@ -258,6 +260,8 @@ export class ModelSelectorComponent extends Container {
 			sessionId?: string;
 			isFastForProvider?: (provider?: string) => boolean;
 			isFastForSubagentProvider?: (provider?: string) => boolean;
+			currentThinkingLevel?: ThinkingLevel;
+			activeModelProfile?: string;
 		},
 	) {
 		super();
@@ -271,6 +275,8 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#currentModel = _currentModel;
+		this.#currentThinkingLevel = options?.currentThinkingLevel;
+		this.#activeModelProfile = options?.activeModelProfile;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
 		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
 		const initialSearchInput = options?.initialSearchInput;
@@ -366,6 +372,12 @@ export class ModelSelectorComponent extends Container {
 							: ThinkingLevel.Inherit,
 				};
 			}
+		}
+		if (this.#activeModelProfile && this.#currentModel) {
+			this.#roles.default = {
+				model: this.#currentModel,
+				thinkingLevel: this.#currentThinkingLevel ?? ThinkingLevel.Inherit,
+			};
 		}
 	}
 

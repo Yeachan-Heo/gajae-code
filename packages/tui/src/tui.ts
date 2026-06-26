@@ -325,6 +325,7 @@ export class TUI extends Container {
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
+	#bottomPinnedComponent: Component | null = null;
 
 	// Overlay stack for modal components rendered on top of base content
 	overlayStack: {
@@ -386,6 +387,11 @@ export class TUI extends Container {
 		if (isFocusable(component)) {
 			component.focused = true;
 		}
+	}
+
+	setBottomPinnedComponent(component: Component | null): void {
+		this.#bottomPinnedComponent = component;
+		this.requestRender();
 	}
 
 	/**
@@ -484,7 +490,10 @@ export class TUI extends Container {
 		this.#terminalUnavailable = false;
 		this.terminal.start(
 			data => this.#handleInput(data),
-			() => this.requestRender(),
+			() => {
+				this.invalidate();
+				this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
+			},
 		);
 		this.#hideCursor();
 		this.#querySixelSupport();
@@ -1278,6 +1287,31 @@ export class TUI extends Container {
 		return lines;
 	}
 
+	#padBeforeBottomPinnedComponent(lines: string[], height: number): string[] {
+		const component = this.#bottomPinnedComponent;
+		if (component === null || lines.length >= height) return lines;
+
+		let pinnedStart = -1;
+		for (let i = this.children.length - 1; i >= 0; i--) {
+			if (this.children[i] === component) {
+				pinnedStart = i;
+				break;
+			}
+		}
+		if (pinnedStart < 0) return lines;
+
+		let pinnedLineCount = 0;
+		for (let i = pinnedStart; i < this.children.length; i++) {
+			pinnedLineCount += this.children[i].render(this.terminal.columns).length;
+		}
+
+		const blankRows = height - lines.length;
+		const insertAt = Math.max(0, lines.length - pinnedLineCount);
+		const padded = [...lines];
+		padded.splice(insertAt, 0, ...Array.from({ length: blankRows }, () => ""));
+		return padded;
+	}
+
 	#doRender(): void {
 		if (this.#stopped || !this.terminalAvailable) return;
 		const width = this.terminal.columns;
@@ -1295,6 +1329,10 @@ export class TUI extends Container {
 		const renderTreeStart = renderMetrics.now();
 		let newLines = this.render(width);
 		if (renderMetrics.enabled) renderMetrics.recordHelper("renderTree", renderMetrics.now() - renderTreeStart);
+
+		if (this.#bottomPinnedComponent !== null && height > 0) {
+			newLines = this.#padBeforeBottomPinnedComponent(newLines, height);
+		}
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {

@@ -1,5 +1,18 @@
 import { describe, expect, it } from "bun:test";
+import type { ScenarioId } from "../bench/composer-scenarios";
 import { type CliOptions, classifyTraceRecord, run, type TraceRecord } from "../bench/composer-stability-v3";
+
+const MUTATION_SCENARIOS = [
+	"read-edit-hashline",
+	"three-turn-tools",
+	"shell-write-discipline",
+	"multi-file-search-edit",
+	"multi-file-search-edit-bad-anchor",
+	"bad-anchor-recovery",
+	"multi-turn-yield-discipline",
+	"wrong-target-disambiguation",
+	"malformed-edit-recovery",
+] as const satisfies readonly ScenarioId[];
 
 const baseOptions: CliOptions = {
 	mode: "trace",
@@ -22,6 +35,21 @@ function record(partial: Partial<TraceRecord>): TraceRecord {
 		...partial,
 	};
 }
+
+it("fails terminal-only successful results for every mutation-obligation scenario", () => {
+	for (const scenarioId of MUTATION_SCENARIOS) {
+		const result = classifyTraceRecord(
+			record({
+				scenarioId,
+				expected: {},
+				events: [{ type: "scenario_result", status: "passed" }],
+			}),
+		);
+
+		expect(result.status).toBe("failed");
+		expect(result.failureClasses).toContain("missing-tool-turn");
+	}
+});
 
 describe("composer-stability-v3 trace classifier", () => {
 	it("counts shell file reads as shell-read failures", () => {
@@ -93,6 +121,146 @@ describe("composer-stability-v3 trace classifier", () => {
 		expect(scriptRead.failureClasses).toContain("shell-read");
 		expect(pythonCRead.failureClasses).toContain("shell-read");
 		expect(snakeCaseToolName.failureClasses).toContain("shell-read");
+	});
+
+	it("allows recovery after Composer bash policy blocks shell file IO", () => {
+		const recovered = classifyTraceRecord(
+			record({
+				scenarioId: "hard-guard-feedback",
+				expected: { requiredTools: ["bash", "read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "read",
+						status: "success",
+						arguments: { path: "fixtures/workspace/src/policy-secret.ts" },
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+		const wrongTargetRecovery = classifyTraceRecord(
+			record({
+				scenarioId: "hard-guard-feedback",
+				expected: { requiredTools: ["bash", "read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "read",
+						status: "success",
+						arguments: { path: "fixtures/workspace/src/other.ts" },
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+		const policyOnly = classifyTraceRecord(
+			record({
+				scenarioId: "hard-guard-feedback",
+				expected: { requiredTools: ["bash", "read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+		const retriedShellIo = classifyTraceRecord(
+			record({
+				scenarioId: "hard-guard-feedback",
+				expected: { requiredTools: ["bash", "read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "read",
+						status: "success",
+						arguments: { path: "fixtures/workspace/src/policy-secret.ts" },
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+		const nonHardGuardPolicyBlock = classifyTraceRecord(
+			record({
+				scenarioId: "bash-discipline",
+				expected: { requiredTools: ["read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/secret.ts" },
+						message:
+							"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.",
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+		const unrecovered = classifyTraceRecord(
+			record({
+				scenarioId: "hard-guard-feedback",
+				expected: { requiredTools: ["bash", "read"], requireSuccess: true },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "bash",
+						status: "error",
+						arguments: { command: "cat fixtures/workspace/src/policy-secret.ts" },
+						message: "Command exited with code 1",
+					},
+					{ type: "scenario_result", status: "passed" },
+				],
+			}),
+		);
+
+		expect(recovered.status).toBe("passed");
+		expect(wrongTargetRecovery.status).toBe("failed");
+		expect(wrongTargetRecovery.failureClasses).toContain("shell-read");
+		expect(policyOnly.failureClasses).toContain("shell-read");
+		expect(policyOnly.failureClasses).toContain("missing-tool-turn");
+		expect(retriedShellIo.failureClasses).toContain("shell-read");
+		expect(nonHardGuardPolicyBlock.failureClasses).toContain("shell-read");
+		expect(unrecovered.failureClasses).toContain("shell-read");
+		expect(unrecovered.failureClasses).toContain("missing-tool-turn");
 	});
 
 	it("counts shell file discovery, shell writes, and contaminated commands", () => {
@@ -207,6 +375,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const recovered = classifyTraceRecord(
 			record({
 				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -232,6 +401,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const unrecovered = classifyTraceRecord(
 			record({
 				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -245,6 +415,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const ambiguousRecovery = classifyTraceRecord(
 			record({
 				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -257,9 +428,30 @@ describe("composer-stability-v3 trace classifier", () => {
 				],
 			}),
 		);
+		const rejectionOutputRecovery = classifyTraceRecord(
+			record({
+				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "edit",
+						status: "error",
+						message: "Edit rejected: anchors do not match\n*1pa|export const marker = 'pending';",
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "edit",
+						status: "success",
+						arguments: { input: "§src/recover.ts\n≔1pa\nexport const marker = 'done';" },
+					},
+				],
+			}),
+		);
 		const wrongOrderRecovery = classifyTraceRecord(
 			record({
 				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -285,6 +477,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const mismatchedPathRecovery = classifyTraceRecord(
 			record({
 				scenarioId: "bad-anchor-recovery",
+				expected: { targetPath: "src/recover.ts", requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -300,6 +493,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		);
 
 		expect(recovered.status).toBe("passed");
+		expect(rejectionOutputRecovery.status).toBe("passed");
 		expect(unrecovered.status).toBe("failed");
 		expect(unrecovered.failureClasses).toContain("bad-anchor-unrecovered");
 		expect(ambiguousRecovery.failureClasses).toContain("bad-anchor-unrecovered");
@@ -311,6 +505,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const recovered = classifyTraceRecord(
 			record({
 				scenarioId: "tool-json-malformed-recovery",
+				expected: { requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -325,6 +520,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const unrecovered = classifyTraceRecord(
 			record({
 				scenarioId: "tool-json-malformed-recovery",
+				expected: { requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -338,6 +534,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const ambiguousRecovery = classifyTraceRecord(
 			record({
 				scenarioId: "tool-json-malformed-recovery",
+				expected: { requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -352,6 +549,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		const unrelatedSuccess = classifyTraceRecord(
 			record({
 				scenarioId: "tool-json-malformed-recovery",
+				expected: { requireSuccess: false },
 				events: [
 					{
 						type: "tool_execution_end",
@@ -424,6 +622,38 @@ describe("composer-stability-v3 trace classifier", () => {
 		expect(sanitize.failureClasses).toContain("sanitize-replay-regression");
 	});
 
+	it("does not classify scenario names or missing-path text as timeout/sanitize failures", () => {
+		const successfulTimeoutPath = classifyTraceRecord(
+			record({
+				scenarioId: "timeout-handling",
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "read",
+						status: "success",
+						message: "fixtures/transcripts/timeout/sample.json",
+					},
+				],
+			}),
+		);
+		const missingSanitizePath = classifyTraceRecord(
+			record({
+				scenarioId: "grok-sanitize-replay",
+				events: [
+					{
+						type: "tool_execution_end",
+						toolName: "read",
+						status: "error",
+						message: "Path '/tmp/work/grok-sanitize-replay/parity.json' not found",
+					},
+				],
+			}),
+		);
+
+		expect(successfulTimeoutPath.failureClasses).not.toContain("timeout");
+		expect(missingSanitizePath.failureClasses).not.toContain("sanitize-replay-regression");
+	});
+
 	it("scores trace parity over candidate and baseline artifacts", async () => {
 		const output = await run({
 			...baseOptions,
@@ -432,8 +662,8 @@ describe("composer-stability-v3 trace classifier", () => {
 
 		expect(output.mode).toBe("trace");
 		expect(output.p1.applicable).toBe(true);
-		expect(output.p1.candidateFailureCount).toBe(14);
-		expect(output.p1.baselineFailureCount).toBe(1);
+		expect(output.p1.candidateFailureCount).toBe(16);
+		expect(output.p1.baselineFailureCount).toBe(3);
 		expect(output.p1.parityDelta).toBe(13);
 		expect(output.p1.passed).toBe(false);
 		expect(output.traceArtifacts?.map(artifact => artifact.records).reduce((sum, count) => sum + count, 0)).toBe(26);

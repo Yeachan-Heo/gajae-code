@@ -81,6 +81,7 @@ describe("agent-wire RPC command scopes", () => {
 			"handoff",
 			"set_host_tools",
 			"set_host_uri_schemes",
+			"workflow_gate_response",
 		];
 		for (const type of sensitive) {
 			expect(isRpcCommandAllowed(type, floor)).toBe(false);
@@ -94,6 +95,7 @@ describe("agent-wire RPC command scopes", () => {
 		expect(scopeForRpcCommand("set_model")).toBe("model");
 		expect(scopeForRpcCommand("get_messages")).toBe("message:read");
 		expect(scopeForRpcCommand("set_todos")).toBe("control");
+		expect(scopeForRpcCommand("workflow_gate_response")).toBe("control");
 		expect(scopeForRpcCommand("set_host_tools")).toBe("host_tools");
 		expect(scopeForRpcCommand("set_host_uri_schemes")).toBe("host_uri");
 		expect(scopeForRpcCommand("handoff")).toBe("admin");

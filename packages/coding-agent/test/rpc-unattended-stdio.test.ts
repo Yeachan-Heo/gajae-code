@@ -100,7 +100,7 @@ const validDeclaration = {
 	actor: "openclaw/hermes",
 	budget: { max_tokens: 100000, max_tool_calls: 50, max_wall_time_ms: 600000, max_cost_usd: 10 },
 	scopes: ["prompt", "control", "bash"],
-	action_allowlist: ["command.prompt", "bash.readonly"],
+	action_allowlist: ["command.prompt", "command.control", "bash.readonly"],
 };
 
 describe("gjc --mode rpc unattended control plane (stdio transport)", () => {

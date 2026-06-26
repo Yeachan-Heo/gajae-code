@@ -91,6 +91,29 @@ describe("keyboard input priority scheduler red-team", () => {
 		}
 	}, 30000);
 
+	it("reflows the current prompt draft after a terminal width resize", async () => {
+		const h = setup(44, 12, 0);
+		try {
+			await h.term.waitForRender();
+			const draft = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+			h.editor.setText(draft);
+			h.tui.requestRender(true, "test.narrow-draft");
+			await h.term.waitForRender();
+			const narrow = h.term.getViewport().join("\n");
+			expect(narrow).toContain("alpha beta gamma delta epsilon zeta");
+			expect(narrow).toContain("eta theta iota kappa");
+
+			h.term.resize(92, 12);
+			await h.term.waitForRender();
+			const wide = h.term.getViewport().join("\n");
+			expect(h.editor.getText()).toBe(draft);
+			expect(wide).toContain(draft);
+			expect(wide).not.toContain("+- eta theta iota kappa");
+		} finally {
+			h.tui.stop();
+		}
+	}, 30000);
+
 	it("forced render immediately after input preserves the keystroke and leaves no stale viewport", async () => {
 		const h = setup();
 		try {

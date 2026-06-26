@@ -77,8 +77,8 @@ def test_index_serves_dashboard_html(settings: Settings) -> None:
     assert '"replayEnabled":' in resp.text
 
 
-def test_index_substitutes_replay_token(env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """When a replay token is set, the config blob exposes it to the SPA."""
+def test_index_does_not_expose_replay_token(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a replay token is set, the config blob only exposes non-secret state."""
     monkeypatch.setenv("ROBGJC_REPLAY_TOKEN", "secret-token-7")
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
@@ -89,7 +89,8 @@ def test_index_substitutes_replay_token(env, monkeypatch: pytest.MonkeyPatch) ->
             resp = client.get("/")
         assert resp.status_code == 200
         assert '"replayEnabled":true' in resp.text
-        assert '"replayToken":"secret-token-7"' in resp.text
+        assert "secret-token-7" not in resp.text
+        assert "replayToken" not in resp.text
     finally:
         close_database()
 

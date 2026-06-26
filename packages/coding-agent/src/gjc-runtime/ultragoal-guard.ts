@@ -65,15 +65,17 @@ function isKnownUltragoalObjective(currentObjective: string): boolean {
 	);
 }
 
-async function ultragoalReadPaths(cwd: string): Promise<UltragoalPaths> {
+async function ultragoalReadPaths(cwd: string): Promise<{ paths: UltragoalPaths; sessionId: string | null }> {
 	const envSessionId = process.env.GJC_SESSION_ID?.trim();
-	if (envSessionId) return getUltragoalPaths(cwd, envSessionId);
+	if (envSessionId) return { paths: getUltragoalPaths(cwd, envSessionId), sessionId: envSessionId };
 	try {
 		const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
-		return getUltragoalPaths(cwd, session.gjcSessionId);
+		return { paths: getUltragoalPaths(cwd, session.gjcSessionId), sessionId: session.gjcSessionId };
 	} catch (error) {
 		if (error instanceof SessionResolutionError && error.code === "no_session") {
-			return getUltragoalPaths(cwd, null);
+			// No session could be resolved (no env, no auto-detectable active session).
+			// Surface the null session id so callers can decide; ask-guard treats it as inactive.
+			return { paths: getUltragoalPaths(cwd, null), sessionId: null };
 		}
 		throw error;
 	}
@@ -82,7 +84,7 @@ async function ultragoalReadPaths(cwd: string): Promise<UltragoalPaths> {
 async function hasDurableUltragoalState(cwd: string): Promise<boolean> {
 	let paths: UltragoalPaths;
 	try {
-		paths = await ultragoalReadPaths(cwd);
+		({ paths } = await ultragoalReadPaths(cwd));
 	} catch (error) {
 		if (error instanceof SessionResolutionError) return true;
 		throw error;
@@ -368,12 +370,24 @@ export async function readUltragoalVerificationState(input: {
 
 export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBlockDiagnostic> {
 	let paths: UltragoalPaths;
+	let sessionId: string | null;
 	try {
-		paths = await ultragoalReadPaths(cwd);
+		({ paths, sessionId } = await ultragoalReadPaths(cwd));
 	} catch (error) {
 		return activeAskDiagnostic({
 			reason: `Unable to resolve durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,
 			source: "durable_state_unreadable",
+		});
+	}
+	// Ultragoal state is session-scoped. When no session can be resolved (no env,
+	// no auto-detectable active session) there is no active run to protect, so the
+	// ask guard must fall open rather than block on legacy/global durable state.
+	if (sessionId === null) {
+		return inactiveAskDiagnostic({
+			reason: "No active GJC session resolved; ultragoal is inactive.",
+			source: "absent",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
 		});
 	}
 	try {
@@ -398,8 +412,8 @@ export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBl
 	let plan: UltragoalPlan | null;
 	let ledger: UltragoalLedgerEvent[];
 	try {
-		plan = await readUltragoalPlan(cwd);
-		ledger = await readUltragoalLedger(cwd);
+		plan = await readUltragoalPlan(cwd, sessionId);
+		ledger = await readUltragoalLedger(cwd, sessionId);
 	} catch (error) {
 		return activeAskDiagnostic({
 			reason: `Unable to read durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,
@@ -409,6 +423,9 @@ export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBl
 		});
 	}
 	if (!plan) {
+		// goals.json absent or empty while the state dir exists is an inconsistent
+		// durable state, not a clean "no run". Fail closed so the pause guard (which
+		// relies on this `durable_state_unreadable` signal) keeps blocking give-ups.
 		return activeAskDiagnostic({
 			reason: "Durable .gjc/ultragoal state exists but goals.json is missing or empty.",
 			source: "durable_state_unreadable",

@@ -222,23 +222,27 @@ describe("HookEditorComponent prompt-style mode", () => {
 	});
 
 	it("inserts newline on Shift+Enter instead of submitting", () => {
-		const onSubmit = vi.fn();
-		const onCancel = vi.fn();
-		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
-			promptStyle: true,
-		});
+		const variants = ["\x1b[13;2~", "\x1b[13;2u"];
 
-		component.handleInput("a");
-		component.handleInput("\x1b[13;2~");
+		for (const variant of variants) {
+			const onSubmit = vi.fn();
+			const onCancel = vi.fn();
+			const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
+				promptStyle: true,
+			});
 
-		expect(onSubmit).not.toHaveBeenCalled();
-		expect(onCancel).not.toHaveBeenCalled();
+			component.handleInput("a");
+			component.handleInput(variant);
 
-		component.handleInput("b");
-		component.handleInput("\r");
+			expect(onSubmit).not.toHaveBeenCalled();
+			expect(onCancel).not.toHaveBeenCalled();
 
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("a\nb");
+			component.handleInput("b");
+			component.handleInput("\r");
+
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit).toHaveBeenCalledWith("a\nb");
+		}
 	});
 
 	it("treats Ctrl+Enter as newline in prompt-style mode", () => {
@@ -271,8 +275,7 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(lines[0]).toMatch(/^─+$/);
 		expect(lines.at(-1)).toMatch(/^─+$/);
 		expect(lines[4]?.startsWith("> ")).toBe(true);
-		expect(rendered).toContain(" enter submit  esc cancel");
-		expect(rendered).not.toContain("shift+enter newline");
+		expect(rendered).toContain(" enter submit  shift+enter/ctrl+j newline");
 		expect(rendered).toContain("ctrl+g external editor");
 	});
 

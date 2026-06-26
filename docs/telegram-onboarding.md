@@ -48,8 +48,8 @@ The wizard does this:
 1. prompts for `Telegram BotFather token:`;
 2. validates the token with Telegram `getMe`;
 3. verifies private-chat Threaded Mode capability via `getMe.has_topics_enabled`
-   and, when it is off in an interactive run, prints @BotFather instructions and
-   re-checks until you enable it or skip;
+   and, when it is off in an interactive run, prints @BotFather guidance and
+   lets you retry or continue unverified;
 4. asks you to message the bot from a private Telegram chat;
 5. polls Telegram `getUpdates` until it sees a private chat message;
 6. writes the paired chat id and enables notifications.
@@ -69,6 +69,16 @@ manual BotFather toggle. A forum-enabled supergroup is no longer required.
 Note: enabling topics in private chats may require an additional Telegram Stars
 purchase fee, per Telegram's Terms of Service for Bot Developers.
 
+If BotFather's **Bot Settings** menu does not show **Threads Settings** or
+**Threaded Mode**, do not treat that as a setup blocker. Telegram exposes this
+capability unevenly across clients/accounts/bot states, and GJC cannot force the
+menu to appear through the Bot API. The safe fallback is to continue setup with a
+private DM pairing: choose `skip` in the interactive prompt (or use
+`--token <botToken> --chat-id <chatId>` for non-interactive setup). GJC will save
+`threaded=unverified`/`threaded=unknown`, try topics at runtime when possible,
+and otherwise deliver notifications flat to the paired private chat with the
+one-time nudge shown below.
+
 Setup verification is capability verification, not a delivery guarantee: even when
 setup reports `threaded=verified`, the first runtime `createForumTopic` for the
 paired chat can still fail if Telegram refuses it. When per-session topics are
@@ -82,8 +92,9 @@ The final setup line reports a `threaded=` status:
 - `threaded=verified`: the bot has Threaded Mode capability (`has_topics_enabled`
   was true during setup);
 - `threaded=unverified`: Threaded Mode was off and you skipped, or setup ran
-  non-interactively; setup is saved, but enable Threaded Mode in @BotFather before
-  expecting per-session delivery;
+  non-interactively; setup is saved, topics are attempted when available, and
+  runtime delivery falls back to the paired flat private chat when Telegram
+  refuses topic creation;
 - `threaded=unknown`: the Telegram response did not include `has_topics_enabled`,
   so capability could not be verified.
 
@@ -176,15 +187,25 @@ starting a second poller. This avoids Telegram `409 Conflict` failures.
 
 ## 7. Use the Telegram chat
 
-The managed daemon uses Telegram forum-topic delivery for per-session routing in
-the paired private chat. This requires the bot to have Threaded Mode enabled in
-@BotFather (verified during setup via `getMe.has_topics_enabled`); a forum-enabled
-supergroup is no longer required. The daemon calls
+The managed daemon prefers Telegram forum-topic delivery for per-session routing
+in the paired private chat. When Threaded Mode is available for the bot (verified
+during setup via `getMe.has_topics_enabled`), the daemon calls
 `createForumTopic`/`editForumTopic` and sends messages with `message_thread_id`
-against the paired `notifications.telegram.chatId`. If Telegram refuses topic
-creation — even when setup reported `threaded=verified` — the daemon routes
-notifications to the normal (flat) paired chat and posts a one-time nudge to enable
-Threaded Mode, rather than dropping them.
+against the paired `notifications.telegram.chatId`. If BotFather does not show
+**Threads Settings**/**Threaded Mode**, or if Telegram refuses topic creation even
+after setup reported `threaded=verified`, the daemon routes notifications to the
+normal (flat) paired private chat and posts a one-time nudge to enable Threaded
+Mode rather than dropping them.
+
+Flat private-chat fallback preserves outbound notifications and inline-button
+answers, but it cannot provide a separate Telegram topic per GJC session. Free-
+text replies and in-topic config commands depend on topic routing, so use
+Threaded Mode when you need multi-session reply separation from Telegram. Do not
+pair a group, supergroup, or channel as a substitute: setup intentionally accepts
+only a private DM, and hand-edited non-private chat ids remain fail-closed to
+avoid leaking session data. If you specifically want group topics, create a
+forum-enabled Telegram group and use a separate/custom notification integration;
+the bundled `gjc notify setup` onboarding path is private-chat only.
 
 The managed daemon can render:
 
@@ -250,13 +271,13 @@ by the current setup flow.
 ### Setup succeeds but no Telegram session messages arrive
 
 Check the `threaded=` status from the last `gjc notify setup` run. If it is
-`threaded=unverified` or `threaded=unknown`, enable Threaded Mode for the bot in
-@BotFather, then re-run `gjc notify setup` (or
-`gjc notify setup --token <botToken> --chat-id <chatId>`) to re-check the
-capability. Also confirm there is no Telegram `409 Conflict` poller conflict.
-Per-session delivery uses private-chat topics; GJC cannot enable Threaded Mode
-through the Bot API. When `createForumTopic` is refused for the paired chat, the
-daemon falls back to flat delivery in the paired chat and posts a one-time
+`threaded=unverified` or `threaded=unknown`, first try the current Telegram
+client's @BotFather flow for this bot. If BotFather's **Bot Settings** menu lacks
+**Threads Settings**/**Threaded Mode**, continue with the saved private-chat
+pairing; this is supported. GJC cannot enable Threaded Mode through the Bot API,
+and no paid/Stars option is required just to receive flat private-chat
+notifications. When `createForumTopic` is refused for the paired chat, the daemon
+falls back to flat delivery in the paired private chat and posts a one-time
 `turn on threaded mode from botfather miniapp to receive gjc notification!` nudge.
 
 ### Telegram 409 conflict

@@ -65,6 +65,11 @@ export class TopicRegistry {
 		return this.byTopic.get(topicId);
 	}
 
+	/** All session ids with a persisted topic record. */
+	sessionIds(): string[] {
+		return [...this.topics.keys()];
+	}
+
 	/** The existing topic record for a session, if any. */
 	get(sessionId: string): TopicRecord | undefined {
 		return this.topics.get(sessionId);

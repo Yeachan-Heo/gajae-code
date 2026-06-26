@@ -155,7 +155,7 @@ function getShellInputPrefix(isNoContext: boolean): string {
 
 function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setBorderVisible(true);
-	editor.setBorderStyle("sharp");
+	editor.setBorderStyle("round");
 	editor.setClosedBorderBox(true);
 	editor.setPromptGutter(undefined);
 	editor.setInputPrefix(getDefaultInputPrefix());
@@ -431,6 +431,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#resizeHandler = () => {
 			this.#syncEditorMaxHeight();
 			this.updateEditorChrome();
+			this.editor.invalidate();
+			this.ui.requestRender(true, "resize");
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		try {
@@ -568,6 +570,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
+		this.ui.setBottomPinnedComponent(this.statusLine);
 		this.ui.setFocus(this.editor);
 
 		this.#inputController.setupKeyHandlers();

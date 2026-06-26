@@ -1,16 +1,13 @@
 /**
- * Public HTTP(S) URL guard for the insane-search read fallback.
+ * Public HTTP(S) URL guard for user-supplied web fetch targets.
  *
- * The vendored insane-search engine performs its own network requests (curl_cffi,
- * a real browser) entirely outside the TypeScript fetch path, so the normal
- * `loadPage()` flow cannot protect against SSRF. This guard MUST run before any
- * dependency probe or engine subprocess is spawned. It is fail-closed: anything
- * it cannot prove is a public, non-credentialed http/https target is rejected.
+ * Network-capable URL readers MUST run this guard before the first request and
+ * before following any redirect target. It is fail-closed: anything it cannot
+ * prove is a public, non-credentialed http/https target is rejected.
  *
- * It does NOT follow or re-validate redirects — the engine may follow redirects
- * internally that this guard never sees. That residual risk is documented in the
- * plan and mitigated by validating the input target and keeping the feature
- * opt-in (default off).
+ * The vendored insane-search engine performs its own redirects outside the
+ * TypeScript fetch path, so its fallback remains opt-in and is guarded before
+ * any dependency probe or engine subprocess is spawned.
  */
 import * as dns from "node:dns/promises";
 import * as net from "node:net";
@@ -105,11 +102,11 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
 }
 
 /**
- * Validate that `rawUrl` is a public http/https target safe to hand to the
- * insane-search engine. Resolves DNS names and rejects any that map to a
- * private/special address. Never throws; returns a discriminated result.
+ * Validate that `rawUrl` is a public http/https target. Resolves DNS names and
+ * rejects any that map to a private/special address. Never throws; returns a
+ * discriminated result.
  */
-export async function validatePublicHttpUrlForInsane(
+export async function validatePublicHttpUrl(
 	rawUrl: string,
 	options: { resolver?: AddressResolver } = {},
 ): Promise<PublicUrlResult> {
@@ -152,4 +149,11 @@ export async function validatePublicHttpUrlForInsane(
 		return { ok: false, reason: "host resolves to a private or reserved address" };
 	}
 	return { ok: true, url, addresses };
+}
+
+export async function validatePublicHttpUrlForInsane(
+	rawUrl: string,
+	options: { resolver?: AddressResolver } = {},
+): Promise<PublicUrlResult> {
+	return validatePublicHttpUrl(rawUrl, options);
 }

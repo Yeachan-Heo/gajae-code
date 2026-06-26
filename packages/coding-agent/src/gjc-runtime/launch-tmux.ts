@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import * as path from "node:path";
-import { safeStderrWrite } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/dirs";
+import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
@@ -164,6 +164,25 @@ function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
 	const detail = stderr?.trim();
 	const suffix = detail ? ` ${detail.slice(0, 240)}` : "";
 	return `gjc --tmux failed after creating tmux session: ${stage}.${suffix}\n`;
+}
+
+function formatTmuxUnavailableDiagnostic(platform: NodeJS.Platform, tmuxCommand: string): string {
+	if (platform === "win32") {
+		return (
+			`gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session. ` +
+			"For managed GJC session/team flows on Windows, use WSL with real tmux, or another tmux provider that round-trips tmux user options. " +
+			"Native psmux can expose tmux-compatible commands, but it is not fully supported for GJC-managed ownership tags/team guarantees yet.\n"
+		);
+	}
+	return `gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session.\n`;
+}
+
+function formatNativeWindowsDirectDiagnostic(): string {
+	return (
+		"gjc --tmux requested on native Windows; starting without a tmux-backed session. " +
+		"For managed GJC session/team flows on Windows, use WSL with real tmux, or another tmux provider that round-trips tmux user options. " +
+		"Native psmux can expose tmux-compatible commands, but it is not fully supported for GJC-managed ownership tags/team guarantees yet.\n"
+	);
 }
 
 function shellQuote(value: string): string {
@@ -368,6 +387,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	if (!context.parsed.tmux || policy === "direct") return undefined;
 	if (env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return undefined;
 	const platform = context.platform ?? process.platform;
+	if (platform === "win32") {
+		(context.diagnosticWriter ?? safeStderrWrite)(formatNativeWindowsDirectDiagnostic());
+		return undefined;
+	}
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
 	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
@@ -385,7 +408,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
-	if (!tmuxAvailable) return undefined;
+	if (!tmuxAvailable) {
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxUnavailableDiagnostic(platform, tmuxCommand));
+		return undefined;
+	}
 	const existingSessionName = allowsExistingTmuxAttach(context.parsed, env)
 		? "existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
@@ -451,7 +477,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 
 	if (plan.attachSessionName) {
 		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.attachSessionName}`], options);
-		return attached.exitCode === 0;
+		if (attached.exitCode === 0) return true;
 	}
 
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);

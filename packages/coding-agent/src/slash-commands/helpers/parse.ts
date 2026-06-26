@@ -1,3 +1,4 @@
+import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 
 export interface ParsedSubcommand {
@@ -65,7 +66,7 @@ export function errorMessage(error: unknown): string {
  * "name required" diagnostics with their own messaging.
  */
 export function parseNamedScopeArgs(rest: string, invalidScopeMessage: string): NamedScopeArgs {
-	const tokens = rest.split(/\s+/).filter(Boolean);
+	const tokens = parseCommandArgs(rest);
 	let name: string | undefined;
 	let scope: ConfigScope = "project";
 	let i = 0;

@@ -5,6 +5,7 @@ import {
 	isSamePrCacheContext,
 	parseDefaultBranch,
 	parseGitHubRepo,
+	resolveCurrentBranch,
 } from "@gajae-code/coding-agent/modes/components/status-line/git-utils";
 
 describe("parseGitHubRepo", () => {
@@ -124,5 +125,17 @@ describe("canReuseCachedPr", () => {
 				null,
 			),
 		).toBe(false);
+	});
+});
+
+describe("resolveCurrentBranch", () => {
+	test("returns null branch metadata when HEAD cannot be read", () => {
+		const permissionError = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+
+		const state = resolveCurrentBranch("/repo", () => {
+			throw permissionError;
+		});
+
+		expect(state).toEqual({ branch: null, repoId: null });
 	});
 });

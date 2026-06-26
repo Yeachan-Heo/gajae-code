@@ -22,7 +22,7 @@ process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
 
-const commands: CommandEntry[] = [
+export const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
 	{ name: "state", load: () => import("./commands/state").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
@@ -39,6 +39,7 @@ const commands: CommandEntry[] = [
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
+	{ name: "mcp", load: () => import("./commands/mcp").then(m => m.default) },
 	{
 		name: "contribute-pr",
 		aliases: ["contribution-prep"],
@@ -48,6 +49,7 @@ const commands: CommandEntry[] = [
 	{ name: "migrate", load: () => import("./commands/migrate").then(m => m.default) },
 	{ name: "rlm", load: () => import("./commands/rlm").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
+	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
 ];
 
@@ -62,7 +64,7 @@ async function showHelp(config: CliConfig): Promise<void> {
 }
 
 async function installRuntimeGlobals(): Promise<void> {
-	const [{ installH2Fetch }, { procmgr }] = await Promise.all([import("@gajae-code/ai"), import("@gajae-code/utils")]);
+	const { installH2Fetch } = await import("@gajae-code/ai/utils/h2-fetch");
 	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
 	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
 	// can't toggle from JS, so we patch globalThis.fetch to pass
@@ -73,7 +75,24 @@ async function installRuntimeGlobals(): Promise<void> {
 	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
 	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
 	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
-	procmgr.scrubProcessEnv();
+	delete process.env.MallocStackLogging;
+	delete process.env.MallocStackLoggingNoCompact;
+}
+
+function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
+	for (const arg of argv) {
+		if (isSubcommand(arg)) return false;
+		if (flags.includes(arg)) return true;
+	}
+	return false;
+}
+
+function hasRootHelpFlag(argv: string[]): boolean {
+	return hasRootFastFlag(argv, rootHelpFlags);
+}
+
+function hasRootVersionFlag(argv: string[]): boolean {
+	return hasRootFastFlag(argv, versionFlags);
 }
 
 class RootHelpCommand extends Command {
@@ -193,7 +212,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		await runSmokeTest();
 		return;
 	}
-	if (rootHelpFlags.includes(argv[0] ?? "")) {
+	if (hasRootHelpFlag(argv)) {
 		const { renderRootHelp } = await import("@gajae-code/utils/cli");
 		const { getExtraHelpText } = await import("./cli/fast-help");
 		renderRootHelp({ bin: APP_NAME, version: VERSION, commands: new Map([["launch", RootHelpCommand]]) });
@@ -203,7 +222,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		return;
 	}
-	if (versionFlags.includes(argv[0] ?? "")) {
+	if (hasRootVersionFlag(argv)) {
 		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
 		return;
 	}
@@ -220,4 +239,6 @@ export async function runCli(argv: string[]): Promise<void> {
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 
-await runCli(process.argv.slice(2));
+if (import.meta.main) {
+	await runCli(process.argv.slice(2));
+}

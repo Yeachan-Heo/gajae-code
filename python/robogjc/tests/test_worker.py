@@ -663,6 +663,7 @@ async def test_run_rpc_skips_reminder_when_unclassified(tmp_path: Path, settings
 # Dirty-state watchdog
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_run_rpc_sends_dirty_state_reminder_when_worktree_has_unpushed_work(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch

@@ -47,7 +47,7 @@ export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
 const TOKEN_ENCODER = new TextEncoder();
 
 export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
-	if (tokens.size === 0) return true;
+	if (tokens.size === 0) return !isNoAuthBrowserOriginRequest(req, tokens);
 	const header = req.headers.get("authorization");
 	if (!header) return false;
 	const match = header.match(/^Bearer\s+(.+)$/i);
@@ -61,6 +61,10 @@ export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean
 		if (timingSafeEqual(presented, expected)) ok = true;
 	}
 	return ok;
+}
+
+export function isNoAuthBrowserOriginRequest(req: Request, tokens: ReadonlySet<string>): boolean {
+	return tokens.size === 0 && req.headers.has("origin");
 }
 
 /**

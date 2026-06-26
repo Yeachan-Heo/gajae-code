@@ -20,6 +20,7 @@ import {
 	createPrCacheContext,
 	isSamePrCacheContext,
 	type PrCacheContext,
+	resolveCurrentBranch,
 } from "./status-line/git-utils";
 import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
@@ -303,19 +304,13 @@ export class StatusLineComponent implements Component {
 		this.#cachedPrContext = undefined;
 	}
 	#getCurrentBranch(): string | null {
-		const head = git.head.resolveSync(getProjectDir());
-		const gitHeadPath = head?.headPath ?? null;
-		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === gitHeadPath) {
+		const current = resolveCurrentBranch(getProjectDir());
+		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === current.repoId) {
 			return this.#cachedBranch;
 		}
 
-		this.#cachedBranchRepoId = gitHeadPath;
-		if (!head) {
-			this.#cachedBranch = null;
-			return null;
-		}
-
-		this.#cachedBranch = head.kind === "ref" ? (head.branchName ?? head.ref) : "detached";
+		this.#cachedBranchRepoId = current.repoId;
+		this.#cachedBranch = current.branch;
 
 		return this.#cachedBranch ?? null;
 	}
@@ -680,7 +675,11 @@ export class StatusLineComponent implements Component {
 		const effectiveSettings = this.#resolveSettings();
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
-		const bgAnsi = theme.getBgAnsi("statusLineBg");
+		// Use the subtle surface tone (the same elevated background as user-message
+		// bubbles) instead of the heavy `statusLineBg` block, so the rail layers
+		// just above the base background as a quiet zone rather than a solid bar.
+		// Resolving through a semantic slot keeps it correct across every theme.
+		const bgAnsi = theme.getBgAnsi("userMessageBg");
 		const fgAnsi = theme.getFgAnsi("text");
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 

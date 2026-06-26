@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `gruvbox-dark` built-in theme: the canonical Gruvbox dark palette mapped across every GJC theme token, selectable via `/theme`.
+
+### Changed
+
+- Refined the interactive composer chrome so the input box, status rail, and welcome banner share one visual language: the composer now uses a rounded border (matching the rounded welcome banner) instead of a sharp rectangle, and the status rail uses the subtle elevated `userMessageBg` surface tone instead of the heavy `statusLineBg` block, so it reads as a quiet layered zone rather than a solid bar. Both resolve through existing semantic theme slots, so every bundled theme tracks automatically.
+### Documentation
+
+- Documented the docs-only Aside evaluation boundary as an opt-in search/context retrieval sidecar using explicit user-provided MCP configuration, with browser actions, login flows, payments, internal tools, secrets, and raw browser/session payload logging out of scope by default (#1097).
+- Documented the Windows psmux namespace boundary for `gjc --tmux`, `gjc session`, and `gjc team`: cwd/`-c` is now called out as a start directory rather than server isolation, `-L <namespace>` is identified as the psmux namespace primitive, and tmux command overrides are documented as executable names rather than shell command lines (#1118).
+
+### Fixed
+
+- Expanded the initial GJC forge welcome box to the live terminal viewport width and pinned the status/composer area to the bottom when the startup layout is shorter than the screen (#1120).
+
+- Deep Interview Restate/option gates now recover through the ask selector path instead of waiting on plaintext `Options:` output.
+
+- `gjc team` now adopts any real tmux session as its leader — including one you started yourself outside `gjc --tmux` — by writing and reading back GJC's `@gjc-profile` ownership tag, instead of only accepting `gjc --tmux`-launched sessions. Providers that cannot round-trip tmux user options (e.g. psmux) are still rejected as unmanaged.
+
+- `gjc team` now fails with actionable guidance when there is no tmux leader to host workers: running it with no tmux installed reports `tmux_not_installed`, and running it outside any tmux session reports `not_inside_tmux` (with a hint to start one via `gjc --tmux` or your own `tmux`, or use `--dry-run`), instead of surfacing raw tmux stderr.
+
 ## [0.7.2] - 2026-06-24
 ### Added
 
@@ -19,6 +41,7 @@
 - Preserve GJC-managed tmux sessions on attach/disconnect instead of tearing them down, and stop implicitly attaching on launch (#1063).
 - Corrected the auto-compaction output reserve so post-compaction responses keep adequate headroom (#1021).
 - Improved active-input shortcut hints and the busy-input queueing hint for clearer in-session guidance (#1022, #1024).
+- Fixed the Ultragoal ask guard blocking the `ask` tool when no GJC session can be resolved. `ultragoalReadPaths` falls back to the legacy/global `.gjc/ultragoal` directory when neither `GJC_SESSION_ID` nor an auto-detectable active session is present, but the follow-up `readUltragoalPlan`/`readUltragoalLedger` reads ignored that resolution and re-ran session detection, throwing `no active GJC session found` and surfacing `durable_state_unreadable` — which blocked `ask` for every agent even with no active Ultragoal run. `ultragoalReadPaths` now returns the resolved session id (or `null`); the ask guard treats a null session as inactive and falls open, and threads the resolved id into the plan/ledger reads so they no longer re-resolve. An inconsistent state (state dir present but `goals.json` missing/empty) still fails closed so the pause guard keeps blocking give-ups.
 
 ## [0.7.1] - 2026-06-23
 ### Fixed

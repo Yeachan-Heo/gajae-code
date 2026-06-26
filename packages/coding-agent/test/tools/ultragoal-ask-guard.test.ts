@@ -206,4 +206,33 @@ describe("ultragoal ask guard", () => {
 		expect(diagnostic.active).toBe(false);
 		expect(diagnostic.source).toBe("durable_state");
 	});
+
+	it("allows ask when no GJC session resolves even if a stale global ultragoal plan exists", async () => {
+		const cwd = await tempDir();
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		delete process.env.GJC_SESSION_ID;
+		try {
+			// Legacy/global .gjc/ultragoal with an incomplete plan, but no resolvable
+			// session (no env, no _session-* activity marker). Must not block ask.
+			const globalDir = path.join(cwd, ".gjc", "ultragoal");
+			await fs.mkdir(globalDir, { recursive: true });
+			await fs.writeFile(
+				path.join(globalDir, "goals.json"),
+				JSON.stringify({
+					version: 1,
+					brief: "Stale run",
+					gjcGoalMode: "aggregate",
+					goals: [{ id: "G001", title: "Leftover", objective: "Leftover", status: "pending" }],
+				}),
+			);
+
+			const diagnostic = await isUltragoalAskBlocked(cwd);
+
+			expect(diagnostic.active).toBe(false);
+			expect(diagnostic.source).toBe("absent");
+		} finally {
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
+		}
+	});
 });

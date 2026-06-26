@@ -71,6 +71,52 @@ describe("GJC native skill-state hooks", () => {
 		return tempDir;
 	}
 
+	async function writePersistedSessionFile(
+		root: string,
+		sessionId: string,
+		messages: readonly {
+			readonly id: string;
+			readonly parentId: string | null;
+			readonly message: Record<string, unknown>;
+		}[],
+	): Promise<string> {
+		const sessionFile = path.join(root, `${sessionId}.jsonl`);
+		const lines = [
+			JSON.stringify({ type: "session", id: sessionId }),
+			...messages.map(entry =>
+				JSON.stringify({
+					type: "message",
+					id: entry.id,
+					parentId: entry.parentId,
+					timestamp: "2026-06-24T00:00:00.000Z",
+					message: entry.message,
+				}),
+			),
+		];
+		await Bun.write(sessionFile, `${lines.join("\n")}\n`);
+		return sessionFile;
+	}
+
+	function assistantMessage(content: readonly Record<string, unknown>[]): Record<string, unknown> {
+		return {
+			role: "assistant",
+			content,
+			api: "openai",
+			provider: "openai",
+			model: "gpt-test",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+	}
+
 	function ultragoalQualityGate(): string {
 		return JSON.stringify({
 			architectReview: {
@@ -516,6 +562,187 @@ describe("GJC native skill-state hooks", () => {
 			expect(message).toContain("demote");
 			expect(message).toContain("cancel");
 		}
+	});
+
+	it("deep-interview plaintext ask leak blocks stop with ask-tool recovery", async () => {
+		const root = await cwd();
+		const sessionId = "session-di-plaintext-leak";
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId,
+				threadId: sessionId,
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		await Bun.write(
+			modeStatePath(root, sessionId, "deep-interview"),
+			JSON.stringify({ active: true, current_phase: "interviewing", session_id: sessionId, thread_id: sessionId }),
+		);
+		const leakedSessionFile = await writePersistedSessionFile(root, sessionId, [
+			{
+				id: "assistant-leak",
+				parentId: null,
+				message: assistantMessage([
+					{ type: "thinking", thinking: "ignored thinking mentions Options: and should not be joined" },
+					{
+						type: "text",
+						text: "Deep Interview Restate gate: If someone read only this line, would they know the intended result?\n\n",
+					},
+					{ type: "toolCall", id: "tool-ignored", name: "ask", arguments: { question: "ignored" } },
+					{ type: "text", text: "Options:\n- Yes, crystallize\n- Adjust wording\n- Missing scope\n" },
+				]),
+			},
+		]);
+
+		const blocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId,
+			threadId: sessionId,
+			sessionFile: leakedSessionFile,
+		});
+		const leakedMessage = String(blocked.outputJson?.systemMessage ?? "");
+		expect(blocked.outputJson).toMatchObject({
+			decision: "block",
+			stopReason: "gjc_skill_deep_interview_plaintext_ask_leak",
+		});
+		expect(leakedMessage).toContain("ask tool");
+		expect(leakedMessage).toContain("Restate gate");
+		expect(leakedMessage).toContain("Yes, crystallize");
+		expect(leakedMessage).toContain("Adjust wording");
+		expect(leakedMessage).toContain("Missing scope");
+
+		for (const sessionFile of [
+			path.join(root, "missing-session.jsonl"),
+			root,
+			await writePersistedSessionFile(root, "session-di-no-assistant", []),
+			await writePersistedSessionFile(root, "session-di-tool-only", [
+				{
+					id: "assistant-tool-only",
+					parentId: null,
+					message: assistantMessage([{ type: "toolCall", id: "only-tool", name: "ask", arguments: {} }]),
+				},
+			]),
+			await writePersistedSessionFile(root, "session-di-older-leak", [
+				{
+					id: "older-leak",
+					parentId: null,
+					message: assistantMessage([
+						{
+							type: "text",
+							text: "Restate gate\nOptions:\n- Yes, crystallize\n- Adjust wording\n- Missing scope",
+						},
+					]),
+				},
+				{
+					id: "latest-safe",
+					parentId: "older-leak",
+					message: assistantMessage([{ type: "text", text: "I will continue by calling the ask tool next." }]),
+				},
+			]),
+		]) {
+			const genericBlocked = await dispatchGjcNativeSkillHook({
+				hookEventName: "Stop",
+				cwd: root,
+				sessionId,
+				threadId: sessionId,
+				sessionFile,
+			});
+			expect(genericBlocked.outputJson).toMatchObject({ decision: "block" });
+			expect(genericBlocked.outputJson?.stopReason).not.toBe("gjc_skill_deep_interview_plaintext_ask_leak");
+			expect(String(genericBlocked.outputJson?.systemMessage ?? "")).not.toContain(
+				"emitted a Deep Interview question/options block as plain text",
+			);
+		}
+
+		const crystallizedSessionId = "session-di-leak-crystallized";
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: crystallizedSessionId,
+				threadId: crystallizedSessionId,
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		const specPath = path.join(sessionSpecsDir(root, crystallizedSessionId), "deep-interview-sample.md");
+		await Bun.write(specPath, "# Final deep-interview spec\n");
+		await Bun.write(
+			modeStatePath(root, crystallizedSessionId, "deep-interview"),
+			JSON.stringify({
+				active: true,
+				current_phase: "complete",
+				session_id: crystallizedSessionId,
+				thread_id: crystallizedSessionId,
+				spec_path: specPath,
+			}),
+		);
+		const crystallizedAllowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: crystallizedSessionId,
+			threadId: crystallizedSessionId,
+			sessionFile: leakedSessionFile,
+		});
+		expect(crystallizedAllowed.outputJson).toBeNull();
+
+		const cancelledSessionId = "session-di-leak-cancelled";
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$deep-interview clarify this",
+				cwd: root,
+				sessionId: cancelledSessionId,
+				threadId: cancelledSessionId,
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		await Bun.write(
+			modeStatePath(root, cancelledSessionId, "deep-interview"),
+			JSON.stringify({
+				active: true,
+				current_phase: "cancelled",
+				session_id: cancelledSessionId,
+				thread_id: cancelledSessionId,
+			}),
+		);
+		const cancelledAllowed = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: cancelledSessionId,
+			threadId: cancelledSessionId,
+			sessionFile: leakedSessionFile,
+		});
+		expect(cancelledAllowed.outputJson).toBeNull();
+
+		const ralplanSessionId = "session-ralplan-leak-ignored";
+		await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ralplan plan this",
+				cwd: root,
+				sessionId: ralplanSessionId,
+				threadId: ralplanSessionId,
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+		await Bun.write(
+			modeStatePath(root, ralplanSessionId, "ralplan"),
+			JSON.stringify({ active: true, current_phase: "planner", session_id: ralplanSessionId }),
+		);
+		const ralplanBlocked = await dispatchGjcNativeSkillHook({
+			hookEventName: "Stop",
+			cwd: root,
+			sessionId: ralplanSessionId,
+			threadId: ralplanSessionId,
+			sessionFile: leakedSessionFile,
+		});
+		expect(ralplanBlocked.outputJson).toMatchObject({ decision: "block" });
+		expect(ralplanBlocked.outputJson?.stopReason).not.toBe("gjc_skill_deep_interview_plaintext_ask_leak");
 	});
 
 	it("UserPromptSubmit treats schema-invalid active ultragoal mode state as inactive and logs", async () => {

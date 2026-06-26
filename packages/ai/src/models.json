@@ -79757,5 +79757,71 @@
 				"maxLevel": "xhigh"
 			}
 		}
+	},
+	"fugu": {
+		"fugu": {
+			"id": "fugu",
+			"name": "Sakana Fugu",
+			"api": "openai-completions",
+			"provider": "fugu",
+			"baseUrl": "https://api.sakana.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 65536,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": false,
+				"supportsUsageInStreaming": true,
+				"maxTokensField": "max_tokens"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"fugu-ultra": {
+			"id": "fugu-ultra",
+			"name": "Sakana Fugu Ultra",
+			"api": "openai-completions",
+			"provider": "fugu",
+			"baseUrl": "https://api.sakana.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 65536,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": false,
+				"supportsUsageInStreaming": true,
+				"maxTokensField": "max_tokens"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		}
 	}
 }

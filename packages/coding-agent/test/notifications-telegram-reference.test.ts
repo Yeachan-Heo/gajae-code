@@ -105,12 +105,13 @@ describe("telegram reference client helpers", () => {
 		});
 	});
 
-	test("buildActionMessage renders ask with an inline keyboard", () => {
+	test("buildActionMessage renders full options in body with compact inline keyboard", () => {
 		const m = buildActionMessage({ kind: "ask", id: "a1", question: "Proceed?", options: ["Yes", "No"] });
 		expect(m.text).toContain("Proceed?");
+		expect(m.text).toContain("1. Yes\n2. No");
 		expect(m.inline_keyboard).toHaveLength(1);
-		expect(m.inline_keyboard?.[0]?.[0]?.text).toBe("1. Yes");
-		expect(m.inline_keyboard?.[0]?.[1]?.text).toBe("2. No");
+		expect(m.inline_keyboard?.[0]?.[0]?.text).toBe("1");
+		expect(m.inline_keyboard?.[0]?.[1]?.text).toBe("2");
 		expect(decodeCallbackData(m.inline_keyboard![0]![0]!.callback_data)).toEqual({ id: "a1", index: 0 });
 	});
 

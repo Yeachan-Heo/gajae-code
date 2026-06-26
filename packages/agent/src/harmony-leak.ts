@@ -14,6 +14,19 @@ import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai";
 const MARKER_RE = /\bto=functions\.[A-Za-z_]\w*/g;
 const HARMONY_RE = /<\|(start|end|channel|message|call|return)\|>/g;
 
+// Leaked tool-call envelope (`I`): a structurally-committed Anthropic-style
+// invoke block (an opening tag carrying a name attribute). openai-codex models
+// use native function calling, so such an envelope appearing as visible
+// assistant text / thinking is always a leaked tool call — a different dialect
+// of the §1 phenomenon where the tool-call intent collapses into the content
+// channel (frequently prefixed by a glitch token such as a bare `court` line).
+// High precision: requires the opening tag AND a committed body (a parameter
+// tag or a closing invoke tag) within a short window, so prose that merely
+// mentions the tag does not trip. Like `H`, it trips on its own (outside code
+// fences). Source spelled with `\s` so this module does not self-trip.
+const INVOKE_OPEN_RE = /<invoke\s+name="[^"]+"\s*>/g;
+const INVOKE_BODY_RE = /<parameter\s+name="|<\/invoke>/;
+
 // Channel-word adjacency (`C`): channel/role name appearing immediately before the marker.
 const CHANNEL_WORD_RE = /\b(?:analysis|commentary|assistant|user|system|developer|tool)\s+to=functions\./;
 
@@ -66,7 +79,7 @@ const RECOVERY_REGISTRY: Record<string, RecoveryConfig> = {
 
 const SIGNAL_ORDER = ["M", "C", "G", "S", "B", "R", "T"] as const;
 
-export type HarmonySignalClass = "H" | (typeof SIGNAL_ORDER)[number];
+export type HarmonySignalClass = "H" | "I" | (typeof SIGNAL_ORDER)[number];
 
 export type HarmonySurface = "assistant_text" | "assistant_thinking" | "tool_arg";
 
@@ -152,6 +165,17 @@ export function detectHarmonyLeak(
 		const start = match.index ?? 0;
 		if (isInsideFence(fences, start)) continue;
 		signals.push(makeSignal(["H"], start, start + match[0].length, match[0]));
+	}
+
+	for (const match of text.matchAll(INVOKE_OPEN_RE)) {
+		const start = match.index ?? 0;
+		if (isInsideFence(fences, start)) continue;
+		// Require a committed body nearby so a bare mention of the tag in prose
+		// does not trip; a real leaked envelope continues into parameters or a
+		// close tag.
+		const forward = text.slice(start, Math.min(text.length, start + 400));
+		if (!INVOKE_BODY_RE.test(forward)) continue;
+		signals.push(makeSignal(["I"], start, start + match[0].length, match[0]));
 	}
 
 	for (const match of text.matchAll(MARKER_RE)) {
@@ -306,7 +330,7 @@ export function createHarmonyAuditEvent(params: {
 // ─── internals ──────────────────────────────────────────────────────────────
 
 function makeSignal(classes: HarmonySignalClass[], start: number, end: number, text: string): HarmonySignal {
-	if (classes[0] === "H") return { classes: ["H"], start, end, text };
+	if (classes[0] === "H" || classes[0] === "I") return { classes: [classes[0]], start, end, text };
 	const sorted: HarmonySignalClass[] = [];
 	for (const cls of SIGNAL_ORDER) {
 		if (classes.includes(cls)) sorted.push(cls);
@@ -402,7 +426,7 @@ function sha8(text: string): string {
 
 const PREVIEW_KEEP_RE = new RegExp(`[${SCRIPT_CLASS}\\s】【”“…」「、。]`, "u");
 const PREVIEW_TOKEN_RE =
-	/^(?:to=functions\.[A-Za-z_]\w*|analysis|commentary|assistant|user|system|developer|tool|changedFiles|RTLU|Jsii(?:_commentary)?|\x4aapgolly)/;
+	/^(?:to=functions\.[A-Za-z_]\w*|<\/?invoke\b[^>]*>|<parameter\b[^>]*>|analysis|commentary|assistant|user|system|developer|tool|changedFiles|RTLU|Jsii(?:_commentary)?|\x4aapgolly)/;
 
 /**
  * Privacy-safe preview for the audit log: keeps marker/channel/glitch tokens,

@@ -15,7 +15,14 @@
  */
 
 import * as fs from "node:fs";
-import { bold, buildButtonGrid, escapeHtml, TELEGRAM_PARSE_MODE, truncateTelegramHtml } from "./html-format";
+import {
+	bold,
+	buildCompactChoiceGrid,
+	escapeHtml,
+	numberedOptionList,
+	TELEGRAM_PARSE_MODE,
+	truncateTelegramHtml,
+} from "./html-format";
 import { renderThreadedFrame } from "./threaded-render";
 
 /** One inline-keyboard button. */
@@ -129,8 +136,9 @@ export function buildActionMessage(action: {
 	const text = `❓ ${bold(action.question ?? "Question")}`;
 	const options = action.options ?? [];
 	if (options.length === 0) return { text: truncateTelegramHtml(`${text}\n\n(reply with text)`) };
-	const inline_keyboard = buildButtonGrid(options, i => encodeCallbackData(action.id, i));
-	return { text: truncateTelegramHtml(text), inline_keyboard };
+	const body = `${text}\n\n${numberedOptionList(options)}`;
+	const inline_keyboard = buildCompactChoiceGrid(options, i => encodeCallbackData(action.id, i));
+	return { text: truncateTelegramHtml(body), inline_keyboard };
 }
 
 /** A protocol `reply` frame the client should send to the server. */

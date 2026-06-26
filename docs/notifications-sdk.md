@@ -258,19 +258,22 @@ The trust model is intentionally strict:
 
 ### Routing in private-chat topics
 
-The paired private chat receives actions from multiple sessions through
-per-session Telegram topics (Threaded Mode). The daemon tags messages by session,
-stores compact callback aliases for inline buttons, and routes replies back to the
-exact session/action. A forum-enabled supergroup is no longer required: once the
-bot owner enables Threaded Mode in @BotFather, the daemon creates one topic per
-session in the paired private chat. GJC cannot enable Threaded Mode through the Bot
-API; setup only verifies the capability and guides the manual BotFather toggle.
-Even after setup verifies `has_topics_enabled`, the first runtime
-`createForumTopic` for the paired chat can still be refused by Telegram. When that
-happens the daemon does not drop the send: it routes the notification to the normal
-(flat) paired chat and posts a one-time `turn on threaded mode from botfather
-miniapp to receive gjc notification!` nudge. Pairing is private-only, so flat
-delivery stays within the user's own private DM.
+The paired private chat prefers per-session Telegram topics (Threaded Mode). The
+daemon tags messages by session, stores compact callback aliases for inline
+buttons, and routes replies back to the exact session/action. A forum-enabled
+supergroup is no longer required: when the bot owner enables Threaded Mode in
+@BotFather, the daemon creates one topic per session in the paired private chat.
+GJC cannot enable Threaded Mode through the Bot API; setup only verifies the
+capability and guides the manual BotFather toggle.
+
+If BotFather's per-bot **Bot Settings** menu does not show **Threads Settings**
+or **Threaded Mode**, the supported fallback is the normal private-chat pairing.
+Setup can be saved as `threaded=unverified`/`threaded=unknown`, and the daemon
+still tries topics when Telegram allows them. When `createForumTopic` is refused,
+the daemon does not drop the send: it routes the notification to the normal
+(flat) paired private chat and posts a one-time `turn on threaded mode from
+botfather miniapp to receive gjc notification!` nudge. Pairing is private-only,
+so flat delivery stays within the user's own private DM.
 
 Supported reply paths:
 
@@ -282,6 +285,13 @@ In threaded mode the user can also adjust per-session behaviour with in-thread
 config commands: `/verbose`, `/lean`, `/verbosity <lean|verbose>`, and
 `/redact <on|off>`. The legacy `/answer <session-tag> <answer>` command is
 removed — replies are routed by the topic they arrive in.
+
+Flat fallback keeps outbound notifications and inline-button answers working,
+but free-text replies and `/verbose`/`/lean`/`/verbosity`/`/redact` commands are
+thread-native and require topic routing. Do not pair a group, supergroup, or
+channel to work around a missing BotFather menu; the bundled setup flow is
+private-chat only, and non-private chat ids remain fail-closed to avoid session
+data leaks.
 
 Unknown, expired, or restart-unvalidated callback aliases fail closed: the daemon
 sends guidance and does not guess a target session or action.

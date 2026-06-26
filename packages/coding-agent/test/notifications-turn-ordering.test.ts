@@ -23,7 +23,7 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
-type Frame = { type: string; text?: string };
+type Frame = { type: string; text?: string; verbosity?: "lean" | "verbose"; tokenUsage?: string; model?: string };
 
 const tempDirs: string[] = [];
 const openSockets: WebSocket[] = [];
@@ -33,7 +33,14 @@ afterEach(() => {
 });
 
 /** Boot the notifications extension against a real NotificationServer + WS client. */
-async function setup(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+async function setup(): Promise<{
+	handlers: Map<string, Handler>;
+	ctx: unknown;
+	frames: Frame[];
+	ws: WebSocket;
+	token: string;
+	sid: string;
+}> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -55,6 +62,8 @@ async function setup(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; 
 			getArtifactsDir: () => cwd,
 			getCwd: () => cwd,
 		},
+		getContextUsage: () => ({ tokens: 12, contextWindow: 100 }),
+		getModel: () => ({ id: "test-model" }),
 	} as never;
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
@@ -73,7 +82,7 @@ async function setup(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; 
 	});
 	// Let the server-side connection subscribe before any (unbuffered) broadcast.
 	await sleep(250);
-	return { handlers, ctx, frames };
+	return { handlers, ctx, frames, ws, token, sid };
 }
 
 test("assistant text preceding an ask is flushed before the ask and not duplicated at turn_end", async () => {
@@ -148,6 +157,41 @@ test("a tool-only ask turn does not mirror the preceding user prompt as turn out
 		// Nothing should have been streamed: the user's prompt must not be mirrored,
 		// and the assistant turn had no text of its own.
 		expect(turnStreams().length).toBe(0);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("inbound /verbose and /lean update runtime verbosity and confirmation policy", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+		const contextUpdates = () => frames.filter(f => f.type === "context_update");
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(200);
+		expect(contextUpdates().length).toBe(0);
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "verbose"), 3000, "verbose config_update");
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(
+			() => contextUpdates().some(f => f.tokenUsage === "12/100" && f.model === "test-model"),
+			3000,
+			"verbose context_update",
+		);
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "lean" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "lean"), 3000, "lean config_update");
+
+		const beforeLeanIdle = contextUpdates().length;
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(200);
+		expect(contextUpdates().length).toBe(beforeLeanIdle);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
