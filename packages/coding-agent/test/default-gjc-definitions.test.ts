@@ -318,8 +318,9 @@ Project executor override body.
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
 
+		expect(team).toContain("current-session active GJC goal snapshot");
+		expect(ultragoal).toContain("current-session GJC goal snapshot");
 		for (const content of [team, ultragoal]) {
-			expect(content).toContain('fresh `goal({"op":"get"})` snapshot');
 			expect(content).toContain("Workers must not run `gjc ultragoal checkpoint`");
 			expect(content).toContain("checkpoint authority stays with the leader");
 			expect(content).toContain("Ultragoal does not auto-launch Team");

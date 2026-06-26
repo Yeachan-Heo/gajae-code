@@ -1,11 +1,12 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
-
+import { normalizeGoal } from "../goals/state";
+import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
-import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { DEFAULT_ULTRAGOAL_OBJECTIVE, GJC_SESSION_FILE_ENV } from "./goal-mode-request";
 import { gjcRoot, sessionUltragoalDir } from "./session-layout";
 import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
@@ -2265,6 +2266,17 @@ function snapshotUpdatedAtMilliseconds(value: unknown): number | null {
 	const parsed = Date.parse(trimmed);
 	return Number.isFinite(parsed) ? parsed : null;
 }
+
+async function readCurrentSessionGjcGoalSnapshot(): Promise<unknown | undefined> {
+	const sessionFile = process.env[GJC_SESSION_FILE_ENV]?.trim();
+	if (!sessionFile) return undefined;
+	const fileEntries = await loadEntriesFromFile(sessionFile);
+	const entries = fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
+	const context = buildSessionContext(entries);
+	if (context.mode !== "goal" && context.mode !== "goal_paused") return undefined;
+	const goal = normalizeGoal(context.modeData?.goal);
+	return goal ? { goal } : undefined;
+}
 async function readGjcGoalSnapshot(input: {
 	cwd: string;
 	value: string | undefined;
@@ -2274,13 +2286,15 @@ async function readGjcGoalSnapshot(input: {
 	errorPrefix: string;
 	allowCompletedLegacyBlocker?: boolean;
 }): Promise<unknown> {
-	if (!input.value?.trim()) {
+	const snapshot = input.value?.trim()
+		? await readStructuredValue(input.cwd, input.value)
+		: await readCurrentSessionGjcGoalSnapshot();
+	if (snapshot === undefined) {
 		if (!input.required) return undefined;
 		throw new Error(
-			`${input.errorPrefix} require --gjc-goal-json from a fresh active goal({"op":"get"}) snapshot; this is the GJC goal-mode receipt, not the .gjc/ultragoal/goals.json goal record`,
+			`${input.errorPrefix} require an active GJC goal-mode snapshot from the current session or --gjc-goal-json; this is the GJC goal-mode receipt, not the .gjc/ultragoal/goals.json goal record`,
 		);
 	}
-	const snapshot = await readStructuredValue(input.cwd, input.value);
 	const snapshotObject = qualityGateObject(snapshot);
 	const detailsObject = qualityGateObject(snapshotObject?.details);
 	const goalObject = qualityGateObject(snapshotObject?.goal) ?? qualityGateObject(detailsObject?.goal);
@@ -3365,18 +3379,19 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"      --status=<value>             pending|active|complete|failed|blocked|review_blocked|superseded",
 			"      --evidence=<value>           Completion or checkpoint evidence text",
 			"      --quality-gate-json=<value>  JSON string or path for complete checkpoints",
-			'      --gjc-goal-json=<value>      JSON string or path containing the current goal({"op":"get"}) snapshot',
+			"      --gjc-goal-json=<value>      Optional JSON/path override for current goal snapshot; omitted complete checkpoints read current session goal state",
 			"      --json                       Output a machine-readable receipt",
 			"",
 			"COMPLETE CHECKPOINT RECEIPTS",
 			"  --quality-gate-json must be an object with architectReview, executorQa, and iteration.",
 			"  executorQa.contractCoverage[] rows require an obligation field; description is not a substitute.",
-			'  --gjc-goal-json must contain the active GJC goal-mode snapshot from goal({"op":"get"}), not the .gjc/ultragoal/goals.json goal record.',
+			"  Complete checkpoints use the current session's active GJC goal-mode snapshot when --gjc-goal-json is omitted.",
+			"  Explicit --gjc-goal-json values must contain an active GJC goal-mode snapshot, not the .gjc/ultragoal/goals.json goal record.",
 			"  goal.updatedAt may be epoch milliseconds or an ISO timestamp and must be fresh.",
 			"",
 			"EXAMPLES",
 			'  $ gjc ultragoal checkpoint --goal-id G001 --status blocked --evidence "waiting on review"',
-			'  $ gjc ultragoal checkpoint --goal-id G001 --status complete --evidence "tests passed" --gjc-goal-json ./goal.json --quality-gate-json ./quality-gate.json --json',
+			'  $ gjc ultragoal checkpoint --goal-id G001 --status complete --evidence "tests passed" --quality-gate-json ./quality-gate.json --json',
 			"",
 		].join("\n");
 	}
