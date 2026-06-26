@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Treated `openai-codex-device` as an auth-storage alias for `openai-codex`, so headless/device Codex logins show as authenticated and logout/remove the stored Codex credential instead of appearing unsaved.
+
 ## [0.7.2] - 2026-06-24
 
 ### Fixed

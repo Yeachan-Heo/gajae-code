@@ -31,7 +31,7 @@ import { grokCliRankingStrategy, grokCliUsageProvider } from "./usage/grok-cli";
 import { kimiUsageProvider } from "./usage/kimi";
 import { codexRankingStrategy, openaiCodexUsageProvider } from "./usage/openai-codex";
 import { zaiUsageProvider } from "./usage/zai";
-import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken } from "./utils/oauth";
+import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
@@ -918,7 +918,8 @@ export class AuthStorage {
 	 * @returns Array of stored credentials, empty if none exist
 	 */
 	#getStoredCredentials(provider: string): StoredCredential[] {
-		return this.#data.get(provider) ?? [];
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		return this.#data.get(storageProvider) ?? [];
 	}
 
 	/**
@@ -1250,16 +1251,17 @@ export class AuthStorage {
 	 * Set credential for a provider.
 	 */
 	async set(provider: string, credential: AuthCredentialEntry): Promise<void> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
 		const normalized = Array.isArray(credential) ? credential : [credential];
-		const deduped = this.#dedupeOAuthCredentials(provider, normalized);
+		const deduped = this.#dedupeOAuthCredentials(storageProvider, normalized);
 		const stored = this.#store.replaceAuthCredentialsRemote
-			? await this.#store.replaceAuthCredentialsRemote(provider, deduped)
-			: this.#store.replaceAuthCredentialsForProvider(provider, deduped);
+			? await this.#store.replaceAuthCredentialsRemote(storageProvider, deduped)
+			: this.#store.replaceAuthCredentialsForProvider(storageProvider, deduped);
 		this.#setStoredCredentials(
-			provider,
+			storageProvider,
 			stored.map(record => ({ id: record.id, credential: record.credential })),
 		);
-		this.#resetProviderAssignments(provider);
+		this.#resetProviderAssignments(storageProvider);
 	}
 
 	#toSnapshotEntries(provider: string, stored: StoredAuthCredential[]): AuthCredentialSnapshotEntry[] {
@@ -1289,26 +1291,30 @@ export class AuthStorage {
 		provider: string,
 		credential: AuthCredential,
 	): Promise<AuthCredentialIfAbsentSnapshotResult> {
-		if (this.#runtimeOverrides.has(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-runtime");
-		if (this.#configOverrides.has(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-config");
-		if (this.#getCredentialsForProvider(provider).length > 0)
-			return this.#snapshotSkipResult(provider, "skipped-existing");
-		if (getEnvApiKey(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-env");
-		if (this.#fallbackResolver?.(provider)) return this.#snapshotSkipResult(provider, "skipped-existing-fallback");
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.has(storageProvider))
+			return this.#snapshotSkipResult(storageProvider, "skipped-existing-runtime");
+		if (this.#configOverrides.has(storageProvider))
+			return this.#snapshotSkipResult(storageProvider, "skipped-existing-config");
+		if (this.#getCredentialsForProvider(storageProvider).length > 0)
+			return this.#snapshotSkipResult(storageProvider, "skipped-existing");
+		if (getEnvApiKey(storageProvider)) return this.#snapshotSkipResult(storageProvider, "skipped-existing-env");
+		if (this.#fallbackResolver?.(storageProvider))
+			return this.#snapshotSkipResult(storageProvider, "skipped-existing-fallback");
 
 		const result = this.#store.upsertAuthCredentialRemoteIfAbsent
-			? await this.#store.upsertAuthCredentialRemoteIfAbsent(provider, credential)
-			: this.#store.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+			? await this.#store.upsertAuthCredentialRemoteIfAbsent(storageProvider, credential)
+			: this.#store.upsertAuthCredentialForProviderIfAbsent(storageProvider, credential);
 		this.#setStoredCredentials(
-			provider,
+			storageProvider,
 			result.entries.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
-		this.#resetProviderAssignments(provider);
+		this.#resetProviderAssignments(storageProvider);
 		return {
 			inserted: result.inserted,
 			reason: result.reason,
 			provider: result.provider,
-			entries: this.#toSnapshotEntries(provider, result.entries),
+			entries: this.#toSnapshotEntries(storageProvider, result.entries),
 		};
 	}
 
@@ -1327,13 +1333,14 @@ export class AuthStorage {
 	 * Remove credential for a provider.
 	 */
 	async remove(provider: string): Promise<void> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#store.deleteAuthCredentialsRemote) {
-			await this.#store.deleteAuthCredentialsRemote(provider, "deleted by user");
+			await this.#store.deleteAuthCredentialsRemote(storageProvider, "deleted by user");
 		} else {
-			this.#store.deleteAuthCredentialsForProvider(provider, "deleted by user");
+			this.#store.deleteAuthCredentialsForProvider(storageProvider, "deleted by user");
 		}
-		this.#setStoredCredentials(provider, []);
-		this.#resetProviderAssignments(provider);
+		this.#setStoredCredentials(storageProvider, []);
+		this.#resetProviderAssignments(storageProvider);
 	}
 
 	/**
@@ -1355,11 +1362,12 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
-		if (this.#runtimeOverrides.has(provider)) return true;
-		if (this.#configOverrides.has(provider)) return true;
-		if (this.#getCredentialsForProvider(provider).length > 0) return true;
-		if (getEnvApiKey(provider)) return true;
-		if (this.#fallbackResolver?.(provider)) return true;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.has(storageProvider)) return true;
+		if (this.#configOverrides.has(storageProvider)) return true;
+		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
+		if (getEnvApiKey(storageProvider)) return true;
+		if (this.#fallbackResolver?.(storageProvider)) return true;
 		return false;
 	}
 
