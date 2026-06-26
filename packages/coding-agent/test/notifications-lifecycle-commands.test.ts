@@ -1,0 +1,175 @@
+import { describe, expect, it } from "bun:test";
+
+import {
+	formatLifecycleOutcome,
+	isLifecycleCommandText,
+	lifecycleUsage,
+	parseLifecycleCommand,
+	validateLifecycleTarget,
+} from "@gajae-code/coding-agent/notifications/lifecycle-commands";
+
+describe("lifecycle command parser (G009)", () => {
+	it("detects lifecycle command text", () => {
+		expect(isLifecycleCommandText("/session_create path /repo")).toBe(true);
+		expect(isLifecycleCommandText("/session_recent")).toBe(true);
+		expect(isLifecycleCommandText("hello")).toBe(false);
+		expect(isLifecycleCommandText("/sessionate")).toBe(false);
+		expect(isLifecycleCommandText(undefined)).toBe(false);
+	});
+
+	it("parses all three create target kinds", () => {
+		expect(parseLifecycleCommand("/session_create path /repo")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+		});
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x")).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+		});
+		expect(parseLifecycleCommand("/session_create dir /new/dir")).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+		});
+	});
+
+	it("parses close, resume, and recent", () => {
+		expect(parseLifecycleCommand("/session_close sess-1")).toEqual({
+			kind: "close",
+			target: { sessionId: "sess-1" },
+		});
+		expect(parseLifecycleCommand("/session_resume abc")).toEqual({
+			kind: "resume",
+			target: { sessionIdOrPrefix: "abc" },
+		});
+		expect(parseLifecycleCommand("/session_recent")).toEqual({ kind: "recent", which: "all" });
+		expect(parseLifecycleCommand("/session_recent create")).toEqual({ kind: "recent", which: "create" });
+	});
+
+	it("rejects an initial prompt (MVP) with usage and no frame", () => {
+		const out = parseLifecycleCommand("/session_create path /repo -- do the thing");
+		expect(out.kind).toBe("reject");
+		if (out.kind === "reject") {
+			expect(out.reason).toBe("prompt_unsupported");
+			// The raw prompt text must NOT be echoed back.
+			expect(out.message).not.toContain("do the thing");
+		}
+	});
+
+	it("returns usage for missing args, not a side effect", () => {
+		expect(parseLifecycleCommand("/session_create").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_create path").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_close").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_create worktree /repo").kind).toBe("usage");
+		expect(lifecycleUsage()).toContain("/session_create");
+	});
+
+	it("rejects injection-shaped paths / branches / ids", () => {
+		expect(parseLifecycleCommand("/session_create path /repo;rm").kind).toBe("reject");
+		expect(parseLifecycleCommand("/session_create worktree /repo ../evil").kind).toBe("reject");
+		expect(parseLifecycleCommand("/session_close bad id with spaces").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_close a$(whoami)").kind).toBe("reject");
+	});
+
+	it("requires exact arity for create (rejects trailing tokens)", () => {
+		// Trailing benign text -> usage (no create intent leaks through).
+		expect(parseLifecycleCommand("/session_create path /repo extra").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_create dir /new junk here").kind).toBe("usage");
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x extra").kind).toBe("usage");
+		// Trailing metacharacter token must NOT produce a create.
+		expect(parseLifecycleCommand("/session_create path /repo ; rm -rf").kind).toBe("usage");
+		// Exact arity still works.
+		expect(parseLifecycleCommand("/session_create path /repo").kind).toBe("create");
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x").kind).toBe("create");
+	});
+
+	it("returns none for non-lifecycle text", () => {
+		expect(parseLifecycleCommand("just a message").kind).toBe("none");
+	});
+
+	it("shared validator agrees with the parser", () => {
+		expect(validateLifecycleTarget("session_create", { kind: "existing_path", path: "/repo" }).ok).toBe(true);
+		expect(validateLifecycleTarget("session_create", { kind: "worktree", repo: "/r", branch: "../x" }).ok).toBe(
+			false,
+		);
+		expect(validateLifecycleTarget("session_close", { sessionId: "ok-1" }).ok).toBe(true);
+		expect(validateLifecycleTarget("session_close", { sessionId: "bad id" }).ok).toBe(false);
+		expect(validateLifecycleTarget("session_resume", { sessionIdOrPrefix: "p" }).ok).toBe(true);
+	});
+
+	it("formats lifecycle outcomes for every status (G010) with no token/prompt leakage", () => {
+		const create = formatLifecycleOutcome({
+			type: "session_create_response",
+			requestId: "r",
+			status: "ok",
+			lifecycleRequestId: "r",
+			sessionId: "sess-1",
+			matchedBy: "spawn_marker",
+			endpoint: { url: "ws://x", token: "session-token" },
+			topic: { chatId: "42", threadId: "9" },
+			target: { kind: "existing_path", path: "/repo" },
+		});
+		expect(create).toContain("sess-1");
+		// Honest MVP copy: we confirm the tmux launch was requested, not that the
+		// agent is ready or a Telegram topic was surfaced.
+		expect(create).toContain("Launching");
+		expect(create).not.toContain("session-token");
+
+		expect(
+			formatLifecycleOutcome({
+				type: "session_resume_response",
+				requestId: "r",
+				status: "ok",
+				sessionId: "s",
+				mode: "cold_restarted",
+				endpoint: { url: "", token: "" },
+				topic: { chatId: "42", threadId: "9" },
+			}),
+		).toContain("Cold-restarting");
+
+		const reasons = [
+			"unauthorized",
+			"rate_limited",
+			"duplicate_conflict",
+			"invalid_target",
+			"spawn_failed",
+			"discovery_timeout",
+			"readiness_timeout",
+			"close_refused",
+			"not_found",
+			"terminal_uncertain",
+		] as const;
+		for (const reason of reasons) {
+			const out = formatLifecycleOutcome({
+				type: "session_lifecycle_error",
+				requestId: "r",
+				status: "error",
+				reason,
+				message: "detail",
+			});
+			expect(out.length).toBeGreaterThan(0);
+		}
+
+		// "in progress" terminal_uncertain is surfaced distinctly (pending).
+		expect(
+			formatLifecycleOutcome({
+				type: "session_lifecycle_error",
+				requestId: "r",
+				status: "error",
+				reason: "terminal_uncertain",
+				message: "request already in progress",
+			}),
+		).toMatch(/in progress/i);
+
+		// ambiguous_target lists candidates.
+		const amb = formatLifecycleOutcome({
+			type: "session_lifecycle_error",
+			requestId: "r",
+			status: "error",
+			reason: "ambiguous_target",
+			message: "multiple",
+			candidates: [{ sessionId: "a" }, { sessionId: "b", path: "/r" }],
+		});
+		expect(amb).toContain("a");
+		expect(amb).toContain("b");
+	});
+});

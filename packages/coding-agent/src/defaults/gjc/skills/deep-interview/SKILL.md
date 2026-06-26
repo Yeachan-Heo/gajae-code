@@ -458,7 +458,7 @@ Also recompute and persist `ambiguity_milestone` each round (detect band transit
 
 - **Round 3+**: Allow early exit if user says "enough", "let's go", "build it"
 - **Round 10**: Show soft warning: "We're at 10 rounds. Current ambiguity: {score}%. Continue or proceed with current clarity?"
-- **Round 20**: Hard cap: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)."
+- **Round 100**: Hard cap: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)."
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
@@ -788,7 +788,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 </Examples>
 
 <Escalation_And_Stop_Conditions>
-- **Hard cap at 20 rounds**: Proceed with whatever clarity exists, noting the risk
+- **Hard cap at 100 rounds**: Proceed with whatever clarity exists, noting the risk
 - **Soft warning at 10 rounds**: Offer to continue or proceed
 - **Early exit (round 3+)**: Allow with warning if ambiguity > threshold
 - **User says "stop", "cancel", "abort"**: Stop immediately, save state for resume
@@ -823,7 +823,7 @@ Optional settings in `.gjc/settings.json`:
   "gjc": {
     "deepInterview": {
       "ambiguityThreshold": <resolvedThreshold>,
-      "maxRounds": 20,
+      "maxRounds": 100,
       "softWarningRounds": 10,
       "minRoundsBeforeExit": 3,
       "enableChallengeAgents": true,

@@ -1,4 +1,4 @@
-import { AUTH_HEADERS } from "./config";
+import { replayAuthHeaders } from "./config";
 import type {
   BrowseResponse,
   CancelResponse,
@@ -41,11 +41,11 @@ async function unwrap<T>(resp: Response): Promise<T> {
 }
 
 function authHeaders(): Record<string, string> {
-  return { ...AUTH_HEADERS };
+  return replayAuthHeaders();
 }
 
 function jsonHeaders(): Record<string, string> {
-  return { "Content-Type": "application/json", ...AUTH_HEADERS };
+  return { "Content-Type": "application/json", ...replayAuthHeaders() };
 }
 
 export const api = {

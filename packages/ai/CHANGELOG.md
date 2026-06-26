@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-06-25
+### Added
+
+- Added the Sakana Fugu provider (`fugu`) with API-key auth (`FUGU_API_KEY`) and bundled catalog models (#1086).
+
+### Fixed
+
+- Wired Fugu API-key auth login so `gjc login fugu` stores a reusable `FUGU_API_KEY` credential instead of the provider having no supported login flow (#1090).
+- Matched the real google-antigravity IDE request headers, system prompt, and preamble config so requests are accepted by Cloud Code Assist (#1080).
+- `isContextOverflow` now detects a third proxy-level overflow case — an empty response with `stopReason: "stop"` and anomalously low usage (input + output ≤ 5 tokens), as emitted by some proxies (notably LiteLLM) when the upstream context window is exceeded — so callers surface overflow instead of treating it as a clean completion (#1102).
+
+### Security
+
+- In no-auth (tokenless) auth-gateway mode, requests carrying a browser `Origin` header are now rejected before CORS preflight handling or route dispatch, while local non-browser CLI clients keep the existing tokenless flow and token-configured browser clients keep the bearer-token/preflight flow (#1115).
+### Fixed
+
+- Treated `openai-codex-device` as an auth-storage alias for `openai-codex`, so headless/device Codex logins show as authenticated and logout/remove the stored Codex credential instead of appearing unsaved.
+
 ## [0.7.2] - 2026-06-24
 
 ### Fixed

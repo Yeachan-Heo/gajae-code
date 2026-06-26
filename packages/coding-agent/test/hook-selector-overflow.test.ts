@@ -343,7 +343,7 @@ describe("HookSelectorComponent", () => {
 				wrapFocused: true,
 				scrollTitleRows: 3,
 				maxVisible: 2,
-				helpText: "up/down navigate  enter select  esc cancel  wheel/PgUp/PgDn scroll question",
+				helpText: "↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript",
 			},
 		);
 
@@ -353,8 +353,9 @@ describe("HookSelectorComponent", () => {
 		expect(titleRows.length).toBeLessThanOrEqual(3);
 		expect(rendered).toContain("answer-a");
 		expect(rendered).toContain("answer-b");
-		expect(rendered).toContain("wheel/PgUp/PgDn scroll question");
-		expect(rendered).toContain("PgDn");
+		expect(rendered).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		expect(rendered).toContain("Wheel: transcript");
+		expect(rendered).toContain("▼ more");
 	});
 
 	it("uses selector-local PageUp/PageDown for title scrolling without moving option focus", () => {
@@ -388,9 +389,8 @@ describe("HookSelectorComponent", () => {
 		const afterPageUp = Bun.stripANSI(component.render(56).join("\n"));
 		expect(afterPageUp).toContain("Question segment 1");
 	});
-
-	it("uses mouse wheel events for title scrolling without moving option focus", () => {
-		const title = Array.from({ length: 8 }, (_, index) => `Wheel segment ${index + 1}`).join("\n\n");
+	it("uses selector-local Ctrl+u/Ctrl+d aliases for title scrolling without moving option focus", () => {
+		const title = Array.from({ length: 8 }, (_, index) => `Ctrl segment ${index + 1}`).join("\n\n");
 		let selected: string | undefined;
 		const component = new HookSelectorComponent(
 			title,
@@ -403,21 +403,20 @@ describe("HookSelectorComponent", () => {
 		);
 
 		const initial = Bun.stripANSI(component.render(56).join("\n"));
-		expect(initial).toContain("Wheel segment 1");
-		expect(initial).not.toContain("Wheel segment 8");
-		expect(initial).toContain("first-choice");
+		expect(initial).toContain("Ctrl segment 1");
+		expect(initial).not.toContain("Ctrl segment 8");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x1b[<65;10;5M");
-		const afterWheelDown = Bun.stripANSI(component.render(56).join("\n"));
-		expect(afterWheelDown).not.toContain("Wheel segment 1");
-		expect(afterWheelDown).toContain("Wheel segment 8");
-		expect(afterWheelDown).toContain("first-choice");
+		for (let i = 0; i < 8; i++) component.handleInput("\x04");
+		const afterCtrlD = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterCtrlD).not.toContain("Ctrl segment 1");
+		expect(afterCtrlD).toContain("Ctrl segment 8");
+		expect(afterCtrlD).toContain("first-choice");
 
 		component.handleInput("\n");
 		expect(selected).toBe("first-choice");
 
-		for (let i = 0; i < 8; i++) component.handleInput("\x1b[<64;10;5M");
-		const afterWheelUp = Bun.stripANSI(component.render(56).join("\n"));
-		expect(afterWheelUp).toContain("Wheel segment 1");
+		for (let i = 0; i < 8; i++) component.handleInput("\x15");
+		const afterCtrlU = Bun.stripANSI(component.render(56).join("\n"));
+		expect(afterCtrlU).toContain("Ctrl segment 1");
 	});
 });

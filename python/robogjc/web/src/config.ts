@@ -5,34 +5,40 @@
 
 export interface AppConfig {
   replayEnabled: boolean;
-  replayToken: string;
 }
 
 function readConfig(): AppConfig {
   const node = document.getElementById("robogjc-config");
   const text = node?.textContent?.trim();
   if (!text || text === "__ROBGJC_CONFIG__") {
-    return { replayEnabled: false, replayToken: "" };
+    return { replayEnabled: false };
   }
   try {
     const parsed: unknown = JSON.parse(text);
     if (parsed === null || typeof parsed !== "object") {
-      return { replayEnabled: false, replayToken: "" };
+      return { replayEnabled: false };
     }
     const record = parsed as Record<string, unknown>;
     return {
       replayEnabled: Boolean(record.replayEnabled),
-      replayToken: typeof record.replayToken === "string" ? record.replayToken : "",
     };
   } catch {
-    return { replayEnabled: false, replayToken: "" };
+    return { replayEnabled: false };
   }
 }
 
 export const CONFIG: AppConfig = readConfig();
 
-export const AUTH_HEADERS: Readonly<Record<string, string>> = CONFIG.replayEnabled
-  ? Object.freeze({ "X-Robogjc-Replay-Token": CONFIG.replayToken })
-  : Object.freeze({});
+const REPLAY_TOKEN_STORAGE_KEY = "robogjc:replay-token";
+
+export function replayAuthHeaders(): Record<string, string> {
+  if (!CONFIG.replayEnabled) return {};
+  const cached = window.sessionStorage.getItem(REPLAY_TOKEN_STORAGE_KEY)?.trim();
+  if (cached) return { "X-Robogjc-Replay-Token": cached };
+  const token = window.prompt("ROBGJC replay token")?.trim();
+  if (!token) return {};
+  window.sessionStorage.setItem(REPLAY_TOKEN_STORAGE_KEY, token);
+  return { "X-Robogjc-Replay-Token": token };
+}
 
 export const POLL_INTERVAL_MS = 3000;

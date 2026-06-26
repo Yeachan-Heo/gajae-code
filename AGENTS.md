@@ -120,6 +120,10 @@ All text displayed in tool renderers must be sanitized:
 
 Apply sanitization to success, error, diff, and streaming render paths.
 
+## UI design and visual QA
+
+For future UI, dashboard, terminal, and TUI visual work, follow [`docs/ui-design-visual-qa.md`](docs/ui-design-visual-qa.md) before broad product-screen implementation. The contract requires a pre-implementation UI workflow branch, complete `DESIGN.md` source material, component showcase/state harness coverage, fresh full-surface visual evidence with CJK semantic line-break defects blocking completion, independent review, ANSI-preserving terminal/TUI evidence requirements, and an explicit provenance boundary against raw third-party corpus vendoring.
+
 ## Commands and verification
 
 - Never commit unless explicitly asked.

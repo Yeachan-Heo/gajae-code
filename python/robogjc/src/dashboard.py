@@ -17,7 +17,8 @@ from typing import Any
 _TAIL_MAX_BYTES = 2 * 1024 * 1024
 
 # Sentinel literally embedded in the built `index.html`; replaced per-request
-# with a JSON config blob so the SPA can pick up the replay token.
+# with a JSON config blob so the SPA can learn whether privileged actions exist
+# without receiving the replay token itself.
 _CONFIG_SENTINEL = "__ROBGJC_CONFIG__"
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -112,19 +113,12 @@ def reset_index_cache() -> None:
     _load_index_template.cache_clear()
 
 
-def render_index(replay_token: str | None) -> str:
-    """Render the dashboard HTML with the server's replay token baked in.
-
-    The token lands inside a `<script type="application/json">` block that the
-    page parses at startup and attaches to every privileged fetch. The user
-    never sees or types it; the only credential to manage is the env var on
-    the server itself.
-    """
+def render_index(replay_enabled: bool) -> str:
+    """Render the dashboard HTML with non-secret per-instance config."""
     config = {
-        "replayEnabled": bool(replay_token),
-        "replayToken": replay_token or "",
+        "replayEnabled": replay_enabled,
     }
-    # `</` would otherwise let an attacker-controlled token break out of the
+    # `</` would otherwise allow string values added later to break out of the
     # script element; escape it the standard way.
     payload = json.dumps(config, separators=(",", ":")).replace("</", "<\\/")
     return _load_index_template().replace(_CONFIG_SENTINEL, payload)

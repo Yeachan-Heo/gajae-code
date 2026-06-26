@@ -13,7 +13,7 @@ describe("RPC workflow_gate contract", () => {
 		expect(isRpcCommandType("negotiate_unattended")).toBe(true);
 		expect(isRpcCommandType("workflow_gate_response")).toBe(true);
 		expect(scopeForRpcCommand("negotiate_unattended")).toBe("control");
-		expect(scopeForRpcCommand("workflow_gate_response")).toBe("prompt");
+		expect(scopeForRpcCommand("workflow_gate_response")).toBe("control");
 	});
 
 	it("validates negotiate_unattended declarations (fail-closed shape)", () => {

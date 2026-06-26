@@ -41,6 +41,193 @@ import {
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
 import { ensureTelegramDaemonRunning } from "./telegram-daemon";
 
+// ===========================================================================
+// Session lifecycle control protocol (TypeScript mirror of the Rust wire
+// contract in `crates/gjc-notifications/src/lifecycle.rs`).
+//
+// These describe the frames exchanged over the daemon-owned, session-independent
+// control endpoint for remote session create / close / resume. Field names are
+// camelCase on the wire; `type`/`kind` discriminators are snake_case. The Rust
+// ingress authenticates and forwards; the daemon (TypeScript) owns all policy,
+// spawn orchestration, idempotency, rate limiting, audit, and UX.
+// ===========================================================================
+
+/** Where a `session_create` should run. Discriminated by `kind`. */
+export type SessionCreateTarget =
+	| { kind: "existing_path"; path: string }
+	| { kind: "worktree"; repo: string; branch: string }
+	| { kind: "plain_dir"; path: string };
+
+/** Identifies the session a `session_close` targets. */
+export interface SessionCloseTarget {
+	sessionId: string;
+	/** Expected GJC-managed tmux session name (defense-in-depth match). */
+	tmuxSession?: string;
+	/** Expected `@gjc-session-state-file` tag (defense-in-depth match). */
+	sessionStateFile?: string;
+}
+
+/** Identifies the session a `session_resume` targets. */
+export interface SessionResumeTarget {
+	sessionIdOrPrefix: string;
+	/** Optional repo/working-dir hint to disambiguate matches. */
+	path?: string;
+}
+
+/** Create a new session. */
+export interface SessionCreateFrame {
+	type: "session_create";
+	requestId: string;
+	/** Deterministic lifecycle marker preallocated by the daemon before spawn. */
+	lifecycleRequestId: string;
+	/** Session id the daemon preallocated and propagates to the child. */
+	intendedSessionId: string;
+	/** Telegram update id (idempotency key on the daemon side). */
+	updateId: number;
+	chatId: string;
+	/** Control-endpoint token authorizing this frame. */
+	token: string;
+	target: SessionCreateTarget;
+	/** Reference to the daemon-written, once-consumed startup-prompt file. */
+	startupPromptRef?: string;
+}
+
+/** Close (hard-kill, history preserved) a session. */
+export interface SessionCloseFrame {
+	type: "session_close";
+	requestId: string;
+	updateId: number;
+	chatId: string;
+	token: string;
+	target: SessionCloseTarget;
+	/** Hard-kill even if a live pane is attached (GJC-managed only). */
+	force?: boolean;
+}
+
+/** Resume a session (reattach if alive, else cold-restart from history). */
+export interface SessionResumeFrame {
+	type: "session_resume";
+	requestId: string;
+	updateId: number;
+	chatId: string;
+	token: string;
+	target: SessionResumeTarget;
+	startupPromptRef?: string;
+}
+
+/** Any client -> ingress lifecycle request frame. */
+export type SessionLifecycleRequest = SessionCreateFrame | SessionCloseFrame | SessionResumeFrame;
+
+/** Terminal status of a lifecycle request. */
+export type LifecycleStatus = "ok" | "error";
+
+/** A connected session's per-session endpoint, returned to the control client. */
+export interface LifecycleEndpoint {
+	url: string;
+	token: string;
+}
+
+/** The Telegram topic/thread a session is surfaced in. */
+export interface LifecycleTopic {
+	chatId: string;
+	threadId: string;
+}
+
+/** How a create request was correlated to its spawned session. */
+export type MatchedBy = "spawn_marker" | "session_ready";
+
+/** Response to a successful `session_create`. */
+export interface SessionCreateResponseFrame {
+	type: "session_create_response";
+	requestId: string;
+	status: LifecycleStatus;
+	lifecycleRequestId: string;
+	sessionId: string;
+	matchedBy: MatchedBy;
+	endpoint: LifecycleEndpoint;
+	topic: LifecycleTopic;
+	target: SessionCreateTarget;
+}
+
+/** Response to a successful `session_close`. */
+export interface SessionCloseResponseFrame {
+	type: "session_close_response";
+	requestId: string;
+	status: LifecycleStatus;
+	sessionId: string;
+	processGone: boolean;
+	historyPreserved: boolean;
+	endpointStale: boolean;
+}
+
+/** Whether a resume reattached to a live session or cold-restarted a dead one. */
+export type ResumeMode = "reattached" | "cold_restarted";
+
+/** Response to a successful `session_resume`. */
+export interface SessionResumeResponseFrame {
+	type: "session_resume_response";
+	requestId: string;
+	status: LifecycleStatus;
+	sessionId: string;
+	mode: ResumeMode;
+	endpoint: LifecycleEndpoint;
+	topic: LifecycleTopic;
+}
+
+/** Machine-readable reason a lifecycle request failed. */
+export type LifecycleErrorReason =
+	| "unauthorized"
+	| "rate_limited"
+	| "duplicate_conflict"
+	| "invalid_target"
+	| "ambiguous_target"
+	| "spawn_failed"
+	| "discovery_timeout"
+	| "readiness_timeout"
+	| "close_refused"
+	| "not_found"
+	| "terminal_uncertain";
+
+/** A candidate returned with an `ambiguous_target` resume error. */
+export interface ResumeCandidate {
+	sessionId: string;
+	path?: string;
+	/** Last-activity epoch-millis (session history file mtime), if known. */
+	mtimeMs?: number;
+}
+
+/** A structured lifecycle error frame. */
+export interface SessionLifecycleErrorFrame {
+	type: "session_lifecycle_error";
+	requestId: string;
+	status: LifecycleStatus;
+	reason: LifecycleErrorReason;
+	message: string;
+	candidates?: ResumeCandidate[];
+}
+
+/** Any ingress -> client lifecycle response frame. */
+export type SessionLifecycleResponse =
+	| SessionCreateResponseFrame
+	| SessionCloseResponseFrame
+	| SessionResumeResponseFrame
+	| SessionLifecycleErrorFrame;
+
+/**
+ * Replayable per-session readiness signal (mirror of the Rust `session_ready`
+ * frame). Buffered and replayed to late clients so WS-open alone never implies
+ * the session is live and surfaced.
+ */
+export interface SessionReadyFrame {
+	type: "session_ready";
+	sessionId: string;
+	lifecycleRequestId?: string;
+	startupPromptRef?: string;
+	repo?: string;
+	branch?: string;
+	title?: string;
+}
+
 /** Resolve the git dir for `cwd`, handling worktrees where `.git` is a file. */
 function gitDir(cwd: string): string | undefined {
 	const dot = path.join(cwd, ".git");
@@ -141,6 +328,7 @@ interface SessionRuntime {
 	/** Deregisters this session's Telegram file sink. */
 	disposeFileSink: () => void;
 	redact: boolean;
+	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
@@ -248,7 +436,7 @@ function registerInteractiveAnswerSource(
 	id: string,
 	server: NotificationServer,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
-	redact: boolean,
+	getRedact: () => boolean,
 	tag: string,
 ): () => void {
 	return registerAskAnswerSource(id, {
@@ -260,7 +448,7 @@ function registerInteractiveAnswerSource(
 					JSON.stringify(
 						notificationActionPayload(
 							{ id: askId, kind: "ask", sessionId: id, question, options },
-							{ redact, sessionTag: tag },
+							{ redact: getRedact(), sessionTag: tag },
 						),
 					),
 					true,
@@ -336,6 +524,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const tag = sessionTag(id);
 		const redact = cfg.redact;
+		const verbosity = cfg.verbosity;
 		let runtime: SessionRuntime | undefined;
 
 		// The SDK can always answer now (interactive via the answer source, or the
@@ -410,7 +599,31 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 				return;
 			}
 			if (inbound.kind === "config_command") {
-				if (runtime && typeof inbound.redact === "boolean") runtime.redact = inbound.redact;
+				if (!runtime) return;
+				const update: {
+					type: "config_update";
+					sessionId: string;
+					verbosity?: "lean" | "verbose";
+					redact?: boolean;
+				} = {
+					type: "config_update",
+					sessionId: id,
+				};
+				if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
+					runtime.verbosity = inbound.verbosity;
+					update.verbosity = inbound.verbosity;
+				}
+				if (typeof inbound.redact === "boolean") {
+					runtime.redact = inbound.redact;
+					update.redact = inbound.redact;
+				}
+				if (update.verbosity !== undefined || update.redact !== undefined) {
+					try {
+						runtime.server.pushFrame(JSON.stringify(update));
+					} catch (e) {
+						logger.warn(`notifications: config_update failed: ${String(e)}`);
+					}
+				}
 			}
 		});
 
@@ -418,7 +631,13 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const endpoint = await server.start();
 
 			// Interactive answer source: the ask tool races the local UI against this.
-			const disposeAnswerSource = registerInteractiveAnswerSource(id, server, pendingInteractive, redact, tag);
+			const disposeAnswerSource = registerInteractiveAnswerSource(
+				id,
+				server,
+				pendingInteractive,
+				() => runtime?.redact ?? redact,
+				tag,
+			);
 			const disposeFileSink = registerTelegramFileSink(id, async file => {
 				try {
 					const data = await fs.promises.readFile(file.path);
@@ -444,6 +663,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 				disposeAnswerSource,
 				disposeFileSink,
 				redact,
+				verbosity,
 				sessionTag: tag,
 				busy: false,
 				pendingInbound: new Set<number>(),
@@ -567,8 +787,9 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const running = runtimes.has(id);
 			const locallyDisabled = disabledSessions.has(id);
 			const enabled = isEnabledForSession(id, resolved.cfg);
+			const runtime = runtimes.get(id);
 			ctx.ui.notify(
-				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${resolved.cfg.redact ? "on" : "off"}${locallyDisabled ? "; locally off" : ""}.`,
+				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${locallyDisabled ? "; locally off" : ""}.`,
 				"info",
 			);
 		},
@@ -616,7 +837,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			newId,
 			rt.server,
 			rt.pendingInteractive,
-			rt.redact,
+			() => rt.redact,
 			rt.sessionTag,
 		);
 		rt.disposeFileSink = registerTelegramFileSink(newId, async file => {
@@ -735,7 +956,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// On idle, stream a context update with metadata (token/model usage +
 		// working-tree diff) unless redaction is on. The agent's last message is
 		// NOT repeated here — it is already streamed once via `turn_stream`.
-		if (!rt.redact) {
+		if (!rt.redact && rt.verbosity === "verbose") {
 			const usage = (
 				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
 			).getContextUsage?.();

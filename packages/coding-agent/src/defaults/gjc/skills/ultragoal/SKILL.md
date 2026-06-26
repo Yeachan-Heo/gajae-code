@@ -211,9 +211,9 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
 5. Delegate an `executor` QA/red-team lane to build and run the e2e/read-teaming QA suite appropriate for the story. This lane must try to break the change, not just confirm the happy path. It must start from the approved plan/spec/acceptance criteria, then user-facing contracts, and only then implementation code as supporting evidence. Plan/code mismatches are blockers, not items to paper over with implementation intent.
 6. The executor QA/red-team lane must prove evidence by the real surface under test:
    - GUI/web surfaces require a valid automation transcript plus a non-uniform screenshot. Bare `inlineEvidence` text or typed receipts never prove live GUI/web execution.
-   - CLI surfaces require runtime argv replay: `replaySafe: true`, an allowlisted argv `command`, and replayed normalized stdout matching `recordedStdout`; unsafe commands require audited `replayExempt` metadata with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs` plus a structurally valid fallback artifact. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
+   - CLI surfaces require runtime argv replay: `replaySafe: true`, an allowlisted argv `command`, and replayed normalized stdout matching `recordedStdout`. The conservative allowlist is intentionally small: `bun --version`, `node --version`, deterministic `bun/node -e "console.log(...)"`, `npm|pnpm|yarn --version`, `npm|pnpm|yarn list`, read-only `git status|rev-parse|merge-base|diff|show|log` with safe args, and `gjc read|status`. Unsafe, non-deterministic, credentialed, interactive, or otherwise unallowlisted commands require audited `replayExempt` metadata with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs` plus a structurally valid fallback artifact. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
    - Native/desktop/tui surfaces require a structurally valid screenshot, PTY capture with terminal control codes, or app-automation transcript.
-   - API/package/algorithm/math surfaces require a real artifact file or typed receipt. Bare `inlineEvidence` text alone is not sufficient for any surface.
+   - API/package surfaces require a real artifact file or typed receipt whose artifact `kind` contains one of `api`, `package`, `consumer`, `black-box`, or `test-report`; examples: `api-package-test-report`, `package-consumer-report`, `black-box-api-receipt`. Algorithm/math surfaces require a real artifact file or typed receipt whose artifact `kind` contains one of `property`, `boundary`, `edge`, `adversarial`, `failure`, `math`, `algorithm`, or `test-report`; examples: `property-test-report`, `algorithm-boundary-report`. Bare `inlineEvidence` text alone is not sufficient for any surface.
    - The mandatory **computer-use** red-team suite (`kill-switch-bypass`, `suspended-enforcement`, `permission-revoked`, …) is conditional, not universal: require it only when computer/desktop control is genuinely part of the product surface being dogfooded. For every other product type, prove the change through the matching live surface instead — browser-use automation for web/GUI, bash/CLI live invocation or argv replay for CLI, and real artifacts or typed receipts for API/package/algorithm/math. Editing docs, prompts, or skills that merely mention computer-use does not by itself make the computer-use suite applicable; pick the red-team surface that matches what the change actually ships.
 7. The executor QA/red-team lane must report a matrix using `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`. Not-applicable rows are allowed only in `contractCoverage` and `surfaceEvidence`; each `status: "not_applicable"` row requires `contractRef` plus `reason`. `adversarialCases` rows cannot be not-applicable.
 8. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
@@ -263,13 +263,25 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
         "id": "cli-replay",
         "kind": "command-replay",
         "path": "artifacts/cli-replay.json",
-        "description": "artifact file containing argv-only CLI replay JSON: schemaVersion 1, kind cli-replay, replaySafe true, allowlisted command, recordedStdout"
+        "description": "artifact file containing argv-only CLI replay JSON: schemaVersion 1, kind cli-replay, replaySafe true, allowlisted command such as bun/node --version or deterministic bun/node -e console.log(...), recordedStdout"
       },
       {
         "id": "adversarial-report",
         "kind": "failure-mode-test",
         "path": "artifacts/adversarial-report.txt",
         "description": "boundary, property, adversarial, or failure-mode result"
+      },
+      {
+        "id": "api-package-report",
+        "kind": "api-package-test-report",
+        "path": "artifacts/api-package-report.txt",
+        "description": "API/package consumer or endpoint verification output"
+      },
+      {
+        "id": "algorithm-report",
+        "kind": "property-test-report",
+        "path": "artifacts/algorithm-report.txt",
+        "description": "Algorithm/math property, boundary, or invariant verification output"
       }
     ],
     "contractCoverage": [
@@ -305,6 +317,22 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
         "invocation": "argv replay executed by the Ultragoal runtime",
         "verdict": "passed",
         "artifactRefs": ["cli-replay"]
+      },
+      {
+        "id": "surface-api",
+        "contractRef": "API/package public interface under test",
+        "surface": "api/package",
+        "invocation": "real endpoint call, package consumer call, or schema contract check",
+        "verdict": "passed",
+        "artifactRefs": ["api-package-report"]
+      },
+      {
+        "id": "surface-algorithm",
+        "contractRef": "algorithm/math invariant under test",
+        "surface": "algorithm/math",
+        "invocation": "property, boundary, or invariant test run",
+        "verdict": "passed",
+        "artifactRefs": ["algorithm-report"]
       },
       {
         "id": "surface-out-of-scope",

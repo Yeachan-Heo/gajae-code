@@ -50,7 +50,11 @@ import {
 	type SummaryOptions,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
-import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
+import {
+	DEFAULT_PRUNE_CONFIG,
+	pruneAssistantToolArguments,
+	pruneToolOutputs,
+} from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
 	Context,
@@ -5617,13 +5621,49 @@ export class AgentSession {
 	}
 
 	#syncTodoPhasesFromBranch(): void {
-		const phases = getLatestTodoPhasesFromEntries(this.sessionManager.getBranch());
+		const phases = getLatestTodoPhasesFromEntries(this.sessionManager.getActivePathEntriesCanonical());
 		// Strip completed/abandoned tasks — they were done in a previous run,
 		// so they have no bearing on progress tracking for the new turn.
 		for (const phase of phases) {
 			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
 		}
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+	}
+
+	async #applyCompactionPostAppend(
+		compactionEntryId: string,
+		firstKeptEntryId: string,
+		fromExtension?: boolean,
+	): Promise<CompactionEntry | undefined> {
+		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
+		const sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(sessionContext.messages);
+		this.#syncTodoPhasesFromBranch();
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+
+		// Get the saved compaction entry for the hook without materializing all entries.
+		const savedCompactionEntry = this.sessionManager.getEntryForFidelity(compactionEntryId) as
+			| CompactionEntry
+			| undefined;
+
+		if (this.#extensionRunner && savedCompactionEntry) {
+			await this.#extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: savedCompactionEntry,
+				fromExtension: fromExtension ?? false,
+			});
+		}
+
+		return savedCompactionEntry;
+	}
+
+	async applyCompactionPostAppendForTests(
+		compactionEntryId: string,
+		firstKeptEntryId: string,
+		fromExtension?: boolean,
+	): Promise<CompactionEntry | undefined> {
+		return this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 	}
 
 	#cloneTodoPhases(phases: TodoPhase[]): TodoPhase[] {
@@ -6339,19 +6379,23 @@ export class AgentSession {
 	async #pruneToolOutputs(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
 		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG);
-		if (result.prunedCount === 0) {
+		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
+		const tokensSaved = result.tokensSaved + argumentResult.argumentTokensSaved;
+		const prunedCount = result.prunedCount + argumentResult.argumentPrunedCount;
+		if (prunedCount === 0) {
 			return undefined;
 		}
 
 		// getBranch() returns materialized copies for blob-externalized entries, so
 		// the pruning mutations must be written back into the canonical store.
-		this.sessionManager.applyEntryMessageUpdates(result.prunedEntries);
+		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries];
+		this.sessionManager.applyEntryMessageUpdates(combined);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
-		return result;
+		return { prunedCount, tokensSaved };
 	}
 
 	/**
@@ -6469,7 +6513,7 @@ export class AgentSession {
 				throw new CompactionCancelledError();
 			}
 
-			this.sessionManager.appendCompaction(
+			const compactionEntryId = this.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
 				firstKeptEntryId,
@@ -6478,24 +6522,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
-			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#syncTodoPhasesFromBranch();
-			this.#closeCodexProviderSessionsForHistoryRewrite();
-
-			// Get the saved compaction entry for the hook
-			const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
-
-			if (this.#extensionRunner && savedCompactionEntry) {
-				await this.#extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension,
-				});
-			}
+			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 			const compactionResult: CompactionResult = {
 				summary,
@@ -7982,7 +8009,7 @@ export class AgentSession {
 				return;
 			}
 
-			this.sessionManager.appendCompaction(
+			const compactionEntryId = this.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
 				firstKeptEntryId,
@@ -7991,24 +8018,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
-			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#syncTodoPhasesFromBranch();
-			this.#closeCodexProviderSessionsForHistoryRewrite();
-
-			// Get the saved compaction entry for the hook
-			const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
-
-			if (this.#extensionRunner && savedCompactionEntry) {
-				await this.#extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension,
-				});
-			}
+			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 			const result: CompactionResult = {
 				summary,
@@ -9626,7 +9636,7 @@ export class AgentSession {
 		cancelled: boolean;
 	}> {
 		const previousSessionFile = this.sessionFile;
-		const selectedEntry = this.sessionManager.getEntry(entryId);
+		const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
 
 		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 			throw new Error("Invalid entry ID for branching");
@@ -9724,7 +9734,7 @@ export class AgentSession {
 			throw new Error("No model available for summarization");
 		}
 
-		const targetEntry = this.sessionManager.getEntry(targetId);
+		const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
 		if (!targetEntry) {
 			throw new Error(`Entry ${targetId} not found`);
 		}
@@ -9880,9 +9890,11 @@ export class AgentSession {
 
 		for (const entry of entries) {
 			if (entry.type !== "message") continue;
-			if (entry.message.role !== "user") continue;
+			const fidelityEntry = this.sessionManager.getEntryForFidelity(entry.id);
+			if (fidelityEntry?.type !== "message") continue;
+			if (fidelityEntry.message.role !== "user") continue;
 
-			const text = this.#extractUserMessageText(entry.message.content);
+			const text = this.#extractUserMessageText(fidelityEntry.message.content);
 			if (text) {
 				result.push({ entryId: entry.id, text });
 			}

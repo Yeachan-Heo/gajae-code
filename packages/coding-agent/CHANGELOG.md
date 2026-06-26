@@ -2,17 +2,69 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Deep Interview (and any scrollable `ask`/hook selector) no longer enables SGR mouse reporting, which was hijacking the mouse wheel and disabling the terminal's native scrollback while a question was on screen. The wheel now scrolls the terminal as usual; long questions still scroll inside the dialog via PgUp/PgDn.
+- Scrollable Deep Interview question boxes now show explicit `▲ more` / `▼ more` affordances when hidden question text exists, and selector mode also supports Ctrl+u/Ctrl+d as question-scroll aliases for PgUp/PgDn.
+
+## [0.7.3] - 2026-06-25
+
+### Added
+
+- Added durable cold-spill eviction for compacted session history: after a compaction, `SessionManager.evictCompactedContent()` moves pre-`firstKeptEntryId` payloads (user/assistant text, thinking, tool-call arguments) out of the hot JSONL and resident heap into durable content-addressed sidecar blobs via `BlobStore.putImmutableSync`, keeping hot retained bytes bounded regardless of pre-compaction history size while preserving graph integrity and the compaction summary.
+- Added a non-materializing, path-only `buildSessionContext()` that no longer populates `#materializedEntriesCache` and performs zero cold-spill reads on covered compacted branches, plus fidelity read APIs (`getEntryForFidelity`/`getBranchForFidelity`/`getEntriesForExport`) that rehydrate cold-spilled content on demand for HTML export, branch & re-edit, and branched-session creation.
+- Added `BlobStore.putImmutableSync`/`getCheckedSync` (plus `EphemeralBlobStore`/`MemoryBlobStore` overrides): immutable, crash-safe, hash-verified content-addressed install (exclusive copy fallback + fsync) and checked reads that throw `BlobCorruptError` on corrupt blobs and never return silent wrong data.
+
+### Fixed
+
+- Fixed unbounded memory growth in long sessions: the full verbatim transcript was retained in `SessionManager.#fileEntries`/`#byId` forever across compactions (compaction only summarized the LLM-bound context), so long coding sessions could OOM. Compaction now reclaims hot resident content via cold-spill, the `AgentSession.compact()` post-append path no longer bulk-materializes the branch (`#syncTodoPhasesFromBranch` uses a non-materializing canonical active-path accessor), and assistant tool-call arguments/text are no longer kept verbatim indefinitely.
+- Lossless branch/export fidelity after compaction: HTML export and branch & re-edit now rehydrate cold-spilled pre-compaction content instead of showing tombstone notices, and branched-session creation preserves cold-spill refs without truncating >500k-char content.
+
+## [0.7.3] - 2026-06-25
+
+### Added
+
+- Added the `gruvbox-dark` built-in theme: the canonical Gruvbox dark palette mapped across every GJC theme token, selectable via `/theme`.
+- Added a standalone MCP registration command: `gjc mcp add|list|remove` writes explicit user-provided MCP server definitions (stdio/http/sse) into GJC config without importing or inheriting other tools' live MCP configs, with env/header/auth values redacted in output (#1095).
+
 ### Changed
 
 - Refined the interactive composer chrome so the input box, status rail, and welcome banner share one visual language: the composer now uses a rounded border (matching the rounded welcome banner) instead of a sharp rectangle, and the status rail uses the subtle elevated `userMessageBg` surface tone instead of the heavy `statusLineBg` block, so it reads as a quiet layered zone rather than a solid bar. Both resolve through existing semantic theme slots, so every bundled theme tracks automatically.
+- When a Composer harness model is active, the `bash` tool now hard-blocks repository file I/O — pipes, process/heredoc/command substitution, redirection, `tee`, file read/discovery (`cat`/`head`/`tail`/`grep`/`find`/`ls`), file mutation (`cp`/`mv`/`rm`/`touch`/`mkdir`/`chmod`/`ln`), `sed`/`awk`, git file-read subcommands, and script file I/O — unless the command is on a strict allowlist (`bun test`/`run check|test|build`, `cargo test|check|build`, `git status`/`rev-parse`, package version queries), forcing Composer models to use the dedicated find/search/read/edit tools for file discovery and mutation (#1027).
+### Documentation
+
+- Documented the docs-only Aside evaluation boundary as an opt-in search/context retrieval sidecar using explicit user-provided MCP configuration, with browser actions, login flows, payments, internal tools, secrets, and raw browser/session payload logging out of scope by default (#1097).
+- Added a UI design and visual QA contract governing future TUI/dashboard/terminal visual work (#1101).
+- Added a CodeGraph custom-tool integration guide (#1073).
+- Documented the Windows psmux namespace boundary for `gjc --tmux`, `gjc session`, and `gjc team`: cwd/`-c` is now called out as a start directory rather than server isolation, `-L <namespace>` is identified as the psmux namespace primitive, and tmux command overrides are documented as executable names rather than shell command lines (#1118).
+- Clarified the Telegram Threaded Mode fallback documentation (#1122).
+
 ### Fixed
 
+- Expanded the initial GJC forge welcome box to the live terminal viewport width and pinned the status/composer area to the bottom when the startup layout is shorter than the screen (#1120).
+
 - Deep Interview Restate/option gates now recover through the ask selector path instead of waiting on plaintext `Options:` output.
+- Widened the forge splash on wide terminals so it no longer clips (#1110).
+- Parse quoted SSH remote host names in the slash-command host parser (#1104).
+- Tolerate an unreadable git HEAD in the status chrome instead of throwing (#1072).
+- Registered the `plugin` command in the CLI command registry so `gjc plugin …` (install/uninstall/list/marketplace/enable/disable/doctor) resolves instead of silently falling through to the default launch/chat command — the command was implemented and tested but was never registered (#1071).
+- Keybinding/Ctrl+Enter newline-handling sweep across the editor and input controller (#1111).
+- Fixed model-profile default badge precedence in the `/model` selector so the correct default-profile badge wins (#1117).
+- Prevented duplicate Telegram topics being created for transient sessions (#1125).
+
+### Security
+
+- User-supplied URL reads now share the public HTTP(S) network guard that was previously insane-fallback-only: the initial target, the redirect chain, and binary-conversion redirects are all revalidated against private-network blocking before any request is opened or followed, closing an SSRF path through the normal read-tool fetch pipeline (#1114).
+- Bridge workflow-gate responses now require the claimed controller token before the unattended control plane may resolve a gate, and the `workflow_gate_response` RPC command was raised from prompt scope to control scope, so prompt-only clients can no longer answer lifecycle workflow gates (#1116).
+
+- `gjc team` now adopts any real tmux session as its leader — including one you started yourself outside `gjc --tmux` — by writing and reading back GJC's `@gjc-profile` ownership tag, instead of only accepting `gjc --tmux`-launched sessions. Providers that cannot round-trip tmux user options (e.g. psmux) are still rejected as unmanaged.
+
+- `gjc team` now fails with actionable guidance when there is no tmux leader to host workers: running it with no tmux installed reports `tmux_not_installed`, and running it outside any tmux session reports `not_inside_tmux` (with a hint to start one via `gjc --tmux` or your own `tmux`, or use `--dry-run`), instead of surfacing raw tmux stderr.
 
 ## [0.7.2] - 2026-06-24
 ### Added
 
-- Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
+- Added a keyless `insane` web search provider that safely ports upstream [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search) public-route fallbacks (MIT; vendored engine pinned in `packages/coding-agent/vendor/insane-search/`) without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
 - `web_search` `auto` mode now drives native provider search over proxies/custom endpoints by reusing the active model's own credential + baseUrl when canonical native creds are absent: `activeContextNativeId()` matches the model's wire api (+ model-id family) to `anthropic` (anthropic-messages), `openai-compatible` (openai-responses/completions), or `gemini` (google-generative-ai Generative Language), each falling back to DuckDuckGo if the endpoint does not support web search.
 - Added built-in C# LSP detection for `csharp-ls`, with `omnisharp` preserved as a fallback when `csharp-ls` is unavailable (#1054).
 - Added Discord and Slack notification adapters alongside the existing Telegram surface, so action-needed signals and replies can be routed to those clients (#1043).

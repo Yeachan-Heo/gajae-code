@@ -5,6 +5,7 @@ import type {
 	BridgeHandshakeAccepted,
 	BridgeHandshakeRequest,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/handshake";
+import { UiRequestBroker } from "@gajae-code/coding-agent/modes/shared/agent-wire/ui-request-broker";
 import { UnattendedSessionControlPlane } from "@gajae-code/coding-agent/modes/shared/agent-wire/unattended-session";
 
 const declaration = {
@@ -23,11 +24,11 @@ function request(unattended = declaration): BridgeHandshakeRequest {
 	};
 }
 
-function authRequest(path: string, body: unknown) {
+function authRequest(path: string, body?: unknown, headers: Record<string, string> = {}) {
 	return new Request(`https://bridge.test${path}`, {
 		method: "POST",
-		headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
-		body: JSON.stringify(body),
+		headers: { Authorization: "Bearer secret", "Content-Type": "application/json", ...headers },
+		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 }
 
@@ -54,26 +55,37 @@ describe("live bridge unattended workflow gate wiring", () => {
 			emitFrame: () => undefined,
 			providerSupportsTokenCostMetrics: true,
 		});
+		const permissionBroker = new UiRequestBroker<unknown, unknown>({ emitRequest: () => undefined });
 		const handle = createBridgeFetchHandler({
 			sessionId: "sess-b",
 			token: "secret",
-			endpointMatrix: { events: true, commands: true, uiResponses: true },
+			endpointMatrix: { events: true, commands: true, control: true, uiResponses: true },
 			commandScopes: ["prompt", "control"],
 			unattendedControlPlane: cp,
+			permissionBroker: permissionBroker as never,
 			idempotencyCache: new Map(),
 		});
 		const hs = await handle(authRequest("/v1/handshake", request()));
 		const accepted = (await hs.json()) as BridgeHandshakeAccepted;
 		expect(accepted.accepted_unattended).toEqual(declaration);
 		expect(accepted.unattended_active).toBe(true);
+		const ownerToken = "owner-bridge-test";
+		const claim = await handle(
+			authRequest("/v1/sessions/sess-b/control:claim", undefined, { "X-GJC-Bridge-Owner-Token": ownerToken }),
+		);
+		expect(claim.status).toBe(200);
 
 		const answerPromise = cp.emitGate(approvalGate({ summary: "bridge ship?" }));
 		const gateId = "wg_runb_ralplan_000001";
 		const response = await handle(
-			authRequest(`/v1/sessions/sess-b/ui-responses/${gateId}`, {
-				gate_id: gateId,
-				answer: { decision: "approve" },
-			}),
+			authRequest(
+				`/v1/sessions/sess-b/ui-responses/${gateId}`,
+				{
+					gate_id: gateId,
+					answer: { decision: "approve" },
+				},
+				{ "X-GJC-Bridge-Owner-Token": ownerToken },
+			),
 		);
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({ gate_id: gateId, status: "accepted" });

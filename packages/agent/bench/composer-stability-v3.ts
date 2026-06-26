@@ -10,45 +10,31 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { benchRunMetadata, type BenchRunMetadata } from "./_meta";
+import {
+	COMPOSER_SCENARIOS as SCENARIOS,
+	DEFAULT_CODEX_BASELINE_MODEL,
+	DEFAULT_COMPOSER_CANDIDATE_MODEL,
+	MIN_COMPARABLE_TRACE_SCENARIOS,
+	SCENARIO_BY_ID,
+	traceExpectationForScenario,
+	type FailureClass,
+	type ScenarioDefinition,
+	type ScenarioId,
+	type TraceExpectation,
+} from "./composer-scenarios";
 const REPO_ROOT = path.resolve(import.meta.dir, "../../..");
 
 
-type ScenarioId =
-	| "read-edit-hashline"
-	| "three-turn-tools"
-	| "bash-discipline"
-	| "file-discovery-discipline"
-	| "shell-write-discipline"
-	| "command-contamination"
-	| "grok-sanitize-replay"
-	| "multi-file-search-edit"
-	| "multi-file-search-edit-bad-anchor"
-	| "bad-anchor-recovery"
-	| "tool-json-malformed-recovery"
-	| "multi-turn-yield-discipline"
-	| "timeout-handling";
+const DEFAULT_MODEL = DEFAULT_COMPOSER_CANDIDATE_MODEL;
+const DEFAULT_BASELINE_MODEL = DEFAULT_CODEX_BASELINE_MODEL;
 
-type FailureClass =
-	| "shell-read"
-	| "shell-file-discovery"
-	| "shell-write"
-	| "contaminated-command"
-	| "bad-anchor-unrecovered"
-	| "malformed-tool-args-unrecovered"
-	| "sanitize-replay-regression"
-	| "wrong-file-edit"
-	| "missing-tool-turn"
-	| "timeout";
-
-type ScenarioDefinition = {
-	id: ScenarioId;
-	description: string;
-	turns: string;
-	fixture: string;
-	obligation: string;
-	failureClass: FailureClass;
-	recovery: boolean;
-};
+export type { FailureClass, ScenarioDefinition, ScenarioId } from "./composer-scenarios";
+export {
+	COMPOSER_SCENARIOS,
+	L2_MIN_SCENARIO_COVERAGE,
+	MIN_COMPARABLE_TRACE_SCENARIOS,
+	TOTAL_SCENARIO_COUNT,
+} from "./composer-scenarios";
 
 type BenchMode = "mock" | "trace" | "live";
 
@@ -67,7 +53,7 @@ type ModelRole = "candidate" | "baseline";
 
 type TrialStatus = "passed" | "failed" | "skipped";
 
-type TrialResult = {
+export type TrialResult = {
 	scenarioId: ScenarioId;
 	modelRole: ModelRole;
 	model: string;
@@ -98,7 +84,7 @@ type TraceArtifact = {
 	error?: string;
 };
 
-type P1Summary = {
+export type P1Summary = {
 	candidateFailureCount: number;
 	baselineFailureCount: number;
 	parityDelta: number;
@@ -127,11 +113,6 @@ type BenchOutput = {
 
 type JsonObject = Record<string, unknown>;
 
-type TraceExpectation = {
-	targetPath?: string;
-	requiredTools?: string[];
-	requireSuccess?: boolean;
-};
 
 export type TraceRecord = {
 	scenarioId: ScenarioId;
@@ -151,131 +132,6 @@ type ClassifiedTrace = {
 
 const DEFAULT_SEED = 42;
 const DEFAULT_TRIALS = 5;
-const DEFAULT_MODEL = "grok-build/grok-composer-2.5-fast";
-const MIN_COMPARABLE_TRACE_SCENARIOS = 3;
-const DEFAULT_BASELINE_MODEL = "openai-codex/gpt-5.5:low";
-
-const SCENARIOS: ScenarioDefinition[] = [
-	{
-		id: "read-edit-hashline",
-		description: "Read anchored file contents, then apply one hashline edit.",
-		turns: "2-3",
-		fixture: "fixtures/workspace/src/foo.ts",
-		obligation: "final file matches golden and file IO uses read/edit tools only",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: false,
-	},
-	{
-		id: "three-turn-tools",
-		description: "Chain read, search, and edit across three tool turns.",
-		turns: "3+",
-		fixture: "fixtures/workspace/src/{a,b}.ts",
-		obligation: "all tool calls are well-formed and final edit applies",
-		failureClass: "missing-tool-turn",
-		recovery: false,
-	},
-	{
-		id: "bash-discipline",
-		description: "User asks for file content; model must avoid shell reads.",
-		turns: "2",
-		fixture: "fixtures/workspace/src/secret.ts",
-		obligation: "no bash/cat/sed/awk/grep/head/tail file reads",
-		failureClass: "shell-read",
-		recovery: false,
-	},
-	{
-		id: "file-discovery-discipline",
-		description: "Locate candidate files without shell ls/find/fd/git-ls-files shortcuts.",
-		turns: "2-3",
-		fixture: "fixtures/workspace/src/**/*.ts",
-		obligation: "file discovery uses the find tool, not shell directory listing commands",
-		failureClass: "shell-file-discovery",
-		recovery: false,
-	},
-	{
-		id: "shell-write-discipline",
-		description: "Apply edits without shell redirection, tee, sed -i, or script writes.",
-		turns: "2-4",
-		fixture: "fixtures/workspace/src/write-target.ts",
-		obligation: "all file mutation uses edit/write tool calls only",
-		failureClass: "shell-write",
-		recovery: false,
-	},
-	{
-		id: "command-contamination",
-		description: "Keep bash command arguments free of reasoning prose and Markdown fences.",
-		turns: "2",
-		fixture: "fixtures/transcripts/command-contamination/*.json",
-		obligation: "shell command strings contain commands only, not analysis text",
-		failureClass: "contaminated-command",
-		recovery: false,
-	},
-	{
-		id: "grok-sanitize-replay",
-		description: "Replay grok-cli payload sanitize edge cases.",
-		turns: "2-4",
-		fixture: "fixtures/transcripts/grok-sanitize-replay/*.json",
-		obligation: "sanitized replay preserves discipline and tool pairing",
-		failureClass: "sanitize-replay-regression",
-		recovery: true,
-	},
-	{
-		id: "multi-file-search-edit",
-		description: "Search multiple files, choose the right target, then edit.",
-		turns: "3-5",
-		fixture: "fixtures/workspace/src/pkg/*",
-		obligation: "correct file chosen and patched",
-		failureClass: "wrong-file-edit",
-		recovery: false,
-	},
-	{
-		id: "multi-file-search-edit-bad-anchor",
-		description: "Recover from a stale anchor after multi-file search.",
-		turns: "3-6",
-		fixture: "fixtures/workspace/src/target.ts",
-		obligation: "first edit fails predictably, re-read occurs, second edit succeeds",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: true,
-	},
-	{
-		id: "bad-anchor-recovery",
-		description: "Recover from a stale anchor in a single-file edit.",
-		turns: "3-5",
-		fixture: "fixtures/workspace/src/recover.ts",
-		obligation: "failed edit is followed by re-anchor read and successful edit",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: true,
-	},
-	{
-		id: "tool-json-malformed-recovery",
-		description: "Recover after one malformed tool-argument payload.",
-		turns: "2-4",
-		fixture: "fixtures/transcripts/tool-json-malformed-recovery/*.json",
-		obligation: "malformed args are corrected with a valid follow-up call",
-		failureClass: "malformed-tool-args-unrecovered",
-		recovery: true,
-	},
-	{
-		id: "multi-turn-yield-discipline",
-		description: "Maintain file IO discipline across a longer multi-turn session.",
-		turns: "4+",
-		fixture: "fixtures/workspace/src/multi.ts",
-		obligation: "no shell reads across turns and task completes",
-		failureClass: "shell-read",
-		recovery: false,
-	},
-	{
-		id: "timeout-handling",
-		description: "Detect turn/run timeouts as first-class instability failures.",
-		turns: "1+",
-		fixture: "fixtures/transcripts/timeout/*.json",
-		obligation: "deadline or timeout failures count against parity instead of being ignored",
-		failureClass: "timeout",
-		recovery: false,
-	},
-];
-
-const SCENARIO_BY_ID = new Map(SCENARIOS.map(scenario => [scenario.id, scenario]));
 const EDIT_TOOL_NAMES = new Set(["edit", "write", "apply_patch", "applyPatch", "patch"]);
 const READ_TOOL_NAMES = new Set(["read", "search", "find"]);
 const SHELL_TOOL_NAMES = new Set(["bash", "shell", "executeBash", "terminal"]);
@@ -287,8 +143,11 @@ const FILE_WRITE_COMMAND_PATTERN = /(?:^|[;&|\s])(?:sed\s+-i|perl\s+-pi)\b|(?:^|
 const COMMAND_CONTAMINATION_PATTERN = /```|^\s*(?:I\s+(?:will|need|am going)|We\s+(?:need|will)|First[, ]|Now[, ]|Let's)\b/im;
 const ANCHOR_ERROR_PATTERN = /(?:anchor|hashline|stale).{0,80}(?:mismatch|do not match|rejected|invalid|bad)|(?:edit rejected).{0,80}(?:anchor|hashline)/i;
 const MALFORMED_ARGS_PATTERN = /(?:malformed|invalid|contaminated).{0,80}(?:json|argument|args|tool)|schema validation|failed to parse/i;
-const SANITIZE_PATTERN = /sanitize|harmony|protocol leak|to=functions|contaminated tool/i;
+const SANITIZE_PATTERN = /sanitize(?:d|r)?\s+(?:payload|replay|output)?\s*(?:failed|failure|error|regression)|harmony|protocol leak|to=functions|contaminated tool/i;
 const TIMEOUT_PATTERN = /timeout|timed out|deadline/i;
+const COMPOSER_BASH_POLICY_BLOCK_PATTERN = /Composer bash policy blocked repository file I\/O/i;
+const PATH_NOT_FOUND_PATTERN = /\bPath ['"].*['"] not found\b/i;
+const FRESH_ANCHOR_LINE_PATTERN = /^\*\d+[a-z]{2}\|/m;
 
 function parseArgs(argv: string[]): CliOptions {
 	const options: CliOptions = {
@@ -491,8 +350,25 @@ function normalizeExpected(value: unknown): TraceExpectation {
 		? requiredToolsValue.filter((entry): entry is string => typeof entry === "string")
 		: undefined;
 	const targetPath = asString(value.targetPath) ?? asString(value.path);
+	const expectedEditText = asString(value.expectedEditText) ?? asString(value.expected_edit_text);
+	const recoveryTargetPath = asString(value.recoveryTargetPath) ?? asString(value.recovery_target_path);
 	const requireSuccess = typeof value.requireSuccess === "boolean" ? value.requireSuccess : undefined;
-	return { targetPath, requiredTools, requireSuccess };
+	return { targetPath, recoveryTargetPath, requiredTools, expectedEditText, requireSuccess };
+}
+
+function mergeTraceExpectation(scenarioId: ScenarioId, override: TraceExpectation | undefined): TraceExpectation {
+	const base = traceExpectationForScenario(scenarioId);
+	if (!override) return base;
+	const overrideKeepsBaseTarget =
+		override.targetPath === undefined ||
+		(base.targetPath !== undefined && path.normalize(override.targetPath) === path.normalize(base.targetPath));
+	return {
+		targetPath: override.targetPath ?? base.targetPath,
+		requiredTools: override.requiredTools ?? base.requiredTools,
+		expectedEditText: override.expectedEditText ?? (overrideKeepsBaseTarget ? base.expectedEditText : undefined),
+		recoveryTargetPath: override.recoveryTargetPath ?? base.recoveryTargetPath,
+		requireSuccess: override.requireSuccess ?? base.requireSuccess,
+	};
 }
 
 function eventToolName(event: JsonObject): string | undefined {
@@ -547,7 +423,11 @@ function eventCommand(event: JsonObject): string | undefined {
 function eventPath(event: JsonObject): string | undefined {
 	const args = eventArgs(event);
 	if (isJsonObject(args)) {
-		return asString(args.path) ?? asString(args.filePath) ?? asString(args.file_path) ?? asString(args.targetPath);
+		const direct = asString(args.path) ?? asString(args.filePath) ?? asString(args.file_path) ?? asString(args.targetPath);
+		if (direct) return direct;
+		const input = asString(args.input);
+		const sectionPath = input?.match(/^§(.+)$/m)?.[1]?.trim();
+		if (sectionPath) return sectionPath;
 	}
 	return asString(event.path) ?? asString(event.filePath) ?? asString(event.file_path) ?? asString(event.targetPath);
 }
@@ -560,6 +440,14 @@ function isEventError(event: JsonObject): boolean {
 	const status = asString(event.status)?.toLowerCase();
 	const type = asString(event.type)?.toLowerCase();
 	return status === "failed" || status === "error" || event.isError === true || type?.includes("error") === true;
+}
+
+function isTimeoutFailureEvent(event: JsonObject, text: string): boolean {
+	return isEventError(event) && TIMEOUT_PATTERN.test(text);
+}
+
+function isSanitizeReplayFailureEvent(event: JsonObject, text: string): boolean {
+	return isEventError(event) && SANITIZE_PATTERN.test(text) && !PATH_NOT_FOUND_PATTERN.test(text);
 }
 
 function isSuccessfulToolEvent(event: JsonObject): boolean {
@@ -610,6 +498,13 @@ function isShellWriteEvent(event: JsonObject): boolean {
 	return FILE_WRITE_COMMAND_PATTERN.test(command);
 }
 
+function isComposerBashPolicyBlockedEvent(event: JsonObject, text: string): boolean {
+	const toolName = eventToolName(event);
+	return Boolean(
+		toolName && SHELL_TOOL_NAMES.has(toolName) && isEventError(event) && COMPOSER_BASH_POLICY_BLOCK_PATTERN.test(text),
+	);
+}
+
 function isContaminatedCommandEvent(event: JsonObject): boolean {
 	const toolName = eventToolName(event);
 	if (!toolName || !SHELL_TOOL_NAMES.has(toolName)) return false;
@@ -634,41 +529,68 @@ function addFailure(failures: Set<FailureClass>, failureClass: FailureClass): vo
 export function classifyTraceRecord(record: TraceRecord): ClassifiedTrace {
 	const failures = new Set<FailureClass>();
 	const scenario = SCENARIO_BY_ID.get(record.scenarioId);
+	const expected = mergeTraceExpectation(record.scenarioId, record.expected);
 	const calledTools = new Set<string>();
 	let sawAnchorErrorAt = -1;
 	let readAfterAnchorErrorAt = -1;
 	let anchorRecoveryTargetPath: string | undefined;
 	let readAfterAnchorErrorPath: string | undefined;
 	let sawRecoveredAnchorError = false;
+	let anchorErrorProvidedFreshAnchors = false;
 	let sawMalformedArgsAt = -1;
 	let malformedArgsToolName: string | undefined;
 	let malformedArgsPath: string | undefined;
 	let sawSuccessAfterMalformedArgs = false;
 	let sawSuccessfulTerminal = false;
+	const isHardGuardFeedbackScenario = record.scenarioId === "hard-guard-feedback";
+	let sawComposerBashPolicyBlockedIo = false;
+	let sawComposerBashPolicyRecoveryTool = false;
+	let sawShellIoRetryAfterComposerBashPolicyBlock = false;
 
+	let sawSuccessfulTargetPathEdit = false;
 	for (let index = 0; index < record.events.length; index++) {
 		const event = record.events[index]!;
 		const text = getTextBlob(event);
 		const toolName = eventToolName(event);
 		if (toolName) calledTools.add(toolName);
-		if (isShellReadEvent(event)) addFailure(failures, "shell-read");
-		if (isShellFileDiscoveryEvent(event)) addFailure(failures, "shell-file-discovery");
-		if (isShellWriteEvent(event)) addFailure(failures, "shell-write");
+		const shellIoFailureClasses = [
+			isShellReadEvent(event) ? "shell-read" : undefined,
+			isShellFileDiscoveryEvent(event) ? "shell-file-discovery" : undefined,
+			isShellWriteEvent(event) ? "shell-write" : undefined,
+		].filter((failureClass): failureClass is FailureClass => failureClass !== undefined);
+		const composerBashPolicyBlocked =
+			isHardGuardFeedbackScenario && shellIoFailureClasses.length > 0 && isComposerBashPolicyBlockedEvent(event, text);
+		if (composerBashPolicyBlocked) {
+			sawShellIoRetryAfterComposerBashPolicyBlock ||= sawComposerBashPolicyBlockedIo;
+			sawComposerBashPolicyBlockedIo = true;
+		} else {
+			if (sawComposerBashPolicyBlockedIo && shellIoFailureClasses.length > 0) {
+				sawShellIoRetryAfterComposerBashPolicyBlock = true;
+			}
+			for (const failureClass of shellIoFailureClasses) addFailure(failures, failureClass);
+		}
 		if (isContaminatedCommandEvent(event)) addFailure(failures, "contaminated-command");
-		if (TIMEOUT_PATTERN.test(text)) addFailure(failures, "timeout");
-		if (SANITIZE_PATTERN.test(text) && isEventError(event)) addFailure(failures, "sanitize-replay-regression");
+		if (isTimeoutFailureEvent(event, text)) addFailure(failures, "timeout");
+		if (isSanitizeReplayFailureEvent(event, text)) addFailure(failures, "sanitize-replay-regression");
 		if (ANCHOR_ERROR_PATTERN.test(text)) {
 			sawAnchorErrorAt = index;
-			anchorRecoveryTargetPath = eventPath(event) ?? record.expected.targetPath;
+			anchorRecoveryTargetPath = eventPath(event) ?? expected.targetPath;
 			readAfterAnchorErrorAt = -1;
 			readAfterAnchorErrorPath = undefined;
+			anchorErrorProvidedFreshAnchors = FRESH_ANCHOR_LINE_PATTERN.test(text);
 			sawRecoveredAnchorError = false;
 		}
 		if (MALFORMED_ARGS_PATTERN.test(text)) {
 			sawMalformedArgsAt = index;
 			malformedArgsToolName = toolName;
-			malformedArgsPath = eventPath(event) ?? record.expected.targetPath;
+			malformedArgsPath = eventPath(event) ?? expected.targetPath;
 			sawSuccessAfterMalformedArgs = false;
+		}
+		if (isHardGuardFeedbackScenario && sawComposerBashPolicyBlockedIo && isReadEvent(event) && isSuccessfulToolEvent(event)) {
+			const recoveryPath = eventPath(event);
+			if (matchesNormalizedPath(expected.recoveryTargetPath, recoveryPath)) {
+				sawComposerBashPolicyRecoveryTool = true;
+			}
 		}
 		if (sawAnchorErrorAt >= 0 && index > sawAnchorErrorAt && isReadEvent(event) && isSuccessfulToolEvent(event)) {
 			const readPath = eventPath(event);
@@ -677,7 +599,12 @@ export function classifyTraceRecord(record: TraceRecord): ClassifiedTrace {
 				readAfterAnchorErrorPath = readPath ?? anchorRecoveryTargetPath;
 			}
 		}
-		if (readAfterAnchorErrorAt >= 0 && index > readAfterAnchorErrorAt && isSuccessfulEditEvent(event)) {
+		if (
+			sawAnchorErrorAt >= 0 &&
+			index > sawAnchorErrorAt &&
+			isSuccessfulEditEvent(event) &&
+			(readAfterAnchorErrorAt >= 0 || anchorErrorProvidedFreshAnchors)
+		) {
 			const editPath = eventPath(event);
 			if (matchesNormalizedPath(anchorRecoveryTargetPath ?? readAfterAnchorErrorPath, editPath)) {
 				sawRecoveredAnchorError = true;
@@ -698,14 +625,19 @@ export function classifyTraceRecord(record: TraceRecord): ClassifiedTrace {
 		if (expectedPath && actualPath && path.normalize(expectedPath) !== path.normalize(actualPath)) {
 			addFailure(failures, "wrong-file-edit");
 		}
-		if (record.expected.targetPath && toolName && EDIT_TOOL_NAMES.has(toolName)) {
+		if (expected.targetPath && toolName && EDIT_TOOL_NAMES.has(toolName)) {
 			const targetPath = eventPath(event);
-			if (targetPath && path.normalize(targetPath) !== path.normalize(record.expected.targetPath)) {
+			const editPayload = `${stringifyArgs(eventArgs(event))}\n${text}`;
+			const hasExpectedEditText = expected.expectedEditText === undefined || editPayload.includes(expected.expectedEditText);
+			if (isSuccessfulEditEvent(event) && matchesNormalizedPath(expected.targetPath, targetPath) && hasExpectedEditText) {
+				sawSuccessfulTargetPathEdit = true;
+			}
+			if (targetPath && !matchesNormalizedPath(expected.targetPath, targetPath)) {
 				addFailure(failures, "wrong-file-edit");
 			}
 		}
 		if (isTerminalSuccessEvent(event)) sawSuccessfulTerminal = true;
-		if (isTerminalFailureEvent(event) && scenario) addFailure(failures, scenario.failureClass);
+		if (isTerminalFailureEvent(event) && scenario && !composerBashPolicyBlocked) addFailure(failures, scenario.failureClass);
 		const status = asString(event.status)?.toLowerCase();
 		const directFailureClass = normalizeFailureClass(event.failureClass);
 		if (directFailureClass && (status === "failed" || isEventError(event))) addFailure(failures, directFailureClass);
@@ -717,10 +649,20 @@ export function classifyTraceRecord(record: TraceRecord): ClassifiedTrace {
 	if (sawMalformedArgsAt >= 0 && !sawSuccessAfterMalformedArgs) {
 		addFailure(failures, "malformed-tool-args-unrecovered");
 	}
-	for (const requiredTool of record.expected.requiredTools ?? []) {
+	if (
+		isHardGuardFeedbackScenario &&
+		sawComposerBashPolicyBlockedIo &&
+		(!sawComposerBashPolicyRecoveryTool || sawShellIoRetryAfterComposerBashPolicyBlock)
+	) {
+		addFailure(failures, "shell-read");
+	}
+	if (expected.targetPath && !sawSuccessfulTargetPathEdit) {
+		addFailure(failures, "missing-tool-turn");
+	}
+	for (const requiredTool of expected.requiredTools ?? []) {
 		if (!calledTools.has(requiredTool)) addFailure(failures, "missing-tool-turn");
 	}
-	if (record.expected.requireSuccess === true && !sawSuccessfulTerminal) {
+	if (expected.requireSuccess === true && !sawSuccessfulTerminal) {
 		addFailure(failures, "missing-tool-turn");
 	}
 
@@ -878,7 +820,7 @@ async function loadTraceRecords(
 	return { records, artifacts };
 }
 
-function createP1Summary(trialResults: TrialResult[], reason?: string): P1Summary {
+export function createP1Summary(trialResults: TrialResult[], reason?: string): P1Summary {
 	const candidateResults = trialResults.filter(result => result.modelRole === "candidate");
 	const baselineResults = trialResults.filter(result => result.modelRole === "baseline");
 	const candidateFailureCount = candidateResults.filter(result => result.status === "failed").length;

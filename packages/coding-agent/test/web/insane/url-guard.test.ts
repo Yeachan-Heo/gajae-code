@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	type AddressResolver,
 	isPrivateOrSpecialAddress,
+	validatePublicHttpUrl,
 	validatePublicHttpUrlForInsane,
 } from "../../../src/web/insane/url-guard";
 
@@ -17,6 +18,13 @@ function staticResolver(map: Record<string, string[]>): AddressResolver {
 }
 
 describe("validatePublicHttpUrlForInsane", () => {
+	it("delegates to the shared public HTTP(S) URL guard", async () => {
+		const options = { resolver: staticResolver({ "example.com": ["93.184.216.34"] }) };
+		const shared = await validatePublicHttpUrl("https://example.com/path", options);
+		const insane = await validatePublicHttpUrlForInsane("https://example.com/path", options);
+		expect(insane).toEqual(shared);
+	});
+
 	it("accepts a normal https URL that resolves to a public IP", async () => {
 		const result = await validatePublicHttpUrlForInsane("https://example.com/path", {
 			resolver: staticResolver({ "example.com": ["93.184.216.34"] }),

@@ -153,6 +153,14 @@ function jsonResponse(status: number, body: unknown): Response {
 	});
 }
 
+function isBridgeControllerOwner(options: BridgeFetchHandlerOptions, ownerToken: string): boolean {
+	if (!ownerToken) return false;
+	const ownerTokens = [options.permissionBroker?.ownerToken, options.uiBroker?.ownerToken].filter(
+		(token): token is string => typeof token === "string" && token.length > 0,
+	);
+	return ownerTokens.length > 0 && ownerTokens.every(token => token === ownerToken);
+}
+
 function parseBridgeScopes(value: string | undefined): readonly BridgeCommandScope[] {
 	if (!value?.trim()) return DEFAULT_BRIDGE_SCOPES;
 	const allowed = new Set(BRIDGE_COMMAND_SCOPES);
@@ -425,6 +433,9 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 				"answer" in payload &&
 				(correlationId === (payload as RpcWorkflowGateResponse).gate_id || correlationId.startsWith("wg_"))
 			) {
+				if (!isBridgeControllerOwner(options, ownerToken)) {
+					return jsonResponse(403, { status: "rejected", code: "not_controller" });
+				}
 				try {
 					const resolution = await options.unattendedControlPlane?.resolveGate({
 						gate_id: (payload as RpcWorkflowGateResponse).gate_id,

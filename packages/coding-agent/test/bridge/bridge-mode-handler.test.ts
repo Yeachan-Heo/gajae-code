@@ -1,12 +1,14 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock } from "bun:test";
 import type { BridgePermissionRequestPayload } from "../../src/modes/bridge/bridge-client-bridge";
 import { createBridgeFetchHandler } from "../../src/modes/bridge/bridge-mode";
 import { BridgeEventStream } from "../../src/modes/bridge/event-stream";
 import { RpcHostToolBridge } from "../../src/modes/rpc/host-tools";
 import { RpcHostUriBridge } from "../../src/modes/rpc/host-uris";
+import type { RpcWorkflowGateResponse } from "../../src/modes/rpc/rpc-types";
 import { BRIDGE_PROTOCOL_VERSION } from "../../src/modes/shared/agent-wire/protocol";
 import { rpcSuccess } from "../../src/modes/shared/agent-wire/responses";
 import { UiRequestBroker } from "../../src/modes/shared/agent-wire/ui-request-broker";
+import type { UnattendedSessionControlPlane } from "../../src/modes/shared/agent-wire/unattended-session";
 import type { ClientBridgePermissionOutcome } from "../../src/session/client-bridge";
 
 type HandshakeJson = {
@@ -421,6 +423,102 @@ describe("bridge mode fetch handler", () => {
 		expect(disconnect.status).toBe(200);
 		expect(await pendingDisconnect).toEqual({ status: "cancelled", reason: "disconnect" });
 	});
+
+	it("requires claimed controller ownership before resolving workflow gate UI responses", async () => {
+		const permissionBroker = new UiRequestBroker<BridgePermissionRequestPayload, ClientBridgePermissionOutcome>({
+			emitRequest: () => {},
+		});
+		const gateResolution = {
+			gate_id: "gate-1",
+			status: "accepted" as const,
+			answer_hash: "answer-hash",
+			resolved_at: "2026-06-25T00:00:00.000Z",
+		};
+		const resolveGateCalls: RpcWorkflowGateResponse[] = [];
+		const resolveGate = mock(async (response: RpcWorkflowGateResponse) => {
+			resolveGateCalls.push(response);
+			return gateResolution;
+		});
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			permissionBroker,
+			commandScopes: ["prompt", "control"],
+			endpointMatrix: { control: true, uiResponses: true },
+			idempotencyCache: new Map(),
+			unattendedControlPlane: { resolveGate } as unknown as UnattendedSessionControlPlane,
+		});
+		const claim = await handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/control:claim", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret", "X-GJC-Bridge-Owner-Token": "owner-1" },
+			}),
+		);
+		expect(claim.status).toBe(200);
+
+		const body = JSON.stringify({ gate_id: "gate-1", answer: { decision: "approve" } });
+		const wrongOwner = await handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/ui-responses/wg_gate-1", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret", "X-GJC-Bridge-Owner-Token": "wrong" },
+				body,
+			}),
+		);
+		expect(wrongOwner.status).toBe(403);
+		expect(await wrongOwner.json()).toEqual({ status: "rejected", code: "not_controller" });
+		expect(resolveGate.mock.calls.length).toBe(0);
+
+		const response = await handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/ui-responses/wg_gate-1", {
+				method: "POST",
+				headers: {
+					Authorization: "Bearer secret",
+					"X-GJC-Bridge-Owner-Token": "owner-1",
+					"Idempotency-Key": "gate-idem-1",
+				},
+				body,
+			}),
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(gateResolution);
+		expect(resolveGate.mock.calls.length).toBe(1);
+		expect(resolveGateCalls[0]).toEqual({
+			gate_id: "gate-1",
+			answer: { decision: "approve" },
+			idempotency_key: "gate-idem-1",
+		});
+
+		const retry = await handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/ui-responses/wg_gate-1", {
+				method: "POST",
+				headers: {
+					Authorization: "Bearer secret",
+					"X-GJC-Bridge-Owner-Token": "owner-1",
+					"Idempotency-Key": "gate-idem-1",
+				},
+				body,
+			}),
+		);
+		expect(retry.status).toBe(200);
+		expect(await retry.json()).toEqual(gateResolution);
+		expect(resolveGate.mock.calls.length).toBe(1);
+
+		const replayWrongOwner = await handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/ui-responses/wg_gate-1", {
+				method: "POST",
+				headers: {
+					Authorization: "Bearer secret",
+					"X-GJC-Bridge-Owner-Token": "attacker",
+					"Idempotency-Key": "gate-idem-1",
+				},
+				body,
+			}),
+		);
+		expect(replayWrongOwner.status).toBe(403);
+		expect(await replayWrongOwner.json()).toEqual({ status: "rejected", code: "not_controller" });
+		expect(resolveGate.mock.calls.length).toBe(1);
+	});
+
 	it("accepts host tool and URI callback results", async () => {
 		const toolRequests: Array<{ id: string }> = [];
 		const uriRequests: Array<{ id: string }> = [];

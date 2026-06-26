@@ -55,7 +55,9 @@ export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
 	return (
 		`the active multiplexer "${tmuxCommand}" lists this session but did not return GJC's ${GJC_TMUX_PROFILE_OPTION} ownership tag; ` +
 		"GJC-managed sessions and `gjc team` require a tmux provider that round-trips tmux user options. " +
-		"Alternative multiplexers such as psmux on Windows do not persist user options yet, so the Windows-native psmux path is not fully supported; " +
+		"For psmux on Windows, cwd/start-directory flags such as `-c` do not isolate the server namespace; psmux uses the tmux-compatible global `-L <namespace>` flag for that. " +
+		"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines, so `psmux -L name` is not a supported value. " +
+		"Alternative multiplexers such as psmux on Windows do not reliably persist user options yet, so the Windows-native psmux path is not fully supported; " +
 		"use real tmux for GJC-managed session and team flows."
 	);
 }

@@ -313,6 +313,10 @@ export class TUI extends Container {
 	#sixelProbeTimeout?: NodeJS.Timeout;
 	#sixelProbeUnsubscribe?: () => void;
 	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
+	// macOS: steady-block cursor anchors CJK IME overlays; disable with GJC_TUI_IME_CURSOR=0.
+	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
+	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
+	#imeCursorActive = false;
 	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
 	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
@@ -321,6 +325,7 @@ export class TUI extends Container {
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
+	#bottomPinnedComponent: Component | null = null;
 
 	// Overlay stack for modal components rendered on top of base content
 	overlayStack: {
@@ -336,6 +341,7 @@ export class TUI extends Container {
 		if (showHardwareCursor !== undefined) {
 			this.#showHardwareCursor = showHardwareCursor;
 		}
+		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
 	}
 
 	get fullRedraws(): number {
@@ -349,6 +355,7 @@ export class TUI extends Container {
 	setShowHardwareCursor(enabled: boolean): void {
 		if (this.#showHardwareCursor === enabled) return;
 		this.#showHardwareCursor = enabled;
+		this.#imeCursorActive = !enabled && this.#useImeBlockCursor;
 		if (!enabled) {
 			this.#hideCursor();
 		}
@@ -380,6 +387,11 @@ export class TUI extends Container {
 		if (isFocusable(component)) {
 			component.focused = true;
 		}
+	}
+
+	setBottomPinnedComponent(component: Component | null): void {
+		this.#bottomPinnedComponent = component;
+		this.requestRender();
 	}
 
 	/**
@@ -478,7 +490,10 @@ export class TUI extends Container {
 		this.#terminalUnavailable = false;
 		this.terminal.start(
 			data => this.#handleInput(data),
-			() => this.requestRender(),
+			() => {
+				this.invalidate();
+				this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
+			},
 		);
 		this.#hideCursor();
 		this.#querySixelSupport();
@@ -698,6 +713,9 @@ export class TUI extends Container {
 			this.#writeTerminal("\r\n");
 		}
 
+		if (this.#useImeBlockCursor) {
+			this.#writeTerminal("\x1b[0 q");
+		}
 		this.#showCursor();
 		try {
 			this.terminal.stop();
@@ -1269,6 +1287,31 @@ export class TUI extends Container {
 		return lines;
 	}
 
+	#padBeforeBottomPinnedComponent(lines: string[], height: number): string[] {
+		const component = this.#bottomPinnedComponent;
+		if (component === null || lines.length >= height) return lines;
+
+		let pinnedStart = -1;
+		for (let i = this.children.length - 1; i >= 0; i--) {
+			if (this.children[i] === component) {
+				pinnedStart = i;
+				break;
+			}
+		}
+		if (pinnedStart < 0) return lines;
+
+		let pinnedLineCount = 0;
+		for (let i = pinnedStart; i < this.children.length; i++) {
+			pinnedLineCount += this.children[i].render(this.terminal.columns).length;
+		}
+
+		const blankRows = height - lines.length;
+		const insertAt = Math.max(0, lines.length - pinnedLineCount);
+		const padded = [...lines];
+		padded.splice(insertAt, 0, ...Array.from({ length: blankRows }, () => ""));
+		return padded;
+	}
+
 	#doRender(): void {
 		if (this.#stopped || !this.terminalAvailable) return;
 		const width = this.terminal.columns;
@@ -1286,6 +1329,10 @@ export class TUI extends Container {
 		const renderTreeStart = renderMetrics.now();
 		let newLines = this.render(width);
 		if (renderMetrics.enabled) renderMetrics.recordHelper("renderTree", renderMetrics.now() - renderTreeStart);
+
+		if (this.#bottomPinnedComponent !== null && height > 0) {
+			newLines = this.#padBeforeBottomPinnedComponent(newLines, height);
+		}
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
@@ -1727,8 +1774,10 @@ export class TUI extends Container {
 		totalLines: number,
 		fromRow: number,
 	): { seq: string; toRow: number } {
-		// No IME target or no content — hide cursor regardless of preference
-		if (!cursorPos || totalLines <= 0) return { seq: "\x1b[?25l", toRow: fromRow };
+		if (!cursorPos || totalLines <= 0) {
+			const hide = this.#useImeBlockCursor ? "\x1b[0 q\x1b[?25l" : "\x1b[?25l";
+			return { seq: hide, toRow: fromRow };
+		}
 
 		// Clamp cursor position to valid range
 		const targetRow = Math.max(0, Math.min(cursorPos.row, totalLines - 1));
@@ -1744,7 +1793,11 @@ export class TUI extends Container {
 		}
 		// Move to absolute column (1-indexed)
 		seq += `\x1b[${targetCol + 1}G`;
-		seq += this.#showHardwareCursor ? "\x1b[?25h" : "\x1b[?25l";
+		if (this.#showHardwareCursor || this.#imeCursorActive) {
+			seq += this.#useImeBlockCursor ? "\x1b[2 q\x1b[?25h" : "\x1b[?25h";
+		} else {
+			seq += "\x1b[?25l";
+		}
 
 		return { seq, toRow: targetRow };
 	}
@@ -1761,6 +1814,7 @@ export class TUI extends Container {
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		this.#hardwareCursorRow = toRow;
-		this.#writeTerminal(`\x1b[?2026h${seq}\x1b[?2026l`);
+		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
+		this.#writeTerminal(seq);
 	}
 }

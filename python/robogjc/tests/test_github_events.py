@@ -425,7 +425,7 @@ def test_extract_mention_returns_none_without_mention() -> None:
 
 
 def test_extract_mention_is_case_insensitive() -> None:
-    assert extract_mention("yo @ROBGJC-BOT", "robogjc-bot") == "yo"
+    assert extract_mention("yo @ROBOGJC-BOT", "robogjc-bot") == "yo"
 
 
 def test_extract_mention_respects_hyphen_word_boundary() -> None:

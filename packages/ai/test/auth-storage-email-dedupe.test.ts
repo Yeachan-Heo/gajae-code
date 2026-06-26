@@ -138,6 +138,23 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		expect(credentials).toHaveLength(2);
 		expect(readDisabledCauses(dbPath, "openai-codex")).toEqual([]);
 	});
+	it("treats openai-codex-device as an openai-codex storage alias", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set(
+			"openai-codex",
+			createCredential({ suffix: "device", accountId: "account-device", email: "device@example.com" }),
+		);
+
+		expect(authStorage.hasAuth("openai-codex-device")).toBe(true);
+		expect(authStorage.hasOAuth("openai-codex-device")).toBe(true);
+		expect(authStorage.getOAuthCredential("openai-codex-device")?.accountId).toBe("account-device");
+
+		await authStorage.remove("openai-codex-device");
+
+		expect(authStorage.hasAuth("openai-codex")).toBe(false);
+		expect(store.listAuthCredentials("openai-codex")).toHaveLength(0);
+	});
 
 	it("dedupes openai-codex credentials when email matches but accountId differs", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");

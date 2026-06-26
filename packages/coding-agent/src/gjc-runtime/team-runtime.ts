@@ -5,7 +5,7 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import type { GcPidProbe, GcRecord } from "./gc-runtime";
-import { applyGjcTmuxProfile, GJC_TMUX_LAUNCHED_ENV } from "./launch-tmux";
+import { applyGjcTmuxProfile } from "./launch-tmux";
 import { modeStatePath, sessionIdFromDirName, sessionReportsDir, teamStateRoot } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import {
@@ -1812,7 +1812,7 @@ async function ensureWorkerWorktree(
 
 function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
 	const suffix = detail?.trim() ? `:${detail.trim()}` : "";
-	return `gjc_team_requires_tmux_leader: run \`gjc --tmux\` first, then run \`gjc team ...\` inside that tmux-backed leader session, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
+	return `gjc_team_requires_tmux_leader: start a tmux session first (run \`gjc --tmux\`, or launch tmux yourself), then run \`gjc team ...\` inside it, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
 }
 function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): string {
 	const result = Bun.spawnSync(
@@ -1826,7 +1826,7 @@ function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): stri
 	return result.stdout.toString().trim();
 }
 
-function retagGjcLaunchedTmuxSession(tmuxCommand: string, sessionName: string): boolean {
+function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): boolean {
 	const result = Bun.spawnSync(
 		[
 			tmuxCommand,
@@ -1845,25 +1845,39 @@ function retagGjcLaunchedTmuxSession(tmuxCommand: string, sessionName: string): 
 }
 
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
+	if (Bun.which(tmuxCommand) === null)
+		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
 	const paneTarget = env.TMUX_PANE?.trim();
 	const args = paneTarget
 		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) throw new Error(buildTeamTmuxLeaderRequirementMessage(result.stderr.toString()));
+	if (result.exitCode !== 0) {
+		// Distinguish "you are not inside any tmux session" from a genuine tmux
+		// query failure so the caller gets actionable guidance instead of raw
+		// tmux stderr. `gjc team` needs a tmux leader; outside tmux there is none.
+		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim());
+		const stderr = result.stderr.toString().trim();
+		throw new Error(
+			buildTeamTmuxLeaderRequirementMessage(
+				insideTmux ? `tmux_query_failed${stderr ? `:${stderr}` : ""}` : "not_inside_tmux",
+			),
+		);
+	}
 	const [sessionAndWindow = "", leaderPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
 	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
-		// Self-heal: a pane launched through `gjc --tmux` exports
-		// GJC_TMUX_LAUNCHED=1, but the session can lose (or never receive) the
-		// @gjc-profile user-option tag when startup attach fails mid-way or the
-		// registry write races. That stranded-but-genuinely-GJC leader pane
-		// previously hard-failed as unmanaged_tmux_session; re-tag it instead.
-		const launchedByGjc = env[GJC_TMUX_LAUNCHED_ENV] === "1";
-		const retagged = launchedByGjc && retagGjcLaunchedTmuxSession(tmuxCommand, sessionName);
-		if (!retagged || readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
+		// Adopt any real tmux leader as a GJC team leader — including a session
+		// the user created outside `gjc --tmux` — by writing GJC's @gjc-profile
+		// ownership tag and reading it back. A provider that round-trips tmux
+		// user options (real tmux) keeps the tag and is adopted; one that does
+		// not (e.g. psmux on Windows) drops it, so the readback still fails and
+		// the leader is rejected as unmanaged. This also self-heals a genuine
+		// `gjc --tmux` pane that lost its @gjc-profile tag mid-startup.
+		const tagged = tagTmuxSessionAsGjcLeader(tmuxCommand, sessionName);
+		if (!tagged || readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
 			throw new Error(
 				buildTeamTmuxLeaderRequirementMessage(
 					`unmanaged_tmux_session:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`,

@@ -73,7 +73,7 @@ const RPC_COMMAND_SCOPE_REGISTRY: Record<RpcCommandType, BridgeCommandScope> = {
 	get_login_providers: "admin",
 	login: "admin",
 	negotiate_unattended: "control",
-	workflow_gate_response: "prompt",
+	workflow_gate_response: "control",
 };
 
 export const RPC_COMMAND_TYPES: readonly RpcCommandType[] = Object.keys(RPC_COMMAND_SCOPE_REGISTRY) as RpcCommandType[];

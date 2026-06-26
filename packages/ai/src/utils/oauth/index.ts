@@ -472,6 +472,9 @@ export async function getOAuthApiKey(
 	return { newCredentials: creds, apiKey };
 }
 
+export function resolveOAuthStorageProvider(provider: OAuthProviderId): OAuthProviderId {
+	return provider === "openai-codex-device" ? "openai-codex" : provider;
+}
 /**
  * Get list of OAuth providers.
  */

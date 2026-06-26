@@ -165,3 +165,116 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 		expect(session.messages[1].role).toBe("assistant");
 	});
 });
+
+function largeBranchMarker(label: string): string {
+	return `${label}-${"x".repeat(520_000)}-end`;
+}
+
+async function createFidelityAgentSession(tempDir: string): Promise<{
+	session: AgentSession;
+	sessionManager: SessionManager;
+	authStorage: AuthStorage;
+}> {
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: {
+			model,
+			systemPrompt: ["test"],
+			tools: [],
+		},
+	});
+	const sessionManager = SessionManager.create(tempDir, tempDir);
+	const authStorage = await AuthStorage.create(path.join(tempDir, "fidelity-auth.db"));
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "fidelity-models.yml"));
+	const session = new AgentSession({
+		agent,
+		sessionManager,
+		settings: Settings.isolated(),
+		modelRegistry,
+	});
+	session.subscribe(() => {});
+	return { session, sessionManager, authStorage };
+}
+
+async function evictOldBranchMessage(sessionManager: SessionManager, marker: string): Promise<string> {
+	sessionManager.appendMessage({ role: "user", content: "intro", timestamp: Date.now() });
+	sessionManager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "intro response" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test-model",
+		stopReason: "stop",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		timestamp: Date.now(),
+	});
+	const oldUserId = sessionManager.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: marker }],
+		timestamp: Date.now(),
+	});
+	const firstKeptEntryId = sessionManager.appendMessage({ role: "user", content: "kept", timestamp: Date.now() });
+	const compactionEntryId = sessionManager.appendCompaction("summary", "short", firstKeptEntryId, 123);
+	sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+	await sessionManager.flush();
+	return oldUserId;
+}
+
+describe("AgentSession branching fidelity", () => {
+	it("uses original pre-compaction user text for branch selectedText", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-branch-selected-fidelity-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		try {
+			const marker = largeBranchMarker("branch-selected-original");
+			const created = await createFidelityAgentSession(tempDir);
+			session = created.session;
+			authStorage = created.authStorage;
+			const oldUserId = await evictOldBranchMessage(created.sessionManager, marker);
+
+			const result = await session.branch(oldUserId);
+
+			expect(result.cancelled).toBe(false);
+			expect(result.selectedText).toBe(marker);
+			expect(result.selectedText).not.toContain("compacted history evicted");
+		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("lists evicted user messages with original text in the branch picker", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-branch-picker-fidelity-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		try {
+			const marker = largeBranchMarker("branch-picker-original");
+			const created = await createFidelityAgentSession(tempDir);
+			session = created.session;
+			authStorage = created.authStorage;
+			const oldUserId = await evictOldBranchMessage(created.sessionManager, marker);
+
+			const messages = session.getUserMessagesForBranching();
+			const oldMessage = messages.find(message => message.entryId === oldUserId);
+
+			expect(oldMessage).toBeDefined();
+			expect(oldMessage?.text).toBe(marker);
+			expect(oldMessage?.text).not.toContain("compacted history evicted");
+		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});

@@ -1448,7 +1448,8 @@ describe("AskTool deep-interview rendering middleware", () => {
 
 		const dialogOptions = select.mock.calls[0]?.[2];
 		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
-		expect(dialogOptions?.helpText).toContain("wheel/PgUp/PgDn scroll question");
+		expect(dialogOptions?.helpText).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		expect(dialogOptions?.helpText).toContain("Wheel: transcript");
 	});
 
 	it("opts structured deep-interview questions into local prompt scrolling", async () => {
@@ -1493,7 +1494,8 @@ describe("AskTool deep-interview rendering middleware", () => {
 
 		const dialogOptions = select.mock.calls[0]?.[2];
 		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
-		expect(dialogOptions?.helpText).toContain("wheel/PgUp/PgDn scroll question");
+		expect(dialogOptions?.helpText).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		expect(dialogOptions?.helpText).toContain("Wheel: transcript");
 	});
 
 	it("Restate gate displays numbered selector labels while returning the raw selected label", async () => {

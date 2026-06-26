@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.7.2",
+	"version": "0.7.3",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",
@@ -74,7 +74,8 @@
 		"zod": "catalog:"
 	},
 	"devDependencies": {
-		"@types/bun": "catalog:"
+		"@types/bun": "catalog:",
+		"@types/ws": "catalog:"
 	},
 	"engines": {
 		"bun": ">=1.3.14"

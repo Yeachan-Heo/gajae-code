@@ -703,8 +703,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         cfg: Settings = request.app.state.bag["settings"]
-        token = cfg.replay_token.get_secret_value() if cfg.replay_token else None
-        return HTMLResponse(render_index(token))
+        return HTMLResponse(render_index(cfg.replay_token is not None))
 
     @app.get("/api/status")
     async def api_status(request: Request) -> dict[str, Any]:

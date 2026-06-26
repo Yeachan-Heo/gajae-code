@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 import textwrap
 import threading
-import time
 import unittest
 
 from gjc_rpc import RpcClient, WorkflowGate

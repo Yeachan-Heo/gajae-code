@@ -66,13 +66,20 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 
 function createSelector(
 	onSelect: (selection: ModelSelectorSelection) => void,
-	options: { temporaryOnly?: boolean } = {},
+	options: {
+		temporaryOnly?: boolean;
+		initialSearchInput?: string;
+		settings?: Settings;
+		currentModel?: Model;
+		currentThinkingLevel?: ThinkingLevel;
+		activeModelProfile?: string;
+	} = {},
 ) {
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
 	return new ModelSelectorComponent(
 		ui,
-		undefined,
-		Settings.isolated(),
+		options.currentModel,
+		options.settings ?? Settings.isolated(),
 		createRegistry() as never,
 		[],
 		onSelect,
@@ -207,6 +214,41 @@ describe("model selector profiles", () => {
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).not.toContain("Profiles");
 		expect(rendered).not.toContain("profile-a");
+	});
+
+	test("active profile makes DEFAULT badge follow runtime model instead of stored default", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({ modelRoles: { default: "provider-a/alternate" } });
+		const selector = createSelector(() => {}, {
+			settings,
+			currentModel: defaultModel,
+			currentThinkingLevel: ThinkingLevel.High,
+			activeModelProfile: "profile-a",
+			initialSearchInput: "provider-a",
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("provider-a/default DEFAULT (high)");
+		expect(rendered).not.toContain("provider-a/alternate DEFAULT");
+	});
+
+	test("without active profile DEFAULT badge follows persisted default model", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({ modelRoles: { default: "provider-a/alternate" } });
+		const selector = createSelector(() => {}, {
+			settings,
+			currentModel: defaultModel,
+			currentThinkingLevel: ThinkingLevel.High,
+			initialSearchInput: "provider-a",
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("provider-a/alternate DEFAULT (inherit)");
+		expect(rendered).not.toContain("provider-a/default DEFAULT");
 	});
 
 	test("Apply for this session activates profile through setModelTemporary", async () => {

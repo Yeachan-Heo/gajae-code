@@ -140,7 +140,7 @@ re-enable work has a stable baseline.
 
 When internally enabled for compatibility tests, event replay still uses `last_seq` and the bounded replay reset marker `replay_window_exceeded`; command and UI response retries still use `Idempotency-Key`. These mechanisms are dormant for default external bridge clients because the endpoint matrix rejects the endpoints before they reach replay, body parsing, idempotency, scope, or dispatch logic.
 
-Workflow-gate responses are part of the UI-response surface, not the dormant command surface: when internally enabled, an answerer responds to `workflow_gate` frame `wg_...` by posting `{ "gate_id": "wg_...", "answer": ... }` to `POST /v1/sessions/{session_id}/ui-responses/{gate_id}`. Gate answers are authorized by bearer auth plus the `control` scope on this (default-disabled) endpoint; `X-GJC-Bridge-Owner-Token` may be carried by SDK helpers and participates in idempotency/cache correlation, but — unlike UI/permission responses — gate resolution does not separately validate it as the current controller token. `Idempotency-Key` is optional and is also forwarded as `idempotency_key` when supplied by SDK helpers.
+Workflow-gate responses are part of the UI-response surface, not the dormant command surface: when internally enabled, an answerer responds to `workflow_gate` frame `wg_...` by posting `{ "gate_id": "wg_...", "answer": ... }` to `POST /v1/sessions/{session_id}/ui-responses/{gate_id}`. Gate answers are authorized by bearer auth, the `control` scope on this (default-disabled) endpoint, and the currently claimed controller owner token. `X-GJC-Bridge-Owner-Token` must match the claimed controller token; mismatches return `403 not_controller` and do not resolve the gate. `Idempotency-Key` is optional and is also forwarded as `idempotency_key` when supplied by SDK helpers.
 
 ### Scopes
 
@@ -202,7 +202,7 @@ endpoint matrix, the default handshake advertises no accepted scopes.
 | `get_login_providers` | `admin` |
 | `login` | `admin` |
 | `negotiate_unattended` | `control` |
-| `workflow_gate_response` | `prompt` |
+| `workflow_gate_response` | `control` |
 
 ### Dormant capabilities and frame types
 
@@ -242,7 +242,7 @@ unconfigured bridge those helpers should be expected to fail because the server
 endpoint matrix disables the corresponding session endpoints until they are
 explicitly enabled.
 
-`BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth plus the `control` scope on the (by-default-disabled) `ui-responses` endpoint; the owner token is carried for idempotency/controller correlation, but — unlike UI/permission responses — gate resolution itself is gated by `control` scope rather than a separately enforced controller-owner-token check.
+`BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth, the `control` scope on the (by-default-disabled) `ui-responses` endpoint, and the current controller owner token; unauthorized owner-token attempts return `403 not_controller` without resolving the gate.
 
 > Response typing: in this experimental version, `command()` and the typed
 > command helpers return `Promise<unknown>`. Callers narrow the response

@@ -28,22 +28,6 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
 
-const SGR_MOUSE_PRESS_PATTERN = /^\x1b\[<(\d+);\d+;\d+M$/;
-const MOUSE_WHEEL_TITLE_SCROLL_ROWS = 3;
-
-function getMouseWheelTitleScrollRows(keyData: string): number {
-	const match = SGR_MOUSE_PRESS_PATTERN.exec(keyData);
-	if (!match) return 0;
-
-	const button = Number.parseInt(match[1] ?? "", 10);
-	if (!Number.isFinite(button) || (button & 64) === 0) return 0;
-
-	const wheelDirection = button & 3;
-	if (wheelDirection === 0) return -MOUSE_WHEEL_TITLE_SCROLL_ROWS;
-	if (wheelDirection === 1) return MOUSE_WHEEL_TITLE_SCROLL_ROWS;
-	return 0;
-}
-
 export interface HookSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
@@ -132,26 +116,58 @@ class ScrollableTitle extends Container {
 
 	render(width: number): string[] {
 		const lines = this.#markdown.render(width);
-		const maxScrollOffset = Math.max(0, lines.length - this.#maxRows);
-		this.#lastMaxScrollOffset = maxScrollOffset;
-		this.#scrollOffset = Math.max(0, Math.min(this.#scrollOffset, maxScrollOffset));
+		if (lines.length <= this.#maxRows) {
+			this.#lastMaxScrollOffset = 0;
+			this.#scrollOffset = 0;
+			return lines;
+		}
 
-		const visibleLines = lines.slice(this.#scrollOffset, this.#scrollOffset + this.#maxRows);
-		if (maxScrollOffset === 0 || visibleLines.length === 0) {
+		if (this.#maxRows < 3) {
+			const maxScrollOffset = Math.max(0, lines.length - this.#maxRows);
+			this.#lastMaxScrollOffset = maxScrollOffset;
+			this.#scrollOffset = Math.max(0, Math.min(this.#scrollOffset, maxScrollOffset));
+
+			const visibleLines = lines.slice(this.#scrollOffset, this.#scrollOffset + this.#maxRows);
+			const indicator =
+				this.#scrollOffset === 0
+					? theme.fg("dim", " PgDn↓")
+					: this.#scrollOffset >= maxScrollOffset
+						? theme.fg("dim", " PgUp↑")
+						: theme.fg("dim", " PgUp/PgDn↕");
+			const lastIndex = visibleLines.length - 1;
+			const availableWidth = Math.max(1, width - visibleWidth(indicator));
+			const fittedLine = truncateToWidth(visibleLines[lastIndex] ?? "", availableWidth);
+			visibleLines[lastIndex] = `${fittedLine}${indicator}`;
 			return visibleLines;
 		}
 
-		const indicator =
-			this.#scrollOffset === 0
-				? theme.fg("dim", " PgDn↓")
-				: this.#scrollOffset >= maxScrollOffset
-					? theme.fg("dim", " PgUp↑")
-					: theme.fg("dim", " PgUp/PgDn↕");
-		const lastIndex = visibleLines.length - 1;
-		const availableWidth = Math.max(1, width - visibleWidth(indicator));
-		const fittedLine = truncateToWidth(visibleLines[lastIndex] ?? "", availableWidth);
-		visibleLines[lastIndex] = `${fittedLine}${indicator}`;
-		return visibleLines;
+		let showTopIndicator = this.#scrollOffset > 0;
+		let showBottomIndicator = true;
+		let contentRows = 1;
+		let maxScrollOffset = 0;
+
+		for (let i = 0; i < 4; i++) {
+			contentRows = Math.max(1, this.#maxRows - (showTopIndicator ? 1 : 0) - (showBottomIndicator ? 1 : 0));
+			maxScrollOffset = Math.max(0, lines.length - contentRows);
+			this.#scrollOffset = Math.max(0, Math.min(this.#scrollOffset, maxScrollOffset));
+
+			const nextShowTopIndicator = this.#scrollOffset > 0;
+			const nextShowBottomIndicator = this.#scrollOffset + contentRows < lines.length;
+			if (nextShowTopIndicator === showTopIndicator && nextShowBottomIndicator === showBottomIndicator) {
+				break;
+			}
+			showTopIndicator = nextShowTopIndicator;
+			showBottomIndicator = nextShowBottomIndicator;
+		}
+
+		this.#lastMaxScrollOffset = maxScrollOffset;
+
+		const visibleLines = lines.slice(this.#scrollOffset, this.#scrollOffset + contentRows);
+		const result: string[] = [];
+		if (showTopIndicator) result.push(theme.fg("dim", truncateToWidth("▲ more", width)));
+		result.push(...visibleLines);
+		if (showBottomIndicator) result.push(theme.fg("dim", truncateToWidth("▼ more", width)));
+		return result.slice(0, this.#maxRows);
 	}
 }
 
@@ -454,18 +470,19 @@ export class HookSelectorComponent extends Container {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();
 
-		if (this.#scrollTitleRows !== undefined) {
-			const wheelRows = getMouseWheelTitleScrollRows(keyData);
-			if (wheelRows !== 0) {
-				this.#scrollableTitle?.scrollBy(wheelRows);
-				return;
-			}
-		}
 		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageUp")) {
 			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
 			return;
 		}
 		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageDown")) {
+			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
+			return;
+		}
+		if (!this.#inlineEditor && this.#scrollTitleRows !== undefined && matchesKey(keyData, "ctrl+u")) {
+			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
+			return;
+		}
+		if (!this.#inlineEditor && this.#scrollTitleRows !== undefined && matchesKey(keyData, "ctrl+d")) {
 			this.#scrollableTitle?.scrollBy(this.#scrollTitleRows);
 			return;
 		}
@@ -543,10 +560,11 @@ export class HookSelectorComponent extends Container {
 		this.#inlineEditor = editor;
 		this.#inputArea.addChild(new Spacer(1));
 		this.#inputArea.addChild(editor);
-		const scrollHint = this.#scrollTitleRows === undefined ? "" : "  wheel/PgUp/PgDn scroll question";
-		this.#helpTextComponent.setText(
-			theme.fg("dim", `enter submit  esc back to options  ctrl+g external editor${scrollHint}`),
-		);
+		const helpText =
+			this.#scrollTitleRows === undefined
+				? "enter submit  esc back to options  ctrl+g external editor"
+				: "enter submit  esc back to options  PgUp/PgDn: question · Wheel: transcript";
+		this.#helpTextComponent.setText(theme.fg("dim", helpText));
 		this.invalidate();
 	}
 

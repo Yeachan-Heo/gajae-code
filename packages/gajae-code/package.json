@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "gajae-code",
-	"version": "0.7.2",
+	"version": "0.7.3",
 	"description": "One-line npm install wrapper for the Gajae-Code gjc CLI",
 	"homepage": "https://gaebal-gajae.dev",
 	"author": "Yeachan-Heo",

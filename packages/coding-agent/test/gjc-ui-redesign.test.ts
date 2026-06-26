@@ -51,8 +51,15 @@ describe("GJC red-claw redesign defaults", () => {
 	it("exposes bundled selectable themes while preserving red-claw and blue-crab defaults", async () => {
 		const themes = await themeModule.getAvailableThemes();
 
-		expect(themes).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
-		expect(Object.keys(defaultThemes).sort()).toEqual(["blue-crab", "claude-code", "codex", "opencode", "red-claw"]);
+		expect(themes).toEqual(["blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode", "red-claw"]);
+		expect(Object.keys(defaultThemes).sort()).toEqual([
+			"blue-crab",
+			"claude-code",
+			"codex",
+			"gruvbox-dark",
+			"opencode",
+			"red-claw",
+		]);
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
 		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
 	});

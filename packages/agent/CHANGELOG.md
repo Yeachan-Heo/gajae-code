@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pruneAssistantToolArguments`: an isolated pre-compaction pruning pass that redacts stale `edit`/`write`/`apply_patch`/`ast_edit` tool-call argument payloads only when every touched path group has a later successful mutation, preserving tool-call identity (id/name/customWireName/signatures/intent/path hints), protecting latest/failed/ambiguous calls, and reporting separate stats from tool-result pruning. Reduces pre-compaction context pressure and the resident footprint of superseded large edit arguments.
+
+## [0.7.3] - 2026-06-25
+### Added
+
+- Added Composer evidence publication gates in the agent loop, so Composer-harness turns emit structured evidence under defined publication conditions (#1106).
+
+### Fixed
+
+- Wired the previously-dead GPT-5 harmony-leak detector into the streamed assistant-message path for openai-codex turns: recoverable tool-argument leaks are now recovered and everything else is routed through the existing abort-retry/audit loop, and the contaminated streamed message is removed (abort-retry) or replaced (truncate-resume) from working context so the model does not replay its own leak as history. Added detection of the leaked Anthropic-style `<invoke name="…">` envelope dialect that gpt-5.5 intermittently emits as visible assistant text instead of a native function call (#1069).
+- Detect proxy-level context overflow from empty responses: some proxies (notably LiteLLM) return an empty `content: []` with `stopReason: "stop"` and fabricated near-zero usage when the upstream context window is exceeded; the agent loop now recognizes this pattern and promotes it to an error so the existing overflow/compaction recovery path fires instead of freezing the session as a clean completion (#1102).
+- Hardened the Composer trace mutation classifier and its recovery-target guard (#1105).
+
 ## [0.7.2] - 2026-06-24
 
 ### Fixed

@@ -672,9 +672,9 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	}
 
 	if key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return") {
-		// alt+enter is commonly ESC + CR even when kitty disambiguation is on (Enter is
-		// an exception).
-		if modifier == MOD_ALT && bytes == b"\x1b\r" {
+		// alt+enter is commonly ESC + CR/LF even when kitty disambiguation is on (Enter
+		// is an exception).
+		if modifier == MOD_ALT && (bytes == b"\x1b\r" || bytes == b"\x1b\n") {
 			return true;
 		}
 
@@ -1066,6 +1066,7 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 	match code {
 		0x7f | 0x08 => return Some(Cow::Borrowed("alt+backspace")),
 		b'\r' => return Some(Cow::Borrowed("alt+enter")),
+		b'\n' => return Some(Cow::Borrowed("alt+enter")),
 		b'\t' => return Some(Cow::Borrowed("alt+tab")),
 		_ => {},
 	}
@@ -1555,6 +1556,12 @@ mod tests {
 		// ctrl+alt+m. Enhanced encodings still match.
 		assert!(matches_key_inner(b"\x1b\r", "alt+enter", false));
 		assert!(!matches_key_inner(b"\x1b\r", "ctrl+alt+m", false));
+		assert!(matches_key_inner(b"\x1b\n", "alt+enter", false));
+		assert!(!matches_key_inner(b"\x1b\n", "ctrl+alt+j", false));
+		assert!(!matches_key_inner(b"\x1b[13;3~", "alt+enter", false));
+		assert_eq!(parse_key_inner(b"\x1b[13;3~", false).as_deref(), Some("alt+f3"));
+		assert!(!matches_key_inner(b"\x1b[13;7~", "ctrl+alt+enter", false));
+		assert_eq!(parse_key_inner(b"\x1b[13;7~", false).as_deref(), Some("ctrl+alt+f3"));
 		assert!(!matches_key_inner(b"\x1b\t", "ctrl+alt+i", false));
 		assert!(!matches_key_inner(b"\x1b\x08", "ctrl+alt+h", false));
 

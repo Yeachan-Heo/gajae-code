@@ -18,6 +18,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.editor.external"
 	| "app.history.search"
 	| "app.message.dequeue"
+	| "app.message.followUp"
 	| "app.message.queue"
 	| "app.clipboard.pasteImage"
 	| "app.clipboard.copyPrompt"
@@ -40,6 +41,7 @@ const CONFIGURABLE_EDITOR_ACTIONS = [
 	"app.thinking.toggle",
 	"app.editor.external",
 	"app.history.search",
+	"app.message.followUp",
 	"app.message.queue",
 	"app.message.dequeue",
 	"app.clipboard.pasteImage",

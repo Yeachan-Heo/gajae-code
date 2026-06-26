@@ -7,6 +7,8 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+const PYTHON_DEV_SETUP =
+	"python3 -m pip install --user --upgrade 'pip>=24' 'setuptools>=69' wheel && python3 -m pip install --user -e python/gjc-rpc -e 'python/robogjc[dev]'";
 // Keys for tasks that compile the @gajae-code/natives addon. They run once in
 // the dedicated dev-ci native-build job (not as matrix shards) and publish the
 // built `.node` files as an artifact the runtime-dependent shards download.
@@ -467,8 +469,8 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 
 	if (pythonChanged) {
-		add(tasks, "python-lint", "Python lint", ["bun", "run", "lint:py"]);
-		add(tasks, "python-test", "Python tests", ["bun", "run", "test:py"]);
+		add(tasks, "python-lint", "Python lint", pythonLintCommand());
+		add(tasks, "python-test", "Python tests", pythonTestCommand());
 	}
 	if (webChanged) {
 		add(tasks, "robogjc-web-typecheck", "robogjc web typecheck", packageScriptCommand("typecheck"), resolvePackageCwd("python/robogjc/web"));
@@ -536,8 +538,8 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			continue;
 		}
 		if (isPythonPath(changedPath)) {
-			add(tasks, "python-lint", "Python lint", ["bun", "run", "lint:py"]);
-			add(tasks, "python-test", "Python tests", ["bun", "run", "test:py"]);
+			add(tasks, "python-lint", "Python lint", pythonLintCommand());
+			add(tasks, "python-test", "Python tests", pythonTestCommand());
 			continue;
 		}
 		if (isWebPath(changedPath)) {
@@ -679,6 +681,22 @@ function add(tasks: Map<string, Task>, key: string, description: string, command
 // (issue #622).
 export function packageScriptCommand(script: string): readonly string[] {
 	return ["bun", "run", script];
+}
+
+function pythonLintCommand(): readonly string[] {
+	return [
+		"bash",
+		"-lc",
+		`${PYTHON_DEV_SETUP} && python3 -m ruff check python && python3 -m ruff format --check python/robogjc`,
+	];
+}
+
+function pythonTestCommand(): readonly string[] {
+	return [
+		"bash",
+		"-lc",
+		`${PYTHON_DEV_SETUP} && python3 -m pytest -x --import-mode=importlib python/gjc-rpc/tests python/robogjc/tests`,
+	];
 }
 
 // Resolve a workspace-relative package directory to an absolute path used as

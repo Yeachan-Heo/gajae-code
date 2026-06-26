@@ -65,6 +65,11 @@ export class TopicRegistry {
 		return this.byTopic.get(topicId);
 	}
 
+	/** All session ids with a persisted topic record. */
+	sessionIds(): string[] {
+		return [...this.topics.keys()];
+	}
+
 	/** The existing topic record for a session, if any. */
 	get(sessionId: string): TopicRecord | undefined {
 		return this.topics.get(sessionId);
@@ -79,6 +84,7 @@ export class TopicRegistry {
 		sessionId: string,
 		create: () => Promise<string>,
 		now: () => number = Date.now,
+		name?: string,
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing) return existing;
@@ -90,7 +96,7 @@ export class TopicRegistry {
 		if (pending) return pending;
 		const promise = (async () => {
 			const topicId = await create();
-			const record: TopicRecord = { topicId, identitySent: false, createdAt: now() };
+			const record: TopicRecord = { topicId, name, identitySent: false, createdAt: now() };
 			this.topics.set(sessionId, record);
 			this.byTopic.set(topicId, sessionId);
 			return record;

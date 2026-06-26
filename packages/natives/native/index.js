@@ -20,13 +20,14 @@ nativeBindings.initNativeCrashDiagnostics?.();
 export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
+export const NotificationControlServer = nativeBindings.NotificationControlServer;
 export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
 export const Shell = nativeBindings.Shell;
 
 // functions
-export const __piNativesV0_7_2 = nativeBindings.__piNativesV0_7_2;
+export const __piNativesV0_7_3 = nativeBindings.__piNativesV0_7_3;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;

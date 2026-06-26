@@ -17,7 +17,7 @@ import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { ensureTool } from "../utils/tools-manager";
 import { INSANE_NOTES, tryInsaneFetch } from "../web/insane/bridge";
-import { validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
+import { validatePublicHttpUrl, validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
 import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../web/parallel";
 import { specialHandlers } from "../web/scrapers";
 import type { RenderResult } from "../web/scrapers/types";
@@ -789,6 +789,21 @@ async function renderUrl(
 
 	// Step 0: Normalize URL (ensure scheme for special handlers)
 	url = normalizeUrl(url);
+	const publicUrl = await validatePublicHttpUrl(url);
+	if (!publicUrl.ok) {
+		notes.push(`Blocked URL fetch: target URL is not public HTTP(S): ${publicUrl.reason}`);
+		return {
+			url,
+			finalUrl: url,
+			contentType: "unknown",
+			method: "failed",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes,
+		};
+	}
+	url = publicUrl.url.toString();
 
 	// Step 1: Try special handlers for known sites (unless raw mode)
 	if (!raw) {
@@ -802,7 +817,8 @@ async function renderUrl(
 		throw new ToolAbortError();
 	}
 	if (!response.ok) {
-		const failureNote = response.status ? `Failed to fetch URL (HTTP ${response.status})` : "Failed to fetch URL";
+		const failureNote =
+			response.error ?? (response.status ? `Failed to fetch URL (HTTP ${response.status})` : "Failed to fetch URL");
 		notes.push(failureNote);
 		const insane = await tryInsaneFallback({
 			url,
