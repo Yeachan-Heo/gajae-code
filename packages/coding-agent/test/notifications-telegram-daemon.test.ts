@@ -1949,6 +1949,29 @@ test("a fresh daemon scanRoots reconnects an existing session endpoint", async (
 	expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
+test("connectSession eagerly creates a Telegram topic on connect (before any frame)", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("sess-abc123", "ws://x", "tok");
+	// FakeWs does not auto-dispatch "open"; fire it to exercise the connect hook.
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await new Promise(r => setTimeout(r, 10));
+	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
+	expect(createTopic).toBeTruthy();
+	// Provisional name uses the session id tail until identity_header renames it.
+	expect(createTopic!.body.name).toBe("GJC abc123");
+});
+
 test("scanRoots connects only live endpoints (skips stale + dead-PID records)", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();
