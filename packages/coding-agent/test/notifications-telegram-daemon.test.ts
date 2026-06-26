@@ -1972,6 +1972,58 @@ test("connectSession eagerly creates a Telegram topic on connect (before any fra
 	expect(createTopic!.body.name).toBe("GJC abc123");
 });
 
+test("identity_header during an in-flight eager create still renames the topic", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let releaseCreate: (tid: string) => void = () => {};
+	const createGate = new Promise<string>(r => {
+		releaseCreate = r;
+	});
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") {
+			const tid = await createGate; // stay in-flight until released
+			return { ok: true, result: { message_thread_id: Number(tid) } };
+		}
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "editForumTopic") return { ok: true, result: true };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("sess-xyz999", "ws://x", "tok");
+	// Eager create starts and blocks in-flight on createGate.
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await Promise.resolve();
+	// identity_header arrives while the create is still in flight -> joins it.
+	const session = daemon.sessions.get("sess-xyz999")!;
+	const identityP = daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "sess-xyz999",
+		repo: "myrepo",
+		branch: "mybranch",
+	});
+	await Promise.resolve();
+	releaseCreate("777"); // now resolve the single shared create
+	await identityP;
+	await new Promise(r => setTimeout(r, 10));
+	// Exactly one topic created (provisional name), then renamed to identity name.
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.find(c => c.method === "createForumTopic")!.body.name).toBe("GJC xyz999");
+	const edit = bot.calls.find(c => c.method === "editForumTopic");
+	expect(edit).toBeTruthy();
+	expect(edit!.body.name).toBe("myrepo/mybranch");
+});
+
 test("scanRoots connects only live endpoints (skips stale + dead-PID records)", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();

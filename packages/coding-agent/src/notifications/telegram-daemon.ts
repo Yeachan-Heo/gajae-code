@@ -1440,8 +1440,12 @@ export class TelegramNotificationDaemon {
 					return String(tid);
 				},
 				this.opts.now,
+				// The create winner records the name it actually used; callers that
+				// merely JOIN an in-flight create must not overwrite it locally, or a
+				// later identity rename would be wrongly skipped (topic stuck at the
+				// provisional name on Telegram).
+				name,
 			);
-			this.topics.applyName(sessionId, name);
 			await this.persistTopics();
 			return rec.topicId;
 		} catch {
