@@ -221,7 +221,16 @@ export function statusGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv
 export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {
 	const tmuxCommand = resolveGjcTmuxCommand(env);
 	const sessionName = buildGjcTmuxSessionName(env);
-	const command = "exec env GJC_TMUX_LAUNCHED=1 gjc";
+	// Build a shell-bootstrap command appropriate for the host shell. Psmux on
+	// Windows runs the new-session command through PowerShell, so we use the
+	// $env:VAR = ... assignment form there. POSIX keeps the historical exec
+	// env form so the launched gjc inherits GJC_TMUX_LAUNCHED without leaking
+	// into the parent tmux server.
+	const platform = process.platform;
+	const command =
+		platform === "win32"
+			? "$env:GJC_TMUX_LAUNCHED = '1'; gjc"
+			: "exec env GJC_TMUX_LAUNCHED=1 gjc";
 	const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, command], {
 		stdout: "pipe",
 		stderr: "pipe",

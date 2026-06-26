@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native Windows `gjc --tmux` is now backed by [psmux](https://github.com/psmux/psmux) when no real tmux is on PATH: a new `psmux-detect` module probes `psmux` / `pmux` / `tmux` on Windows and resolves the multiplexer to use, `tmux-common.ts` re-exports the resolver for downstream callers, and `buildDefaultTmuxLaunchPlan` builds a real PowerShell-encoded `--tmux` plan instead of falling through to the direct-launch diagnostic. The native Windows `gjc session` / `gjc team` ownership-tag and worker-spawn paths therefore work end-to-end on a Windows host with psmux installed (no WSL required).
+- Three new environment knobs back the Windows psmux path: `GJC_PSMUX_COMMAND` (force the multiplexer to be treated as psmux), `GJC_PSMUX_DETECTION` (`off` / `false` to skip probing entirely), and `GJC_PSMUX_FORCE_DETECT` (`1` / `true` to re-probe on every call). `GJC_TMUX_COMMAND` and `GJC_TEAM_TMUX_COMMAND` continue to override the multiplexer selection on every platform.
+- New unit tests under `packages/coding-agent/test/gjc-runtime/psmux-detect.test.ts` cover detection verdicts, override precedence, cache behavior, and the `resolveGjcTmuxBinary` Windows / POSIX resolution paths. The existing launch-tmux test surface was updated to assert the new Windows psmux path (a real `--tmux` plan is produced when psmux is available, the diagnostic points at the psmux install URL when no multiplexer is found, and the mouse / clipboard / mode-style UX profile is filtered out for psmux while the `@gjc-profile` ownership tag still round-trips).
+
+### Fixed
+
+- `gjc --tmux` on native Windows no longer silently falls through to a tmux-less launch: when psmux is installed the plan now boots gjc through a PowerShell-encoded inner command, when no tmux-class binary resolves on PATH the diagnostic points at the psmux install URL and `GJC_TMUX_COMMAND` override, and explicit `GJC_TMUX_COMMAND` overrides are honored on every platform.
+- The `gjc team` worker-command string is now formatted for the host shell: on Windows + psmux each env assignment uses the `$env:VAR = 'value';` PowerShell form (with PowerShell-safe single-quote escaping) instead of the POSIX `VAR='value'` form, so worker panes spawned via psmux ConPTY panes inherit the right `GJC_TEAM_*` environment.
+- `createGjcTmuxSession` now chooses the new-session bootstrap command for the host shell: PowerShell `$env:GJC_TMUX_LAUNCHED = '1'; gjc` on Windows, `exec env GJC_TMUX_LAUNCHED=1 gjc` on POSIX, so psmux-managed sessions tag the spawned gjc the same way tmux-managed ones do.
+- `applyGjcTmuxProfile` no longer hard-fails the `gjc --tmux` boot on Windows when psmux drops the UX profile round-trip. When the resolved multiplexer is psmux, only the `mouse` / `set-clipboard` / `mode-style` UX keys are filtered out; the `@gjc-profile` / branch / project / session-identity ownership tags are still emitted because those are required for `gjc session` and `gjc team`.
+- `renameExistingTmuxWindowIfNeeded` no longer short-circuits on `platform === "win32"`: on a Windows host running psmux inside `gjc --tmux`, the leader window now inherits the project:branch title the same way it does on POSIX.
+
+### Documentation
+
+- The native Windows psmux section in `docs/environment-variables.md` now reflects that `gjc --tmux` builds a real tmux-backed plan via psmux, lists the new `GJC_PSMUX_*` knobs, and explains the worker-spawn shell-quoting rule. The bundled `team` skill doc points readers at the same environment section instead of the legacy "psmux is not fully supported" warning.
+
+## [0.7.3] - 2026-06-25
+
 ### Fixed
 
 - Deep Interview (and any scrollable `ask`/hook selector) no longer enables SGR mouse reporting, which was hijacking the mouse wheel and disabling the terminal's native scrollback while a question was on screen. The wheel now scrolls the terminal as usual; long questions still scroll inside the dialog via PgUp/PgDn.

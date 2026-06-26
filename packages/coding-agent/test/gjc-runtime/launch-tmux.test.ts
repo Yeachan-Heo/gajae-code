@@ -176,8 +176,11 @@ describe("default GJC tmux launch", () => {
 		expect(plan.innerCommand).toContain("GJC_COORDINATOR_SESSION_STATE_FILE=");
 	});
 
-	it("falls through to direct launch for native Windows --tmux", () => {
-		const diagnostics: string[] = [];
+	it("plans native Windows --tmux launches when tmux is available", () => {
+		// The historical direct-launch fallback only fires when no tmux binary
+		// resolves on PATH. When psmux / tmux is available,
+		// buildDefaultTmuxLaunchPlan returns a plan that bootstraps gjc through
+		// PowerShell. Set tmuxAvailable: true here to mirror a host with psmux.
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
@@ -190,13 +193,9 @@ describe("default GJC tmux launch", () => {
 			tmuxAvailable: true,
 			currentBranch: "",
 			existingBranchSessionName: null,
-			diagnosticWriter: message => diagnostics.push(message),
 		});
 
-		expect(plan).toBeUndefined();
-		expect(diagnostics[0]).toContain("native Windows");
-		expect(diagnostics[0]).toContain("starting without a tmux-backed session");
-		expect(diagnostics[0]).toContain("WSL with real tmux");
+		expect(plan).toBeDefined();
 	});
 
 	it("uses a host command for compiled Bun virtual entrypoints", () => {
@@ -390,13 +389,19 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.newSessionArgs.slice(0, 6)).toEqual(["new-session", "-d", "-s", "custom-gjc", "-c", "/repo"]);
 	});
 
-	it("falls through to direct launch for native Windows GJC_TMUX_COMMAND overrides", () => {
-		const diagnostics: string[] = [];
+	it("honors explicit GJC_TMUX_COMMAND on native Windows without direct-launch fallback", () => {
+		// Once psmux is a supported Windows multiplexer, an explicit
+		// GJC_TMUX_COMMAND override must always produce a tmux plan. The
+		// legacy direct-launch fallback only fires when no tmux provider is
+		// resolvable on PATH; the user has named a multiplexer here so the
+		// buildDefaultTmuxLaunchPlan path is authoritative. Runtime failures
+		// surface through the normal spawn-failure diagnostics instead of a
+		// silent direct launch.
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "C:\\repo",
-			env: { GJC_TMUX_COMMAND: "psmux -L repo" },
+			env: { GJC_TMUX_COMMAND: "psmux" },
 			argv: ["C:\\Program Files\\GJC\\gjc.exe"],
 			execPath: "C:\\Program Files\\GJC\\gjc.exe",
 			platform: "win32",
@@ -404,12 +409,9 @@ describe("default GJC tmux launch", () => {
 			tmuxAvailable: true,
 			currentBranch: "",
 			existingBranchSessionName: null,
-			diagnosticWriter: message => diagnostics.push(message),
 		});
 
-		expect(plan).toBeUndefined();
-		expect(diagnostics[0]).toContain("native Windows");
-		expect(diagnostics[0]).toContain("psmux");
+		expect(plan).toBeDefined();
 	});
 	it("does not auto-reuse scoped sessions from another GJC version", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(
@@ -630,6 +632,7 @@ describe("default GJC tmux launch", () => {
 			path.join(sessionRuntimeDir("/repo", "gjc-sess"), "tmux-sessions"),
 		);
 	});
+
 
 	it("applies the tmux profile only to the requested target", () => {
 		const calls: { command: string; args: string[] }[] = [];
@@ -1073,7 +1076,10 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
-	it("explains the native Windows psmux support boundary when tmux is unavailable", () => {
+	it("explains the psmux install path when no tmux binary is found on native Windows", () => {
+		// The legacy diagnostic pointed users at WSL and warned that psmux was
+		// "not fully supported". With psmux detected as a supported Windows
+		// multiplexer, the diagnostic now recommends installing psmux directly.
 		const diagnostics: string[] = [];
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ tmux: true }),
@@ -1090,9 +1096,9 @@ describe("default GJC tmux launch", () => {
 
 		expect(plan).toBeUndefined();
 		expect(diagnostics[0]).toContain("native Windows");
-		expect(diagnostics[0]).toContain("WSL with real tmux");
 		expect(diagnostics[0]).toContain("psmux");
-		expect(diagnostics[0]).toContain("not fully supported");
+		expect(diagnostics[0]).toContain("https://github.com/psmux/psmux");
+		expect(diagnostics[0]).toContain("GJC_TMUX_COMMAND");
 	});
 
 	it("applies session-scoped mouse scrolling when launching tmux on WSL/Linux", () => {

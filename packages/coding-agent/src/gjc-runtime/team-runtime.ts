@@ -595,6 +595,16 @@ function teamDir(stateRoot: string, teamName: string): string {
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, "'\\''")}'`;
 }
+
+/**
+ * PowerShell-safe single-quote escape: doubles single quotes inside a
+ * single-quoted PowerShell literal ('it''s ok') and uses the same
+ * surrounding quotes. Used to build worker command strings that psmux
+ * will hand to a Windows ConPTY pane running PowerShell.
+ */
+function powershellQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
 function safePathSegment(kind: string, value: string): string {
 	assertSafeId(kind, value);
 	return value;
@@ -1895,7 +1905,17 @@ export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.Process
 	if (entrypoint && path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
 	return "gjc";
 }
-function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): string {
+/** @internal Exported for unit tests. */
+export function buildWorkerCommand(
+	config: GjcTeamConfig,
+	worker: GjcTeamWorker,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const quote = platform === "win32" ? powershellQuote : shellQuote;
+	const envAssignment = (key: string, value: string): string =>
+		platform === "win32"
+			? `$env:${key} = ${quote(value)};`
+			: `${key}=${quote(value)}`;
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
 		: `Worker cwd: ${config.leader.cwd}.`;
@@ -1908,17 +1928,18 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
 		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
 	].join("\n");
-	const env = [
-		`GJC_TEAM_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
-		`GJC_TEAM_INTERNAL_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
-		`GJC_TEAM_NAME=${shellQuote(config.team_name)}`,
-		`GJC_TEAM_WORKER_ID=${shellQuote(worker.id)}`,
-		`GJC_TEAM_STATE_ROOT=${shellQuote(config.state_root)}`,
-		`GJC_TEAM_LEADER_CWD=${shellQuote(config.leader.cwd)}`,
-		`GJC_TEAM_DISPLAY_NAME=${shellQuote(config.display_name)}`,
-		...(worker.worktree_path ? [`GJC_TEAM_WORKTREE_PATH=${shellQuote(worker.worktree_path)}`] : []),
+	const envLines = [
+		envAssignment("GJC_TEAM_WORKER", `${config.team_name}/${worker.id}`),
+		envAssignment("GJC_TEAM_INTERNAL_WORKER", `${config.team_name}/${worker.id}`),
+		envAssignment("GJC_TEAM_NAME", config.team_name),
+		envAssignment("GJC_TEAM_WORKER_ID", worker.id),
+		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
+		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
+		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
+		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
-	return `${env.join(" ")} ${config.worker_command} ${shellQuote(prompt)}`;
+	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
+	return `${joined} ${config.worker_command} ${quote(prompt)}`;
 }
 interface GjcTeamInitialLane {
 	label: string;
@@ -2036,7 +2057,7 @@ async function startTmuxSession(
 					"#{pane_id}",
 					"-c",
 					worker.worktree_path ?? config.leader.cwd,
-					buildWorkerCommand(config, worker),
+					buildWorkerCommand(config, worker, (process.platform as NodeJS.Platform)),
 				],
 				{ stdout: "pipe", stderr: "pipe" },
 			);

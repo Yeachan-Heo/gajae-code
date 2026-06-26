@@ -15,6 +15,7 @@ import {
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	type GjcTmuxProfileCommand,
+	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
 import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope, type GjcTmuxSessionStatus } from "./tmux-sessions";
@@ -31,6 +32,26 @@ export {
 export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
+export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+
+function envFlagDisabled(value: string | undefined): boolean {
+	const normalized = value?.trim().toLowerCase();
+	return normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no";
+}
+
+/**
+ * Decide whether the mouse / clipboard / mode-style UX profile commands should
+ * be dropped for the active multiplexer. Psmux historically does not
+ * round-trip every user option perfectly; the ownership-tag round-trip is the
+ * only piece gjc session / gjc team actually need, so dropping the rest keeps
+ * native Windows `gjc --tmux` bootable when those UX options would otherwise
+ * hard-fail.
+ */
+function psmuxProfileCommandsShouldDropUx(env: NodeJS.ProcessEnv, tmuxCommand: string): boolean {
+	if (envFlagDisabled(env[GJC_PSMUX_PROFILE_FORCE_ENV])) return false;
+	const resolved = resolveGjcTmuxBinary({ env });
+	return resolved.command === tmuxCommand && resolved.isPsmux;
+}
 
 type LaunchPolicy = "direct" | "tmux";
 
@@ -169,20 +190,13 @@ function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
 function formatTmuxUnavailableDiagnostic(platform: NodeJS.Platform, tmuxCommand: string): string {
 	if (platform === "win32") {
 		return (
-			`gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session. ` +
-			"For managed GJC session/team flows on Windows, use WSL with real tmux, or another tmux provider that round-trips tmux user options. " +
-			"Native psmux can expose tmux-compatible commands, but it is not fully supported for GJC-managed ownership tags/team guarantees yet.\n"
+			`gjc --tmux requested but no tmux executable was found; starting without a tmux-backed session. ` +
+			`GJC searched for psmux, pmux, and tmux on PATH (got \`${tmuxCommand}\`). ` +
+			"Install psmux (https://github.com/psmux/psmux) for native Windows tmux support, or use WSL with real tmux. " +
+			"You can also point GJC at a specific binary via GJC_TMUX_COMMAND.\n"
 		);
 	}
 	return `gjc --tmux requested but no ${tmuxCommand} executable was found; starting without a tmux-backed session.\n`;
-}
-
-function formatNativeWindowsDirectDiagnostic(): string {
-	return (
-		"gjc --tmux requested on native Windows; starting without a tmux-backed session. " +
-		"For managed GJC session/team flows on Windows, use WSL with real tmux, or another tmux provider that round-trips tmux user options. " +
-		"Native psmux can expose tmux-compatible commands, but it is not fully supported for GJC-managed ownership tags/team guarantees yet.\n"
-	);
 }
 
 function shellQuote(value: string): string {
@@ -218,7 +232,7 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
 	const env = context.env ?? process.env;
 	const branchSlug = context.branch ? buildGjcTmuxSessionSlug(context.branch) : (context.branchSlug ?? null);
-	const commands = buildGjcTmuxProfileCommands(context.target, env, {
+	let commands = buildGjcTmuxProfileCommands(context.target, env, {
 		branch: context.branch ?? null,
 		branchSlug,
 		project: context.project ?? null,
@@ -226,6 +240,17 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 		sessionStateFile: context.sessionStateFile ?? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
 		version: context.version ?? null,
 	});
+	if (psmuxProfileCommandsShouldDropUx(env, context.tmuxCommand)) {
+		// Keep the ownership-tag round-trip (required for `gjc session` and
+		// `gjc team`); drop only the UX profile commands whose option keys
+		// historically do not round-trip cleanly on psmux.
+		const dropArgs = new Set(["mouse", "set-clipboard", "mode-style"]);
+		commands = commands.filter(command => {
+			const flag = command.args[0];
+			const key = command.args[command.args.length - 2];
+			return !(dropArgs.has(String(key)) && (flag === "set-option" || flag === "set-window-option"));
+		});
+	}
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
 	const cwd = context.cwd ?? process.cwd();
@@ -335,7 +360,10 @@ function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 	if (parseLaunchPolicy(env) === "direct") return;
 
 	const platform = context.platform ?? process.platform;
-	if (platform === "win32") return;
+	// Note: Windows is intentionally allowed here. Psmux supports
+	// `rename-window` and we want the leader window to inherit the
+	// project:branch title even on native Windows, where gjc --tmux runs
+	// through PowerShell to a psmux backend.
 
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
 	if (!isInteractiveRootLaunch(context.parsed, tty)) return;
@@ -387,10 +415,6 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	if (!context.parsed.tmux || policy === "direct") return undefined;
 	if (env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return undefined;
 	const platform = context.platform ?? process.platform;
-	if (platform === "win32") {
-		(context.diagnosticWriter ?? safeStderrWrite)(formatNativeWindowsDirectDiagnostic());
-		return undefined;
-	}
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
 	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
@@ -398,7 +422,12 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const branch = context.worktreeBranch ?? context.currentBranch ?? readCurrentBranch(cwd);
 	const project = context.project ?? cwd;
 	const sessionName = buildGjcTmuxSessionName(env, { branch });
-	const tmuxCommand = resolveGjcTmuxCommand(env);
+	// Pick the most appropriate tmux binary for this platform. On native Windows
+	// the resolver walks psmux / pmux / tmux and uses the first one present on
+	// PATH, so the default `gjc --tmux` flow lands on a real multiplexer even
+	// without an explicit GJC_TMUX_COMMAND override.
+	const resolvedBinary = resolveGjcTmuxBinary({ platform, env });
+	const tmuxCommand = resolvedBinary.command;
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
 	// The session ROOT is keyed by the active GJC session (GJC_SESSION_ID), NOT the
 	// coordinator/tmux identity. Fall back to the coordinator id only for standalone
