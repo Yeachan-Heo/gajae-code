@@ -5,6 +5,7 @@ import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
+	materializeActiveModelProfileAssignment,
 	prepareModelProfileActivation,
 } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -162,7 +163,7 @@ describe("model profile activation", () => {
 		expect(prepared.agentModelOverrides.critic).toBe("openai-codex/gpt-5.5:medium");
 	});
 
-	test("session-only changes active model and applies runtime overrides without persisted sets", async () => {
+	test("session-only changes active model and replaces runtime overrides without persisted sets", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "task.agentModelOverrides": { critic: "provider-a/old" } });
 		const setCalls: string[] = [];
@@ -180,7 +181,6 @@ describe("model profile activation", () => {
 			vision: "provider-a/architect",
 		});
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			critic: "provider-a/old",
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
@@ -189,7 +189,58 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
-	test("--default persists only modelProfile.default and flushes", async () => {
+	test("materializing a profile role override persists the full effective assignment set and clears the profile", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"modelProfile.default": "codex-medium",
+			"task.agentModelOverrides": { critic: "provider-a/old-critic" },
+		});
+
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+
+		expect(materialized).toBe(true);
+		expect(settings.get("modelRoles")).toEqual({
+			default: "provider-a/default:high",
+			vision: "provider-a/architect",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor:medium",
+			architect: "provider-a/architect",
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("materializing a default override stores the selected default and clears the profile", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "default",
+			selector: "provider-c/default:low",
+		});
+
+		expect(materialized).toBe(true);
+		expect(settings.get("modelRoles")).toMatchObject({
+			default: "provider-c/default:low",
+			vision: "provider-a/architect",
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated();
 		const setCalls: string[] = [];
@@ -208,7 +259,7 @@ describe("model profile activation", () => {
 			{ persistDefault: true },
 		);
 
-		expect(setCalls).toEqual(["modelProfile.default"]);
+		expect(setCalls).toEqual(["modelRoles", "task.agentModelOverrides", "modelProfile.default"]);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");

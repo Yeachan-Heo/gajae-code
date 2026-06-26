@@ -196,6 +196,28 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.agent.state.thinkingLevel).toBe(Effort.High);
 	});
 
+	it("resolves subagent model assignments from task.agentModelOverrides", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const executorModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.Low,
+			modelRoles: {
+				default: `${defaultModel.provider}/${defaultModel.id}:low`,
+			},
+		});
+		sessionSettings.set("task.agentModelOverrides", {
+			executor: `${executorModel.provider}/${executorModel.id}:high`,
+		});
+
+		const resolved = session.resolveRoleModelWithThinking("executor");
+
+		expect(resolved.model?.id).toBe(executorModel.id);
+		expect(resolved.thinkingLevel).toBe(Effort.High);
+		expect(resolved.explicitThinkingLevel).toBe(true);
+	});
+
 	it("clamps unsupported selections from model metadata", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		const agent = new Agent({

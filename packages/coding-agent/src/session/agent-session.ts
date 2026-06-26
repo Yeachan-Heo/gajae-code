@@ -131,7 +131,7 @@ import {
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
-import { MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
+import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -7507,11 +7507,14 @@ export class AgentSession {
 		availableModels: Model[],
 		currentModel: Model | undefined,
 	): ResolvedModelRoleValue {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role as keyof typeof GJC_MODEL_ASSIGNMENT_TARGETS];
 		const roleModelStr =
-			role === "default"
-				? (this.settings.getModelRole("default") ??
-					(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
-				: this.settings.getModelRole(role);
+			target?.settingsPath === "task.agentModelOverrides"
+				? this.settings.get("task.agentModelOverrides")[role]
+				: role === "default"
+					? (this.settings.getModelRole("default") ??
+						(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
+					: this.settings.getModelRole(role);
 
 		if (!roleModelStr) {
 			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };

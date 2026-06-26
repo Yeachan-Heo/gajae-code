@@ -381,6 +381,17 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	refreshRoleAssignments(
+		options: { currentModel?: Model; currentThinkingLevel?: ThinkingLevel; activeModelProfile?: string } = {},
+	): void {
+		if ("currentModel" in options) this.#currentModel = options.currentModel;
+		if ("currentThinkingLevel" in options) this.#currentThinkingLevel = options.currentThinkingLevel;
+		if ("activeModelProfile" in options) this.#activeModelProfile = options.activeModelProfile;
+		this.#roles = {};
+		this.#loadRoleModels();
+		this.#applyTabFilter();
+	}
+
 	#sortModels(models: ModelItem[]): void {
 		// Sort: default-tagged model first, then MRU, then alphabetical
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];

@@ -7,8 +7,13 @@ import {
 	formatAvailableProfileNames,
 	resolveProfileBindings,
 } from "./model-profiles";
-import { type GjcModelAssignmentTargetId, isAuthenticated, type ModelRegistry } from "./model-registry";
-import { resolveModelRoleValue } from "./model-resolver";
+import {
+	GJC_MODEL_ASSIGNMENT_TARGETS,
+	type GjcModelAssignmentTargetId,
+	isAuthenticated,
+	type ModelRegistry,
+} from "./model-registry";
+import { formatModelSelectorValue, resolveModelRoleValue } from "./model-resolver";
 import type { Settings } from "./settings";
 
 const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
@@ -59,6 +64,48 @@ export interface PreparedModelProfileActivation {
 	 * resume default without promoting a transient model to it.
 	 */
 	previousSessionDefaultModel: string | undefined;
+}
+export interface MaterializeModelProfileAssignmentOptions {
+	session: Pick<
+		ModelProfileActivationSession,
+		"model" | "thinkingLevel" | "setActiveModelProfile" | "getActiveModelProfile"
+	>;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	role: GjcModelAssignmentTargetId;
+	selector: string;
+}
+
+export function materializeActiveModelProfileAssignment(options: MaterializeModelProfileAssignmentOptions): boolean {
+	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
+	if (!activeProfile) return false;
+
+	const nextModelRoles = { ...options.settings.get("modelRoles") };
+	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
+	const target = GJC_MODEL_ASSIGNMENT_TARGETS[options.role];
+
+	if (options.role === "default") {
+		nextModelRoles.default = options.selector;
+	} else if (!nextModelRoles.default && options.session.model) {
+		nextModelRoles.default = formatModelSelectorValue(
+			`${options.session.model.provider}/${options.session.model.id}`,
+			options.session.thinkingLevel,
+		);
+	}
+
+	if (target.settingsPath === "modelRoles") {
+		nextModelRoles[options.role] = options.selector;
+	} else {
+		nextAgentModelOverrides[options.role] = options.selector;
+	}
+
+	options.settings.set("modelRoles", nextModelRoles);
+	options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
+	options.settings.set("modelProfile.default", undefined);
+	options.settings.clearOverride("modelProfile.default");
+	options.settings.override("modelRoles", nextModelRoles);
+	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+	options.session.setActiveModelProfile?.(undefined);
+	return true;
 }
 
 export function formatModelProfileCredentialError(profileName: string, providers: readonly string[]): string {
@@ -254,21 +301,13 @@ export async function applyPreparedModelProfileActivation(
 			});
 			modelChanged = true;
 		}
-		if (Object.keys(prepared.modelRoles).length > 0) {
-			prepared.settings.override("modelRoles", {
-				...prepared.settings.get("modelRoles"),
-				...prepared.modelRoles,
-			});
-			modelRolesChanged = true;
-		}
-		if (Object.keys(prepared.agentModelOverrides).length > 0) {
-			prepared.settings.override("task.agentModelOverrides", {
-				...prepared.settings.get("task.agentModelOverrides"),
-				...prepared.agentModelOverrides,
-			});
-			overridesChanged = true;
-		}
+		prepared.settings.override("modelRoles", prepared.modelRoles);
+		modelRolesChanged = true;
+		prepared.settings.override("task.agentModelOverrides", prepared.agentModelOverrides);
+		overridesChanged = true;
 		if (options.persistDefault) {
+			prepared.settings.set("modelRoles", {});
+			prepared.settings.set("task.agentModelOverrides", {});
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			defaultChanged = true;
 			await prepared.settings.flush();
@@ -277,6 +316,8 @@ export async function applyPreparedModelProfileActivation(
 	} catch (error) {
 		if (defaultChanged) {
 			prepared.settings.set("modelProfile.default", previousPersistedDefault);
+			prepared.settings.set("modelRoles", previousModelRoles);
+			prepared.settings.set("task.agentModelOverrides", previousAgentModelOverrides);
 		}
 		if (modelRolesChanged) {
 			prepared.settings.override("modelRoles", previousModelRoles);
