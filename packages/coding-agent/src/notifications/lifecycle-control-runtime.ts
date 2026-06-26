@@ -132,7 +132,10 @@ export function buildCreateArgv(
 	_ids: { intendedSessionId: string; startupPromptRef?: string },
 ): { cwd: string; args: string[] } {
 	if (frame.target.kind === "worktree") {
-		return { cwd: frame.target.repo, args: ["--worktree", frame.target.branch] };
+		// Use the `--worktree=<branch>` form so the branch is a single argv token:
+		// a flag-shaped branch (e.g. `-x`) can never be mis-parsed as a separate
+		// launcher flag / detached-mode trigger.
+		return { cwd: frame.target.repo, args: [`--worktree=${frame.target.branch}`] };
 	}
 	return { cwd: frame.target.path, args: [] };
 }

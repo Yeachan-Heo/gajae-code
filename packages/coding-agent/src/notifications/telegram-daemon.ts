@@ -215,6 +215,7 @@ export function startDaemonLifecycleControl(input: {
 	const deps = buildOrchestratorDeps({
 		pairedChatId: input.pairedChatId,
 		agentNotificationsDir: daemonPaths(input.agentDir).dir,
+		sessionsRoot: path.join(input.agentDir, "sessions"),
 		env: input.env,
 	});
 	attachLifecycleControl(input.controlServer, deps);

@@ -1949,6 +1949,39 @@ test("a fresh daemon scanRoots reconnects an existing session endpoint", async (
 	expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
+test("scanRoots connects only live endpoints (skips stale + dead-PID records)", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "live" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
+	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(path.join(endpointDir, "live.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }));
+	fs.writeFileSync(
+		path.join(endpointDir, "stale.json"),
+		JSON.stringify({ url: "ws://stale", token: "t", pid: 4242, stale: true }),
+	);
+	fs.writeFileSync(path.join(endpointDir, "dead.json"), JSON.stringify({ url: "ws://dead", token: "t", pid: 999999 }));
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+		// Only pid 4242 is "alive"; 999999 is dead.
+		pidAlive: (pid: number) => pid === 4242,
+	});
+	await daemon.scanRoots();
+	expect(daemon.sessions.has("live")).toBe(true);
+	expect(daemon.sessions.has("stale")).toBe(false);
+	expect(daemon.sessions.has("dead")).toBe(false);
+	expect(FakeWs.instances.every(ws => ws.url.startsWith("ws://live"))).toBe(true);
+});
+
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);

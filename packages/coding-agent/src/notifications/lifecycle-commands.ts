@@ -169,7 +169,9 @@ function isSafePath(value: string): boolean {
 }
 
 function isSafeBranch(value: string): boolean {
-	return /^[A-Za-z0-9._/-]{1,255}$/.test(value) && !value.includes("..");
+	// Defense-in-depth: also reject leading-hyphen names so a branch can never be
+	// mistaken for a CLI flag downstream.
+	return /^[A-Za-z0-9._/-]{1,255}$/.test(value) && !value.includes("..") && !value.startsWith("-");
 }
 
 /**

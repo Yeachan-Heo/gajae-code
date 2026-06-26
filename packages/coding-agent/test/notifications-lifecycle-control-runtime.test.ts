@@ -68,7 +68,7 @@ describe("lifecycle control runtime", () => {
 			buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" } }), {
 				intendedSessionId: "x",
 			}),
-		).toEqual({ cwd: "/r", args: ["--worktree", "feat/y"] });
+		).toEqual({ cwd: "/r", args: ["--worktree=feat/y"] });
 		expect(
 			buildCreateArgv(createFrame({ target: { kind: "plain_dir", path: "/new" } }), { intendedSessionId: "x" }),
 		).toEqual({ cwd: "/new", args: [] });
@@ -80,6 +80,18 @@ describe("lifecycle control runtime", () => {
 		});
 		const { mode, remainingArgs } = parseLaunchWorktreeMode(args);
 		expect(mode).toEqual({ enabled: true, detached: false, name: "feat/y" });
+		expect(remainingArgs).toEqual([]);
+	});
+
+	it("a flag-shaped branch stays a named worktree (no detached/stray-flag mis-parse)", () => {
+		// `--worktree=<branch>` keeps the branch a single argv token even if it
+		// looks like a flag, so it can never trigger detached mode.
+		const { args } = buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "/r", branch: "-x" } }), {
+			intendedSessionId: "x",
+		});
+		expect(args).toEqual(["--worktree=-x"]);
+		const { mode, remainingArgs } = parseLaunchWorktreeMode(args);
+		expect(mode).toEqual({ enabled: true, detached: false, name: "-x" });
 		expect(remainingArgs).toEqual([]);
 	});
 
