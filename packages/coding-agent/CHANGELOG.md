@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Deep Interview (and any scrollable `ask`/hook selector) no longer enables SGR mouse reporting, which was hijacking the mouse wheel and disabling the terminal's native scrollback while a question was on screen. The wheel now scrolls the terminal as usual; long questions still scroll inside the dialog via PgUp/PgDn.
+- Scrollable Deep Interview question boxes now show explicit `▲ more` / `▼ more` affordances when hidden question text exists, and selector mode also supports Ctrl+u/Ctrl+d as question-scroll aliases for PgUp/PgDn.
+
 ## [0.7.3] - 2026-06-25
 
 ### Added
