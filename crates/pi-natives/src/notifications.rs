@@ -246,7 +246,8 @@ impl NotificationServer {
 
 	/// Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
 	/// `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-	/// `image_attachment`, `config_update`, `hello`). Not buffered for replay.
+	/// `image_attachment`, `session_closed`, `config_update`, `hello`). Not
+	/// buffered for replay.
 	///
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.

@@ -197,3 +197,19 @@ test("inbound /verbose and /lean update runtime verbosity and confirmation polic
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
 }, 30000);
+
+test("session shutdown emits session_closed before stopping the endpoint", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await waitFor(() => frames.some(f => f.type === "activity"), 3000, "activity frame");
+		frames.length = 0;
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		await waitFor(() => frames.some(f => f.type === "session_closed"), 3000, "session_closed frame");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);

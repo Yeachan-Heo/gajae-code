@@ -130,9 +130,10 @@ per-session repo/branch/machine header), `context_update` (last message, task,
 goal, token usage, model, diff), `turn_stream` (live/finalized turn output),
 `image_attachment` (agent-produced images), `activity` (busy/idle, drives the
 typing indicator), `inbound_ack` (delivery state of an injected user message),
-`config_update` (current verbosity/redact), `hello` (server capability/version),
-and `pong`. A minimal client only needs `action_needed`, `action_resolved`, and
-`reply_rejected`.
+`session_closed` (endpoint teardown; threaded clients may delete/archive the
+remote conversation), `config_update` (current verbosity/redact), `hello`
+(server capability/version), and `pong`. A minimal client only needs
+`action_needed`, `action_resolved`, and `reply_rejected`.
 
 ### Client → server
 
@@ -239,6 +240,12 @@ directory. It enables:
 After setup, sessions auto-connect when notifications are enabled. Each session
 still publishes its own loopback endpoint; the daemon is only the Telegram-side
 multiplexer.
+
+For Telegram forum topics, the daemon deletes the per-session topic when the local
+notification endpoint shuts down, so it disappears from the topic list. A resumed
+session creates a fresh topic before sending again. The bot must be allowed to
+delete messages in that chat; without that permission, deletion is best-effort and
+delivery continues.
 
 ### Singleton poller and trust model
 

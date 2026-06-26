@@ -1199,6 +1199,14 @@ export class TelegramNotificationDaemon {
 						await this.setReaction(target.messageId, CONSUMED_REACTION);
 					}
 				},
+			})
+			.add({
+				name: "session_closed",
+				matches: msg => msg.type === "session_closed",
+				handle: async session => {
+					this.busy.delete(session.sessionId);
+					await this.deleteTopic(session.sessionId);
+				},
 			});
 	}
 
@@ -1450,6 +1458,29 @@ export class TelegramNotificationDaemon {
 			return rec.topicId;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
+	private async deleteTopic(sessionId: string): Promise<void> {
+		const record = this.topics.get(sessionId);
+		if (!record) return;
+		try {
+			// Drain any queued final turn/context frames before deleting the topic.
+			await this.flushPool();
+			const res = (await this.botApi.call("deleteForumTopic", {
+				chat_id: this.opts.chatId,
+				message_thread_id: Number(record.topicId),
+			})) as { ok?: boolean };
+			if (res?.ok === false) return;
+			this.topics.delete(sessionId);
+			this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
+				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
+			});
+			this.pendingThreadedFrames.delete(sessionId);
+			await this.persistTopics();
+		} catch {
+			// Best-effort: missing Telegram topic permissions must not stop teardown.
 		}
 	}
 

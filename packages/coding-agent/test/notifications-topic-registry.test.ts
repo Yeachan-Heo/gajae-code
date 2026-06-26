@@ -78,4 +78,23 @@ describe("TopicRegistry", () => {
 		expect(results.map(r => r.topicId)).toEqual(["topic-1", "topic-1", "topic-1"]);
 		expect(reg.sessionForTopic("topic-1")).toBe("s1");
 	});
+
+	test("deletes topic records so later use creates a fresh topic", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "t1");
+
+		expect(reg.delete("s1")).toBe(true);
+		expect(reg.delete("s1")).toBe(false);
+		expect(reg.get("s1")).toBeUndefined();
+		expect(reg.sessionForTopic("t1")).toBeUndefined();
+
+		let created = false;
+		const rec = await reg.getOrCreateTopic("s1", async () => {
+			created = true;
+			return "t2";
+		});
+		expect(created).toBe(true);
+		expect(rec.topicId).toBe("t2");
+		expect(reg.sessionForTopic("t2")).toBe("s1");
+	});
 });
