@@ -6,8 +6,8 @@
 //!
 //! Design boundary (deliberate): the Rust side is a *minimal authenticated
 //! ingress*. It parses, authenticates, and forwards lifecycle frames; it does
-//! **not** own Telegram policy, spawn orchestration, idempotency, rate limiting,
-//! audit, or UX — those live in the TypeScript daemon.
+//! **not** own Telegram policy, spawn orchestration, idempotency, rate
+//! limiting, audit, or UX — those live in the TypeScript daemon.
 //!
 //! Field names are `camelCase` on the wire (matching the TypeScript daemon),
 //! while the `type` / enum discriminators are `snake_case`, consistent with the
@@ -278,7 +278,8 @@ pub enum LifecycleErrorReason {
 	TerminalUncertain,
 }
 
-/// A candidate returned with an [`LifecycleErrorReason::AmbiguousTarget`] error.
+/// A candidate returned with an [`LifecycleErrorReason::AmbiguousTarget`]
+/// error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeCandidate {
@@ -384,7 +385,7 @@ mod tests {
 			update_id:            100,
 			chat_id:              "42".into(),
 			token:                "control-token".into(),
-			target:              SessionCreateTarget::ExistingPath { path: "/repo".into() },
+			target:               SessionCreateTarget::ExistingPath { path: "/repo".into() },
 			startup_prompt_ref:   Some("prompt_lc_01".into()),
 		});
 		assert_eq!(round_trip(&msg), msg);
@@ -392,10 +393,8 @@ mod tests {
 
 	#[test]
 	fn create_target_kind_is_snake_case_on_wire() {
-		let target = SessionCreateTarget::Worktree {
-			repo:   "/repo".into(),
-			branch: "feat/x".into(),
-		};
+		let target =
+			SessionCreateTarget::Worktree { repo: "/repo".into(), branch: "feat/x".into() };
 		let json = serde_json::to_value(&target).expect("serialize");
 		assert_eq!(json["kind"], "worktree");
 		assert_eq!(json["repo"], "/repo");
@@ -433,10 +432,7 @@ mod tests {
 				url:   "ws://127.0.0.1:49152".into(),
 				token: "session-token".into(),
 			},
-			topic:                LifecycleTopic {
-				chat_id:   "42".into(),
-				thread_id: "99".into(),
-			},
+			topic:                LifecycleTopic { chat_id: "42".into(), thread_id: "99".into() },
 			target:               SessionCreateTarget::ExistingPath { path: "/repo".into() },
 		});
 		let json = serde_json::to_value(&resp).expect("serialize");

@@ -27,40 +27,40 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct EndpointRecord {
 	/// Schema version.
-	pub version:    u32,
+	pub version:              u32,
 	/// The session id this endpoint serves.
-	pub session_id: String,
+	pub session_id:           String,
 	/// The OS process id hosting the server (for dead-PID stale cleanup).
-	pub pid:        u32,
+	pub pid:                  u32,
 	/// Bind host (always loopback in practice).
-	pub host:       String,
+	pub host:                 String,
 	/// Bound port.
-	pub port:       u16,
+	pub port:                 u16,
 	/// Full `ws://host:port` URL.
-	pub url:        String,
+	pub url:                  String,
 	/// The per-session token. Required by clients; never log it raw.
-	pub token:      String,
+	pub token:                String,
 	/// Epoch-millis when the server started.
-	pub started_at: u64,
+	pub started_at:           u64,
 	/// Epoch-millis of the last update.
-	pub updated_at: u64,
+	pub updated_at:           u64,
 	/// Set true when the server stopped but the file could not be removed.
 	#[serde(default)]
-	pub stale:      bool,
+	pub stale:                bool,
 	/// Epoch-millis when the server stopped, if known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stopped_at: Option<u64>,
+	pub stopped_at:           Option<u64>,
 	/// Lifecycle marker echoed when this session was spawned by the control
 	/// ingress, so a `session_create` matches by marker (never "newest").
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lifecycle_request_id: Option<String>,
 	/// Startup-prompt reference echoed when spawned by the control ingress.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub startup_prompt_ref: Option<String>,
+	pub startup_prompt_ref:   Option<String>,
 	/// The preallocated intended session id propagated to the child, when the
 	/// session was spawned by the control ingress.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub intended_session_id: Option<String>,
+	pub intended_session_id:  Option<String>,
 }
 
 impl EndpointRecord {
@@ -196,7 +196,6 @@ impl ControlEndpointRecord {
 			stopped_at: None,
 		}
 	}
-
 }
 
 /// Path of the daemon-owned control-endpoint file under an agent dir.
@@ -309,8 +308,9 @@ fn mark_stale(path: &Path) -> std::io::Result<()> {
 	fs::write(path, json)
 }
 
-/// Mark a **control** endpoint file stale when it cannot be deleted. The control
-/// record never persists a token, so this only flips the stale flag/timestamp.
+/// Mark a **control** endpoint file stale when it cannot be deleted. The
+/// control record never persists a token, so this only flips the stale
+/// flag/timestamp.
 fn mark_control_stale(path: &Path) -> std::io::Result<()> {
 	let Some(mut record) = read_control_endpoint_at(path) else {
 		return fs::remove_file(path);
@@ -321,7 +321,8 @@ fn mark_control_stale(path: &Path) -> std::io::Result<()> {
 	fs::write(path, json)
 }
 
-/// Read a control-endpoint record from an explicit path (used by stale-marking).
+/// Read a control-endpoint record from an explicit path (used by
+/// stale-marking).
 fn read_control_endpoint_at(path: &Path) -> Option<ControlEndpointRecord> {
 	let bytes = fs::read(path).ok()?;
 	serde_json::from_slice(&bytes).ok()
@@ -456,8 +457,11 @@ mod tests {
 	#[test]
 	fn endpoint_with_lifecycle_markers_roundtrips() {
 		let root = temp_root();
-		let rec = EndpointRecord::new("sess-1", "127.0.0.1", 5555, "secret-token")
-			.with_lifecycle("lc_01", "sess-1", Some("prompt_lc_01".into()));
+		let rec = EndpointRecord::new("sess-1", "127.0.0.1", 5555, "secret-token").with_lifecycle(
+			"lc_01",
+			"sess-1",
+			Some("prompt_lc_01".into()),
+		);
 		let path = write_endpoint(&root, &rec).unwrap();
 		let read = read_endpoint(&path).unwrap();
 		assert_eq!(read.lifecycle_request_id.as_deref(), Some("lc_01"));
@@ -500,7 +504,8 @@ mod tests {
 		assert_eq!(read, rec);
 		// The control discovery file MUST NOT carry any token: the daemon owns the
 		// in-memory secret and is the only client; persisting it would be a leak.
-		let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+		let json: serde_json::Value =
+			serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 		assert!(json.get("token").is_none(), "control.json must not contain a token field");
 		assert_eq!(json.get("url").and_then(|v| v.as_str()), Some("ws://127.0.0.1:6000"));
 		remove_control_endpoint(&root).unwrap();

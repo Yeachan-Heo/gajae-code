@@ -45,15 +45,15 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ControlServerConfig {
 	/// The control token clients must present (`?token=` + per-frame `token`).
-	pub token:      String,
+	pub token:     String,
 	/// Bind host. Defaults to loopback via [`ControlServerConfig::new`].
-	pub host:       IpAddr,
+	pub host:      IpAddr,
 	/// Bind port. `0` selects an ephemeral port; the bound port is read back.
-	pub port:       u16,
+	pub port:      u16,
 	/// Daemon agent dir; when set, the control discovery file is written here.
-	pub agent_dir:  Option<PathBuf>,
+	pub agent_dir: Option<PathBuf>,
 	/// Identifier of the daemon that owns this endpoint.
-	pub owner_id:   String,
+	pub owner_id:  String,
 }
 
 impl ControlServerConfig {
@@ -166,11 +166,8 @@ pub async fn start_control(config: ControlServerConfig) -> std::io::Result<Contr
 	let addr = listener.local_addr()?;
 
 	if let Some(agent_dir) = config.agent_dir.as_deref() {
-		let record = ControlEndpointRecord::new(
-			&addr.ip().to_string(),
-			addr.port(),
-			config.owner_id.as_str(),
-		);
+		let record =
+			ControlEndpointRecord::new(&addr.ip().to_string(), addr.port(), config.owner_id.as_str());
 		crate::discovery::write_control_endpoint(agent_dir, &record)?;
 	}
 
@@ -445,10 +442,7 @@ mod tests {
 			other => panic!("expected unauthorized error, got {other:?}"),
 		}
 		// And nothing was forwarded to the host.
-		assert!(
-			rx.try_recv().is_err(),
-			"unauthorized frame must not be forwarded to the host"
-		);
+		assert!(rx.try_recv().is_err(), "unauthorized frame must not be forwarded to the host");
 		handle.stop();
 	}
 
@@ -456,7 +450,9 @@ mod tests {
 	async fn non_loopback_bind_is_refused() {
 		let mut config = ControlServerConfig::new("control-token", "daemon-1");
 		config.host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-		let err = start_control(config).await.expect_err("must refuse non-loopback");
+		let err = start_control(config)
+			.await
+			.expect_err("must refuse non-loopback");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 	}
 }

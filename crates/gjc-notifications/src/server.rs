@@ -974,7 +974,11 @@ mod tests {
 		// A client connected before readiness sees it broadcast live.
 		let mut early = connect(&handle, "secret").await;
 		let hello = next_server_hello(&mut early).await;
-		assert!(hello.capabilities.contains(&capabilities::SESSION_READY.into()));
+		assert!(
+			hello
+				.capabilities
+				.contains(&capabilities::SESSION_READY.into())
+		);
 		wait_for_clients(&handle, 1).await;
 
 		handle.push_session_ready(SessionReady {
