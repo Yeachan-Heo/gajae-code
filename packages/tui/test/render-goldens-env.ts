@@ -22,6 +22,7 @@ export const GOLDEN_BASELINE_ENV: Record<string, string | undefined> = {
 	TERMUX_VERSION: undefined,
 	SSH_TTY: undefined,
 	CI: undefined,
+	GJC_TUI_IME_CURSOR: "0",
 };
 
 for (const [key, value] of Object.entries(GOLDEN_BASELINE_ENV)) {
