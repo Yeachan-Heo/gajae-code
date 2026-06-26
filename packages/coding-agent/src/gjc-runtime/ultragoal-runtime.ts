@@ -2267,12 +2267,23 @@ function snapshotUpdatedAtMilliseconds(value: unknown): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+function singleSessionLeafId(entries: readonly SessionEntry[]): string | undefined {
+	if (entries.length === 0) return undefined;
+	const parentIds = new Set(
+		entries.map(entry => entry.parentId).filter((parentId): parentId is string => typeof parentId === "string"),
+	);
+	const leafIds = entries.map(entry => entry.id).filter(id => !parentIds.has(id));
+	return leafIds.length === 1 ? leafIds[0] : undefined;
+}
+
 async function readCurrentSessionGjcGoalSnapshot(): Promise<unknown | undefined> {
 	const sessionFile = process.env[GJC_SESSION_FILE_ENV]?.trim();
 	if (!sessionFile) return undefined;
 	const fileEntries = await loadEntriesFromFile(sessionFile);
 	const entries = fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-	const context = buildSessionContext(entries);
+	const leafId = singleSessionLeafId(entries);
+	if (!leafId) return undefined;
+	const context = buildSessionContext(entries, leafId);
 	if (context.mode !== "goal" && context.mode !== "goal_paused") return undefined;
 	const goal = normalizeGoal(context.modeData?.goal);
 	return goal ? { goal } : undefined;
