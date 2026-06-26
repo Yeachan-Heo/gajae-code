@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
-import { type PruneConfig, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
-import type { ToolResultMessage } from "@gajae-code/ai/types";
+import {
+	type PruneConfig,
+	pruneAssistantToolArguments,
+	pruneToolOutputs,
+} from "@gajae-code/agent-core/compaction/pruning";
+import type { ToolCall, ToolResultMessage } from "@gajae-code/ai/types";
 
 const timestamp = "2026-06-11T00:00:00.000Z";
 
@@ -41,6 +45,45 @@ function customEntry(id: string): SessionEntry {
 		customType: "redteam-marker",
 		data: { id },
 	};
+}
+
+function assistantEntry(
+	id: string,
+	callId: string,
+	toolName: string,
+	args: Record<string, unknown>,
+): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp,
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: callId, name: toolName, arguments: args }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "m",
+			stopReason: "toolUse",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.parse(timestamp),
+		},
+	} as SessionMessageEntry;
+}
+
+function toolCallOf(entry: SessionMessageEntry): ToolCall {
+	const message = entry.message;
+	expect(message.role).toBe("assistant");
+	const block = message.role === "assistant" ? message.content[0] : undefined;
+	expect(block?.type).toBe("toolCall");
+	return block as ToolCall;
 }
 
 function textOf(entry: SessionMessageEntry): string {
@@ -201,5 +244,53 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		const second = pruneToolOutputs(entries, config({ protectTokens: tokens(newest), minimumSavings: 0 }));
 		expect(second).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
 		expect((old.message as ToolResultMessage).prunedAt).toBeNumber();
+	});
+});
+
+describe("pruneAssistantToolArguments red-team boundaries", () => {
+	test("protect window preserves newest stale assistant arguments", () => {
+		const stale = assistantEntry("a-old", "call-old", "edit", {
+			path: "src/a.ts",
+			old_string: "old",
+			new_string: "new".repeat(1000),
+		});
+		const staleResult = toolEntry("old", "edit", "ok");
+		const newest = assistantEntry("a-new", "call-new", "write", { path: "src/a.ts", content: "latest" });
+		const newestResult = toolEntry("new", "write", "ok");
+		const entries: SessionEntry[] = [stale, staleResult, newest, newestResult];
+
+		const result = pruneAssistantToolArguments(
+			entries,
+			config({ protectTokens: estimateMessageTokensHeuristic(newest.message) + 1, minimumSavings: 0 }),
+		);
+
+		expect(result.argumentPrunedCount).toBe(0);
+		expect(toolCallOf(stale).arguments).not.toHaveProperty("pruned");
+	});
+
+	test("already-pruned assistant arguments are not re-pruned", () => {
+		const stale = assistantEntry("a-old", "call-old", "edit", {
+			path: "src/a.ts",
+			old_string: "old",
+			new_string: "new".repeat(1000),
+		});
+		toolCallOf(stale).arguments = {
+			pruned: true,
+			reason: "stale_tool_arguments",
+			pathHints: ["src/a.ts"],
+			originalChars: 4096,
+			prunedAt: 123,
+		};
+		const entries: SessionEntry[] = [
+			stale,
+			toolEntry("old", "edit", "ok"),
+			assistantEntry("a-new", "call-new", "write", { path: "src/a.ts", content: "latest" }),
+			toolEntry("new", "write", "ok"),
+		];
+
+		const result = pruneAssistantToolArguments(entries, config({ protectTokens: 0, minimumSavings: 0 }));
+
+		expect(result).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+		expect(toolCallOf(stale).arguments).toMatchObject({ pruned: true, prunedAt: 123 });
 	});
 });

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolResultMessage } from "@gajae-code/ai";
+import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import { estimateEntryTokens } from "../src/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
-import { DEFAULT_PRUNE_CONFIG, type PruneConfig, pruneToolOutputs } from "../src/compaction/pruning";
+import {
+	DEFAULT_PRUNE_CONFIG,
+	type PruneConfig,
+	pruneAssistantToolArguments,
+	pruneToolOutputs,
+} from "../src/compaction/pruning";
 
 /**
  * Staleness-aware pruning: superseded tool results (same target read/searched
@@ -37,6 +43,19 @@ function assistantCallEntry(callId: string, toolName: string, args: Record<strin
 			timestamp: idCounter,
 		},
 	} as SessionEntry;
+}
+
+function toolCallBlock(entry: SessionEntry): ToolCall {
+	expect(entry.type).toBe("message");
+	const message = (entry as SessionMessageEntry).message;
+	expect(message.role).toBe("assistant");
+	const block = message.role === "assistant" ? message.content[0] : undefined;
+	expect(block?.type).toBe("toolCall");
+	return block as ToolCall;
+}
+
+function argumentSentinel(entry: SessionEntry): Record<string, unknown> {
+	return toolCallBlock(entry).arguments;
 }
 
 function toolResultEntry(callId: string, toolName: string, sizeChars = 8000, isError = false): SessionMessageEntry {
@@ -452,5 +471,156 @@ describe("protected tools", () => {
 		const config: PruneConfig = { protectTokens: 0, minimumSavings: 0, protectedTools: ["read"] };
 		const ids = prunedIds(entries, config);
 		expect(ids).not.toContain(oldRead.id);
+	});
+});
+describe("assistant edit argument pruning", () => {
+	it("detects customWireName apply_patch candidates and prunes stale arguments", () => {
+		const entries: SessionEntry[] = [];
+		const staleCall = assistantCallEntry("c1", "edit", {
+			input: ["*** Begin Patch", "*** Update File: src/a.ts", "@@", "-old", "+new", "*** End Patch"].join("\n"),
+			payload: "x".repeat(2000),
+		});
+		toolCallBlock(staleCall).customWireName = "apply_patch";
+		entries.push(staleCall, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "new" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(1);
+		expect(result.argumentTokensSaved).toBeGreaterThan(0);
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual([staleCall.id]);
+		expect(argumentSentinel(staleCall)).toMatchObject({
+			pruned: true,
+			reason: "stale_tool_arguments",
+			pathHints: ["src/a.ts"],
+		});
+	});
+
+	it("stales earlier edit arguments only from later successful tool results", () => {
+		const entries: SessionEntry[] = [];
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "c" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(1);
+		expect(argumentSentinel(oldEdit).reason).toBe("stale_tool_arguments");
+	});
+
+	it("failed edits do not stale earlier arguments for the same path", () => {
+		const entries: SessionEntry[] = [];
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "c" }, 100, true);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(0);
+		expect(argumentSentinel(oldEdit).reason).not.toBe("stale_tool_arguments");
+	});
+
+	it("keeps the latest edit arguments and ambiguous-path calls", () => {
+		const entries: SessionEntry[] = [];
+		const ambiguous = assistantCallEntry("c0", "ast_edit", { ops: [{ pat: "foo", out: "bar" }] });
+		entries.push(ambiguous, toolResultEntry("c0", "ast_edit", 100));
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		const latestCall = assistantCallEntry("c2", "write", { path: "src/a.ts", content: "c".repeat(2000) });
+		entries.push(latestCall, toolResultEntry("c2", "write", 100));
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(1);
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual([oldEdit.id]);
+		expect(argumentSentinel(ambiguous).reason).not.toBe("stale_tool_arguments");
+		expect(argumentSentinel(latestCall).reason).not.toBe("stale_tool_arguments");
+	});
+
+	it("is idempotent and shrinks assistant token estimates", () => {
+		const entries: SessionEntry[] = [];
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(4000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "c" }, 100);
+		const beforeTokens = estimateEntryTokens(oldEdit);
+
+		const first = pruneAssistantToolArguments(entries, EAGER);
+		const afterTokens = estimateEntryTokens(oldEdit);
+		const second = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(first.argumentPrunedCount).toBe(1);
+		expect(first.argumentTokensSaved).toBeGreaterThan(0);
+		expect(afterTokens).toBeLessThan(beforeTokens);
+		expect(second).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+	});
+
+	it("does not prune a multi-file apply_patch when only one touched file is later mutated", () => {
+		const entries: SessionEntry[] = [];
+		const multiFile = assistantCallEntry("c1", "apply_patch", {
+			input: [
+				"*** Begin Patch",
+				"*** Update File: src/a.ts",
+				"@@",
+				"-olda",
+				"+newa",
+				"*** Update File: src/b.ts",
+				"@@",
+				"-oldb",
+				"+newb",
+				"*** End Patch",
+			].join("\n"),
+			payload: "x".repeat(2000),
+		});
+		entries.push(multiFile, toolResultEntry("c1", "apply_patch", 100));
+		// Later successful write touches ONLY src/a.ts; src/b.ts is still current.
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "c" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(0);
+		expect(argumentSentinel(multiFile).reason).not.toBe("stale_tool_arguments");
+	});
+
+	it("prunes a multi-file apply_patch only when every touched file is later mutated", () => {
+		const entries: SessionEntry[] = [];
+		const multiFile = assistantCallEntry("c1", "apply_patch", {
+			input: [
+				"*** Begin Patch",
+				"*** Update File: src/a.ts",
+				"@@",
+				"-olda",
+				"+newa",
+				"*** Update File: src/b.ts",
+				"@@",
+				"-oldb",
+				"+newb",
+				"*** End Patch",
+			].join("\n"),
+			payload: "x".repeat(2000),
+		});
+		entries.push(multiFile, toolResultEntry("c1", "apply_patch", 100));
+		pair(entries, "c2", "write", { path: "src/a.ts", content: "c" }, 100);
+		pair(entries, "c3", "write", { path: "src/b.ts", content: "d" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+
+		expect(result.argumentPrunedCount).toBe(1);
+		expect(argumentSentinel(multiFile).reason).toBe("stale_tool_arguments");
 	});
 });

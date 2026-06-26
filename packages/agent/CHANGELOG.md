@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pruneAssistantToolArguments`: an isolated pre-compaction pruning pass that redacts stale `edit`/`write`/`apply_patch`/`ast_edit` tool-call argument payloads only when every touched path group has a later successful mutation, preserving tool-call identity (id/name/customWireName/signatures/intent/path hints), protecting latest/failed/ambiguous calls, and reporting separate stats from tool-result pruning. Reduces pre-compaction context pressure and the resident footprint of superseded large edit arguments.
+
 ## [0.7.3] - 2026-06-25
 ### Added
 

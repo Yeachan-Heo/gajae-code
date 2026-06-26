@@ -126,6 +126,24 @@ function estimatePrunedSavings(tokens: number, notice: string): number {
 	return Math.max(0, tokens - noticeTokens);
 }
 
+export interface AssistantArgumentPruneResult {
+	argumentPrunedCount: number;
+	argumentTokensSaved: number;
+	/**
+	 * The mutated assistant message entries. Callers whose entry source returns
+	 * materialized copies must write these back into their canonical store by id.
+	 */
+	prunedEntries: SessionMessageEntry[];
+}
+
+interface PrunedToolArgumentsSentinel {
+	pruned: true;
+	reason: "stale_tool_arguments";
+	pathHints: string[];
+	originalChars: number;
+	prunedAt: number;
+}
+
 const EDIT_TOOL_NAMES = new Set(["edit", "write", "apply_patch", "ast_edit"]);
 
 /** Extract the file-path argument from a tool call, when the tool has one. */
@@ -169,6 +187,68 @@ function editToolPathGroups(call: ToolCall): string[][] {
 		}
 	}
 	return groups;
+}
+function pathGroupKey(group: string[]): string {
+	return JSON.stringify([...group].sort());
+}
+
+function pathHintsForGroups(groups: string[][]): string[] {
+	return [...new Set(groups.flat())].sort();
+}
+
+function isPrunedToolArgumentsSentinel(value: unknown): value is PrunedToolArgumentsSentinel {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { pruned?: unknown; reason?: unknown }).pruned === true &&
+		(value as { pruned?: unknown; reason?: unknown }).reason === "stale_tool_arguments"
+	);
+}
+
+function isEditToolCall(call: ToolCall): boolean {
+	return EDIT_TOOL_NAMES.has(call.name) || call.customWireName === "apply_patch";
+}
+
+interface AssistantArgumentStalenessIndex {
+	latestSuccessfulMutationByPathGroup: Map<string, { index: number; callId: string }>;
+	failedCallIds: Set<string>;
+}
+
+function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): AssistantArgumentStalenessIndex {
+	const callsById = new Map<string, ToolCall>();
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const message = entry.message as AgentMessage;
+		if (message.role !== "assistant") continue;
+		for (const content of message.content) {
+			if (content.type === "toolCall") callsById.set(content.id, content);
+		}
+	}
+
+	const latestSuccessfulMutationByPathGroup = new Map<string, { index: number; callId: string }>();
+	const failedCallIds = new Set<string>();
+	for (let i = 0; i < entries.length; i++) {
+		const message = getToolResultMessage(entries[i]);
+		if (!message) continue;
+		const call = callsById.get(message.toolCallId);
+		if (!call || !isEditToolCall(call)) continue;
+		const detailFiles = call.name === "ast_edit" ? resultDetailFiles(message) : [];
+		const groups = detailFiles.length > 0 ? detailFiles.map(file => [file]) : editToolPathGroups(call);
+		if (groups.length === 0) continue;
+		if (message.isError) {
+			failedCallIds.add(call.id);
+			continue;
+		}
+		const failed = failedEditPaths(message);
+		let mutated = false;
+		for (const group of groups) {
+			if (group.some(groupPath => failed.has(groupPath))) continue;
+			latestSuccessfulMutationByPathGroup.set(pathGroupKey(group), { index: i, callId: call.id });
+			mutated = true;
+		}
+		if (!mutated) failedCallIds.add(call.id);
+	}
+	return { latestSuccessfulMutationByPathGroup, failedCallIds };
 }
 
 /**
@@ -360,6 +440,91 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 	}
 
 	return { staleResultIndices };
+}
+export function pruneAssistantToolArguments(
+	entries: SessionEntry[],
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+): AssistantArgumentPruneResult {
+	let accumulatedTokens = 0;
+	let argumentTokensSaved = 0;
+	const { latestSuccessfulMutationByPathGroup, failedCallIds } = buildAssistantArgumentStalenessIndex(entries);
+	const candidates: Array<{
+		entry: SessionMessageEntry;
+		call: ToolCall;
+		pathHints: string[];
+		originalChars: number;
+		savings: number;
+	}> = [];
+
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "message") continue;
+		const message = entry.message as AgentMessage;
+		if (message.role !== "assistant") continue;
+		const entryTokens = estimateEntryTokens(entry);
+		const insideProtectWindow = accumulatedTokens < config.protectTokens;
+		accumulatedTokens += entryTokens;
+		for (const content of message.content) {
+			if (content.type !== "toolCall" || !isEditToolCall(content)) continue;
+			const argumentJson = JSON.stringify(content.arguments);
+			if (argumentJson === undefined) continue;
+			const originalChars = argumentJson.length;
+			if (isPrunedToolArgumentsSentinel(content.arguments)) continue;
+			if (insideProtectWindow || failedCallIds.has(content.id)) continue;
+			const groups = editToolPathGroups(content);
+			if (groups.length === 0) continue;
+			// Arguments are pruned as one indivisible payload, so require EVERY
+			// concrete path group to be stale from a later successful mutation.
+			// A group with no later success (failed/unknown/ambiguous) protects the
+			// whole call rather than dropping non-stale multi-file patch evidence.
+			const isStale =
+				groups.length > 0 &&
+				groups.every(group => {
+					const latest = latestSuccessfulMutationByPathGroup.get(pathGroupKey(group));
+					return latest !== undefined && latest.index > i && latest.callId !== content.id;
+				});
+			if (!isStale) continue;
+			const sentinelChars = JSON.stringify({
+				pruned: true,
+				reason: "stale_tool_arguments",
+				pathHints: pathHintsForGroups(groups),
+				originalChars,
+				prunedAt: 0,
+			} satisfies PrunedToolArgumentsSentinel).length;
+			candidates.push({
+				entry: entry as SessionMessageEntry,
+				call: content,
+				pathHints: pathHintsForGroups(groups),
+				originalChars,
+				savings: Math.max(0, Math.ceil((originalChars - sentinelChars) / 4)),
+			});
+		}
+	}
+
+	for (const candidate of candidates) {
+		argumentTokensSaved += candidate.savings;
+	}
+	if (argumentTokensSaved < config.minimumSavings || candidates.length === 0) {
+		return { argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] };
+	}
+
+	const prunedAt = Date.now();
+	const prunedEntries: SessionMessageEntry[] = [];
+	const prunedEntryIds = new Set<string>();
+	for (const candidate of candidates) {
+		candidate.call.arguments = {
+			pruned: true,
+			reason: "stale_tool_arguments",
+			pathHints: candidate.pathHints,
+			originalChars: candidate.originalChars,
+			prunedAt,
+		};
+		if (!prunedEntryIds.has(candidate.entry.id)) {
+			prunedEntries.push(candidate.entry);
+			prunedEntryIds.add(candidate.entry.id);
+		}
+	}
+	return { argumentPrunedCount: candidates.length, argumentTokensSaved, prunedEntries };
 }
 
 export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {

@@ -41,6 +41,7 @@ import {
 	isBlobRef,
 	isImageDataUrl,
 	MemoryBlobStore,
+	parseBlobRef,
 	ResidentBlobMissingError,
 	resolveImageData,
 	resolveImageDataUrl,
@@ -93,9 +94,55 @@ export interface SessionEntryBase {
 	timestamp: string;
 }
 
+export interface ColdSpillRef {
+	kind: "cold_spill";
+	ref: string;
+	encoding: "utf8" | "json";
+	originalChars: number;
+	sha256: string;
+	bytes: number;
+}
+
+export interface EvictedContentMarker {
+	evictedAt: number;
+	reason: "compacted_history";
+	compactionEntryId: string;
+	firstKeptEntryId: string;
+	payloads: Record<string, ColdSpillRef>;
+}
+
+export interface EvictCompactedContentResult {
+	evictedEntries: number;
+	hotCharsRemoved: number;
+	coldBlobBytes: number;
+	payloadRefs: number;
+	alreadyEvictedEntries: number;
+	coldSpillWriteCount: number;
+	coldSpillReadCount: number;
+	residentTextReadCount: number;
+	residentImageReadCount: number;
+}
+
+export interface SessionManagerObservabilityStats {
+	coldSpillWriteCount: number;
+	coldSpillReadCount: number;
+	residentTextReadCount: number;
+	residentImageReadCount: number;
+	publicMaterializerCallCount: number;
+	getEntryMaterializerCallCount: number;
+	getBranchMaterializerCallCount: number;
+	getEntriesMaterializerCallCount: number;
+	materializedEntriesCachePopulateCount: number;
+	pathOnlyContextBuildCount: number;
+}
+
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	/** Cold-spill marker: when present, heavy message content was moved to durable
+	 *  content-addressed blobs after compaction. The marker is entry-level session
+	 *  metadata (not a message field) so strict message types stay intact. */
+	evictedContent?: EvictedContentMarker;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -227,6 +274,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
+	/** Cold-spill marker for custom-message content evicted after compaction. */
+	evictedContent?: EvictedContentMarker;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
@@ -1199,6 +1248,17 @@ function isResidentBlobSentinel(value: unknown): value is ResidentBlobSentinel {
 		isBlobRef((value as { ref: string }).ref)
 	);
 }
+function containsResidentSentinel(value: unknown, seen = new WeakSet<object>()): boolean {
+	if (value === null || value === undefined || typeof value !== "object") return false;
+	if ((value as { [RESIDENT_BLOB_SENTINEL_KEY]?: unknown })[RESIDENT_BLOB_SENTINEL_KEY] === true) return true;
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsResidentSentinel(item, seen));
+	for (const child of Object.values(value)) {
+		if (containsResidentSentinel(child, seen)) return true;
+	}
+	return false;
+}
 
 /**
  * Recursively truncate large strings in an object for session persistence.
@@ -1257,6 +1317,7 @@ interface ResidentBlobStores {
 	imageStore: BlobStore;
 	sessionId?: string;
 	sessionFile?: string;
+	onResidentBlobRead?: (kind: ResidentBlobKind) => void;
 }
 
 type ResidentBlobMissingPolicy = "throw" | "placeholder";
@@ -1344,6 +1405,7 @@ function materializeResidentValueSync(
 			}
 		}
 		cache.set(cacheKey, resolved);
+		stores.onResidentBlobRead?.(obj.kind);
 		return resolved;
 	}
 	if (Array.isArray(obj)) {
@@ -1433,6 +1495,308 @@ function cloneAgentMessage<T extends AgentMessage>(message: T): T {
 function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	if (entry.type !== "message") return { ...entry };
 	return { ...entry, message: cloneAgentMessage(entry.message) } as SessionEntry;
+}
+
+const COLD_SPILL_NOTICE = "[Compacted history content evicted to durable cold storage]";
+const COLD_SPILL_ARGUMENTS_SENTINEL_KEY = "__gjcColdSpillArguments";
+const COLD_SPILL_MIN_CHARS = 1024;
+
+type ColdSpillWrite = {
+	path: string;
+	encoding: "utf8" | "json";
+	data: Buffer;
+	originalChars: number;
+};
+
+type ColdSpillResidentPromotion = {
+	stores: ResidentBlobStores;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isColdSpillRef(value: unknown): value is ColdSpillRef {
+	return (
+		isRecord(value) &&
+		value.kind === "cold_spill" &&
+		typeof value.ref === "string" &&
+		(value.encoding === "utf8" || value.encoding === "json") &&
+		typeof value.originalChars === "number" &&
+		typeof value.sha256 === "string" &&
+		typeof value.bytes === "number"
+	);
+}
+
+function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && value[COLD_SPILL_ARGUMENTS_SENTINEL_KEY] === true;
+}
+
+function residentBlobBytesForColdSpill(value: ResidentBlobSentinel, promotion: ColdSpillResidentPromotion): Buffer {
+	const hash = parseBlobRef(value.ref);
+	if (!hash)
+		throw new ResidentBlobMissingError(
+			value.ref,
+			value.kind,
+			promotion.stores.sessionId,
+			promotion.stores.sessionFile,
+		);
+	const store = value.kind === "text" ? promotion.stores.textStore : promotion.stores.imageStore;
+	const data = store.getSync(hash);
+	if (!data)
+		throw new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile);
+	promotion.stores.onResidentBlobRead?.(value.kind);
+	if (value.kind === "imageData") return Buffer.from(data.toString("base64"), "utf8");
+	return Buffer.from(data);
+}
+
+function coldSpillResidentValue(
+	value: ResidentBlobSentinel,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): string {
+	const data = residentBlobBytesForColdSpill(value, promotion);
+	writes.push({ path: basePath, encoding: "utf8", data, originalChars: data.byteLength });
+	return COLD_SPILL_NOTICE;
+}
+
+function coldSpillTextValue(value: string, basePath: string, writes: ColdSpillWrite[]): string {
+	writes.push({ path: basePath, encoding: "utf8", data: Buffer.from(value, "utf8"), originalChars: value.length });
+	return COLD_SPILL_NOTICE;
+}
+
+function coldSpillJsonValue(value: unknown, basePath: string, writes: ColdSpillWrite[]): Record<string, unknown> {
+	const json = JSON.stringify(value);
+	writes.push({ path: basePath, encoding: "json", data: Buffer.from(json, "utf8"), originalChars: json.length });
+	return {
+		[COLD_SPILL_ARGUMENTS_SENTINEL_KEY]: true,
+		refPath: basePath,
+		notice: COLD_SPILL_NOTICE,
+	};
+}
+
+function coldSpillSubtreeValue(
+	value: unknown,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	if (isResidentBlobSentinel(value)) return coldSpillResidentValue(value, basePath, writes, promotion);
+	if (isColdSpillArgumentsSentinel(value)) return value;
+	if (typeof value === "string") {
+		return value.length >= COLD_SPILL_MIN_CHARS ? coldSpillTextValue(value, basePath, writes) : value;
+	}
+	if (Array.isArray(value)) {
+		if (!containsResidentSentinel(value)) {
+			const json = JSON.stringify(value);
+			return json.length >= COLD_SPILL_MIN_CHARS ? coldSpillJsonValue(value, basePath, writes) : value;
+		}
+		let changed = false;
+		const next = value.map((child, index) => {
+			const replaced = coldSpillSubtreeValue(child, `${basePath}.${index}`, writes, promotion);
+			if (replaced !== child) changed = true;
+			return replaced;
+		});
+		return changed ? next : value;
+	}
+	if (!isRecord(value)) return value;
+	if (!containsResidentSentinel(value)) {
+		const json = JSON.stringify(value);
+		return json.length >= COLD_SPILL_MIN_CHARS ? coldSpillJsonValue(value, basePath, writes) : value;
+	}
+	let changed = false;
+	const entries = Object.entries(value).map(([key, child]) => {
+		const replaced = coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		if (replaced !== child) changed = true;
+		return [key, replaced] as const;
+	});
+	return changed ? Object.fromEntries(entries) : value;
+}
+
+function coldSpillArgumentsValue(
+	value: unknown,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	return coldSpillSubtreeValue(value, basePath, writes, promotion);
+}
+
+function coldSpillContentBlock(
+	block: unknown,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	if (!isRecord(block) || typeof block.type !== "string") return block;
+	if (isResidentBlobSentinel(block)) return coldSpillResidentValue(block, basePath, writes, promotion);
+	if (block.type === "image") return block;
+	if (block.type === "text") {
+		const text = block.text;
+		if (isResidentBlobSentinel(text))
+			return { ...block, text: coldSpillResidentValue(text, `${basePath}.text`, writes, promotion) };
+		if (typeof text !== "string" || text.length < COLD_SPILL_MIN_CHARS) return block;
+		return { ...block, text: coldSpillTextValue(text, `${basePath}.text`, writes) };
+	}
+	if (block.type === "thinking") {
+		const thinking = block.thinking;
+		if (typeof thinking !== "string" || thinking.length < COLD_SPILL_MIN_CHARS) return block;
+		return { ...block, thinking: coldSpillTextValue(thinking, `${basePath}.thinking`, writes) };
+	}
+	if (block.type === "redactedThinking") {
+		const data = block.data;
+		if (typeof data !== "string" || data.length < COLD_SPILL_MIN_CHARS) return block;
+		return { ...block, data: coldSpillTextValue(data, `${basePath}.data`, writes) };
+	}
+	if (block.type === "toolCall") {
+		const args = block.arguments;
+		if (isColdSpillArgumentsSentinel(args)) return block;
+		const json = JSON.stringify(args);
+		if (json.length < COLD_SPILL_MIN_CHARS && !containsResidentSentinel(args)) return block;
+		const nextArgs = coldSpillArgumentsValue(args, `${basePath}.arguments`, writes, promotion);
+		return nextArgs === args ? block : { ...block, arguments: nextArgs };
+	}
+	let changed = false;
+	const entries = Object.entries(block).map(([key, child]) => {
+		const replaced = key === "type" ? child : coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		if (replaced !== child) changed = true;
+		return [key, replaced] as const;
+	});
+	return changed ? Object.fromEntries(entries) : block;
+}
+
+function coldSpillContentBlocks(
+	value: unknown[],
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	if (!containsResidentSentinel(value)) {
+		let changedRuns = false;
+		const merged: unknown[] = [];
+		for (let index = 0; index < value.length; index++) {
+			const block = value[index];
+			if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+				const start = index;
+				const texts: string[] = [];
+				while (index < value.length) {
+					const runBlock = value[index];
+					if (!isRecord(runBlock) || runBlock.type !== "text" || typeof runBlock.text !== "string") break;
+					texts.push(runBlock.text);
+					index++;
+				}
+				index--;
+				const text = texts.join("");
+				if (text.length >= COLD_SPILL_MIN_CHARS) {
+					changedRuns = true;
+					merged.push({ ...block, text: coldSpillTextValue(text, `${basePath}.${start}.text`, writes) });
+				} else {
+					merged.push(...value.slice(start, index + 1));
+				}
+				continue;
+			}
+			const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+			if (replaced !== block) changedRuns = true;
+			merged.push(replaced);
+		}
+		if (changedRuns) return merged;
+	}
+	let changed = false;
+	const next = value.map((block, index) => {
+		const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+		if (replaced !== block) changed = true;
+		return replaced;
+	});
+	return changed ? next : value;
+}
+
+function coldSpillCustomMessageContent(
+	content: CustomMessageEntry["content"],
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): CustomMessageEntry["content"] {
+	if (typeof content === "string") {
+		return content.length >= COLD_SPILL_MIN_CHARS
+			? coldSpillTextValue(content, "custom_message.content", writes)
+			: content;
+	}
+	if (Array.isArray(content))
+		return coldSpillContentBlocks(
+			content,
+			"custom_message.content",
+			writes,
+			promotion,
+		) as CustomMessageEntry["content"];
+	return content;
+}
+
+function coldSpillUnavailable(ref: ColdSpillRef): string {
+	return `[Cold-spill blob unavailable: ${ref.ref}; original ${ref.originalChars} chars unavailable]`;
+}
+
+function rehydrateColdSpillRef(ref: ColdSpillRef, blobStore: BlobStore, residentStores?: ResidentBlobStores): unknown {
+	const hash = ref.ref.startsWith("blob:sha256:") ? ref.ref.slice("blob:sha256:".length) : ref.sha256;
+	const data = blobStore.getCheckedSync(hash);
+	if (!data || hash !== ref.sha256) return coldSpillUnavailable(ref);
+	const text = data.toString("utf8");
+	if (ref.encoding === "json") {
+		try {
+			const parsed = JSON.parse(text) as unknown;
+			return residentStores ? materializeResidentValueSync(parsed, residentStores) : parsed;
+		} catch {
+			return coldSpillUnavailable(ref);
+		}
+	}
+	return text;
+}
+
+function rehydrateColdSpillValue(
+	value: unknown,
+	marker: EvictedContentMarker | undefined,
+	blobStore: BlobStore,
+	basePath: string,
+	residentStores?: ResidentBlobStores,
+): unknown {
+	const directRef = marker?.payloads[basePath];
+	if (directRef) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
+	if (isColdSpillArgumentsSentinel(value) && typeof value.refPath === "string") {
+		const ref = marker?.payloads[value.refPath];
+		return ref ? rehydrateColdSpillRef(ref, blobStore, residentStores) : value;
+	}
+	if (Array.isArray(value))
+		return value.map((item, index) =>
+			rehydrateColdSpillValue(item, marker, blobStore, `${basePath}.${index}`, residentStores),
+		);
+	if (!isRecord(value)) return value;
+	const entries = Object.entries(value).map(([key, child]) => {
+		if (key === "evictedContent") return [key, child] as const;
+		return [key, rehydrateColdSpillValue(child, marker, blobStore, `${basePath}.${key}`, residentStores)] as const;
+	});
+	return Object.fromEntries(entries);
+}
+
+function rehydrateColdSpillEntry(
+	entry: SessionEntry,
+	blobStore: BlobStore,
+	residentStores?: ResidentBlobStores,
+): SessionEntry {
+	if (entry.type === "message") {
+		const marker = entry.evictedContent;
+		const message = rehydrateColdSpillValue(
+			entry.message,
+			marker,
+			blobStore,
+			"message",
+			residentStores,
+		) as AgentMessage;
+		return { ...entry, message };
+	}
+	if (entry.type === "custom_message") {
+		const marker = entry.evictedContent;
+		return rehydrateColdSpillValue(entry, marker, blobStore, "custom_message", residentStores) as CustomMessageEntry;
+	}
+	return cloneSessionEntry(entry);
 }
 
 async function truncateForPersistence(obj: FileEntry, blobStore: BlobStore, key?: string): Promise<FileEntry>;
@@ -2220,6 +2584,16 @@ export class SessionManager {
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
 	#sessionContextReplayMetadataRevision = -1;
+	#coldSpillWriteCount = 0;
+	#coldSpillReadCount = 0;
+	#residentTextReadCount = 0;
+	#residentImageReadCount = 0;
+	#publicMaterializerCallCount = 0;
+	#getEntryMaterializerCallCount = 0;
+	#getBranchMaterializerCallCount = 0;
+	#getEntriesMaterializerCallCount = 0;
+	#materializedEntriesCachePopulateCount = 0;
+	#pathOnlyContextBuildCount = 0;
 
 	private constructor(
 		private cwd: string,
@@ -2241,6 +2615,19 @@ export class SessionManager {
 			imageStore: this.#residentImageBlobStore,
 			sessionId: this.#sessionId || undefined,
 			sessionFile: this.#sessionFile,
+		};
+	}
+
+	#residentBlobStoresForColdRehydrate(): ResidentBlobStores {
+		return {
+			...this.#residentBlobStores(),
+			onResidentBlobRead: kind => {
+				if (kind === "text") {
+					this.#residentTextReadCount++;
+				} else {
+					this.#residentImageReadCount++;
+				}
+			},
 		};
 	}
 
@@ -3589,7 +3976,214 @@ export class SessionManager {
 		return undefined;
 	}
 
+	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
+		const firstKept = this.#byId.get(firstKeptEntryId);
+		const compaction = this.#byId.get(compactionEntryId);
+		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
+		if (!compaction || compaction.type !== "compaction")
+			throw new Error(`Compaction entry ${compactionEntryId} not found`);
+		const ids: string[] = [];
+		let current: SessionEntry | undefined = compaction;
+		while (current) {
+			ids.push(current.id);
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+		}
+		ids.reverse();
+		let evictedEntries = 0;
+		let hotCharsRemoved = 0;
+		let coldBlobBytes = 0;
+		let payloadRefs = 0;
+		let alreadyEvictedEntries = 0;
+		let mutated = false;
+		try {
+			for (const id of ids) {
+				if (id === firstKeptEntryId) break;
+				const entry = this.#byId.get(id);
+				if (!entry || entry.type === "compaction") continue;
+				if (entry.type !== "message" && entry.type !== "custom_message") continue;
+				if (entry.evictedContent?.reason === "compacted_history") {
+					alreadyEvictedEntries++;
+					continue;
+				}
+				const beforeChars = JSON.stringify(entry).length;
+				const writes: ColdSpillWrite[] = [];
+				const nextEntry = this.#coldSpillClone(entry, writes);
+				if (writes.length === 0 || nextEntry === entry) continue;
+				const payloads: Record<string, ColdSpillRef> = {};
+				for (const write of writes) {
+					const put = this.#blobStore.putImmutableSync(write.data);
+					this.#coldSpillWriteCount++;
+					payloads[write.path] = {
+						kind: "cold_spill",
+						ref: put.ref,
+						encoding: write.encoding,
+						originalChars: write.originalChars,
+						sha256: put.hash,
+						bytes: put.bytes,
+					};
+					coldBlobBytes += put.bytes;
+				}
+				const marker: EvictedContentMarker = {
+					evictedAt: Date.now(),
+					reason: "compacted_history",
+					compactionEntryId,
+					firstKeptEntryId,
+					payloads,
+				};
+				// Store the marker at the ENTRY level (session metadata), not on the
+				// strict message type, so message shapes stay type-clean.
+				if (nextEntry.type === "message" || nextEntry.type === "custom_message") {
+					nextEntry.evictedContent = marker;
+				}
+				this.#replaceCanonicalEntry(nextEntry);
+				mutated = true;
+				evictedEntries++;
+				payloadRefs += writes.length;
+				hotCharsRemoved += Math.max(0, beforeChars - JSON.stringify(nextEntry).length);
+			}
+		} finally {
+			if (mutated) {
+				this.#needsFullRewriteOnNextPersist = true;
+				this.#bumpEntryRevision();
+				this.#replayMetadataRevision++;
+				this.#materializedEntriesCache = undefined;
+				this.#materializedEntriesRevision = -1;
+				this.#sessionContextCache = undefined;
+			}
+		}
+		return {
+			evictedEntries,
+			hotCharsRemoved,
+			coldBlobBytes,
+			payloadRefs,
+			alreadyEvictedEntries,
+			coldSpillWriteCount: this.#coldSpillWriteCount,
+			coldSpillReadCount: this.#coldSpillReadCount,
+			residentTextReadCount: this.#residentTextReadCount,
+			residentImageReadCount: this.#residentImageReadCount,
+		};
+	}
+
+	#coldSpillClone(entry: SessionEntry, writes: ColdSpillWrite[]): SessionEntry {
+		if (entry.type === "message") {
+			const content = "content" in entry.message ? entry.message.content : undefined;
+			if (!Array.isArray(content)) return entry;
+			const nextContent = coldSpillContentBlocks(content, "message.content", writes, {
+				stores: this.#residentBlobStoresForColdRehydrate(),
+			});
+			return nextContent === content
+				? entry
+				: { ...entry, message: { ...entry.message, content: nextContent } as AgentMessage };
+		}
+		if (entry.type === "custom_message") {
+			const content = coldSpillCustomMessageContent(entry.content, writes, {
+				stores: this.#residentBlobStoresForColdRehydrate(),
+			});
+			return content === entry.content ? entry : { ...entry, content };
+		}
+		return entry;
+	}
+
+	#replaceCanonicalEntry(entry: SessionEntry): void {
+		this.#byId.set(entry.id, entry);
+		const index = this.#fileEntries.findIndex(candidate => candidate.type !== "session" && candidate.id === entry.id);
+		if (index >= 0) this.#fileEntries[index] = entry;
+	}
+
+	getObservabilityStatsForTests(): SessionManagerObservabilityStats {
+		return {
+			coldSpillWriteCount: this.#coldSpillWriteCount,
+			coldSpillReadCount: this.#coldSpillReadCount,
+			residentTextReadCount: this.#residentTextReadCount,
+			residentImageReadCount: this.#residentImageReadCount,
+			publicMaterializerCallCount: this.#publicMaterializerCallCount,
+			getEntryMaterializerCallCount: this.#getEntryMaterializerCallCount,
+			getBranchMaterializerCallCount: this.#getBranchMaterializerCallCount,
+			getEntriesMaterializerCallCount: this.#getEntriesMaterializerCallCount,
+			materializedEntriesCachePopulateCount: this.#materializedEntriesCachePopulateCount,
+			pathOnlyContextBuildCount: this.#pathOnlyContextBuildCount,
+		};
+	}
+
+	hotRetainedMessageCharsForTests(): number {
+		let total = 0;
+		for (const entry of this.#fileEntries) {
+			if (entry.type !== "message" && entry.type !== "custom_message") continue;
+			total += JSON.stringify(entry).length;
+		}
+		return total;
+	}
+
+	getCanonicalEntryForTests(id: string): SessionEntry | undefined {
+		const entry = this.#byId.get(id);
+		return entry ? cloneSessionEntry(entry) : undefined;
+	}
+
+	getEntryForFidelity(id: string): SessionEntry | undefined {
+		const entry = this.#byId.get(id);
+		return entry
+			? rehydrateColdSpillEntry(
+					materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()),
+					this.#blobStore,
+					this.#residentBlobStoresForColdRehydrate(),
+				)
+			: undefined;
+	}
+
+	getBranchForFidelity(fromId?: string): SessionEntry[] {
+		const cache = new Map<string, string>();
+		const path: SessionEntry[] = [];
+		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
+		while (current) {
+			path.push(
+				rehydrateColdSpillEntry(
+					materializeResidentEntrySync(current, this.#residentBlobStores(), cache),
+					this.#blobStore,
+					this.#residentBlobStoresForColdRehydrate(),
+				),
+			);
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+		}
+		path.reverse();
+		return path;
+	}
+
+	#getCanonicalBranchClones(fromId?: string): SessionEntry[] {
+		const path: SessionEntry[] = [];
+		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
+		while (current) {
+			path.push(cloneSessionEntry(current));
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+		}
+		path.reverse();
+		return path;
+	}
+
+	/**
+	 * Walk the active branch without materializing resident blobs or rehydrating
+	 * cold-spill payloads. Intended for metadata-only scans such as todo-phase
+	 * sync; callers must not mutate returned entries.
+	 */
+	getActivePathEntriesCanonical(fromId?: string): SessionEntry[] {
+		return this.#getCanonicalBranchClones(fromId);
+	}
+
+	getEntriesForExport(): SessionEntry[] {
+		const cache = new Map<string, string>();
+		return this.#fileEntries
+			.filter((entry): entry is SessionEntry => entry.type !== "session")
+			.map(entry =>
+				rehydrateColdSpillEntry(
+					materializeResidentEntrySync(entry, this.#residentBlobStores(), cache),
+					this.#blobStore,
+					this.#residentBlobStoresForColdRehydrate(),
+				),
+			);
+	}
+
 	getEntry(id: string): SessionEntry | undefined {
+		this.#publicMaterializerCallCount++;
+		this.#getEntryMaterializerCallCount++;
 		const entry = this.#byId.get(id);
 		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
@@ -3647,6 +4241,8 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		this.#publicMaterializerCallCount++;
+		this.#getBranchMaterializerCallCount++;
 		const cache = new Map<string, string>();
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.#leafId;
@@ -3673,12 +4269,59 @@ export class SessionManager {
 		) {
 			return cloneSessionContext(cached);
 		}
-		const context = buildSessionContext(this.#getMaterializedEntriesInternal(), this.#leafId);
+		this.#pathOnlyContextBuildCount++;
+		const context = buildSessionContext(this.#getActivePathEntriesForProviderContext(), this.#leafId);
 		this.#sessionContextCache = new WeakRef(context);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
 		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
 		return cloneSessionContext(context);
+	}
+
+	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
+		if (fromId === null || (fromId === undefined && this.#leafId === null)) return [];
+		const ids: string[] = [];
+		let current = this.#byId.get(fromId ?? this.#leafId ?? "");
+		while (current) {
+			ids.push(current.id);
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+		}
+		ids.reverse();
+		const pathEntries = ids
+			.map(id => this.#byId.get(id))
+			.filter((entry): entry is SessionEntry => entry !== undefined);
+		let compaction: CompactionEntry | undefined;
+		for (const entry of pathEntries) if (entry.type === "compaction") compaction = entry;
+		if (!compaction) return pathEntries.map(entry => this.#entryForProviderContext(entry, undefined));
+		const compactionIndex = pathEntries.findIndex(entry => entry.id === compaction.id);
+		const firstKeptIndex = pathEntries.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+		const remote = compaction.preserveData?.openaiRemoteCompaction;
+		const hasRemoteReplacement = isRecord(remote) && Array.isArray(remote.replacementHistory);
+		return pathEntries.map((entry, index) => {
+			const covered =
+				index < compactionIndex && (hasRemoteReplacement || (firstKeptIndex >= 0 && index < firstKeptIndex));
+			return this.#entryForProviderContext(entry, covered ? "covered" : undefined);
+		});
+	}
+
+	#entryForProviderContext(entry: SessionEntry, coldSpillPolicy: "covered" | undefined): SessionEntry {
+		if (coldSpillPolicy === "covered" && (entry.type === "message" || entry.type === "custom_message")) {
+			return cloneSessionEntry(entry);
+		}
+		if (entry.type !== "message" && entry.type !== "custom_message") return cloneSessionEntry(entry);
+		const materialized = materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map());
+		const rehydrated = rehydrateColdSpillEntry(
+			materialized,
+			this.#blobStore,
+			this.#residentBlobStoresForColdRehydrate(),
+		);
+		if (rehydrated !== materialized) this.#coldSpillReadCount += this.#countColdSpillPayloads(entry);
+		return rehydrated;
+	}
+
+	#countColdSpillPayloads(entry: SessionEntry): number {
+		const marker = entry.type === "message" || entry.type === "custom_message" ? entry.evictedContent : undefined;
+		return marker ? Object.keys(marker.payloads ?? {}).length : 0;
 	}
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
@@ -3721,6 +4364,7 @@ export class SessionManager {
 		if (this.#materializedEntriesRevision === this.#entryRevision && this.#materializedEntriesCache) {
 			return this.#materializedEntriesCache;
 		}
+		this.#materializedEntriesCachePopulateCount++;
 		const resolvedTextBlobCache = new Map<string, string>();
 		const materializedEntries = this.#fileEntries
 			.filter((e): e is SessionEntry => e.type !== "session")
@@ -3731,6 +4375,8 @@ export class SessionManager {
 	}
 
 	getEntries(): SessionEntry[] {
+		this.#publicMaterializerCallCount++;
+		this.#getEntriesMaterializerCallCount++;
 		return this.#getMaterializedEntriesInternal().map(entry => cloneSessionEntry(entry));
 	}
 
@@ -3837,7 +4483,7 @@ export class SessionManager {
 	 */
 	createBranchedSession(leafId: string): string | undefined {
 		const previousSessionFile = this.#sessionFile;
-		const branchPath = this.getBranch(leafId);
+		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}

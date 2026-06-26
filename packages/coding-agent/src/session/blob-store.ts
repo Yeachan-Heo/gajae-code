@@ -11,6 +11,82 @@ export interface BlobPutResult {
 	get ref(): string;
 }
 
+export interface CheckedBlobPutResult extends BlobPutResult {
+	bytes: number;
+}
+
+export class BlobCorruptError extends Error {
+	constructor(
+		readonly hash: string,
+		readonly path: string,
+	) {
+		super(`Blob ${hash} at ${path} failed SHA-256 verification`);
+		this.name = "BlobCorruptError";
+	}
+}
+
+function sha256Hex(data: Buffer): string {
+	return new Bun.SHA256().update(data).digest("hex");
+}
+
+function makeBlobPutResult(hash: string, blobPath: string): BlobPutResult;
+function makeBlobPutResult(hash: string, blobPath: string, bytes: number): CheckedBlobPutResult;
+function makeBlobPutResult(hash: string, blobPath: string, bytes?: number): BlobPutResult | CheckedBlobPutResult {
+	const result = {
+		hash,
+		path: blobPath,
+		get ref() {
+			return `${BLOB_PREFIX}${hash}`;
+		},
+	};
+	if (bytes === undefined) return result;
+	return { ...result, bytes };
+}
+
+function fsyncDirBestEffortSync(dir: string): void {
+	let fd: number | null = null;
+	try {
+		fd = fs.openSync(dir, "r");
+		fs.fsyncSync(fd);
+	} catch {
+		// Best-effort only: some platforms/filesystems do not support fsync on directories.
+	} finally {
+		if (fd !== null) fs.closeSync(fd);
+	}
+}
+
+/**
+ * Best-effort fsync of an installed blob file. Used on install paths that
+ * create the destination by copy (not hard-link from an already-fsynced temp),
+ * so the durable-install contract holds there too. Failures are best-effort:
+ * some platforms/filesystems reject fsync on read-only handles.
+ */
+function fsyncFileBestEffortSync(filePath: string): void {
+	let fd: number | null = null;
+	try {
+		fd = fs.openSync(filePath, "r");
+		fs.fsyncSync(fd);
+	} catch {
+		// Best-effort only.
+	} finally {
+		if (fd !== null) fs.closeSync(fd);
+	}
+}
+
+function uniqueTempBlobPath(dir: string, hash: string): string {
+	return path.join(dir, `${hash}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`);
+}
+
+function verifyBlobBytesSync(hash: string, blobPath: string, data: Buffer): void {
+	if (sha256Hex(data) !== hash) throw new BlobCorruptError(hash, blobPath);
+}
+
+function verifyBlobFileSync(hash: string, blobPath: string): Buffer {
+	const data = fs.readFileSync(blobPath);
+	verifyBlobBytesSync(hash, blobPath, data);
+	return data;
+}
+
 /**
  * Content-addressed blob store for externalizing large binary data (images) from session JSONL files.
  *
@@ -60,6 +136,79 @@ export class BlobStore {
 		return result;
 	}
 
+	/**
+	 * Durably install binary data as an immutable content-addressed blob.
+	 *
+	 * Callers that persist references to this blob must mutate canonical session entries only
+	 * after this method returns successfully. A corrupt pre-existing target is reported with
+	 * {@link BlobCorruptError}; it is never silently overwritten or trusted.
+	 */
+	putImmutableSync(data: Buffer): CheckedBlobPutResult {
+		const hash = sha256Hex(data);
+		const blobPath = path.join(this.dir, hash);
+		const result = makeBlobPutResult(hash, blobPath, data.byteLength);
+		fs.mkdirSync(this.dir, { recursive: true });
+
+		if (fs.existsSync(blobPath)) {
+			verifyBlobFileSync(hash, blobPath);
+			return result;
+		}
+
+		const tempPath = uniqueTempBlobPath(this.dir, hash);
+		try {
+			const fd = fs.openSync(tempPath, "wx");
+			try {
+				fs.writeFileSync(fd, data);
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+
+			try {
+				fs.linkSync(tempPath, blobPath);
+			} catch (err) {
+				if (isEnoent(err)) throw err;
+				const code = typeof err === "object" && err !== null && "code" in err ? err.code : undefined;
+				if (code === "EEXIST") {
+					verifyBlobFileSync(hash, blobPath);
+					return result;
+				}
+				if (code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP") {
+					// Hard links unsupported (e.g. cross-device / some network FS). Use an
+					// EXCLUSIVE copy so a concurrently installed winner is never overwritten;
+					// verify it by hash on EEXIST instead of clobbering it.
+					try {
+						fs.copyFileSync(tempPath, blobPath, fs.constants.COPYFILE_EXCL);
+						// The temp was fsync'd before install, but copyFileSync creates a
+						// fresh destination whose bytes are not yet durable — fsync it so the
+						// durable-install contract holds on hard-link-unsupported paths too.
+						fsyncFileBestEffortSync(blobPath);
+					} catch (copyErr) {
+						const copyCode =
+							typeof copyErr === "object" && copyErr !== null && "code" in copyErr ? copyErr.code : undefined;
+						if (copyCode === "EEXIST") {
+							verifyBlobFileSync(hash, blobPath);
+							return result;
+						}
+						throw copyErr;
+					}
+				} else {
+					throw err;
+				}
+			}
+
+			verifyBlobFileSync(hash, blobPath);
+			fsyncDirBestEffortSync(this.dir);
+			return result;
+		} finally {
+			try {
+				fs.unlinkSync(tempPath);
+			} catch {
+				// Best-effort temp cleanup: never mask the primary result or throw.
+			}
+		}
+	}
+
 	/** Read blob by hash, returns Buffer or null if not found. */
 	async get(hash: string): Promise<Buffer | null> {
 		const blobPath = path.join(this.dir, hash);
@@ -78,6 +227,22 @@ export class BlobStore {
 		const blobPath = path.join(this.dir, hash);
 		try {
 			return fs.readFileSync(blobPath);
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
+	/** Read blob by hash and verify its content hash; returns null if not found. */
+	async getChecked(hash: string): Promise<Buffer | null> {
+		return this.getCheckedSync(hash);
+	}
+
+	/** Synchronously read blob by hash and verify its content hash; returns null if not found. */
+	getCheckedSync(hash: string): Buffer | null {
+		const blobPath = path.join(this.dir, hash);
+		try {
+			return verifyBlobFileSync(hash, blobPath);
 		} catch (err) {
 			if (isEnoent(err)) return null;
 			throw err;
@@ -134,6 +299,12 @@ export class EphemeralBlobStore extends BlobStore {
 		return result;
 	}
 
+	putImmutableSync(data: Buffer): CheckedBlobPutResult {
+		const result = super.putImmutableSync(data);
+		this.#cachePut(result.hash, Buffer.from(data));
+		return result;
+	}
+
 	getSync(hash: string): Buffer | null {
 		const cached = this.#bufferCache.get(hash);
 		if (cached) {
@@ -148,6 +319,12 @@ export class EphemeralBlobStore extends BlobStore {
 			this.#bufferCacheBytes -= cached.byteLength;
 		}
 		const data = super.getSync(hash);
+		if (data) this.#cachePut(hash, Buffer.from(data));
+		return data;
+	}
+
+	getCheckedSync(hash: string): Buffer | null {
+		const data = super.getCheckedSync(hash);
 		if (data) this.#cachePut(hash, Buffer.from(data));
 		return data;
 	}
@@ -208,15 +385,15 @@ export class MemoryBlobStore extends BlobStore {
 	}
 
 	putSync(data: Buffer): BlobPutResult {
-		const hash = new Bun.SHA256().update(data).digest("hex");
+		const hash = sha256Hex(data);
 		this.#store(hash, Buffer.from(data));
-		return {
-			hash,
-			path: `memory:${hash}`,
-			get ref() {
-				return `${BLOB_PREFIX}${hash}`;
-			},
-		};
+		return makeBlobPutResult(hash, `memory:${hash}`);
+	}
+
+	putImmutableSync(data: Buffer): CheckedBlobPutResult {
+		const hash = sha256Hex(data);
+		this.#store(hash, Buffer.from(data));
+		return makeBlobPutResult(hash, `memory:${hash}`, data.byteLength);
 	}
 
 	async get(hash: string): Promise<Buffer | null> {
@@ -230,6 +407,17 @@ export class MemoryBlobStore extends BlobStore {
 		this.#blobs.delete(hash);
 		this.#blobs.set(hash, data);
 		return Buffer.from(data);
+	}
+
+	async getChecked(hash: string): Promise<Buffer | null> {
+		return this.getCheckedSync(hash);
+	}
+
+	getCheckedSync(hash: string): Buffer | null {
+		const data = this.getSync(hash);
+		if (!data) return null;
+		verifyBlobBytesSync(hash, `memory:${hash}`, data);
+		return data;
 	}
 
 	async has(hash: string): Promise<boolean> {

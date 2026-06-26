@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added durable cold-spill eviction for compacted session history: after a compaction, `SessionManager.evictCompactedContent()` moves pre-`firstKeptEntryId` payloads (user/assistant text, thinking, tool-call arguments) out of the hot JSONL and resident heap into durable content-addressed sidecar blobs via `BlobStore.putImmutableSync`, keeping hot retained bytes bounded regardless of pre-compaction history size while preserving graph integrity and the compaction summary.
+- Added a non-materializing, path-only `buildSessionContext()` that no longer populates `#materializedEntriesCache` and performs zero cold-spill reads on covered compacted branches, plus fidelity read APIs (`getEntryForFidelity`/`getBranchForFidelity`/`getEntriesForExport`) that rehydrate cold-spilled content on demand for HTML export, branch & re-edit, and branched-session creation.
+- Added `BlobStore.putImmutableSync`/`getCheckedSync` (plus `EphemeralBlobStore`/`MemoryBlobStore` overrides): immutable, crash-safe, hash-verified content-addressed install (exclusive copy fallback + fsync) and checked reads that throw `BlobCorruptError` on corrupt blobs and never return silent wrong data.
+
+### Fixed
+
+- Fixed unbounded memory growth in long sessions: the full verbatim transcript was retained in `SessionManager.#fileEntries`/`#byId` forever across compactions (compaction only summarized the LLM-bound context), so long coding sessions could OOM. Compaction now reclaims hot resident content via cold-spill, the `AgentSession.compact()` post-append path no longer bulk-materializes the branch (`#syncTodoPhasesFromBranch` uses a non-materializing canonical active-path accessor), and assistant tool-call arguments/text are no longer kept verbatim indefinitely.
+- Lossless branch/export fidelity after compaction: HTML export and branch & re-edit now rehydrate cold-spilled pre-compaction content instead of showing tombstone notices, and branched-session creation preserves cold-spill refs without truncating >500k-char content.
+
 ## [0.7.3] - 2026-06-25
 
 ### Added

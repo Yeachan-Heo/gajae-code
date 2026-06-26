@@ -125,7 +125,7 @@ export async function exportSessionToHtml(
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries: sm.getEntries(),
+		entries: sm.getEntriesForExport(),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt.join("\n\n"),
 		tools: state?.tools?.map(t => ({ name: t.name, description: t.description })),
@@ -153,7 +153,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	try {
 		const sessionData: SessionData = {
 			header: sm.getHeader(),
-			entries: sm.getEntries(),
+			entries: sm.getEntriesForExport(),
 			leafId: sm.getLeafId(),
 		};
 
