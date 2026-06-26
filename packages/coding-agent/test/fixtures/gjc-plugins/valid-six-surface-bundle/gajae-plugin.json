@@ -1,0 +1,17 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "valid-six-surface-bundle",
+  "version": "1.0.0",
+  "subskills": ["subskills/design/SKILL.md"],
+  "tools": [
+    { "name": "domain_note", "path": "tools/domain-note.ts", "description": "Write a domain-scoped note" }
+  ],
+  "hooks": [
+    { "name": "audit-read", "event": "tool_call", "target": "read", "phase": "before", "path": "hooks/audit-read.ts" }
+  ],
+  "mcps": [
+    { "name": "domain_docs", "transport": "stdio", "command": "bun", "args": ["mcp/domain-docs.ts"], "cwd": "." }
+  ],
+  "system_appendix": [{ "name": "domain-policy", "path": "prompts/system-appendix.md" }],
+  "agent-appendix": [{ "agent": "executor", "name": "domain-executor", "path": "prompts/executor-appendix.md" }]
+}

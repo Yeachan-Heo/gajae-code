@@ -421,6 +421,13 @@ export interface AgentSessionConfig {
 	 * **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedAsyncJobManager?: AsyncJobManager;
+	/**
+	 * MCPManager whose lifecycle this session owns (top-level sessions that
+	 * connected plugin-bundle MCP servers). Only the owned manager is
+	 * disconnected on dispose; subagents and callers that merely observe the
+	 * process-global manager **MUST NOT** dispose it on their own teardown.
+	 */
+	ownedMcpManager?: MCPManager;
 	/** Optional fork-context seed used to initialize a child session before its first prompt. */
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
@@ -958,6 +965,7 @@ export class AgentSession {
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
+	readonly #ownedMcpManager: MCPManager | undefined;
 	#pendingPythonMessages: PythonExecutionMessage[] = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
@@ -1161,6 +1169,7 @@ export class AgentSession {
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
+		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -3240,10 +3249,14 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
-		const mcpManager = MCPManager.instance();
-		if (mcpManager) {
-			await mcpManager.disconnectAll();
-			if (MCPManager.instance() === mcpManager) {
+		// Only disconnect the MCP manager THIS session owns (top-level sessions that
+		// connected plugin-bundle MCP servers). Subagents and callers that merely
+		// observe the process-global manager must never tear down a manager they do
+		// not own. Mirrors the ownedAsyncJobManager rule above.
+		const ownedMcpManager = this.#ownedMcpManager;
+		if (ownedMcpManager) {
+			await ownedMcpManager.disconnectAll();
+			if (MCPManager.instance() === ownedMcpManager) {
 				MCPManager.setInstance(undefined);
 			}
 		}

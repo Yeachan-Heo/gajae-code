@@ -336,6 +336,8 @@ export interface BuildSystemPromptOptions {
 	toolNames?: string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
+	/** Rendered GJC plugin system-appendix blocks (lower-authority, appended last). */
+	pluginAppendices?: string;
 	/** Repeat full tool descriptions in system prompt. Default: false */
 	repeatToolDescriptions?: boolean;
 	/** Skills settings for discovery. */
@@ -380,6 +382,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		customPrompt,
 		tools,
 		appendSystemPrompt,
+		pluginAppendices,
 		repeatToolDescriptions = false,
 		skillsSettings,
 		toolNames: providedToolNames,
@@ -577,6 +580,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const projectPrompt = resolvedCustomPrompt ? "" : prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
+	}
+
+	// Plugin system appendices are appended last as a lower-authority block; they
+	// can never override base/project/developer instructions above them.
+	if (pluginAppendices?.trim()) {
+		systemPrompt.push(pluginAppendices.trim());
 	}
 
 	return { systemPrompt };

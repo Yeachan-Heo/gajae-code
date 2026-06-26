@@ -19,7 +19,7 @@ import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import { buildAgentSubskillInjection } from "../extensibility/gjc-plugins";
+import { buildAgentSubskillInjection, renderAgentPromptAdditions } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -1229,6 +1229,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				agentName: agent.name,
 			});
 
+			let agentPromptAdditions = { appendix: "", advertisement: "" };
+			try {
+				agentPromptAdditions = await renderAgentPromptAdditions({ cwd, agentName: agent.name });
+			} catch (error) {
+				logger.warn("Failed to render GJC plugin agent prompt additions", { error });
+			}
+
 			const { session } = await awaitAbortable(
 				createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1259,7 +1266,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							ircSelfId: ircEnabled ? id : "",
 							forkContext: forkContextNotice,
 						});
-						const promptWithSubskills = `${subagentPrompt}${agentSubskillBlock}`;
+						// Order: base agent prompt -> agent appendix -> Tier-1 advertisement -> Tier-2 body.
+						const appendixPart = agentPromptAdditions.appendix ? `\n\n${agentPromptAdditions.appendix}` : "";
+						const advertPart = agentPromptAdditions.advertisement
+							? `\n\n${agentPromptAdditions.advertisement}`
+							: "";
+						const promptWithSubskills = `${subagentPrompt}${appendixPart}${advertPart}${agentSubskillBlock}`;
 						return defaultPrompt.length === 0
 							? [promptWithSubskills]
 							: [...defaultPrompt.slice(0, -1), promptWithSubskills, defaultPrompt[defaultPrompt.length - 1]];

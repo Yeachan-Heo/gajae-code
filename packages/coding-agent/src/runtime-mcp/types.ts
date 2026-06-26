@@ -81,6 +81,13 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	command: string;
 	args?: string[];
 	env?: Record<string, string>;
+	/**
+	 * When true, the child process is NOT given the host environment. Only a
+	 * minimal OS allowlist (PATH/HOME/temp/locale) plus any explicit `env` keys
+	 * are passed. Used for third-party plugin-bundle MCP servers so they cannot
+	 * read host secrets from the inherited environment.
+	 */
+	noInheritEnv?: boolean;
 	cwd?: string;
 }
 

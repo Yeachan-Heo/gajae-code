@@ -24,6 +24,38 @@ import { toJsonRpcError } from "../../runtime-mcp/types";
  */
 const CLOSE_WAIT_MS = 1_000;
 
+/**
+ * Build a minimal environment for a no-inherit stdio MCP child. Only OS-level
+ * keys needed to locate/run an interpreter (PATH, HOME, temp, locale, and the
+ * Windows system essentials) are copied from the host; everything else
+ * (API keys, tokens, secrets) is withheld. Explicit `env` overrides win.
+ */
+function buildMinimalStdioEnv(explicit?: Record<string, string>): Record<string, string> {
+	const allow = [
+		"PATH",
+		"HOME",
+		"TMPDIR",
+		"TEMP",
+		"TMP",
+		"LANG",
+		"LC_ALL",
+		"LC_CTYPE",
+		"SHELL",
+		"USER",
+		"SystemRoot",
+		"SYSTEMROOT",
+		"PATHEXT",
+		"COMSPEC",
+		"WINDIR",
+	];
+	const env: Record<string, string> = {};
+	for (const key of allow) {
+		const value = Bun.env[key];
+		if (typeof value === "string") env[key] = value;
+	}
+	return { ...env, ...explicit };
+}
+
 export class StdioTransport implements MCPTransport {
 	#process: OwnedProcess | null = null;
 	#pendingRequests = new Map<
@@ -63,10 +95,12 @@ export class StdioTransport implements MCPTransport {
 		if (this.#connected) return;
 
 		const args = this.config.args ?? [];
-		const env = {
-			...Bun.env,
-			...this.config.env,
-		};
+		const env = this.config.noInheritEnv
+			? buildMinimalStdioEnv(this.config.env)
+			: {
+					...Bun.env,
+					...this.config.env,
+				};
 
 		this.#process = spawnOwnedProcess([this.config.command, ...args], {
 			cwd: this.config.cwd ?? getProjectDir(),

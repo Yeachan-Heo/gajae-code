@@ -45,7 +45,7 @@ async function discoverGjcPluginRootsIn(baseDir: string): Promise<string[]> {
 			}),
 	);
 
-	return roots.filter((root): root is string => root !== null);
+	return roots.filter((root): root is string => root !== null).sort((a, b) => a.localeCompare(b));
 }
 
 export async function discoverGjcPluginRoots({ cwd }: { cwd: string; home?: string }): Promise<string[]> {

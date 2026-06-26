@@ -1,0 +1,8 @@
+{
+  "kind": "gajae-code-plugin",
+  "name": "valid-mcp-bundle",
+  "version": "1.0.0",
+  "mcps": [
+    { "name": "domain_docs", "transport": "stdio", "command": "bun", "args": ["mcp/server.ts"], "cwd": "." }
+  ]
+}

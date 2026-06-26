@@ -49,6 +49,8 @@ export default class Plugin extends Command {
 			description: 'Install scope: "user" (default) or "project"',
 			options: ["user", "project"],
 		}),
+		user: Flags.boolean({ description: "Install GJC plugin bundle into the user root" }),
+		project: Flags.boolean({ description: "Install GJC plugin bundle into the project root" }),
 	};
 
 	async run(): Promise<void> {
@@ -69,6 +71,8 @@ export default class Plugin extends Command {
 				disable: flags.disable,
 				set: flags.set,
 				scope: flags.scope as "user" | "project" | undefined,
+				user: flags.user,
+				project: flags.project,
 			},
 		};
 

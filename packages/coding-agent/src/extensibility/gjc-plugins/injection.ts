@@ -131,3 +131,112 @@ export async function buildAgentSubskillInjection(input: {
 	);
 	return blocks.join("");
 }
+
+// ---------------------------------------------------------------------------
+// Tier-1 sub-skill advertisement (metadata-only, bounded, target-parent scoped)
+// ---------------------------------------------------------------------------
+
+import type { GjcPluginRegistryEntry } from "./types";
+
+const ADVERT_MAX_ITEMS = 12;
+const ADVERT_MAX_DESC = 200;
+const ADVERT_MAX_FIELD = 80;
+const ADVERT_MAX_BYTES = 4 * 1024;
+
+function escapeAdvertAttr(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+interface AdvertItem {
+	plugin: string;
+	name: string;
+	description: string;
+	activationArg: string;
+	phase: string;
+}
+
+function clampField(value: string): string {
+	const v = value.length > ADVERT_MAX_FIELD ? `${value.slice(0, ADVERT_MAX_FIELD - 1)}\u2026` : value;
+	return escapeAdvertAttr(v);
+}
+
+function renderAdvertItem(it: AdvertItem): string {
+	const desc =
+		it.description.length > ADVERT_MAX_DESC
+			? `${it.description.slice(0, ADVERT_MAX_DESC - 1)}\u2026`
+			: it.description;
+	return `  - plugin="${clampField(it.plugin)}" name="${clampField(it.name)}" activation_arg="${clampField(it.activationArg)}" phase="${clampField(it.phase)}": ${escapeAdvertAttr(desc)}`;
+}
+
+function wrapAdvert(kind: "skill" | "agent", parent: string, lines: string[]): string {
+	return `<gjc-plugin-subskill-advertisement parent="${clampField(parent)}" kind="${kind}">\n${lines.join("\n")}\n</gjc-plugin-subskill-advertisement>`;
+}
+
+function renderAdvertisement(items: AdvertItem[], kind: "skill" | "agent", parent: string): string {
+	if (items.length === 0) return "";
+	// Build iteratively against the byte budget so the block is HARD-capped even
+	// if individual items are large; every metadata field is also length-clamped.
+	const candidates = items.slice(0, ADVERT_MAX_ITEMS);
+	const lines: string[] = [];
+	let shownCount = 0;
+	for (const it of candidates) {
+		const next = [...lines, renderAdvertItem(it)];
+		const omittedNote = `  - ${items.length - (shownCount + 1)} additional plugin sub-skill(s) omitted; invoke explicitly with a known activation arg.`;
+		const probe = wrapAdvert(kind, parent, items.length - (shownCount + 1) > 0 ? [...next, omittedNote] : next);
+		if (Buffer.byteLength(probe) > ADVERT_MAX_BYTES) break;
+		lines.push(renderAdvertItem(it));
+		shownCount += 1;
+	}
+	const omitted = items.length - shownCount;
+	if (shownCount === 0) {
+		// Nothing fit: guaranteed-small overflow-only block.
+		return wrapAdvert(kind, parent, [
+			`  - ${items.length} plugin sub-skill(s) available; invoke explicitly with a known activation arg.`,
+		]);
+	}
+	if (omitted > 0) {
+		lines.push(
+			`  - ${omitted} additional plugin sub-skill(s) omitted; invoke explicitly with a known activation arg.`,
+		);
+	}
+	return wrapAdvert(kind, parent, lines);
+}
+
+function collectAdverts(entries: readonly GjcPluginRegistryEntry[], parent: string, phase?: string): AdvertItem[] {
+	const items: AdvertItem[] = [];
+	for (const entry of entries) {
+		if (!entry.enabled) continue;
+		const disabled = new Set(entry.disabledSurfaceIds);
+		for (const s of entry.surfaces.subskills) {
+			if (disabled.has(s.extensionId)) continue;
+			if (s.parent !== parent) continue;
+			if (phase && s.phase !== phase) continue;
+			items.push({
+				plugin: entry.name,
+				name: s.name,
+				description: s.description,
+				activationArg: s.activationArg,
+				phase: s.phase,
+			});
+		}
+	}
+	return items;
+}
+
+/**
+ * Tier-1 advertisement for a workflow parent skill: bounded, metadata-only list
+ * of installed sub-skills bound to `parent`, rendered ONLY in that parent's
+ * prompt (never the global public-workflow-surface). No body content.
+ */
+export function buildSubskillAdvertisement(
+	entries: readonly GjcPluginRegistryEntry[],
+	parent: string,
+	phase?: string,
+): string {
+	return renderAdvertisement(collectAdverts(entries, parent, phase), "skill", parent);
+}
+
+/** Tier-1 advertisement for a role-agent parent. */
+export function buildAgentSubskillAdvertisement(entries: readonly GjcPluginRegistryEntry[], agentName: string): string {
+	return renderAdvertisement(collectAdverts(entries, agentName), "agent", agentName);
+}

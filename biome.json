@@ -9,7 +9,7 @@
 		"enabled": true,
 		"includes": ["**"],
 		"rules": {
-			"recommended": true,
+			"preset": "recommended",
 			"a11y": "off",
 			"correctness": {
 				"noUnusedImports": "error",

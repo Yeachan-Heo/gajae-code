@@ -10,6 +10,7 @@ import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
+import { renderSkillAdvertisement } from "./gjc-plugins/runtime-adapters";
 export interface Skill {
 	name: string;
 	description: string;
@@ -414,6 +415,20 @@ export async function buildSkillPromptMessage(
 			details.subskillActivation = injection.details ?? context.subskillActivation;
 		} else if (context.subskillActivation) {
 			details.subskillActivation = context.subskillActivation;
+		}
+		// Tier-1 advertisement: metadata-only list of installed sub-skills bound to
+		// this parent skill, so the agent can choose one contextually.
+		if (context.cwd) {
+			try {
+				const advert = await renderSkillAdvertisement({
+					cwd: context.cwd,
+					skillName: skill.name,
+					phase: context.currentPhase,
+				});
+				if (advert) message += `\n\n${advert}`;
+			} catch {
+				// Advertisement is best-effort; never block skill prompt construction.
+			}
 		}
 	}
 	return {
