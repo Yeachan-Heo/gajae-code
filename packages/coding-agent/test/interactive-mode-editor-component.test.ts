@@ -81,10 +81,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	}
 
 	it("shows busy steering and queueing hints only while work is active", () => {
-		let rendered = mode.editor
-			.render(96)
-			.map(stripRenderControls)
-			.join("\n");
+		let rendered = mode.editor.render(96).map(stripRenderControls).join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).not.toContain("Enter: Steering");
 		expect(rendered).not.toContain(expectedQueueShortcutHint());
@@ -92,10 +89,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = true;
 		mode.updateEditorChrome();
 
-		rendered = mode.editor
-			.render(96)
-			.map(stripRenderControls)
-			.join("\n");
+		rendered = mode.editor.render(96).map(stripRenderControls).join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).toContain("Enter: Steering");
 		expect(rendered).toContain(expectedQueueShortcutHint());
@@ -103,10 +97,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = false;
 		mode.updateEditorChrome();
 
-		rendered = mode.editor
-			.render(96)
-			.map(stripRenderControls)
-			.join("\n");
+		rendered = mode.editor.render(96).map(stripRenderControls).join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).not.toContain("Enter: Steering");
 		expect(rendered).not.toContain(expectedQueueShortcutHint());
