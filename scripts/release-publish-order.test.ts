@@ -34,6 +34,9 @@ describe("unscoped gajae-code package publication", () => {
 		);
 		expect(aliasManifest.bin).toEqual({ gjc: "bin/gjc.js" });
 		expect(aliasManifest.dependencies?.["@gajae-code/coding-agent"]).toBe("catalog:");
+		const wrapper = await Bun.file(path.join(repoRoot, "packages/gajae-code/bin/gjc.js")).text();
+		expect(wrapper).toContain('import { runCli } from "@gajae-code/coding-agent/cli";');
+		expect(wrapper).toContain("await runCli(process.argv.slice(2));");
 	});
 
 	test("release dependency normalization collapses repeated file prefixes", () => {
