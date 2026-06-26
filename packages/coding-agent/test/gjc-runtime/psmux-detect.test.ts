@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import {
 	clearPsmuxDetectionCache,
 	detectPsmux,
@@ -29,12 +29,27 @@ function buildRunner(versionOutput: string | null) {
 	};
 }
 
+let whichSpy: ReturnType<typeof spyOn> | null = null;
+
 beforeEach(() => {
 	clearPsmuxDetectionCache();
+	// Mock Bun.which so tests do not depend on whether the binary is on PATH
+	// in the runner image (psmux / pmux / tmux are usually not installed in CI).
+	whichSpy?.mockRestore();
+	whichSpy = spyOn(Bun, "which");
+	whichSpy.mockImplementation(((candidate: string) => {
+		if (candidate === "psmux" || candidate === "pmux" || candidate === "tmux") {
+			return `/usr/bin/${candidate}`;
+		}
+		return null;
+	}) as typeof Bun.which);
 });
 
 afterEach(() => {
 	clearPsmuxDetectionCache();
+	whichSpy?.mockRestore();
+	whichSpy = null;
+	vi.restoreAllMocks();
 });
 
 describe("PSMUX_BINARY_NAMES", () => {

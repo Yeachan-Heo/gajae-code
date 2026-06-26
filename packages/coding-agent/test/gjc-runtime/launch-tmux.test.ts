@@ -146,7 +146,11 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(plan).toBeDefined();
-		expect(spawnSyncSpy).not.toHaveBeenCalled();
+		// Only assert the session-listing command family. The psmux detection
+		// probe may issue a one-time tmux 3.3 to detect the multiplexer and
+		// that is intentionally out of scope for this test.
+		const listSessionsCalls = spawnSyncSpy.mock.calls.filter(call => call[0]?.[1] === "list-sessions");
+		expect(listSessionsCalls).toHaveLength(0);
 	});
 
 	it("plans an interactive --tmux root launch inside a new GJC tmux session", () => {
