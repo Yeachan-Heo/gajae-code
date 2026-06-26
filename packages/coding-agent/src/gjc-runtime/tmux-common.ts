@@ -1,3 +1,5 @@
+import { resolveGjcTmuxBinary } from "./psmux-detect";
+
 export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
 export const GJC_TMUX_SESSION_PREFIX = `${GJC_DEFAULT_TMUX_SESSION}_`;
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
@@ -31,8 +33,28 @@ export function envDisabled(value: string | undefined): boolean {
 	return normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no";
 }
 
-export function resolveGjcTmuxCommand(env: NodeJS.ProcessEnv = process.env): string {
-	return env[GJC_TMUX_COMMAND_ENV]?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim() || "tmux";
+/**
+ * Resolve the tmux (or tmux-compatible multiplexer) command GJC should invoke.
+ *
+ * This is the shared entry point used by every GJC code path that needs to talk
+ * to a multiplexer: `gjc --tmux` planning, `gjc session ...`, `gjc team ...`,
+ * the lifecycle controller, and the harness resident owner. Routing all of
+ * them through the same resolver means a single `GJC_TMUX_COMMAND` override or
+ * a single Windows psmux / pmux detection wins for the whole process — the
+ * failure mode where `gjc --tmux` creates a psmux-backed session and then
+ * `gjc session status` fails because it queries literal `tmux` is closed off.
+ *
+ * Explicit `GJC_TMUX_COMMAND` / `GJC_TEAM_TMUX_COMMAND` overrides are honored on
+ * every platform. On native Windows without an override the resolver walks
+ * `psmux`, then `pmux`, then `tmux` and uses the first binary present on PATH.
+ * On POSIX the resolver returns `tmux` (the historical default) and only
+ * falls through to the platform-aware walker if the caller opts in.
+ */
+export function resolveGjcTmuxCommand(
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return resolveGjcTmuxBinary({ env, platform }).command;
 }
 
 export type { PsmuxProbe, ResolvedTmuxBinary, ResolveGjcTmuxBinaryOptions } from "./psmux-detect";

@@ -10,6 +10,7 @@ import {
 	probePsmux,
 	resolveGjcTmuxBinary,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
+import { resolveGjcTmuxCommand } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 
 function psmuxVersionOutput(): string {
 	return "psmux 3.3.0\n";
@@ -200,5 +201,45 @@ describe("probePsmux", () => {
 		});
 		expect(probe.isPsmux).toBe(false);
 		expect(probe.versionOutput).toBe("");
+	});
+});
+
+describe("resolveGjcTmuxCommand (shared session/team resolver)", () => {
+	it("returns psmux on native Windows when psmux resolves and tmux.exe alias does not", () => {
+		// Reproduces the case the review flagged: a Windows host with psmux
+		// installed but no tmux.exe alias on PATH. The shared resolver must
+		// pick psmux so gjc session ... and gjc team ... talk to the same
+		// multiplexer that gjc --tmux just created.
+		__setBinaryResolverForTests(candidate =>
+			candidate === "psmux" || candidate === "pmux"
+				? `C:\\Users\\runner\\AppData\\Local\\Microsoft\\WinGet\\Links\\${candidate}.exe`
+				: null,
+		);
+		const command = resolveGjcTmuxCommand({}, "win32");
+		expect(command).toBe("psmux");
+	});
+
+	it("returns pmux on native Windows when only pmux resolves", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "pmux" ? `/usr/bin/${candidate}` : null));
+		const command = resolveGjcTmuxCommand({}, "win32");
+		expect(command).toBe("pmux");
+	});
+
+	it("returns tmux.exe on native Windows when only the tmux alias resolves", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? `/usr/bin/${candidate}` : null));
+		const command = resolveGjcTmuxCommand({}, "win32");
+		expect(command).toBe("tmux");
+	});
+
+	it("honors GJC_TMUX_COMMAND override on every platform", () => {
+		__setBinaryResolverForTests(() => null);
+		const command = resolveGjcTmuxCommand({ GJC_TMUX_COMMAND: "psmux" }, "win32");
+		expect(command).toBe("psmux");
+	});
+
+	it("falls back to literal tmux on POSIX when no binary resolves", () => {
+		__setBinaryResolverForTests(() => null);
+		const command = resolveGjcTmuxCommand({}, "linux");
+		expect(command).toBe("tmux");
 	});
 });

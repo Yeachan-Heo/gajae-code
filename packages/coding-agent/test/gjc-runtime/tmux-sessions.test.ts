@@ -62,6 +62,11 @@ describe("GJC tmux session management", () => {
 	});
 
 	it("guards status and remove to GJC-managed sessions", () => {
+		// Pin the resolved command to tmux so the assertions are agnostic to
+		// whether the host has psmux / pmux / tmux on PATH. The shared
+		// resolveGjcTmuxCommand now picks the first available multiplexer on
+		// Windows; we explicitly opt into literal tmux for this guard test.
+		const env = { GJC_TMUX_COMMAND: "tmux" };
 		const calls: string[][] = [];
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
@@ -73,9 +78,9 @@ describe("GJC tmux session management", () => {
 			return spawnResult(0, "");
 		});
 
-		expect(statusGjcTmuxSession("gajae_code_work").name).toBe("gajae_code_work");
-		expect(() => statusGjcTmuxSession("unrelated")).toThrow("gjc_tmux_session_not_found:unrelated");
-		expect(removeGjcTmuxSession("gajae_code_work").name).toBe("gajae_code_work");
+		expect(statusGjcTmuxSession("gajae_code_work", env).name).toBe("gajae_code_work");
+		expect(() => statusGjcTmuxSession("unrelated", env)).toThrow("gjc_tmux_session_not_found:unrelated");
+		expect(removeGjcTmuxSession("gajae_code_work", env).name).toBe("gajae_code_work");
 		expect(calls.at(-1)).toEqual(["tmux", "kill-session", "-t", "=gajae_code_work"]);
 	});
 
@@ -158,6 +163,8 @@ describe("GJC tmux session management", () => {
 	});
 
 	it("queries the profile option with a window-qualified exact target", () => {
+		// Pin the resolved command to tmux so this test is platform-agnostic.
+		const env = { GJC_TMUX_COMMAND: "tmux" };
 		const calls: string[][] = [];
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
@@ -169,7 +176,7 @@ describe("GJC tmux session management", () => {
 			return spawnResult(0, "");
 		});
 
-		removeGjcTmuxSession("gajae_code_work");
+		removeGjcTmuxSession("gajae_code_work", env);
 
 		const showOptions = calls.find(call => call.includes("show-options"));
 		expect(showOptions).toEqual(["tmux", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
