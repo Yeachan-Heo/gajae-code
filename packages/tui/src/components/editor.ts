@@ -833,7 +833,7 @@ export class Editor implements Component, Focusable {
 		// Compute inline hint text (dim ghost text after cursor)
 		const inlineHint = this.#getInlineHint();
 		const hintStyle = this.#theme.hintStyle ?? ((t: string) => `\x1b[2m${t}\x1b[0m`);
-		const showPlaceholder = this.#isEditorEmpty() && !inlineHint && !!this.#placeholder && !this.#useTerminalCursor;
+		const showPlaceholder = this.#isEditorEmpty() && !inlineHint && !!this.#placeholder;
 
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
@@ -853,7 +853,9 @@ export class Editor implements Component, Focusable {
 			if (showPlaceholder) {
 				displayText = hintStyle(truncateToWidth(this.#placeholder ?? "", lineContentWidth));
 				displayWidth = Math.min(visibleWidth(this.#placeholder ?? ""), lineContentWidth);
-				hasCursor = false;
+				if (!this.#useTerminalCursor) {
+					hasCursor = false;
+				}
 			}
 
 			if (!borderVisible && displayWidth > lineContentWidth) {

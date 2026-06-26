@@ -4,6 +4,7 @@ import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { CURSOR_MARKER } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { CustomEditor } from "../src/modes/components/custom-editor";
@@ -13,6 +14,9 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 class TestModalEditor extends CustomEditor {}
+function stripRenderControls(line: string): string {
+	return stripVTControlCharacters(line.replaceAll(CURSOR_MARKER, ""));
+}
 
 describe("InteractiveMode.setEditorComponent", () => {
 	let tempDir: TempDir;
@@ -61,7 +65,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	});
 
 	it("renders the default composer as a closed rounded input box", () => {
-		const lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		const lines = mode.editor.render(48).map(stripRenderControls);
 
 		expect(lines[0]).toStartWith("╭");
 		expect(lines[0]).toEndWith("╮");
@@ -79,7 +83,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	it("shows busy steering and queueing hints only while work is active", () => {
 		let rendered = mode.editor
 			.render(96)
-			.map(line => stripVTControlCharacters(line))
+			.map(stripRenderControls)
 			.join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).not.toContain("Enter: Steering");
@@ -90,7 +94,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 
 		rendered = mode.editor
 			.render(96)
-			.map(line => stripVTControlCharacters(line))
+			.map(stripRenderControls)
 			.join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).toContain("Enter: Steering");
@@ -101,7 +105,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 
 		rendered = mode.editor
 			.render(96)
-			.map(line => stripVTControlCharacters(line))
+			.map(stripRenderControls)
 			.join("\n");
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).not.toContain("Enter: Steering");
@@ -113,7 +117,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 
 		await mode.init();
 
-		const rendered = mode.ui.render(48).map(line => stripVTControlCharacters(line));
+		const rendered = mode.ui.render(48).map(stripRenderControls);
 		const composerContentIndex = rendered.findIndex(line => line.includes("Type your message..."));
 		const composerIndex = composerContentIndex - 1;
 
@@ -128,7 +132,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			[28, "narrow terminal composer"],
 		] as const) {
 			mode.editor.setText(text);
-			const lines = mode.editor.render(width).map(line => stripVTControlCharacters(line));
+			const lines = mode.editor.render(width).map(stripRenderControls);
 
 			expect(lines[0]).toStartWith("╭");
 			expect(lines[0]).toEndWith("╮");
@@ -147,7 +151,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		mode.updateEditorChrome();
 
 		expect(mode.editor.borderColor("x")).toBe(theme.fg("warning", "x"));
-		let lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		let lines = mode.editor.render(48).map(stripRenderControls);
 		expect(
 			lines.some(
 				line =>
@@ -162,13 +166,13 @@ describe("InteractiveMode.setEditorComponent", () => {
 		mode.updateEditorChrome();
 
 		expect(mode.editor.borderColor("x")).toBe(theme.getBashModeBorderColor()("x"));
-		lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		lines = mode.editor.render(48).map(stripRenderControls);
 		expect(lines.some(line => line.startsWith("│") && line.includes("shell") && line.includes("!!pwd"))).toBe(true);
 
 		mode.isBashMode = false;
 		mode.updateEditorChrome();
 
-		lines = mode.editor.render(48).map(line => stripVTControlCharacters(line));
+		lines = mode.editor.render(48).map(stripRenderControls);
 		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.includes("!!pwd"))).toBe(true);
 		expect(lines.join("\n")).not.toContain("shell");
 	});
