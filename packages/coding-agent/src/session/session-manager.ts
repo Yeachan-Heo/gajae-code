@@ -4512,7 +4512,10 @@ export class SessionManager {
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map
 		const pathWithoutLabels = branchPath.filter(e => e.type !== "label");
-
+		const materializedPathWithoutLabels = materializeResidentEntriesSync(
+			pathWithoutLabels,
+			this.#residentBlobStores(),
+		);
 		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -4539,7 +4542,7 @@ export class SessionManager {
 		if (this.persist) {
 			const lines: string[] = [];
 			lines.push(JSON.stringify(header));
-			for (const entry of pathWithoutLabels) {
+			for (const entry of materializedPathWithoutLabels) {
 				lines.push(JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore)));
 			}
 			// Write fresh label entries at the end
@@ -4566,7 +4569,7 @@ export class SessionManager {
 			this.#resetResidentTextBlobStore();
 			this.#fileEntries = [
 				header,
-				...pathWithoutLabels.map(
+				...materializedPathWithoutLabels.map(
 					entry => prepareEntryForResidentSync(entry, this.#residentBlobStores()) as SessionEntry,
 				),
 				...labelEntries,
@@ -4596,7 +4599,7 @@ export class SessionManager {
 		this.#resetResidentTextBlobStore();
 		this.#fileEntries = [
 			header,
-			...pathWithoutLabels.map(
+			...materializedPathWithoutLabels.map(
 				entry => prepareEntryForResidentSync(entry, this.#residentBlobStores()) as SessionEntry,
 			),
 			...labelEntries,
