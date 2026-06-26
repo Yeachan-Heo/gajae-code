@@ -7,7 +7,7 @@
 import { APP_NAME, getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
-import { installGjcPluginBundle, isGjcPluginBundleSource } from "../extensibility/gjc-plugins";
+import { installGjcPluginBundle, isGjcPluginBundleSource, readRegistry } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
 	getInstalledPluginsRegistryPath,
@@ -502,13 +502,16 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 	const npmPlugins = await manager.list();
 	const mktMgr = await makeMarketplaceManager();
 	const mktPlugins = await mktMgr.listInstalledPlugins();
+	const cwd = getProjectDir();
+	const [gjcUser, gjcProject] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
+	const gjcBundles = [...gjcUser.plugins, ...gjcProject.plugins];
 
 	if (flags.json) {
-		console.log(JSON.stringify({ npm: npmPlugins, marketplace: mktPlugins }, null, 2));
+		console.log(JSON.stringify({ npm: npmPlugins, marketplace: mktPlugins, gjc: gjcBundles }, null, 2));
 		return;
 	}
 
-	if (npmPlugins.length === 0 && mktPlugins.length === 0) {
+	if (npmPlugins.length === 0 && mktPlugins.length === 0 && gjcBundles.length === 0) {
 		console.log(chalk.dim("No plugins installed"));
 		console.log(chalk.dim(`\nInstall plugins with: ${APP_NAME} plugin install <package>`));
 		return;
@@ -548,6 +551,26 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 			const shadowLabel = plugin.shadowedBy ? chalk.dim(" [shadowed]") : "";
 			const scopeLabel = chalk.dim(` (${plugin.scope})`);
 			console.log(`  ${plugin.id} (${version})${scopeLabel}${shadowLabel}`);
+		}
+	}
+
+	if (gjcBundles.length > 0) {
+		if (npmPlugins.length > 0 || mktPlugins.length > 0) console.log();
+		console.log(chalk.bold("GJC Plugin Bundles:\n"));
+		for (const plugin of gjcBundles) {
+			const status = plugin.enabled ? chalk.green(theme.status.enabled) : chalk.dim(theme.status.disabled);
+			const scopeLabel = chalk.dim(` (${plugin.scope})`);
+			const disabledCount = plugin.disabledSurfaceIds.length;
+			const quarantineCount = plugin.quarantine?.length ?? 0;
+			const detail = [
+				disabledCount > 0 ? `${disabledCount} disabled` : null,
+				quarantineCount > 0 ? `${quarantineCount} quarantined` : null,
+			]
+				.filter((v): v is string => Boolean(v))
+				.join(", ");
+			console.log(
+				`${status} ${plugin.name}@${plugin.version}${scopeLabel}${detail ? chalk.dim(` — ${detail}`) : ""}`,
+			);
 		}
 	}
 }
