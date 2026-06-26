@@ -116,12 +116,16 @@ describe("buildFastStatusReport", () => {
 		roles: Record<string, Model | undefined>;
 		fastProviders: string[];
 		subagentFastProviders?: string[];
+		/** When set, drives `isFastModeActive()` (current-model EFFECTIVE state). */
+		currentEffectiveFast?: boolean;
 	}): FastStatusSessionLike {
 		const subagentFastProviders = args.subagentFastProviders ?? args.fastProviders;
 		return {
 			model: args.model,
 			isFastForProvider: provider => provider !== undefined && args.fastProviders.includes(provider),
 			isFastForSubagentProvider: provider => provider !== undefined && subagentFastProviders.includes(provider),
+			isFastModeActive:
+				args.currentEffectiveFast === undefined ? undefined : () => args.currentEffectiveFast === true,
 			resolveRoleModelWithThinking: role => ({ model: args.roles[role] }),
 		};
 	}
@@ -192,6 +196,25 @@ describe("buildFastStatusReport", () => {
 				roles: { executor: model("anthropic", "claude-opus-4-1") },
 				fastProviders: [],
 				subagentFastProviders: ["anthropic"],
+			}),
+			roleTargets: [{ id: "executor", label: "EXECUTOR", isSubagentRole: true }],
+			iconFast: ICON,
+		});
+		expect(report).toContain(`현재 모델: anthropic/claude-sonnet-4-5 ${FAST_STATUS_OFF}`);
+		expect(report).toContain(`EXECUTOR: anthropic/claude-opus-4-1 ${ICON}`);
+	});
+
+	test("current row reflects EFFECTIVE state (off after Q1 auto-disable) while subagent stays on", () => {
+		// Paired display/executor parity: after a provider fast-mode auto-disable
+		// the current model's intent is still priority, but the current row shows
+		// off (effective) while an inheriting subagent role stays on.
+		const report = buildFastStatusReport({
+			session: fakeSession({
+				model: model("anthropic", "claude-sonnet-4-5"),
+				roles: { executor: model("anthropic", "claude-opus-4-1") },
+				fastProviders: ["anthropic"], // intent still grants fast
+				subagentFastProviders: ["anthropic"], // subagent inherits intent
+				currentEffectiveFast: false, // ...but the current model was auto-disabled
 			}),
 			roleTargets: [{ id: "executor", label: "EXECUTOR", isSubagentRole: true }],
 			iconFast: ICON,

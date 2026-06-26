@@ -1,5 +1,5 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
-import type { Model, ToolChoice } from "@gajae-code/ai";
+import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
 import { $env, $flag, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -222,6 +222,8 @@ export interface ToolSession {
 	agentOutputManager?: AgentOutputManager;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
+	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
+	serviceTier?: ServiceTier;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Goal mode state (if active or paused) */

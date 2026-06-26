@@ -1231,6 +1231,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get model() {
 				return agent?.state.model ?? model;
 			},
+			get serviceTier() {
+				// Live parent service-tier intent (e.g. runtime `/fast on`), inherited by
+				// `inherit` subagents. Read from the live agent, not the init snapshot.
+				return agent?.serviceTier ?? initialServiceTier;
+			},
 			getAgentId: () => resolvedAgentId,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
 			bashRestrictionProfile: options.bashRestrictionProfile,

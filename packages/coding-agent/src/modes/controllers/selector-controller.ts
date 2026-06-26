@@ -750,6 +750,7 @@ export class SelectorController {
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
 					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
+					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 				},
 			);
 			return { component: selector, focus: selector };

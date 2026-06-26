@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
+import type { ServiceTier } from "@gajae-code/ai";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -146,6 +147,13 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/**
+	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
+	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
+	 * live value (not the stale settings snapshot) lets a runtime `/fast on` reach
+	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
+	 */
+	inheritedServiceTier?: ServiceTier;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -482,15 +490,19 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
-export function createSubagentSettings(baseSettings: Settings): Settings {
+export function createSubagentSettings(baseSettings: Settings, inheritedServiceTier?: ServiceTier): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
 	}
-	// Subagent-scoped service-tier override: "inherit" keeps the snapshotted main
-	// session tier; any explicit value applies only to subagent sessions.
+	// Subagent-scoped service-tier override: "inherit" uses the parent session's
+	// LIVE intent (so a runtime `/fast on` reaches subagents and a main-model
+	// fast-mode auto-disable never clobbers it); any explicit value applies only
+	// to subagent sessions and wins over inherited intent.
 	const taskServiceTier = baseSettings.get("task.serviceTier");
-	if (taskServiceTier !== "inherit") {
+	if (taskServiceTier === "inherit") {
+		snapshot.serviceTier = inheritedServiceTier ?? "none";
+	} else {
 		snapshot.serviceTier = taskServiceTier;
 	}
 	return Settings.isolated({
@@ -571,7 +583,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const settings = options.settings ?? Settings.isolated();
-	const subagentSettings = createSubagentSettings(settings);
+	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;

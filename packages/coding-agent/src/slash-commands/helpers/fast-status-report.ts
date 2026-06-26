@@ -56,6 +56,12 @@ export interface FastStatusSessionLike {
 	readonly model?: Model;
 	/** Fast predicate against the main session tier (current model + `modelRoles`). */
 	isFastForProvider(provider?: string): boolean;
+	/**
+	 * Current-model EFFECTIVE fast state (intent minus any provider auto-disable).
+	 * Used for the current-model row so it matches what the next request does.
+	 * Optional so lightweight fakes can omit it; falls back to `isFastForProvider`.
+	 */
+	isFastModeActive?(): boolean;
 	/** Fast predicate against the effective subagent tier (`task.agentModelOverrides` roles). */
 	isFastForSubagentProvider(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: Model };
@@ -95,9 +101,13 @@ export interface BuildFastStatusReportArgs {
  */
 export function buildFastStatusReport(args: BuildFastStatusReportArgs): string {
 	const { session, roleTargets, iconFast, formatInactive } = args;
-	const rows: FastStatusRow[] = [
-		{ label: "현재 모델", model: session.model, fast: session.isFastForProvider(session.model?.provider) },
-	];
+	// Current-model row uses the EFFECTIVE predicate (intent minus any provider
+	// auto-disable) so it matches the next request; `modelRoles` rows below stay
+	// on pure intent. Fall back to intent when a fake omits `isFastModeActive`.
+	const currentFast = session.isFastModeActive
+		? session.isFastModeActive()
+		: session.isFastForProvider(session.model?.provider);
+	const rows: FastStatusRow[] = [{ label: "현재 모델", model: session.model, fast: currentFast }];
 	for (const target of roleTargets) {
 		const resolved = session.resolveRoleModelWithThinking(target.id);
 		if (resolved.model) {

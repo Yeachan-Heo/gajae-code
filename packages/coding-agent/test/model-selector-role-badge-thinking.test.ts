@@ -625,6 +625,7 @@ function createFastSelector(args: {
 	settings: Settings;
 	isFastForProvider: (provider?: string) => boolean;
 	isFastForSubagentProvider?: (provider?: string) => boolean;
+	isCurrentModelFastModeActive?: () => boolean;
 	currentModel?: Model;
 }): ModelSelectorComponent {
 	const { models, settings, isFastForProvider, currentModel } = args;
@@ -647,7 +648,7 @@ function createFastSelector(args: {
 		scoped,
 		() => {},
 		() => {},
-		{ isFastForProvider, isFastForSubagentProvider },
+		{ isFastForProvider, isFastForSubagentProvider, isCurrentModelFastModeActive: args.isCurrentModelFastModeActive },
 	);
 }
 
@@ -833,5 +834,35 @@ describe("ModelSelector fast-mode indicator", () => {
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("DEFAULT (low)");
 		expect(rendered).not.toContain(iconFast);
+	});
+
+	test("current model's DEFAULT badge uses EFFECTIVE state: no glyph after auto-disable, subagent still on", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const settings = Settings.isolated({
+			modelRoles: { default: `${model.provider}/${model.id}:low` },
+			"task.agentModelOverrides": { executor: `${model.provider}/${model.id}:high` },
+		});
+		// Intent grants fast (isFastForProvider true), the subagent inherits it, but
+		// the current model was auto-disabled (effective false). The DEFAULT badge on
+		// the current row must drop its glyph while the EXECUTOR subagent badge keeps it.
+		const selector = createFastSelector({
+			models: [model],
+			settings,
+			isFastForProvider: () => true,
+			isFastForSubagentProvider: () => true,
+			isCurrentModelFastModeActive: () => false,
+			currentModel: model,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+		const iconFast = theme.icon.fast;
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		// Current-model DEFAULT badge: no glyph (effective off).
+		expect(rendered).toContain("DEFAULT (low)");
+		expect(rendered).not.toContain(`DEFAULT (low) ${iconFast}`);
+		// Subagent EXECUTOR badge: glyph present (inherited intent).
+		expect(rendered).toContain(`EXECUTOR (high) ${iconFast}`);
 	});
 });
