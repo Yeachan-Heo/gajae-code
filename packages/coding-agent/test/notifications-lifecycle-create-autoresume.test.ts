@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { setAgentDir } from "@gajae-code/utils";
-import type { Args } from "../src/args";
+import type { Args } from "../src/cli/args";
 import { Settings } from "../src/config/settings";
 import { createSessionManager } from "../src/main";
 import { SessionManager } from "../src/session/session-manager";
