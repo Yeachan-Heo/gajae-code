@@ -6,6 +6,7 @@
 
 - `gjc update` now refreshes opted-in on-disk default workflow skill copies (written by `gjc setup defaults` under the agent dir) after a successful update, so they no longer stay stale relative to the embedded defaults; copies that were never installed are left absent.
 - cmux workspace auto-renames now include a `GJC: ` prefix so renamed workspaces remain identifiable as GJC sessions.
+- Enforce a hard 2000px image-dimension ceiling on image ingestion even when `images.autoResize` is disabled. A single image whose longest edge exceeds 2000px makes Anthropic reject the entire request ("many-image requests" limit) with HTTP 400 on every retry, permanently bricking the session; `loadImageInput` now always clamps over-ceiling images (in-spec images pass through untouched).
 
 ## [0.7.10] - 2026-07-02
 ### Added
