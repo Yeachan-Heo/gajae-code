@@ -6313,15 +6313,15 @@ export class AgentSession {
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
-		if (this.serviceTier === serviceTier) return;
-		// Re-arming priority on Anthropic? Clear the per-session auto-fallback
-		// sticky disable AND the auto-disable markers so the next request actually
-		// carries `speed: "fast"` again. Without this, switching to a tier that
-		// grants anthropic priority after an auto-disable is a silent no-op and the
-		// warning notice fires every turn.
+		// Re-arming a priority-granting tier always clears the per-session
+		// auto-fallback sticky disable AND the auto-disable markers so the next
+		// request carries `speed: "fast"` again — even when the tier is unchanged
+		// (re-selecting the same tier is a deliberate re-arm), and before the
+		// no-op early-return below.
 		if (serviceTier === "priority" || serviceTier === "claude-only") {
 			this.#rearmFastMode();
 		}
+		if (this.serviceTier === serviceTier) return;
 		this.agent.serviceTier = serviceTier;
 		this.sessionManager.appendServiceTierChange(serviceTier ?? null);
 	}

@@ -981,12 +981,15 @@ export class ModelSelectorComponent extends Container {
 
 			// Build role badges (inverted: color as background, black text)
 			const roleBadgeTokens: string[] = [];
-			let roleMatched = false;
+			// Whether a non-subagent (modelRoles) badge on the CURRENT model row already
+			// rendered the current-model EFFECTIVE glyph. Only that case should suppress
+			// the standalone current glyph below — a subagent-only match must NOT, since
+			// subagent badges reflect the subagent tier, not the current model.
+			let currentModelEffectiveGlyphRendered = false;
 			for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 				const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 				const assigned = this.#roles[role];
 				if (roleInfo.tag && assigned && modelsAreEqual(assigned.model, item.model)) {
-					roleMatched = true;
 					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
 					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
 
@@ -995,22 +998,26 @@ export class ModelSelectorComponent extends Container {
 					// (modelRoles) badge on the CURRENT model row uses the current-model
 					// effective predicate so a provider auto-disable hides the glyph;
 					// other modelRoles rows show pure intent.
+					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
-					const roleFast =
-						roleInfo.settingsPath === "task.agentModelOverrides"
-							? this.#isFastForSubagentProvider(assigned.model.provider)
-							: isCurrentRow
-								? this.#isCurrentModelFastModeActive()
-								: this.#isFastForProvider(assigned.model.provider);
+					const roleFast = isSubagentRole
+						? this.#isFastForSubagentProvider(assigned.model.provider)
+						: isCurrentRow
+							? this.#isCurrentModelFastModeActive()
+							: this.#isFastForProvider(assigned.model.provider);
+					if (roleFast && isCurrentRow && !isSubagentRole) {
+						currentModelEffectiveGlyphRendered = true;
+					}
 					const fastSuffix = roleFast ? ` ${theme.icon.fast}` : "";
 					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}${fastSuffix}`);
 				}
 			}
 			// Active/current non-role row: show the fast glyph on the session's current
-			// model row even when it carries no role badge. Skip when a role token for
-			// this row already rendered the glyph (duplicate-glyph guard).
+			// model row. Suppress only when a non-subagent current-row badge already
+			// rendered the current-model effective glyph (duplicate-glyph guard) — a
+			// subagent-only match must not hide the current model's own indicator.
 			if (
-				!roleMatched &&
+				!currentModelEffectiveGlyphRendered &&
 				this.#currentModel !== undefined &&
 				modelsAreEqual(this.#currentModel, item.model) &&
 				this.#isCurrentModelFastModeActive()

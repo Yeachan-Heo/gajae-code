@@ -46,4 +46,13 @@ describe("createSubagentSettings service-tier inheritance", () => {
 		// Main session settings are untouched by the subagent override.
 		expect(base.get("serviceTier")).toBe("priority");
 	});
+
+	it("inheriting undefined (after /fast off) does not resurrect a startup tier", () => {
+		// Regression: the live session tier is the source of truth. A session that
+		// started with priority but later ran `/fast off` (live tier undefined) must
+		// hand subagents `none`, never the stale startup value.
+		const base = Settings.isolated({ serviceTier: "priority", "task.serviceTier": "inherit" });
+		const subagent = createSubagentSettings(base, undefined);
+		expect(subagent.get("serviceTier")).toBe("none");
+	});
 });

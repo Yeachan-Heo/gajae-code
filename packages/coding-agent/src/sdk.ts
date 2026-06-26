@@ -1232,9 +1232,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return agent?.state.model ?? model;
 			},
 			get serviceTier() {
-				// Live parent service-tier intent (e.g. runtime `/fast on`), inherited by
-				// `inherit` subagents. Read from the live agent, not the init snapshot.
-				return agent?.serviceTier ?? initialServiceTier;
+				// Live parent service-tier intent (e.g. runtime `/fast on|off`), inherited
+				// by `inherit` subagents. Only fall back to the startup tier when there is
+				// no live agent yet — never `??`, or an intentional `/fast off`
+				// (serviceTier === undefined) would be resurrected to the startup value.
+				return agent ? agent.serviceTier : initialServiceTier;
 			},
 			getAgentId: () => resolvedAgentId,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
