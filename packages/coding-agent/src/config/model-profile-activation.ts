@@ -301,10 +301,17 @@ export async function applyPreparedModelProfileActivation(
 			});
 			modelChanged = true;
 		}
-		prepared.settings.override("modelRoles", prepared.modelRoles);
-		modelRolesChanged = true;
-		prepared.settings.override("task.agentModelOverrides", prepared.agentModelOverrides);
-		overridesChanged = true;
+		if (Object.keys(prepared.modelRoles).length > 0) {
+			prepared.settings.override("modelRoles", { ...previousModelRoles, ...prepared.modelRoles });
+			modelRolesChanged = true;
+		}
+		if (Object.keys(prepared.agentModelOverrides).length > 0) {
+			prepared.settings.override("task.agentModelOverrides", {
+				...previousAgentModelOverrides,
+				...prepared.agentModelOverrides,
+			});
+			overridesChanged = true;
+		}
 		if (options.persistDefault) {
 			prepared.settings.set("modelRoles", {});
 			prepared.settings.set("task.agentModelOverrides", {});

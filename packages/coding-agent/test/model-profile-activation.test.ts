@@ -181,6 +181,7 @@ describe("model profile activation", () => {
 			vision: "provider-a/architect",
 		});
 		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "provider-a/old",
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
@@ -211,6 +212,7 @@ describe("model profile activation", () => {
 			vision: "provider-a/architect",
 		});
 		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "provider-a/old-critic",
 			executor: "provider-c/executor:medium",
 			architect: "provider-a/architect",
 		});
