@@ -1,11 +1,11 @@
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns exactly one Telegram forum topic in the paired private
- * DM. The topic is created once (via `createForumTopic`) and REUSED on resume,
- * keyed by session id, so a resumed session streams back into its existing
- * thread/history. The registry also tracks whether the one-time identity header
- * has already been pinned, so it is sent exactly once per topic even across
+ * Each GJC session owns one active Telegram forum topic in the paired private
+ * DM. The topic is created via `createForumTopic`, reused while the session
+ * remains active, and removed from the registry when the daemon deletes it on
+ * shutdown. The registry also tracks whether the one-time identity header has
+ * already been pinned, so it is sent exactly once per active topic, even across
  * reconnects.
  *
  * State is a plain serialisable map persisted beside the daemon state files;
@@ -76,9 +76,8 @@ export class TopicRegistry {
 	}
 
 	/**
-	 * Return the existing topic for `sessionId`, or create one via `create`
-	 * (called only on first use). Reuse-on-resume: an existing record is
-	 * returned without invoking `create`.
+	 * Return the existing active topic for `sessionId`, or create one via
+	 * `create` (called only on first use).
 	 */
 	async getOrCreateTopic(
 		sessionId: string,
@@ -129,6 +128,15 @@ export class TopicRegistry {
 		const record = this.topics.get(sessionId);
 		if (!record || record.name === name) return false;
 		record.name = name;
+		return true;
+	}
+
+	/** Remove a session topic record after Telegram deletes the topic. */
+	delete(sessionId: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record) return false;
+		this.topics.delete(sessionId);
+		this.byTopic.delete(record.topicId);
 		return true;
 	}
 

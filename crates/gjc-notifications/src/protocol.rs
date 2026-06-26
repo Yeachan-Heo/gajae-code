@@ -179,6 +179,9 @@ pub enum ServerMessage {
 	/// Replayable readiness signal: the session is up and surfaced. Buffered
 	/// and replayed to late clients so WS-open alone never implies readiness.
 	SessionReady(SessionReady),
+	/// Session endpoint teardown signal for clients that maintain per-session
+	/// surfaces.
+	SessionClosed(SessionClosed),
 	/// Application-level liveness response to a client ping.
 	Pong(Pong),
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
@@ -330,6 +333,14 @@ pub struct ConfigUpdate {
 	/// Whether redaction is enabled.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub redact:     Option<bool>,
+}
+
+/// Session endpoint teardown signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClosed {
+	/// The session whose notification endpoint is shutting down.
+	pub session_id: String,
 }
 
 /// Server capability/version advertisement.
@@ -640,6 +651,14 @@ mod tests {
 		assert_eq!(v["branch"], "feat/notification-surface");
 		assert_eq!(v["machine"], "mac-studio");
 		assert_eq!(v["title"], "Rebuild notifications");
+	}
+
+	#[test]
+	fn session_closed_serializes_camelcase() {
+		let msg = ServerMessage::SessionClosed(SessionClosed { session_id: "sess-1".into() });
+		let v = serde_json::to_value(&msg).unwrap();
+		assert_eq!(v["type"], "session_closed");
+		assert_eq!(v["sessionId"], "sess-1");
 	}
 
 	#[test]

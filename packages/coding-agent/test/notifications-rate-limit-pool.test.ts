@@ -71,4 +71,17 @@ describe("RateLimitPool", () => {
 		pool.submit(item("s1", "live", "c", "other"));
 		expect(pool.pending).toBe(3);
 	});
+
+	test("removes matching queued items without consuming tokens", () => {
+		const pool = new RateLimitPool<string>({ capacity: 1, refillPerSec: 0, now: () => 0 });
+		pool.submit(item("s1", "finalized", "s1-final"));
+		pool.submit(item("s1", "live", "s1-live"));
+		pool.submit(item("s2", "live", "s2-live"));
+
+		expect(pool.drain(0).map(i => i.payload)).toEqual(["s1-final"]);
+		const removed = pool.removeWhere(i => i.sessionId === "s1");
+		expect(removed.map(i => i.payload)).toEqual(["s1-live"]);
+		expect(pool.pending).toBe(1);
+		expect(pool.drain(60_000).map(i => i.payload)).toEqual([]);
+	});
 });

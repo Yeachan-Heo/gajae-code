@@ -1293,6 +1293,63 @@ test("activity busy frame sends a typing chat action into the session topic", as
 	expect(bot.calls.some(c => c.method === "sendChatAction")).toBe(false);
 });
 
+test("session_closed deletes the topic and resume creates a fresh visible topic", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let now = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+	for (let i = 0; i < 25; i++) {
+		await daemon.handleSessionMessage(session as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: `queued-before-delete-${i}`,
+		});
+	}
+	bot.calls = [];
+
+	await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+	const deleted = bot.calls.find(c => c.method === "deleteForumTopic");
+	expect(deleted).toBeTruthy();
+	expect(deleted!.body.message_thread_id).toBe(threadId);
+
+	now = 10_000;
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+		title: "resumed",
+	});
+	const create = bot.calls.find(c => c.method === "createForumTopic");
+	const send = bot.calls.find(c => c.method === "sendMessage");
+	expect(create).toBeTruthy();
+	expect(create!.body.name).toBe("r/b - resumed");
+	expect(send).toBeTruthy();
+	expect(send!.body.message_thread_id).toBeTruthy();
+	expect(bot.calls.some(c => c.method === "reopenForumTopic")).toBe(false);
+	expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("queued-before-delete"))).toBe(
+		false,
+	);
+});
+
 test("inbound thread message gets a queued reaction, flipped to consumed on ack", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();

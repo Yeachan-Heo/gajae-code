@@ -12,7 +12,7 @@
  * - `ask` (unattended/RPC): observes emitted workflow gates and resolves the real
  *   gate on a remote reply via `ctx.workflowGate`.
  * - `turn_end` -> `action_needed` (kind `idle`, deduped per turn).
- * - `session_shutdown` -> stop the server + deregister the answer source.
+ * - `session_shutdown` -> `session_closed` frame, stop server, deregister answer source.
  *
  * Enable with Settings notifications config, `GJC_NOTIFICATIONS=1` (a token is
  * generated), or `GJC_NOTIFICATIONS_TOKEN`.
@@ -484,8 +484,9 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 	const runtimes = new Map<string, SessionRuntime>();
 	const disabledSessions = new Set<string>();
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
+	const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
-	function stopSession(id: string): boolean {
+	async function stopSession(id: string): Promise<boolean> {
 		const rt = runtimes.get(id);
 		if (!rt) return false;
 		runtimes.delete(id);
@@ -496,6 +497,14 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
+		let closeFrameSent = false;
+		try {
+			rt.server.pushFrame(JSON.stringify({ type: "session_closed", sessionId: id }));
+			closeFrameSent = true;
+		} catch (e) {
+			logger.warn(`notifications: session_closed failed: ${String(e)}`);
+		}
+		if (closeFrameSent) await sleep(100);
 		try {
 			rt.server.stop();
 		} catch (e) {
@@ -739,7 +748,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 
 			if (command === "off") {
 				disabledSessions.add(id);
-				const stopped = stopSession(id);
+				const stopped = await stopSession(id);
 				ctx.ui.notify(
 					stopped
 						? "Notifications disabled for this session."
@@ -1057,7 +1066,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		}
 	});
 
-	api.on("session_shutdown", (_event, ctx) => {
-		stopSession(sessionId(ctx));
+	api.on("session_shutdown", async (_event, ctx) => {
+		await stopSession(sessionId(ctx));
 	});
 };

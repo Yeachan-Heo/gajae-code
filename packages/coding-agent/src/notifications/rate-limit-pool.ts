@@ -136,6 +136,25 @@ export class RateLimitPool<T = unknown> {
 		return granted;
 	}
 
+	/** Remove queued items matching `predicate` without consuming tokens. Returns removed items in lane/FIFO order. */
+	removeWhere(predicate: (item: RateLimitItem<T>) => boolean): RateLimitItem<T>[] {
+		const removed: RateLimitItem<T>[] = [];
+		for (const lane of LANE_PRIORITY) {
+			const queue = this.lanes.get(lane)!;
+			let write = 0;
+			for (let read = 0; read < queue.length; read++) {
+				const queued = queue[read]!;
+				if (predicate(queued.item)) {
+					removed.push(queued.item);
+				} else {
+					queue[write++] = queued;
+				}
+			}
+			queue.length = write;
+		}
+		return removed;
+	}
+
 	private refill(nowMs: number): void {
 		if (nowMs <= this.lastRefill) return;
 		const elapsedSec = (nowMs - this.lastRefill) / 1000;
