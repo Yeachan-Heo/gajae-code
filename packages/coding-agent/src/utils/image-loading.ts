@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import type { ImageContent } from "@gajae-code/ai";
 import { formatBytes, readImageMetadata, SUPPORTED_IMAGE_MIME_TYPES } from "@gajae-code/utils";
 import { resolveReadPath } from "../tools/path-utils";
-import { formatDimensionNote, resizeImage } from "./image-resize";
+import { clampImageToApiDimensionCeiling, formatDimensionNote, resizeImage } from "./image-resize";
 
 export const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
 export const SUPPORTED_INPUT_IMAGE_MIME_TYPES = SUPPORTED_IMAGE_MIME_TYPES;
@@ -83,6 +83,21 @@ export async function loadImageInput(options: LoadImageInputOptions): Promise<Lo
 			dimensionNote = formatDimensionNote(resized);
 		} catch {
 			// keep original image when resize fails
+		}
+	} else {
+		// Auto-resize is off, but the hard API dimension ceiling MUST still hold: a single
+		// image over 2000px on any edge permanently bricks multi-image requests (HTTP 400).
+		// Downscale only when the ceiling is exceeded; in-spec images pass through untouched.
+		try {
+			const clamped = await clampImageToApiDimensionCeiling({ type: "image", data: outputData, mimeType });
+			if (clamped.wasResized) {
+				outputData = clamped.data;
+				outputMimeType = clamped.mimeType;
+				outputBytes = clamped.buffer.byteLength;
+				dimensionNote = formatDimensionNote(clamped);
+			}
+		} catch {
+			// keep original image when clamp fails
 		}
 	}
 

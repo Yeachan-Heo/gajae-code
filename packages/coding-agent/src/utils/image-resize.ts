@@ -23,6 +23,13 @@ export interface ResizedImage {
 // binding constraint once images are downsized to 1568px (Anthropic's internal threshold).
 const DEFAULT_MAX_BYTES = 500 * 1024;
 
+// Anthropic rejects any image whose longest edge exceeds 2000px when a request carries
+// multiple images ("many-image requests"). One over-ceiling image makes the WHOLE request
+// fail with HTTP 400 on every retry, permanently bricking the session. This is a hard
+// API-compatibility ceiling — distinct from the aggressive `images.autoResize` downscale —
+// and MUST hold even when aggressive resizing is disabled.
+export const IMAGE_API_HARD_MAX_DIMENSION = 2000;
+
 const DEFAULT_OPTIONS: Required<Omit<ImageResizeOptions, "excludeWebP">> = {
 	// Anthropic's "internal recommended size" — Anthropic model internally caps images at
 	// 1568px on the longest edge before vision processing.
@@ -288,6 +295,27 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 			},
 		};
 	}
+}
+
+/**
+ * Enforce the hard API-compatibility dimension ceiling (`IMAGE_API_HARD_MAX_DIMENSION`)
+ * WITHOUT the aggressive byte/quality compression `resizeImage` applies by default.
+ *
+ * Only downscales when an edge exceeds the ceiling; in-spec images pass through untouched
+ * (`wasResized === false`). Use this on image-ingestion paths even when `images.autoResize`
+ * is disabled, because a single over-ceiling image permanently bricks multi-image requests.
+ */
+export async function clampImageToApiDimensionCeiling(
+	img: ImageContent,
+	maxDimension: number = IMAGE_API_HARD_MAX_DIMENSION,
+): Promise<ResizedImage> {
+	// Effectively unbound `maxBytes` so in-spec images are not recompressed — we want a
+	// pure dimension clamp here, not the byte-target ladder.
+	return resizeImage(img, {
+		maxWidth: maxDimension,
+		maxHeight: maxDimension,
+		maxBytes: Number.MAX_SAFE_INTEGER,
+	});
 }
 
 /**

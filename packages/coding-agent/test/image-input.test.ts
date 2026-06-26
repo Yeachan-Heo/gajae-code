@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readImageMetadata } from "@gajae-code/utils";
+import { loadImageInput } from "../src/utils/image-loading";
 
 describe("readImageMetadata", () => {
 	let testDir: string;
@@ -55,5 +56,55 @@ describe("readImageMetadata", () => {
 
 		const metadata = await readImageMetadata(textPath);
 		expect(metadata).toBeNull();
+	});
+});
+
+// 1x1 red PNG seed — upscaled via Bun.Image to synthesize fixtures without binary blobs.
+const RED_1X1_PNG_BASE64 =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+async function writeRedPng(dir: string, name: string, width: number, height: number): Promise<string> {
+	const seed = Buffer.from(RED_1X1_PNG_BASE64, "base64");
+	const bytes = await new Bun.Image(seed).resize(width, height, { filter: "nearest" }).png().bytes();
+	const filePath = path.join(dir, name);
+	fs.writeFileSync(filePath, bytes);
+	return filePath;
+}
+
+describe("loadImageInput hard dimension ceiling", () => {
+	let testDir: string;
+
+	beforeEach(() => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-image-clamp-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(testDir, { recursive: true, force: true });
+	});
+
+	it("clamps an over-2000px image even when autoResize is disabled", async () => {
+		// 2560x1080 ultrawide screenshot — the case that permanently bricks sessions.
+		const imagePath = await writeRedPng(testDir, "ultrawide.png", 2560, 1080);
+
+		const result = await loadImageInput({ path: imagePath, cwd: testDir, autoResize: false });
+
+		expect(result).not.toBeNull();
+		const { width, height } = await new Bun.Image(Buffer.from(result!.data, "base64")).metadata();
+		expect(width).toBeLessThanOrEqual(2000);
+		expect(height).toBeLessThanOrEqual(2000);
+	});
+
+	it("passes through an in-spec image unchanged when autoResize is disabled", async () => {
+		const imagePath = await writeRedPng(testDir, "in-spec.png", 1800, 1600);
+		const originalData = fs.readFileSync(imagePath).toString("base64");
+
+		const result = await loadImageInput({ path: imagePath, cwd: testDir, autoResize: false });
+
+		expect(result).not.toBeNull();
+		expect(result!.mimeType).toBe("image/png");
+		expect(result!.data).toBe(originalData);
+		const { width, height } = await new Bun.Image(Buffer.from(result!.data, "base64")).metadata();
+		expect(width).toBe(1800);
+		expect(height).toBe(1600);
 	});
 });

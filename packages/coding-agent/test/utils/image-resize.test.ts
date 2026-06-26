@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { resizeImage } from "../../src/utils/image-resize";
+import {
+	clampImageToApiDimensionCeiling,
+	IMAGE_API_HARD_MAX_DIMENSION,
+	resizeImage,
+} from "../../src/utils/image-resize";
 
 // 1x1 red PNG (69 bytes) — used as a Bun.Image seed to synthesize larger fixtures
 // without checking binary blobs into the repo.
@@ -145,5 +149,43 @@ describe("resizeImage env wiring", () => {
 		Bun.env.GJC_NO_WEBP = "0";
 		const zero = await resizeImage({ type: "image", data, mimeType: "image/webp" });
 		expect(zero.mimeType).toBe("image/webp");
+	});
+});
+
+describe("clampImageToApiDimensionCeiling", () => {
+	it("downscales images that exceed the 2000px many-image ceiling", async () => {
+		// 2560x1080 — an ultrawide desktop screenshot: the real-world brick case.
+		const data = await makeRedPng(2560, 1080);
+
+		const result = await clampImageToApiDimensionCeiling({ type: "image", data, mimeType: "image/png" });
+
+		expect(result.wasResized).toBe(true);
+		expect(result.width).toBeLessThanOrEqual(IMAGE_API_HARD_MAX_DIMENSION);
+		expect(result.height).toBeLessThanOrEqual(IMAGE_API_HARD_MAX_DIMENSION);
+		// Aspect ratio preserved (with rounding tolerance).
+		expect(Math.abs(result.width / result.height - 2560 / 1080)).toBeLessThan(0.01);
+	});
+
+	it("leaves in-spec images untouched (dimension-only, no byte-target recompression)", async () => {
+		// 1800x1600 — both edges <= 2000, so the ceiling must not touch it, even though it
+		// exceeds the aggressive 1568 autoResize cap. clamp is a pure dimension guard.
+		const data = await makeRedPng(1800, 1600);
+
+		const result = await clampImageToApiDimensionCeiling({ type: "image", data, mimeType: "image/png" });
+
+		expect(result.wasResized).toBe(false);
+		expect(result.width).toBe(1800);
+		expect(result.height).toBe(1600);
+		expect(result.mimeType).toBe("image/png");
+	});
+
+	it("treats exactly 2000px as in-spec (inclusive ceiling)", async () => {
+		const data = await makeRedPng(2000, 1200);
+
+		const result = await clampImageToApiDimensionCeiling({ type: "image", data, mimeType: "image/png" });
+
+		expect(result.wasResized).toBe(false);
+		expect(result.width).toBe(2000);
+		expect(result.height).toBe(1200);
 	});
 });

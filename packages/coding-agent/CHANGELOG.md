@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce a hard 2000px image-dimension ceiling on image ingestion even when `images.autoResize` is disabled. A single image whose longest edge exceeds 2000px makes Anthropic reject the entire request ("many-image requests" limit) with HTTP 400 on every retry, permanently bricking the session; `loadImageInput` now always clamps over-ceiling images (in-spec images pass through untouched).
+
 ## [0.7.3] - 2026-06-25
 
 ### Added
