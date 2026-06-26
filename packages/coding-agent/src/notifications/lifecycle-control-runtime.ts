@@ -59,28 +59,28 @@ export type LifecycleControlServerFactory = (input: {
 }) => LifecycleControlServer;
 
 /** Atomic + fsynced file-backed idempotency ledger store. */
-export function fileLedgerStore(ledgerPath: string): LedgerStore {
+export function fileLedgerStore(idempotencyFile: string): LedgerStore {
 	return {
 		async read(): Promise<LedgerDoc> {
 			try {
-				return JSON.parse(fs.readFileSync(ledgerPath, "utf8")) as LedgerDoc;
+				return JSON.parse(fs.readFileSync(idempotencyFile, "utf8")) as LedgerDoc;
 			} catch {
 				return { version: 1, entries: {} };
 			}
 		},
 		async write(doc: LedgerDoc): Promise<void> {
-			fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
-			const tmp = `${ledgerPath}.${process.pid}.${Date.now()}.tmp`;
+			fs.mkdirSync(path.dirname(idempotencyFile), { recursive: true });
+			const tmp = `${idempotencyFile}.${process.pid}.${Date.now()}.tmp`;
 			const fd = fs.openSync(tmp, "w", 0o600);
 			fs.writeSync(fd, JSON.stringify(doc));
 			fs.fsyncSync(fd);
 			fs.closeSync(fd);
-			fs.renameSync(tmp, ledgerPath);
+			fs.renameSync(tmp, idempotencyFile);
 			// fsync the parent directory so the rename itself is durable across a
 			// crash / power loss (the temp-file fsync alone does not persist the
 			// directory entry).
 			try {
-				const dirFd = fs.openSync(path.dirname(ledgerPath), "r");
+				const dirFd = fs.openSync(path.dirname(idempotencyFile), "r");
 				try {
 					fs.fsyncSync(dirFd);
 				} finally {
