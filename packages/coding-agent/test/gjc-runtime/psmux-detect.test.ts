@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	__setBinaryResolverForTests,
 	clearPsmuxDetectionCache,
 	detectPsmux,
 	GJC_PSMUX_COMMAND_ENV,
@@ -29,27 +30,20 @@ function buildRunner(versionOutput: string | null) {
 	};
 }
 
-let whichSpy: ReturnType<typeof spyOn> | null = null;
-
 beforeEach(() => {
 	clearPsmuxDetectionCache();
-	// Mock Bun.which so tests do not depend on whether the binary is on PATH
-	// in the runner image (psmux / pmux / tmux are usually not installed in CI).
-	whichSpy?.mockRestore();
-	whichSpy = spyOn(Bun, "which");
-	whichSpy.mockImplementation(((candidate: string) => {
-		if (candidate === "psmux" || candidate === "pmux" || candidate === "tmux") {
-			return `/usr/bin/${candidate}`;
-		}
-		return null;
-	}) as typeof Bun.which);
+	// Make the binary resolver a no-op so tests are hermetic and do not
+	// depend on whether psmux / pmux / tmux happen to exist on PATH in the
+	// runner image. Tests that need a resolvable binary opt in by setting the
+	// resolver to a stub that returns a fake path for their candidate names.
+	__setBinaryResolverForTests(candidate =>
+		candidate === "psmux" || candidate === "pmux" || candidate === "tmux" ? `/usr/bin/${candidate}` : null,
+	);
 });
 
 afterEach(() => {
 	clearPsmuxDetectionCache();
-	whichSpy?.mockRestore();
-	whichSpy = null;
-	vi.restoreAllMocks();
+	__setBinaryResolverForTests(null);
 });
 
 describe("PSMUX_BINARY_NAMES", () => {
@@ -131,6 +125,9 @@ describe("detectPsmux", () => {
 	});
 
 	it("treats an explicit GJC_PSMUX_COMMAND override as authoritative", () => {
+		// Override path must NOT consult the resolver at all; the host binary
+		// resolver can be left as a no-op stub and detection still wins.
+		__setBinaryResolverForTests(() => null);
 		const detected = detectPsmux("psmux", {
 			env: { [GJC_PSMUX_COMMAND_ENV]: "psmux" },
 			runner: failingRunner(),
@@ -163,6 +160,7 @@ describe("resolveGjcTmuxBinary", () => {
 	});
 
 	it("returns tmux as the POSIX default when no override and no binary on PATH", () => {
+		__setBinaryResolverForTests(() => null);
 		const resolved = resolveGjcTmuxBinary({
 			platform: "linux",
 			env: {},

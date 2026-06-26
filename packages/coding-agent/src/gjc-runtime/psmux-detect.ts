@@ -32,6 +32,30 @@ export type PsmuxSpawnRunner = (
 	args: string[],
 ) => { exitCode: number | null; stdout?: string; stderr?: string };
 
+/**
+ * Resolves a tmux-class binary name (e.g. "psmux", "tmux") to an absolute
+ * filesystem path or returns null when the binary cannot be located. The
+ * default implementation uses `Bun.which`; production callers leave it
+ * alone and unit tests inject a stub via `__setBinaryResolverForTests`
+ * so the version-banner probe can be exercised hermetically.
+ */
+export type BinaryResolver = (candidate: string) => string | null;
+
+const DEFAULT_BINARY_RESOLVER: BinaryResolver = candidate => {
+	if (!candidate) return null;
+	const stripped = candidate.trim().replace(/^["']|["']$/g, "");
+	if (!stripped) return null;
+	if (Bun.which(stripped)) return stripped;
+	return null;
+};
+
+let activeBinaryResolver: BinaryResolver = DEFAULT_BINARY_RESOLVER;
+
+/** @internal Test-only seam; production code never calls this. */
+export function __setBinaryResolverForTests(resolver: BinaryResolver | null): void {
+	activeBinaryResolver = resolver ?? DEFAULT_BINARY_RESOLVER;
+}
+
 interface CacheEntry {
 	command: string;
 	isPsmux: boolean;
@@ -92,11 +116,7 @@ function outputMentionsPsmux(output: string): boolean {
 }
 
 function resolveBinaryPath(candidate: string): string | null {
-	if (!candidate) return null;
-	const stripped = candidate.trim().replace(/^["']|["']$/g, "");
-	if (!stripped) return null;
-	if (Bun.which(stripped)) return stripped;
-	return null;
+	return activeBinaryResolver(candidate);
 }
 
 function detectPsmuxForCommand(command: string, runner: PsmuxSpawnRunner): boolean {
@@ -118,6 +138,22 @@ export function detectPsmux(
 	const env = options.env ?? process.env;
 	const explicit = env[GJC_PSMUX_COMMAND_ENV]?.trim();
 	if (explicit) {
+		// The override is authoritative on its own — we trust the user's
+		// GJC_PSMUX_COMMAND value when they name a psmux-class binary, even
+		// when the binary cannot be located on PATH in the current process.
+		// This keeps the override usable from CI runners and from test
+		// environments where Bun.which would otherwise return null.
+		const normalized = explicit.toLowerCase();
+		if (
+			normalized === "psmux" ||
+			normalized === "pmux" ||
+			normalized.endsWith("/psmux") ||
+			normalized.endsWith("/pmux") ||
+			normalized.endsWith("\\psmux") ||
+			normalized.endsWith("\\pmux")
+		) {
+			return true;
+		}
 		const explicitPath = resolveBinaryPath(explicit);
 		if (explicitPath && explicitPath === resolveBinaryPath(command)) return true;
 	}

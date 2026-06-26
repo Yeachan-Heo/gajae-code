@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from 
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { VERSION } from "@gajae-code/coding-agent";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
 	applyGjcTmuxProfile,
@@ -14,7 +15,6 @@ import {
 	type TmuxSpawnOptions,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { VERSION } from "@gajae-code/utils/dirs";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
