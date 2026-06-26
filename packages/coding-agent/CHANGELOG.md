@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Deep Interview (and any scrollable `ask`/hook selector) no longer enables SGR mouse reporting, which was hijacking the mouse wheel and disabling the terminal's native scrollback while a question was on screen. The wheel now scrolls the terminal as usual; long questions still scroll inside the dialog via PgUp/PgDn.
+
+## [0.7.3] - 2026-06-25
+
 ### Added
 
 - Added the `gruvbox-dark` built-in theme: the canonical Gruvbox dark palette mapped across every GJC theme token, selectable via `/theme`.

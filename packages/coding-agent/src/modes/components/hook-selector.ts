@@ -28,22 +28,6 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
 
-const SGR_MOUSE_PRESS_PATTERN = /^\x1b\[<(\d+);\d+;\d+M$/;
-const MOUSE_WHEEL_TITLE_SCROLL_ROWS = 3;
-
-function getMouseWheelTitleScrollRows(keyData: string): number {
-	const match = SGR_MOUSE_PRESS_PATTERN.exec(keyData);
-	if (!match) return 0;
-
-	const button = Number.parseInt(match[1] ?? "", 10);
-	if (!Number.isFinite(button) || (button & 64) === 0) return 0;
-
-	const wheelDirection = button & 3;
-	if (wheelDirection === 0) return -MOUSE_WHEEL_TITLE_SCROLL_ROWS;
-	if (wheelDirection === 1) return MOUSE_WHEEL_TITLE_SCROLL_ROWS;
-	return 0;
-}
-
 export interface HookSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
@@ -454,13 +438,6 @@ export class HookSelectorComponent extends Container {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();
 
-		if (this.#scrollTitleRows !== undefined) {
-			const wheelRows = getMouseWheelTitleScrollRows(keyData);
-			if (wheelRows !== 0) {
-				this.#scrollableTitle?.scrollBy(wheelRows);
-				return;
-			}
-		}
 		if (this.#scrollTitleRows !== undefined && matchesKey(keyData, "pageUp")) {
 			this.#scrollableTitle?.scrollBy(-this.#scrollTitleRows);
 			return;
@@ -543,7 +520,7 @@ export class HookSelectorComponent extends Container {
 		this.#inlineEditor = editor;
 		this.#inputArea.addChild(new Spacer(1));
 		this.#inputArea.addChild(editor);
-		const scrollHint = this.#scrollTitleRows === undefined ? "" : "  wheel/PgUp/PgDn scroll question";
+		const scrollHint = this.#scrollTitleRows === undefined ? "" : "  PgUp/PgDn scroll question";
 		this.#helpTextComponent.setText(
 			theme.fg("dim", `enter submit  esc back to options  ctrl+g external editor${scrollHint}`),
 		);
