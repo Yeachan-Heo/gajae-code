@@ -37,6 +37,17 @@ function renderAssistantMessage(markdown: string): string {
 		.join("\n");
 }
 
+function renderAssistantThinking(thinking: string): string {
+	const component = new AssistantMessageComponent({
+		...createAssistantMessage(""),
+		content: [{ type: "thinking", thinking }],
+	});
+	return Bun.stripANSI(component.render(240).join("\n"))
+		.split("\n")
+		.map(line => line.trimEnd())
+		.join("\n");
+}
+
 beforeAll(async () => {
 	await initTheme(false);
 });
@@ -71,6 +82,24 @@ describe("AssistantMessageComponent mermaid markdown", () => {
 		expect(TERMINAL.imageProtocol).toBeNull();
 		expect(rendered).toContain("```mermaid");
 		expect(rendered).toContain("this is not mermaid");
+	});
+});
+
+describe("AssistantMessageComponent thinking rendering", () => {
+	it("elides pathological repeated-token thinking loops", () => {
+		const repeated = Array.from({ length: 40 }, () => "is").join(" ");
+		const rendered = renderAssistantThinking(`The plan is sound. ${repeated}`);
+
+		expect(rendered).toContain('The plan is sound. is is is … [thinking loop elided: "is" repeated 37 more times]');
+		expect(rendered.match(/\bis\b/g)?.length ?? 0).toBeLessThan(10);
+	});
+
+	it("keeps non-pathological repeated thinking visible", () => {
+		const repeated = Array.from({ length: 12 }, () => "is").join(" ");
+		const rendered = renderAssistantThinking(`Checking a small loop. ${repeated}`);
+
+		expect(rendered).toContain(`Checking a small loop. ${repeated}`);
+		expect(rendered).not.toContain("thinking loop elided");
 	});
 });
 
