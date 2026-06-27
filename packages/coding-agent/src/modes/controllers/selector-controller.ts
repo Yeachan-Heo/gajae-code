@@ -8,6 +8,7 @@ import { activateModelProfile, materializeActiveModelProfileAssignment } from ".
 import { recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
+import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -238,7 +239,7 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
-	showCustomModelPresetWizard(): void {
+	showCustomModelPresetWizard(snapshot: ModelProfileConfig): void {
 		this.showSelector(done => {
 			let wizard: CustomModelPresetWizardComponent;
 			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
@@ -255,6 +256,7 @@ export class SelectorController {
 				}
 			};
 			wizard = new CustomModelPresetWizardComponent(
+				snapshot,
 				input => {
 					void submit(input);
 				},
@@ -676,7 +678,7 @@ export class SelectorController {
 					try {
 						if (selection.kind === "createProfile") {
 							done();
-							this.showCustomModelPresetWizard();
+							this.showCustomModelPresetWizard(selection.profile);
 							return;
 						}
 						if (selection.kind === "profile") {
