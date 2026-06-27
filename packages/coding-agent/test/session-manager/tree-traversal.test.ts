@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type CustomEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { assistantMsg, userMsg } from "../utilities";
 
@@ -268,6 +271,41 @@ describe("SessionManager append and tree traversal", () => {
 
 			const node3 = node2.children.find(c => c.entry.id === id3)!;
 			expect(node3.children).toHaveLength(1); // id4
+		});
+
+		it("terminates when duplicate ids create a child cycle reachable from roots", async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-gettree-cycle-"));
+			try {
+				const sessionFile = path.join(tempDir, "corrupt.jsonl");
+				const corruptSessionJsonl = `${[
+					'{"type":"session","id":"session","timestamp":"2026-06-27T10:50:00.000Z","cwd":"/tmp"}',
+					'{"type":"message","id":"a","parentId":null,"timestamp":"2026-06-27T10:50:01.000Z","message":{"role":"user","content":"root-a","timestamp":1}}',
+					'{"type":"message","id":"a","parentId":"b","timestamp":"2026-06-27T10:50:02.000Z","message":{"role":"user","content":"duplicate-a","timestamp":2}}',
+					JSON.stringify({
+						type: "message",
+						id: "b",
+						parentId: "a",
+						timestamp: "2026-06-27T10:50:03.000Z",
+						message: assistantMsg("child-b"),
+					}),
+				].join("\n")}\n`;
+				fs.writeFileSync(sessionFile, corruptSessionJsonl);
+
+				const session = await SessionManager.open(sessionFile);
+				const tree = session.getTree();
+
+				expect(tree.length).toBeGreaterThan(0);
+				const visited = new Set<object>();
+				const stack = [...tree];
+				while (stack.length > 0) {
+					const node = stack.pop()!;
+					expect(visited.has(node)).toBe(false);
+					visited.add(node);
+					stack.push(...node.children);
+				}
+			} finally {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
 		});
 	});
 

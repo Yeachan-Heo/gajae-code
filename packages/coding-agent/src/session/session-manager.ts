@@ -4439,18 +4439,48 @@ export class SessionManager {
 			nodeMap.set(entry.id, { entry, children: [], label });
 		}
 
-		// Build tree
+		const addRoot = (node: SessionTreeNode): void => {
+			if (!roots.includes(node)) {
+				roots.push(node);
+			}
+		};
+		const removeRoot = (node: SessionTreeNode): void => {
+			const index = roots.indexOf(node);
+			if (index !== -1) {
+				roots.splice(index, 1);
+			}
+		};
+		const wouldCreateChildCycle = (parent: SessionTreeNode, child: SessionTreeNode): boolean => {
+			const stack: SessionTreeNode[] = [child];
+			const visited = new Set<SessionTreeNode>();
+			while (stack.length > 0) {
+				const current = stack.pop()!;
+				if (current === parent) {
+					return true;
+				}
+				if (visited.has(current)) {
+					continue;
+				}
+				visited.add(current);
+				stack.push(...current.children);
+			}
+			return false;
+		};
+
+		// Build tree. Corrupt session files can contain duplicate IDs or parentId
+		// cycles; reject only the edge that would make the returned tree cyclic.
 		for (const entry of entries) {
 			const node = nodeMap.get(entry.id)!;
 			if (entry.parentId === null || entry.parentId === entry.id) {
-				roots.push(node);
+				addRoot(node);
 			} else {
 				const parent = nodeMap.get(entry.parentId);
-				if (parent) {
+				if (parent && !wouldCreateChildCycle(parent, node)) {
 					parent.children.push(node);
+					removeRoot(node);
 				} else {
-					// Orphan - treat as root
-					roots.push(node);
+					// Orphan or cycle-closing edge - treat as root
+					addRoot(node);
 				}
 			}
 		}
@@ -4458,8 +4488,13 @@ export class SessionManager {
 		// Sort children by timestamp (oldest first, newest at bottom)
 		// Use iterative approach to avoid stack overflow on deep trees
 		const stack: SessionTreeNode[] = [...roots];
+		const sorted = new Set<SessionTreeNode>();
 		while (stack.length > 0) {
 			const node = stack.pop()!;
+			if (sorted.has(node)) {
+				continue;
+			}
+			sorted.add(node);
 			node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
 			stack.push(...node.children);
 		}
