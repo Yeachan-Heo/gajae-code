@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils";
-import { getDisplayChangelogEntries, parseChangelogContent } from "../src/utils/changelog";
+import {
+	getDisplayChangelogEntries,
+	getInstalledVersionChangelogEntry,
+	parseChangelogContent,
+} from "../src/utils/changelog";
 
 const tempDirs: string[] = [];
 
@@ -100,5 +104,22 @@ describe("getDisplayChangelogEntries", () => {
 			if (originalPiPackageDir === undefined) delete process.env.PI_PACKAGE_DIR;
 			else process.env.PI_PACKAGE_DIR = originalPiPackageDir;
 		}
+	});
+});
+
+describe("first-run changelog display", () => {
+	it("uses only the current embedded changelog entry on first launch", () => {
+		const entries = getDisplayChangelogEntries();
+		expect(entries.length).toBeGreaterThanOrEqual(2);
+
+		const firstRunEntry = getInstalledVersionChangelogEntry(entries, VERSION);
+		const olderVersion = entries.find(entry => `${entry.major}.${entry.minor}.${entry.patch}` !== VERSION);
+		expect(firstRunEntry).toBeDefined();
+		expect(olderVersion).toBeDefined();
+
+		expect(firstRunEntry!.content).toContain(`## [${VERSION}]`);
+		expect(firstRunEntry!.content).not.toContain(
+			`## [${olderVersion!.major}.${olderVersion!.minor}.${olderVersion!.patch}]`,
+		);
 	});
 });

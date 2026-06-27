@@ -92,6 +92,14 @@ export function getDisplayChangelogEntries(): ChangelogEntry[] {
 	return parseChangelogContent(CHANGELOG_TEXT);
 }
 
+export function getInstalledVersionChangelogEntry(
+	entries: readonly ChangelogEntry[],
+	installedVersion: string,
+): ChangelogEntry | undefined {
+	const [major = 0, minor = 0, patch = 0] = installedVersion.split(".").map(Number);
+	return entries.find(entry => entry.major === major && entry.minor === minor && entry.patch === patch) ?? entries[0];
+}
+
 /**
  * Compare versions. Returns: -1 if v1 < v2, 0 if v1 === v2, 1 if v1 > v2
  */

@@ -52,7 +52,7 @@ import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
 import type { LspStartupServerInfo } from "./tools";
-import { getDisplayChangelogEntries, getNewEntries } from "./utils/changelog";
+import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
@@ -407,7 +407,7 @@ async function getChangelogForDisplay(parsed: Args): Promise<string | undefined>
 		if (entries.length > 0) {
 			settings.set("lastChangelogVersion", VERSION);
 			await flushChangelogVersion();
-			return entries.map(e => e.content).join("\n\n");
+			return getInstalledVersionChangelogEntry(entries, VERSION)?.content;
 		}
 	} else {
 		const newEntries = getNewEntries(entries, lastVersion);

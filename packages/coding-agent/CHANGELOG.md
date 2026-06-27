@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- First-time `gjc` startup now shows only the installed/current version changelog entry instead of dumping the full historical changelog before the actionable UI; full history remains available through `/changelog --full`.
+
 - `gjc --tmux` on native Windows no longer silently falls through to a tmux-less launch: when psmux is installed the plan now boots gjc through a PowerShell-encoded inner command, when no tmux-class binary resolves on PATH the diagnostic points at the psmux install URL and `GJC_TMUX_COMMAND` override, and explicit `GJC_TMUX_COMMAND` overrides are honored on every platform.
 - The `gjc team` worker-command string is now formatted for the host shell: on Windows + psmux each env assignment uses the `$env:VAR = 'value';` PowerShell form (with PowerShell-safe single-quote escaping) instead of the POSIX `VAR='value'` form, so worker panes spawned via psmux ConPTY panes inherit the right `GJC_TEAM_*` environment.
 - `createGjcTmuxSession` now chooses the new-session bootstrap command for the host shell: PowerShell `$env:GJC_TMUX_LAUNCHED = '1'; gjc` on Windows, `exec env GJC_TMUX_LAUNCHED=1 gjc` on POSIX, so psmux-managed sessions tag the spawned gjc the same way tmux-managed ones do.
