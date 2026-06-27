@@ -28,6 +28,7 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../../config/model-resolver";
+import type { ModelProfileConfig } from "../../config/models-config-schema";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
@@ -105,6 +106,7 @@ export type ModelSelectorSelection =
 	  }
 	| {
 			kind: "createProfile";
+			profile: ModelProfileConfig;
 	  };
 
 interface PendingThinkingChoice {
@@ -155,11 +157,16 @@ interface PresetCreateRow {
 	kind: "create";
 }
 
+interface PresetAlreadySavedRow {
+	kind: "alreadySaved";
+	profileName: string;
+}
+
 interface PresetBrowseRow {
 	kind: "browse";
 }
 
-type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetCreateRow | PresetBrowseRow;
+type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetCreateRow | PresetAlreadySavedRow | PresetBrowseRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -174,6 +181,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return "browse";
 		case "create":
 			return "create";
+		case "alreadySaved":
+			return `alreadySaved:${row.profileName}`;
 	}
 }
 
@@ -192,6 +201,54 @@ function isPrintableCharacter(keyData: string): boolean {
 
 function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
 	return [...new Set(profile.requiredProviders)].sort((a, b) => a.localeCompare(b));
+}
+
+function isInheritedRoleSelector(value: string | undefined): boolean {
+	const normalized = value?.trim();
+	return !normalized || normalized === "default" || normalized === "pi/default";
+}
+
+function getSelectorProvider(selector: string): string | undefined {
+	const slashIndex = selector.indexOf("/");
+	return slashIndex > 0 ? selector.slice(0, slashIndex) : undefined;
+}
+
+function deriveRequiredProviders(modelMapping: ModelProfileConfig["model_mapping"]): string[] {
+	const providers = new Set<string>();
+	for (const selector of Object.values(modelMapping)) {
+		const provider = getSelectorProvider(selector);
+		if (provider) providers.add(provider);
+	}
+	return [...providers].sort((a, b) => a.localeCompare(b));
+}
+
+function sameStringRecord(
+	left: Readonly<Record<string, string | undefined>>,
+	right: Readonly<Record<string, string | undefined>>,
+): boolean {
+	const leftEntries = Object.entries(left)
+		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b));
+	const rightEntries = Object.entries(right)
+		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (leftEntries.length !== rightEntries.length) return false;
+	for (let i = 0; i < leftEntries.length; i++) {
+		const leftEntry = leftEntries[i];
+		const rightEntry = rightEntries[i];
+		if (!leftEntry || !rightEntry || leftEntry[0] !== rightEntry[0] || leftEntry[1] !== rightEntry[1]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let i = 0; i < left.length; i++) {
+		if (left[i] !== right[i]) return false;
+	}
+	return true;
 }
 /**
  * Component that renders a canonical model selector with provider tabs.
@@ -733,6 +790,46 @@ export class ModelSelectorComponent extends Container {
 		return groupModelProfilesForPresetLanding(this.#modelRegistry.getModelProfiles?.() ?? new Map());
 	}
 
+	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
+		const modelMapping: ModelProfileConfig["model_mapping"] = {};
+		if (this.#currentModel) {
+			modelMapping.default = formatModelSelectorValue(
+				`${this.#currentModel.provider}/${this.#currentModel.id}`,
+				this.#currentThinkingLevel,
+			);
+		} else {
+			const defaultRole = this.#settings.getModelRole("default");
+			if (!isInheritedRoleSelector(defaultRole)) modelMapping.default = defaultRole;
+		}
+
+		const visionRole = this.#settings.getModelRole("vision");
+		if (!isInheritedRoleSelector(visionRole)) modelMapping.vision = visionRole;
+
+		const agentOverrides = this.#settings.get("task.agentModelOverrides");
+		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
+			if (role === "default" || role === "vision") continue;
+			const selector = agentOverrides[role];
+			if (!isInheritedRoleSelector(selector)) modelMapping[role] = selector;
+		}
+
+		return {
+			required_providers: deriveRequiredProviders(modelMapping),
+			model_mapping: modelMapping,
+		};
+	}
+
+	#findDuplicateGeneratedProfile(snapshot: ModelProfileConfig): ModelProfileDefinition | undefined {
+		for (const profile of this.#modelRegistry.getModelProfiles?.().values() ?? []) {
+			if (
+				sameStringRecord(profile.modelMapping, snapshot.model_mapping) &&
+				sameStringArray(profile.requiredProviders, snapshot.required_providers)
+			) {
+				return profile;
+			}
+		}
+		return undefined;
+	}
+
 	#getPresetRows(): PresetLandingRow[] {
 		const rows: PresetLandingRow[] = [];
 		for (const [groupId, profiles] of this.#getPresetGroups()) {
@@ -741,7 +838,9 @@ export class ModelSelectorComponent extends Container {
 				for (const profile of profiles) rows.push({ kind: "profile", groupId, profile });
 			}
 		}
-		rows.push({ kind: "create" });
+		const snapshot = this.#buildCustomModelProfileSnapshot();
+		const duplicateProfile = this.#findDuplicateGeneratedProfile(snapshot);
+		rows.push(duplicateProfile ? { kind: "alreadySaved", profileName: duplicateProfile.name } : { kind: "create" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -815,7 +914,8 @@ export class ModelSelectorComponent extends Container {
 
 	#expandSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
+		if (!selected || selected.kind === "browse" || selected.kind === "create" || selected.kind === "alreadySaved")
+			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
 		const targetIdentity = presetRowIdentity(selected);
 		this.#expandedPresetProviderId = selected.groupId;
@@ -824,7 +924,8 @@ export class ModelSelectorComponent extends Container {
 
 	#collapseSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
+		if (!selected || selected.kind === "browse" || selected.kind === "create" || selected.kind === "alreadySaved")
+			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
 		const targetIdentity = selected.kind === "profile" ? `group:${selected.groupId}` : presetRowIdentity(selected);
 		this.#expandedPresetProviderId = undefined;
@@ -858,6 +959,12 @@ export class ModelSelectorComponent extends Container {
 			if (row.kind === "create") {
 				const label = "Create custom preset";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
+			if (row.kind === "alreadySaved") {
+				const label = `Already saved as ${row.profileName}`;
+				const renderedLabel = selected ? theme.fg("accent", label) : theme.fg("dim", label);
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
 				continue;
 			}
 			if (row.kind === "browse") {
@@ -1306,7 +1413,10 @@ export class ModelSelectorComponent extends Container {
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
 		if (row.kind === "create") {
-			this.#onSelectCallback({ kind: "createProfile" });
+			this.#onSelectCallback({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
+			return;
+		}
+		if (row.kind === "alreadySaved") {
 			return;
 		}
 		if (row.kind === "browse") {
