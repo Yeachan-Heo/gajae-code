@@ -2545,6 +2545,10 @@ function applyOpenCodeGoOfficialMetadata<TApi extends Api>(model: Model<TApi>): 
 		cost: { ...metadata.cost },
 		contextWindow: metadata.contextWindow,
 		maxTokens: metadata.maxTokens,
+		compat: {
+			...(model.compat ?? {}),
+			disableReasoningOnForcedToolChoice: true,
+		},
 	};
 }
 
