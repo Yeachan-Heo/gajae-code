@@ -16,8 +16,8 @@ describe("OpenAI Codex defaults", () => {
 			maxLevel: Effort.XHigh,
 			defaultLevel: Effort.XHigh,
 		});
-		// Codex discovery reports GPT-5.5 at 272K; bundled metadata must not
-		// drift back to a stale 400K snapshot or compaction fires too late.
-		expect(model.contextWindow).toBe(272000);
+		// GPT-5.5/Codex 5.5 is a 1M-context model; keep the bundled metadata aligned
+		// with the active runtime policy so status/compaction surfaces do not show 272K.
+		expect(model.contextWindow).toBe(1_000_000);
 	});
 });

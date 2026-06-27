@@ -197,7 +197,7 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
  * model with a larger context window on the same provider:
  * - `OpenAI code backend-spark` variants promote to `gpt-5.5`.
  *
- * `gpt-5.5` itself is a 400K-context model and is not demoted to `gpt-5.4`
+ * `gpt-5.5` itself is a 1M-context model and is not demoted to `gpt-5.4`
  * (which has a smaller window), so it has no promotion target.
  */
 export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
@@ -453,15 +453,8 @@ function inferGeneratedApplyPatchToolType(
 }
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
-	// OpenAI Codex reports GPT-5.5 with a 272K prompt budget. Keep the generated
-	// bundle aligned with the backend limit so compaction fires before the prompt
-	// crosses the usable Codex window instead of trusting stale 400K snapshots.
-	if (model.provider === "openai-codex" && parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
-		model.contextWindow = 272000;
-		return true;
-	}
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
-		model.contextWindow = 400000;
+		model.contextWindow = 1_000_000;
 		return true;
 	}
 	return false;
