@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as z from "zod/v4";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, Context, Model, OpenAICompat, Tool } from "../src/types";
 
-import * as z from "zod/v4";
 const originalFetch = global.fetch;
 
 afterEach(() => {
@@ -509,7 +509,9 @@ describe("kimi model detection via detectCompat", () => {
 		expect(compat.requiresAssistantContentForToolCalls).toBe(true);
 	});
 
-	async function captureOpenCodeGoPayload(options: Parameters<typeof streamOpenAICompletions>[2]): Promise<Record<string, unknown>> {
+	async function captureOpenCodeGoPayload(
+		options: Parameters<typeof streamOpenAICompletions>[2],
+	): Promise<Record<string, unknown>> {
 		const tool: Tool = {
 			name: "search",
 			description: "Search test data",
