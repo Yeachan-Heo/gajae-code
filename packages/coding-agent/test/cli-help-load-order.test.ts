@@ -242,5 +242,4 @@ ${stderr}`;
 		expect(stdout).toContain("USAGE");
 		expect(combined).not.toContain("Bun is a fast JavaScript runtime");
 	}, 15_000);
-
 });
