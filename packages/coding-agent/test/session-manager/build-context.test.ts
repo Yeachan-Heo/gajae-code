@@ -341,5 +341,24 @@ describe("buildSessionContext", () => {
 			// Should only get the orphan since parent chain is broken
 			expect(ctx.messages).toHaveLength(1);
 		});
+
+		it("terminates instead of OOMing when the parentId chain forms a cycle", () => {
+			// Regression: an old/corrupt session whose entries form a parentId
+			// cycle (e.g. duplicate ids overwriting each other in the byId index)
+			// previously made the leaf->root walk push entries forever until OOM.
+			const entries: SessionEntry[] = [
+				msg("a", "b", "user", "first"),
+				msg("b", "a", "assistant", "second"), // a <-> b cycle
+			];
+			const ctx = buildSessionContext(entries, "b");
+			// Each entry is visited at most once, so the walk halts.
+			expect(ctx.messages.length).toBeLessThanOrEqual(2);
+		});
+
+		it("terminates when an entry is its own parent (self-cycle)", () => {
+			const entries: SessionEntry[] = [msg("1", null, "user", "root"), msg("2", "2", "assistant", "self-parent")];
+			const ctx = buildSessionContext(entries, "2");
+			expect(ctx.messages).toHaveLength(1);
+		});
 	});
 });

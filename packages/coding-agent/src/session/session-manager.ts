@@ -640,8 +640,11 @@ export function buildSessionContext(
 
 	// Walk from leaf to root, then reverse once to avoid repeated front insertions on long branches.
 	const path: SessionEntry[] = [];
+	const visited = new Set<string>();
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
+		if (visited.has(current.id)) break;
+		visited.add(current.id);
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
@@ -3988,8 +3991,11 @@ export class SessionManager {
 	 * Returns undefined if no model change has been recorded.
 	 */
 	getLastModelChangeRole(): string | undefined {
+		const visited = new Set<string>();
 		let current = this.getLeafEntry();
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			if (current.type === "model_change") {
 				return current.role ?? "default";
 			}
@@ -4005,8 +4011,11 @@ export class SessionManager {
 		if (!compaction || compaction.type !== "compaction")
 			throw new Error(`Compaction entry ${compactionEntryId} not found`);
 		const ids: string[] = [];
+		const visited = new Set<string>();
 		let current: SessionEntry | undefined = compaction;
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			ids.push(current.id);
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
@@ -4155,8 +4164,11 @@ export class SessionManager {
 	getBranchForFidelity(fromId?: string): SessionEntry[] {
 		const cache = new Map<string, string>();
 		const path: SessionEntry[] = [];
+		const visited = new Set<string>();
 		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			path.push(
 				rehydrateColdSpillEntry(
 					materializeResidentEntrySync(current, this.#residentBlobStores(), cache),
@@ -4172,8 +4184,11 @@ export class SessionManager {
 
 	#getCanonicalBranchClones(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
+		const visited = new Set<string>();
 		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			path.push(cloneSessionEntry(current));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
@@ -4267,9 +4282,12 @@ export class SessionManager {
 		this.#getBranchMaterializerCallCount++;
 		const cache = new Map<string, string>();
 		const path: SessionEntry[] = [];
+		const visited = new Set<string>();
 		const startId = fromId ?? this.#leafId;
 		let current = startId ? this.#byId.get(startId) : undefined;
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			path.push(materializeResidentEntrySync(current, this.#residentBlobStores(), cache));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
@@ -4303,8 +4321,11 @@ export class SessionManager {
 	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
 		if (fromId === null || (fromId === undefined && this.#leafId === null)) return [];
 		const ids: string[] = [];
+		const visited = new Set<string>();
 		let current = this.#byId.get(fromId ?? this.#leafId ?? "");
 		while (current) {
+			if (visited.has(current.id)) break;
+			visited.add(current.id);
 			ids.push(current.id);
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
