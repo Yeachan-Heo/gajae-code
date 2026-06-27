@@ -506,6 +506,31 @@ describe("OpenAI responses history payload", () => {
 		]);
 	});
 
+	it("normalizes string-valued message text to well-formed replay input", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.2-codex") as Model<"openai-codex-responses">;
+		const illFormedText = "Bad surrogate \uD800";
+		const payload = (await captureCodexPayload(model, {
+			messages: [
+				{ role: "user", content: "generic history that should be replaced", timestamp: Date.now() },
+				makeAssistantMessage(
+					[
+						{
+							type: "message",
+							role: "user",
+							content: [{ type: "input_text", text: illFormedText }],
+						},
+					],
+					false,
+					"openai-codex",
+					"gpt-5.2-codex",
+				),
+				{ role: "user", content: "follow-up user", timestamp: Date.now() },
+			],
+		})) as { input?: Array<{ content?: Array<{ text?: string }> }> };
+
+		expect(payload.input?.[0]?.content?.[0]?.text).toBe(illFormedText.toWellFormed());
+	});
+
 	it("stringifies object-valued tool replay fields instead of collapsing nested text", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.2-codex") as Model<"openai-codex-responses">;
 		const functionCallId = "call_replay_object_args";

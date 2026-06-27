@@ -117,7 +117,7 @@ function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 	return content.map(part => {
 		if (!part || typeof part !== "object") return part;
 		const sanitizedPart = { ...(part as Record<string, unknown>) };
-		if ("text" in sanitizedPart && typeof sanitizedPart.text !== "string") {
+		if ("text" in sanitizedPart) {
 			sanitizedPart.text = normalizeResponsesMessageTextForReplay(sanitizedPart.text);
 		}
 		return sanitizedPart;
