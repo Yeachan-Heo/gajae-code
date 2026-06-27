@@ -471,6 +471,41 @@ describe("OpenAI responses history payload", () => {
 		]);
 	});
 
+	it("normalizes object-valued text fields before replaying openai-codex native history", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.2-codex") as Model<"openai-codex-responses">;
+		const malformedHistoryItems: Record<string, unknown>[] = [
+			{
+				type: "message",
+				role: "user",
+				id: "msg_user",
+				content: [{ type: "input_text", text: { type: "text", text: "Recovered user" } }],
+			},
+			{
+				type: "message",
+				role: "assistant",
+				id: "msg_assistant",
+				content: [{ type: "output_text", text: { type: "text", text: "Recovered assistant" } }],
+			},
+		];
+		const payload = (await captureCodexPayload(model, {
+			messages: [
+				{ role: "user", content: "generic history that should be replaced", timestamp: Date.now() },
+				makeAssistantMessage(malformedHistoryItems, false, "openai-codex", "gpt-5.2-codex"),
+				{ role: "user", content: "follow-up user", timestamp: Date.now() },
+			],
+		})) as { input?: unknown[] };
+
+		expect(payload.input).toEqual([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "Recovered user" }] },
+			{
+				type: "message",
+				role: "assistant",
+				content: [{ type: "output_text", text: "Recovered assistant" }],
+			},
+			{ role: "user", content: [{ type: "input_text", text: "follow-up user" }] },
+		]);
+	});
+
 	it("ignores incompatible native history snapshots across providers", async () => {
 		const model = getBundledModel("github-copilot", "gpt-5.4") as Model<"openai-responses">;
 		const payload = (await captureResponsesPayload(model, codexToCopilotContext)) as { input?: unknown[] };
