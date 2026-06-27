@@ -7,6 +7,54 @@ import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { isSilentAbort } from "../../session/messages";
 import { resolveImageOptions } from "../../tools/render-utils";
 
+const THINKING_REPETITION_ELIDE_MIN_RUN = 24;
+const THINKING_REPETITION_VISIBLE_TOKENS = 3;
+const THINKING_REPETITION_TOKEN_PATTERN = /[\p{L}\p{N}_'-]{1,32}/gu;
+
+interface ThinkingRepetitionToken {
+	text: string;
+	normalized: string;
+	start: number;
+	end: number;
+}
+
+function elideRunawayThinkingRepetition(text: string): string {
+	const tokens: ThinkingRepetitionToken[] = [];
+	for (const match of text.matchAll(THINKING_REPETITION_TOKEN_PATTERN)) {
+		if (match.index === undefined) continue;
+		tokens.push({
+			text: match[0],
+			normalized: match[0].toLocaleLowerCase("en-US"),
+			start: match.index,
+			end: match.index + match[0].length,
+		});
+	}
+
+	let runStart = 0;
+	for (let i = 1; i <= tokens.length; i++) {
+		const current = tokens[i];
+		const previous = tokens[i - 1];
+		if (current && previous && current.normalized === previous.normalized) continue;
+
+		const runLength = i - runStart;
+		if (runLength >= THINKING_REPETITION_ELIDE_MIN_RUN) {
+			const first = tokens[runStart];
+			const last = tokens[i - 1];
+			if (!first || !last) return text;
+
+			const visibleCount = Math.min(THINKING_REPETITION_VISIBLE_TOKENS, runLength);
+			const visible = Array.from({ length: visibleCount }, () => first.text).join(" ");
+			const omitted = runLength - visibleCount;
+			const marker = `${visible} … [thinking loop elided: "${first.text}" repeated ${omitted} more times]`;
+			return `${text.slice(0, first.start)}${marker}${text.slice(last.end)}`.trim();
+		}
+
+		runStart = i;
+	}
+
+	return text;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -128,7 +176,7 @@ export class AssistantMessageComponent extends Container {
 	#renderThinkingBlock(content: { thinking: string }): Markdown {
 		const cached = this.#contentBlocksCache.get(content);
 		if (cached?.source === content.thinking) return cached.component as Markdown;
-		const trimmed = content.thinking.trim();
+		const trimmed = elideRunawayThinkingRepetition(content.thinking.trim());
 		const component = new Markdown(trimmed, 1, 0, getMarkdownTheme(), {
 			color: (text: string) => theme.fg("thinkingText", text),
 			italic: true,
