@@ -23,6 +23,7 @@ export interface InputItem {
 	name?: string;
 	output?: unknown;
 	arguments?: unknown;
+	encrypted_content?: unknown;
 }
 
 export interface RequestBody {
@@ -97,11 +98,19 @@ function normalizeTextPartFields(content: unknown, path: string): unknown {
 function normalizeInputTextPartFields(input: InputItem[] | undefined): InputItem[] | undefined {
 	if (!Array.isArray(input)) return input;
 	return input.map((item, itemIndex) => {
-		if (item.type !== "message") return item;
-		return {
-			...item,
-			content: normalizeTextPartFields(item.content, `input[${itemIndex}].content`),
-		};
+		const normalizedItem = { ...item };
+		const itemRecord = normalizedItem as Record<string, unknown>;
+		if ("encrypted_content" in itemRecord) {
+			if (typeof itemRecord.encrypted_content === "string") {
+				itemRecord.encrypted_content = itemRecord.encrypted_content.toWellFormed();
+			} else {
+				delete itemRecord.encrypted_content;
+			}
+		}
+		if (normalizedItem.type === "message") {
+			normalizedItem.content = normalizeTextPartFields(normalizedItem.content, `input[${itemIndex}].content`);
+		}
+		return normalizedItem;
 	});
 }
 

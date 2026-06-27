@@ -105,6 +105,28 @@ describe("openai-codex request transformer", () => {
 		);
 	});
 
+	it("drops non-string encrypted_content before provider send", async () => {
+		const body: RequestBody = {
+			model: "gpt-5.1-codex",
+			input: [
+				{
+					type: "reasoning",
+					encrypted_content: { opaque: "not-a-valid-encrypted-payload" },
+				},
+				{
+					type: "reasoning",
+					encrypted_content: "enc_valid",
+				},
+			],
+		};
+
+		const transformed = await transformRequestBody(body, createCodexModel(body.model), {});
+		const [dropped, preserved] = transformed.input as Array<Record<string, unknown>>;
+
+		expect(dropped?.encrypted_content).toBeUndefined();
+		expect(preserved?.encrypted_content).toBe("enc_valid");
+	});
+
 	it("fails locally for unserializable text parts", async () => {
 		const circular: Record<string, unknown> = { summary: "compacted continuation" };
 		circular.self = circular;
