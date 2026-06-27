@@ -1,3 +1,4 @@
+import { resolveGjcTmuxBinary } from "./psmux-detect";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
@@ -128,10 +129,29 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 		}
 		throw error;
 	}
-	return output
+	const lines = output
 		.split("\n")
 		.map(line => line.trim())
 		.filter(Boolean);
+	// psmux 3.3.0 silently ignores the tmux `-F` format flag and returns its
+	// default `name: N windows (created ...)` shape. Detect that case and
+	// synthesize a tab-separated row so downstream parseSessionLine /
+	// hydrateSessionFromExactOptions can recover the @gjc-* ownership tags
+	// via follow-up show-options calls. Without this fallback gjc session
+	// list / status return an empty list on psmux even when sessions exist.
+	if (lines.length > 0 && !lines[0].includes("\t")) {
+		const binary = resolveGjcTmuxBinary({ env });
+		if (binary.isPsmux) {
+			return lines.map(line => {
+				const match = line.match(/^([^:]+):\s*(\d+)\s+windows?\s+\(created\s+([^)]+)\)/);
+				if (!match) return line;
+				const [, name, windows, created] = match;
+				const createdEpoch = String(Math.floor(new Date(`${created} UTC`).getTime() / 1000) || 0);
+				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", ""].join("\t");
+			});
+		}
+	}
+	return lines;
 }
 
 function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -235,7 +255,14 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 	});
 	if (created.exitCode !== 0) throw new Error(created.stderr.toString().trim() || "gjc_tmux_session_create_failed");
 	try {
-		for (const profileCommand of buildGjcTmuxProfileCommands(sessionName, env)) {
+		// psmux 3.3.0 rejects the tmux `=NAME` exact-session prefix for option
+		// commands, so the target is the bare session name on psmux and the
+		// window-qualified `=NAME:` on tmux. The ownership-tag round-trip
+		// (set-option @gjc-*) is preserved on both; only the UX profile commands
+		// (mouse / set-clipboard / mode-style / set-window-option) get filtered
+		// by buildGjcTmuxProfileCommands when the active binary is psmux.
+		const target = buildGjcTmuxExactOptionTarget(sessionName, { env });
+		for (const profileCommand of buildGjcTmuxProfileCommands(target, env, {}, { tmuxCommand })) {
 			runTmux(profileCommand.args, env);
 		}
 	} catch (error) {
@@ -246,18 +273,43 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 }
 
 function readProfileForExactTarget(sessionName: string, env: NodeJS.ProcessEnv): string {
-	return runTmux(
-		["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), GJC_TMUX_PROFILE_OPTION],
+	const raw = runTmux(
+		["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName, { env }), GJC_TMUX_PROFILE_OPTION],
 		env,
 	).trim();
+	// tmux returns just the value; psmux returns `key value`. Strip the
+	// leading key on psmux so the GJC_TMUX_PROFILE_VALUE equality check
+	// against "1" works the same on both.
+	if (raw && resolveGjcTmuxBinary({ env }).isPsmux) {
+		const tokens = raw.split(/\s+/).filter(Boolean);
+		return tokens[tokens.length - 1] ?? raw;
+	}
+	return raw;
 }
 
 function readExactOptionForGc(sessionName: string, option: string, env: NodeJS.ProcessEnv): string | undefined {
 	try {
-		return (
-			runTmux(["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), option], env).trim() ||
-			undefined
-		);
+		const raw = runTmux(
+			["show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName, { env }), option],
+			env,
+		).trim();
+		if (!raw) return undefined;
+		// tmux returns just the option value (e.g. `1` for @gjc-profile).
+		// psmux 3.3.0 returns `key value` (or `key "value with space"` for
+		// @gjc-branch etc.). On psmux, parse the last token and strip any
+		// surrounding double quotes so both shapes resolve to the same value.
+		if (resolveGjcTmuxBinary({ env }).isPsmux) {
+			// Prefer the last whitespace-separated token. If the value is
+			// quoted, find the matching close-quote and slice.
+			const lastQuote = raw.lastIndexOf('"');
+			if (lastQuote > 0 && raw[lastQuote - 1] !== "\\") {
+				const firstQuote = raw.lastIndexOf('"', lastQuote - 1);
+				if (firstQuote > 0) return raw.slice(firstQuote + 1, lastQuote);
+			}
+			const tokens = raw.split(/\s+/).filter(Boolean);
+			return tokens[tokens.length - 1];
+		}
+		return raw;
 	} catch {
 		return undefined;
 	}
