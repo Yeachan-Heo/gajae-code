@@ -199,4 +199,48 @@ describe("CLI help load order", () => {
 		expect(stdout).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
 		expect(stderr).toBe("");
 	}, 15_000);
+	it("package bin wrapper executes CLI help when imported by a Bun global shim", async () => {
+		if (Bun.semver.order(Bun.version, "1.3.14") < 0) {
+			return;
+		}
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bin-wrapper-help-"));
+		cleanupRoot = root;
+		const home = path.join(root, "home");
+		const xdg = path.join(root, "xdg");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(home, { recursive: true });
+		await fs.mkdir(xdg, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+
+		const wrapperPath = path.join(repoRoot, "packages", "coding-agent", "bin", "gjc.js");
+		const proc = Bun.spawn([process.execPath, wrapperPath, "--help"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				HOME: home,
+				XDG_CONFIG_HOME: xdg,
+				XDG_DATA_HOME: xdg,
+				GJC_CODING_AGENT_DIR: agentDir,
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_NO_TITLE: "1",
+				NO_COLOR: "1",
+			},
+		});
+
+		const [stdout, stderr, exitCode] = await Promise.all([
+			readStream(proc.stdout as ReadableStream<Uint8Array>),
+			readStream(proc.stderr as ReadableStream<Uint8Array>),
+			proc.exited,
+		]);
+		const combined = `${stdout}
+${stderr}`;
+
+		expect(exitCode, combined).toBe(0);
+		expect(stdout).toContain("gjc v");
+		expect(stdout).toContain("USAGE");
+		expect(combined).not.toContain("Bun is a fast JavaScript runtime");
+	}, 15_000);
+
 });

@@ -28,7 +28,7 @@
 	"main": "./src/index.ts",
 	"types": "./src/index.ts",
 	"bin": {
-		"gjc": "src/cli.ts"
+		"gjc": "bin/gjc.js"
 	},
 	"scripts": {
 		"build": "bun scripts/build-binary.ts",
@@ -82,6 +82,7 @@
 	},
 	"files": [
 		"src",
+		"bin",
 		"scripts",
 		"examples",
 		"README.md",
