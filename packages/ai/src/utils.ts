@@ -91,12 +91,8 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
-function normalizeResponsesStringParamForReplay(value: unknown): string {
+function stringifyResponsesStringParamForReplay(value: unknown): string {
 	if (typeof value === "string") return value.toWellFormed();
-	if (value && typeof value === "object") {
-		const nestedText = (value as { text?: unknown }).text;
-		if (typeof nestedText === "string") return nestedText.toWellFormed();
-	}
 	try {
 		const encoded = JSON.stringify(value);
 		if (typeof encoded === "string") return encoded.toWellFormed();
@@ -106,6 +102,15 @@ function normalizeResponsesStringParamForReplay(value: unknown): string {
 	return String(value ?? "").toWellFormed();
 }
 
+function normalizeResponsesMessageTextForReplay(value: unknown): string {
+	if (typeof value === "string") return value.toWellFormed();
+	if (value && typeof value === "object") {
+		const nestedText = (value as { text?: unknown }).text;
+		if (typeof nestedText === "string") return nestedText.toWellFormed();
+	}
+	return stringifyResponsesStringParamForReplay(value);
+}
+
 function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 	if (typeof content === "string") return content.toWellFormed();
 	if (!Array.isArray(content)) return content;
@@ -113,7 +118,7 @@ function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 		if (!part || typeof part !== "object") return part;
 		const sanitizedPart = { ...(part as Record<string, unknown>) };
 		if ("text" in sanitizedPart && typeof sanitizedPart.text !== "string") {
-			sanitizedPart.text = normalizeResponsesStringParamForReplay(sanitizedPart.text);
+			sanitizedPart.text = normalizeResponsesMessageTextForReplay(sanitizedPart.text);
 		}
 		return sanitizedPart;
 	});
@@ -124,17 +129,17 @@ function sanitizeResponsesStringFieldsForReplay(item: Record<string, unknown>): 
 		item.content = sanitizeResponsesMessageContentForReplay(item.content);
 	}
 	if (item.type === "function_call" && "arguments" in item && typeof item.arguments !== "string") {
-		item.arguments = normalizeResponsesStringParamForReplay(item.arguments);
+		item.arguments = stringifyResponsesStringParamForReplay(item.arguments);
 	}
 	if (item.type === "custom_tool_call" && "input" in item && typeof item.input !== "string") {
-		item.input = normalizeResponsesStringParamForReplay(item.input);
+		item.input = stringifyResponsesStringParamForReplay(item.input);
 	}
 	if (
 		(item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
 		"output" in item &&
 		typeof item.output !== "string"
 	) {
-		item.output = normalizeResponsesStringParamForReplay(item.output);
+		item.output = stringifyResponsesStringParamForReplay(item.output);
 	}
 }
 
