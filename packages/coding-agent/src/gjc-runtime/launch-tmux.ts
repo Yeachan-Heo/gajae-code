@@ -34,25 +34,6 @@ export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
 
-function envFlagDisabled(value: string | undefined): boolean {
-	const normalized = value?.trim().toLowerCase();
-	return normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no";
-}
-
-/**
- * Decide whether the mouse / clipboard / mode-style UX profile commands should
- * be dropped for the active multiplexer. Psmux historically does not
- * round-trip every user option perfectly; the ownership-tag round-trip is the
- * only piece gjc session / gjc team actually need, so dropping the rest keeps
- * native Windows `gjc --tmux` bootable when those UX options would otherwise
- * hard-fail.
- */
-function psmuxProfileCommandsShouldDropUx(env: NodeJS.ProcessEnv, tmuxCommand: string): boolean {
-	if (envFlagDisabled(env[GJC_PSMUX_PROFILE_FORCE_ENV])) return false;
-	const resolved = resolveGjcTmuxBinary({ env });
-	return resolved.command === tmuxCommand && resolved.isPsmux;
-}
-
 type LaunchPolicy = "direct" | "tmux";
 
 interface TtyState {
@@ -232,25 +213,26 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
 	const env = context.env ?? process.env;
 	const branchSlug = context.branch ? buildGjcTmuxSessionSlug(context.branch) : (context.branchSlug ?? null);
-	let commands = buildGjcTmuxProfileCommands(context.target, env, {
-		branch: context.branch ?? null,
-		branchSlug,
-		project: context.project ?? null,
-		sessionId: context.sessionId ?? env[GJC_COORDINATOR_SESSION_ID_ENV] ?? null,
-		sessionStateFile: context.sessionStateFile ?? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
-		version: context.version ?? null,
-	});
-	if (psmuxProfileCommandsShouldDropUx(env, context.tmuxCommand)) {
-		// Keep the ownership-tag round-trip (required for `gjc session` and
-		// `gjc team`); drop only the UX profile commands whose option keys
-		// historically do not round-trip cleanly on psmux.
-		const dropArgs = new Set(["mouse", "set-clipboard", "mode-style"]);
-		commands = commands.filter(command => {
-			const flag = command.args[0];
-			const key = command.args[command.args.length - 2];
-			return !(dropArgs.has(String(key)) && (flag === "set-option" || flag === "set-window-option"));
-		});
-	}
+	// The psmux UX filter (mouse / set-clipboard / mode-style /
+	// set-window-option) now lives in buildGjcTmuxProfileCommands so every
+	// caller — gjc --tmux planning, gjc session create, gjc team bootstrap —
+	// applies the same drop set when the active multiplexer is psmux. We pass
+	// the resolved tmuxCommand through the new opts seam so the filter
+	// engages for this exact command, not whatever the resolver returns at
+	// profile-build time.
+	const commands = buildGjcTmuxProfileCommands(
+		context.target,
+		env,
+		{
+			branch: context.branch ?? null,
+			branchSlug,
+			project: context.project ?? null,
+			sessionId: context.sessionId ?? env[GJC_COORDINATOR_SESSION_ID_ENV] ?? null,
+			sessionStateFile: context.sessionStateFile ?? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
+			version: context.version ?? null,
+		},
+		{ tmuxCommand: context.tmuxCommand },
+	);
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
 	const cwd = context.cwd ?? process.cwd();

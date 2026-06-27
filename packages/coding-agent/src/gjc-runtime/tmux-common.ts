@@ -1,3 +1,4 @@
+import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 
 export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
@@ -13,6 +14,7 @@ export const GJC_TMUX_PROJECT_OPTION = "@gjc-project";
 export const GJC_TMUX_SESSION_ID_OPTION = "@gjc-session-id";
 export const GJC_TMUX_SESSION_STATE_FILE_OPTION = "@gjc-session-state-file";
 export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
+export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
 
 export interface GjcTmuxProfileCommand {
 	description: string;
@@ -70,7 +72,17 @@ export { clearPsmuxDetectionCache, detectPsmux, probePsmux, resolveGjcTmuxBinary
  * keeps the exact-session match while giving tmux the window-qualified target
  * those commands require. See gajae-code#580.
  */
-export function buildGjcTmuxExactOptionTarget(sessionName: string): string {
+export function buildGjcTmuxExactOptionTarget(
+	sessionName: string,
+	opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; binary?: ResolvedTmuxBinary } = {},
+): string {
+	const binary = opts.binary ?? resolveGjcTmuxBinary({ env: opts.env, platform: opts.platform });
+	// psmux 3.3.0 rejects the tmux `=NAME` exact-session prefix for option
+	// commands ("no server running on session '=NAME'"); bare `NAME` and
+	// window-qualified `NAME:` both work. tmux 3.6a needs the
+	// window-qualified `=NAME:` to resolve the session for option
+	// commands (gajae-code#580).
+	if (binary.isPsmux) return sessionName;
 	return `=${sessionName}:`;
 }
 
@@ -171,6 +183,16 @@ export function buildGjcTmuxRequiredProfileCommands(
 	return commands;
 }
 
+/**
+ * Keys whose set-option / set-window-option round-trip is unreliable on psmux
+ * 3.3.0. psmux does not support the tmux `set-window-option` command at all
+ * (it reports "unknown command: set-window-option") and silently drops several
+ * `set-option` keys. The list lives here so every code path that tags a tmux
+ * session (gjc --tmux planning, gjc session create, gjc team bootstrap)
+ * applies the same filter.
+ */
+const PSMUX_UNSUPPORTED_PROFILE_KEYS = new Set(["mouse", "set-clipboard", "mode-style"]);
+
 export function buildGjcTmuxProfileCommands(
 	target: string,
 	env: NodeJS.ProcessEnv = process.env,
@@ -182,6 +204,7 @@ export function buildGjcTmuxProfileCommands(
 		sessionStateFile?: string | null;
 		version?: string | null;
 	} = {},
+	opts: { platform?: NodeJS.Platform; tmuxCommand?: string } = {},
 ): GjcTmuxProfileCommand[] {
 	const commands = buildGjcTmuxRequiredProfileCommands(target, metadata);
 	if (envDisabled(env[GJC_TMUX_PROFILE_ENV])) return commands;
@@ -197,6 +220,40 @@ export function buildGjcTmuxProfileCommands(
 			description: "enable tmux mouse scrolling",
 			args: ["set-option", "-t", target, "mouse", "on"],
 		});
+	// psmux does not implement set-window-option and historically drops
+	// mouse / set-clipboard / mode-style. Filter the UX profile commands
+	// centrally so every code path that tags a session (gjc --tmux planning,
+	// gjc session create, gjc team bootstrap) drops the same set. The
+	// GJC_PSMUX_PROFILE_FORCE override lets the operator opt back in when
+	// running on a psmux build that has caught up. The ownership-tag
+	// round-trip (set-option @gjc-*) is never filtered, since gjc session /
+	// gjc team rely on it.
+	// The filter is opt-in: callers that explicitly pass `opts.tmuxCommand`
+	// name a psmux-class multiplexer (psmux / pmux) when they want the UX
+	// profile filtered. Auto-detect on Windows hosts where psmux happens
+	// to be on PATH would silently change the test output for every caller
+	// that does not pin the multiplexer, so we require the caller to opt
+	// in by naming the multiplexer. GJC_PSMUX_PROFILE_FORCE re-enables
+	// the UX profile commands when a psmux build catches up.
+	const tmuxName = (opts.tmuxCommand ?? "").toLowerCase();
+	const isPsmuxClass =
+		tmuxName === "psmux" ||
+		tmuxName === "pmux" ||
+		tmuxName.endsWith("/psmux") ||
+		tmuxName.endsWith("/pmux") ||
+		tmuxName.endsWith("\\psmux") ||
+		tmuxName.endsWith("\\pmux");
+	const dropUx = isPsmuxClass && !envDisabled(env[GJC_PSMUX_PROFILE_FORCE_ENV]);
+	if (dropUx) {
+		return commands.filter(command => {
+			const flag = command.args[0];
+			const key = command.args[command.args.length - 2];
+			return !(
+				PSMUX_UNSUPPORTED_PROFILE_KEYS.has(String(key)) &&
+				(flag === "set-option" || flag === "set-window-option")
+			);
+		});
+	}
 	return commands;
 }
 

@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import {
+	__setBinaryResolverForTests,
+	clearPsmuxDetectionCache,
+} from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 import { buildGjcTmuxExactOptionTarget } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
+	createGjcTmuxSession,
 	listGjcTmuxSessions,
 	removeGjcTmuxSession,
 	statusGjcTmuxSession,
@@ -27,13 +32,14 @@ describe("GJC tmux session management", () => {
 			spawnResult(
 				0,
 				[
-					"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a",
-					"unrelated\t2\t1\t1770000060\t\troot\t3\t23456\t\t",
-					"gajae_code\t1\t1\t1770000120\t\troot\t1\t34567\t\t",
+					"gajae_code_abc	1	0	1770000000	1	root	2	12345	feature/demo	feature-demo	/repo-a",
+					"unrelated	2	1	1770000060		root	3	23456		",
+					"gajae_code	1	1	1770000120		root	1	34567		",
 				].join("\n"),
 			),
 		);
 
+		clearPsmuxDetectionCache();
 		const sessions = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" });
 
 		expect(sessions.map(session => session.name)).toEqual(["gajae_code_abc"]);
@@ -49,7 +55,7 @@ describe("GJC tmux session management", () => {
 				"tmux-test",
 				"list-sessions",
 				"-F",
-				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-version}",
+				"#{session_name}	#{session_windows}	#{session_attached}	#{session_created}	#{@gjc-profile}	#{session_key_table}	#{session_panes}	#{pane_pid}	#{@gjc-branch}	#{@gjc-branch-slug}	#{@gjc-project}	#{@gjc-session-id}	#{@gjc-session-state-file}	#{@gjc-version}",
 			],
 			expect.any(Object),
 		);
@@ -72,7 +78,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
+				return spawnResult(0, "gajae_code_work	1	0	1770000000	1	root	1			\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
 			return spawnResult(0, "");
@@ -90,7 +96,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
+				return spawnResult(0, "gajae_code_work	1	0	1770000000	1	root	1			\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "\n");
 			return spawnResult(0, "");
@@ -108,7 +114,7 @@ describe("GJC tmux session management", () => {
 				// The bare `#{session_name}` probe sees the session (psmux ls shows it)...
 				if (format === "#{session_name}") return spawnResult(0, "psmux_session\n");
 				// ...but the full format does not round-trip @gjc-profile, so the profile column is empty.
-				return spawnResult(0, "psmux_session\t1\t0\t1770000000\t\troot\t0\t\t\t\t\n");
+				return spawnResult(0, "psmux_session	1	0	1770000000		root	0				\n");
 			}
 			return spawnResult(0, "");
 		});
@@ -131,7 +137,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "win_session\t1\t0\t1770000000\t\troot\t1\t12345\t\t\t\t\t\n");
+				return spawnResult(0, "win_session	1	0	1770000000		root	1	12345					\n");
 			}
 			if (cmd.includes("show-options")) {
 				const option = cmd.at(-1);
@@ -170,7 +176,7 @@ describe("GJC tmux session management", () => {
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
+				return spawnResult(0, "gajae_code_work	1	0	1770000000	1	root	1			\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
 			return spawnResult(0, "");
@@ -182,5 +188,128 @@ describe("GJC tmux session management", () => {
 		expect(showOptions).toEqual(["tmux", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
 		// Session-scoped commands keep the bare exact target, which tmux resolves.
 		expect(calls.at(-1)).toEqual(["tmux", "kill-session", "-t", "=gajae_code_work"]);
+	});
+
+	it("drops the tmux `=NAME` exact-session prefix on psmux for option commands", () => {
+		// psmux 3.3.0 rejects the tmux `=NAME` exact-session prefix on
+		// set-option / show-options with "no server running on session '=NAME'",
+		// but tmux 3.6a needs the window-qualified `=NAME:` to resolve the
+		// session for option/display commands. The shared resolver should
+		// pick the right shape for the active multiplexer. Use the
+		// BinaryResolver test seam + GJC_PSMUX_COMMAND override so the
+		// detection layer agrees on the multiplexer identity without
+		// needing a real psmux binary on PATH.
+		__setBinaryResolverForTests(candidate =>
+			candidate === "psmux" || candidate === "pmux" ? `/fake/${candidate}` : null,
+		);
+		try {
+			expect(buildGjcTmuxExactOptionTarget("work", { env: { GJC_TMUX_COMMAND: "tmux" } })).toBe("=work:");
+			expect(
+				buildGjcTmuxExactOptionTarget("work", { env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" } }),
+			).toBe("work");
+			expect(
+				buildGjcTmuxExactOptionTarget("work", { env: { GJC_TMUX_COMMAND: "pmux", GJC_PSMUX_COMMAND: "pmux" } }),
+			).toBe("work");
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
+	});
+
+	it("hydrates native psmux sessions even when -F is silently ignored", () => {
+		// Make the resolver recognize psmux so the list-sessions fallback engages.
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		try {
+			// psmux 3.3.0 silently ignores the tmux -F format flag and returns its
+			// default `name: N windows (created ...)` shape. The list-sessions
+			// fallback should detect that, synthesize a tab-separated row, and
+			// recover the @gjc-profile tag via follow-up show-options calls.
+			//
+			// psmux show-options returns `key value` (not just `value` like tmux),
+			// so the parser must also strip the leading key on psmux.
+			const calls: string[][] = [];
+			const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+			spawnSyncSpy.mockImplementation((cmd: string[]) => {
+				calls.push(cmd);
+				if (cmd.includes("list-sessions")) {
+					return spawnResult(0, "psmux_session: 1 windows (created Sat Jun 27 17:00:00 2026)\n");
+				}
+				if (cmd.includes("show-options")) {
+					const option = cmd.at(-1);
+					if (option === "@gjc-profile") return spawnResult(0, "@gjc-profile 1");
+					return spawnResult(0, "");
+				}
+				return spawnResult(0, "");
+			});
+
+			const sessions = listGjcTmuxSessions({
+				GJC_TMUX_COMMAND: "psmux",
+				GJC_PSMUX_COMMAND: "psmux",
+			});
+
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0].name).toBe("psmux_session");
+			expect(sessions[0].profile).toBe("1");
+			expect(sessions[0].windows).toBe(1);
+			// follow-up show-options hit the bare `NAME` target (no `=` prefix).
+			expect(calls).toContainEqual(["psmux", "show-options", "-qv", "-t", "psmux_session", "@gjc-profile"]);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
+	});
+
+	it("createGjcTmuxSession drops the psmux UX profile commands", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		try {
+			// psmux does not implement set-window-option (it reports "unknown
+			// command: set-window-option") and historically drops mouse /
+			// set-clipboard / mode-style on set-option. createGjcTmuxSession must
+			// apply the same UX filter that applyGjcTmuxProfile already applies
+			// for `gjc --tmux` planning, otherwise the create flow throws and
+			// the new session gets killed by tryKillSession.
+			const calls: string[][] = [];
+			const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+			spawnSyncSpy.mockImplementation((cmd: string[]) => {
+				calls.push(cmd);
+				if (cmd[0] === "psmux" && cmd[1] === "new-session") return spawnResult(0, "");
+				if (cmd.includes("list-sessions")) {
+					return spawnResult(0, "psmux_session: 1 windows (created Sat Jun 27 17:00:00 2026)\n");
+				}
+				if (cmd.includes("show-options")) return spawnResult(0, "@gjc-profile 1");
+				return spawnResult(0, "");
+			});
+
+			try {
+				createGjcTmuxSession({
+					GJC_TMUX_COMMAND: "psmux",
+					GJC_PSMUX_COMMAND: "psmux",
+				} as NodeJS.ProcessEnv);
+			} catch {
+				// Some CI environments stub the tmux binary; we only assert on the
+				// profile command list, not the overall result.
+			}
+
+			const setWindowOptionCalls = calls.filter(cmd => cmd[0] === "psmux" && cmd[1] === "set-window-option");
+			const setOptionCalls = calls.filter(cmd => cmd[0] === "psmux" && cmd[1] === "set-option");
+			// set-window-option must never run on psmux.
+			expect(setWindowOptionCalls).toEqual([]);
+			// Every psmux set-option call must carry an @gjc-* ownership tag, never
+			// mouse / set-clipboard / mode-style. The UX profile commands get
+			// filtered out by buildGjcTmuxProfileCommands when the active binary
+			// is psmux.
+			for (const cmd of setOptionCalls) {
+				const key = cmd[cmd.length - 2];
+				expect([
+					"@gjc-profile",
+					"@gjc-branch",
+					"@gjc-branch-slug",
+					"@gjc-project",
+					"@gjc-session-id",
+					"@gjc-session-state-file",
+					"@gjc-version",
+				]).toContain(key);
+			}
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
 	});
 });
