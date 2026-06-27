@@ -605,11 +605,22 @@ export class StatusLineComponent implements Component {
 			tokensPerSecond: this.#getTokensPerSecond(),
 		};
 
-		// Context usage — aligned with /context command so both surfaces report the same value
+		// Context usage — anchor to provider usage (getContextUsage) so the
+		// status-line matches the footer / /context / actual billed tokens.
+		// getContextUsage() = calculatePromptTokens(lastUsage) (input+cacheRead+
+		// cacheWrite) + trailing unsent delta. Fall back to the chars/4 heuristic
+		// only when provider usage is unavailable (e.g. right after compaction,
+		// tokens === null).
+		const usage = this.session.getContextUsage();
 		const breakdown = this.getCachedContextBreakdown();
-		const contextTokens = breakdown.usedTokens;
-		const contextWindow = breakdown.contextWindow || state.model?.contextWindow || 0;
-		const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+		const contextWindow = usage?.contextWindow || breakdown.contextWindow || state.model?.contextWindow || 0;
+		const contextTokens = usage?.tokens != null ? usage.tokens : breakdown.usedTokens;
+		const contextPercent =
+			usage?.percent != null
+				? usage.percent
+				: contextWindow > 0
+					? (contextTokens / contextWindow) * 100
+					: 0;
 
 		return {
 			session: this.session,
