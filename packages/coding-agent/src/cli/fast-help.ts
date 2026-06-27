@@ -1,7 +1,35 @@
 import { APP_NAME, CONFIG_DIR_NAME } from "@gajae-code/utils/dirs";
 
 export function getExtraHelpText(): string {
-	return `Environment Variables:
+	return `Commands:
+  ${APP_NAME} [prompt]             - Start an interactive coding session (default launch command)
+  ${APP_NAME} launch               - Start an explicit launch/session workflow
+  ${APP_NAME} setup                - Install GJC defaults or optional dependencies
+  ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
+  ${APP_NAME} state                - Inspect or manage persisted GJC state
+  ${APP_NAME} harness              - Run harness control-plane commands
+  ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
+  ${APP_NAME} team                 - Run tmux-backed coordinated execution
+  ${APP_NAME} ultragoal            - Run durable goal execution workflow
+  ${APP_NAME} ralplan              - Run consensus planning workflow
+  ${APP_NAME} deep-interview       - Run requirements interview workflow
+  ${APP_NAME} skills               - List/read embedded workflow skills
+  ${APP_NAME} config               - List, get, and set configuration values
+  ${APP_NAME} notify               - Send or test notifications
+  ${APP_NAME} daemon               - Manage background daemon helpers
+  ${APP_NAME} mcp                  - Manage MCP server registrations
+  ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
+  ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts
+  ${APP_NAME} migrate              - Run migration helpers
+  ${APP_NAME} rlm                  - Run RLM helpers
+  ${APP_NAME} update               - Update GJC installation artifacts
+  ${APP_NAME} plugin               - Install, remove, and list plugins
+  ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
+  ${APP_NAME} codex-native-hook    - Run Codex native hook integration
+  ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
+  ${APP_NAME} <command> --help     - Show command-specific help
+
+Environment Variables:
   # Core Providers
   ANTHROPIC_API_KEY          - Anthropic Claude models
   ANTHROPIC_OAUTH_TOKEN      - Anthropic OAuth (takes precedence over API key)
