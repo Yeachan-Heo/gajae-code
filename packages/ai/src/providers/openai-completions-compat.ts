@@ -103,6 +103,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		provider === "opencode-go" ||
 		baseUrl.includes("opencode.ai");
 	const isOpenCodeProvider = provider === "opencode-go" || provider === "opencode-zen";
+	const isOpenCodeGoReasoning = provider === "opencode-go" && Boolean(model.reasoning);
 
 	const useMaxTokens =
 		provider === "mistral" ||
@@ -194,7 +195,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsReasoningEffort: !isGrok && !isZai,
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
-		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
+		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(model.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
 		supportsForcedToolChoice: true,
