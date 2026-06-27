@@ -154,7 +154,7 @@ describe("opencode-go qwen3.7-max keeps anthropic-messages transport (issue #489
 		expect(glm?.baseUrl).toBe("https://opencode.ai/zen/go/v1");
 		expect(glm?.cost.input).toBe(9);
 	});
-	test("gpt-5.5 context cap is clamped without clobbering static overrides", async () => {
+	test("gpt-5.5 context cap is normalized without clobbering static overrides", async () => {
 		const staticModels: Model<Api>[] = [
 			{
 				id: "gpt-5.5",
@@ -245,7 +245,7 @@ describe("opencode-go qwen3.7-max keeps anthropic-messages transport (issue #489
 		const preview = models.find(m => m.id === "gpt-5.5-preview");
 		const unknownSuffix = models.find(m => m.id === "gpt-5.5-experimental");
 		const other = models.find(m => m.id === "gpt-5.4");
-		expect(gpt55?.contextWindow).toBe(400_000);
+		expect(gpt55?.contextWindow).toBe(1_000_000);
 		expect(gpt55?.api).toBe("openai-responses");
 		expect(gpt55?.baseUrl).toBe("https://api.openai.com/v1");
 		expect(pro?.contextWindow).toBe(1_100_000);
