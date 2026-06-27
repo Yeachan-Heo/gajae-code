@@ -44,6 +44,7 @@ import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	normalizeSystemPrompts,
+	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
@@ -2550,17 +2551,16 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	for (const msg of transformedMessages) {
 		if (msg.role === "user" || msg.role === "developer") {
 			const providerPayload = (msg as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
-			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider) as
-				| Array<ResponseInput[number]>
-				| undefined;
+			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
 			if (historyItems) {
-				for (const item of historyItems) {
+				const sanitizedHistoryItems = sanitizeOpenAIResponsesHistoryItemsForReplay(historyItems);
+				for (const item of sanitizedHistoryItems) {
 					const maybe = item as { type?: string; call_id?: string };
 					if (maybe.type === "custom_tool_call" && typeof maybe.call_id === "string") {
 						customCallIds.add(maybe.call_id);
 					}
 				}
-				messages.push(...historyItems);
+				messages.push(...sanitizedHistoryItems);
 				msgIndex += 1;
 				continue;
 			}
@@ -2579,18 +2579,19 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				model.provider,
 				assistantMsg.provider,
 			);
-			const historyItems = providerPayload?.items as Array<ResponseInput[number]> | undefined;
+			const historyItems = providerPayload?.items;
 			if (historyItems) {
-				for (const item of historyItems) {
+				const sanitizedHistoryItems = sanitizeOpenAIResponsesHistoryItemsForReplay(historyItems);
+				for (const item of sanitizedHistoryItems) {
 					const maybe = item as { type?: string; call_id?: string };
 					if (maybe.type === "custom_tool_call" && typeof maybe.call_id === "string") {
 						customCallIds.add(maybe.call_id);
 					}
 				}
 				if (providerPayload?.dt) {
-					messages.push(...historyItems);
+					messages.push(...sanitizedHistoryItems);
 				} else {
-					messages.splice(0, messages.length, ...historyItems);
+					messages.splice(0, messages.length, ...sanitizedHistoryItems);
 					// Keep customCallIds from the pre-splice state since historyItems may re-introduce them.
 				}
 				msgIndex += 1;

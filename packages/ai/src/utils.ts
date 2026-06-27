@@ -91,6 +91,52 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
+function normalizeResponsesStringParamForReplay(value: unknown): string {
+	if (typeof value === "string") return value.toWellFormed();
+	if (value && typeof value === "object") {
+		const nestedText = (value as { text?: unknown }).text;
+		if (typeof nestedText === "string") return nestedText.toWellFormed();
+	}
+	try {
+		const encoded = JSON.stringify(value);
+		if (typeof encoded === "string") return encoded.toWellFormed();
+	} catch {
+		// Fall through to String().
+	}
+	return String(value ?? "").toWellFormed();
+}
+
+function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
+	if (typeof content === "string") return content.toWellFormed();
+	if (!Array.isArray(content)) return content;
+	return content.map(part => {
+		if (!part || typeof part !== "object") return part;
+		const sanitizedPart = { ...(part as Record<string, unknown>) };
+		if ("text" in sanitizedPart && typeof sanitizedPart.text !== "string") {
+			sanitizedPart.text = normalizeResponsesStringParamForReplay(sanitizedPart.text);
+		}
+		return sanitizedPart;
+	});
+}
+
+function sanitizeResponsesStringFieldsForReplay(item: Record<string, unknown>): void {
+	if (item.type === "message") {
+		item.content = sanitizeResponsesMessageContentForReplay(item.content);
+	}
+	if (item.type === "function_call" && "arguments" in item && typeof item.arguments !== "string") {
+		item.arguments = normalizeResponsesStringParamForReplay(item.arguments);
+	}
+	if (item.type === "custom_tool_call" && "input" in item && typeof item.input !== "string") {
+		item.input = normalizeResponsesStringParamForReplay(item.input);
+	}
+	if (
+		(item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
+		"output" in item &&
+		typeof item.output !== "string"
+	) {
+		item.output = normalizeResponsesStringParamForReplay(item.output);
+	}
+}
 
 function sanitizeOpenAIResponsesHistoryItemForReplay(
 	item: Record<string, unknown>,
@@ -105,6 +151,7 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 	if (typeof item.call_id === "string") {
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
+	sanitizeResponsesStringFieldsForReplay(sanitizedItem);
 
 	return sanitizedItem as unknown as OpenAIResponsesReplayItem;
 }
