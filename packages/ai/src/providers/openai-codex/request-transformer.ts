@@ -62,6 +62,49 @@ function getReasoningConfig(model: Model<Api>, options: CodexRequestOptions): Re
 	return config;
 }
 
+function describeTextPartValue(value: unknown): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
+
+function normalizeTextPartValue(value: unknown, path: string): string {
+	if (typeof value === "string") return value.toWellFormed();
+	try {
+		const encoded = JSON.stringify(value);
+		if (typeof encoded === "string") return encoded.toWellFormed();
+	} catch {
+		// Fall through to the actionable local error below.
+	}
+	throw new Error(
+		`Invalid Codex request text part at ${path}: expected a string or JSON-serializable value, received ${describeTextPartValue(value)}. Normalize compacted continuation content before sending to Codex.`,
+	);
+}
+
+function normalizeTextPartFields(content: unknown, path: string): unknown {
+	if (typeof content === "string") return content.toWellFormed();
+	if (!Array.isArray(content)) return content;
+	return content.map((part, index) => {
+		if (!part || typeof part !== "object") return part;
+		const normalizedPart = { ...(part as Record<string, unknown>) };
+		if ("text" in normalizedPart) {
+			normalizedPart.text = normalizeTextPartValue(normalizedPart.text, `${path}[${index}].text`);
+		}
+		return normalizedPart;
+	});
+}
+
+function normalizeInputTextPartFields(input: InputItem[] | undefined): InputItem[] | undefined {
+	if (!Array.isArray(input)) return input;
+	return input.map((item, itemIndex) => {
+		if (item.type !== "message") return item;
+		return {
+			...item,
+			content: normalizeTextPartFields(item.content, `input[${itemIndex}].content`),
+		};
+	});
+}
+
 function filterInput(input: InputItem[] | undefined): InputItem[] | undefined {
 	if (!Array.isArray(input)) return input;
 
@@ -121,6 +164,7 @@ export async function transformRequestBody(
 				return item;
 			});
 		}
+		body.input = normalizeInputTextPartFields(body.input);
 	}
 
 	if (prompt?.developerMessages && prompt.developerMessages.length > 0 && Array.isArray(body.input)) {

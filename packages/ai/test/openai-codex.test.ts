@@ -69,6 +69,60 @@ describe("openai-codex request transformer", () => {
 		const orphaned = input.find(item => item.type === "message" && item.role === "assistant");
 		expect(orphaned?.content).toMatch(/Previous tool result/);
 	});
+
+	it("normalizes object-valued text parts before provider send", async () => {
+		const body: RequestBody = {
+			model: "gpt-5.1-codex",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						{
+							type: "input_text",
+							text: {
+								summary: "compacted continuation",
+								facts: ["context overflow maintenance resumed"],
+							},
+						},
+					],
+				},
+			],
+		};
+
+		const transformed = await transformRequestBody(body, createCodexModel(body.model), {});
+		const message = transformed.input?.[0];
+		const content = message?.content;
+
+		expect(Array.isArray(content)).toBe(true);
+		const [part] = content as Array<{ text: unknown }>;
+		expect(typeof part.text).toBe("string");
+		expect(part.text).toBe(
+			JSON.stringify({
+				summary: "compacted continuation",
+				facts: ["context overflow maintenance resumed"],
+			}),
+		);
+	});
+
+	it("fails locally for unserializable text parts", async () => {
+		const circular: Record<string, unknown> = { summary: "compacted continuation" };
+		circular.self = circular;
+		const body: RequestBody = {
+			model: "gpt-5.1-codex",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: circular }],
+				},
+			],
+		};
+
+		await expect(transformRequestBody(body, createCodexModel(body.model), {})).rejects.toThrow(
+			/Invalid Codex request text part at input\[0\]\.content\[0\]\.text/,
+		);
+	});
 });
 
 describe("openai-codex reasoning effort validation", () => {
