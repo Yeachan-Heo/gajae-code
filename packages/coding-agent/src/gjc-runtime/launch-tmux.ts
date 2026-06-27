@@ -306,8 +306,15 @@ function truncateVisibleTail(value: string, maxWidth: number): string {
 	return `…${result}`;
 }
 
+function sanitizeTmuxWindowProjectName(project: string): string {
+	const trimmed = project.trim();
+	if (!trimmed || /^\.+$/.test(trimmed)) return "gjc";
+	if (trimmed.startsWith(".")) return `dot-${trimmed.replace(/^\.+/, "")}`;
+	return trimmed;
+}
+
 export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
-	const project = path.basename(path.resolve(cwd)) || "gjc";
+	const project = sanitizeTmuxWindowProjectName(path.basename(path.resolve(cwd)) || "gjc");
 	const trimmedBranch = branch?.trim();
 	if (!trimmedBranch) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 

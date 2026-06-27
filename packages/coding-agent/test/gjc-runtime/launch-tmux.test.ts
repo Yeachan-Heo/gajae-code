@@ -87,6 +87,43 @@ describe("default GJC tmux launch", () => {
 		expect(title.endsWith("끝")).toBe(true);
 	});
 
+	it("sanitizes dot-prefixed cwd basenames for tmux window titles", () => {
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", null)).toBe("dot-claude");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "feature/demo")).toBe("dot-claude:feature/demo");
+		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("gjc:feature/demo");
+	});
+
+	it("passes sanitized dot-prefixed cwd basenames to tmux rename-window", () => {
+		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/tmp/.claude",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			currentBranch: null,
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.find(call => call.args[0] === "rename-window")?.args).toEqual([
+			"rename-window",
+			"-t",
+			expect.stringMatching(/^=gajae_code_/),
+			"--",
+			"dot-claude",
+		]);
+	});
+
 	it("separates dash-leading tmux window titles from tmux options", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
