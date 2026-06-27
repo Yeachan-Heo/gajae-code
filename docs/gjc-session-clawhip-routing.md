@@ -54,9 +54,9 @@ This repository includes a portable implementation in `scripts/gjc-session/`. It
 
 The `scripts/gjc-session/` directory contains the public version of the operator helpers:
 
-- `create.sh` validates a dedicated git worktree, starts interactive `gjc` in tmux, preserves the pane after exit, and optionally registers a Clawhip-style `tmux watch`.
-- `prompt.sh` sends a text or `@file` prompt only after the pane looks like a ready GJC TUI, then sends multiple Enters to handle terminal submission edge cases.
-- `tail.sh` captures bounded pane output for readiness and acceptance checks.
+- `create.sh` validates a dedicated git worktree, starts interactive `gjc` in tmux, preserves the pane after exit, prints and writes the session-specific durable state path, writes `metadata.json`, mirrors pane output to `pane.log`, records lifecycle events in `events.log`, writes normal-exit `final.json`, and optionally registers a Clawhip-style `tmux watch`.
+- `prompt.sh` sends a text or `@file` prompt only after the pane looks like a ready GJC TUI; if the tmux session vanished, it refuses injection and prints the durable metadata/log/final/events recovery paths plus the last pane-log excerpt.
+- `tail.sh` captures bounded pane output for readiness and acceptance checks, with durable metadata, pane-log, event-log, and final-status fallback when tmux vanished.
 - `harness-tmux-owner-start.sh` starts the GJC harness control plane with the RuntimeOwner resident inside tmux for dogfood/debug cases that need visible owner liveness.
 
 Configuration is runtime-only:
@@ -66,6 +66,8 @@ export GJC_BIN=/path/to/gjc                         # optional; defaults to comm
 export GJC_SESSION_FLAGS="--model provider/model"   # optional interactive gjc flags
 export GJC_SESSION_ROUTER=clawhip                   # optional router binary
 export GJC_SESSION_SKIP_ROUTER=1                    # skip router registration
+export GJC_SESSION_STATE_DIR=/tmp/gjc-session-state # optional durable metadata/log root
+export GJC_SESSION_LOG_SEARCH_ROOT=$HOME/Workspace  # optional tail/prompt fallback search root
 export GJC_SESSION_STALE_MINUTES=60                 # router stale window
 export GJC_SESSION_KEYWORDS="/skill:ralplan,Question"
 ```
@@ -147,7 +149,7 @@ After prompt delivery, require one of these before reporting that the session is
 - a GitHub comment/review/PR URL,
 - a terminal verdict such as `MERGE_READY` or `REQUEST_CHANGES`.
 
-A prompt being visible in tmux scrollback is not acceptance by itself.
+A prompt being visible in tmux scrollback is not acceptance by itself. If tmux disappears before terminal verdict, inspect the state path printed by `create.sh`: `metadata.json` identifies the worktree/session, `pane.log` contains the mirrored transcript, `events.log` records launch/exit milestones, and `final.json` is present when `gjc` exited normally. Use `tail.sh <session-name> [lines]` to surface these artifacts without a live tmux server.
 
 ## Anti-patterns
 
@@ -155,5 +157,6 @@ A prompt being visible in tmux scrollback is not acceptance by itself.
 - Launching from the canonical repo checkout instead of a task worktree.
 - Running a long GJC/tmux session under a short shell timeout that can SIGKILL the owner process.
 - Treating tmux process existence as proof that the prompt was accepted.
+- Restarting a vanished session without first checking its durable metadata, pane log, event log, and final status.
 - Hard-coding private channel ids, bot mentions, or router tokens into public GJC docs.
 - Using this visible-session pattern when Coordinator MCP turn state is available and sufficient.
