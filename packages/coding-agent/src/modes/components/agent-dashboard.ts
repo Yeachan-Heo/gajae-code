@@ -25,6 +25,7 @@ import {
 	matchesKey,
 	padding,
 	replaceTabs,
+	resolveTerminalColumns,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -870,7 +871,7 @@ export class AgentDashboard extends Container {
 	}
 
 	#uiWidth(): number {
-		return Math.max(40, process.stdout.columns ?? 100);
+		return Math.max(40, resolveTerminalColumns());
 	}
 
 	/** Rebuild layout and request a TUI render pass (for use after async state changes). */

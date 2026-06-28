@@ -15,7 +15,7 @@
  *   - Enter on main session -> close overlay (jump back)
  */
 import type { ToolResultMessage } from "@gajae-code/ai";
-import { Container, Markdown, type MarkdownTheme, matchesKey } from "@gajae-code/tui";
+import { Container, Markdown, type MarkdownTheme, matchesKey, resolveTerminalColumns } from "@gajae-code/tui";
 import { formatDuration, formatNumber, logger } from "@gajae-code/utils";
 import type { KeyId } from "../../config/keybindings";
 import { isSilentAbort } from "../../session/messages";
@@ -39,7 +39,7 @@ const INDENT = "    ";
 
 /** Compute the max content width for the current terminal, accounting for indent and chrome. */
 function contentWidth(indent = INDENT): number {
-	return Math.max(TRUNCATE_LENGTHS.SHORT, (process.stdout.columns || 80) - indent.length - 2);
+	return Math.max(TRUNCATE_LENGTHS.SHORT, resolveTerminalColumns() - indent.length - 2);
 }
 
 /** Sanitize a line for TUI display: replace tabs, then truncate to viewport width. */
@@ -390,7 +390,7 @@ export class SessionObserverOverlayComponent extends Container {
 
 	/** Render markdown text into indented lines using the theme's markdown renderer */
 	#renderMarkdownToLines(text: string, indent: string = INDENT): string[] {
-		const width = Math.max(40, (process.stdout.columns || 80) - indent.length - 4);
+		const width = Math.max(40, resolveTerminalColumns() - indent.length - 4);
 		const md = new Markdown(text, 0, 0, this.#mdTheme);
 		const rendered = md.render(width);
 		return rendered.map(line => `${indent}${line.trimEnd()}`);
