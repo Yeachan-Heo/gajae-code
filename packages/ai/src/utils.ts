@@ -149,8 +149,10 @@ function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 			if (sanitizedPart.type === "image_url") {
 				sanitizedPart.type = "input_image";
 			}
-			if (!("detail" in sanitizedPart) && normalizedImageUrl.detail) {
+			if (normalizedImageUrl.detail) {
 				sanitizedPart.detail = normalizedImageUrl.detail;
+			} else if ("detail" in sanitizedPart && !isResponsesImageDetail(sanitizedPart.detail)) {
+				delete sanitizedPart.detail;
 			}
 		}
 		return sanitizedPart;
