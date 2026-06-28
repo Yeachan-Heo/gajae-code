@@ -4,10 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
+	buildWorkerCommand,
 	claimGjcTeamTask,
 	classifyGjcTeamCheckpointFiles,
 	executeGjcTeamApiOperation,
 	type GjcTeamConfig,
+	type GjcTeamWorker,
 	listGjcTeams,
 	monitorGjcTeam,
 	monitorGjcTeamSnapshot,
@@ -373,6 +375,64 @@ describe("native gjc team runtime", () => {
 		expect(manifest.worker_command).toBe("bun ./packages/coding-agent/src/cli.ts");
 		expect(telemetry).toContain("bun ./packages/coding-agent/src/cli.ts");
 		expect(resolveGjcWorkerCommand(cleanupRoot, { GJC_TEAM_WORKER_COMMAND: "gjc-dev" })).toBe("gjc-dev");
+	});
+
+	it("builds PowerShell worker commands with an invocation operator", () => {
+		const config = {
+			team_name: "win-team",
+			display_name: "win-team",
+			requested_name: "win-team",
+			task: "Do Windows work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "C:\\state",
+			worker_command: "'C:\\Program Files\\gjc\\gjc.exe'",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "psmux",
+			tmux_session: "win-session",
+			tmux_session_name: "win-session",
+			tmux_target: "win-session:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "leader", pane_id: "%1", cwd: "C:\\repo" },
+			leader_cwd: "C:\\repo",
+			team_state_root: "C:\\state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		const command = buildWorkerCommand(config, worker, "win32");
+
+		expect(command).toContain("; & 'C:\\Program Files\\gjc\\gjc.exe'");
+		expect(command).not.toContain("; 'C:\\Program Files\\gjc\\gjc.exe' ");
+		expect(command).toContain("'You are worker-1 in gjc team win-team.");
+	});
+
+	it("resolves Windows JavaScript entrypoints through an executable runtime", async () => {
+		const command = resolveGjcWorkerCommand(
+			"C:\\repo",
+			{},
+			"win32",
+			["node", "C:\\repo\\node_modules\\@gajae-code\\coding-agent\\bin\\gjc.js"],
+			"C:\\Users\\you\\.bun\\bin\\bun.exe",
+		);
+
+		expect(command).toBe(
+			"'C:\\Users\\you\\.bun\\bin\\bun.exe' 'C:\\repo\\node_modules\\@gajae-code\\coding-agent\\bin\\gjc.js'",
+		);
+		expect(command).not.toBe("'C:\\repo\\node_modules\\@gajae-code\\coding-agent\\bin\\gjc.js'");
 	});
 
 	it("keeps worker CLI selection limited to GJC teammate sessions", async () => {

@@ -1896,13 +1896,27 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
-export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
+export function resolveGjcWorkerCommand(
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+	argv: string[] = process.argv,
+	execPath = process.execPath,
+): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
 	if (explicit) return explicit;
-	const entrypoint = process.argv[1];
-	if (entrypoint?.endsWith(".ts"))
-		return `${shellQuote(process.execPath)} ${shellQuote(path.resolve(cwd, entrypoint))}`;
-	if (entrypoint && path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
+	const entrypoint = argv[1];
+	if (!entrypoint) return "gjc";
+	const pathModule = platform === "win32" ? path.win32 : path;
+	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
+	if (platform === "win32") {
+		if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs"))
+			return `${powershellQuote(execPath)} ${powershellQuote(resolvedEntrypoint)}`;
+		if (pathModule.basename(entrypoint).startsWith("gjc")) return powershellQuote(resolvedEntrypoint);
+		return "gjc";
+	}
+	if (entrypoint.endsWith(".ts")) return `${shellQuote(execPath)} ${shellQuote(resolvedEntrypoint)}`;
+	if (path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
 	return "gjc";
 }
 /** @internal Exported for unit tests. */
@@ -1937,7 +1951,8 @@ export function buildWorkerCommand(
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
-	return `${joined} ${config.worker_command} ${quote(prompt)}`;
+	const invocation = platform === "win32" ? `& ${config.worker_command}` : config.worker_command;
+	return `${joined} ${invocation} ${quote(prompt)}`;
 }
 interface GjcTeamInitialLane {
 	label: string;
