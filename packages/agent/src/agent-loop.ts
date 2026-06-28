@@ -25,6 +25,7 @@ import {
 	isHarmonyLeakMitigationTarget,
 	recoverHarmonyToolCall,
 	signalListLabel,
+	shouldMitigateHarmonyLeak,
 } from "./harmony-leak";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -515,19 +516,11 @@ async function runLoopBody(
 					streamFn,
 					harmonyRetryAttempt,
 				);
-				// Post-stream harmony-leak detection. The mitigation scaffolding
-				// below (HarmonyLeakInterruption catch + retry/recover/audit,
-				// plus harmonyAbortController) existed but nothing invoked the
-				// detector, so leaks on openai-codex models were never caught.
-				// Detect on the completed message and route recoverable tool-arg
-				// leaks through recovery, everything else through abort-retry.
-				if (isHarmonyLeakMitigationTarget(config.model)) {
-					const detection = detectHarmonyLeakInAssistantMessage(message);
-					if (detection) {
-						const rec = recoverHarmonyToolCall(message, detection);
-						const removed = rec ? rec.removed : extractHarmonyRemoved(message, detection);
-						throw new HarmonyLeakInterruption(detection, removed, rec);
-					}
+				const detection = detectHarmonyLeakInAssistantMessage(message);
+				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
+					const rec = recoverHarmonyToolCall(message, detection);
+					const removed = rec ? rec.removed : extractHarmonyRemoved(message, detection);
+					throw new HarmonyLeakInterruption(detection, removed, rec);
 				}
 				harmonyRetryAttempt = 0;
 				harmonyTruncateResumeCount = 0;

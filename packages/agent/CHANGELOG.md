@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Mitigate leaked Anthropic-style `<invoke name="…">` tool-call envelopes across providers, not only `openai-codex`, while keeping Codex `to=functions.*` harmony-header mitigation provider-scoped.
+
 ## [0.7.4] - 2026-06-27
 
 ### Added

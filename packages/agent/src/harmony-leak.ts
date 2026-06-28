@@ -127,6 +127,11 @@ export function isHarmonyLeakMitigationTarget(model: Model): boolean {
 	return model.provider === "openai-codex";
 }
 
+export function shouldMitigateHarmonyLeak(model: Model, detection: HarmonyDetection): boolean {
+	if (isHarmonyLeakMitigationTarget(model)) return true;
+	return detection.signals.some(signal => signal.classes.includes("I"));
+}
+
 export function signalListLabel(signals: readonly HarmonySignal[]): string {
 	const seen: string[] = [];
 	for (const signal of signals) {

@@ -8,6 +8,7 @@ import {
 	extractHarmonyRemoved,
 	isHarmonyLeakMitigationTarget,
 	recoverHarmonyToolCall,
+	shouldMitigateHarmonyLeak,
 	signalListLabel,
 } from "../src/harmony-leak";
 import corpus from "./fixtures/harmony-leak-corpus.json" with { type: "json" };
@@ -49,6 +50,30 @@ describe("isHarmonyLeakMitigationTarget", () => {
 
 	it("does not target Anthropic models", () => {
 		expect(isHarmonyLeakMitigationTarget(anthropicModel)).toBe(false);
+	});
+});
+
+describe("shouldMitigateHarmonyLeak", () => {
+	it("mitigates provider-neutral invoke envelope leaks for Anthropic models", () => {
+		const detection = detectHarmonyLeak(
+			[
+				"call",
+				'<invoke name="web_search">',
+				'<parameter name="query">portfolio copywriting examples</parameter>',
+				"</invoke>",
+			].join("\n"),
+			"assistant_text",
+		);
+
+		expect(detection).toBeDefined();
+		expect(shouldMitigateHarmonyLeak(anthropicModel, detection!)).toBe(true);
+	});
+
+	it("does not broaden codex harmony-header mitigation to Anthropic models", () => {
+		const detection = detectHarmonyLeak("analysis to=functions.read code {}", "assistant_text");
+
+		expect(detection).toBeDefined();
+		expect(shouldMitigateHarmonyLeak(anthropicModel, detection!)).toBe(false);
 	});
 });
 

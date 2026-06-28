@@ -13,12 +13,14 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 // model emitted the `ask` call as visible text instead of a native function
 // call (with the `court` glitch line in front), exactly as seen in the wild.
 const LEAKED = [
-	"court",
-	'<invoke name="proxy_ask">',
-	'<parameter name="_i">decision</parameter>',
-	'<parameter name="questions">[{"id":"x"}]</parameter>',
+	"call",
+	'<invoke name="web_search">',
+	"<parameter name=\"query\">portfolio copywriting examples</parameter>",
+	'<parameter name="_i">Researching copy</parameter>',
 	"</invoke>",
 ].join("\n");
+
+const HARMONY_HEADER_LEAK = "analysis to=functions.read code {\n  \"path\": \"src/x.ts\"\n}";
 
 function assistantContains(messages: AgentMessage[], needle: string): boolean {
 	return messages.some(m => m.role === "assistant" && JSON.stringify(m.content).includes(needle));
@@ -57,11 +59,11 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		expect(assistantContains(context.messages, "<invoke name=")).toBe(false);
 	});
 
-	it("does not engage for non-codex providers (gate is provider-scoped)", async () => {
+	it("detects a leaked <invoke> envelope for non-codex providers too", async () => {
 		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 		const mock = createMockModel({
 			provider: "anthropic",
-			responses: [{ content: [LEAKED] }],
+			responses: [{ content: [LEAKED] }, { content: ["ok"] }],
 		});
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
@@ -76,9 +78,33 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		await Array.fromAsync(stream);
 		const messages = await stream.result();
 
-		// Gate off: no detection, no retry, and the leak passes through unmitigated.
+		expect(audits.some(a => a.action === "abort_retry")).toBe(true);
+		expect(mock.calls).toHaveLength(2);
+		expect(assistantContains(messages, "ok")).toBe(true);
+		expect(assistantContains(messages, "<invoke name=")).toBe(false);
+	});
+
+	it("keeps harmony-header mitigation scoped to codex providers", async () => {
+		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const mock = createMockModel({
+			provider: "anthropic",
+			responses: [{ content: [HARMONY_HEADER_LEAK] }],
+		});
+		const audits: Array<{ action: string }> = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onHarmonyLeak: e => {
+				audits.push(e);
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, mock.stream);
+		await Array.fromAsync(stream);
+		const messages = await stream.result();
+
 		expect(audits).toHaveLength(0);
 		expect(mock.calls).toHaveLength(1);
-		expect(assistantContains(messages, "<invoke name=")).toBe(true);
+		expect(assistantContains(messages, "to=functions.read")).toBe(true);
 	});
 });
