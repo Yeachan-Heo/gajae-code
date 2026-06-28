@@ -268,7 +268,7 @@ async function resolveModelCommandSelection(
 	}
 
 	const providerRef = parseProviderQualifiedSelector(selector);
-	const discoverableProviders = runtime.session.modelRegistry.getDiscoverableProviders?.() ?? [];
+	const discoverableProviders = runtime.session.modelRegistry?.getDiscoverableProviders?.() ?? [];
 	if (providerRef && discoverableProviders.includes(providerRef.provider)) {
 		await runtime.session.modelRegistry.refreshProvider?.(providerRef.provider, "online");
 		availableModels = runtime.session.getAvailableModels?.() ?? [];
