@@ -8,9 +8,13 @@ import {
 	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
+	recordUltragoalNudgeIfBudgetRemaining,
+	resolveUltragoalNudgeBudget,
+	selectUltragoalNudgeTarget,
 	type UltragoalCompletionVerification,
 	type UltragoalGoal,
 	type UltragoalLedgerEvent,
+	type UltragoalNudgeSurface,
 	type UltragoalPaths,
 	type UltragoalPlan,
 	type UltragoalReceiptKind,
@@ -494,6 +498,96 @@ export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBl
 	});
 }
 
+const NUDGE_SURFACE_LABEL: Record<UltragoalNudgeSurface, string> = {
+	pause: "pausing the goal",
+	drop: "dropping the run",
+	ask: "asking the user",
+	premature_complete: "finishing the story early",
+};
+
+const NUDGE_SURFACE_REASON: Record<UltragoalNudgeSurface, string> = {
+	pause: "an active story still has resolvable work",
+	drop: "the aggregate run still has unfinished stories",
+	ask: "the decision can be resolved as durable story work",
+	premature_complete: "story verification is not yet satisfied",
+};
+
+/**
+ * Escalating per-attempt refusal text. Deliberately avoids every
+ * `isUltragoalBypassPrompt` trigger: no `update_goal(`, no "skip/weaken verification",
+ * no "mark ... complete", no "--status complete", and the word "complete" never
+ * appears (so the `goal` ... `complete` proximity rule cannot match).
+ */
+export function formatUltragoalNudgeMessage(input: {
+	surface: UltragoalNudgeSurface;
+	attempt: number;
+	budget: number;
+	goalId: string;
+}): string {
+	const label = NUDGE_SURFACE_LABEL[input.surface];
+	const reason = NUDGE_SURFACE_REASON[input.surface];
+	return [
+		`Ultragoal try-harder nudge (${input.attempt}/${input.budget}) for ${input.goalId}: ${label} was refused before the normal gate.`,
+		`Resolving this is part of the goal, not a reason to stop. Try a different approach first: inspect the failure, run a focused test or replay, find local credentials/config if access is the blocker, split the obstacle with \`gjc ultragoal steer --kind add_subgoal\`, delegate an executor, or record concrete review blockers.`,
+		`Reason: ${reason}.`,
+	].join("\n");
+}
+
+/**
+ * Consume one nudge for a guarded give-up attempt. MUST only be called from assert/
+ * consume paths, never from read-style `is...Blocked` diagnostics. Returns a nudge
+ * message while the per-story budget remains; otherwise reports not-nudged so the
+ * caller falls through to today's gate.
+ */
+async function consumeUltragoalNudge(input: {
+	cwd: string;
+	surface: UltragoalNudgeSurface;
+	currentGoal?: CurrentGoalLike | null;
+	sessionId?: string | null;
+}): Promise<{ nudged: true; message: string } | { nudged: false }> {
+	const sessionId = input.sessionId?.trim() || (await ultragoalReadPaths(input.cwd)).sessionId;
+	if (!sessionId) return { nudged: false };
+	const plan = await readUltragoalPlan(input.cwd, sessionId);
+	if (!plan) return { nudged: false };
+	const target = selectUltragoalNudgeTarget(plan, { currentGoalObjective: input.currentGoal?.objective });
+	if (!target) return { nudged: false };
+	const { budget } = await resolveUltragoalNudgeBudget(input.cwd);
+	const outcome = await recordUltragoalNudgeIfBudgetRemaining({
+		cwd: input.cwd,
+		sessionId,
+		target,
+		surface: input.surface,
+		budget,
+		reason: NUDGE_SURFACE_REASON[input.surface],
+		...(input.currentGoal?.objective ? { currentGoalObjective: input.currentGoal.objective } : {}),
+	});
+	if (outcome.nudged) {
+		return {
+			nudged: true,
+			message: formatUltragoalNudgeMessage({
+				surface: input.surface,
+				attempt: outcome.attempt,
+				budget: outcome.budget,
+				goalId: outcome.goalId,
+			}),
+		};
+	}
+	return { nudged: false };
+}
+
+/**
+ * Assert-path entry for the `ask` surface (the ask guard lives in another module).
+ * Resolves the active (leader) Ultragoal session so subagent/headless asks consume
+ * the leader run's budget rather than a fresh child ledger.
+ */
+export async function consumeUltragoalAskNudge(
+	cwd: string,
+	sessionId?: string | null,
+): Promise<{ nudged: true; message: string } | { nudged: false }> {
+	if (!cwd) return { nudged: false };
+	return consumeUltragoalNudge({ cwd, surface: "ask", sessionId });
+}
+
 export async function assertCanCompleteCurrentGoal(input: {
 	cwd: string;
 	currentGoal?: CurrentGoalLike | null;
@@ -502,6 +596,13 @@ export async function assertCanCompleteCurrentGoal(input: {
 	if (!input.cwd) return;
 	const diagnostic = await readUltragoalVerificationState(input);
 	if (["inactive", "unrelated_goal", "active_verified_complete"].includes(diagnostic.state)) return;
+	const nudge = await consumeUltragoalNudge({
+		cwd: input.cwd,
+		surface: "premature_complete",
+		currentGoal: input.currentGoal,
+		sessionId: input.sessionId,
+	});
+	if (nudge.nudged) throw new Error(nudge.message);
 	throw new Error(
 		`${diagnostic.message} Run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>\` first, or record review blockers and rerun verification.`,
 	);
@@ -558,6 +659,10 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 }
 
 export async function assertUltragoalPauseAllowed(cwd: string): Promise<void> {
+	if (cwd) {
+		const nudge = await consumeUltragoalNudge({ cwd, surface: "pause" });
+		if (nudge.nudged) throw new Error(nudge.message);
+	}
 	const diagnostic = await isUltragoalPauseBlocked(cwd);
 	if (!diagnostic.blocked) return;
 	throw new Error(
@@ -567,4 +672,66 @@ export async function assertUltragoalPauseAllowed(cwd: string): Promise<void> {
 			'If the blocker is genuinely human-only, record `gjc ultragoal classify-blocker --classification human_blocked --evidence "<human-only dependency>"` immediately before pausing.',
 		].join("\n"),
 	);
+}
+/**
+ * Guard `goal({"op":"drop"})` during an active Ultragoal run. A *real give-up* (an
+ * aggregate run still mid-flight with incomplete required stories) is nudged while
+ * budget remains; once exhausted it falls through to today's drop behavior. Legitimate
+ * aggregate-reset drops — no durable run, unrelated goal, an already dropped/stale
+ * aggregate, or an all-stories-complete run — are never nudged. If durable state
+ * exists but cannot be read to classify the drop, fail closed.
+ */
+export async function assertUltragoalDropAllowed(input: {
+	cwd: string;
+	currentGoal?: CurrentGoalLike | null;
+	sessionId?: string | null;
+}): Promise<void> {
+	if (!input.cwd) return;
+	let paths: UltragoalPaths;
+	let sessionId: string | null;
+	try {
+		({ paths, sessionId } = await ultragoalReadPaths(input.cwd));
+	} catch (error) {
+		throw new Error(
+			`Unable to classify Ultragoal drop (durable state unreadable): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (sessionId === null) return;
+	try {
+		await fs.stat(paths.dir);
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw new Error(
+			`Unable to classify Ultragoal drop (durable state present but unreadable): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	let plan: UltragoalPlan | null;
+	try {
+		plan = await readUltragoalPlan(input.cwd, sessionId);
+	} catch (error) {
+		throw new Error(
+			`Unable to classify Ultragoal drop (goals.json unreadable): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (!plan) {
+		throw new Error("Unable to classify Ultragoal drop: durable state exists but goals.json is missing or empty.");
+	}
+	// Out of scope: per-story mode drops keep today's behavior.
+	if (plan.gjcGoalMode !== "aggregate") return;
+	// A real give-up requires an active aggregate goal to actually be abandoned. With no
+	// current goal-mode goal (or a non-active one), `drop` is a no-op/reset before a fresh
+	// `create`, never a give-up — so it is left un-nudged.
+	if (!input.currentGoal) return;
+	if (input.currentGoal.status !== "active") return;
+	// Unrelated active goal: not this aggregate run.
+	if (!objectiveMatches(input.currentGoal.objective, plan)) return;
+	// All required stories complete: a legitimate reset, not a give-up.
+	if (getUltragoalRunCompletionState(plan).allComplete) return;
+	const nudge = await consumeUltragoalNudge({
+		cwd: input.cwd,
+		surface: "drop",
+		currentGoal: input.currentGoal,
+		sessionId,
+	});
+	if (nudge.nudged) throw new Error(nudge.message);
 }

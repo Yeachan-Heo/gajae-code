@@ -256,6 +256,11 @@ export function renderUltragoalStatusMarkdown(summary: {
 	currentGoal?: { id: string; status: string; title?: string; objective?: string };
 	counts: Record<string, number>;
 	goals: unknown[];
+	nudgeBudget?: number;
+	nudgeCount?: number;
+	nudgeRemaining?: number;
+	nudgeGoalId?: string;
+	nudgeTargetKind?: string;
 }): string {
 	if (!summary.exists)
 		return `# ultragoal status\n\n- status: missing\n- No ultragoal plan found at ${summary.paths.goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
@@ -270,6 +275,14 @@ export function renderUltragoalStatusMarkdown(summary: {
 	];
 	if (summary.gjcObjective) lines.push(`- objective: ${summary.gjcObjective}`);
 	if (summary.currentGoal) lines.push(`- current: ${summary.currentGoal.id} (${summary.currentGoal.status})`);
+	if (summary.nudgeBudget !== undefined && summary.nudgeGoalId) {
+		const used = summary.nudgeCount ?? 0;
+		const remaining = summary.nudgeRemaining ?? Math.max(0, summary.nudgeBudget - used);
+		const target = summary.nudgeTargetKind ? ` target=${summary.nudgeTargetKind}` : "";
+		lines.push(
+			`- nudge: ${summary.nudgeGoalId} ${used}/${summary.nudgeBudget} used (${remaining} remaining)${target}`,
+		);
+	}
 	lines.push(`- goals_path: ${summary.paths.goalsPath}`);
 	if (summary.paths.ledgerPath) lines.push(`- ledger_path: ${summary.paths.ledgerPath}`);
 	return `${lines.join("\n")}\n`;

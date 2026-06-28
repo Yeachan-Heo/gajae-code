@@ -1,5 +1,9 @@
 import type { AgentTool } from "@gajae-code/agent-core";
-import { isUltragoalAskBlocked, type UltragoalAskBlockDiagnostic } from "../gjc-runtime/ultragoal-guard";
+import {
+	consumeUltragoalAskNudge,
+	isUltragoalAskBlocked,
+	type UltragoalAskBlockDiagnostic,
+} from "../gjc-runtime/ultragoal-guard";
 import { ToolError } from "./tool-errors";
 
 const ULTRAGOAL_ASK_GUARD = Symbol.for("gajae-code.ultragoalAskGuard");
@@ -17,6 +21,8 @@ export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiag
 export async function assertUltragoalAskAllowed(cwd: string): Promise<void> {
 	const diagnostic = await isUltragoalAskBlocked(cwd);
 	if (!diagnostic.active) return;
+	const nudge = await consumeUltragoalAskNudge(cwd);
+	if (nudge.nudged) throw new ToolError(nudge.message);
 	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
 }
 

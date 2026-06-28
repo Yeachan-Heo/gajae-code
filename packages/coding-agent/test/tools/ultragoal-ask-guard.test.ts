@@ -125,7 +125,7 @@ describe("ultragoal ask guard", () => {
 
 		await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(ToolError);
 		await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(
-			/record-review-blockers/,
+			/try-harder nudge/,
 		);
 		expect(execute).not.toHaveBeenCalled();
 	});
@@ -157,7 +157,7 @@ describe("ultragoal ask guard", () => {
 				undefined,
 				createContext(select),
 			),
-		).rejects.toThrow(/record-review-blockers/);
+		).rejects.toThrow(/try-harder nudge/);
 		expect(select).not.toHaveBeenCalled();
 	});
 

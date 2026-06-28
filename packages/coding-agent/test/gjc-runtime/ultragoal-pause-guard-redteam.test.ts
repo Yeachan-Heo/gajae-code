@@ -23,6 +23,11 @@ async function tempDir(): Promise<string> {
 async function createActiveRun(): Promise<string> {
 	const cwd = await tempDir();
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	// Disable the pre-gate try-harder nudge so these tests isolate the underlying
+	// human_blocked pause gate (the nudge layer has its own dedicated coverage in
+	// ultragoal-nudge-guard.test.ts).
+	await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+	await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ultragoal.nudgeBudget": 0 }));
 	await createUltragoalPlan({ cwd, brief: "Implement the story" });
 	return cwd;
 }

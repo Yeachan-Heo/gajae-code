@@ -257,6 +257,13 @@ describe("GoalTool", () => {
 		try {
 			const sessionId = "goal-tool-ultragoal-test";
 			const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal", sessionId });
+			// Isolate the receipt gate: disable the pre-gate try-harder nudge (covered
+			// separately in ultragoal-nudge-guard.test.ts).
+			await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+			await fs.writeFile(
+				path.join(root, ".gjc", "settings.json"),
+				JSON.stringify({ "gjc.ultragoal.nudgeBudget": 0 }),
+			);
 			await startNextUltragoalGoal({ cwd: root, sessionId });
 			const harness = createRuntimeHarness({
 				enabled: true,

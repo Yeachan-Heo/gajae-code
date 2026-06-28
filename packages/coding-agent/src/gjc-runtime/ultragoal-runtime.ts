@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as os from "node:os";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
 import { normalizeGoal } from "../goals/state";
@@ -11,7 +12,13 @@ import { gjcRoot, sessionUltragoalDir } from "./session-layout";
 import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
-import { appendJsonl, persistedStateRevision, writeArtifact, writeGuardedJsonAtomic } from "./state-writer";
+import {
+	appendJsonl,
+	persistedStateRevision,
+	withWorkflowStateLock,
+	writeArtifact,
+	writeGuardedJsonAtomic,
+} from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
@@ -80,6 +87,44 @@ export interface UltragoalLedgerEvent extends JsonObject {
 	timestamp?: string;
 }
 
+export type UltragoalNudgeSurface = "pause" | "drop" | "ask" | "premature_complete";
+export type UltragoalNudgeTargetKind = "story" | "final_aggregate_receipt";
+
+export interface UltragoalNudgeLedgerEvent extends UltragoalLedgerEvent {
+	event: "nudge";
+	goalId: string;
+	targetKind: UltragoalNudgeTargetKind;
+	surface: UltragoalNudgeSurface;
+	attempt: number;
+	budget: number;
+	reason: string;
+	currentGoalObjective?: string;
+}
+
+export interface UltragoalNudgeTarget {
+	goalId: string;
+	targetKind: UltragoalNudgeTargetKind;
+}
+
+export type UltragoalNudgeOutcome =
+	| {
+			nudged: true;
+			attempt: number;
+			budget: number;
+			goalId: string;
+			targetKind: UltragoalNudgeTargetKind;
+			event: UltragoalNudgeLedgerEvent;
+	  }
+	| {
+			nudged: false;
+			exhausted: true;
+			count: number;
+			budget: number;
+			goalId: string;
+			targetKind: UltragoalNudgeTargetKind;
+	  }
+	| { nudged: false; inactive: true; reason: string };
+
 export interface UltragoalPaths {
 	dir: string;
 	briefPath: string;
@@ -95,6 +140,11 @@ export interface UltragoalStatusSummary {
 	currentGoal?: UltragoalGoal;
 	counts: Record<UltragoalGoalStatus, number>;
 	goals: UltragoalGoal[];
+	nudgeBudget?: number;
+	nudgeCount?: number;
+	nudgeRemaining?: number;
+	nudgeGoalId?: string;
+	nudgeTargetKind?: UltragoalNudgeTargetKind;
 }
 
 export interface UltragoalCommandResult {
@@ -218,6 +268,156 @@ export async function readUltragoalLedger(cwd: string, sessionId?: string | null
 		if (isEnoent(error)) return [];
 		throw error;
 	}
+}
+
+export const DEFAULT_ULTRAGOAL_NUDGE_BUDGET = 10;
+
+/** Pure: count ledger `nudge` rows for an exact goalId. */
+export function countUltragoalNudges(ledger: readonly UltragoalLedgerEvent[], goalId: string): number {
+	return ledger.filter(event => event.event === "nudge" && event.goalId === goalId).length;
+}
+
+function parseNudgeBudgetValue(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+async function readSettingsNudgeBudget(settingsPath: string): Promise<number | null> {
+	try {
+		const raw = await Bun.file(settingsPath).text();
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		// Support both the flat dotted key and a nested gjc.ultragoal.nudgeBudget shape.
+		const flat = parseNudgeBudgetValue(parsed["gjc.ultragoal.nudgeBudget"]);
+		if (flat !== null) return flat;
+		const gjc = parsed.gjc;
+		if (gjc && typeof gjc === "object") {
+			const ultragoal = (gjc as Record<string, unknown>).ultragoal;
+			if (ultragoal && typeof ultragoal === "object") {
+				return parseNudgeBudgetValue((ultragoal as Record<string, unknown>).nudgeBudget);
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Resolve the per-story nudge budget. Project `./.gjc/settings.json` overrides the
+ * user settings (`$GJC_CONFIG_DIR/settings.json` or `~/.gjc/settings.json`), else the
+ * default. Mirrors the `gjc.deepInterview.ambiguityThreshold` user+project precedence.
+ */
+export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget: number; source: string }> {
+	const projectPath = path.join(gjcRoot(cwd), "settings.json");
+	const project = await readSettingsNudgeBudget(projectPath);
+	if (project !== null) return { budget: project, source: projectPath };
+	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
+	const userPath = path.join(userDir, "settings.json");
+	const user = await readSettingsNudgeBudget(userPath);
+	if (user !== null) return { budget: user, source: userPath };
+	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };
+}
+
+/**
+ * Pure canonical selector shared by guards and status so `nudgeGoalId` can never
+ * diverge between what a guard consumes and what status displays. Prefers the active
+ * current-goal objective, then active > pending > failed (matching `chooseNextGoal`),
+ * then the aggregate final-receipt target when all stories are complete but the
+ * aggregate run still needs a final receipt. Returns null for verified-complete or
+ * absent/unrelated plans.
+ */
+export function selectUltragoalNudgeTarget(
+	plan: UltragoalPlan,
+	options: { currentGoalObjective?: string; retryFailed?: boolean } = {},
+): UltragoalNudgeTarget | null {
+	const objective = options.currentGoalObjective?.trim();
+	if (objective) {
+		const matched = plan.goals.find(
+			goal => goal.objective.trim() === objective && SCHEDULABLE_STATUSES.has(goal.status),
+		);
+		if (matched) return { goalId: matched.id, targetKind: "story" };
+	}
+	const next = chooseNextGoal(plan, options.retryFailed === true);
+	if (next) return { goalId: next.id, targetKind: "story" };
+	const completion = getUltragoalRunCompletionState(plan, { retryFailed: options.retryFailed });
+	if (completion.needsFinalAggregateReceipt) {
+		const required = requiredUltragoalGoals(plan);
+		const finalGoal = required.at(-1);
+		if (finalGoal) return { goalId: finalGoal.id, targetKind: "final_aggregate_receipt" };
+	}
+	return null;
+}
+
+/**
+ * Atomic consuming writer. Locks the ledger path, rereads + counts nudge rows for the
+ * target story, and appends exactly one `nudge` row inside the same critical section
+ * only while budget remains. Reuses the lockless `appendLedger` inside the lock (it
+ * does not acquire a conflicting lock), so concurrent guarded attempts cannot both
+ * observe `count = budget - 1` and overshoot the budget.
+ */
+export async function recordUltragoalNudgeIfBudgetRemaining(input: {
+	cwd: string;
+	sessionId?: string | null;
+	target: UltragoalNudgeTarget;
+	surface: UltragoalNudgeSurface;
+	budget: number;
+	reason: string;
+	currentGoalObjective?: string;
+}): Promise<UltragoalNudgeOutcome> {
+	const { cwd, sessionId, target, surface, budget, reason } = input;
+	if (!Number.isFinite(budget) || budget <= 0) {
+		return {
+			nudged: false,
+			exhausted: true,
+			count: 0,
+			budget: Math.max(0, budget | 0),
+			goalId: target.goalId,
+			targetKind: target.targetKind,
+		};
+	}
+	const resolvedSessionId =
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const paths = getUltragoalPaths(cwd, resolvedSessionId);
+	return withWorkflowStateLock(
+		paths.ledgerPath,
+		async () => {
+			const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+			const count = countUltragoalNudges(ledger, target.goalId);
+			if (count >= budget) {
+				return {
+					nudged: false,
+					exhausted: true,
+					count,
+					budget,
+					goalId: target.goalId,
+					targetKind: target.targetKind,
+				} as const;
+			}
+			const attempt = count + 1;
+			const entry = (await appendLedger(
+				cwd,
+				{
+					event: "nudge",
+					goalId: target.goalId,
+					targetKind: target.targetKind,
+					surface,
+					attempt,
+					budget,
+					reason,
+					...(input.currentGoalObjective ? { currentGoalObjective: input.currentGoalObjective } : {}),
+				},
+				resolvedSessionId,
+			)) as UltragoalNudgeLedgerEvent;
+			return {
+				nudged: true,
+				attempt,
+				budget,
+				goalId: target.goalId,
+				targetKind: target.targetKind,
+				event: entry,
+			} as const;
+		},
+		{ cwd },
+	);
 }
 
 async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | null): Promise<void> {
@@ -525,6 +725,20 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 	else if (counts.active > 0) status = "active";
 	else if (counts.failed > 0) status = "failed";
 	else if (counts.blocked > 0 || counts.review_blocked > 0) status = "blocked";
+	const nudgeTarget = selectUltragoalNudgeTarget(plan, { currentGoalObjective: currentGoal?.objective });
+	let nudgeFields: Partial<UltragoalStatusSummary> = {};
+	if (nudgeTarget) {
+		const { budget } = await resolveUltragoalNudgeBudget(cwd);
+		const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+		const nudgeCount = countUltragoalNudges(ledger, nudgeTarget.goalId);
+		nudgeFields = {
+			nudgeBudget: budget,
+			nudgeCount,
+			nudgeRemaining: Math.max(0, budget - nudgeCount),
+			nudgeGoalId: nudgeTarget.goalId,
+			nudgeTargetKind: nudgeTarget.targetKind,
+		};
+	}
 	return {
 		exists: true,
 		status,
@@ -533,6 +747,7 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 		currentGoal,
 		counts,
 		goals: plan.goals,
+		...nudgeFields,
 	};
 }
 export function buildUltragoalHudSummary(
@@ -3847,6 +4062,11 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 			goals_path: summary.paths.goalsPath,
 		};
 		if (summary.gjcObjective) payload.gjc_objective = summary.gjcObjective;
+		if (summary.nudgeBudget !== undefined) payload.nudge_budget = summary.nudgeBudget;
+		if (summary.nudgeCount !== undefined) payload.nudge_count = summary.nudgeCount;
+		if (summary.nudgeRemaining !== undefined) payload.nudge_remaining = summary.nudgeRemaining;
+		if (summary.nudgeGoalId !== undefined) payload.nudge_goal_id = summary.nudgeGoalId;
+		if (summary.nudgeTargetKind !== undefined) payload.nudge_target_kind = summary.nudgeTargetKind;
 		const ledgerText = await Bun.file(summary.paths.ledgerPath)
 			.text()
 			.catch(() => "");
