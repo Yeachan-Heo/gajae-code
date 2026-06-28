@@ -4,10 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
+	buildWorkerCommand,
 	claimGjcTeamTask,
 	classifyGjcTeamCheckpointFiles,
 	executeGjcTeamApiOperation,
 	type GjcTeamConfig,
+	type GjcTeamWorker,
 	listGjcTeams,
 	monitorGjcTeam,
 	monitorGjcTeamSnapshot,
@@ -373,6 +375,60 @@ describe("native gjc team runtime", () => {
 		expect(manifest.worker_command).toBe("bun ./packages/coding-agent/src/cli.ts");
 		expect(telemetry).toContain("bun ./packages/coding-agent/src/cli.ts");
 		expect(resolveGjcWorkerCommand(cleanupRoot, { GJC_TEAM_WORKER_COMMAND: "gjc-dev" })).toBe("gjc-dev");
+	});
+
+	it("builds executable PowerShell worker launches on Windows", () => {
+		const previousArgv1 = process.argv[1];
+		process.argv[1] = "C:\\Users\\USER\\.bun\\install\\global\\node_modules\\@gajae-code\\coding-agent\\bin\\gjc.js";
+		try {
+			const workerCommand = resolveGjcWorkerCommand("C:\\work", {}, "win32");
+			expect(workerCommand).toBe(
+				`${"'"}${process.execPath.replace(/'/g, "''")}${"'"} 'C:\\Users\\USER\\.bun\\install\\global\\node_modules\\@gajae-code\\coding-agent\\bin\\gjc.js'`,
+			);
+
+			const worker: GjcTeamWorker = {
+				id: "worker-1",
+				name: "worker-1",
+				index: 1,
+				agent_type: "executor",
+				role: "executor",
+				status: "starting",
+				last_heartbeat: "2026-06-28T00:00:00.000Z",
+				assigned_tasks: [],
+				worktree_path: "C:\\work\\worker-1",
+			};
+			const config = {
+				team_name: "psmux-team",
+				display_name: "psmux-team",
+				requested_name: "psmux-team",
+				task: "Verify Windows worker command quoting",
+				agent_type: "executor",
+				worker_count: 1,
+				max_workers: 1,
+				state_root: "C:\\work\\.gjc\\state\\team\\psmux-team",
+				worker_command: workerCommand,
+				worker_cli_plan: ["gjc"],
+				tmux_command: "psmux",
+				tmux_session: "gjc",
+				tmux_session_name: "gjc",
+				tmux_target: "gjc:0",
+				workspace_mode: "worktree",
+				dry_run: true,
+				leader: { session_id: TEST_SESSION_ID, pane_id: "%1", cwd: "C:\\work" },
+				leader_cwd: "C:\\work",
+				team_state_root: "C:\\work\\.gjc\\state\\team",
+				workers: [worker],
+				created_at: "2026-06-28T00:00:00.000Z",
+				updated_at: "2026-06-28T00:00:00.000Z",
+			} satisfies GjcTeamConfig;
+
+			const command = buildWorkerCommand(config, worker, "win32");
+			expect(command).toContain(`; & ${workerCommand} '`);
+			expect(command).not.toContain(`; ${workerCommand} '`);
+			expect(command).toContain("$env:GJC_TEAM_WORKER = 'psmux-team/worker-1';");
+		} finally {
+			process.argv[1] = previousArgv1;
+		}
 	});
 
 	it("keeps worker CLI selection limited to GJC teammate sessions", async () => {

@@ -1896,10 +1896,23 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
-export function resolveGjcWorkerCommand(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
+export function resolveGjcWorkerCommand(
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
 	if (explicit) return explicit;
 	const entrypoint = process.argv[1];
+	if (platform === "win32") {
+		if (entrypoint && /\.(?:ts|js|mjs)$/.test(entrypoint)) {
+			return `${powershellQuote(process.execPath)} ${powershellQuote(path.resolve(cwd, entrypoint))}`;
+		}
+		if (entrypoint && path.basename(entrypoint).toLowerCase().startsWith("gjc")) {
+			return powershellQuote(path.resolve(cwd, entrypoint));
+		}
+		return "gjc";
+	}
 	if (entrypoint?.endsWith(".ts"))
 		return `${shellQuote(process.execPath)} ${shellQuote(path.resolve(cwd, entrypoint))}`;
 	if (entrypoint && path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
@@ -1936,7 +1949,12 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
-	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
+	const joined = envLines.join(" ");
+	if (platform === "win32") {
+		const workerCommand = config.worker_command.trim();
+		const invocation = workerCommand.startsWith("&") ? workerCommand : `& ${workerCommand}`;
+		return `${joined} ${invocation} ${quote(prompt)}`;
+	}
 	return `${joined} ${config.worker_command} ${quote(prompt)}`;
 }
 interface GjcTeamInitialLane {
