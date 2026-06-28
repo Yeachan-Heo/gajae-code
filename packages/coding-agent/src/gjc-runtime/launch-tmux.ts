@@ -306,27 +306,33 @@ function truncateVisibleTail(value: string, maxWidth: number): string {
 	return `…${result}`;
 }
 
+const GJC_TMUX_WINDOW_BRANCH_SEPARATOR = "-";
+
+function sanitizeTmuxWindowTitleSegment(value: string): string {
+	return value.replace(/:+/g, "-");
+}
+
 function sanitizeTmuxWindowProjectName(project: string): string {
 	const trimmed = project.trim();
 	if (!trimmed || /^\.+$/.test(trimmed)) return "gjc";
-	if (trimmed.startsWith(".")) return `dot-${trimmed.replace(/^\.+/, "")}`;
-	return trimmed;
+	if (trimmed.startsWith(".")) return sanitizeTmuxWindowTitleSegment(`dot-${trimmed.replace(/^\.+/, "")}`);
+	return sanitizeTmuxWindowTitleSegment(trimmed);
 }
 
 export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
 	const project = sanitizeTmuxWindowProjectName(path.basename(path.resolve(cwd)) || "gjc");
-	const trimmedBranch = branch?.trim();
+	const trimmedBranch = sanitizeTmuxWindowTitleSegment(branch?.trim() ?? "");
 	if (!trimmedBranch) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
-	const separatorWidth = visibleWidth(":");
+	const separatorWidth = visibleWidth(GJC_TMUX_WINDOW_BRANCH_SEPARATOR);
 	const projectWidth = visibleWidth(project);
-	const fullTitle = `${project}:${trimmedBranch}`;
+	const fullTitle = `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${trimmedBranch}`;
 	if (visibleWidth(fullTitle) <= GJC_TMUX_WINDOW_LABEL_MAX_WIDTH) return fullTitle;
 
 	const remainingBranchWidth = GJC_TMUX_WINDOW_LABEL_MAX_WIDTH - projectWidth - separatorWidth;
 	if (remainingBranchWidth <= 0) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
-	return `${project}:${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
+	return `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
 }
 
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
@@ -350,8 +356,8 @@ function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 
 	// Note: Windows is intentionally allowed here. Psmux supports
 	// `rename-window` and we want the leader window to inherit the
-	// project:branch title even on native Windows, where gjc --tmux runs
-	// through PowerShell to a psmux backend.
+	// sanitized project-branch title even on native Windows, where
+	// gjc --tmux runs through PowerShell to a psmux backend.
 
 	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
 	if (!isInteractiveRootLaunch(context.parsed, tty)) return;

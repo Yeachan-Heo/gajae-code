@@ -65,17 +65,24 @@ describe("default GJC tmux launch", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("builds project and branch tmux window titles", () => {
-		expect(buildGjcTmuxWindowTitle("/repo", "feature/demo")).toBe("repo:feature/demo");
+	it("builds sanitized project and branch tmux window titles", () => {
+		expect(buildGjcTmuxWindowTitle("/repo", "feature/demo")).toBe("repo-feature/demo");
+		expect(buildGjcTmuxWindowTitle("/repo", "main")).toBe("repo-main");
 		expect(buildGjcTmuxWindowTitle("/repo", null)).toBe("repo");
 		expect(buildGjcTmuxWindowTitle("/repo", "")).toBe("repo");
+	});
+
+	it("replaces colon-bearing tmux window title segments", () => {
+		expect(buildGjcTmuxWindowTitle("/repo:backend", "main")).toBe("repo-backend-main");
+		expect(buildGjcTmuxWindowTitle("/repo", "release:main")).toBe("repo-release-main");
+		expect(buildGjcTmuxWindowTitle("/repo", "feature:::demo")).toBe("repo-feature-demo");
 	});
 
 	it("truncates long tmux window titles to 48 visible columns while preserving the project and branch tail", () => {
 		const title = buildGjcTmuxWindowTitle("/repo", `feature/${"a".repeat(80)}tail`);
 
 		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
-		expect(title.startsWith("repo:…")).toBe(true);
+		expect(title.startsWith("repo-…")).toBe(true);
 		expect(title.endsWith("tail")).toBe(true);
 	});
 
@@ -83,14 +90,16 @@ describe("default GJC tmux launch", () => {
 		const title = buildGjcTmuxWindowTitle("/저장소", `feature/${"界".repeat(80)}끝`);
 
 		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
-		expect(title.startsWith("저장소:…")).toBe(true);
+		expect(title.startsWith("저장소-…")).toBe(true);
 		expect(title.endsWith("끝")).toBe(true);
 	});
 
 	it("sanitizes dot-prefixed cwd basenames for tmux window titles", () => {
 		expect(buildGjcTmuxWindowTitle("/tmp/.claude", null)).toBe("dot-claude");
-		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "feature/demo")).toBe("dot-claude:feature/demo");
-		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("gjc:feature/demo");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "feature/demo")).toBe("dot-claude-feature/demo");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "repo:main")).toBe("dot-claude-repo-main");
+		expect(buildGjcTmuxWindowTitle("/tmp/...", null)).toBe("gjc");
+		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("gjc-feature/demo");
 	});
 
 	it("passes sanitized dot-prefixed cwd basenames to tmux rename-window", () => {
@@ -145,7 +154,7 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(false);
-		expect(calls[0]?.args).toEqual(["rename-window", "--", "-repo:feature/demo"]);
+		expect(calls[0]?.args).toEqual(["rename-window", "--", "-repo-feature/demo"]);
 	});
 
 	it("does not plan tmux for interactive root launch without --tmux", () => {
@@ -746,7 +755,7 @@ describe("default GJC tmux launch", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toMatchObject({
 			command: "tmux",
-			args: ["rename-window", "--", "repo:feature/demo"],
+			args: ["rename-window", "--", "repo-feature/demo"],
 		});
 	});
 
@@ -850,7 +859,7 @@ describe("default GJC tmux launch", () => {
 
 		expect(newSessionIndex).toBeGreaterThanOrEqual(0);
 		expect(renameIndex).toBeGreaterThan(newSessionIndex);
-		expect(calls[renameIndex]?.args).toEqual(["rename-window", "-t", `=${sessionName}`, "--", "repo:feature/demo"]);
+		expect(calls[renameIndex]?.args).toEqual(["rename-window", "-t", `=${sessionName}`, "--", "repo-feature/demo"]);
 	});
 	it("falls through to direct launch when session creation fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
