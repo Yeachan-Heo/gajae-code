@@ -29,6 +29,14 @@ const snapshot: ModelProfileConfig = {
 	model_mapping: { default: "my-oai/gpt-custom:low" },
 };
 
+const placeholderProfile: ModelProfileDefinition = {
+	name: "placeholder",
+	displayName: "Placeholder",
+	requiredProviders: ["my-oai"],
+	modelMapping: { default: "my-oai/gpt-custom" },
+	source: "user",
+};
+
 beforeEach(async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-custom-preset-"));
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -49,18 +57,24 @@ function normalizeRenderedText(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = []) {
+interface TestRegistryOptions {
+	readonly models?: readonly Model[];
+	readonly resolveCanonicalModel?: (canonicalId: string) => Model | undefined;
+}
+
+function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [], options: TestRegistryOptions = {}) {
 	const profileMap = new Map(profiles);
+	const models = [...(options.models ?? [currentModel("my-oai", "gpt-custom"), currentModel("anthropic", "claude")])];
 	return {
 		refresh: async () => {},
 		getError: () => undefined,
-		getAvailable: () => [currentModel("my-oai", "gpt-custom"), currentModel("anthropic", "claude")],
-		getAll: () => [currentModel("my-oai", "gpt-custom"), currentModel("anthropic", "claude")],
+		getAvailable: () => [...models],
+		getAll: () => [...models],
 		getProviders: () => [],
 		getCanonicalModels: () => [],
 		getDiscoverableProviders: () => [],
 		findCanonicalModel: () => undefined,
-		resolveCanonicalModel: () => undefined,
+		resolveCanonicalModel: options.resolveCanonicalModel ?? (() => undefined),
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
 		getApiKeyForProvider: async () => "key",
@@ -226,11 +240,10 @@ describe("custom model preset creation", () => {
 
 	it("surfaces create custom preset with the generated current model snapshot", async () => {
 		const settings = Settings.isolated({
-			modelRoles: { vision: "default" },
 			"task.agentModelOverrides": {
 				executor: "anthropic/claude:high",
 				architect: "pi/default",
-				planner: "",
+				planner: "pi/default:high",
 				critic: "my-oai/gpt-custom",
 			},
 		});
@@ -270,6 +283,7 @@ describe("custom model preset creation", () => {
 					model_mapping: {
 						default: "my-oai/gpt-custom:low",
 						executor: "anthropic/claude:high",
+						planner: "my-oai/gpt-custom:high",
 						critic: "my-oai/gpt-custom",
 					},
 				},
@@ -311,6 +325,76 @@ describe("custom model preset creation", () => {
 		selector.handleInput("\n");
 		expect(selections[0]?.kind).toBe("createProfile");
 	});
+
+	it("resolves canonical ids and role aliases before creating the snapshot", async () => {
+		const canonicalModel = currentModel("my-oai", "gpt-custom");
+		const settings = Settings.isolated({
+			modelRoles: { default: "best-coder" },
+			"task.agentModelOverrides": {
+				executor: "pi/default:low",
+				critic: "anthropic/claude:max",
+			},
+		});
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			undefined,
+			settings,
+			createRegistry([[placeholderProfile.name, placeholderProfile]], {
+				resolveCanonicalModel: canonicalId => (canonicalId === "best-coder" ? canonicalModel : undefined),
+			}),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Create custom preset");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([
+			{
+				kind: "createProfile",
+				profile: {
+					required_providers: ["anthropic", "my-oai"],
+					model_mapping: {
+						default: "my-oai/gpt-custom",
+						executor: "my-oai/gpt-custom:low",
+						critic: "anthropic/claude:max",
+					},
+				},
+			},
+		]);
+	});
+
+	it("disables custom preset creation when no concrete snapshot can be generated", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			undefined,
+			Settings.isolated({}),
+			createRegistry([[placeholderProfile.name, placeholderProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Select a model before creating a custom preset");
+		expect(text).not.toContain("Create custom preset");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([]);
+	});
+
 	it("replaces create custom preset with a disabled already-saved row for duplicate raw payloads", async () => {
 		const duplicateProfile: ModelProfileDefinition = {
 			name: "saved-current",
