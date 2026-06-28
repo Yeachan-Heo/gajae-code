@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Coordinator MCP now fails tmux-delivered turns that never receive a runtime prompt acknowledgement/`turn_start`, surfacing an explicit unacknowledged delivery reason instead of leaving Hermes/Oren waiting on a normal active/running state (#1237).
 - Telegram now advertises `/session_create`, `/session_recent`, `/session_close`, and `/session_resume` in the bot command menu so lifecycle control commands are discoverable from `/` autocomplete.
 
 ## [0.7.7] - 2026-06-28
