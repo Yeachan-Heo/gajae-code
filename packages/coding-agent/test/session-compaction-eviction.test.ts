@@ -526,6 +526,79 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		expect(JSON.stringify(context.messages)).toContain("openaiResponsesHistory");
 	});
 
+	it("materializes resident compaction provider-visible fields for replay context", () => {
+		const { session, firstKeptEntryId } = buildLargeSession(4, false);
+		const summary = `resident replay summary ${"s".repeat(5_000)}`;
+		const encryptedContent = `resident encrypted ${"e".repeat(5_000)}`;
+		const nestedText = `resident nested text ${"t".repeat(5_000)}`;
+		const compactionEntryId = session.appendCompaction(
+			summary,
+			"short",
+			firstKeptEntryId,
+			123,
+			undefined,
+			undefined,
+			{
+				openaiRemoteCompaction: {
+					provider: "openai-codex",
+					replacementHistory: [
+						{ type: "reasoning", encrypted_content: encryptedContent },
+						{
+							type: "message",
+							role: "assistant",
+							content: [{ type: "output_text", text: nestedText }],
+						},
+					],
+				},
+			},
+		);
+		session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+
+		const canonical = session.getCanonicalEntryForTests(compactionEntryId);
+		expect(canonical?.type).toBe("compaction");
+		if (canonical?.type !== "compaction") throw new Error("Expected compaction entry");
+		expect(residentTextSentinel(canonical.summary).ref).toBeString();
+		const remote = canonical.preserveData?.openaiRemoteCompaction;
+		expect(remote).toBeObject();
+		const replacementHistory = (remote as { replacementHistory?: unknown }).replacementHistory;
+		expect(JSON.stringify(replacementHistory)).toContain("__gjcResidentBlob");
+
+		const context = session.buildSessionContext();
+		const compactionMessage = context.messages.find(message => message.role === "compactionSummary");
+		expect(compactionMessage).toBeDefined();
+		if (compactionMessage?.role !== "compactionSummary") {
+			throw new Error("Expected compaction summary message");
+		}
+		expect(compactionMessage.summary).toBe(summary);
+		expect(JSON.stringify(compactionMessage.providerPayload)).not.toContain("__gjcResidentBlob");
+		expect(compactionMessage.providerPayload?.type).toBe("openaiResponsesHistory");
+		const items = compactionMessage.providerPayload?.items;
+		expect(items).toBeArray();
+		expect(items?.[0]?.encrypted_content).toBe(encryptedContent);
+		const messageItem = items?.[1] as { content?: Array<{ text?: unknown }> } | undefined;
+		expect(messageItem?.content?.[0]?.text).toBe(nestedText);
+	});
+
+	it("materializes resident branch summary text for replay context", () => {
+		const session = SessionManager.inMemory("/cwd", new MemorySessionStorage());
+		const anchor = session.appendMessage({ role: "user", content: "anchor", timestamp: Date.now() });
+		const summary = `resident branch summary ${"b".repeat(5_000)}`;
+		const summaryId = session.branchWithSummary(anchor, summary);
+		const canonical = session.getCanonicalEntryForTests(summaryId);
+		expect(canonical?.type).toBe("branch_summary");
+		if (canonical?.type !== "branch_summary") throw new Error("Expected branch summary entry");
+		expect(residentTextSentinel(canonical.summary).ref).toBeString();
+
+		const context = session.buildSessionContext();
+		const branchMessage = context.messages.find(message => message.role === "branchSummary");
+		expect(branchMessage).toBeDefined();
+		if (branchMessage?.role !== "branchSummary") {
+			throw new Error("Expected branch summary message");
+		}
+		expect(branchMessage.summary).toBe(summary);
+		expect(JSON.stringify(context.messages)).not.toContain("__gjcResidentBlob");
+	});
+
 	it("preserves assistant metadata and tool call identity in hot evicted entries", () => {
 		const { session, firstKeptEntryId, oldAssistantEntryId } = buildLargeSession(4, false);
 		const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);

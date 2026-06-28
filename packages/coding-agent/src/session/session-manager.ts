@@ -1515,6 +1515,40 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return { ...entry, message: cloneAgentMessage(entry.message) } as SessionEntry;
 }
 
+function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
+	if (entry.type === "compaction") {
+		const cache = new Map<string, string>();
+		const summary = materializeResidentValueSync(entry.summary, stores, "summary", cache);
+		const shortSummary = materializeResidentValueSync(entry.shortSummary, stores, "shortSummary", cache);
+		const remote = entry.preserveData?.openaiRemoteCompaction;
+		const remoteRecord = isRecord(remote) ? remote : undefined;
+		const replacementHistory = remoteRecord
+			? materializeResidentValueSync(remoteRecord.replacementHistory, stores, "replacementHistory", cache)
+			: undefined;
+		const preserveData =
+			remoteRecord && replacementHistory !== undefined && replacementHistory !== remoteRecord.replacementHistory
+				? {
+						...entry.preserveData,
+						openaiRemoteCompaction: {
+							...remoteRecord,
+							replacementHistory,
+						},
+					}
+				: entry.preserveData;
+		return {
+			...entry,
+			summary: typeof summary === "string" ? summary : entry.summary,
+			shortSummary: typeof shortSummary === "string" ? shortSummary : entry.shortSummary,
+			preserveData,
+		};
+	}
+	if (entry.type === "branch_summary") {
+		const summary = materializeResidentValueSync(entry.summary, stores, "summary", new Map<string, string>());
+		return typeof summary === "string" ? { ...entry, summary } : { ...entry };
+	}
+	return cloneSessionEntry(entry);
+}
+
 const COLD_SPILL_NOTICE = "[Compacted history content evicted to durable cold storage]";
 const COLD_SPILL_ARGUMENTS_SENTINEL_KEY = "__gjcColdSpillArguments";
 const COLD_SPILL_MIN_CHARS = 1024;
@@ -1533,19 +1567,6 @@ type ColdSpillResidentPromotion = {
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
-function isColdSpillRef(value: unknown): value is ColdSpillRef {
-	return (
-		isRecord(value) &&
-		value.kind === "cold_spill" &&
-		typeof value.ref === "string" &&
-		(value.encoding === "utf8" || value.encoding === "json") &&
-		typeof value.originalChars === "number" &&
-		typeof value.sha256 === "string" &&
-		typeof value.bytes === "number"
-	);
-}
-
 function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, unknown> {
 	return isRecord(value) && value[COLD_SPILL_ARGUMENTS_SENTINEL_KEY] === true;
 }
@@ -4008,8 +4029,7 @@ export class SessionManager {
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);
 		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
-		if (!compaction || compaction.type !== "compaction")
-			throw new Error(`Compaction entry ${compactionEntryId} not found`);
+		if (compaction?.type !== "compaction") throw new Error(`Compaction entry ${compactionEntryId} not found`);
 		const ids: string[] = [];
 		const visited = new Set<string>();
 		let current: SessionEntry | undefined = compaction;
@@ -4351,7 +4371,8 @@ export class SessionManager {
 		if (coldSpillPolicy === "covered" && (entry.type === "message" || entry.type === "custom_message")) {
 			return cloneSessionEntry(entry);
 		}
-		if (entry.type !== "message" && entry.type !== "custom_message") return cloneSessionEntry(entry);
+		if (entry.type !== "message" && entry.type !== "custom_message")
+			return materializeProviderVisibleEntrySync(entry, this.#residentBlobStores());
 		const materialized = materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map());
 		const rehydrated = rehydrateColdSpillEntry(
 			materialized,
