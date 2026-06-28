@@ -29,6 +29,7 @@ interface PromptActionAutocompleteOptions {
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
 	pasteImage: () => void;
+	scrollTmuxToPreviousUserInput: () => void;
 	undo: (prefix: string) => void;
 	moveCursorToMessageEnd: () => void;
 	moveCursorToMessageStart: () => void;
@@ -377,6 +378,13 @@ export function createPromptActionAutocompleteProvider(
 			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.pasteImage")),
 			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
 			execute: options.pasteImage,
+		},
+		{
+			id: "tmux-previous-user-input",
+			label: "Scroll to previous user input",
+			description: "tmux copy-mode",
+			keywords: ["scroll", "tmux", "previous", "user", "input", "prompt", "history"],
+			execute: options.scrollTmuxToPreviousUserInput,
 		},
 		{
 			id: "undo",

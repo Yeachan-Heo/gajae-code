@@ -9,6 +9,7 @@ import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibil
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
+import { scrollTmuxToPreviousUserInput as scrollTmuxPaneToPreviousUserInput } from "../../modes/tmux-scroll";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
@@ -858,6 +859,7 @@ export class InputController {
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
 			pasteImage: () => void this.handleImagePaste(),
+			scrollTmuxToPreviousUserInput: () => this.scrollTmuxToPreviousUserInput(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
@@ -950,6 +952,19 @@ export class InputController {
 
 	toggleToolOutputExpansion(): void {
 		this.setToolsExpanded(!this.ctx.toolOutputExpanded);
+	}
+
+	scrollTmuxToPreviousUserInput(): void {
+		const result = scrollTmuxPaneToPreviousUserInput();
+		if (result.ok) return;
+
+		if (result.reason === "not_inside_tmux") {
+			this.ctx.showWarning("Previous-input scroll works only inside tmux.");
+			return;
+		}
+
+		const detail = result.error ? `: ${result.error}` : ".";
+		this.ctx.showWarning(`Failed to scroll tmux to previous user input${detail}`);
 	}
 
 	setToolsExpanded(expanded: boolean): void {
