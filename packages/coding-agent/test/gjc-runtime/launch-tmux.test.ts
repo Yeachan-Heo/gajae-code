@@ -1285,3 +1285,52 @@ it("emits a UTF-16LE BOM and a script-block &-invocation for native Windows --tm
 	// because that is what previously made pwsh reject the encoded command.
 	expect(script).not.toMatch(/&\s+'-{1,2}[A-Za-z]/);
 });
+
+it("captures psmux stderr in the attach-failed diagnostic", () => {
+	// Regression: gjc --tmux on native Windows + psmux 3.3.0 surfaces a silent
+	// exit when attach-session fails. The previous defaultSpawnSync dropped
+	// Bun.spawnSync's result.stderr, so the "attach failed" diagnostic
+	// template rendered with an empty detail and the user could not
+	// diagnose the real failure. With captureStderr: true the new-session
+	// and profile spawns retain their stderr, and the diagnostic template
+	// emits the captured text so future regressions in the same lane are
+	// diagnosable from the test surface alone.
+	const diagnostics: string[] = [];
+	const handled = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: {},
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: message => {
+			diagnostics.push(message);
+		},
+		spawnSync: (_command, spawnArgs) => {
+			if (spawnArgs[0] === "new-session") {
+				// Simulate psmux rejecting the new-session call by emitting a
+				// distinctive stderr message and exiting non-zero.
+				return {
+					exitCode: 1,
+					stderr: "psmux: cannot create session: server is shutting down",
+				};
+			}
+			if (spawnArgs[0] === "attach-session") {
+				return { exitCode: 0 };
+			}
+			return { exitCode: 0 };
+		},
+	});
+	// The handler should return false because new-session failed and there
+	// is no usable plan to fall through from. The captured stderr is what
+	// the diagnostic writer saw, so it should include the failure reason.
+	expect(handled).toBe(false);
+	expect(diagnostics.length).toBeGreaterThan(0);
+	expect(diagnostics[0]).toContain("new-session failed");
+	expect(diagnostics[0]).toContain("cannot create session");
+});
