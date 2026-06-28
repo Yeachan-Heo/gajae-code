@@ -1708,7 +1708,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (
 			sessionState &&
 			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
-			sessionState.current_turn_id === resolvedTurn.turn_id &&
+			(sessionState.current_turn_id === resolvedTurn.turn_id ||
+				(sessionState.state === "errored" &&
+					sessionState.source === "agent_session_event" &&
+					sessionState.current_turn_id == null)) &&
 			(sessionState.state === "completed" || sessionState.state === "errored")
 		) {
 			resolvedTurn = await markTurnTerminalFromSessionState(namespaceDir, resolvedTurn, sessionState);

@@ -952,6 +952,81 @@ describe("Coordinator MCP server protocol", () => {
 		}
 	});
 
+	it("preserves launch errors from runtime state before tmux liveness masking", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "hermes-launch-error");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "gjc-demo",
+					tmuxSession: "gjc-demo",
+					tmuxTarget: "gjc-demo:0.0",
+					cwd: input.cwd,
+					createdAt: "2026-06-07T00:00:00.000Z",
+				}),
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+		await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "gjc-demo",
+			prompt: "work",
+			allow_mutation: true,
+		});
+		const turnId = turn.turn_id as string;
+		const sessionStatesDir = path.join(stateRoot, "local", "repo", "session-states");
+		await fs.mkdir(sessionStatesDir, { recursive: true });
+		await Bun.write(
+			path.join(sessionStatesDir, "gjc-demo.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "gjc-demo",
+				state: "errored",
+				ready_for_input: false,
+				current_turn_id: null,
+				last_turn_id: null,
+				updated_at: "2026-06-07T00:00:01.000Z",
+				source: "agent_session_event",
+				live: false,
+				reason: "worktree_target_mismatch",
+				final_response: {
+					text: "worktree_target_mismatch:/tmp/repo.gajae-code-worktrees/main",
+					format: "markdown",
+					source: "launch_error",
+					artifact_path: null,
+					truncated: false,
+				},
+				error: {
+					code: "worktree_target_mismatch",
+					message: "worktree_target_mismatch:/tmp/repo.gajae-code-worktrees/main",
+					recoverable: true,
+				},
+			}),
+		);
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "gjc-demo",
+			turn_id: turnId,
+		});
+
+		expect((read.turn as { status: string }).status).toBe("failed");
+		expect((read.turn as { error: { code: string } }).error.code).toBe("worktree_target_mismatch");
+		expect((read.turn as { final_response: { text: string } }).final_response.text).toContain(
+			"worktree_target_mismatch",
+		);
+	});
+
 	it("terminalizes active turns from durable runtime session state", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "hermes-runtime");
