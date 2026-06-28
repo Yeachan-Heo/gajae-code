@@ -459,7 +459,8 @@ function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel)
 		// budget. GJC's `contextWindow` is the usable prompt/input cap, not the
 		// marketing total window; using 1M here delays compaction and makes the UI
 		// promise space that `/responses/compact`/agent turns cannot actually use.
-		model.contextWindow = model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
+		model.contextWindow =
+			model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
 		return true;
 	}
 	return false;
