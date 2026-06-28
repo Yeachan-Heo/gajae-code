@@ -201,12 +201,24 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
-	const invocation = ["&", ...command.map(powershellQuote), ...stripRootTmuxFlag(rawArgs).map(powershellQuote)].join(
-		" ",
-	);
+	// The inner `&` invocation must wrap the resolved gjc command in a
+	// script-block so the trailing PowerShell exec-policy flags from the
+	// outer invocation are not forwarded into the bun / node / .bat
+	// binary the gjc command resolves to. Without the wrapping, the flags
+	// reach the runtime binary and cause an immediate failure that closes
+	// the psmux pane before the gjc --tmux attach can land.
+	const resolvedCommand = command.map(powershellQuote).join(" ");
+	const innerArgs = stripRootTmuxFlag(rawArgs).map(powershellQuote).join(" ");
+	const invocation = `& { ${resolvedCommand} ${innerArgs} }`;
 	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
 	const script = [...envLines, invocation, exitLine].join("\n");
-	const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
+	// PowerShell -EncodedCommand requires a UTF-16LE BOM (0xFF 0xFE) at the
+	// start of the decoded buffer; without it pwsh may misinterpret the
+	// leading bytes and reject the script with a parse error, which would
+	// kill the psmux pane before the gjc --tmux attach could land.
+	const bom = Buffer.from([0xff, 0xfe]);
+	const body = Buffer.from(script, "utf16le");
+	const encodedCommand = Buffer.concat([bom, body]).toString("base64");
 	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }
 

@@ -1165,3 +1165,47 @@ describe("default GJC tmux launch", () => {
 		expect(calls.map(call => call.args)).toContainEqual(["set-option", "-t", sessionName, "@gjc-version", VERSION]);
 	});
 });
+
+it("emits a UTF-16LE BOM and a script-block &-invocation for native Windows --tmux plans", () => {
+	// Regression: gjc --tmux on native Windows + psmux previously failed with
+	// "attach failed: no server running" because the inner PowerShell-encoded
+	// command lacked a UTF-16LE BOM (pwsh rejected it with a parse error) and
+	// the trailing `-NoLogo -NoProfile -ExecutionPolicy Bypass` flags were
+	// being forwarded into the resolved gjc binary instead of being absorbed
+	// by PowerShell. Both root causes are fixed by:
+	//   1. Prepending a UTF-16LE BOM (0xFF 0xFE) to the encoded buffer.
+	//   2. Wrapping the `& <command> <args>` invocation in a script block
+	//      `& { ... }` so the trailing flags do not reach the runtime binary.
+	const plan = buildDefaultTmuxLaunchPlan({
+		parsed: args({ messages: [], tmux: true }),
+		rawArgs: ["--tmux"],
+		cwd: "C:\\repo",
+		env: {},
+		argv: ["C:\\Program Files\\GJC\\gjc.exe"],
+		execPath: "C:\\Program Files\\GJC\\gjc.exe",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+	});
+	expect(plan).toBeDefined();
+	if (!plan) throw new Error("expected tmux plan for win32 --tmux launch");
+	const encodedMatch = plan.innerCommand.match(/-EncodedCommand\s+(\S+)/);
+	expect(encodedMatch).not.toBeNull();
+	if (!encodedMatch) throw new Error("expected -EncodedCommand in inner command");
+	const decoded = Buffer.from(encodedMatch[1], "base64");
+	// The first two bytes of the decoded buffer must be the UTF-16LE BOM
+	// (0xFF 0xFE) so PowerShell -EncodedCommand parses the script correctly.
+	expect(decoded[0]).toBe(0xff);
+	expect(decoded[1]).toBe(0xfe);
+	const script = decoded.subarray(2).toString("utf16le");
+	// The inner invocation must be wrapped in a script block so the trailing
+	// PowerShell exec-policy flags from the outer invocation are not
+	// forwarded into the resolved gjc binary itself.
+	expect(script).toContain("& {");
+	expect(script).toContain("}");
+	// No bare `& '<flag>'` invocation should leak into the inner script,
+	// because that is what previously made pwsh reject the encoded command.
+	expect(script).not.toMatch(/&\s+'-{1,2}[A-Za-z]/);
+});
