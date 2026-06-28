@@ -1,4 +1,4 @@
-import { enrichModelThinking } from "./model-thinking";
+import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import MODELS from "./models.json" with { type: "json" };
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
@@ -47,7 +47,9 @@ function applyBundledCompatDefaults(model: Model<Api>): Model<Api> {
 			compat: { ...(normalized.compat ?? {}), toolChoiceSupport: "auto" } as Model<Api>["compat"],
 		};
 	}
-	return normalized;
+	const policyModels = [normalized];
+	applyGeneratedModelPolicies(policyModels);
+	return policyModels[0] ?? normalized;
 }
 
 export type GeneratedProvider = keyof typeof MODELS;

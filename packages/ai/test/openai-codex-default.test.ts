@@ -16,8 +16,9 @@ describe("OpenAI Codex defaults", () => {
 			maxLevel: Effort.XHigh,
 			defaultLevel: Effort.XHigh,
 		});
-		// GPT-5.5/Codex 5.5 is a 1M-context model; keep the bundled metadata aligned
-		// with the active runtime policy so status/compaction surfaces do not show 272K.
-		expect(model.contextWindow).toBe(1_000_000);
+		// Codex GPT-5.5 may advertise a 1M total window, but the code backend's
+		// effective prompt/request cap is lower. Status and compaction must use the
+		// safe request cap instead of promising a window that overflows upstream.
+		expect(model.contextWindow).toBe(272_000);
 	});
 });

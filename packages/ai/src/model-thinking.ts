@@ -454,7 +454,12 @@ function inferGeneratedApplyPatchToolType(
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
-		model.contextWindow = 1_000_000;
+		// The first-party OpenAI GPT-5.5 model advertises a 1M total window, but
+		// the OpenAI code backend request path still enforces the smaller prompt
+		// budget. GJC's `contextWindow` is the usable prompt/input cap, not the
+		// marketing total window; using 1M here delays compaction and makes the UI
+		// promise space that `/responses/compact`/agent turns cannot actually use.
+		model.contextWindow = model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
 		return true;
 	}
 	return false;

@@ -285,7 +285,7 @@ describe("generated model policies", () => {
 		expect(models[1]?.contextPromotionTarget).toBeUndefined();
 	});
 
-	it("keeps Codex gpt-5.5 at the 1M context window even if discovery is stale", () => {
+	it("keeps Codex gpt-5.5 at the effective 272K request cap even if discovery advertises 1M", () => {
 		const models: Model<Api>[] = [
 			{
 				...createModel({
@@ -293,15 +293,16 @@ describe("generated model policies", () => {
 					api: "openai-codex-responses",
 					provider: "openai-codex",
 				}),
-				// OpenAI code discovery/cache can carry stale 272K metadata.
-				contextWindow: 272000,
+				// OpenAI code discovery/cache can advertise the total 1M window, but
+				// the usable request prompt cap remains lower on this transport.
+				contextWindow: 1_000_000,
 				maxTokens: 128000,
 			},
 		];
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models[0]?.contextWindow).toBe(1_000_000);
+		expect(models[0]?.contextWindow).toBe(272_000);
 	});
 
 	it("sets freeform apply_patch metadata for first-party GPT-5 Responses models", () => {
