@@ -2005,6 +2005,10 @@ export class TelegramNotificationDaemon {
 					{ command: "verbose", description: "Mirror full tool output + reasoning in this thread" },
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
+					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir" },
+					{ command: "session_recent", description: "List recent GJC sessions" },
+					{ command: "session_close", description: "Close a GJC-managed session" },
+					{ command: "session_resume", description: "Resume or reattach a session" },
 				],
 			});
 		} catch {
