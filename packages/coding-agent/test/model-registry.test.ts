@@ -3046,4 +3046,43 @@ describe("ModelRegistry", () => {
 		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
 		expect(model?.requestTransform).toEqual({ extraBody: { routed: true } });
 	});
+	describe("generic local OpenAI-compatible provider config", () => {
+		test("does not add a generic local provider by default", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(getModelsForProvider(registry, "local")).toHaveLength(0);
+			expect(registry.getProviderBaseUrl("local")).toBeUndefined();
+		});
+
+		test("parses providers.local.openaiCompat and discovers OpenAI-compatible models", async () => {
+			writeRawModelsJson({
+				local: {
+					openaiCompat: {
+						baseUrl: "http://127.0.0.1:1234",
+						apiKey: "LOCAL_TEST_KEY",
+					},
+				},
+			});
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url !== "http://127.0.0.1:1234/v1/models") {
+					throw new Error(`Unexpected URL: ${url}`);
+				}
+				expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer LOCAL_TEST_KEY");
+				return new Response(JSON.stringify({ data: [{ id: "local-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+			const model = registry.find("local", "local-model");
+
+			expect(model?.api).toBe("openai-completions");
+			expect(model?.baseUrl).toBe("http://127.0.0.1:1234/v1");
+			expect(getOpenAICompat(model)?.supportsStore).toBe(false);
+			expect(await registry.getApiKeyForProvider("local")).toBe("LOCAL_TEST_KEY");
+		});
+	});
 });

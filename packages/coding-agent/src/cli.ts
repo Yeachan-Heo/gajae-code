@@ -38,6 +38,7 @@ export const commands: CommandEntry[] = [
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
+	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
 	{ name: "mcp", load: () => import("./commands/mcp").then(m => m.default) },
 	{

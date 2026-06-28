@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added a generic `providers.local.openaiCompat` models config path for OpenAI-compatible local endpoints plus `gjc local-provider smoke` for bounded streaming chat-completion checks (#1246).
+
 ### Fixed
 
 - Coordinator MCP now fails tmux-delivered turns that never receive a runtime prompt acknowledgement/`turn_start`, surfacing an explicit unacknowledged delivery reason instead of leaving Hermes/Oren waiting on a normal active/running state (#1237).
