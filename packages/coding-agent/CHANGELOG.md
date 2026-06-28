@@ -4,6 +4,7 @@
 ### Added
 
 - Added a generic `providers.local.openaiCompat` models config path for OpenAI-compatible local endpoints plus `gjc local-provider smoke` for bounded streaming chat-completion checks (#1246).
+- Added `gjc local-provider discover` / `models` to list model IDs from a configured local OpenAI-compatible provider via `GET /v1/models`, with clear network and response-shape errors and no chat-completion request (#1247).
 
 ### Fixed
 

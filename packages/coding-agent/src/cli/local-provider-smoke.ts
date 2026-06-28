@@ -22,6 +22,15 @@ export interface LocalProviderSmokeResult {
 	error?: string;
 }
 
+export interface LocalProviderDiscoveryResult {
+	ok: boolean;
+	provider: string;
+	baseUrl?: string;
+	models: string[];
+	message: string;
+	error?: string;
+}
+
 const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_SMOKE_PROMPT = "Reply with ok.";
 
@@ -56,6 +65,24 @@ export function getLocalOpenAICompatConfig(config: ModelsConfig | undefined): Lo
 	};
 }
 
+function extractModelIds(payload: unknown): string[] {
+	if (!isRecord(payload)) {
+		throw new Error("/models response was not a JSON object");
+	}
+	if (!Array.isArray(payload.data)) {
+		throw new Error("/models response did not include a data array");
+	}
+	const models = payload.data.flatMap(item => {
+		if (!isRecord(item) || typeof item.id !== "string") return [];
+		const id = item.id.trim();
+		return id ? [id] : [];
+	});
+	if (models.length === 0) {
+		throw new Error("/models returned no model ids");
+	}
+	return [...new Set(models)].sort((left, right) => left.localeCompare(right));
+}
+
 async function readLocalConfig(
 	modelsPath: string | undefined,
 ): Promise<LocalProviderSmokeResult | LocalOpenAICompatConfig> {
@@ -85,7 +112,7 @@ function toErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function discoverFirstModel(config: LocalOpenAICompatConfig, timeoutMs: number): Promise<string> {
+async function fetchLocalModelIds(config: LocalOpenAICompatConfig, timeoutMs: number): Promise<string[]> {
 	const response = await fetch(`${config.baseUrl}/models`, {
 		headers: buildHeaders(config.apiKey),
 		signal: AbortSignal.timeout(timeoutMs),
@@ -93,17 +120,25 @@ async function discoverFirstModel(config: LocalOpenAICompatConfig, timeoutMs: nu
 	if (!response.ok) {
 		throw new Error(`HTTP ${response.status} from ${config.baseUrl}/models`);
 	}
-	const payload = (await response.json()) as unknown;
-	const data = isRecord(payload) ? payload.data : undefined;
-	if (!Array.isArray(data)) {
-		throw new Error("/models response did not include a data array");
+	let payload: unknown;
+	try {
+		payload = await response.json();
+	} catch (error) {
+		throw new Error(`Failed to parse /models JSON: ${toErrorMessage(error)}`);
 	}
-	for (const item of data) {
-		if (isRecord(item) && typeof item.id === "string" && item.id.trim()) {
-			return item.id;
+	return extractModelIds(payload);
+}
+
+async function discoverFirstModel(config: LocalOpenAICompatConfig, timeoutMs: number): Promise<string> {
+	try {
+		return (await fetchLocalModelIds(config, timeoutMs))[0]!;
+	} catch (error) {
+		const message = toErrorMessage(error);
+		if (message === "/models returned no model ids") {
+			throw new Error("/models returned no model ids; pass --model explicitly");
 		}
+		throw error;
 	}
-	throw new Error("/models returned no model ids; pass --model explicitly");
 }
 
 async function readStreamingBody(response: Response): Promise<number> {
@@ -120,6 +155,42 @@ async function readStreamingBody(response: Response): Promise<number> {
 		reader.releaseLock();
 	}
 	return chunks;
+}
+
+export async function runLocalProviderDiscover(
+	cmd: Omit<LocalProviderSmokeCommandArgs, "model">,
+): Promise<LocalProviderDiscoveryResult> {
+	const timeoutMs = cmd.timeoutMs && cmd.timeoutMs > 0 ? cmd.timeoutMs : DEFAULT_TIMEOUT_MS;
+	const configResult = await readLocalConfig(cmd.modelsPath);
+	if ("ok" in configResult) {
+		return {
+			ok: false,
+			provider: "local",
+			models: [],
+			message: configResult.message,
+			error: configResult.error,
+		};
+	}
+
+	try {
+		const models = await fetchLocalModelIds(configResult, timeoutMs);
+		return {
+			ok: true,
+			provider: "local",
+			baseUrl: configResult.baseUrl,
+			models,
+			message: `Discovered ${models.length} model${models.length === 1 ? "" : "s"}.`,
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			provider: "local",
+			baseUrl: configResult.baseUrl,
+			models: [],
+			message: "Local provider model discovery failed.",
+			error: toErrorMessage(error),
+		};
+	}
 }
 
 export async function runLocalProviderSmoke(cmd: LocalProviderSmokeCommandArgs): Promise<LocalProviderSmokeResult> {
@@ -175,6 +246,26 @@ export async function runLocalProviderSmoke(cmd: LocalProviderSmokeCommandArgs):
 			error: toErrorMessage(error),
 		};
 	}
+}
+
+export async function runLocalProviderDiscoverCommand(
+	cmd: Omit<LocalProviderSmokeCommandArgs, "model">,
+): Promise<void> {
+	const result = await runLocalProviderDiscover(cmd);
+	if (cmd.json) {
+		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+	} else if (result.ok) {
+		process.stdout.write(`${chalk.green("ok")} ${result.message}\n`);
+		process.stdout.write(`provider=${result.provider} baseUrl=${result.baseUrl}\n`);
+		for (const model of result.models) {
+			process.stdout.write(`${model}\n`);
+		}
+	} else {
+		process.stderr.write(`${chalk.red("error")} ${result.message}\n`);
+		process.stderr.write(`${chalk.dim(`provider=${result.provider} baseUrl=${result.baseUrl ?? "<unknown>"}`)}\n`);
+		if (result.error) process.stderr.write(`${chalk.dim(result.error)}\n`);
+	}
+	if (!result.ok) process.exitCode = 1;
 }
 
 export async function runLocalProviderSmokeCommand(cmd: LocalProviderSmokeCommandArgs): Promise<void> {
