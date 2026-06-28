@@ -79,6 +79,19 @@ async function installRuntimeGlobals(): Promise<void> {
 	delete process.env.MallocStackLoggingNoCompact;
 }
 
+function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
+	return argv[0] === "notify" && argv[1] === "daemon-internal";
+}
+
+async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
+	const { parseNotifyArgs, runNotifyCommand } = await import("./cli/notify-cli");
+	const cmd = parseNotifyArgs(argv);
+	if (cmd?.action !== "daemon-internal") {
+		throw new Error("invalid notify daemon-internal fast path");
+	}
+	await runNotifyCommand(cmd);
+}
+
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
 	for (const arg of argv) {
 		if (isSubcommand(arg)) return false;
@@ -208,6 +221,10 @@ async function runSmokeTest(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (isNotifyDaemonInternalFastPath(argv)) {
+		await runNotifyDaemonInternalFastPath(argv);
+		return;
+	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
 		return;
