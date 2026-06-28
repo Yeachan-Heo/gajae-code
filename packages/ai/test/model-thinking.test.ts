@@ -281,7 +281,7 @@ describe("generated model policies", () => {
 		linkOpenAIPromotionTargets(models);
 
 		expect(models[0]?.contextPromotionTarget).toBe("openai-codex/gpt-5.5");
-		// gpt-5.5 is a 1M model and must not demote to the smaller gpt-5.4.
+		// gpt-5.5 remains the largest OpenAI code backend target and must not demote to gpt-5.4.
 		expect(models[1]?.contextPromotionTarget).toBeUndefined();
 	});
 
@@ -303,6 +303,24 @@ describe("generated model policies", () => {
 		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.contextWindow).toBe(272_000);
+	});
+
+	it("keeps first-party OpenAI gpt-5.5 at the 1M context window", () => {
+		const models: Model<Api>[] = [
+			{
+				...createModel({
+					id: "gpt-5.5",
+					api: "openai-responses",
+					provider: "openai",
+				}),
+				contextWindow: 272000,
+				maxTokens: 128000,
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(1_000_000);
 	});
 
 	it("sets freeform apply_patch metadata for first-party GPT-5 Responses models", () => {
