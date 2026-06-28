@@ -217,9 +217,7 @@ function detectCorruptedGjcWrapper(): string | null {
 				if (view[0] === 0x4d && view[1] === 0x5a) {
 					return `Detected PE-binary gjc wrapper at ${full} (MZ header, ${stat.size} bytes). cmd.exe will hang reading it as text. Recreate the wrapper from the gjc-tmux.cmd template.`;
 				}
-			} catch {
-				continue;
-			}
+			} catch {}
 		}
 	}
 	return null;
