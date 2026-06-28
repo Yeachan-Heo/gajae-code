@@ -44,16 +44,33 @@ export function findCredential(
 }
 
 /**
- * Default hard ceiling for a single web-search round-trip. 60s tolerates
+ * Default hard ceiling for a single web-search round-trip. 300s tolerates
  * legitimate slow LLM-mediated responses (anthropic web_search_20250305,
  * perplexity, gemini, OpenAI code backend) while still guaranteeing the session unfreezes
- * within a minute if Bun's `AbortSignal` fails to propagate on Windows.
+ * if Bun's `AbortSignal` fails to propagate on Windows.
  *
  * Pure search APIs (brave, exa, jina, tavily, searxng, synthetic, zai)
  * settle far faster in practice; reusing the same ceiling keeps the wiring
  * uniform without compromising correctness.
  */
-export const SEARCH_HARD_TIMEOUT_MS = 60_000;
+export const SEARCH_HARD_TIMEOUT_MS = 300_000;
+
+/**
+ * Runtime-configurable hard timeout, seeded from the `web_search.timeout`
+ * setting via {@link setSearchHardTimeoutMs}. Falls back to
+ * {@link SEARCH_HARD_TIMEOUT_MS} when unset or invalid.
+ */
+let configuredHardTimeoutMs = SEARCH_HARD_TIMEOUT_MS;
+
+/**
+ * Override the hard timeout applied to every web-search round-trip.
+ *
+ * @param ms - Hard timeout in milliseconds. Non-finite or non-positive
+ *   values reset the timeout to {@link SEARCH_HARD_TIMEOUT_MS}.
+ */
+export function setSearchHardTimeoutMs(ms: number | undefined): void {
+	configuredHardTimeoutMs = typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : SEARCH_HARD_TIMEOUT_MS;
+}
 
 /**
  * Compose a caller-supplied {@link AbortSignal} with a hard timeout so an
@@ -66,9 +83,9 @@ export const SEARCH_HARD_TIMEOUT_MS = 60_000;
  * because the user's Esc is never delivered to the native layer.
  *
  * @param signal - Caller cancellation signal, if any.
- * @param ms - Hard timeout in milliseconds. Defaults to {@link SEARCH_HARD_TIMEOUT_MS}.
+ * @param ms - Hard timeout in milliseconds. Defaults to the configured value.
  */
-export function withHardTimeout(signal: AbortSignal | undefined, ms: number = SEARCH_HARD_TIMEOUT_MS): AbortSignal {
+export function withHardTimeout(signal: AbortSignal | undefined, ms: number = configuredHardTimeoutMs): AbortSignal {
 	const timeout = AbortSignal.timeout(ms);
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }

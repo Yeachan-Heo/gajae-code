@@ -51,6 +51,7 @@ import {
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
+	setSearchHardTimeoutMs,
 } from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -639,6 +640,11 @@ export class SelectorController {
 					setSearchFallbackProviders(
 						value.filter(item => typeof item === "string" && isConfigurableSearchProviderId(item)),
 					);
+				}
+				break;
+			case "web_search.timeout":
+				if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+					setSearchHardTimeoutMs(value * 1000);
 				}
 				break;
 			case "providers.image":

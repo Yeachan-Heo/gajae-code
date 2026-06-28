@@ -15,6 +15,7 @@ import {
 	type SearchQueryParams,
 } from "../web/search/index";
 import { SEARCH_PROVIDER_ORDER, setPreferredSearchProvider, setSearchFallbackProviders } from "../web/search/provider";
+import { setSearchHardTimeoutMs } from "../web/search/providers/utils";
 import { renderSearchResult } from "../web/search/render";
 import type { SearchProviderId } from "../web/search/types";
 
@@ -178,6 +179,10 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		setSearchFallbackProviders(
 			configuredFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
 		);
+	}
+	const configuredTimeout = settings.get("web_search.timeout");
+	if (typeof configuredTimeout === "number" && Number.isFinite(configuredTimeout) && configuredTimeout > 0) {
+		setSearchHardTimeoutMs(configuredTimeout * 1000);
 	}
 
 	const params: SearchQueryParams = {

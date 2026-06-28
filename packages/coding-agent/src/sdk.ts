@@ -140,6 +140,7 @@ import {
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
+	setSearchHardTimeoutMs,
 	type Tool,
 	type ToolSession,
 	WebSearchTool,
@@ -940,6 +941,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		setSearchFallbackProviders(
 			webSearchFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
 		);
+	}
+	const webSearchTimeout = settings.get("web_search.timeout");
+	if (typeof webSearchTimeout === "number" && Number.isFinite(webSearchTimeout) && webSearchTimeout > 0) {
+		setSearchHardTimeoutMs(webSearchTimeout * 1000);
 	}
 
 	const imageProvider = settings.get("providers.image");

@@ -2178,6 +2178,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"web_search.timeout": {
+		type: "number",
+		default: 300,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+		ui: {
+			tab: "tools",
+			label: "Web Search Timeout",
+			description: "Hard timeout in seconds for a single web search request (default 300)",
+		},
+	},
+
 	"browser.enabled": {
 		type: "boolean",
 		default: true,

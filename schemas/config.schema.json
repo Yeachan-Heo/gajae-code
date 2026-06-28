@@ -1734,6 +1734,11 @@
 					},
 					"description": "Ordered fallback web search providers after the active model native provider",
 					"default": []
+				},
+				"timeout": {
+					"type": "number",
+					"description": "Hard timeout in seconds for a single web search request (default 300)",
+					"default": 300
 				}
 			},
 			"additionalProperties": false

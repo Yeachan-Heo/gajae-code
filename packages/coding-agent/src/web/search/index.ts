@@ -322,5 +322,6 @@ export function getSearchTools(): CustomTool<any, any>[] {
 }
 
 export { getSearchProvider, setPreferredSearchProvider, setSearchFallbackProviders } from "./provider";
+export { setSearchHardTimeoutMs } from "./providers/utils";
 export type { SearchProviderId as SearchProvider, SearchResponse } from "./types";
 export { isConfigurableSearchProviderId, isSearchProviderPreference } from "./types";
