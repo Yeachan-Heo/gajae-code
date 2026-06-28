@@ -1304,3 +1304,56 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 	expect(diagnostics[0]).toContain("new-session failed");
 	expect(diagnostics[0]).toContain("cannot create session");
 });
+
+it('surfaces a wrapper-corruption warning in the new-session diagnostic on Windows', () => {
+	// Regression: when gjc.cmd / gjc.bat on PATH has been overwritten with
+	// PE-binary garbage (a 194MB PE image or similar), cmd.exe hangs reading
+	// it as text and the user sees a silent exit. The wrapper-corruption
+	// probe must surface a clear hint in the diagnostic so the user can
+	// identify and fix the wrapper without re-running the wrapper diagnostic
+	// script.
+	if (process.platform !== 'win32') return;
+	const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'gjc-wrapper-probe-'));
+	const wrapperPath = path.join(dir, 'gjc.cmd');
+	// Write 4KB of PE-binary garbage (MZ header + zero padding).
+	const garbage = Buffer.alloc(4096);
+	garbage[0] = 0x4d;
+	garbage[1] = 0x5a;
+	fs.writeFileSync(wrapperPath, garbage);
+	const originalPath = process.env.PATH;
+	process.env.PATH = dir + path.delimiter + (originalPath ?? '');
+	try {
+		const diagnostics = [];
+		launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ['hello world'], tmux: true }),
+			rawArgs: ['--tmux', 'hello world'],
+			cwd: '/repo',
+			env: {},
+			argv: ['bun', 'packages/coding-agent/src/cli.ts'],
+			execPath: '/bin/bun',
+			platform: 'win32',
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: '',
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (_command, spawnArgs) => {
+				if (spawnArgs[0] === 'new-session') {
+					return { exitCode: 1, stderr: 'psmux: cannot create session: server is shutting down' };
+				}
+				if (spawnArgs[0] === 'attach-session') {
+					return { exitCode: 0 };
+				}
+				return { exitCode: 0 };
+			},
+		});
+		expect(diagnostics.length).toBeGreaterThan(0);
+		expect(diagnostics[0]).toContain('new-session failed');
+		expect(diagnostics[0]).toContain('Wrapper warning');
+		expect(diagnostics[0]).toContain(wrapperPath);
+	} finally {
+		process.env.PATH = originalPath;
+		try { fs.unlinkSync(wrapperPath); } catch {}
+		try { fs.rmdirSync(dir); } catch {}
+	}
+});

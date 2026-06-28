@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
@@ -177,6 +178,50 @@ function formatTmuxLaunchDiagnostic(stage: string, stderr?: string): string {
 	return `gjc --tmux failed after creating tmux session: ${stage}.${suffix}\n`;
 }
 
+/**
+ * Detect a corrupted gjc.cmd / gjc.bat wrapper at well-known PATH locations.
+ * On Windows, `gjc.cmd` / `gjc.bat` files at the front of PATH that turn out
+ * to be PE-binary garbage (e.g. a 194MB PE image written over the wrapper)
+ * cause cmd.exe to hang silently when invoked from PowerShell — cmd reads
+ * the binary as text and never returns, so the user sees the prompt return
+ * with no output but no actual launch. This probe surfaces that failure mode
+ * in the diagnostic so the user gets a clear "wrapper corrupted" hint instead
+ * of a silent exit. Best-effort: returns null when the file is missing,
+ * unreadable, or under 1KB (real CMD wrappers are 100-500 bytes; the original
+ * 194MB PE-binary garbage was obviously out of band). Sync because the
+ * call site (launchDefaultTmuxIfNeeded) is sync; uses statSync + 2-byte
+ * read.
+ */
+function detectCorruptedGjcWrapper(): string | null {
+	if (process.platform !== "win32") return null;
+	const pathEnv = process.env.PATH ?? "";
+	if (!pathEnv) return null;
+	const seen = new Set<string>();
+	for (const dir of pathEnv.split(path.delimiter)) {
+		for (const name of ["gjc.cmd", "gjc.bat"]) {
+			const full = path.join(dir, name);
+			if (seen.has(full)) continue;
+			seen.add(full);
+			try {
+				const stat = fs.statSync(full);
+				if (!stat.isFile()) continue;
+				if (stat.size < 1024) continue;
+				if (stat.size > 64 * 1024) {
+					return `Detected suspicious gjc wrapper at ${full}: ${stat.size} bytes (expected <1KB). The wrapper may be corrupted; cmd.exe will hang reading it as text. Recreate it from the gjc-tmux.cmd template.`;
+				}
+				const head = fs.readFileSync(full);
+				if (head.byteLength < 2) continue;
+				const view = new Uint8Array(head);
+				if (view[0] === 0x4d && view[1] === 0x5a) {
+					return `Detected PE-binary gjc wrapper at ${full} (MZ header, ${stat.size} bytes). cmd.exe will hang reading it as text. Recreate the wrapper from the gjc-tmux.cmd template.`;
+				}
+			} catch {
+				continue;
+			}
+		}
+	}
+	return null;
+}
 function formatTmuxUnavailableDiagnostic(platform: NodeJS.Platform, tmuxCommand: string): string {
 	if (platform === "win32") {
 		return (
@@ -586,14 +631,20 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			return true;
 		}
 	}
+	const probeWarning = detectCorruptedGjcWrapper();
 	if (created.exitCode !== 0) {
 		// The new-session spawn failed. Surface the captured stderr so the
 		// user sees the actual psmux rejection (e.g. "cannot create session:
-		// server is shutting down") instead of a silent exit.
-		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", created.stderr));
+		// server is shutting down") instead of a silent exit. The wrapper
+		// probe gives the user a deterministic hint when the silent-exit
+		// symptom is actually caused by a corrupted gjc.cmd / gjc.bat on
+		// PATH (a 194MB PE-binary at the wrapper path produces cmd.exe
+		// hangs that look like a tmux/psmux failure from the user's seat).
+		const stderr = created.stderr;
+		const suffix = probeWarning ? ` Wrapper warning: ${probeWarning}` : "";
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return false;
 	}
-	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], attachOptions);
 	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
