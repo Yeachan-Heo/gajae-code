@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,8 +7,9 @@ import {
 	runLocalProviderDiscover,
 	runLocalProviderDiscoverCommand,
 	runLocalProviderSmoke,
+	runLocalProviderStatus,
 } from "@gajae-code/coding-agent/cli/local-provider-smoke";
-import { hookFetch, Snowflake } from "@gajae-code/utils";
+import { hookFetch } from "@gajae-code/utils/hook-fetch";
 import { LOCAL_PROVIDER_ACTIONS, LOCAL_PROVIDER_DEFAULT_ACTION } from "../src/commands/local-provider";
 
 describe("local provider streaming smoke", () => {
@@ -15,7 +17,7 @@ describe("local provider streaming smoke", () => {
 	let modelsPath: string;
 
 	beforeEach(() => {
-		tempDir = path.join(os.tmpdir(), `gjc-local-provider-smoke-${Snowflake.next()}`);
+		tempDir = path.join(os.tmpdir(), `gjc-local-provider-smoke-${crypto.randomUUID()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsPath = path.join(tempDir, "models.json");
 	});
@@ -102,9 +104,130 @@ describe("local provider streaming smoke", () => {
 		expect(output).toContain("local-alpha");
 	});
 
-	test("keeps bare local-provider command defaulting to streaming smoke while exposing discovery actions", () => {
-		expect(LOCAL_PROVIDER_DEFAULT_ACTION).toBe("smoke");
-		expect(LOCAL_PROVIDER_ACTIONS).toEqual(["discover", "models", "smoke"]);
+	test("keeps bare local-provider command defaulting to status while exposing diagnostics actions", () => {
+		expect(LOCAL_PROVIDER_DEFAULT_ACTION).toBe("status");
+		expect(LOCAL_PROVIDER_ACTIONS).toEqual(["status", "diagnose", "discover", "models", "smoke"]);
+	});
+
+	test("reports status without streaming smoke and without mutating config", async () => {
+		const configText = JSON.stringify({
+			providers: {
+				local: { openaiCompat: { baseUrl: "http://127.0.0.1:1234/", apiKey: "local-key" } },
+			},
+		});
+		fs.writeFileSync(modelsPath, configText);
+		const requestedUrls: string[] = [];
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			requestedUrls.push(url);
+			expect(init?.method ?? "GET").toBe("GET");
+			return new Response(JSON.stringify({ data: [{ id: "local-alpha" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const result = await runLocalProviderStatus({ modelsPath });
+
+		expect(result.ok).toBe(true);
+		expect(result.baseUrl).toBe("http://127.0.0.1:1234/v1");
+		expect(result.models).toEqual(["local-alpha"]);
+		expect(result.checks.map(check => [check.name, check.status])).toEqual([
+			["config", "ok"],
+			["models", "ok"],
+			["chat_stream", "skipped"],
+		]);
+		expect(requestedUrls).toEqual(["http://127.0.0.1:1234/v1/models"]);
+		expect(fs.readFileSync(modelsPath, "utf8")).toBe(configText);
+	});
+
+	test("runs optional status streaming smoke against the discovered model", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					local: { openaiCompat: { baseUrl: "http://127.0.0.1:1234", apiKey: "local-key" } },
+				},
+			}),
+		);
+		const requestedUrls: string[] = [];
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url.endsWith("/models")) {
+				return new Response(JSON.stringify({ data: [{ id: "local-alpha" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			expect(url).toBe("http://127.0.0.1:1234/v1/chat/completions");
+			const body = JSON.parse(String(init?.body)) as { model: string; stream: boolean };
+			expect(body.model).toBe("local-alpha");
+			expect(body.stream).toBe(true);
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+						controller.close();
+					},
+				}),
+				{ status: 200 },
+			);
+		});
+
+		const result = await runLocalProviderStatus({ modelsPath, smoke: true });
+
+		expect(result.ok).toBe(true);
+		expect(result.model).toBe("local-alpha");
+		expect(result.checks.map(check => [check.name, check.status])).toEqual([
+			["config", "ok"],
+			["models", "ok"],
+			["chat_stream", "ok"],
+		]);
+		expect(requestedUrls).toEqual(["http://127.0.0.1:1234/v1/models", "http://127.0.0.1:1234/v1/chat/completions"]);
+	});
+
+	test("classifies status authentication failures from /v1/models", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					local: { openaiCompat: { baseUrl: "http://127.0.0.1:1234", apiKey: "bad-key" } },
+				},
+			}),
+		);
+		using _hook = hookFetch(() => new Response("unauthorized", { status: 401 }));
+
+		const result = await runLocalProviderStatus({ modelsPath, smoke: true });
+
+		expect(result.ok).toBe(false);
+		expect(result.checks.find(check => check.name === "models")?.category).toBe("auth");
+		expect(result.checks.find(check => check.name === "chat_stream")?.status).toBe("skipped");
+	});
+
+	test("classifies streaming smoke not-ready failures", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					local: { openaiCompat: { baseUrl: "http://127.0.0.1:1234", apiKey: "local-key" } },
+				},
+			}),
+		);
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url.endsWith("/models")) {
+				return new Response(JSON.stringify({ data: [{ id: "local-alpha" }] }), { status: 200 });
+			}
+			return new Response("model is loading", { status: 503 });
+		});
+
+		const result = await runLocalProviderStatus({ modelsPath, smoke: true });
+
+		expect(result.ok).toBe(false);
+		const streamCheck = result.checks.find(check => check.name === "chat_stream");
+		expect(streamCheck?.status).toBe("error");
+		expect(streamCheck?.category).toBe("not_ready");
 	});
 
 	test("reports local discovery network failures clearly", async () => {
@@ -180,7 +303,8 @@ describe("local provider streaming smoke", () => {
 		const result = await runLocalProviderSmoke({ modelsPath, model: "local-model", timeoutMs: 25 });
 
 		expect(result.ok).toBe(false);
-		expect(result.message).toContain("smoke request failed");
+		expect(result.category).toBe("unreachable");
+		expect(result.message).toContain("could not reach");
 		expect(result.error).toContain("connection refused");
 	});
 
