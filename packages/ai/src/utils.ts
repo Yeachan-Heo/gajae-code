@@ -111,6 +111,29 @@ function normalizeResponsesMessageTextForReplay(value: unknown): string {
 	return stringifyResponsesStringParamForReplay(value);
 }
 
+type ResponsesImageDetail = "auto" | "low" | "high";
+
+interface NormalizedResponsesImageUrl {
+	readonly imageUrl: string;
+	readonly detail?: ResponsesImageDetail;
+}
+
+function isResponsesImageDetail(value: unknown): value is ResponsesImageDetail {
+	return value === "auto" || value === "low" || value === "high";
+}
+
+function normalizeResponsesImageUrlForReplay(value: unknown): NormalizedResponsesImageUrl {
+	if (typeof value === "string") return { imageUrl: value.toWellFormed() };
+	if (value && typeof value === "object" && "url" in value && typeof value.url === "string") {
+		const detail = "detail" in value && isResponsesImageDetail(value.detail) ? value.detail : undefined;
+		return {
+			imageUrl: value.url.toWellFormed(),
+			...(detail ? { detail } : {}),
+		};
+	}
+	return { imageUrl: stringifyResponsesStringParamForReplay(value) };
+}
+
 function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 	if (typeof content === "string") return content.toWellFormed();
 	if (!Array.isArray(content)) return content;
@@ -119,6 +142,16 @@ function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 		const sanitizedPart = { ...(part as Record<string, unknown>) };
 		if ("text" in sanitizedPart) {
 			sanitizedPart.text = normalizeResponsesMessageTextForReplay(sanitizedPart.text);
+		}
+		if ("image_url" in sanitizedPart) {
+			const normalizedImageUrl = normalizeResponsesImageUrlForReplay(sanitizedPart.image_url);
+			sanitizedPart.image_url = normalizedImageUrl.imageUrl;
+			if (sanitizedPart.type === "image_url") {
+				sanitizedPart.type = "input_image";
+			}
+			if (!("detail" in sanitizedPart) && normalizedImageUrl.detail) {
+				sanitizedPart.detail = normalizedImageUrl.detail;
+			}
 		}
 		return sanitizedPart;
 	});
