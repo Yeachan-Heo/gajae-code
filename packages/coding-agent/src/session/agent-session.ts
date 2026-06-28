@@ -5231,6 +5231,19 @@ export class AgentSession {
 			attribution: "user",
 			timestamp: Date.now(),
 		});
+		// A live agent loop polls the steering queue at every tool/turn boundary
+		// and consumes this message on its own. But when a steer is queued while no
+		// loop is actively running — e.g. the session still reports busy only
+		// because a finished prompt is unwinding (deferred agent_end / post-prompt
+		// work) — nothing delivers it until the next explicit prompt or a
+		// user-interrupt abort, so it stalls until the user presses Esc. Schedule a
+		// continue so the steer is delivered promptly. A live loop (or an
+		// already-drained queue) makes the scheduled continue a no-op.
+		if (this.#canAutoContinueForSteer()) {
+			this.#scheduleAgentContinue({
+				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
+			});
+		}
 	}
 
 	/**
@@ -5269,6 +5282,21 @@ export class AgentSession {
 	 */
 	#canAutoContinueForFollowUp(): boolean {
 		if (this.isStreaming) return false;
+		if (this.isRetrying) return false;
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		return last?.role === "assistant";
+	}
+
+	/**
+	 * Gate for idle / winding-down steer auto-continue. Unlike the follow-up gate
+	 * this checks `agent.state.isStreaming` (a live agent loop) rather than the
+	 * public `isStreaming` (which stays true while a finished prompt unwinds), so a
+	 * steer queued during the unwind window is still delivered. A live loop returns
+	 * false here because it polls the steering queue itself.
+	 */
+	#canAutoContinueForSteer(): boolean {
+		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];

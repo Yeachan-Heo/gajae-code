@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed steering regression where a prompt submitted while the agent was busy (`busyPromptMode: "steer"`) could stall in the steering queue — shown as a `Steer:` chip but never delivered — until the user pressed Esc to interrupt. A steer queued while no live agent loop was running (the busy/unwind window between a finished turn and the session going idle) now schedules a continuation so it is delivered promptly, mirroring the follow-up queue. A live loop still consumes the steer at its next tool/turn boundary, so steers are never double-delivered.
+
 ## [0.7.6] - 2026-06-28
 
 ### Fixed

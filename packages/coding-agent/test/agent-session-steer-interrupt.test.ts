@@ -79,6 +79,28 @@ describe("AgentSession steer-on-interrupt", () => {
 		expect(assistantCount(session)).toBe(2);
 	});
 
+	it("delivers a steer queued while the agent is idle without a user interrupt", async () => {
+		session = buildSession([{ content: ["first done"] }, { content: ["handled steering"] }]);
+
+		await session.prompt("first task");
+		await session.waitForIdle();
+		expect(assistantCount(session)).toBe(1);
+
+		// A steer lands while no live agent loop is running (the busy/unwind window
+		// the interactive composer routes through). It must be delivered promptly
+		// instead of stalling until the user presses Esc.
+		await session.steer("also handle the steer");
+		await session.waitForIdle();
+
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(assistantCount(session)).toBe(2);
+		expect(
+			session.agent.state.messages.some(
+				m => m.role === "user" && JSON.stringify(m.content).includes("also handle the steer"),
+			),
+		).toBe(true);
+	});
+
 	it("does not resume queued steering after a non-user abort", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["should not run"] }]);
 
