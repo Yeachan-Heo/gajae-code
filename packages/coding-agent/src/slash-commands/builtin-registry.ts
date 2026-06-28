@@ -12,7 +12,12 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
 } from "../config/model-registry";
-import { extractExplicitThinkingSelector, formatModelSelectorValue, parseModelPattern } from "../config/model-resolver";
+import {
+	extractExplicitThinkingSelector,
+	formatModelSelectorValue,
+	parseModelPattern,
+	parseModelString,
+} from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
@@ -169,11 +174,32 @@ function splitExplicitThinkingSelector(selector: string): { baseSelector: string
 	return thinkingLevel ? { baseSelector: trimmed.slice(0, colonIndex), thinkingLevel } : { baseSelector: trimmed };
 }
 
-function resolveModelCommandSelection(
+interface ModelCommandSelection {
+	model: Model;
+	selector: string;
+	thinkingLevel?: ThinkingLevel;
+}
+
+interface ModelCommandResolutionFailure {
+	message: string;
+}
+
+type ModelCommandResolution =
+	| { ok: true; selection: ModelCommandSelection }
+	| { ok: false; failure: ModelCommandResolutionFailure };
+
+function parseProviderQualifiedSelector(selector: string): { provider: string; modelId: string } | undefined {
+	const splitSelector = splitExplicitThinkingSelector(selector);
+	const parsed = parseModelString(splitSelector.baseSelector);
+	if (!parsed) return undefined;
+	return { provider: parsed.provider, modelId: parsed.id };
+}
+
+function resolveModelCommandSelectionFromAvailable(
 	runtime: SlashCommandRuntime,
 	selector: string,
-): { model: Model; selector: string; thinkingLevel?: ThinkingLevel } | undefined {
-	const availableModels = runtime.session.getAvailableModels?.() ?? [];
+	availableModels: Model[],
+): ModelCommandSelection | undefined {
 	const matchPreferences = { usageOrder: runtime.settings.getStorage()?.getModelUsageOrder() };
 	const resolved = parseModelPattern(selector, availableModels, matchPreferences, {
 		modelRegistry: runtime.session.modelRegistry,
@@ -195,6 +221,78 @@ function resolveModelCommandSelection(
 		model: resolved.model,
 		selector: persistedSelector,
 		thinkingLevel: resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined,
+	};
+}
+
+function formatDiscoverableProviderFailure(
+	selector: string,
+	provider: string,
+	modelId: string,
+	runtime: SlashCommandRuntime,
+): string {
+	const state = runtime.session.modelRegistry.getProviderDiscoveryState?.(provider);
+	const discovered = state?.models ?? [];
+	const base = `Unknown model: ${selector}.`;
+	if (!modelId.trim()) {
+		return `${base} Local provider model selectors must use provider/model-id syntax with a non-empty model id.`;
+	}
+	if (!state) {
+		return `${base} Provider ${provider} is configured for discovery but has not reported models yet.`;
+	}
+	if (state.status === "unavailable") {
+		const details = state.error ? ` (${state.error})` : "";
+		return `${base} Provider ${provider} discovery is unavailable${details}. Check the local endpoint and run /model again.`;
+	}
+	if (state.status === "unauthenticated") {
+		return `${base} Provider ${provider} requires authentication before model discovery.`;
+	}
+	if (state.status === "empty") {
+		return `${base} Provider ${provider} discovery succeeded but returned no models.`;
+	}
+	if (discovered.length > 0) {
+		const preview = discovered.slice(0, 8).join(", ");
+		const suffix = discovered.length > 8 ? ", …" : "";
+		return `${base} Provider ${provider} did not report model ${modelId}. Available local models: ${preview}${suffix}.`;
+	}
+	return `${base} Provider ${provider} did not report model ${modelId}.`;
+}
+
+async function resolveModelCommandSelection(
+	runtime: SlashCommandRuntime,
+	selector: string,
+): Promise<ModelCommandResolution> {
+	let availableModels = runtime.session.getAvailableModels?.() ?? [];
+	const initialSelection = resolveModelCommandSelectionFromAvailable(runtime, selector, availableModels as Model[]);
+	if (initialSelection) {
+		return { ok: true, selection: initialSelection };
+	}
+
+	const providerRef = parseProviderQualifiedSelector(selector);
+	const discoverableProviders = runtime.session.modelRegistry.getDiscoverableProviders?.() ?? [];
+	if (providerRef && discoverableProviders.includes(providerRef.provider)) {
+		await runtime.session.modelRegistry.refreshProvider?.(providerRef.provider, "online");
+		availableModels = runtime.session.getAvailableModels?.() ?? [];
+		const refreshedSelection = resolveModelCommandSelectionFromAvailable(
+			runtime,
+			selector,
+			availableModels as Model[],
+		);
+		if (refreshedSelection) {
+			return { ok: true, selection: refreshedSelection };
+		}
+		return {
+			ok: false,
+			failure: {
+				message: formatDiscoverableProviderFailure(selector, providerRef.provider, providerRef.modelId, runtime),
+			},
+		};
+	}
+
+	return {
+		ok: false,
+		failure: {
+			message: `Unknown model: ${selector}. Configure or login to a provider first, then list/select models with /model.`,
+		},
 	};
 }
 
@@ -282,16 +380,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
-				const selection = resolveModelCommandSelection(runtime, modelId);
-				if (!selection) {
-					return usage(
-						modelSelectionUsage(
-							runtime,
-							`Unknown model: ${modelId}. Configure or login to a provider first, then list/select models with /model.`,
-						),
-						runtime,
-					);
+				const resolution = await resolveModelCommandSelection(runtime, modelId);
+				if (!resolution.ok) {
+					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
 				}
+				const { selection } = resolution;
 				try {
 					const persistedSelector = formatModelSelectorValue(selection.selector, selection.thinkingLevel);
 					if (parsedArgs.targetId === "default") {
