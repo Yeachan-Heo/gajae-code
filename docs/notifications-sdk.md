@@ -439,9 +439,11 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
    active sessions it still idle-exits after the inactivity timeout.
 2. **Create.** From your paired chat send `/session_create path <repo-dir>` (or
    `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
-   The bot replies once the tmux launch is requested; the session shows up in
-   `/session_recent` once it is ready. (Inline prompts via `-- <text>` are
-   rejected for now with usage text.)
+   `<repo-dir>`, `<repo>`, and `<newdir>` may use `~`/`~/...` for your own home
+   directory; named-user forms such as `~alice/repo` are rejected. The bot replies
+   once the tmux launch is requested; the session shows up in `/session_recent`
+   once it is ready. (Inline prompts via `-- <text>` are rejected for now with
+   usage text.)
 3. **List.** `/session_recent` shows recent sessions (most-recent first) to copy
    an id from.
 4. **Close.** `/session_close <sessionId>` hard-kills the GJC-managed session

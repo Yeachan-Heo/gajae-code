@@ -11,6 +11,7 @@
  * prompt text ever enters a frame, audit, log, or response until daemon-owned
  * 0600 prompt refs are designed.
  */
+import * as os from "node:os";
 import type { SessionCloseTarget, SessionCreateTarget, SessionLifecycleResponse, SessionResumeTarget } from "./index";
 
 export type LifecycleCommandVerb = "session_create" | "session_close" | "session_resume";
@@ -94,22 +95,21 @@ export function parseLifecycleCommand(text: string | undefined): ParsedLifecycle
 	const kind = args[0];
 	if (kind === "path") {
 		if (args.length !== 2) return { kind: "usage", message: USAGE };
-		const p = args[1]!;
-		if (!isSafePath(p)) return { kind: "reject", reason: "invalid_target", message: `Invalid path.\n\n${USAGE}` };
+		const p = normalizeLifecyclePath(args[1]!);
+		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid path.\n\n${USAGE}` };
 		return { kind: "create", target: { kind: "existing_path", path: p } };
 	}
 	if (kind === "dir") {
 		if (args.length !== 2) return { kind: "usage", message: USAGE };
-		const p = args[1]!;
-		if (!isSafePath(p)) return { kind: "reject", reason: "invalid_target", message: `Invalid dir.\n\n${USAGE}` };
+		const p = normalizeLifecyclePath(args[1]!);
+		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid dir.\n\n${USAGE}` };
 		return { kind: "create", target: { kind: "plain_dir", path: p } };
 	}
 	if (kind === "worktree") {
 		if (args.length !== 3) return { kind: "usage", message: USAGE };
-		const repo = args[1]!;
+		const repo = normalizeLifecyclePath(args[1]!);
 		const branch = args[2]!;
-		if (!isSafePath(repo))
-			return { kind: "reject", reason: "invalid_target", message: `Invalid repo path.\n\n${USAGE}` };
+		if (!repo) return { kind: "reject", reason: "invalid_target", message: `Invalid repo path.\n\n${USAGE}` };
 		if (!isSafeBranch(branch)) {
 			return { kind: "reject", reason: "invalid_target", message: `Invalid branch name.\n\n${USAGE}` };
 		}
@@ -137,10 +137,10 @@ export function validateLifecycleTarget(
 	if (verb === "session_create") {
 		const t = target as SessionCreateTarget;
 		if (t.kind === "existing_path" || t.kind === "plain_dir") {
-			return isSafePath(t.path) ? { ok: true } : bad("invalid path");
+			return normalizeLifecyclePath(t.path) ? { ok: true } : bad("invalid path");
 		}
 		if (t.kind === "worktree") {
-			if (!isSafePath(t.repo)) return bad("invalid repo path");
+			if (!normalizeLifecyclePath(t.repo)) return bad("invalid repo path");
 			return isSafeBranch(t.branch) ? { ok: true } : bad("invalid branch");
 		}
 		return bad("unknown create target");
@@ -156,6 +156,16 @@ export function validateLifecycleTarget(
 // --- Safety primitives (defensive; the full-trust paired chat is accepted, but
 // we still reject obviously malformed/injection-shaped inputs early). ---
 
+export function normalizeLifecyclePath(value: string): string | undefined {
+	if (!isSafePath(value)) return undefined;
+	if (value === "~") return os.homedir() || undefined;
+	if (value.startsWith("~/")) {
+		const home = os.homedir();
+		return home ? `${home}${value.slice(1)}` : undefined;
+	}
+	if (value.startsWith("~")) return undefined;
+	return value;
+}
 function isSafeIdentifier(value: string): boolean {
 	return /^[A-Za-z0-9._-]{1,128}$/.test(value);
 }

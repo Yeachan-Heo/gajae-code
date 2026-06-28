@@ -22,6 +22,7 @@ import {
 	statusGjcTmuxSession,
 } from "../gjc-runtime/tmux-sessions";
 import type { ResumeCandidate, SessionCreateFrame, SessionLifecycleRequest, SessionLifecycleResponse } from "./index";
+import { normalizeLifecyclePath } from "./lifecycle-commands";
 import {
 	type AuditEvent,
 	type CreateEffectResult,
@@ -132,12 +133,16 @@ export function buildCreateArgv(
 	_ids: { intendedSessionId: string; startupPromptRef?: string },
 ): { cwd: string; args: string[] } {
 	if (frame.target.kind === "worktree") {
+		const cwd = normalizeLifecyclePath(frame.target.repo);
+		if (!cwd) throw new Error("invalid_lifecycle_repo_path");
 		// Use the `--worktree=<branch>` form so the branch is a single argv token:
 		// a flag-shaped branch (e.g. `-x`) can never be mis-parsed as a separate
 		// launcher flag / detached-mode trigger.
-		return { cwd: frame.target.repo, args: [`--worktree=${frame.target.branch}`] };
+		return { cwd, args: [`--worktree=${frame.target.branch}`] };
 	}
-	return { cwd: frame.target.path, args: [] };
+	const cwd = normalizeLifecyclePath(frame.target.path);
+	if (!cwd) throw new Error("invalid_lifecycle_path");
+	return { cwd, args: [] };
 }
 
 /** Real daemon-safe tmux launcher: detached `tmux new-session -d` + GJC tags. */

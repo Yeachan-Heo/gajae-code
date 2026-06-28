@@ -74,6 +74,24 @@ describe("lifecycle control runtime", () => {
 		).toEqual({ cwd: "/new", args: [] });
 	});
 
+	it("buildCreateArgv expands own-home tilde paths defensively", () => {
+		const home = os.homedir();
+
+		expect(
+			buildCreateArgv(createFrame({ target: { kind: "existing_path", path: "~/repo" } }), {
+				intendedSessionId: "x",
+			}),
+		).toEqual({
+			cwd: `${home}/repo`,
+			args: [],
+		});
+		expect(
+			buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "~/repo", branch: "feat/y" } }), {
+				intendedSessionId: "x",
+			}),
+		).toEqual({ cwd: `${home}/repo`, args: ["--worktree=feat/y"] });
+	});
+
 	it("worktree argv parses as a NAMED (non-detached) worktree with no stray flags", () => {
 		const { args } = buildCreateArgv(createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" } }), {
 			intendedSessionId: "x",

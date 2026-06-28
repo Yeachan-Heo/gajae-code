@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
 
 import {
 	formatLifecycleOutcome,
 	isLifecycleCommandText,
 	lifecycleUsage,
+	normalizeLifecyclePath,
 	parseLifecycleCommand,
 	validateLifecycleTarget,
 } from "@gajae-code/coding-agent/notifications/lifecycle-commands";
@@ -30,6 +32,24 @@ describe("lifecycle command parser (G009)", () => {
 			kind: "create",
 			target: { kind: "plain_dir", path: "/new/dir" },
 		});
+	});
+
+	it("expands own-home tilde paths for create targets", () => {
+		const home = os.homedir();
+
+		expect(parseLifecycleCommand("/session_create path ~/projects/work")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: `${home}/projects/work` },
+		});
+		expect(parseLifecycleCommand("/session_create dir ~/scratch/new")).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: `${home}/scratch/new` },
+		});
+		expect(parseLifecycleCommand("/session_create worktree ~/projects/repo feat/x")).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: `${home}/projects/repo`, branch: "feat/x" },
+		});
+		expect(normalizeLifecyclePath("~")).toBe(home);
 	});
 
 	it("parses close, resume, and recent", () => {
@@ -68,6 +88,11 @@ describe("lifecycle command parser (G009)", () => {
 		expect(parseLifecycleCommand("/session_create worktree /repo ../evil").kind).toBe("reject");
 		expect(parseLifecycleCommand("/session_close bad id with spaces").kind).toBe("usage");
 		expect(parseLifecycleCommand("/session_close a$(whoami)").kind).toBe("reject");
+	});
+
+	it("rejects unsupported named-user tilde paths", () => {
+		expect(parseLifecycleCommand("/session_create path ~other/repo").kind).toBe("reject");
+		expect(validateLifecycleTarget("session_create", { kind: "existing_path", path: "~other/repo" }).ok).toBe(false);
 	});
 
 	it("requires exact arity for create (rejects trailing tokens)", () => {
