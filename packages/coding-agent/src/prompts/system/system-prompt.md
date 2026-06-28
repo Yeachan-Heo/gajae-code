@@ -196,7 +196,7 @@ Delegate by default for multi-file changes, refactors, new features, tests, and 
 
 {{#has tools "read"}}
 <images>
-For image understanding, call `{{toolRefs.read}}` on the image path with a `question` describing what to inspect; it delegates to a vision-capable model and returns the answer instead of raw image bytes.
+For image understanding, call `{{toolRefs.read}}` on the image path; the image is returned inline for direct visual inspection.
 </images>
 {{/has}}
 

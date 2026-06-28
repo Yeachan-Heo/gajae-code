@@ -186,10 +186,9 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
 ### Images
 - Image detection is metadata-based (`readImageMetadata()`).
 - Max accepted image size is `20 MiB` (`MAX_IMAGE_INPUT_BYTES`, re-exported as `MAX_IMAGE_SIZE`). Larger files throw.
-- If `question` is provided for an image path, `read` delegates to a vision-capable model (resolved via `modelRoles.vision`, else a vision-capable default/active model) and returns the model's text answer instead of the image bytes. Honors `images.blockImages`; resolves no vision model → actionable `ToolError`.
-- Otherwise (no `question`) it calls `loadImageInput()` and returns:
+- For an image path, `read` calls `loadImageInput()` and returns:
   - a text note from the image loader
-  - an inline image block
+  - an inline image block (for direct visual inspection by a vision-capable model)
 - Unsupported/undecodable image formats throw a `ToolError`.
 
 ### Internal URLs

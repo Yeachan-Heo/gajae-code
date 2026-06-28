@@ -2,15 +2,12 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { instrumentedCompleteSimple, resolveTelemetry } from "@gajae-code/agent-core";
-import type { Api, completeSimple, ImageContent, Model, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { glob, type SummaryResult, summarizeCode } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { extractTextContent } from "../commit/utils";
-import { expandRoleAlias, resolveModelFromString } from "../config/model-resolver";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -19,7 +16,6 @@ import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
-import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import {
@@ -34,12 +30,7 @@ import {
 import { fileHyperlink, renderCodeCell, renderMarkdownCell, renderStatusLine, tryResolveInternalUrlSync } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import {
-	ImageInputTooLargeError,
-	type LoadedImageInput,
-	loadImageInput,
-	MAX_IMAGE_INPUT_BYTES,
-} from "../utils/image-loading";
+import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
 import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import { type ArchiveReader, openArchive, parseArchivePathCandidates } from "./archive-reader";
@@ -491,12 +482,6 @@ function prependSuffixResolutionNotice(text: string, suffixResolution?: { from: 
 const readSchema = z
 	.object({
 		path: z.string().describe('path or url; append :<sel> for line ranges or raw mode (e.g. "src/foo.ts:50-100")'),
-		question: z
-			.string()
-			.optional()
-			.describe(
-				"for image paths only: ask a vision-capable model to analyze the image and answer this question instead of returning metadata/blocks",
-			),
 	})
 	.strict();
 
@@ -521,8 +506,6 @@ export interface ReadToolDetails {
 	summary?: { lines: number; elidedSpans: number; elidedLines: number };
 	/** Number of unresolved git conflicts surfaced by this read (TUI uses for inline `⚠ N` badge). */
 	conflictCount?: number;
-	/** Vision model used to answer a `question` about an image (set only for image analysis reads). */
-	visionModel?: string;
 }
 
 type ReadParams = ReadToolInput;
@@ -687,148 +670,20 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 	readonly #autoResizeImages: boolean;
 	readonly #defaultLimit: number;
-	constructor(
-		private readonly session: ToolSession,
-		private readonly completeImageRequest?: typeof completeSimple,
-	) {
+
+	constructor(private readonly session: ToolSession) {
 		const displayMode = resolveFileDisplayMode(session);
 		this.#autoResizeImages = session.settings.get("images.autoResize");
 		this.#defaultLimit = Math.max(
 			1,
 			Math.min(session.settings.get("read.defaultLimit") ?? DEFAULT_MAX_LINES, DEFAULT_MAX_LINES),
 		);
-
 		this.description = prompt.render(readDescription, {
 			DEFAULT_LIMIT: String(this.#defaultLimit),
 			DEFAULT_MAX_LINES: String(DEFAULT_MAX_LINES),
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 		});
-	}
-
-	/**
-	 * Delegate image understanding to a vision-capable model. Resolves the vision model role (or a
-	 * vision-capable default/active model), submits the image plus the caller's question, and returns
-	 * the model's text answer. Used when `read` is called with a `question` on an image path.
-	 */
-	async #analyzeImage(
-		readPath: string,
-		absolutePath: string,
-		detectedMimeType: string,
-		question: string,
-		signal?: AbortSignal,
-	): Promise<{ content: TextContent[]; model: string; resolvedPath: string }> {
-		if (this.session.settings.get("images.blockImages")) {
-			throw new ToolError(
-				"Image submission is disabled by settings (images.blockImages=true). Disable it to analyze images with a question.",
-			);
-		}
-
-		const modelRegistry = this.session.modelRegistry;
-		if (!modelRegistry) {
-			throw new ToolError("Model registry is unavailable for image analysis.");
-		}
-
-		const availableModels = modelRegistry.getAvailable();
-		if (availableModels.length === 0) {
-			throw new ToolError("No models available for image analysis.");
-		}
-
-		const matchPreferences = { usageOrder: this.session.settings.getStorage()?.getModelUsageOrder() };
-		const resolvePattern = (pattern: string | undefined): Model<Api> | undefined => {
-			if (!pattern) return undefined;
-			const expanded = expandRoleAlias(pattern, this.session.settings);
-			return resolveModelFromString(expanded, availableModels, matchPreferences, modelRegistry);
-		};
-
-		const activeModelPattern = this.session.getActiveModelString?.() ?? this.session.getModelString?.();
-		const configuredVisionPattern = this.session.settings.getModelRole("vision")?.trim();
-		const configuredVisionModel = configuredVisionPattern ? resolvePattern("pi/vision") : undefined;
-		if (configuredVisionPattern && !configuredVisionModel) {
-			throw new ToolError(
-				`Configured modelRoles.vision (${configuredVisionPattern}) did not resolve to an available model. Configure modelRoles.vision with a vision-capable model.`,
-			);
-		}
-		const model = configuredVisionModel ?? resolvePattern("pi/default") ?? resolvePattern(activeModelPattern);
-		if (!model) {
-			throw new ToolError(
-				"Unable to resolve a model for image analysis. Configure modelRoles.vision with a vision-capable model or select a vision-capable active/default model.",
-			);
-		}
-
-		// A text-only selected model must be paired with an explicit vision role so the
-		// model/cost boundary stays visible.
-		if (!model.input.includes("image")) {
-			throw new ToolError(
-				`Resolved model ${model.provider}/${model.id} does not support image input. Configure modelRoles.vision with a vision-capable model.`,
-			);
-		}
-
-		const apiKey = await modelRegistry.getApiKey(model);
-		if (!apiKey) {
-			throw new ToolError(
-				`No API key available for ${model.provider}/${model.id}. Configure credentials for this provider or choose another vision-capable model.`,
-			);
-		}
-
-		let imageInput: LoadedImageInput | null;
-		try {
-			imageInput = await loadImageInput({
-				path: readPath,
-				cwd: this.session.cwd,
-				autoResize: this.#autoResizeImages,
-				maxBytes: MAX_IMAGE_INPUT_BYTES,
-				resolvedPath: absolutePath,
-				detectedMimeType,
-			});
-		} catch (error) {
-			if (error instanceof ImageInputTooLargeError) {
-				throw new ToolError(error.message);
-			}
-			throw error;
-		}
-
-		if (!imageInput) {
-			throw new ToolError("Image analysis only supports PNG, JPEG, GIF, and WEBP files detected by file content.");
-		}
-
-		const telemetry = resolveTelemetry(this.session.getTelemetry?.(), this.session.getSessionId?.() ?? undefined);
-		const response = await instrumentedCompleteSimple(
-			model,
-			{
-				systemPrompt: [prompt.render(inspectImageSystemPromptTemplate)],
-				messages: [
-					{
-						role: "user",
-						content: [
-							{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
-							{ type: "text", text: question },
-						],
-						timestamp: Date.now(),
-					},
-				],
-			},
-			{ apiKey, signal },
-			{ telemetry, oneshotKind: "inspect_image", completeImpl: this.completeImageRequest },
-		);
-
-		if (response.stopReason === "error") {
-			throw new ToolError(response.errorMessage ?? "Image analysis request failed.");
-		}
-		if (response.stopReason === "aborted") {
-			throw new ToolError("Image analysis request aborted.");
-		}
-
-		const text = extractTextContent(response);
-		if (!text) {
-			throw new ToolError("Image analysis model returned no text output.");
-		}
-
-		return {
-			content: [{ type: "text", text }],
-			model: `${model.provider}/${model.id}`,
-			resolvedPath: imageInput.resolvedPath,
-		};
 	}
 
 	async #resolveArchiveReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedArchiveReadPath | null> {
@@ -1715,41 +1570,34 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			| undefined;
 
 		if (mimeType) {
-			if (params.question !== undefined) {
-				const analysis = await this.#analyzeImage(readPath, absolutePath, mimeType, params.question, signal);
-				content = analysis.content;
-				details = { visionModel: analysis.model };
-				sourcePath = analysis.resolvedPath;
-			} else {
-				if (fileSize > MAX_IMAGE_SIZE) {
-					const sizeStr = formatBytes(fileSize);
-					const maxStr = formatBytes(MAX_IMAGE_SIZE);
-					throw new ToolError(`Image file too large: ${sizeStr} exceeds ${maxStr} limit.`);
+			if (fileSize > MAX_IMAGE_SIZE) {
+				const sizeStr = formatBytes(fileSize);
+				const maxStr = formatBytes(MAX_IMAGE_SIZE);
+				throw new ToolError(`Image file too large: ${sizeStr} exceeds ${maxStr} limit.`);
+			}
+			try {
+				const imageInput = await loadImageInput({
+					path: readPath,
+					cwd: this.session.cwd,
+					autoResize: this.#autoResizeImages,
+					maxBytes: MAX_IMAGE_SIZE,
+					resolvedPath: absolutePath,
+					detectedMimeType: mimeType,
+				});
+				if (!imageInput) {
+					throw new ToolError(`Read image file [${mimeType}] failed: unsupported image format.`);
 				}
-				try {
-					const imageInput = await loadImageInput({
-						path: readPath,
-						cwd: this.session.cwd,
-						autoResize: this.#autoResizeImages,
-						maxBytes: MAX_IMAGE_SIZE,
-						resolvedPath: absolutePath,
-						detectedMimeType: mimeType,
-					});
-					if (!imageInput) {
-						throw new ToolError(`Read image file [${mimeType}] failed: unsupported image format.`);
-					}
-					content = [
-						{ type: "text", text: imageInput.textNote },
-						{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
-					];
-					details = {};
-					sourcePath = imageInput.resolvedPath;
-				} catch (error) {
-					if (error instanceof ImageInputTooLargeError) {
-						throw new ToolError(error.message);
-					}
-					throw error;
+				content = [
+					{ type: "text", text: imageInput.textNote },
+					{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
+				];
+				details = {};
+				sourcePath = imageInput.resolvedPath;
+			} catch (error) {
+				if (error instanceof ImageInputTooLargeError) {
+					throw new ToolError(error.message);
 				}
+				throw error;
 			}
 		} else if (isNotebookPath(absolutePath) && !isRawSelector(parsed)) {
 			const notebookText = await readEditableNotebookText(absolutePath, localReadPath);

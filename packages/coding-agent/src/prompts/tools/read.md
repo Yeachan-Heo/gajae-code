@@ -46,7 +46,7 @@ Extracts text from PDF, Word, PowerPoint, Excel, RTF, and EPUB. Notebooks (`.ipy
 
 # Images
 
-Reading an image path returns the image itself for visual inspection. To delegate analysis to a vision-capable model instead, pass `question` describing what to inspect (e.g. `read` with `path` = the image and `question` = "What error text is visible?"); the model's text answer is returned in place of the raw image.
+Reading an image path returns the image itself for visual inspection by a vision-capable model.
 
 # Archives
 
