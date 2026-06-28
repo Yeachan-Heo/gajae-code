@@ -74,7 +74,7 @@ describe("OpenAI responses history image replay", () => {
 				id: "msg_user_with_image",
 				content: [
 					{ type: "input_text", text: "Recovered user image" },
-					{ type: "image_url", image_url: { url: imageUrl, detail: "high" }, detail: "huge" },
+					{ type: "image_url", image_url: { url: imageUrl, detail: "high" }, detail: { leak: true } },
 				],
 			},
 		];
