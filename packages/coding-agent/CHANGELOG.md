@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `#` prompt action that enters tmux copy-mode and searches backward to the previous rendered `user` input marker, providing a tmux-local previous-input scroll jump without relying on terminal-specific modified key chords.
+
 ### Fixed
 
 - Fixed steering regression where a prompt submitted while the agent was busy (`busyPromptMode: "steer"`) could stall in the steering queue — shown as a `Steer:` chip but never delivered — until the user pressed Esc to interrupt. A steer queued while no live agent loop was running (the busy/unwind window between a finished turn and the session going idle) now schedules a continuation so it is delivered promptly, mirroring the follow-up queue. A live loop still consumes the steer at its next tool/turn boundary, so steers are never double-delivered.
@@ -20,7 +24,6 @@
 - Elided runaway thinking-token loops in the assistant message renderer so repeated thinking output no longer grows without bound (#1196).
 - Made `gjc session` create/list work on psmux-backed multiplexers (#1192).
 - Sanitized dot-prefixed cwd window titles so tmux window names render correctly (#1198).
-
 ## [0.7.4] - 2026-06-27
 
 ### Added
