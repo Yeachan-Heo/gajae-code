@@ -1324,6 +1324,8 @@ const RESIDENT_EXTERNALIZE_STRING_EXCLUDED_KEYS = new Set([
 	"toolName",
 	"targetId",
 	"firstKeptEntryId",
+	"encrypted_content",
+	"reasoning_encrypted_content",
 ]);
 
 function shouldExternalizeResidentString(key: string | undefined): boolean {

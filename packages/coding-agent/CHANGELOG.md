@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept Codex `reasoning.encrypted_content` replay strings out of the resident large-text externalizer so resumed sessions preserve the provider's opaque encrypted reasoning payload instead of degrading it to a resident blob object.
+
 ## [0.7.4] - 2026-06-27
 
 ### Added

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage, UserMessage } from "@gajae-code/ai";
+
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import {
 	BlobStore,
@@ -222,6 +223,33 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		sm.appendMessage(assistantMessage("invalidate warm resident view"));
 		expectMissingBlob(() => sm.getEntries());
 		await sm.close().catch(() => {});
+	});
+	it("keeps encrypted reasoning replay strings inline instead of resident-blob externalizing them", async () => {
+		for (const replayKey of ["encrypted_content", "reasoning_encrypted_content"] as const) {
+			const root = makeTempDir();
+			const sm = SessionManager.create(root, path.join(root, "sessions"));
+			const encryptedContent = `enc_${replayKey}_${"r".repeat(2048)}`;
+			sm.appendMessage({
+				...assistantMessage(`codex reasoning replay ${replayKey}`),
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					provider: "openai-codex",
+					items: [{ type: "reasoning", [replayKey]: encryptedContent }],
+				},
+			});
+
+			expect(JSON.stringify(sm.getEntries())).toContain(encryptedContent);
+			await fs.promises.rm(residentCacheRoot(sm), { recursive: true, force: true });
+			Bun.gc(true);
+			sm.appendMessage(assistantMessage(`invalidate encrypted replay materialization ${replayKey}`));
+			expect(JSON.stringify(sm.getEntries())).toContain(encryptedContent);
+			await sm.ensureOnDisk();
+			await sm.flush();
+			const sessionFile = sm.getSessionFile();
+			if (!sessionFile) throw new Error("Expected session file");
+			expect(await Bun.file(sessionFile).text()).toContain(encryptedContent);
+			await sm.close();
+		}
 	});
 
 	it("standalone export close does not destroy the live manager resident cache", async () => {
