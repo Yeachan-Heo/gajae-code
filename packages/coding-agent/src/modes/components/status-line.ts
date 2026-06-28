@@ -222,7 +222,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
-		this.#settings = { ...this.#settings, ...settings };
+		this.#settings = { ...this.#settings, previewHighlightSegment: undefined, ...settings };
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {

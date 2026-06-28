@@ -123,6 +123,24 @@ describe("status line session accent", () => {
 		expect(border).not.toContain(`${accentAnsi}${theme.boxRound.horizontal}`);
 	});
 });
+describe("status line preview highlight", () => {
+	it("clears transient highlight when later settings omit it", () => {
+		const component = new StatusLineComponent(createStatusLineSession("Highlight session"));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae"],
+			rightSegments: [],
+			separator: "powerline-thin",
+			previewHighlightSegment: "gajae",
+		});
+
+		expect(component.getTopBorder(80).content).toContain("\x1b[7m");
+
+		component.updateSettings({ separator: "pipe" });
+
+		expect(component.getTopBorder(80).content).not.toContain("\x1b[7m");
+	});
+});
 
 describe("status line version display", () => {
 	function buildComponent(widthVersion: string = "9.8.7") {

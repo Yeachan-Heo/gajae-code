@@ -124,6 +124,25 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 
 		expect(settings.get("statusLine.segmentOptions")).toEqual(minimalSegmentOptions as Record<string, unknown>);
 	});
+	it("preserves an intentionally empty saved custom layout", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", []);
+		settings.set("statusLine.rightSegments", []);
+		const { component, previews } = createSelector();
+
+		openCustomEditor(component);
+
+		expect(previews.at(-1)).toMatchObject({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: [],
+		});
+
+		component.handleInput("\n");
+
+		expect(settings.get("statusLine.leftSegments")).toEqual([]);
+		expect(settings.get("statusLine.rightSegments")).toEqual([]);
+	});
 
 	it("edits segment placement and typed options before saving", () => {
 		settings.set("statusLine.preset", "minimal");
@@ -162,6 +181,8 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 			leftSegments: [],
 			rightSegments: [],
 		});
+		expect(Object.hasOwn(previews.at(-1) ?? {}, "previewHighlightSegment")).toBe(true);
+		expect(previews.at(-1)?.previewHighlightSegment).toBeUndefined();
 		expect(settings.get("statusLine.preset")).toBe("minimal");
 	});
 	it("moves segments between sides, reorders within a side, and saves separator changes", () => {

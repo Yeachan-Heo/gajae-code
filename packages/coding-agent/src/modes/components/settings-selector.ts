@@ -208,7 +208,7 @@ function effectiveCustomSegments(
 	leftSegments: StatusLineSegmentId[],
 	rightSegments: StatusLineSegmentId[],
 ): { leftSegments: StatusLineSegmentId[]; rightSegments: StatusLineSegmentId[] } {
-	if (preset === "custom" && (leftSegments.length > 0 || rightSegments.length > 0)) {
+	if (preset === "custom") {
 		return { leftSegments: [...leftSegments], rightSegments: [...rightSegments] };
 	}
 	const presetDef = getPreset(preset);
@@ -574,6 +574,7 @@ class StatusLineCustomEditor extends Container {
 			separator: settings.get("statusLine.separator"),
 			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			previewHighlightSegment: undefined,
 		});
 	}
 
@@ -591,6 +592,7 @@ class StatusLineCustomEditor extends Container {
 		this.callbacks.onChange("statusLine.rightSegments", [...this.#draft.rightSegments]);
 		this.callbacks.onChange("statusLine.separator", this.#draft.separator);
 		this.callbacks.onChange("statusLine.segmentOptions", cloneSegmentOptions(this.#draft.segmentOptions));
+		this.#previewHighlightSegment = undefined;
 		this.#preview();
 		this.done("saved");
 	}
@@ -842,6 +844,7 @@ export class SettingsSelectorComponent extends Container {
 					leftSegments: presetDef.leftSegments,
 					rightSegments: presetDef.rightSegments,
 					separator: presetDef.separator,
+					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
 			};
@@ -865,6 +868,7 @@ export class SettingsSelectorComponent extends Container {
 					rightSegments: presetDef.rightSegments,
 					separator: presetDef.separator,
 					...savedCustomSettings,
+					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
 			};
@@ -875,7 +879,7 @@ export class SettingsSelectorComponent extends Container {
 			};
 			onPreviewCancel = () => {
 				const separator = settings.get("statusLine.separator");
-				this.callbacks.onStatusLinePreview?.({ separator });
+				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
 				this.#updateStatusPreview();
 			};
 		}
@@ -1060,6 +1064,7 @@ export class SettingsSelectorComponent extends Container {
 			separator: settings.get("statusLine.separator"),
 			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			previewHighlightSegment: undefined,
 		};
 		this.callbacks.onStatusLinePreview?.(statusLineSettings);
 		this.#updateStatusPreview();
