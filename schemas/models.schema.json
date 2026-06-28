@@ -1160,7 +1160,6 @@
 							"type": "string",
 							"enum": [
 								"default",
-								"vision",
 								"executor",
 								"architect",
 								"planner",

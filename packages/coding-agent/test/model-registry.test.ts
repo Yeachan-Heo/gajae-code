@@ -10,8 +10,8 @@ import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provide
 import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("model roles", () => {
-	test("default and vision are built-in model roles", () => {
-		expect(MODEL_ROLE_IDS).toEqual(["default", "vision"]);
+	test("default is the only built-in model role", () => {
+		expect(MODEL_ROLE_IDS).toEqual(["default"]);
 	});
 });
 

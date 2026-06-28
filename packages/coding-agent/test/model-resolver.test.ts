@@ -905,14 +905,7 @@ describe("expandRoleAlias", () => {
 		expect(expandRoleAlias("pi/default", settings)).toBe("openai/gpt-4o");
 	});
 
-	test("expands pi/vision to the configured vision role", () => {
-		const settings = Settings.isolated();
-		settings.setModelRole("vision", "openai/gpt-4o");
-
-		expect(expandRoleAlias("pi/vision", settings)).toBe("openai/gpt-4o");
-	});
-
-	test("keeps an unconfigured known role alias unchanged", () => {
+	test("leaves an unknown role alias unchanged", () => {
 		const settings = Settings.isolated();
 
 		expect(expandRoleAlias("pi/vision", settings)).toBe("pi/vision");

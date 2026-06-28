@@ -190,18 +190,10 @@ describe("default GJC definitions", () => {
 		});
 	});
 
-	it("exposes default, vision, and four GJC role agents as model assignment targets", () => {
-		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS).toEqual([
-			"default",
-			"vision",
-			"executor",
-			"architect",
-			"planner",
-			"critic",
-		]);
+	it("exposes default and four GJC role agents as model assignment targets", () => {
+		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS).toEqual(["default", "executor", "architect", "planner", "critic"]);
 		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => GJC_MODEL_ASSIGNMENT_TARGETS[id].tag)).toEqual([
 			"DEFAULT",
-			"VISION",
 			"EXECUTOR",
 			"ARCHITECT",
 			"PLANNER",

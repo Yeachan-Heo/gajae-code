@@ -70,7 +70,7 @@ export function isAuthenticated(apiKey: string | undefined | null): apiKey is st
 	return Boolean(apiKey) && apiKey !== kNoAuth;
 }
 
-export type ModelRole = "default" | "vision";
+export type ModelRole = "default";
 
 export interface ModelRoleInfo {
 	tag?: string;
@@ -80,12 +80,11 @@ export interface ModelRoleInfo {
 
 export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 	default: { tag: "DEFAULT", name: "Default", color: "success" },
-	vision: { tag: "VISION", name: "Vision", color: "accent" },
 };
 
-export const MODEL_ROLE_IDS: ModelRole[] = ["default", "vision"];
+export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 
-export type GjcModelAssignmentTargetId = "default" | "vision" | "executor" | "architect" | "planner" | "critic";
+export type GjcModelAssignmentTargetId = "default" | "executor" | "architect" | "planner" | "critic";
 
 export interface GjcModelAssignmentTargetInfo extends ModelRoleInfo {
 	id: GjcModelAssignmentTargetId;
@@ -94,7 +93,6 @@ export interface GjcModelAssignmentTargetInfo extends ModelRoleInfo {
 
 export const GJC_MODEL_ASSIGNMENT_TARGET_IDS: GjcModelAssignmentTargetId[] = [
 	"default",
-	"vision",
 	"executor",
 	"architect",
 	"planner",
@@ -103,7 +101,6 @@ export const GJC_MODEL_ASSIGNMENT_TARGET_IDS: GjcModelAssignmentTargetId[] = [
 
 export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, GjcModelAssignmentTargetInfo> = {
 	default: { id: "default", tag: "DEFAULT", name: "Default", color: "success", settingsPath: "modelRoles" },
-	vision: { id: "vision", tag: "VISION", name: "Vision", color: "accent", settingsPath: "modelRoles" },
 	executor: {
 		id: "executor",
 		tag: "EXECUTOR",

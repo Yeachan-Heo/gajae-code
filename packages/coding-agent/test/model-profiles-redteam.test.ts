@@ -146,13 +146,12 @@ describe("model profile red-team schema and catalog cases", () => {
 			modelMapping: {
 				default: "provider/default:medium",
 				executor: "provider/executor:high",
-				vision: "provider/vision",
 			},
 			source: "user",
 		});
 
 		expect(resolved.defaultSelector).toBe("provider/default:medium");
-		expect(resolved.modelRoles).toEqual({ vision: "provider/vision" });
+		expect(resolved.modelRoles).toEqual({});
 		expect(resolved.agentModelOverrides).toEqual({ executor: "provider/executor:high" });
 	});
 

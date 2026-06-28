@@ -23,8 +23,8 @@ export interface ModelProfileDefinition {
 
 export interface ResolvedProfileBinding {
 	defaultSelector?: string;
-	modelRoles: Partial<Record<"vision", string>>;
-	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default" | "vision">, string>>;
+	modelRoles: Record<string, string>;
+	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, string>>;
 }
 
 function parseModelSelectorProvider(selector: string): string | undefined {
@@ -383,9 +383,8 @@ export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map
 }
 
 export function resolveProfileBindings(definition: ModelProfileDefinition): ResolvedProfileBinding {
-	const { default: defaultSelector, vision, executor, architect, planner, critic } = definition.modelMapping;
+	const { default: defaultSelector, executor, architect, planner, critic } = definition.modelMapping;
 	const modelRoles: ResolvedProfileBinding["modelRoles"] = {};
-	if (vision !== undefined) modelRoles.vision = vision;
 	const agentModelOverrides: ResolvedProfileBinding["agentModelOverrides"] = {};
 	if (executor !== undefined) agentModelOverrides.executor = executor;
 	if (architect !== undefined) agentModelOverrides.architect = architect;

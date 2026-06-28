@@ -81,7 +81,7 @@ const ModelBindingsSchema = z.object({
 	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
 	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
 });
-export const ProfileRoleSchema = z.enum(["default", "vision", "executor", "architect", "planner", "critic"]);
+export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
 
 function isValidProfileModelSelector(value: string): boolean {
 	if (value.includes(",")) return false;
