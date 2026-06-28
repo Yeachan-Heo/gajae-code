@@ -57,6 +57,10 @@ export interface TabSession {
 	kindTag: BrowserKindTag;
 	/** Session that acquired this tab; used for session-scoped teardown (F13). */
 	ownerId?: string;
+	/** Unix-ms timestamp of the last acquire/run activity; drives GC idle + LRU ordering. */
+	lastUsedAt: number;
+	/** Set synchronously by the shared begin-release guard so concurrent release is a no-op. */
+	releasing?: boolean;
 }
 
 export interface AcquireTabOptions {
@@ -94,6 +98,76 @@ export function getTab(name: string): TabSession | undefined {
 	return tabs.get(name);
 }
 
+/**
+ * Shared synchronous begin-release guard. Returns true for the first caller (which then
+ * owns teardown) and false for any concurrent/repeat caller, so `releaseBrowser` and the
+ * `BrowserHandle.refCount` decrement happen exactly once even when the idle sweep, the RSS
+ * sweep, a manual close, and `forceKillTab` race on the same tab.
+ */
+function beginRelease(tab: TabSession): boolean {
+	if (tab.releasing) return false;
+	tab.releasing = true;
+	return true;
+}
+
+/** Read-only, GC-facing projection of a live tab. Never exposes the mutable `tabs` map. */
+export interface TabGcSnapshot {
+	name: string;
+	ownerId?: string;
+	state: TabSession["state"];
+	pendingCount: number;
+	kindTag: BrowserKindTag;
+	lastUsedAt: number;
+	browserRefCount: number;
+}
+
+export interface BrowserGcEligibilityPolicy {
+	now: () => number;
+	idleMs: number;
+}
+
+/** Snapshot every live tab for GC ordering/diagnostics. */
+export function listTabsForGc(): TabGcSnapshot[] {
+	return [...tabs.values()].map(tab => ({
+		name: tab.name,
+		ownerId: tab.ownerId,
+		state: tab.state,
+		pendingCount: tab.pending.size,
+		kindTag: tab.kindTag,
+		lastUsedAt: tab.lastUsedAt,
+		browserRefCount: tab.browser.refCount,
+	}));
+}
+
+/**
+ * Evict a tab only if it is still GC-eligible against the LIVE supervisor state. The full
+ * predicate is checked synchronously and `releaseTab` is invoked with no intervening await,
+ * so a tab that became busy after a GC snapshot cannot be closed (its run rejected). Returns
+ * true only when the tab was actually released.
+ */
+export async function releaseTabIfGcEligible(name: string, policy: BrowserGcEligibilityPolicy): Promise<boolean> {
+	const tab = tabs.get(name);
+	if (!tab) return false;
+	if (tab.releasing) return false;
+	if (tab.state !== "alive") return false;
+	if (tab.pending.size !== 0) return false;
+	if (tab.kindTag !== "headless" && tab.kindTag !== "spawned") return false;
+	if (policy.now() - tab.lastUsedAt <= policy.idleMs) return false;
+	// All predicates passed synchronously; releaseTab applies the shared begin-release guard
+	// on the same microtask, so no other code runs between the check and the state transition.
+	return await releaseTab(name, { kill: false });
+}
+
+/** Test-only: install a fabricated tab session. */
+export function setTabForTest(tab: TabSession): void {
+	tabs.set(tab.name, tab);
+}
+
+/** Test-only: clear the tab registry between cases. */
+export function clearTabsForTest(): void {
+	tabs.clear();
+}
+
 export async function acquireTab(
 	name: string,
 	browser: BrowserHandle,
@@ -105,6 +179,7 @@ export async function acquireTab(
 			if (opts.dialogs !== undefined && opts.dialogs !== existing.dialogPolicy) {
 				await releaseTab(name, { kill: false });
 			} else {
+				existing.lastUsedAt = Date.now();
 				if (opts.url) {
 					await runInTabWithSnapshot(
 						name,
@@ -166,6 +241,7 @@ export async function acquireTab(
 		dialogPolicy: opts.dialogs,
 		kindTag: browser.kind.kind,
 		ownerId: opts.ownerId,
+		lastUsedAt: Date.now(),
 	};
 	worker.onMessage(msg => handleTabMessage(tab, msg));
 	tabs.set(name, tab);
@@ -188,6 +264,7 @@ async function runInTabWithSnapshot(
 	const tab = tabs.get(name);
 	if (!tab || tab.state === "dead") throw new ToolError(`Tab ${JSON.stringify(name)} is not alive. Reopen it.`);
 	if (tab.pending.size > 0) throw new ToolError(`Tab ${JSON.stringify(name)} is busy`);
+	tab.lastUsedAt = Date.now();
 	const id = Snowflake.next();
 	const { promise, resolve, reject } = Promise.withResolvers<RunResultOk>();
 	const pending: PendingRun = {
@@ -224,6 +301,10 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 		logger.debug("releaseTab: unknown tab", { name });
 		return false;
 	}
+	if (!beginRelease(tab)) {
+		logger.debug("releaseTab: already releasing", { name });
+		return false;
+	}
 	const wasAlive = tab.state === "alive";
 	tab.state = "dead";
 	const closeError = new ToolError(`Tab ${JSON.stringify(name)} was closed`);
@@ -246,7 +327,9 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	await tab.worker.terminate().catch(() => undefined);
 	if (forced && tab.kindTag === "headless") await closeOrphanTarget(tab);
 	await releaseBrowser(tab.browser, { kill: opts.kill ?? false });
-	tabs.delete(name);
+	// Only delete if the map still holds THIS tab: a same-name reacquire during our async
+	// teardown may have installed a fresh tab that we must not evict.
+	if (tabs.get(name) === tab) tabs.delete(name);
 	return true;
 }
 
@@ -392,6 +475,7 @@ function toErrorPayload(error: unknown): RunErrorPayload {
 async function forceKillTab(name: string, reason: string): Promise<void> {
 	const tab = tabs.get(name);
 	if (!tab) return;
+	if (!beginRelease(tab)) return;
 	tab.state = "dead";
 	const error = new ToolError(reason);
 	for (const pending of tab.pending.values()) pending.reject(error);
@@ -399,7 +483,7 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	await tab.worker.terminate().catch(() => undefined);
 	if (tab.kindTag === "headless") await closeOrphanTarget(tab);
 	await releaseBrowser(tab.browser, { kill: false });
-	tabs.delete(name);
+	if (tabs.get(name) === tab) tabs.delete(name);
 }
 
 async function closeOrphanTarget(tab: TabSession): Promise<void> {

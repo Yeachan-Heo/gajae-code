@@ -7,6 +7,7 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
 import { resizeImage } from "../utils/image-resize";
+import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -547,6 +548,7 @@ function getScreenshotFallbackDir(session: ToolSession): Promise<string> {
 async function createScreenshotFallbackDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-computer-screenshots-"));
 	await fs.chmod(dir, 0o700);
+	markScreenshotFallbackDirCreatedForGc();
 	return dir;
 }
 

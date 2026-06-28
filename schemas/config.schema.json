@@ -1754,6 +1754,38 @@
 				"screenshotDir": {
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
+				},
+				"gc": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Automatically reclaim idle, unheld GJC-managed headless/spawned browser tabs.",
+							"default": true
+						},
+						"idleMs": {
+							"type": "number",
+							"description": "Evict headless/spawned tabs idle longer than this many milliseconds.",
+							"default": 300000
+						},
+						"rssLimitMb": {
+							"type": "number",
+							"description": "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
+							"default": 1536
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"resourceGc": {
+			"type": "object",
+			"properties": {
+				"sweepIntervalMs": {
+					"type": "number",
+					"description": "How often the resource GC sweeps browser tabs and stale screenshot directories.",
+					"default": 30000
 				}
 			},
 			"additionalProperties": false
@@ -1793,6 +1825,27 @@
 							"type": "boolean",
 							"description": "Persist audit records for enabled computer-use actions.",
 							"default": true
+						}
+					},
+					"additionalProperties": false
+				},
+				"screenshotGc": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Delete stale computer-use screenshot fallback directories on disk.",
+							"default": true
+						},
+						"staleMs": {
+							"type": "number",
+							"description": "Remove screenshot fallback directories whose mtime is older than this many milliseconds.",
+							"default": 43200000
+						},
+						"scanIntervalMs": {
+							"type": "number",
+							"description": "Minimum interval between os.tmpdir scans for stale screenshot directories.",
+							"default": 1800000
 						}
 					},
 					"additionalProperties": false

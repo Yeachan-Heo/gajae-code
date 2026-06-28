@@ -250,6 +250,7 @@ import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
+import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -964,6 +965,8 @@ export class AgentSession {
 	// Python execution state
 	#evalAbortControllers = new Set<AbortController>();
 	#evalKernelOwnerId: string;
+	/** Idempotent unregister handle for this session's resource-GC registration. */
+	#unregisterResourceGc?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -1180,6 +1183,15 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.taskDepth = config.taskDepth ?? 0;
+		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
+		// + stale screenshot cleanup). Session-keyed so concurrent sessions share one timer safely.
+		const resourceGcSessionId = this.sessionManager.getSessionId();
+		if (resourceGcSessionId) {
+			this.#unregisterResourceGc = registerResourceGcSession({
+				sessionId: resourceGcSessionId,
+				settings: this.settings,
+			});
+		}
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
@@ -3285,6 +3297,8 @@ export class AgentSession {
 		// browsers disconnect, headless close gracefully). Scoped by the session id the
 		// browser tool tagged tabs with, so other live sessions' tabs are untouched.
 		// No-op when this session opened no tabs. Failure is logged, not thrown.
+		this.#unregisterResourceGc?.();
+		this.#unregisterResourceGc = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
 			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
 		);
@@ -3324,6 +3338,8 @@ export class AgentSession {
 	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
 		const sessionId = this.sessionManager.getSessionId();
 		const kernelOwnerId = this.#evalKernelOwnerId;
+		this.#unregisterResourceGc?.();
+		this.#unregisterResourceGc = undefined;
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).

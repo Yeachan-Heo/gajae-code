@@ -2208,6 +2208,46 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"browser.gc.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Browser Tab GC",
+			description: "Automatically reclaim idle, unheld GJC-managed headless/spawned browser tabs.",
+		},
+	},
+	"browser.gc.idleMs": {
+		type: "number",
+		default: 300_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+		ui: {
+			tab: "tools",
+			label: "Browser Tab GC Idle (ms)",
+			description: "Evict headless/spawned tabs idle longer than this many milliseconds.",
+		},
+	},
+	"browser.gc.rssLimitMb": {
+		type: "number",
+		default: 1536,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+		ui: {
+			tab: "tools",
+			label: "Browser Tab GC RSS Limit (MB)",
+			description: "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
+		},
+	},
+	"resourceGc.sweepIntervalMs": {
+		type: "number",
+		default: 30_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+		ui: {
+			tab: "tools",
+			label: "Resource GC Sweep Interval (ms)",
+			description: "How often the resource GC sweeps browser tabs and stale screenshot directories.",
+		},
+	},
+
 	"computer.enabled": {
 		type: "boolean",
 		default: false,
@@ -2265,6 +2305,35 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Computer Audit Log",
 			description: "Persist audit records for enabled computer-use actions.",
+		},
+	},
+	"computer.screenshotGc.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Computer Screenshot GC",
+			description: "Delete stale computer-use screenshot fallback directories on disk.",
+		},
+	},
+	"computer.screenshotGc.staleMs": {
+		type: "number",
+		default: 43_200_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+		ui: {
+			tab: "tools",
+			label: "Computer Screenshot GC Stale Age (ms)",
+			description: "Remove screenshot fallback directories whose mtime is older than this many milliseconds.",
+		},
+	},
+	"computer.screenshotGc.scanIntervalMs": {
+		type: "number",
+		default: 1_800_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+		ui: {
+			tab: "tools",
+			label: "Computer Screenshot GC Scan Interval (ms)",
+			description: "Minimum interval between os.tmpdir scans for stale screenshot directories.",
 		},
 	},
 
