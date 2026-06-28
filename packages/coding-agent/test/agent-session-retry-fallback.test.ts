@@ -63,7 +63,11 @@ function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Ag
 	});
 }
 
-function createCachedLocalModel(provider: "ollama" | "lm-studio", id: string, baseUrl: string): Model<"openai-responses"> {
+function createCachedLocalModel(
+	provider: "ollama" | "lm-studio",
+	id: string,
+	baseUrl: string,
+): Model<"openai-responses"> {
 	return {
 		id,
 		name: id,
@@ -262,10 +266,7 @@ describe("AgentSession retry fallback", () => {
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
 			"retry.fallbackChains": {
-				default: [
-					`${localFallback.provider}/${localFallback.id}`,
-					`${cloudFallback.provider}/${cloudFallback.id}`,
-				],
+				default: [`${localFallback.provider}/${localFallback.id}`, `${cloudFallback.provider}/${cloudFallback.id}`],
 			},
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
@@ -324,7 +325,9 @@ describe("AgentSession retry fallback", () => {
 
 		const requestedModels: string[] = [];
 		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
-		const mock = createMockModel({ handler: () => ({ throw: "fetch failed: connect ECONNREFUSED 127.0.0.1:11434" }) });
+		const mock = createMockModel({
+			handler: () => ({ throw: "fetch failed: connect ECONNREFUSED 127.0.0.1:11434" }),
+		});
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
