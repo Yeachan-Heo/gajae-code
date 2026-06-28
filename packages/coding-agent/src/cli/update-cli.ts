@@ -27,6 +27,7 @@ export interface InstalledVersionVerification {
 	path?: string;
 	smokeTestFailed?: boolean;
 	smokeTestOutput?: string;
+	cleanupWarning?: string;
 }
 
 /** Paths and verifier used while replacing a downloaded binary update. */
@@ -367,6 +368,19 @@ async function unlinkIfExists(filePath: string): Promise<void> {
 	}
 }
 
+function formatBackupCleanupWarning(backupPath: string, err: unknown): string {
+	return `Installed update, but could not remove backup file ${backupPath}: ${err}. You can delete it manually after closing shells or antivirus processes that may still hold it.`;
+}
+
+async function cleanupVerifiedBackup(backupPath: string): Promise<string | undefined> {
+	try {
+		await unlinkIfExists(backupPath);
+		return undefined;
+	} catch (err) {
+		return formatBackupCleanupWarning(backupPath, err);
+	}
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -386,8 +400,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 
 		backupReady = false;
-		await unlinkIfExists(options.backupPath);
-		return verification;
+		const cleanupWarning = await cleanupVerifiedBackup(options.backupPath);
+		return cleanupWarning ? { ...verification, cleanupWarning } : verification;
 	} catch (err) {
 		if (backupReady) {
 			await unlinkIfExists(options.targetPath);
@@ -430,7 +444,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 	await pipeline(response.body, fileStream);
 
 	console.log(chalk.dim("Installing update..."));
-	await replaceBinaryForUpdate({
+	const verification = await replaceBinaryForUpdate({
 		targetPath,
 		tempPath,
 		backupPath,
@@ -438,6 +452,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 		verifyInstalledVersion: verifyInstalledRuntime,
 	});
 	printVerifiedVersion(expectedVersion);
+	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
 	printRestartGuidance();
 }
 
