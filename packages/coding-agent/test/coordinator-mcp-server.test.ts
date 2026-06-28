@@ -3,7 +3,16 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { COORDINATOR_MCP_TOOL_NAMES, createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import {
+	boundedAwaitTurnTimeoutMs,
+	boundedEventWatchTimeoutMs,
+	boundedPollIntervalMs,
+	COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS,
+	COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS,
+	COORDINATOR_MCP_TOOL_NAMES,
+	COORDINATOR_POLL_INTERVAL_MAX_MS,
+	createCoordinatorMcpServer,
+} from "../src/coordinator-mcp/server";
 
 const tempDirs: string[] = [];
 
@@ -18,6 +27,14 @@ afterEach(async () => {
 });
 
 describe("Coordinator MCP server protocol", () => {
+	it("bounds await_turn and event-watch timeouts with distinct caps", () => {
+		expect(boundedAwaitTurnTimeoutMs(1_800_000)).toBe(1_800_000);
+		expect(boundedAwaitTurnTimeoutMs(3_600_000)).toBe(COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS);
+		expect(boundedEventWatchTimeoutMs(1_800_000)).toBe(COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS);
+		expect(boundedPollIntervalMs(10_000)).toBe(10_000);
+		expect(boundedPollIntervalMs(60_000)).toBe(COORDINATOR_POLL_INTERVAL_MAX_MS);
+	});
+
 	it("initializes with GJC coordinator server identity and lists GJC-named tools", async () => {
 		const server = createCoordinatorMcpServer({ env: {} });
 

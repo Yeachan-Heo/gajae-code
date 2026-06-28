@@ -317,8 +317,14 @@ function toolSchema(name: CoordinatorToolName): {
 				properties: {
 					session_id: sessionId,
 					turn_id: { type: "string" },
-					timeout_ms: { type: "number" },
-					poll_interval_ms: { type: "number" },
+					timeout_ms: {
+						type: "number",
+						description: "Bounded await timeout in milliseconds, capped at 30 minutes.",
+					},
+					poll_interval_ms: {
+						type: "number",
+						description: "Bounded polling interval in milliseconds, capped at 10 seconds.",
+					},
 					lines: { type: "number" },
 				},
 				required: ["turn_id"],
@@ -406,7 +412,10 @@ function toolSchema(name: CoordinatorToolName): {
 					after_seq: { type: "number" },
 					session_id: sessionId,
 					event_types: { type: "array", items: { type: "string" } },
-					timeout_ms: { type: "number" },
+					timeout_ms: {
+						type: "number",
+						description: "Bounded event long-poll timeout in milliseconds, capped at 30 seconds.",
+					},
 					limit: { type: "number" },
 				},
 			},
@@ -447,7 +456,8 @@ function toolSchema(name: CoordinatorToolName): {
 					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
 					timeout_ms: {
 						type: "number",
-						description: "Bounded await timeout; same cap semantics as gjc_coordinator_await_turn.",
+						description:
+							"Bounded await timeout in milliseconds, capped at 30 minutes like gjc_coordinator_await_turn.",
 					},
 					poll_interval_ms: { type: "number", description: "Bounded await polling interval." },
 					lines: { type: "number", description: "Bounded advisory tail lines returned with await/read payloads." },
@@ -1086,16 +1096,25 @@ function asTerminalTurnStatus(status: unknown): TurnStatus | null {
 	return null;
 }
 
-function boundedTimeoutMs(value: unknown): number {
+export const COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+export const COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS = 30_000;
+export const COORDINATOR_POLL_INTERVAL_MAX_MS = 10_000;
+
+function parsePositiveIntegerMs(value: unknown, fallback: number): number {
 	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return 1000;
-	return Math.min(parsed, 30_000);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function boundedPollIntervalMs(value: unknown): number {
-	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return 100;
-	return Math.min(Math.max(parsed, 10), 1000);
+export function boundedAwaitTurnTimeoutMs(value: unknown): number {
+	return Math.min(parsePositiveIntegerMs(value, 1000), COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS);
+}
+
+export function boundedEventWatchTimeoutMs(value: unknown): number {
+	return Math.min(parsePositiveIntegerMs(value, 1000), COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS);
+}
+
+export function boundedPollIntervalMs(value: unknown): number {
+	return Math.min(Math.max(parsePositiveIntegerMs(value, 100), 10), COORDINATOR_POLL_INTERVAL_MAX_MS);
 }
 async function runCommand(command: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
@@ -1685,7 +1704,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_watch_events") {
 				const limit = boundedEventLimit(args.limit);
-				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				const timeoutMs = boundedEventWatchTimeoutMs(args.timeout_ms);
 				let events = await readCoordinatorEvents(namespaceDir);
 				let matched = filterCoordinatorEvents(events, args, limit);
 				let timedOut = false;
@@ -1819,7 +1838,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				if (promptAliasIgnored) base.prompt_alias_ignored = true;
 				if (args.await_completion === true && !shouldQueue) {
-					const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+					const timeoutMs = boundedAwaitTurnTimeoutMs(args.timeout_ms);
 					const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
 					const deadline = Date.now() + timeoutMs;
 					let payload = await readTurnPayload(turn.turn_id, sessionId, args.lines);
@@ -1979,7 +1998,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return await readTurnPayload(args.turn_id, args.session_id, args.lines);
 			}
 			if (name === "gjc_coordinator_await_turn") {
-				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				const timeoutMs = boundedAwaitTurnTimeoutMs(args.timeout_ms);
 				const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
 				const deadline = Date.now() + timeoutMs;
 				let payload = await readTurnPayload(args.turn_id, args.session_id, args.lines);
