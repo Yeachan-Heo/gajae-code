@@ -73,6 +73,15 @@ export interface TmuxSpawnOptions {
 	stdin: "inherit";
 	stdout: "inherit";
 	stderr: "inherit";
+	/**
+	 * When true, the spawn captures stderr into a buffer and forwards it to
+	 * the parent stderr so the user still sees the live output. The captured
+	 * text is also returned in TmuxSpawnResult.stderr for diagnostic
+	 * surfacing in "attach failed" / "profile tagging failed" messages.
+	 * Defaults to false to preserve the previous PTY-binding behavior for
+	 * attach-session and other interactive commands.
+	 */
+	captureStderr?: boolean;
 }
 
 export interface TmuxLaunchPlan {
@@ -248,7 +257,14 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
 	const cwd = context.cwd ?? process.cwd();
-	const options: TmuxSpawnOptions = { cwd, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" };
+	const options: TmuxSpawnOptions = {
+		cwd,
+		env,
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+		captureStderr: true,
+	};
 	const failures: GjcTmuxProfileResult["failures"] = [];
 	for (const command of commands) {
 		const result = spawnSync(context.tmuxCommand, command.args, options);
@@ -484,15 +500,33 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
+	// When captureStderr is set on the options, route stderr through a
+	// pipe so we can both forward it to the parent stderr (so the user
+	// still sees the live output) and retain it in TmuxSpawnResult.stderr
+	// for diagnostic surfacing. PTY-bound commands (attach-session) keep
+	// stderr: "inherit" because psmux needs a real terminal handle.
+	const stdio = options.captureStderr
+		? { stdin: options.stdin, stdout: options.stdout, stderr: "pipe" as const }
+		: { stdin: options.stdin, stdout: options.stdout, stderr: options.stderr };
 	const result = Bun.spawnSync({
 		cmd: [command, ...args],
 		cwd: options.cwd,
 		env: options.env,
-		stdin: options.stdin,
-		stdout: options.stdout,
-		stderr: options.stderr,
+		...stdio,
 	});
-	return { exitCode: result.exitCode, signalCode: result.signalCode };
+	let stderrText: string | undefined;
+	if (options.captureStderr) {
+		const stderrBytes = result.stderr;
+		stderrText = stderrBytes ? new TextDecoder().decode(stderrBytes) : "";
+		if (stderrText.length > 0) {
+			try {
+				process.stderr.write(stderrText);
+			} catch {
+				// parent stderr already closed during shutdown; ignore.
+			}
+		}
+	}
+	return { exitCode: result.exitCode, signalCode: result.signalCode, stderr: stderrText };
 }
 
 export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
@@ -510,18 +544,24 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stderr: "inherit",
 	};
 
+	const attachOptions: TmuxSpawnOptions = { ...options };
+	const controlOptions: TmuxSpawnOptions = { ...options, captureStderr: true };
 	if (plan.attachSessionName) {
-		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.attachSessionName}`], options);
+		const attached = spawnSync(
+			plan.tmuxCommand,
+			["attach-session", "-t", `=${plan.attachSessionName}`],
+			attachOptions,
+		);
 		if (attached.exitCode === 0) return true;
 	}
 
-	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
+	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, controlOptions);
 	if (created.exitCode === 0) {
 		renameTmuxWindow(
 			plan.tmuxCommand,
 			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
 			spawnSync,
-			options,
+			controlOptions,
 			`=${plan.sessionName}`,
 		);
 
@@ -546,8 +586,15 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			return true;
 		}
 	}
-	if (created.exitCode !== 0) return false;
-	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], options);
+	if (created.exitCode !== 0) {
+		// The new-session spawn failed. Surface the captured stderr so the
+		// user sees the actual psmux rejection (e.g. "cannot create session:
+		// server is shutting down") instead of a silent exit.
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", created.stderr));
+		return false;
+	}
+	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
+	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], attachOptions);
 	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
