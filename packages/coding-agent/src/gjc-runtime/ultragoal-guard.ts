@@ -69,9 +69,12 @@ function isKnownUltragoalObjective(currentObjective: string): boolean {
 	);
 }
 
-async function ultragoalReadPaths(cwd: string): Promise<{ paths: UltragoalPaths; sessionId: string | null }> {
-	const envSessionId = process.env.GJC_SESSION_ID?.trim();
-	if (envSessionId) return { paths: getUltragoalPaths(cwd, envSessionId), sessionId: envSessionId };
+async function ultragoalReadPaths(
+	cwd: string,
+	options: { sessionId?: string | null } = {},
+): Promise<{ paths: UltragoalPaths; sessionId: string | null }> {
+	const explicitSessionId = options.sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
+	if (explicitSessionId) return { paths: getUltragoalPaths(cwd, explicitSessionId), sessionId: explicitSessionId };
 	try {
 		const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
 		return { paths: getUltragoalPaths(cwd, session.gjcSessionId), sessionId: session.gjcSessionId };
@@ -372,11 +375,14 @@ export async function readUltragoalVerificationState(input: {
 	return receiptDiagnostic;
 }
 
-export async function isUltragoalAskBlocked(cwd: string): Promise<UltragoalAskBlockDiagnostic> {
+export async function isUltragoalAskBlocked(
+	cwd: string,
+	options: { sessionId?: string | null } = {},
+): Promise<UltragoalAskBlockDiagnostic> {
 	let paths: UltragoalPaths;
 	let sessionId: string | null;
 	try {
-		({ paths, sessionId } = await ultragoalReadPaths(cwd));
+		({ paths, sessionId } = await ultragoalReadPaths(cwd, options));
 	} catch (error) {
 		return activeAskDiagnostic({
 			reason: `Unable to resolve durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,

@@ -551,7 +551,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(this.session.cwd);
+		await assertUltragoalAskAllowed(this.session.cwd, {
+			activeSkillState: this.session.getActiveSkillState?.(),
+			sessionId: this.session.getSessionId?.() ?? null,
+		});
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		const canUseWorkflowGate = gateEmitter?.isUnattended() === true;
 
