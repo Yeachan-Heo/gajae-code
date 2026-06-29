@@ -14,6 +14,8 @@ import { theme } from "../modes/theme/theme";
 
 const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
+const NPM_WRAPPER_PACKAGE = "gajae-code";
+const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
 
 interface ReleaseInfo {
 	tag: string;
@@ -103,23 +105,76 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateTarget = { method: "bun" } | { method: "binary"; path: string };
+type PackageManagerTarget = { manager: "npm"; packageName: string };
+type UpdateTarget = { method: "bun" } | { method: "npm"; packageName: string } | { method: "binary"; path: string };
 
-function resolveUpdateMethod(ompPath: string, bunBinDir: string | undefined): "bun" | "binary" {
+type PathPlatform = NodeJS.Platform;
+type PackageExists = (packageName: string, packageRoot: string) => boolean;
+
+function pathApiForPlatform(platform: PathPlatform): typeof path.posix | typeof path.win32 {
+	return platform === "win32" ? path.win32 : path.posix;
+}
+
+function defaultPackageExists(_packageName: string, packageRoot: string): boolean {
+	return fs.existsSync(path.join(packageRoot, "package.json"));
+}
+
+function npmPackageRootForBinPath(binPath: string, packageName: string, platform: PathPlatform): string {
+	const pathApi = pathApiForPlatform(platform);
+	const segments = packageName.split("/");
+	return pathApi.join(pathApi.dirname(binPath), "node_modules", ...segments);
+}
+
+function resolveNpmManagedTarget(
+	ompPath: string,
+	platform: PathPlatform = process.platform,
+	packageExists: PackageExists = defaultPackageExists,
+): PackageManagerTarget | undefined {
+	if (platform !== "win32") return undefined;
+	const pathApi = pathApiForPlatform(platform);
+	const extension = pathApi.extname(ompPath).toLowerCase();
+	if (extension !== ".cmd" && extension !== ".ps1") return undefined;
+	const basename = pathApi.basename(ompPath, extension).toLowerCase();
+	if (basename !== APP_NAME.toLowerCase()) return undefined;
+
+	for (const packageName of NPM_MANAGED_PACKAGES) {
+		const packageRoot = npmPackageRootForBinPath(ompPath, packageName, platform);
+		if (packageExists(packageName, packageRoot)) return { manager: "npm", packageName };
+	}
+	return undefined;
+}
+
+function resolveUpdateMethod(ompPath: string, bunBinDir: string | undefined): "bun" | "npm" | "binary" {
+	if (resolveNpmManagedTarget(ompPath)) return "npm";
 	if (!bunBinDir) return "binary";
 	return isPathInDirectory(ompPath, bunBinDir) ? "bun" : "binary";
 }
 
-export function resolveUpdateMethodForTest(ompPath: string, bunBinDir: string | undefined): "bun" | "binary" {
+export function resolveUpdateMethodForTest(ompPath: string, bunBinDir: string | undefined): "bun" | "npm" | "binary" {
 	return resolveUpdateMethod(ompPath, bunBinDir);
+}
+
+export function resolveNpmManagedTargetForTest(
+	ompPath: string,
+	platform: PathPlatform,
+	packageExists: PackageExists,
+): PackageManagerTarget | undefined {
+	return resolveNpmManagedTarget(ompPath, platform, packageExists);
 }
 async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const bunBinDir = await getBunGlobalBinDir();
 	const ompPath = resolveGjcPath();
 
 	if (ompPath) {
+		const npmTarget = resolveNpmManagedTarget(ompPath);
+		if (npmTarget) return { method: "npm", packageName: npmTarget.packageName };
 		const method = resolveUpdateMethod(ompPath, bunBinDir);
 		if (method === "bun") return { method };
+		if (method === "npm") {
+			throw new Error(
+				formatUnsupportedTargetMessage(`Could not resolve npm package root for ${APP_NAME} shim ${ompPath}`),
+			);
+		}
 		return { method, path: ompPath };
 	}
 
@@ -425,6 +480,16 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
 	await printVerification(expectedVersion);
 }
 
+async function updateViaNpm(packageName: string, expectedVersion: string): Promise<void> {
+	console.log(chalk.dim(`Updating npm-managed install via npm (${packageName})...`));
+	const result = await $`npm install -g ${packageName}@${expectedVersion}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`npm install failed with exit code ${result.exitCode}`);
+	}
+
+	await printVerification(expectedVersion);
+}
+
 /**
  * Download a release binary to a target path, replacing an existing file.
  */
@@ -494,6 +559,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		const target = await resolveUpdateTarget();
 		if (target.method === "bun") {
 			await updateViaBun(release.version);
+		} else if (target.method === "npm") {
+			await updateViaNpm(target.packageName, release.version);
 		} else {
 			await updateViaBinaryAt(target.path, release.version);
 		}

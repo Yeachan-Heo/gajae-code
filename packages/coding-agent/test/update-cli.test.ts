@@ -9,6 +9,7 @@ import {
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	replaceBinaryForUpdate,
+	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
 } from "../src/cli/update-cli";
 
@@ -41,6 +42,50 @@ describe("update-cli install target detection", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.local/bin/gjc", undefined);
 
 		expect(method).toBe("binary");
+	});
+
+	it("detects a Windows npm wrapper shim and avoids one-file binary replacement", () => {
+		const seenRoots: Array<{ packageName: string; packageRoot: string }> = [];
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.cmd",
+			"win32",
+			(packageName, packageRoot) => {
+				seenRoots.push({ packageName, packageRoot });
+				return packageName === "gajae-code";
+			},
+		);
+
+		expect(target).toEqual({ manager: "npm", packageName: "gajae-code" });
+		expect(seenRoots[0]).toEqual({
+			packageName: "gajae-code",
+			packageRoot: "C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\gajae-code",
+		});
+	});
+
+	it("detects PowerShell npm wrapper shims so gjc.ps1 is updated through npm too", () => {
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.ps1",
+			"win32",
+			packageName => packageName === "gajae-code",
+		);
+
+		expect(target).toEqual({ manager: "npm", packageName: "gajae-code" });
+	});
+
+	it("does not classify missing Windows node_modules roots as npm-managed", () => {
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.cmd",
+			"win32",
+			() => false,
+		);
+
+		expect(target).toBeUndefined();
+	});
+
+	it("keeps non-Windows package-manager-like shims on the existing bun/binary classifier", () => {
+		const target = resolveNpmManagedTargetForTest("/usr/local/bin/gjc", "linux", () => true);
+
+		expect(target).toBeUndefined();
 	});
 });
 
