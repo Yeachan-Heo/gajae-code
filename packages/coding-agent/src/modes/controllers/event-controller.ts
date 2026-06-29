@@ -23,6 +23,7 @@ import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
+import { ringTerminalBell } from "../utils/terminal-bell";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
@@ -962,6 +963,7 @@ export class EventController {
 			lastAssistantMessage: summary,
 			stopReason: last?.stopReason,
 		};
+		ringTerminalBell("complete");
 		if (isBackgrounded) TERMINAL.sendNotification(title);
 		this.#runCompletionNotifyCommand(payload);
 	}

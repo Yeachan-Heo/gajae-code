@@ -86,6 +86,26 @@
 						}
 					},
 					"additionalProperties": false
+				},
+				"terminalBell": {
+					"type": "boolean",
+					"description": "Emit a BEL character for local terminal notifications",
+					"default": false
+				},
+				"bellOnComplete": {
+					"type": "boolean",
+					"description": "Ring the terminal bell when an agent turn completes",
+					"default": true
+				},
+				"bellOnApproval": {
+					"type": "boolean",
+					"description": "Ring the terminal bell when a plan or approval prompt needs attention",
+					"default": true
+				},
+				"bellOnAsk": {
+					"type": "boolean",
+					"description": "Ring the terminal bell when an ask/user-input prompt needs attention",
+					"default": true
 				}
 			},
 			"additionalProperties": false

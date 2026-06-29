@@ -89,6 +89,28 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		expect(spy).toHaveBeenCalledWith(expect.stringContaining("Complete"));
 	});
 
+	it("rings terminal bell on completion only when enabled", () => {
+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		settings.override("completion.notify", "on");
+		settings.set("notifications.terminalBell", true);
+		settings.set("notifications.bellOnComplete", true);
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendCompletionNotification();
+		expect(writeSpy).toHaveBeenCalledWith("\x07");
+	});
+
+	it("does not ring terminal bell when completion bell is disabled", () => {
+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		settings.override("completion.notify", "on");
+		settings.set("notifications.terminalBell", true);
+		settings.set("notifications.bellOnComplete", false);
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendCompletionNotification();
+		expect(writeSpy).not.toHaveBeenCalledWith("\x07");
+	});
+
 	it("fires notification when getLastAssistantMessage is absent (e.g. brand-new session)", () => {
 		// Defensive: optional-chain `?.()` returns undefined; treat as 'no abort flag', proceed.
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
