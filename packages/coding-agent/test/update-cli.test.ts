@@ -11,6 +11,7 @@ import {
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
+	runPackageManagerUpdateForTest,
 } from "../src/cli/update-cli";
 
 const tempDirs: string[] = [];
@@ -169,6 +170,56 @@ describe("update-cli binary release assets", () => {
 		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "freebsd", "x64")).toThrow(
 			"bun install -g @gajae-code/coding-agent@latest",
 		);
+	});
+});
+
+describe("update-cli package-manager verification", () => {
+	it("treats a nonzero bun install as successful when the installed runtime verifies", async () => {
+		const warnings: string[] = [];
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(message => {
+			warnings.push(String(message));
+		});
+		try {
+			const result = await runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({
+					exitCode: 1,
+					text: () => 'Fail extracting tarball for "@gajae-code/natives"',
+				}),
+				verifyInstalledRuntime: async expectedVersion => ({
+					ok: true,
+					actual: expectedVersion,
+					path: "/Users/test/.bun/bin/gjc",
+				}),
+				printRecoveredVerification: () => {},
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.actual).toBe("0.7.8");
+			expect(warnings.join("\n")).toContain("bun exited with 1");
+			expect(warnings.join("\n")).toContain("Treating the update as installed");
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("keeps package-manager nonzero failures hard when runtime verification does not prove the update landed", async () => {
+		await expect(
+			runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({
+					exitCode: 1,
+					text: () => 'Fail extracting tarball for "@gajae-code/natives"',
+				}),
+				verifyInstalledRuntime: async () => ({
+					ok: false,
+					actual: "0.7.7",
+					path: "/Users/test/.bun/bin/gjc",
+				}),
+			}),
+		).rejects.toThrow("Fail extracting tarball");
 	});
 });
 

@@ -32,6 +32,22 @@ export interface InstalledVersionVerification {
 	cleanupWarning?: string;
 }
 
+export interface PackageManagerUpdateResult {
+	exitCode: number | null;
+	text: () => string;
+}
+
+export type PackageManagerUpdateRunner = (expectedVersion: string) => Promise<PackageManagerUpdateResult>;
+
+export interface PackageManagerUpdateOptions {
+	managerName: string;
+	expectedVersion: string;
+	runInstall: PackageManagerUpdateRunner;
+	verifyInstalledRuntime: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+	printVerificationResult?: (expectedVersion: string) => Promise<void>;
+	printRecoveredVerification?: (expectedVersion: string) => void;
+}
+
 /** Paths and verifier used while replacing a downloaded binary update. */
 export interface BinaryReplacementOptions {
 	targetPath: string;
@@ -318,6 +334,11 @@ function printVerifiedVersion(expectedVersion: string): void {
 	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
 }
 
+function printSuccessfulVerification(expectedVersion: string): void {
+	printVerifiedVersion(expectedVersion);
+	printRestartGuidance();
+}
+
 function formatBinaryInstallInstruction(platform: NodeJS.Platform = process.platform): string {
 	if (platform === "win32") {
 		return `For a supported binary install, reinstall with PowerShell: irm https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.ps1 | iex`;
@@ -407,8 +428,7 @@ export function formatVerificationFailureForTest(
 async function printVerification(expectedVersion: string): Promise<void> {
 	const result = await verifyInstalledRuntime(expectedVersion);
 	if (result.ok) {
-		printVerifiedVersion(expectedVersion);
-		printRestartGuidance();
+		printSuccessfulVerification(expectedVersion);
 		return;
 	}
 	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
@@ -467,27 +487,67 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
+function formatPackageManagerInstallFailure(
+	managerName: string,
+	result: PackageManagerUpdateResult,
+	verification: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	const output = normalizeVerificationOutput(result.text());
+	const outputSuffix = output ? `: ${output}` : "";
+	return `${managerName} install failed with exit code ${result.exitCode ?? "unknown"}${outputSuffix}. ${formatVerificationFailure(verification, expectedVersion)}`;
+}
+
+export async function runPackageManagerUpdateForTest(
+	options: PackageManagerUpdateOptions,
+): Promise<InstalledVersionVerification> {
+	return updateViaPackageManager(options);
+}
+
+async function updateViaPackageManager(options: PackageManagerUpdateOptions): Promise<InstalledVersionVerification> {
+	const result = await options.runInstall(options.expectedVersion);
+	if (result.exitCode === 0) {
+		await (options.printVerificationResult ?? printVerification)(options.expectedVersion);
+		return await options.verifyInstalledRuntime(options.expectedVersion);
+	}
+
+	const verification = await options.verifyInstalledRuntime(options.expectedVersion);
+	if (verification.ok) {
+		console.warn(
+			chalk.yellow(
+				`${options.managerName} exited with ${result.exitCode ?? "unknown"}, but ${APP_NAME} now verifies as ${options.expectedVersion}. Treating the update as installed.`,
+			),
+		);
+		(options.printRecoveredVerification ?? printSuccessfulVerification)(options.expectedVersion);
+		return verification;
+	}
+
+	throw new Error(
+		formatPackageManagerInstallFailure(options.managerName, result, verification, options.expectedVersion),
+	);
+}
+
 /**
  * Update via bun package manager.
  */
 async function updateViaBun(expectedVersion: string): Promise<void> {
 	console.log(chalk.dim("Updating via bun..."));
-	const result = await $`bun install -g ${PACKAGE}@${expectedVersion}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`bun install failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
+	await updateViaPackageManager({
+		managerName: "bun",
+		expectedVersion,
+		runInstall: async version => await $`bun install -g ${PACKAGE}@${version}`.nothrow(),
+		verifyInstalledRuntime,
+	});
 }
 
 async function updateViaNpm(packageName: string, expectedVersion: string): Promise<void> {
 	console.log(chalk.dim(`Updating npm-managed install via npm (${packageName})...`));
-	const result = await $`npm install -g ${packageName}@${expectedVersion}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`npm install failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
+	await updateViaPackageManager({
+		managerName: "npm",
+		expectedVersion,
+		runInstall: async version => await $`npm install -g ${packageName}@${version}`.nothrow(),
+		verifyInstalledRuntime,
+	});
 }
 
 /**
