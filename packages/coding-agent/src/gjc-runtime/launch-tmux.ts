@@ -618,7 +618,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	if (plan.attachSessionName) {
 		const attached = spawnSync(
 			plan.tmuxCommand,
-["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })], attachOptions,
+			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
+			attachOptions,
 		);
 		if (attached.exitCode === 0) return true;
 	}
@@ -628,7 +629,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			plan.tmuxCommand,
 			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
 			spawnSync,
-controlOptions, buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
+			controlOptions,
+			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
 		);
 
 		const profile = applyGjcTmuxProfile({
@@ -652,8 +654,8 @@ controlOptions, buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
 			return true;
 		}
 	}
-const probeWarning = detectCorruptedGjcWrapper();
-if (created.exitCode !== 0) {
+	const probeWarning = detectCorruptedGjcWrapper();
+	if (created.exitCode !== 0) {
 		// The new-session spawn failed. Surface the captured stderr so the
 		// user sees the actual psmux rejection (e.g. "cannot create session:
 		// server is shutting down") instead of a silent exit. The wrapper
@@ -666,13 +668,13 @@ if (created.exitCode !== 0) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return false;
 	}
-// Verify the psmux server is still alive and the session is registered
-// before we attach. On Windows, psmux 3.3.0/3.3.6 can race: new-session
-// returns exit 0 but the psmux server dies before it finishes registering
-// the session on its control socket. The follow-up attach-session then
-// fails with "no server running". Re-run new-session once if has-session
-// reports the session is missing, and capture the probe's stderr so the
-// diagnostic message names the actual psmux rejection.
+	// Verify the psmux server is still alive and the session is registered
+	// before we attach. On Windows, psmux 3.3.0/3.3.6 can race: new-session
+	// returns exit 0 but the psmux server dies before it finishes registering
+	// the session on its control socket. The follow-up attach-session then
+	// fails with "no server running". Re-run new-session once if has-session
+	// reports the session is missing, and capture the probe's stderr so the
+	// diagnostic message names the actual psmux rejection.
 	const probeOptions: TmuxSpawnOptions = {
 		...options,
 		stdin: "pipe",
