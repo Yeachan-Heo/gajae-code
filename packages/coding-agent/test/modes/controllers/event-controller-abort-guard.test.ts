@@ -36,6 +36,7 @@ afterEach(() => {
 });
 
 type StopReason = "stop" | "aborted" | "error";
+type NotifyProc = Bun.Subprocess<"ignore", "ignore", "ignore">;
 
 function makeAssistantMessage(stopReason: StopReason): AssistantMessage {
 	return {
@@ -123,7 +124,7 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 					exited: Promise.resolve(0),
 					kill: () => {},
 					unref: () => {},
-				}) as unknown as ReturnType<typeof Bun.spawn>,
+				}) as unknown as NotifyProc,
 		);
 		settings.override("completion.notify", "on");
 		settings.set("completion.notifyCommand", "notify-test");
@@ -152,7 +153,7 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 					exited: Promise.resolve(0),
 					kill: () => {},
 					unref: () => {},
-				}) as unknown as ReturnType<typeof Bun.spawn>,
+				}) as unknown as NotifyProc,
 		);
 		settings.override("completion.notify", "on");
 		settings.set("completion.notifyCommand", "notify-test");
@@ -173,7 +174,7 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 					exited: Promise.resolve(0),
 					kill: () => {},
 					unref: () => {},
-				}) as unknown as ReturnType<typeof Bun.spawn>,
+				}) as unknown as NotifyProc,
 		);
 		settings.override("completion.notify", "on");
 		settings.override("completion.notifyCommand", "notify-test");
