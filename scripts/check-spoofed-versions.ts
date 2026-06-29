@@ -23,7 +23,6 @@ const PROVIDER_FILE = path.join(
 interface VersionCheck {
 	/** Human label for the report. */
 	name: string;
-	/** Regex to extract the current hardcoded version from PROVIDER_FILE. */
 	sourcePattern: RegExp;
 	/** GitHub owner/repo to fetch latest release from. */
 	repo: string;
@@ -51,7 +50,7 @@ const SEMVER_RE = /(\d+\.\d+\.\d+)/;
 const checks: VersionCheck[] = [
 	{
 		name: "Gemini CLI",
-		sourcePattern: /PI_AI_GEMINI_CLI_VERSION\s*\|\|\s*"(\d+\.\d+\.\d+)"/,
+		sourcePattern: /DEFAULT_GEMINI_CLI_VERSION\s*=\s*"(\d+\.\d+\.\d+)"/,
 		repo: "google-gemini/gemini-cli",
 		parseTag: (tag) => SEMVER_RE.exec(tag)?.[1] ?? null,
 	},

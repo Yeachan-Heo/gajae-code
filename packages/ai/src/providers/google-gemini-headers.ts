@@ -3,8 +3,13 @@
  * Uses the same format as the official Gemini CLI (v0.35+):
  * GeminiCLI/VERSION/MODEL (PLATFORM; ARCH; SURFACE)
  */
+export const GEMINI_CLI_VERSION_ENV = "GJC_AI_GEMINI_CLI_VERSION";
+export const LEGACY_GEMINI_CLI_VERSION_ENV = "PI_AI_GEMINI_CLI_VERSION";
+export const DEFAULT_GEMINI_CLI_VERSION = "0.49.0";
+
 export function getGeminiCliUserAgent(modelId = "gemini-3.1-pro-preview"): string {
-	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.46.0";
+	const version =
+		process.env[GEMINI_CLI_VERSION_ENV] || process.env[LEGACY_GEMINI_CLI_VERSION_ENV] || DEFAULT_GEMINI_CLI_VERSION;
 	const platform = process.platform === "win32" ? "win32" : process.platform;
 	const arch = process.arch === "x64" ? "x64" : process.arch;
 	return `GeminiCLI/${version}/${modelId} (${platform}; ${arch}; terminal)`;
