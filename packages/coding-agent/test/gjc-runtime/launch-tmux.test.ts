@@ -1242,16 +1242,16 @@ describe("default GJC tmux launch", () => {
 	});
 });
 
-it("emits a UTF-16LE BOM and a script-block &-invocation for native Windows --tmux plans", () => {
+it("emits a BOM-less UTF-16LE encoded command and a direct `&` invocation for native Windows --tmux plans", () => {
 	// Regression: gjc --tmux on native Windows + psmux previously failed with
-	// "attach failed: no server running" because the inner PowerShell-encoded
-	// command lacked a UTF-16LE BOM (pwsh rejected it with a parse error) and
-	// the trailing `-NoLogo -NoProfile -ExecutionPolicy Bypass` flags were
-	// being forwarded into the resolved gjc binary instead of being absorbed
-	// by PowerShell. Both root causes are fixed by:
-	//   1. Prepending a UTF-16LE BOM (0xFF 0xFE) to the encoded buffer.
-	//   2. Wrapping the `& <command> <args>` invocation in a script block
-	//      `& { ... }` so the trailing flags do not reach the runtime binary.
+	// the literal text "﻿$env:GJC_TMUX_LAUNCHED : The term '﻿$env:...' is not
+	// recognized" appearing in the psmux pane, because the encoded command
+	// was prefixed with a UTF-16LE BOM (0xFF 0xFE). pwsh does not strip the
+	// BOM on -EncodedCommand input; it decodes the BOM to U+FEFF and emits
+	// that character as part of the first token, which then fails to match
+	// any cmdlet. Fix: emit the buffer WITHOUT a BOM, and use a direct
+	// `& 'cmd' 'arg1' 'arg2'` invocation (no script-block wrapper, which
+	// is itself a parser error for adjacent single-quoted tokens).
 	const plan = buildDefaultTmuxLaunchPlan({
 		parsed: args({ messages: [], tmux: true }),
 		rawArgs: ["--tmux"],
@@ -1271,11 +1271,15 @@ it("emits a UTF-16LE BOM and a script-block &-invocation for native Windows --tm
 	expect(encodedMatch).not.toBeNull();
 	if (!encodedMatch) throw new Error("expected -EncodedCommand in inner command");
 	const decoded = Buffer.from(encodedMatch[1], "base64");
-	// The first two bytes of the decoded buffer must be the UTF-16LE BOM
-	// (0xFF 0xFE) so PowerShell -EncodedCommand parses the script correctly.
-	expect(decoded[0]).toBe(0xff);
-	expect(decoded[1]).toBe(0xfe);
-	const script = decoded.subarray(2).toString("utf16le");
+	// The decoded buffer must NOT start with the UTF-16LE BOM. pwsh does not
+	// strip the BOM on -EncodedCommand input, so prepending one would cause
+	// the first script token to be prefixed with U+FEFF, breaking the parse.
+	expect(decoded[0]).not.toBe(0xff);
+	expect(decoded[1]).not.toBe(0xfe);
+	const script = decoded.toString("utf16le");
+	// The first character of the decoded script must be the first character
+	// of the actual PowerShell command (`$` from `$env:GJC_TMUX_LAUNCHED`).
+	expect(script[0]).toBe("$");
 	// The inner invocation must use the PowerShell `&` call operator directly
 	// (no `& { ... }` script-block wrapper) because adjacent single-quoted
 	// tokens inside a script-block body are a parser error. The correct shape

@@ -271,13 +271,14 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 	const invocation = `& ${resolvedCommand} ${innerArgs}`;
 	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
 	const script = [...envLines, invocation, exitLine].join("\n");
-	// PowerShell -EncodedCommand requires a UTF-16LE BOM (0xFF 0xFE) at the
-	// start of the decoded buffer; without it pwsh may misinterpret the
-	// leading bytes and reject the script with a parse error, which would
-	// kill the psmux pane before the gjc --tmux attach could land.
-	const bom = Buffer.from([0xff, 0xfe]);
+	// Encode the script as UTF-16LE base64 for pwsh -EncodedCommand. Do NOT
+	// prepend a UTF-16LE BOM (0xFF 0xFE): the BOM survives the decode and is
+	// inserted as a literal U+FEFF character in front of the first script
+	// token, which pwsh then reports as a "term not recognized" parse error
+	// (e.g. "﻿$env:GJC_TMUX_LAUNCHED"). pwsh expects the decoded buffer to
+	// start with the first character of the script, not with a BOM.
 	const body = Buffer.from(script, "utf16le");
-	const encodedCommand = Buffer.concat([bom, body]).toString("base64");
+	const encodedCommand = body.toString("base64");
 	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }
 
