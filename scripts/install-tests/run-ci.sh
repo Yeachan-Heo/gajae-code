@@ -66,7 +66,8 @@ SOURCE_BUN_HOME="$WORK_DIR/bun-source"
 section "Tarball install smoke"
 TARBALL_DIR="$WORK_DIR/tarballs"
 mkdir -p "$TARBALL_DIR"
-for pkg in utils natives ai agent tui stats coding-agent gajae-code; do
+bun scripts/sync-native-platform-packages.ts
+for pkg in utils natives natives-linux-x64 natives-linux-arm64 natives-darwin-x64 natives-darwin-arm64 natives-win32-x64 ai agent tui stats coding-agent gajae-code; do
 	(
 		cd "$ROOT_DIR/packages/$pkg"
 		bun pm pack --destination "$TARBALL_DIR" --quiet >/dev/null
@@ -75,6 +76,11 @@ done
 
 utils_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-utils-*.tgz)"
 natives_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-*.tgz)"
+natives_linux_x64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-linux-x64-*.tgz)"
+natives_linux_arm64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-linux-arm64-*.tgz)"
+natives_darwin_x64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-darwin-x64-*.tgz)"
+natives_darwin_arm64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-darwin-arm64-*.tgz)"
+natives_win32_x64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-win32-x64-*.tgz)"
 ai_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-ai-*.tgz)"
 agent_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-agent-core-*.tgz)"
 tui_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-tui-*.tgz)"
@@ -95,6 +101,11 @@ mkdir -p "$TARBALL_APP_DIR"
 		pkg.overrides = {
 			'@gajae-code/utils': '$utils_tgz',
 			'@gajae-code/natives': '$natives_tgz',
+			'@gajae-code/natives-linux-x64': '$natives_linux_x64_tgz',
+			'@gajae-code/natives-linux-arm64': '$natives_linux_arm64_tgz',
+			'@gajae-code/natives-darwin-x64': '$natives_darwin_x64_tgz',
+			'@gajae-code/natives-darwin-arm64': '$natives_darwin_arm64_tgz',
+			'@gajae-code/natives-win32-x64': '$natives_win32_x64_tgz',
 			'@gajae-code/ai': '$ai_tgz',
 			'@gajae-code/agent-core': '$agent_tgz',
 			'@gajae-code/tui': '$tui_tgz',

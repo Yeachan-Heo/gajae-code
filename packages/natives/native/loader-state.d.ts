@@ -39,6 +39,7 @@ export interface ResolveLoaderCandidatesInput {
 	isCompiledBinary: boolean;
 	stageFromNodeModules?: boolean;
 	nativeDir: string;
+	platformNativeDirs?: string[];
 	execDir: string;
 	versionedDir: string;
 	userDataDir: string;
