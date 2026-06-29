@@ -1967,7 +1967,7 @@ export function buildWorkerCommand(
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
-// On Windows we wrap the worker command invocation in `& { & 'cmd' 'arg1' ... }`
+	// On Windows we wrap the worker command invocation in `& { & 'cmd' 'arg1' ... }`
 	// so pwsh keeps the whole multi-statement body in command position. Two
 	// failure modes this avoids:
 	//   1. Bare `bun 'cli.ts' 'prompt'` after `$env:X = 'y'; ...` would be
@@ -1980,6 +1980,15 @@ export function buildWorkerCommand(
 	// the invocation. POSIX shells do not need this — they already treat
 	// `cmd 'arg'` as a normal command invocation after `;`-separated
 	// variable assignments.
+	//
+	// ASSUMPTION: this branch only fires when the worker pane is a PowerShell
+	// shell. psmux launches pwsh by default on Windows, so the unset /
+	// unset-and-replace cases are correct. If a user has explicitly set
+	// `set -g default-shell "C:/Program Files/Git/bin/bash.exe"` (or any
+	// other non-pwsh shell), this branch will send PowerShell syntax to a
+	// bash pane and the worker will fail with a parse error. Detecting the
+	// pane's shell at runtime and switching the quoting + invocation style
+	// accordingly is a follow-up; for now the pwsh default is assumed.
 	if (platform === "win32") {
 		const invocation = `& ${config.worker_command} ${quote(prompt)}`;
 		return `& { ${joined} ${invocation} }`;
