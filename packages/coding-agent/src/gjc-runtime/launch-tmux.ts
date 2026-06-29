@@ -592,9 +592,23 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stdout: "inherit",
 		stderr: "inherit",
 	};
-
 	const attachOptions: TmuxSpawnOptions = { ...options };
 	const controlOptions: TmuxSpawnOptions = { ...options, captureStderr: true };
+	// new-session needs pipe stdio (not inherit) because the user terminal must
+	// remain untouched until attach-session takes over. Inheriting psmux's
+	// stdout/stderr for new-session can corrupt the terminal state or race with
+	// attach-session on Windows, where psmux 3.3.0/3.3.6's server can die if it
+	// sees the controlling TTY in an inconsistent state mid-spawn. Capturing
+	// both streams also gives the diagnostic writer the full error detail when
+	// new-session itself fails.
+	const newSessionOptions: TmuxSpawnOptions = {
+		...options,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		captureStderr: true,
+	};
+
 	if (plan.attachSessionName) {
 		const attached = spawnSync(
 			plan.tmuxCommand,
@@ -602,8 +616,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		);
 		if (attached.exitCode === 0) return true;
 	}
-
-	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, controlOptions);
+	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
 	if (created.exitCode === 0) {
 		renameTmuxWindow(
 			plan.tmuxCommand,
@@ -647,7 +660,34 @@ if (created.exitCode !== 0) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return false;
 	}
-// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
+// Verify the psmux server is still alive and the session is registered
+// before we attach. On Windows, psmux 3.3.0/3.3.6 can race: new-session
+// returns exit 0 but the psmux server dies before it finishes registering
+// the session on its control socket. The follow-up attach-session then
+// fails with "no server running". Re-run new-session once if has-session
+// reports the session is missing, and capture the probe's stderr so the
+// diagnostic message names the actual psmux rejection.
+	const probeOptions: TmuxSpawnOptions = {
+		...options,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		captureStderr: true,
+	};
+	const hasSession = spawnSync(plan.tmuxCommand, ["has-session", "-t", `=${plan.sessionName}`], probeOptions);
+	if (hasSession.exitCode !== 0) {
+		const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
+		if (retry.exitCode !== 0) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				formatTmuxLaunchDiagnostic(
+					"new-session retry failed after missing session",
+					retry.stderr ?? hasSession.stderr,
+				),
+			);
+			return true;
+		}
+	}
+	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	const attached = spawnSync(
 		plan.tmuxCommand,
 		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],

@@ -1391,3 +1391,53 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 		} catch {}
 	}
 });
+
+it("retries new-session when the psmux server has not yet registered the session (Windows race)", () => {
+	// Regression: on Windows + psmux 3.3.0/3.3.6, the new-session spawn can
+	// return exit 0 before the psmux server has finished registering the
+	// session on its control socket. The follow-up attach-session then fails
+	// with "psmux: can't find session '=NAME' (no server running)" because
+	// the psmux server is alive but the session is briefly invisible. The
+	// has-session probe + new-session retry in launchDefaultTmuxIfNeeded
+	// closes the race. This test simulates the failure shape without
+	// requiring a live psmux server.
+	const calls = [];
+	let newSessionCount = 0;
+	let capturedSessionName = "";
+	const result = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: {},
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: () => {},
+		spawnSync: (_command, spawnArgs) => {
+			calls.push({ command: spawnArgs[0], args: spawnArgs });
+			if (spawnArgs[0] === "new-session") {
+				capturedSessionName = spawnArgs[3] ?? capturedSessionName;
+				newSessionCount++;
+				return { exitCode: 0, stderr: "" };
+			}
+			if (spawnArgs[0] === "has-session") {
+				if (newSessionCount === 1) {
+					return {
+						exitCode: 1,
+						stderr: `psmux: can't find session '=${capturedSessionName}' (no server running)`,
+					};
+				}
+				return { exitCode: 0 };
+			}
+			return { exitCode: 0 };
+		},
+	});
+	expect(result).toBe(true);
+	const newSessionCalls = calls.filter(call => call.command === "new-session");
+	expect(newSessionCalls.length).toBe(2);
+	expect(calls.some(call => call.command === "has-session" && call.args[2] === `=${capturedSessionName}`)).toBe(true);
+});
