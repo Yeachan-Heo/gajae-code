@@ -73,9 +73,9 @@ export type TmuxSpawnSync = (command: string, args: string[], options: TmuxSpawn
 export interface TmuxSpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
-	stdin: "inherit";
-	stdout: "inherit";
-	stderr: "inherit";
+	stdin: "inherit" | "pipe";
+	stdout: "inherit" | "pipe";
+	stderr: "inherit" | "pipe";
 	/**
 	 * When true, the spawn captures stderr into a buffer and forwards it to
 	 * the parent stderr so the user still sees the live output. The captured
