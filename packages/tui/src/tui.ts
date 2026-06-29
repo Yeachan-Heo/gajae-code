@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, getDebugLogPath } from "@gajae-code/utils";
+import { $flag, getDebugLogPath, logger } from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -257,12 +257,46 @@ export class Container implements Component {
 		width = Math.max(1, width);
 		const lines: string[] = [];
 		for (const child of this.children) {
-			const childLines = child.render(width);
+			const childLines = safeRenderComponent(child, width, "container-child");
 			for (let i = 0; i < childLines.length; i++) {
 				lines.push(childLines[i]);
 			}
 		}
 		return lines;
+	}
+}
+
+const MAX_REPORTED_RENDER_ERRORS = 200;
+const reportedRenderErrors = new Set<string>();
+
+/**
+ * Render a component's lines without letting a thrown error escape the frame.
+ *
+ * The TUI render loop ({@link TUI.#doRender}) runs inside a `nextTick`/`setTimeout`
+ * with no try/catch, and the process installs a fail-fast `uncaughtException`
+ * handler that exits. So a single component whose `render()` throws (e.g. a tool
+ * renderer fed an optional/undefined field) used to take down the whole app —
+ * fatal on whatever happened to trigger the frame (a keystroke, resize, or a
+ * command such as `/background`). Isolate the failure: log it once, emit a
+ * visible fallback line, and keep rendering the rest of the tree.
+ */
+function safeRenderComponent(component: Component, width: number, where: string): string[] {
+	try {
+		return component.render(width);
+	} catch (err) {
+		const name = component?.constructor?.name ?? "Component";
+		const key = `${where}:${name}:${err instanceof Error ? err.message : String(err)}`;
+		if (!reportedRenderErrors.has(key)) {
+			if (reportedRenderErrors.size >= MAX_REPORTED_RENDER_ERRORS) reportedRenderErrors.clear();
+			reportedRenderErrors.add(key);
+			logger.error("Component render failed; emitting fallback line", {
+				where,
+				component: name,
+				error: err instanceof Error ? err.message : String(err),
+				stack: err instanceof Error ? err.stack : undefined,
+			});
+		}
+		return [`[render error: ${name}]`];
 	}
 }
 
@@ -1071,7 +1105,7 @@ export class TUI extends Container {
 			const { width, maxHeight } = this.#resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Render component at calculated width
-			let overlayLines = component.render(width);
+			let overlayLines = safeRenderComponent(component, width, "overlay");
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
@@ -1302,7 +1336,7 @@ export class TUI extends Container {
 
 		let pinnedLineCount = 0;
 		for (let i = pinnedStart; i < this.children.length; i++) {
-			pinnedLineCount += this.children[i].render(this.terminal.columns).length;
+			pinnedLineCount += safeRenderComponent(this.children[i], this.terminal.columns, "pinned").length;
 		}
 
 		const blankRows = height - lines.length;
