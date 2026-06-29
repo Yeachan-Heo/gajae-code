@@ -2641,3 +2641,51 @@ describe("native gjc team runtime", () => {
 		}
 	});
 });
+
+describe("buildWorkerCommand prompt normalization", () => {
+	it("strips U+FEFF and replaces embedded LF / CRLF with spaces so tmux send-keys cannot split the prompt", async () => {
+		const { buildWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const cfg = {
+			team_name: "test-team",
+			state_root: "C:\\repo\\.gjc\\team",
+			leader: { pane_id: "%1", cwd: "C:\\repo" },
+			worker_command: "bun cli.ts",
+			display_name: "test-team",
+			task: "\uFEFFline one\nline two\r\nline three",
+			workers: [{ id: "worker-1", index: 1, worktree_path: null }],
+		};
+		const worker = cfg.workers[0];
+		const out = buildWorkerCommand(cfg, worker, "win32");
+		// Strip the env-assignment prefix so we are looking only at the prompt body.
+		const m = out.match(/'([^']*(?:''[^']*)*)'\s*$/);
+		expect(m).not.toBeNull();
+		const body = (m?.[1] ?? "").replace(/''/g, "'");
+		// Body must NOT contain a literal LF: tmux send-keys would have
+		// interpreted that LF as an Enter keypress.
+		expect(body).not.toMatch(/\n/);
+		expect(body).not.toMatch(/\r/);
+		// Body must NOT start with U+FEFF (the inline-BOM bug).
+		expect(body.charCodeAt(0)).not.toBe(0xfeff);
+		// Body must reference the worker id (worker prompt template is intact).
+		expect(body).toContain("worker-1");
+	});
+
+	it("falls back to a placeholder prompt when the task text normalizes to whitespace", async () => {
+		const { buildWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const cfg = {
+			team_name: "test-team",
+			state_root: "C:\\repo\\.gjc\\team",
+			leader: { pane_id: "%1", cwd: "C:\\repo" },
+			worker_command: "bun cli.ts",
+			display_name: "test-team",
+			task: "  ",
+			workers: [{ id: "worker-7", index: 1, worktree_path: null }],
+		};
+		const out = buildWorkerCommand(cfg, cfg.workers[0], "win32");
+		const m = out.match(/'([^']*(?:''[^']*)*)'\s*$/);
+		expect(m).not.toBeNull();
+		const body = (m?.[1] ?? "").replace(/''/g, "'");
+		expect(body).not.toMatch(/\n/);
+		expect(body).toContain("worker-7");
+	});
+});
