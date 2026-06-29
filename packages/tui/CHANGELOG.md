@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- The render loop now isolates a component whose `render()` throws: the failure is logged once and replaced with a `[render error: <Name>]` fallback line instead of escaping the frame and tripping the process-level fail-fast `uncaughtException` exit. Previously any unguarded renderer fault (e.g. a tool renderer fed an undefined field) crashed the whole app on whatever triggered the next frame — a keystroke, resize, or command such as `/background` (#1291).
+
 - Resolved terminal dimensions from the live TTY window size before stream defaults so wide Windows Terminal/PowerShell sessions render against the actual viewport width (#1239).
 
 ## [0.7.4] - 2026-06-27
