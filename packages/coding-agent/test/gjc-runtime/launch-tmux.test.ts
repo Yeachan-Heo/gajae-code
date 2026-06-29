@@ -14,6 +14,7 @@ import {
 	launchDefaultTmuxIfNeeded,
 	type TmuxSpawnOptions,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
+import { __setBinaryResolverForTests } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 function args(overrides: Partial<Args> = {}): Args {
@@ -340,6 +341,35 @@ describe("default GJC tmux launch", () => {
 		expect(handled).toBe(true);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
 		expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
+	});
+
+	it("uses bare session targets for psmux attach paths", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		try {
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
+				rawArgs: ["--tmux", "--resume", "hello world"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				worktreeBranch: "feature/demo",
+				existingBranchSessionName: "gajae_code_feature",
+				spawnSync: (command, spawnArgs, options) => {
+					calls.push({ command, args: spawnArgs, options });
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled).toBe(true);
+			expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "gajae_code_feature"]);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
 	});
 
 	it("explicit resume attaches existing tagged session for matching worktree branch", () => {

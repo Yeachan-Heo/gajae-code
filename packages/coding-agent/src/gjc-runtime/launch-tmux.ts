@@ -6,6 +6,7 @@ import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
 import {
+	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
@@ -21,6 +22,7 @@ import {
 import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope, type GjcTmuxSessionStatus } from "./tmux-sessions";
 
 export {
+	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_COMMAND_ENV,
@@ -407,7 +409,11 @@ function readCurrentBranch(cwd: string): string | null {
 }
 
 function cleanupCreatedTmuxSession(plan: TmuxLaunchPlan, spawnSync: TmuxSpawnSync, options: TmuxSpawnOptions): void {
-	spawnSync(plan.tmuxCommand, ["kill-session", "-t", `=${plan.sessionName}`], options);
+	spawnSync(
+		plan.tmuxCommand,
+		["kill-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env: options.env })],
+		options,
+	);
 }
 function isTmuxAttachDisconnectError(result: TmuxSpawnResult): boolean {
 	if (result.signalCode === "SIGHUP") return true;
@@ -511,7 +517,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	};
 
 	if (plan.attachSessionName) {
-		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.attachSessionName}`], options);
+		const attached = spawnSync(
+			plan.tmuxCommand,
+			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
+			options,
+		);
 		if (attached.exitCode === 0) return true;
 	}
 
@@ -522,7 +532,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
 			spawnSync,
 			options,
-			`=${plan.sessionName}`,
+			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
 		);
 
 		const profile = applyGjcTmuxProfile({
@@ -547,7 +557,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 	}
 	if (created.exitCode !== 0) return false;
-	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], options);
+	const attached = spawnSync(
+		plan.tmuxCommand,
+		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
+		options,
+	);
 	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
