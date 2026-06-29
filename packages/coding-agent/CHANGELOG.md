@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Fixed a class of TUI renderer crashes (`TypeError: undefined is not an object (evaluating 'x.trim'/'x.split')`) where render helpers typed `(x: string)` ran a string op on an optional/possibly-undefined tool-detail field. The deep-interview/ralplan `ask` renderer crashed on a result with a missing `question`; caught during streaming but fatal on render/teardown paths such as `/background` detach. Hardened `normalizeText`, `getPreviewLines`, `shortenPath`, and the eval git_log status-event renderer (#1290).
+
 - `gjc update` now verifies the installed runtime after package-manager failures and treats a nonzero Bun/npm exit as recoverable when the requested version and smoke test actually landed, avoiding false failures from Bun tarball extraction errors (#1280).
 - Submitted user prompts now use the live terminal viewport width in wide Windows Terminal/PowerShell sessions, keeping Korean/CJK prompt wrapping responsive without changing narrow layouts (#1239).
 - Coordinator MCP now fails tmux-delivered turns that never receive a runtime prompt acknowledgement/`turn_start`, surfacing an explicit unacknowledged delivery reason instead of leaving Hermes/Oren waiting on a normal active/running state (#1237).
