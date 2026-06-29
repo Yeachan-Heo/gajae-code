@@ -1354,7 +1354,7 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 	const originalPath = process.env.PATH;
 	process.env.PATH = dir + path.delimiter + (originalPath ?? "");
 	try {
-		const diagnostics = [];
+		const diagnostics: string[] = [];
 		launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
@@ -1402,7 +1402,7 @@ it("retries new-session when the psmux server has not yet registered the session
 	// has-session probe + new-session retry in launchDefaultTmuxIfNeeded
 	// closes the race. This test simulates the failure shape without
 	// requiring a live psmux server.
-	const calls = [];
+	const calls: Array<{ command: string; args: string[] }> = [];
 	let newSessionCount = 0;
 	let capturedSessionName = "";
 	const result = launchDefaultTmuxIfNeeded({

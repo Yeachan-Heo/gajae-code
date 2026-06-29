@@ -2647,13 +2647,39 @@ describe("buildWorkerCommand prompt normalization", () => {
 		const { buildWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
 		const cfg = {
 			team_name: "test-team",
-			state_root: "C:\\repo\\.gjc\\team",
-			leader: { pane_id: "%1", cwd: "C:\\repo" },
-			worker_command: "bun cli.ts",
 			display_name: "test-team",
+			requested_name: "test-team",
 			task: "\uFEFFline one\nline two\r\nline three",
-			workers: [{ id: "worker-1", index: 1, worktree_path: null }],
-		};
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "C:\\repo\\.gjc\\team",
+			worker_command: "bun cli.ts",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "psmux",
+			tmux_session: "test",
+			tmux_session_name: "test",
+			tmux_target: "test:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "test", pane_id: "%1", cwd: "C:\\repo" },
+			leader_cwd: "C:\\repo",
+			team_state_root: "C:\\repo\\.gjc\\team",
+			workers: [
+				{
+					id: "worker-1",
+					name: "worker-1",
+					index: 1,
+					agent_type: "executor",
+					role: "executor",
+					status: "starting",
+					last_heartbeat: "2026-01-01T00:00:00.000Z",
+					assigned_tasks: [],
+				},
+			],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
 		const worker = cfg.workers[0];
 		const out = buildWorkerCommand(cfg, worker, "win32");
 		// On Windows the body is wrapped in `& { ... }` to keep pwsh in
@@ -2678,13 +2704,39 @@ describe("buildWorkerCommand prompt normalization", () => {
 		const { buildWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
 		const cfg = {
 			team_name: "test-team",
-			state_root: "C:\\repo\\.gjc\\team",
-			leader: { pane_id: "%1", cwd: "C:\\repo" },
-			worker_command: "bun cli.ts",
 			display_name: "test-team",
+			requested_name: "test-team",
 			task: "  ",
-			workers: [{ id: "worker-7", index: 1, worktree_path: null }],
-		};
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "C:\\repo\\.gjc\\team",
+			worker_command: "bun cli.ts",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "psmux",
+			tmux_session: "test",
+			tmux_session_name: "test",
+			tmux_target: "test:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "test", pane_id: "%1", cwd: "C:\\repo" },
+			leader_cwd: "C:\\repo",
+			team_state_root: "C:\\repo\\.gjc\\team",
+			workers: [
+				{
+					id: "worker-7",
+					name: "worker-7",
+					index: 1,
+					agent_type: "executor",
+					role: "executor",
+					status: "starting",
+					last_heartbeat: "2026-01-01T00:00:00.000Z",
+					assigned_tasks: [],
+				},
+			],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
 		const out = buildWorkerCommand(cfg, cfg.workers[0], "win32");
 		const m = out.match(/& \{ [^}]*?'([^']*(?:''[^']*)*)'\s*\}\s*$/);
 		expect(m).not.toBeNull();
@@ -2703,9 +2755,6 @@ describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
 	it("prepends the bun runtime when argv[1] ends in .js", async () => {
 		process.argv = ["C:\\Users\\withfox\\.bun\\bin\\bun.exe", "C:\\repo\\packages\\coding-agent\\bin\\gjc.js"];
 		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// pass win32 explicitly: the bun-prefix invariant is Windows-only —
-		// on POSIX a bare `node bin/gjc.js` works because node IS the script
-		// interpreter, so the prefix would be redundant noise.
 		// Pass win32 + a Windows-shaped execPath explicitly: the bun-prefix
 		// invariant is Windows-only — on POSIX a bare `node bin/gjc.js` works
 		// because node IS the script interpreter, so the prefix would be
@@ -2730,7 +2779,6 @@ describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
 	it("prepends the bun runtime when argv[1] ends in .mjs", async () => {
 		process.argv = ["bun", "/repo/packages/coding-agent/src/cli.mjs"];
 		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// pass win32 explicitly: the bun-prefix invariant is Windows-only.
 		// pass win32 + a Windows-shaped execPath explicitly so the test is
 		// portable across POSIX runners (which have a bare `bun`, no `.exe`).
 		const out = resolveGjcWorkerCommand(
