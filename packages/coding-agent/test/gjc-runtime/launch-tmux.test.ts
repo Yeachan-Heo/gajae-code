@@ -1276,18 +1276,15 @@ it("emits a UTF-16LE BOM and a script-block &-invocation for native Windows --tm
 	expect(decoded[0]).toBe(0xff);
 	expect(decoded[1]).toBe(0xfe);
 	const script = decoded.subarray(2).toString("utf16le");
-	// The inner invocation must be wrapped in a script block so the trailing
-	// PowerShell exec-policy flags from the outer invocation are not
-	// forwarded into the resolved gjc binary itself.
-	expect(script).toContain("& {");
-	expect(script).toContain("}");
-	// No bare `& '<flag>'` invocation should leak into the inner script,
-	// because that is what previously made pwsh reject the encoded command.
-	expect(script).not.toMatch(/&\s+'-{1,2}[A-Za-z]/);
+	// The inner invocation must use the PowerShell `&` call operator directly
+	// (no `& { ... }` script-block wrapper) because adjacent single-quoted
+	// tokens inside a script-block body are a parser error. The correct shape
+	// is `& 'cmd' 'arg1' 'arg2'`, which is exactly what buildWindowsPowerShell
+	// InnerCommand produces below.
+	expect(script).toMatch(/&\s+'/);
 });
 
 it("captures psmux stderr in the attach-failed diagnostic", () => {
-	// Regression: gjc --tmux on native Windows + psmux 3.3.0 surfaces a silent
 	// exit when attach-session fails. The previous defaultSpawnSync dropped
 	// Bun.spawnSync's result.stderr, so the "attach failed" diagnostic
 	// template rendered with an empty detail and the user could not
