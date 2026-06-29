@@ -67,23 +67,23 @@ describe("default GJC tmux launch", () => {
 	});
 
 	it("builds sanitized project and branch tmux window titles", () => {
-		expect(buildGjcTmuxWindowTitle("/repo", "feature/demo")).toBe("repo-feature/demo");
-		expect(buildGjcTmuxWindowTitle("/repo", "main")).toBe("repo-main");
-		expect(buildGjcTmuxWindowTitle("/repo", null)).toBe("repo");
-		expect(buildGjcTmuxWindowTitle("/repo", "")).toBe("repo");
+		expect(buildGjcTmuxWindowTitle("/repo", "feature/demo")).toBe("GJC-repo-feature/demo");
+		expect(buildGjcTmuxWindowTitle("/repo", "main")).toBe("GJC-repo-main");
+		expect(buildGjcTmuxWindowTitle("/repo", null)).toBe("GJC-repo");
+		expect(buildGjcTmuxWindowTitle("/repo", "")).toBe("GJC-repo");
 	});
 
 	it("replaces colon-bearing tmux window title segments", () => {
-		expect(buildGjcTmuxWindowTitle("/repo:backend", "main")).toBe("repo-backend-main");
-		expect(buildGjcTmuxWindowTitle("/repo", "release:main")).toBe("repo-release-main");
-		expect(buildGjcTmuxWindowTitle("/repo", "feature:::demo")).toBe("repo-feature-demo");
+		expect(buildGjcTmuxWindowTitle("/repo:backend", "main")).toBe("GJC-repo-backend-main");
+		expect(buildGjcTmuxWindowTitle("/repo", "release:main")).toBe("GJC-repo-release-main");
+		expect(buildGjcTmuxWindowTitle("/repo", "feature:::demo")).toBe("GJC-repo-feature-demo");
 	});
 
 	it("truncates long tmux window titles to 48 visible columns while preserving the project and branch tail", () => {
 		const title = buildGjcTmuxWindowTitle("/repo", `feature/${"a".repeat(80)}tail`);
 
 		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
-		expect(title.startsWith("repo-…")).toBe(true);
+		expect(title.startsWith("GJC-repo-…")).toBe(true);
 		expect(title.endsWith("tail")).toBe(true);
 	});
 
@@ -91,16 +91,16 @@ describe("default GJC tmux launch", () => {
 		const title = buildGjcTmuxWindowTitle("/저장소", `feature/${"界".repeat(80)}끝`);
 
 		expect(Bun.stringWidth(title)).toBeLessThanOrEqual(48);
-		expect(title.startsWith("저장소-…")).toBe(true);
+		expect(title.startsWith("GJC-저장소-…")).toBe(true);
 		expect(title.endsWith("끝")).toBe(true);
 	});
 
 	it("sanitizes dot-prefixed cwd basenames for tmux window titles", () => {
-		expect(buildGjcTmuxWindowTitle("/tmp/.claude", null)).toBe("dot-claude");
-		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "feature/demo")).toBe("dot-claude-feature/demo");
-		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "repo:main")).toBe("dot-claude-repo-main");
-		expect(buildGjcTmuxWindowTitle("/tmp/...", null)).toBe("gjc");
-		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("gjc-feature/demo");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", null)).toBe("GJC-dot-claude");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "feature/demo")).toBe("GJC-dot-claude-feature/demo");
+		expect(buildGjcTmuxWindowTitle("/tmp/.claude", "repo:main")).toBe("GJC-dot-claude-repo-main");
+		expect(buildGjcTmuxWindowTitle("/tmp/...", null)).toBe("GJC-gjc");
+		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("GJC-gjc-feature/demo");
 	});
 
 	it("passes sanitized dot-prefixed cwd basenames to tmux rename-window", () => {
@@ -130,11 +130,49 @@ describe("default GJC tmux launch", () => {
 			"-t",
 			expect.stringMatching(/^=gajae_code_/),
 			"--",
-			"dot-claude",
+			"GJC-dot-claude",
 		]);
 	});
 
-	it("separates dash-leading tmux window titles from tmux options", () => {
+	it("sets the root terminal title before starting managed tmux", () => {
+		const events: string[] = [];
+		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
+		const previousIsTTY = stdout.isTTY;
+		const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+			events.push(String(chunk));
+			return true;
+		});
+		stdout.isTTY = true;
+
+		try {
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux", "hello world"],
+				cwd: "/repo",
+				env: {},
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				currentBranch: "feature/demo",
+				spawnSync: (_command, spawnArgs) => {
+					events.push(spawnArgs[0] ?? "");
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled).toBe(true);
+			expect(events[0]).toBe("\x1b]0;GJC: repo-feature/demo\x07");
+			expect(events[1]).toBe("new-session");
+			expect(writeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			stdout.isTTY = previousIsTTY;
+		}
+	});
+
+	it("passes prefixed tmux window titles after the tmux option separator", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
@@ -155,7 +193,7 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(false);
-		expect(calls[0]?.args).toEqual(["rename-window", "--", "-repo-feature/demo"]);
+		expect(calls[0]?.args).toEqual(["rename-window", "--", "GJC--repo-feature/demo"]);
 	});
 
 	it("does not plan tmux for interactive root launch without --tmux", () => {
@@ -785,7 +823,7 @@ describe("default GJC tmux launch", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toMatchObject({
 			command: "tmux",
-			args: ["rename-window", "--", "repo-feature/demo"],
+			args: ["rename-window", "--", "GJC-repo-feature/demo"],
 		});
 	});
 
@@ -889,7 +927,13 @@ describe("default GJC tmux launch", () => {
 
 		expect(newSessionIndex).toBeGreaterThanOrEqual(0);
 		expect(renameIndex).toBeGreaterThan(newSessionIndex);
-		expect(calls[renameIndex]?.args).toEqual(["rename-window", "-t", `=${sessionName}`, "--", "repo-feature/demo"]);
+		expect(calls[renameIndex]?.args).toEqual([
+			"rename-window",
+			"-t",
+			`=${sessionName}`,
+			"--",
+			"GJC-repo-feature/demo",
+		]);
 	});
 	it("falls through to direct launch when session creation fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];

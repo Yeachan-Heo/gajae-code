@@ -35,6 +35,7 @@ export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 type LaunchPolicy = "direct" | "tmux";
 
@@ -321,6 +322,8 @@ function truncateVisibleTail(value: string, maxWidth: number): string {
 }
 
 const GJC_TMUX_WINDOW_BRANCH_SEPARATOR = "-";
+const GJC_TMUX_WINDOW_TITLE_PREFIX = "GJC-";
+const GJC_TMUX_TERMINAL_TITLE_PREFIX = "GJC: ";
 
 function sanitizeTmuxWindowTitleSegment(value: string): string {
 	return value.replace(/:+/g, "-");
@@ -333,20 +336,35 @@ function sanitizeTmuxWindowProjectName(project: string): string {
 	return sanitizeTmuxWindowTitleSegment(trimmed);
 }
 
-export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
+function buildGjcTmuxPrefixedTitle(prefix: string, cwd: string, branch: string | null | undefined): string {
 	const project = sanitizeTmuxWindowProjectName(path.basename(path.resolve(cwd)) || "gjc");
+	const projectTitle = `${prefix}${project}`;
 	const trimmedBranch = sanitizeTmuxWindowTitleSegment(branch?.trim() ?? "");
-	if (!trimmedBranch) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+	if (!trimmedBranch) return truncateVisible(projectTitle, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
 	const separatorWidth = visibleWidth(GJC_TMUX_WINDOW_BRANCH_SEPARATOR);
-	const projectWidth = visibleWidth(project);
-	const fullTitle = `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${trimmedBranch}`;
+	const projectWidth = visibleWidth(projectTitle);
+	const fullTitle = `${projectTitle}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${trimmedBranch}`;
 	if (visibleWidth(fullTitle) <= GJC_TMUX_WINDOW_LABEL_MAX_WIDTH) return fullTitle;
 
 	const remainingBranchWidth = GJC_TMUX_WINDOW_LABEL_MAX_WIDTH - projectWidth - separatorWidth;
-	if (remainingBranchWidth <= 0) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+	if (remainingBranchWidth <= 0) return truncateVisible(projectTitle, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
-	return `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
+	return `${projectTitle}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
+}
+
+export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
+	return buildGjcTmuxPrefixedTitle(GJC_TMUX_WINDOW_TITLE_PREFIX, cwd, branch);
+}
+
+function buildGjcTmuxRootTerminalTitle(cwd: string, branch: string | null | undefined): string {
+	return buildGjcTmuxPrefixedTitle(GJC_TMUX_TERMINAL_TITLE_PREFIX, cwd, branch);
+}
+
+function setGjcTmuxRootTerminalTitle(title: string): void {
+	if (!process.stdout.isTTY) return;
+	const sanitized = title.replace(TERMINAL_TITLE_CONTROL_CHARS, "").trim() || "GJC";
+	process.stdout.write(`\x1b]0;${sanitized}\x07`);
 }
 
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
@@ -516,6 +534,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		stderr: "inherit",
 	};
 
+	const windowTitle = buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch);
+	setGjcTmuxRootTerminalTitle(buildGjcTmuxRootTerminalTitle(plan.project ?? plan.cwd, plan.branch));
+
 	if (plan.attachSessionName) {
 		const attached = spawnSync(
 			plan.tmuxCommand,
@@ -529,7 +550,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	if (created.exitCode === 0) {
 		renameTmuxWindow(
 			plan.tmuxCommand,
-			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
+			windowTitle,
 			spawnSync,
 			options,
 			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
