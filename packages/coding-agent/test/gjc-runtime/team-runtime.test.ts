@@ -2703,7 +2703,21 @@ describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
 	it("prepends the bun runtime when argv[1] ends in .js", async () => {
 		process.argv = ["C:\\Users\\withfox\\.bun\\bin\\bun.exe", "C:\\repo\\packages\\coding-agent\\bin\\gjc.js"];
 		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand("C:\\repo");
+		// pass win32 explicitly: the bun-prefix invariant is Windows-only —
+		// on POSIX a bare `node bin/gjc.js` works because node IS the script
+		// interpreter, so the prefix would be redundant noise.
+		// Pass win32 + a Windows-shaped execPath explicitly: the bun-prefix
+		// invariant is Windows-only — on POSIX a bare `node bin/gjc.js` works
+		// because node IS the script interpreter, so the prefix would be
+		// redundant noise. The execPath override keeps the test assertion
+		// stable across POSIX runners (which have a bare `bun`, no `.exe`).
+		const out = resolveGjcWorkerCommand(
+			"C:\\repo",
+			process.env,
+			"win32",
+			process.argv,
+			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
+		);
 		// Result must reference bun.exe AND the original .js path; without
 		// the bun prefix, Windows would dispatch the .js file through the
 		// .js file association (cscript.exe), which fails immediately with
@@ -2716,7 +2730,16 @@ describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
 	it("prepends the bun runtime when argv[1] ends in .mjs", async () => {
 		process.argv = ["bun", "/repo/packages/coding-agent/src/cli.mjs"];
 		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand("/repo");
+		// pass win32 explicitly: the bun-prefix invariant is Windows-only.
+		// pass win32 + a Windows-shaped execPath explicitly so the test is
+		// portable across POSIX runners (which have a bare `bun`, no `.exe`).
+		const out = resolveGjcWorkerCommand(
+			"/repo",
+			process.env,
+			"win32",
+			process.argv,
+			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
+		);
 		expect(out).toContain("bun");
 		expect(out).toContain("cli.mjs");
 	});
