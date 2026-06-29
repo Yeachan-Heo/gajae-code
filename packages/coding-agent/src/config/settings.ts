@@ -297,6 +297,17 @@ export class Settings {
 		return getDefault(path);
 	}
 
+	/**
+	 * Get a setting value from the user/global config only.
+	 *
+	 * Use for machine-local command hooks and other settings that must not be
+	 * activated by project-scoped config files.
+	 */
+	getGlobal<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#global, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;

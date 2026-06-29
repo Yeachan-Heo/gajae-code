@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a user-level `completion.notifyCommand` hook that runs a shell command with `GJC_NOTIFICATION_*` payload environment variables when an agent turn completes, enabling cmux/desktop/webhook completion alerts without project-config command execution.
+
 ## [0.7.1] - 2026-06-23
 ### Fixed
 
