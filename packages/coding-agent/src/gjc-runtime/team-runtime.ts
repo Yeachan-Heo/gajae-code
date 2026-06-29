@@ -1967,8 +1967,24 @@ export function buildWorkerCommand(
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
-	const invocation = platform === "win32" ? `& ${config.worker_command}` : config.worker_command;
-	return `${joined} ${invocation} ${quote(prompt)}`;
+// On Windows we wrap the worker command invocation in `& { & 'cmd' 'arg1' ... }`
+	// so pwsh keeps the whole multi-statement body in command position. Two
+	// failure modes this avoids:
+	//   1. Bare `bun 'cli.ts' 'prompt'` after `$env:X = 'y'; ...` would be
+	//      parsed in expression position and PowerShell would reject the
+	//      second quoted token with "Unexpected token '<cli.ts>'".
+	//   2. `& { 'cmd' 'arg1' 'arg2' }` (single & inside a block with adjacent
+	//      single-quoted tokens) is itself invalid because pwsh does not
+	//      concatenate adjacent single-quoted strings inside a script block.
+	// The nested `&` inside the block forces command-position parsing for
+	// the invocation. POSIX shells do not need this — they already treat
+	// `cmd 'arg'` as a normal command invocation after `;`-separated
+	// variable assignments.
+	if (platform === "win32") {
+		const invocation = `& ${config.worker_command} ${quote(prompt)}`;
+		return `& { ${joined} ${invocation} }`;
+	}
+	return `${joined} ${config.worker_command} ${quote(prompt)}`;
 }
 interface GjcTeamInitialLane {
 	label: string;
@@ -2101,15 +2117,21 @@ async function startTmuxSession(
 			// readline never receives an Enter, so the worker never starts.
 			// Create the pane without a command, then dispatch the worker
 			// command through send-keys + Enter so it actually executes.
-			// `-l` makes tmux send every key literally (no key-name resolution),
-			// so the worker command body cannot accidentally expand any embedded
-			// control characters as Enter/C-c/etc. The trailing `Enter` is a
-			// separate argv entry and tmux still resolves that as the actual
-			// submit keystroke.
-			const sendKeys = Bun.spawnSync(
-				[config.tmux_command, "send-keys", "-l", "-t", paneId, buildWorkerCommand(config, worker), "Enter"],
-				{ stdout: "ignore", stderr: "ignore" },
-			);
+			// Two-step dispatch because tmux's `-l` (literal mode) flag is
+			// global per send-keys invocation, not per arg: passing `-l
+			// <body> Enter` would treat "Enter" as literal text too. Sending
+			// the body in literal mode first and the Enter keypress second
+			// keeps the body verbatim while still submitting the prompt as a
+			// keystroke.
+			const body = buildWorkerCommand(config, worker);
+			Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, body], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
 			// void-cast the exit code so the linter does not flag an unused
 			// expression; the value is intentionally discarded here because
 			// the actual spawn outcome is recovered by the leader through

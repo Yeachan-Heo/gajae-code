@@ -2656,8 +2656,12 @@ describe("buildWorkerCommand prompt normalization", () => {
 		};
 		const worker = cfg.workers[0];
 		const out = buildWorkerCommand(cfg, worker, "win32");
-		// Strip the env-assignment prefix so we are looking only at the prompt body.
-		const m = out.match(/'([^']*(?:''[^']*)*)'\s*$/);
+		// On Windows the body is wrapped in `& { ... }` to keep pwsh in
+		// command position (a bare `bun 'cli.ts' 'prompt'` after
+		// `$env:X = 'y'; ...` would be parsed in expression position and
+		// rejected with "Unexpected token '<cli.ts>'"). Extract the inner
+		// single-quoted body to inspect.
+		const m = out.match(/& \{ [^}]*?'([^']*(?:''[^']*)*)'\s*\}\s*$/);
 		expect(m).not.toBeNull();
 		const body = (m?.[1] ?? "").replace(/''/g, "'");
 		// Body must NOT contain a literal LF: tmux send-keys would have
@@ -2682,7 +2686,7 @@ describe("buildWorkerCommand prompt normalization", () => {
 			workers: [{ id: "worker-7", index: 1, worktree_path: null }],
 		};
 		const out = buildWorkerCommand(cfg, cfg.workers[0], "win32");
-		const m = out.match(/'([^']*(?:''[^']*)*)'\s*$/);
+		const m = out.match(/& \{ [^}]*?'([^']*(?:''[^']*)*)'\s*\}\s*$/);
 		expect(m).not.toBeNull();
 		const body = (m?.[1] ?? "").replace(/''/g, "'");
 		expect(body).not.toMatch(/\n/);
