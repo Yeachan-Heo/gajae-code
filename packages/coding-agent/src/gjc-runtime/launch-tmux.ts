@@ -367,6 +367,10 @@ function setGjcTmuxRootTerminalTitle(title: string): void {
 	process.stdout.write(`\x1b]0;${sanitized}\x07`);
 }
 
+function shouldSetGjcTmuxRootTerminalTitle(parsed: Args, env: NodeJS.ProcessEnv): boolean {
+	return !parsed.noTitle && !env.PI_NO_TITLE;
+}
+
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
 	return target ? ["rename-window", "-t", target, "--", title] : ["rename-window", "--", title];
 }
@@ -535,7 +539,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	};
 
 	const windowTitle = buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch);
-	setGjcTmuxRootTerminalTitle(buildGjcTmuxRootTerminalTitle(plan.project ?? plan.cwd, plan.branch));
+	const rootTerminalTitle = shouldSetGjcTmuxRootTerminalTitle(context.parsed, env)
+		? buildGjcTmuxRootTerminalTitle(plan.project ?? plan.cwd, plan.branch)
+		: undefined;
 
 	if (plan.attachSessionName) {
 		const attached = spawnSync(
@@ -543,7 +549,10 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
 			options,
 		);
-		if (attached.exitCode === 0) return true;
+		if (attached.exitCode === 0) {
+			if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
+			return true;
+		}
 	}
 
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
@@ -576,6 +585,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			);
 			return true;
 		}
+		if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
 	}
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(
