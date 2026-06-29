@@ -63,6 +63,37 @@ function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Ag
 	});
 }
 
+function createCachedLocalModel(
+	provider: "ollama" | "lm-studio",
+	id: string,
+	baseUrl: string,
+): Model<"openai-responses"> {
+	return {
+		id,
+		name: id,
+		api: "openai-responses",
+		provider,
+		baseUrl,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 8_192,
+	};
+}
+
+function seedLocalProviderCache(
+	tempDir: TempDir,
+	authStorage: AuthStorage,
+	models: Model<"openai-responses">[],
+): ModelRegistry {
+	const cacheDbPath = path.join(tempDir.path(), "models.db");
+	for (const model of models) {
+		writeModelCache(model.provider, Date.now(), [model], true, "", cacheDbPath);
+	}
+	return new ModelRegistry(authStorage, path.join(tempDir.path(), "models.json"));
+}
+
 describe("AgentSession retry fallback", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -194,6 +225,156 @@ describe("AgentSession retry fallback", () => {
 				role: "default",
 			},
 		]);
+	});
+
+	it("explicitly falls back from an unavailable local provider to the first non-local configured fallback", async () => {
+		const primaryModel = createCachedLocalModel("ollama", "qwen-local", "http://127.0.0.1:11434/v1");
+		const localFallback = createCachedLocalModel("lm-studio", "backup-local", "http://localhost:1234/v1");
+		const cloudFallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!cloudFallback) {
+			throw new Error("Expected bundled OpenAI fallback model to exist");
+		}
+		modelRegistry = seedLocalProviderCache(tempDir, authStorage, [primaryModel, localFallback]);
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const fallbackSucceededEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_succeeded" }>> = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (requestedModel.provider === primaryModel.provider && requestedModel.id === primaryModel.id) {
+					mock.push({ throw: "connect ECONNREFUSED 127.0.0.1:11434" });
+				} else if (requestedModel.provider === cloudFallback.provider && requestedModel.id === cloudFallback.id) {
+					mock.push({ content: ["Recovered on explicit cloud fallback"] });
+				} else {
+					throw new Error(`Unexpected model requested: ${requestedModel.provider}/${requestedModel.id}`);
+				}
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+			"retry.fallbackChains": {
+				default: [`${localFallback.provider}/${localFallback.id}`, `${cloudFallback.provider}/${cloudFallback.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+			if (event.type === "retry_fallback_succeeded") {
+				fallbackSucceededEvents.push(event);
+			}
+		});
+
+		await session.prompt("Recover from unavailable local provider");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${cloudFallback.provider}/${cloudFallback.id}`,
+		]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ attempt: 1, maxAttempts: 1, delayMs: 0 });
+		expect(fallbackAppliedEvents).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: `${primaryModel.provider}/${primaryModel.id}`,
+				to: `${cloudFallback.provider}/${cloudFallback.id}`,
+				role: "default",
+			},
+		]);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		expect(fallbackSucceededEvents).toEqual([
+			{
+				type: "retry_fallback_succeeded",
+				model: `${cloudFallback.provider}/${cloudFallback.id}`,
+				role: "default",
+			},
+		]);
+		const lastAssistant = getLastAssistantMessage(session);
+		expect(lastAssistant.stopReason).toBe("stop");
+		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered on explicit cloud fallback" });
+	});
+
+	it("does not hammer a failing local provider when no non-local fallback is explicitly configured", async () => {
+		const primaryModel = createCachedLocalModel("ollama", "qwen-local", "http://127.0.0.1:11434/v1");
+		const localFallback = createCachedLocalModel("lm-studio", "backup-local", "http://localhost:1234/v1");
+		modelRegistry = seedLocalProviderCache(tempDir, authStorage, [primaryModel, localFallback]);
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel({
+			handler: () => ({ throw: "fetch failed: connect ECONNREFUSED 127.0.0.1:11434" }),
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 3,
+			"retry.fallbackChains": {
+				default: [`${localFallback.provider}/${localFallback.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+		});
+
+		await session.prompt("Do not retry unavailable local provider without cloud fallback");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(fallbackAppliedEvents).toHaveLength(0);
+		const lastAssistant = getLastAssistantMessage(session);
+		expect(lastAssistant.stopReason).toBe("error");
+		expect(lastAssistant.errorMessage).toBe("fetch failed: connect ECONNREFUSED 127.0.0.1:11434");
 	});
 
 	it("uses Google retry hints in quota errors before quota backoff", async () => {

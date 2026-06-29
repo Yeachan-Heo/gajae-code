@@ -437,7 +437,8 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
    running (`gjc launch` in a repo, or `GJC_NOTIFICATIONS=1`). The owner starts
    the loopback control endpoint and accepts `/session_*` while running; with zero
    active sessions it still idle-exits after the inactivity timeout.
-2. **Create.** From your paired chat send `/session_create path <repo-dir>` (or
+2. **Create.** From your paired chat, pick `/session_create` from the Telegram
+   command menu or send `/session_create path <repo-dir>` (or
    `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
    `<repo-dir>`, `<repo>`, and `<newdir>` may use `~`/`~/...` for your own home
    directory; named-user forms such as `~alice/repo` are rejected. The bot replies

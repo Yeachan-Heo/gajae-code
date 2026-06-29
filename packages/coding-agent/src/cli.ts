@@ -38,6 +38,7 @@ export const commands: CommandEntry[] = [
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
+	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
 	{ name: "mcp", load: () => import("./commands/mcp").then(m => m.default) },
 	{
@@ -77,6 +78,19 @@ async function installRuntimeGlobals(): Promise<void> {
 	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
 	delete process.env.MallocStackLogging;
 	delete process.env.MallocStackLoggingNoCompact;
+}
+
+function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
+	return argv[0] === "notify" && argv[1] === "daemon-internal";
+}
+
+async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
+	const { parseNotifyArgs, runNotifyCommand } = await import("./cli/notify-cli");
+	const cmd = parseNotifyArgs(argv);
+	if (cmd?.action !== "daemon-internal") {
+		throw new Error("invalid notify daemon-internal fast path");
+	}
+	await runNotifyCommand(cmd);
 }
 
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
@@ -208,6 +222,10 @@ async function runSmokeTest(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (isNotifyDaemonInternalFastPath(argv)) {
+		await runNotifyDaemonInternalFastPath(argv);
+		return;
+	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
 		return;

@@ -86,6 +86,22 @@ export function buildGjcTmuxExactOptionTarget(
 	return `=${sessionName}:`;
 }
 
+/**
+ * Build the exact-session target for tmux *session-scoped* commands such as
+ * `attach-session` and `kill-session`. Native tmux accepts `=NAME` for an
+ * exact session match, but Windows psmux 3.3.x rejects that target form for
+ * session commands even though the bare `NAME` resolves. Keep native tmux on
+ * exact targets and intentionally use the bare session name for psmux.
+ */
+export function buildGjcTmuxExactSessionTarget(
+	sessionName: string,
+	opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; binary?: ResolvedTmuxBinary } = {},
+): string {
+	const binary = opts.binary ?? resolveGjcTmuxBinary({ env: opts.env, platform: opts.platform });
+	if (binary.isPsmux) return sessionName;
+	return `=${sessionName}`;
+}
+
 export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
 
 export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {

@@ -23,6 +23,7 @@ import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
+import { classifyHookSelectorBellEvent, ringTerminalBell } from "../utils/terminal-bell";
 
 const MAX_WIDGET_LINES = 10;
 const HOOK_SELECTOR_CHROME_ROWS = 7;
@@ -621,6 +622,8 @@ export class ExtensionUiController {
 			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - inlineInputRows - HOOK_SELECTOR_CHROME_ROWS;
 		const scrollTitleRows =
 			requestedTitleRows === undefined ? undefined : Math.max(1, Math.min(requestedTitleRows, availableTitleRows));
+
+		ringTerminalBell(classifyHookSelectorBellEvent(title));
 
 		this.ctx.hookSelector = new HookSelectorComponent(
 			title,

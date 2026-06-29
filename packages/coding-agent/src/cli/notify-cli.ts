@@ -6,7 +6,7 @@
 import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils";
 import chalk from "chalk";
-import { Settings } from "../config/settings";
+import type { Settings } from "../config/settings";
 import { getNotificationConfig, maskToken } from "../notifications/config";
 
 export type NotifyAction = "setup" | "status" | "daemon-internal";
@@ -122,7 +122,9 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 }
 
 async function getSettings(deps: NotifyCommandDeps): Promise<Settings> {
-	return deps.settings ?? (await Settings.init());
+	if (deps.settings) return deps.settings;
+	const { Settings } = await import("../config/settings");
+	return await Settings.init();
 }
 
 async function runSetup(deps: NotifyCommandDeps): Promise<void> {

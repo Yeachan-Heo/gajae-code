@@ -28,6 +28,7 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../../config/model-resolver";
+import type { ModelProfileConfig } from "../../config/models-config-schema";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
@@ -105,6 +106,7 @@ export type ModelSelectorSelection =
 	  }
 	| {
 			kind: "createProfile";
+			profile: ModelProfileConfig;
 	  };
 
 interface PendingThinkingChoice {
@@ -155,11 +157,27 @@ interface PresetCreateRow {
 	kind: "create";
 }
 
+interface PresetCreateUnavailableRow {
+	kind: "createUnavailable";
+	label: string;
+}
+
+interface PresetAlreadySavedRow {
+	kind: "alreadySaved";
+	profileName: string;
+}
+
 interface PresetBrowseRow {
 	kind: "browse";
 }
 
-type PresetLandingRow = PresetGroupRow | PresetProfileRow | PresetCreateRow | PresetBrowseRow;
+type PresetLandingRow =
+	| PresetGroupRow
+	| PresetProfileRow
+	| PresetCreateRow
+	| PresetCreateUnavailableRow
+	| PresetAlreadySavedRow
+	| PresetBrowseRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -174,6 +192,10 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return "browse";
 		case "create":
 			return "create";
+		case "createUnavailable":
+			return "createUnavailable";
+		case "alreadySaved":
+			return `alreadySaved:${row.profileName}`;
 	}
 }
 
@@ -192,6 +214,64 @@ function isPrintableCharacter(keyData: string): boolean {
 
 function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
 	return [...new Set(profile.requiredProviders)].sort((a, b) => a.localeCompare(b));
+}
+
+function isInheritedRoleSelector(value: string | undefined): boolean {
+	const normalized = value?.trim();
+	return !normalized || normalized === "default" || normalized === "pi/default";
+}
+
+function getDefaultAliasThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
+	const normalized = value?.trim();
+	if (!normalized?.startsWith("pi/default:")) return undefined;
+	return parseThinkingLevel(normalized.slice("pi/default:".length));
+}
+
+function getSelectorProvider(selector: string): string | undefined {
+	const slashIndex = selector.indexOf("/");
+	return slashIndex > 0 ? selector.slice(0, slashIndex) : undefined;
+}
+
+function deriveRequiredProviders(modelMapping: ModelProfileConfig["model_mapping"]): string[] {
+	const providers = new Set<string>();
+	for (const selector of Object.values(modelMapping)) {
+		const provider = getSelectorProvider(selector);
+		if (provider) providers.add(provider);
+	}
+	return [...providers].sort((a, b) => a.localeCompare(b));
+}
+
+function sameStringRecord(
+	left: Readonly<Record<string, string | undefined>>,
+	right: Readonly<Record<string, string | undefined>>,
+): boolean {
+	const leftEntries = Object.entries(left)
+		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b));
+	const rightEntries = Object.entries(right)
+		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (leftEntries.length !== rightEntries.length) return false;
+	for (let i = 0; i < leftEntries.length; i++) {
+		const leftEntry = leftEntries[i];
+		const rightEntry = rightEntries[i];
+		if (!leftEntry || !rightEntry || leftEntry[0] !== rightEntry[0] || leftEntry[1] !== rightEntry[1]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let i = 0; i < left.length; i++) {
+		if (left[i] !== right[i]) return false;
+	}
+	return true;
+}
+
+function hasPersistableProfileSnapshot(snapshot: ModelProfileConfig): boolean {
+	return Object.keys(snapshot.model_mapping).length > 0 && snapshot.required_providers.length > 0;
 }
 /**
  * Component that renders a canonical model selector with provider tabs.
@@ -733,6 +813,67 @@ export class ModelSelectorComponent extends Container {
 		return groupModelProfilesForPresetLanding(this.#modelRegistry.getModelProfiles?.() ?? new Map());
 	}
 
+	#formatCurrentModelSelector(
+		thinkingLevel: ThinkingLevel | undefined = this.#currentThinkingLevel,
+	): string | undefined {
+		if (!this.#currentModel) return undefined;
+		return formatModelSelectorValue(`${this.#currentModel.provider}/${this.#currentModel.id}`, thinkingLevel);
+	}
+
+	#resolveProfileModelSelector(value: string | undefined): string | undefined {
+		const normalized = value?.trim();
+		if (isInheritedRoleSelector(normalized)) return undefined;
+
+		const resolved = resolveModelRoleValue(normalized, this.#modelRegistry.getAll(), {
+			settings: this.#settings,
+			matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
+			modelRegistry: this.#modelRegistry,
+		});
+		if (resolved.model) {
+			return formatModelSelectorValue(`${resolved.model.provider}/${resolved.model.id}`, resolved.thinkingLevel);
+		}
+
+		const inheritedDefaultThinkingLevel = getDefaultAliasThinkingLevel(normalized);
+		if (inheritedDefaultThinkingLevel) return this.#formatCurrentModelSelector(inheritedDefaultThinkingLevel);
+		return undefined;
+	}
+
+	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
+		const modelMapping: ModelProfileConfig["model_mapping"] = {};
+		const currentModelSelector = this.#formatCurrentModelSelector();
+		if (currentModelSelector) {
+			modelMapping.default = currentModelSelector;
+		} else {
+			const defaultRole = this.#settings.getModelRole("default");
+			const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
+			if (defaultSelector) modelMapping.default = defaultSelector;
+		}
+
+		const agentOverrides = this.#settings.get("task.agentModelOverrides");
+		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
+			if (role === "default") continue;
+			const selector = this.#resolveProfileModelSelector(agentOverrides[role]);
+			if (selector) modelMapping[role] = selector;
+		}
+
+		return {
+			required_providers: deriveRequiredProviders(modelMapping),
+			model_mapping: modelMapping,
+		};
+	}
+
+	#findDuplicateGeneratedProfile(snapshot: ModelProfileConfig): ModelProfileDefinition | undefined {
+		for (const profile of this.#modelRegistry.getModelProfiles?.().values() ?? []) {
+			if (
+				sameStringRecord(profile.modelMapping, snapshot.model_mapping) &&
+				sameStringArray(profile.requiredProviders, snapshot.required_providers)
+			) {
+				return profile;
+			}
+		}
+		return undefined;
+	}
+
 	#getPresetRows(): PresetLandingRow[] {
 		const rows: PresetLandingRow[] = [];
 		for (const [groupId, profiles] of this.#getPresetGroups()) {
@@ -741,7 +882,15 @@ export class ModelSelectorComponent extends Container {
 				for (const profile of profiles) rows.push({ kind: "profile", groupId, profile });
 			}
 		}
-		rows.push({ kind: "create" });
+		const snapshot = this.#buildCustomModelProfileSnapshot();
+		if (hasPersistableProfileSnapshot(snapshot)) {
+			const duplicateProfile = this.#findDuplicateGeneratedProfile(snapshot);
+			rows.push(
+				duplicateProfile ? { kind: "alreadySaved", profileName: duplicateProfile.name } : { kind: "create" },
+			);
+		} else {
+			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
+		}
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -815,7 +964,14 @@ export class ModelSelectorComponent extends Container {
 
 	#expandSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
+		if (
+			!selected ||
+			selected.kind === "browse" ||
+			selected.kind === "create" ||
+			selected.kind === "createUnavailable" ||
+			selected.kind === "alreadySaved"
+		)
+			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
 		const targetIdentity = presetRowIdentity(selected);
 		this.#expandedPresetProviderId = selected.groupId;
@@ -824,7 +980,14 @@ export class ModelSelectorComponent extends Container {
 
 	#collapseSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
-		if (!selected || selected.kind === "browse" || selected.kind === "create") return;
+		if (
+			!selected ||
+			selected.kind === "browse" ||
+			selected.kind === "create" ||
+			selected.kind === "createUnavailable" ||
+			selected.kind === "alreadySaved"
+		)
+			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
 		const targetIdentity = selected.kind === "profile" ? `group:${selected.groupId}` : presetRowIdentity(selected);
 		this.#expandedPresetProviderId = undefined;
@@ -858,6 +1021,17 @@ export class ModelSelectorComponent extends Container {
 			if (row.kind === "create") {
 				const label = "Create custom preset";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
+			if (row.kind === "createUnavailable") {
+				const renderedLabel = selected ? theme.fg("accent", row.label) : theme.fg("dim", row.label);
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+				continue;
+			}
+			if (row.kind === "alreadySaved") {
+				const label = `Already saved as ${row.profileName}`;
+				const renderedLabel = selected ? theme.fg("accent", label) : theme.fg("dim", label);
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
 				continue;
 			}
 			if (row.kind === "browse") {
@@ -1306,7 +1480,10 @@ export class ModelSelectorComponent extends Container {
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
 		if (row.kind === "create") {
-			this.#onSelectCallback({ kind: "createProfile" });
+			this.#onSelectCallback({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
+			return;
+		}
+		if (row.kind === "alreadySaved" || row.kind === "createUnavailable") {
 			return;
 		}
 		if (row.kind === "browse") {

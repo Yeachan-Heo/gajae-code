@@ -839,7 +839,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 	});
 });
 
-test("daemon registers in-thread config commands and drops stale rpc/answer commands", async () => {
+test("daemon registers in-thread config and lifecycle commands and drops stale rpc/answer commands", async () => {
 	const s = settings(tempAgentDir());
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -856,6 +856,10 @@ test("daemon registers in-thread config commands and drops stale rpc/answer comm
 	expect(cmds).toContain("verbose");
 	expect(cmds).toContain("lean");
 	expect(cmds).toContain("redact");
+	expect(cmds).toContain("session_create");
+	expect(cmds).toContain("session_recent");
+	expect(cmds).toContain("session_close");
+	expect(cmds).toContain("session_resume");
 	expect(cmds).not.toContain("answer");
 	expect(cmds).not.toContain("attach");
 	expect(cmds).not.toContain("detach");

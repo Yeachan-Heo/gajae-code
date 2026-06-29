@@ -1079,6 +1079,27 @@
 							"short",
 							"long"
 						]
+					},
+					"openaiCompat": {
+						"type": "object",
+						"properties": {
+							"baseUrl": {
+								"type": "string",
+								"minLength": 1
+							},
+							"apiKey": {
+								"type": "string",
+								"minLength": 1
+							},
+							"apiKeyEnv": {
+								"type": "string",
+								"minLength": 1
+							}
+						},
+						"required": [
+							"baseUrl"
+						],
+						"additionalProperties": false
 					}
 				},
 				"additionalProperties": false

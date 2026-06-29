@@ -1,6 +1,7 @@
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import {
 	buildGjcTmuxExactOptionTarget,
+	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxUntaggedSessionError,
@@ -60,7 +61,7 @@ function runTmux(args: string[], env: NodeJS.ProcessEnv = process.env): string {
 
 function tryKillSession(sessionName: string, env: NodeJS.ProcessEnv): void {
 	try {
-		runTmux(["kill-session", "-t", `=${sessionName}`], env);
+		runTmux(["kill-session", "-t", buildGjcTmuxExactSessionTarget(sessionName, { env })], env);
 	} catch {
 		// Best-effort cleanup only; preserve the original create/tag failure.
 	}
@@ -360,7 +361,7 @@ export function removeGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv
 	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE) {
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
 	}
-	runTmux(["kill-session", "-t", `=${session.name}`], env);
+	runTmux(["kill-session", "-t", buildGjcTmuxExactSessionTarget(session.name, { env })], env);
 	return session;
 }
 
@@ -404,18 +405,21 @@ export function forceCloseGjcTmuxSession(
 		}
 	}
 	// Intentionally NOT refusing live/attached panes — force-close is hard-kill.
-	runTmux(["kill-session", "-t", `=${session.name}`], env);
+	runTmux(["kill-session", "-t", buildGjcTmuxExactSessionTarget(session.name, { env })], env);
 	return session;
 }
 
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
 	const session = statusGjcTmuxSession(sessionName, env);
 	const tmuxCommand = resolveGjcTmuxCommand(env);
-	const result = Bun.spawnSync([tmuxCommand, "attach-session", "-t", `=${session.name}`], {
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-		env,
-	});
+	const result = Bun.spawnSync(
+		[tmuxCommand, "attach-session", "-t", buildGjcTmuxExactSessionTarget(session.name, { env })],
+		{
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+			env,
+		},
+	);
 	process.exit(result.exitCode ?? 1);
 }

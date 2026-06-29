@@ -2345,7 +2345,7 @@ mod tests {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 		let sibling = std::process::Command::new("/bin/sh")
 			.arg("-c")
-			.arg("sleep 5")
+			.arg("sleep 30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
@@ -2370,25 +2370,33 @@ mod tests {
 			.expect("grandchild marker should be emitted before timeout");
 		assert_eq!(result.exit_code, Some(124), "output={output:?}");
 
-		for _ in 0..250 {
-			let grandchild_dead = process::Process::from_pid(grandchild_pid)
-				.is_none_or(|process| process.status() != process::ProcessStatus::Running);
-			let sibling_alive = process::Process::from_pid(sibling_pid)
-				.is_some_and(|process| process.status() == process::ProcessStatus::Running);
-			if grandchild_dead && sibling_alive {
-				let _ = process::Process::from_pid(sibling_pid)
-					.expect("sibling should still be alive")
-					.kill_tree(Some(process::KILL_SIGNAL));
-				return;
+		// The unrelated sibling lives in the *test's* process group, so the
+		// timeout's group-targeted reaping never targets it; whether it was hit
+		// is fully decided by the time `execute_shell` returns. Check (and reap)
+		// it now instead of racing its liveness against the asynchronous death
+		// of the reparented grandchild — coupling the two previously let a slow
+		// runner fail spuriously when the sibling's sleep elapsed first.
+		let sibling_alive = process::Process::from_pid(sibling_pid)
+			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
+		let _ = process::Process::from_pid(sibling_pid)
+			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		assert!(sibling_alive, "timeout killed unrelated sibling {sibling_pid}; output={output:?}");
+
+		// SIGKILL delivery to the reparented grandchild can lag under CI load, so
+		// poll generously rather than asserting a tight deadline.
+		let mut grandchild_dead = false;
+		for _ in 0..500 {
+			if process::Process::from_pid(grandchild_pid)
+				.is_none_or(|process| process.status() != process::ProcessStatus::Running)
+			{
+				grandchild_dead = true;
+				break;
 			}
 			time::sleep(Duration::from_millis(20)).await;
 		}
-		let _ = process::Process::from_pid(sibling_pid)
-			.expect("sibling should still be alive")
-			.kill_tree(Some(process::KILL_SIGNAL));
-		panic!(
-			"timeout left reparented grandchild {grandchild_pid} alive or killed sibling; \
-			 output={output:?}"
+		assert!(
+			grandchild_dead,
+			"timeout left reparented grandchild {grandchild_pid} alive; output={output:?}"
 		);
 	}
 
@@ -2398,7 +2406,7 @@ mod tests {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 		let sibling = std::process::Command::new("/bin/sh")
 			.arg("-c")
-			.arg("sleep 5")
+			.arg("sleep 30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
@@ -2457,23 +2465,33 @@ mod tests {
 		run.abort();
 		let _ = run.await;
 
-		for _ in 0..50 {
-			let grandchild_dead = process::Process::from_pid(grandchild_pid)
-				.is_none_or(|process| process.status() != process::ProcessStatus::Running);
-			let sibling_alive = process::Process::from_pid(sibling_pid)
-				.is_some_and(|process| process.status() == process::ProcessStatus::Running);
-			if grandchild_dead && sibling_alive {
-				let _ = process::Process::from_pid(sibling_pid)
-					.expect("sibling should still be alive")
-					.kill_tree(Some(process::KILL_SIGNAL));
-				return;
+		// The unrelated sibling shares the test's process group; cancellation
+		// only targets the command's descendants, so the sibling's survival is
+		// settled once `run` finishes. Check (and reap) it now rather than
+		// coupling it to the reparented grandchild's asynchronous death.
+		let sibling_alive = process::Process::from_pid(sibling_pid)
+			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
+		let _ = process::Process::from_pid(sibling_pid)
+			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		assert!(
+			sibling_alive,
+			"cancellation killed unrelated sibling {sibling_pid}; output={output:?}"
+		);
+
+		let mut grandchild_dead = false;
+		for _ in 0..500 {
+			if process::Process::from_pid(grandchild_pid)
+				.is_none_or(|process| process.status() != process::ProcessStatus::Running)
+			{
+				grandchild_dead = true;
+				break;
 			}
 			time::sleep(Duration::from_millis(20)).await;
 		}
-		let _ = process::Process::from_pid(sibling_pid)
-			.expect("sibling should still be alive")
-			.kill_tree(Some(process::KILL_SIGNAL));
-		panic!("reparented grandchild {grandchild_pid} survived cancellation");
+		assert!(
+			grandchild_dead,
+			"reparented grandchild {grandchild_pid} survived cancellation; output={output:?}"
+		);
 	}
 
 	#[cfg(unix)]

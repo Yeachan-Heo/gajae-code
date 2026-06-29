@@ -18,6 +18,14 @@ GJC already exposes public lifecycle events through the extension/hook event con
 - `turn_end` — a model/tool turn finished. The public payload is `{ type: "turn_end", turnIndex, message, toolResults }`.
 - `agent_end` — the agent loop for a submitted prompt reached a terminal boundary. The public payload is `{ type: "agent_end", messages }`.
 
+For simple local side effects that do not need a full extension, set the user-level `completion.notifyCommand`. GJC runs it on completed agent turns with `GJC_NOTIFICATION_*` environment variables (`GJC_NOTIFICATION_TITLE`, `GJC_NOTIFICATION_BODY`, `GJC_NOTIFICATION_JSON`, etc.); project settings cannot activate this command hook.
+
+```sh
+gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_TITLE" --body "$GJC_NOTIFICATION_BODY"'
+```
+
+`cmux notify` returning successfully means GJC handed the completion event to cmux. cmux may still suppress the native desktop banner when the app/window is focused, the emitting workspace is active, or the notification panel is open. In those cases, check cmux's notification panel or unread workspace state instead of treating the missing banner as a GJC delivery failure.
+
 Recommended external mapping:
 
 | Notification | Public event | Status guidance |

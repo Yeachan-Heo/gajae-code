@@ -3,7 +3,10 @@ import {
 	__setBinaryResolverForTests,
 	clearPsmuxDetectionCache,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
-import { buildGjcTmuxExactOptionTarget } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import {
+	buildGjcTmuxExactOptionTarget,
+	buildGjcTmuxExactSessionTarget,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	createGjcTmuxSession,
 	listGjcTmuxSessions,
@@ -188,6 +191,23 @@ describe("GJC tmux session management", () => {
 		expect(showOptions).toEqual(["tmux", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
 		// Session-scoped commands keep the bare exact target, which tmux resolves.
 		expect(calls.at(-1)).toEqual(["tmux", "kill-session", "-t", "=gajae_code_work"]);
+	});
+
+	it("builds psmux-aware targets for session-scoped commands", () => {
+		__setBinaryResolverForTests(candidate =>
+			candidate === "psmux" || candidate === "pmux" ? `/fake/${candidate}` : null,
+		);
+		try {
+			expect(buildGjcTmuxExactSessionTarget("work", { env: { GJC_TMUX_COMMAND: "tmux" } })).toBe("=work");
+			expect(
+				buildGjcTmuxExactSessionTarget("work", { env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" } }),
+			).toBe("work");
+			expect(
+				buildGjcTmuxExactSessionTarget("work", { env: { GJC_TMUX_COMMAND: "pmux", GJC_PSMUX_COMMAND: "pmux" } }),
+			).toBe("work");
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
 	});
 
 	it("drops the tmux `=NAME` exact-session prefix on psmux for option commands", () => {

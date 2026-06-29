@@ -505,28 +505,17 @@ const usageSegment: StatusLineSegment = {
 	id: "usage",
 	render(ctx) {
 		const u = ctx.usage;
-		if (!u || (!u.fiveHour && !u.sevenDay)) {
+		if (!u || u.windows.length === 0) {
 			return { content: "", visible: false };
 		}
-		const parts: string[] = [];
-		if (u.fiveHour) {
-			const pct = u.fiveHour.percent;
-			const pctText = theme.fg(pickUsageColor(pct), `${Math.round(pct)}%`);
+		const parts = u.windows.map(window => {
+			const pctText = theme.fg(pickUsageColor(window.percent), `${Math.round(window.percent)}%`);
 			const reset =
-				u.fiveHour.resetMinutes !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.fiveHour.resetMinutes, "m")})`)
+				window.resetValue !== undefined && window.resetUnit !== undefined
+					? theme.fg("muted", ` (${formatUsageReset(window.resetValue, window.resetUnit)})`)
 					: "";
-			parts.push(`5h ${pctText}${reset}`);
-		}
-		if (u.sevenDay) {
-			const pct = u.sevenDay.percent;
-			const pctText = theme.fg(pickUsageColor(pct), `${Math.round(pct)}%`);
-			const reset =
-				u.sevenDay.resetHours !== undefined
-					? theme.fg("muted", ` (${formatUsageReset(u.sevenDay.resetHours, "h")})`)
-					: "";
-			parts.push(`7d ${pctText}${reset}`);
-		}
+			return `${window.label} ${pctText}${reset}`;
+		});
 		const content = withIcon(theme.icon.time, parts.join(theme.sep.dot));
 		return { content, visible: true };
 	},

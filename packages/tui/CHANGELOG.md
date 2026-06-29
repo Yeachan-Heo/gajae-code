@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolved terminal dimensions from the live TTY window size before stream defaults so wide Windows Terminal/PowerShell sessions render against the actual viewport width (#1239).
+
 ## [0.7.4] - 2026-06-27
 
 ### Fixed

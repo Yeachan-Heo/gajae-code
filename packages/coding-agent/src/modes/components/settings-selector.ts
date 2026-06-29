@@ -27,7 +27,9 @@ import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
+import type { StatusLineSegmentOptions } from "./status-line";
 import { getPreset } from "./status-line/presets";
+import { ALL_SEGMENT_IDS } from "./status-line/segments";
 
 /**
  * A submenu component for selecting from a list of options.
@@ -161,6 +163,449 @@ class SelectSubmenu extends Container {
 		this.#selectList.handleInput(data);
 	}
 }
+const STATUS_LINE_CUSTOM_EDITOR_ID = "statusLine.customEditor";
+const PUBLIC_STATUS_SEGMENTS = ALL_SEGMENT_IDS.filter(id => id !== "pi");
+
+type StatusLineDraft = Required<
+	Pick<StatusLinePreviewSettings, "preset" | "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
+>;
+
+const BOOL_VALUES = ["true", "false"];
+const PATH_LENGTH_OPTIONS: SelectItem[] = [16, 24, 32, 40, 50, 60, 80].map(value => ({
+	value: String(value),
+	label: String(value),
+}));
+const TIME_FORMAT_OPTIONS: SelectItem[] = [
+	{ value: "24h", label: "24h" },
+	{ value: "12h", label: "12h" },
+];
+
+function cloneSegmentOptions(options: StatusLineSegmentOptions | undefined): StatusLineSegmentOptions {
+	return mergeSegmentOptions(undefined, options);
+}
+
+function mergeSegmentOptions(
+	base: StatusLineSegmentOptions | undefined,
+	overrides: StatusLineSegmentOptions | undefined,
+): StatusLineSegmentOptions {
+	return {
+		model: base?.model || overrides?.model ? { ...(base?.model ?? {}), ...(overrides?.model ?? {}) } : undefined,
+		path: base?.path || overrides?.path ? { ...(base?.path ?? {}), ...(overrides?.path ?? {}) } : undefined,
+		git: base?.git || overrides?.git ? { ...(base?.git ?? {}), ...(overrides?.git ?? {}) } : undefined,
+		time: base?.time || overrides?.time ? { ...(base?.time ?? {}), ...(overrides?.time ?? {}) } : undefined,
+	};
+}
+
+function effectiveSegmentOptions(
+	preset: StatusLinePreset,
+	options: StatusLineSegmentOptions | undefined,
+): StatusLineSegmentOptions {
+	return mergeSegmentOptions(getPreset(preset).segmentOptions, options);
+}
+
+function effectiveCustomSegments(
+	preset: StatusLinePreset,
+	leftSegments: StatusLineSegmentId[],
+	rightSegments: StatusLineSegmentId[],
+): { leftSegments: StatusLineSegmentId[]; rightSegments: StatusLineSegmentId[] } {
+	if (preset === "custom") {
+		return { leftSegments: [...leftSegments], rightSegments: [...rightSegments] };
+	}
+	const presetDef = getPreset(preset);
+	return {
+		leftSegments: [...presetDef.leftSegments],
+		rightSegments: [...presetDef.rightSegments],
+	};
+}
+
+function statusSegmentLabel(id: StatusLineSegmentId): string {
+	return id.replace(/_/g, " ");
+}
+
+function segmentPlacement(
+	id: StatusLineSegmentId,
+	leftSegments: StatusLineSegmentId[],
+	rightSegments: StatusLineSegmentId[],
+): "hidden" | "left" | "right" {
+	if (leftSegments.includes(id)) return "left";
+	if (rightSegments.includes(id)) return "right";
+	return "hidden";
+}
+
+class StatusLineCustomEditor extends Container {
+	#list!: SettingsList;
+	#draft: StatusLineDraft;
+	#currentWidthPreviewText!: Text;
+	#narrowWidthPreviewText!: Text;
+	#previewHighlightSegment: StatusLineSegmentId | undefined;
+
+	constructor(
+		private readonly callbacks: SettingsCallbacks,
+		private readonly done: (value?: string) => void,
+	) {
+		super();
+		const preset = settings.get("statusLine.preset");
+		const seeded = effectiveCustomSegments(
+			preset,
+			settings.get("statusLine.leftSegments"),
+			settings.get("statusLine.rightSegments"),
+		);
+		this.#draft = {
+			preset: "custom",
+			leftSegments: seeded.leftSegments,
+			rightSegments: seeded.rightSegments,
+			separator: settings.get("statusLine.separator"),
+			segmentOptions: effectiveSegmentOptions(
+				preset,
+				settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+			),
+		};
+		this.#preview();
+		this.#build();
+	}
+
+	#build(): void {
+		this.clear();
+		this.addChild(new Text(theme.bold(theme.fg("accent", "Status Line Custom Editor")), 0, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("muted", "Current width preview:"), 0, 0));
+		this.#currentWidthPreviewText = new Text(this.#statusLinePreview(), 0, 0);
+		this.addChild(this.#currentWidthPreviewText);
+		this.addChild(new Text(theme.fg("muted", "Narrow width preview:"), 0, 0));
+		this.#narrowWidthPreviewText = new Text(this.#statusLinePreview(40), 0, 0);
+		this.addChild(this.#narrowWidthPreviewText);
+		this.addChild(new Spacer(1));
+		this.#list = new SettingsList(
+			this.#items(),
+			14,
+			getSettingsListTheme(),
+			(id, value) => this.#handleChange(id, value),
+			() => this.#cancel(),
+			item => this.#setSelectedItem(item),
+		);
+		this.addChild(this.#list);
+	}
+
+	#refresh(): void {
+		this.#refreshPreview();
+		this.#list.setItems(this.#items());
+	}
+
+	#refreshPreview(): void {
+		this.#currentWidthPreviewText.setText(this.#statusLinePreview());
+		this.#narrowWidthPreviewText.setText(this.#statusLinePreview(40));
+	}
+
+	#statusLinePreview(width?: number): string {
+		return this.callbacks.getStatusLinePreview?.(width) ?? theme.fg("dim", "(preview not available)");
+	}
+	#setSelectedItem(item: SettingItem | undefined): void {
+		this.#previewHighlightSegment = this.#highlightSegmentForItem(item);
+		this.#preview();
+		this.#refreshPreview();
+	}
+
+	#highlightSegmentForItem(item: SettingItem | undefined): StatusLineSegmentId | undefined {
+		if (!item) return undefined;
+		if (item.id.startsWith("segment.")) {
+			return item.id.slice("segment.".length) as StatusLineSegmentId;
+		}
+		if (item.id.startsWith("moveup.")) {
+			return item.id.slice("moveup.".length) as StatusLineSegmentId;
+		}
+		if (item.id.startsWith("movedown.")) {
+			return item.id.slice("movedown.".length) as StatusLineSegmentId;
+		}
+		if (item.id.startsWith("option.")) {
+			const [segment] = item.id.slice("option.".length).split(".");
+			return segment as StatusLineSegmentId;
+		}
+		return undefined;
+	}
+
+	#items(): SettingItem[] {
+		const items: SettingItem[] = [
+			{
+				id: "action.save",
+				label: "Save custom status line",
+				description: "Persist the previewed custom status line to user config.",
+				currentValue: "approve",
+				values: ["approve"],
+			},
+			{
+				id: "action.cancel",
+				label: "Cancel and restore",
+				description: "Close without persisting draft settings and restore the previous preview.",
+				currentValue: "restore",
+				values: ["restore"],
+			},
+			{
+				id: "separator",
+				label: "Separator",
+				description: "Separator style between status line segments.",
+				currentValue: this.#draft.separator,
+				submenu: (currentValue, done) =>
+					new SelectSubmenu(
+						"Status Line Separator",
+						"Style of separators between segments.",
+						[
+							{ value: "powerline", label: "Powerline" },
+							{ value: "powerline-thin", label: "Thin chevron" },
+							{ value: "slash", label: "Slash" },
+							{ value: "pipe", label: "Pipe" },
+							{ value: "block", label: "Block" },
+							{ value: "none", label: "None" },
+							{ value: "ascii", label: "ASCII" },
+						],
+						currentValue,
+						done,
+						() => done(),
+					),
+			},
+		];
+
+		for (const id of PUBLIC_STATUS_SEGMENTS) {
+			items.push({
+				id: `segment.${id}`,
+				label: `Segment: ${statusSegmentLabel(id)}`,
+				description: "Cycle placement: hidden → left → right. Use move actions below to reorder visible segments.",
+				currentValue: segmentPlacement(id, this.#draft.leftSegments, this.#draft.rightSegments),
+				values: ["hidden", "left", "right"],
+			});
+			if (segmentPlacement(id, this.#draft.leftSegments, this.#draft.rightSegments) !== "hidden") {
+				items.push(
+					{
+						id: `moveup.${id}`,
+						label: `Move left: ${statusSegmentLabel(id)}`,
+						currentValue: "←",
+						values: ["←"],
+					},
+					{
+						id: `movedown.${id}`,
+						label: `Move right: ${statusSegmentLabel(id)}`,
+						currentValue: "→",
+						values: ["→"],
+					},
+				);
+			}
+		}
+
+		items.push(
+			{
+				id: "option.model.showThinkingLevel",
+				label: "Model: show thinking level",
+				currentValue: String(this.#draft.segmentOptions.model?.showThinkingLevel !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.path.abbreviate",
+				label: "Path: abbreviate",
+				currentValue: String(this.#draft.segmentOptions.path?.abbreviate !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.path.maxLength",
+				label: "Path: max length",
+				currentValue: String(this.#draft.segmentOptions.path?.maxLength ?? 32),
+				submenu: (currentValue, done) =>
+					new SelectSubmenu(
+						"Path max length",
+						"Maximum displayed path length.",
+						PATH_LENGTH_OPTIONS,
+						currentValue,
+						done,
+						() => done(),
+					),
+			},
+			{
+				id: "option.path.stripWorkPrefix",
+				label: "Path: strip work prefix",
+				currentValue: String(this.#draft.segmentOptions.path?.stripWorkPrefix === true),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.git.showBranch",
+				label: "Git: show branch",
+				currentValue: String(this.#draft.segmentOptions.git?.showBranch !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.git.showStaged",
+				label: "Git: show staged",
+				currentValue: String(this.#draft.segmentOptions.git?.showStaged !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.git.showUnstaged",
+				label: "Git: show unstaged",
+				currentValue: String(this.#draft.segmentOptions.git?.showUnstaged !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.git.showUntracked",
+				label: "Git: show untracked",
+				currentValue: String(this.#draft.segmentOptions.git?.showUntracked !== false),
+				values: BOOL_VALUES,
+			},
+			{
+				id: "option.time.format",
+				label: "Time: format",
+				currentValue: this.#draft.segmentOptions.time?.format ?? "24h",
+				submenu: (currentValue, done) =>
+					new SelectSubmenu(
+						"Time format",
+						"Clock format for the time segment.",
+						TIME_FORMAT_OPTIONS,
+						currentValue,
+						done,
+						() => done(),
+					),
+			},
+			{
+				id: "option.time.showSeconds",
+				label: "Time: show seconds",
+				currentValue: String(this.#draft.segmentOptions.time?.showSeconds === true),
+				values: BOOL_VALUES,
+			},
+		);
+
+		return items;
+	}
+
+	#handleChange(id: string, value: string): void {
+		if (id === "action.save") {
+			this.#save();
+			return;
+		}
+		if (id === "action.cancel") {
+			this.#cancel();
+			return;
+		}
+		if (id === "separator") {
+			this.#draft.separator = value as StatusLineSeparatorStyle;
+		} else if (id.startsWith("segment.")) {
+			this.#setSegmentPlacement(
+				id.slice("segment.".length) as StatusLineSegmentId,
+				value as "hidden" | "left" | "right",
+			);
+		} else if (id.startsWith("moveup.")) {
+			this.#moveSegment(id.slice("moveup.".length) as StatusLineSegmentId, -1);
+		} else if (id.startsWith("movedown.")) {
+			this.#moveSegment(id.slice("movedown.".length) as StatusLineSegmentId, 1);
+		} else if (id.startsWith("option.")) {
+			this.#setOption(id.slice("option.".length), value);
+		}
+		this.#preview();
+		this.#refresh();
+	}
+
+	#setSegmentPlacement(id: StatusLineSegmentId, placement: "hidden" | "left" | "right"): void {
+		this.#draft.leftSegments = this.#draft.leftSegments.filter(segment => segment !== id);
+		this.#draft.rightSegments = this.#draft.rightSegments.filter(segment => segment !== id);
+		if (placement === "left") this.#draft.leftSegments.push(id);
+		if (placement === "right") this.#draft.rightSegments.push(id);
+	}
+
+	#moveSegment(id: StatusLineSegmentId, delta: -1 | 1): void {
+		const group = this.#draft.leftSegments.includes(id) ? this.#draft.leftSegments : this.#draft.rightSegments;
+		const index = group.indexOf(id);
+		if (index < 0) return;
+		const nextIndex = Math.max(0, Math.min(group.length - 1, index + delta));
+		if (nextIndex === index) return;
+		const [segment] = group.splice(index, 1);
+		if (segment) group.splice(nextIndex, 0, segment);
+	}
+
+	#setOption(path: string, value: string): void {
+		const bool = value === "true";
+		switch (path) {
+			case "model.showThinkingLevel":
+				this.#draft.segmentOptions.model = { ...(this.#draft.segmentOptions.model ?? {}), showThinkingLevel: bool };
+				break;
+			case "path.abbreviate":
+				this.#draft.segmentOptions.path = { ...(this.#draft.segmentOptions.path ?? {}), abbreviate: bool };
+				break;
+			case "path.maxLength":
+				this.#draft.segmentOptions.path = { ...(this.#draft.segmentOptions.path ?? {}), maxLength: Number(value) };
+				break;
+			case "path.stripWorkPrefix":
+				this.#draft.segmentOptions.path = { ...(this.#draft.segmentOptions.path ?? {}), stripWorkPrefix: bool };
+				break;
+			case "git.showBranch":
+				this.#draft.segmentOptions.git = { ...(this.#draft.segmentOptions.git ?? {}), showBranch: bool };
+				break;
+			case "git.showStaged":
+				this.#draft.segmentOptions.git = { ...(this.#draft.segmentOptions.git ?? {}), showStaged: bool };
+				break;
+			case "git.showUnstaged":
+				this.#draft.segmentOptions.git = { ...(this.#draft.segmentOptions.git ?? {}), showUnstaged: bool };
+				break;
+			case "git.showUntracked":
+				this.#draft.segmentOptions.git = { ...(this.#draft.segmentOptions.git ?? {}), showUntracked: bool };
+				break;
+			case "time.format":
+				this.#draft.segmentOptions.time = {
+					...(this.#draft.segmentOptions.time ?? {}),
+					format: value as "12h" | "24h",
+				};
+				break;
+			case "time.showSeconds":
+				this.#draft.segmentOptions.time = { ...(this.#draft.segmentOptions.time ?? {}), showSeconds: bool };
+				break;
+		}
+	}
+
+	#preview(): void {
+		this.callbacks.onStatusLinePreview?.({
+			preset: "custom",
+			leftSegments: [...this.#draft.leftSegments],
+			rightSegments: [...this.#draft.rightSegments],
+			separator: this.#draft.separator,
+			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
+			previewHighlightSegment: this.#previewHighlightSegment,
+		});
+	}
+
+	#restorePreview(): void {
+		this.callbacks.onStatusLinePreview?.({
+			preset: settings.get("statusLine.preset"),
+			leftSegments: settings.get("statusLine.leftSegments"),
+			rightSegments: settings.get("statusLine.rightSegments"),
+			separator: settings.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
+			sessionAccent: settings.get("statusLine.sessionAccent"),
+			previewHighlightSegment: undefined,
+		});
+	}
+
+	#save(): void {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
+		settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
+		settings.set("statusLine.separator", this.#draft.separator);
+		settings.set(
+			"statusLine.segmentOptions",
+			cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
+		);
+		this.callbacks.onChange("statusLine.preset", "custom");
+		this.callbacks.onChange("statusLine.leftSegments", [...this.#draft.leftSegments]);
+		this.callbacks.onChange("statusLine.rightSegments", [...this.#draft.rightSegments]);
+		this.callbacks.onChange("statusLine.separator", this.#draft.separator);
+		this.callbacks.onChange("statusLine.segmentOptions", cloneSegmentOptions(this.#draft.segmentOptions));
+		this.#previewHighlightSegment = undefined;
+		this.#preview();
+		this.done("saved");
+	}
+
+	#cancel(): void {
+		this.#restorePreview();
+		this.done();
+	}
+
+	handleInput(data: string): void {
+		this.#list.handleInput(data);
+	}
+}
 
 function getSettingsTabs(): Tab[] {
 	return [
@@ -194,6 +639,8 @@ export interface StatusLinePreviewSettings {
 	leftSegments?: StatusLineSegmentId[];
 	rightSegments?: StatusLineSegmentId[];
 	separator?: StatusLineSeparatorStyle;
+	segmentOptions?: StatusLineSegmentOptions;
+	previewHighlightSegment?: StatusLineSegmentId;
 	sessionAccent?: boolean;
 }
 
@@ -207,7 +654,7 @@ export interface SettingsCallbacks {
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
-	getStatusLinePreview?: () => string;
+	getStatusLinePreview?: (width?: number) => string;
 	/** Called when plugins change */
 	onPluginsChanged?: () => void;
 	/** Called when settings panel is closed */
@@ -372,7 +819,9 @@ export class SettingsSelectorComponent extends Container {
 		} else if (def.path === "theme.dark" || def.path === "theme.light") {
 			options = this.context.availableThemes.map(t => ({ value: t, label: t }));
 		}
-
+		if (def.path === "statusLine.preset") {
+			options = options.filter(option => option.value !== "custom");
+		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
 		let onPreviewCancel: (() => void) | undefined;
@@ -395,17 +844,31 @@ export class SettingsSelectorComponent extends Container {
 					leftSegments: presetDef.leftSegments,
 					rightSegments: presetDef.rightSegments,
 					separator: presetDef.separator,
+					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
 			};
 			onPreviewCancel = () => {
 				const currentPreset = settings.get("statusLine.preset");
 				const presetDef = getPreset(currentPreset);
+				const savedCustomSettings =
+					currentPreset === "custom"
+						? {
+								leftSegments: settings.get("statusLine.leftSegments"),
+								rightSegments: settings.get("statusLine.rightSegments"),
+								separator: settings.get("statusLine.separator"),
+								segmentOptions: cloneSegmentOptions(
+									settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+								),
+							}
+						: {};
 				this.callbacks.onStatusLinePreview?.({
 					preset: currentPreset,
 					leftSegments: presetDef.leftSegments,
 					rightSegments: presetDef.rightSegments,
 					separator: presetDef.separator,
+					...savedCustomSettings,
+					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
 			};
@@ -416,7 +879,7 @@ export class SettingsSelectorComponent extends Container {
 			};
 			onPreviewCancel = () => {
 				const separator = settings.get("statusLine.separator");
-				this.callbacks.onStatusLinePreview?.({ separator });
+				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
 				this.#updateStatusPreview();
 			};
 		}
@@ -509,7 +972,7 @@ export class SettingsSelectorComponent extends Container {
 		}
 
 		this.#currentList = new SettingsList(
-			this.#buildItemsForDefs(defs),
+			this.#buildItemsForTab(defs, tabId),
 			10,
 			getSettingsListTheme(),
 			(id, newValue) => {
@@ -553,10 +1016,31 @@ export class SettingsSelectorComponent extends Container {
 		return items;
 	}
 
+	#buildItemsForTab(defs: SettingDef[], tabId: SettingTab): SettingItem[] {
+		const items = this.#buildItemsForDefs(defs);
+		if (tabId === "appearance") {
+			const customEditorItem: SettingItem = {
+				id: STATUS_LINE_CUSTOM_EDITOR_ID,
+				label: "Status Line Custom Editor",
+				description:
+					"Edit custom status line segments, placement, separator, and typed segment options with live previews.",
+				currentValue: "open",
+				submenu: (_currentValue, done) => new StatusLineCustomEditor(this.callbacks, done),
+			};
+			const presetIndex = items.findIndex(item => item.id === "statusLine.preset");
+			if (presetIndex >= 0) {
+				items.splice(presetIndex + 1, 0, customEditorItem);
+			} else {
+				items.push(customEditorItem);
+			}
+		}
+		return items;
+	}
+
 	/** Re-evaluate condition gates against the current settings and refresh the active list. */
 	#refreshCurrentTabItems(defs: SettingDef[]): void {
 		if (this.#currentTabId === "plugins" || !this.#currentList) return;
-		this.#currentList.setItems(this.#buildItemsForDefs(defs));
+		this.#currentList.setItems(this.#buildItemsForTab(defs, this.#currentTabId));
 	}
 
 	/**
@@ -578,7 +1062,9 @@ export class SettingsSelectorComponent extends Container {
 			leftSegments: settings.get("statusLine.leftSegments"),
 			rightSegments: settings.get("statusLine.rightSegments"),
 			separator: settings.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			previewHighlightSegment: undefined,
 		};
 		this.callbacks.onStatusLinePreview?.(statusLineSettings);
 		this.#updateStatusPreview();

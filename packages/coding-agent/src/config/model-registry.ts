@@ -243,6 +243,7 @@ interface ProviderValidationConfig {
 	requestTransform?: ModelRequestTransform;
 	disableStrictTools?: boolean;
 	cacheRetention?: CacheRetention;
+	openaiCompat?: { baseUrl: string; apiKey?: string; apiKeyEnv?: string };
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
 }
@@ -271,11 +272,12 @@ function validateProviderConfiguration(
 				!config.disableStrictTools &&
 				!config.requestTransform &&
 				!config.cacheRetention &&
+				!config.openaiCompat &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "disableStrictTools", "modelOverrides", "discovery", "openaiCompat", or "models"`,
 				);
 			}
 		}
@@ -389,6 +391,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					requestTransform: providerConfig.requestTransform,
 					disableStrictTools: providerConfig.disableStrictTools,
 					cacheRetention: providerConfig.cacheRetention,
+					openaiCompat: providerConfig.openaiCompat,
 					modelOverrides: providerConfig.modelOverrides,
 					models: (providerConfig.models ?? []) as ProviderValidationModel[],
 				},
@@ -434,6 +437,18 @@ function getProviderBaseUrlEnvKeys(provider: string): string[] {
 
 function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
 	return $pickenv(...getProviderBaseUrlEnvKeys(provider));
+}
+
+function normalizeLocalOpenAICompatBaseUrl(baseUrl: string): string {
+	try {
+		const parsed = new URL(baseUrl);
+		const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
+		parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
+		return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+	} catch {
+		const trimmed = baseUrl.replace(/\/+$/g, "");
+		return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+	}
 }
 
 /**
@@ -1409,6 +1424,45 @@ export class ModelRegistry {
 		for (const [providerName, providerConfig] of providerEntries) {
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
 			const providerApiKeyConfig = providerConfig.apiKey ?? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
+			const localOpenAICompat = providerConfig.openaiCompat;
+			const localOpenAICompatApiKeyConfig = localOpenAICompat
+				? (localOpenAICompat.apiKey ?? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv))
+				: undefined;
+			if (localOpenAICompat) {
+				const localOpenAICompatBaseUrl = normalizeLocalOpenAICompatBaseUrl(localOpenAICompat.baseUrl);
+				const localCompatResolvedKey = localOpenAICompat.apiKeyEnv
+					? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
+					: localOpenAICompat.apiKey
+						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+						: undefined;
+				overrides.set(providerName, {
+					baseUrl: localOpenAICompatBaseUrl,
+					apiKey: localOpenAICompatApiKeyConfig,
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: false,
+					},
+				});
+				discoverableProviders.push({
+					provider: providerName,
+					api: "openai-completions",
+					baseUrl: localOpenAICompatBaseUrl,
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: false,
+					},
+					discovery: { type: "openai-models-list" },
+					optional: false,
+				});
+				if (localCompatResolvedKey) {
+					this.#customProviderApiKeys.set(providerName, localCompatResolvedKey);
+					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey);
+				} else {
+					keylessProviders.add(providerName);
+				}
+			}
 			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/transport are present
 			if (
 				providerConfig.baseUrl ||

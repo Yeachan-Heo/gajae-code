@@ -6,6 +6,7 @@ import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
 import {
+	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
@@ -21,6 +22,7 @@ import {
 import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope, type GjcTmuxSessionStatus } from "./tmux-sessions";
 
 export {
+	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_COMMAND_ENV,
@@ -201,12 +203,24 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
-	const invocation = ["&", ...command.map(powershellQuote), ...stripRootTmuxFlag(rawArgs).map(powershellQuote)].join(
-		" ",
-	);
+	// The inner `&` invocation must wrap the resolved gjc command in a
+	// script-block so the trailing PowerShell exec-policy flags from the
+	// outer invocation are not forwarded into the bun / node / .bat
+	// binary the gjc command resolves to. Without the wrapping, the flags
+	// reach the runtime binary and cause an immediate failure that closes
+	// the psmux pane before the gjc --tmux attach can land.
+	const resolvedCommand = command.map(powershellQuote).join(" ");
+	const innerArgs = stripRootTmuxFlag(rawArgs).map(powershellQuote).join(" ");
+	const invocation = `& { ${resolvedCommand} ${innerArgs} }`;
 	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
 	const script = [...envLines, invocation, exitLine].join("\n");
-	const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
+	// PowerShell -EncodedCommand requires a UTF-16LE BOM (0xFF 0xFE) at the
+	// start of the decoded buffer; without it pwsh may misinterpret the
+	// leading bytes and reject the script with a parse error, which would
+	// kill the psmux pane before the gjc --tmux attach could land.
+	const bom = Buffer.from([0xff, 0xfe]);
+	const body = Buffer.from(script, "utf16le");
+	const encodedCommand = Buffer.concat([bom, body]).toString("base64");
 	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }
 
@@ -395,7 +409,11 @@ function readCurrentBranch(cwd: string): string | null {
 }
 
 function cleanupCreatedTmuxSession(plan: TmuxLaunchPlan, spawnSync: TmuxSpawnSync, options: TmuxSpawnOptions): void {
-	spawnSync(plan.tmuxCommand, ["kill-session", "-t", `=${plan.sessionName}`], options);
+	spawnSync(
+		plan.tmuxCommand,
+		["kill-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env: options.env })],
+		options,
+	);
 }
 function isTmuxAttachDisconnectError(result: TmuxSpawnResult): boolean {
 	if (result.signalCode === "SIGHUP") return true;
@@ -499,7 +517,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	};
 
 	if (plan.attachSessionName) {
-		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.attachSessionName}`], options);
+		const attached = spawnSync(
+			plan.tmuxCommand,
+			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
+			options,
+		);
 		if (attached.exitCode === 0) return true;
 	}
 
@@ -510,7 +532,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
 			spawnSync,
 			options,
-			`=${plan.sessionName}`,
+			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
 		);
 
 		const profile = applyGjcTmuxProfile({
@@ -535,7 +557,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 	}
 	if (created.exitCode !== 0) return false;
-	const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", `=${plan.sessionName}`], options);
+	const attached = spawnSync(
+		plan.tmuxCommand,
+		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
+		options,
+	);
 	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));

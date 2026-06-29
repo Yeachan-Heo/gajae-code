@@ -32,6 +32,7 @@ export class SettingsList implements Component {
 	#maxVisible: number;
 	#onChange: (id: string, newValue: string) => void;
 	#onCancel: () => void;
+	#onSelectionChange?: (item: SettingItem | undefined) => void;
 
 	// Submenu state
 	#submenuComponent: Component | null = null;
@@ -43,12 +44,15 @@ export class SettingsList implements Component {
 		theme: SettingsListTheme,
 		onChange: (id: string, newValue: string) => void,
 		onCancel: () => void,
+		onSelectionChange?: (item: SettingItem | undefined) => void,
 	) {
 		this.#items = items;
 		this.#maxVisible = maxVisible;
 		this.#theme = theme;
 		this.#onChange = onChange;
 		this.#onCancel = onCancel;
+		this.#onSelectionChange = onSelectionChange;
+		this.#notifySelectionChange();
 	}
 
 	/** Update an item's currentValue */
@@ -73,10 +77,15 @@ export class SettingsList implements Component {
 		} else if (this.#selectedIndex >= this.#items.length) {
 			this.#selectedIndex = this.#items.length - 1;
 		}
+		this.#notifySelectionChange();
 	}
 
 	invalidate(): void {
 		this.#submenuComponent?.invalidate?.();
+	}
+
+	#notifySelectionChange(): void {
+		this.#onSelectionChange?.(this.#items[this.#selectedIndex]);
 	}
 
 	render(width: number): string[] {
@@ -167,8 +176,10 @@ export class SettingsList implements Component {
 		const kb = getKeybindings();
 		if (kb.matches(data, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#items.length - 1 : this.#selectedIndex - 1;
+			this.#notifySelectionChange();
 		} else if (kb.matches(data, "tui.select.down")) {
 			this.#selectedIndex = this.#selectedIndex === this.#items.length - 1 ? 0 : this.#selectedIndex + 1;
+			this.#notifySelectionChange();
 		} else if (kb.matches(data, "tui.select.confirm") || data === " " || data === "\n") {
 			this.#activateItem();
 		} else if (kb.matches(data, "tui.select.cancel")) {
@@ -206,6 +217,7 @@ export class SettingsList implements Component {
 		if (this.#submenuItemIndex !== null) {
 			this.#selectedIndex = this.#submenuItemIndex;
 			this.#submenuItemIndex = null;
+			this.#notifySelectionChange();
 		}
 	}
 }

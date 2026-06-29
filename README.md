@@ -152,6 +152,8 @@ GJC accepts images in two ways:
 - **CLI startup**: prefix a local image path with `@`, for example `gjc @screenshot.png "What should I change?"`.
 - **Interactive TUI**: copy an image to the system clipboard and use the configured **Paste image from clipboard** key (Ctrl+V on Linux/macOS, Alt+V on Windows), or type `#paste-image` and choose the prompt action. When the clipboard is unavailable, paste or pass the image file path with `@path/to/image.png` instead.
 
+Type `#` in the interactive editor to open prompt actions. In a tmux-backed session, choose **Scroll to previous user input** (for example via `#prev`) to enter tmux copy-mode at the previous rendered user message.
+
 Inside a GJC session, use the public workflow surface:
 
 ```text
