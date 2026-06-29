@@ -2693,3 +2693,31 @@ describe("buildWorkerCommand prompt normalization", () => {
 		expect(body).toContain("worker-7");
 	});
 });
+
+describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
+	const origArgv = process.argv;
+	afterEach(() => {
+		process.argv = origArgv;
+	});
+
+	it("prepends the bun runtime when argv[1] ends in .js", async () => {
+		process.argv = ["C:\\Users\\withfox\\.bun\\bin\\bun.exe", "C:\\repo\\packages\\coding-agent\\bin\\gjc.js"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand("C:\\repo");
+		// Result must reference bun.exe AND the original .js path; without
+		// the bun prefix, Windows would dispatch the .js file through the
+		// .js file association (cscript.exe), which fails immediately with
+		// a Windows Script Host JScript error dialog.
+		expect(out).toContain("bun.exe");
+		expect(out).toContain("bin\\gjc.js");
+		expect(out.indexOf("bun.exe")).toBeLessThan(out.indexOf("gjc.js"));
+	});
+
+	it("prepends the bun runtime when argv[1] ends in .mjs", async () => {
+		process.argv = ["bun", "/repo/packages/coding-agent/src/cli.mjs"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand("/repo");
+		expect(out).toContain("bun");
+		expect(out).toContain("cli.mjs");
+	});
+});
