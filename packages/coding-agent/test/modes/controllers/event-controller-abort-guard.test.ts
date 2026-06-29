@@ -53,6 +53,8 @@ function makeContext(lastMessage: AssistantMessage | undefined): InteractiveMode
 		isBackgrounded: true,
 		sessionManager: {
 			getSessionName: () => "test-session",
+			getCwd: () => process.cwd(),
+			getSessionId: () => "session-test",
 		},
 		session: {
 			getLastAssistantMessage: () => lastMessage,
@@ -95,7 +97,7 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		expect(spy).toHaveBeenCalledTimes(1);
 	});
 
-	it("honors the existing isBackgrounded gate (no notification when foreground)", () => {
+	it("honors the existing isBackgrounded gate for terminal notifications", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "on");
 		const ctx = makeContext(makeAssistantMessage("stop"));
@@ -111,5 +113,74 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
 		controller.sendCompletionNotification();
 		expect(spy).toHaveBeenCalledTimes(0);
+	});
+
+	it("runs the user-level completion notify command with payload environment", () => {
+		const terminalSpy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const spawnSpy = vi.spyOn(Bun, "spawn").mockImplementation(
+			() =>
+				({
+					exited: Promise.resolve(0),
+					kill: () => {},
+					unref: () => {},
+				}) as unknown as ReturnType<typeof Bun.spawn>,
+		);
+		settings.override("completion.notify", "on");
+		settings.set("completion.notifyCommand", "notify-test");
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendCompletionNotification();
+
+		expect(terminalSpy).toHaveBeenCalledTimes(1);
+		expect(spawnSpy).toHaveBeenCalledTimes(1);
+		const [cmd, options] = spawnSpy.mock.calls[0] as unknown as [
+			string[],
+			{ cwd?: string; env?: Record<string, string> },
+		];
+		expect(cmd).toContain("notify-test");
+		expect(options.cwd).toBe(process.cwd());
+		expect(options.env?.GJC_NOTIFICATION_TYPE).toBe("agent-turn-complete");
+		expect(options.env?.GJC_NOTIFICATION_TITLE).toBe("test-session: Complete");
+		expect(options.env?.GJC_NOTIFICATION_BODY).toBe("hello");
+		expect(options.env?.GJC_NOTIFICATION_SESSION_ID).toBe("session-test");
+	});
+
+	it("runs the user-level completion notify command even when foreground", () => {
+		const terminalSpy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const spawnSpy = vi.spyOn(Bun, "spawn").mockImplementation(
+			() =>
+				({
+					exited: Promise.resolve(0),
+					kill: () => {},
+					unref: () => {},
+				}) as unknown as ReturnType<typeof Bun.spawn>,
+		);
+		settings.override("completion.notify", "on");
+		settings.set("completion.notifyCommand", "notify-test");
+		const ctx = makeContext(makeAssistantMessage("stop"));
+		(ctx as unknown as { isBackgrounded: boolean }).isBackgrounded = false;
+		const controller = new EventController(ctx);
+		controller.sendCompletionNotification();
+
+		expect(terminalSpy).toHaveBeenCalledTimes(0);
+		expect(spawnSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not run completion notify commands from runtime or project overrides", () => {
+		const terminalSpy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const spawnSpy = vi.spyOn(Bun, "spawn").mockImplementation(
+			() =>
+				({
+					exited: Promise.resolve(0),
+					kill: () => {},
+					unref: () => {},
+				}) as unknown as ReturnType<typeof Bun.spawn>,
+		);
+		settings.override("completion.notify", "on");
+		settings.override("completion.notifyCommand", "notify-test");
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendCompletionNotification();
+
+		expect(terminalSpy).toHaveBeenCalledTimes(1);
+		expect(spawnSpy).toHaveBeenCalledTimes(0);
 	});
 });

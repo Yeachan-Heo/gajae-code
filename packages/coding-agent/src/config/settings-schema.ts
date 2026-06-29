@@ -1135,6 +1135,16 @@ export const SETTINGS_SCHEMA = {
 		default: "on",
 		ui: { tab: "interaction", label: "Completion Notification", description: "Notify when the agent completes" },
 	},
+	"completion.notifyCommand": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			label: "Completion Notification Command",
+			description:
+				"Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables.",
+		},
+	},
 
 	"ask.timeout": {
 		type: "number",

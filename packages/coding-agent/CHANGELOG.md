@@ -138,6 +138,9 @@
 - Corrected the auto-compaction output reserve so post-compaction responses keep adequate headroom (#1021).
 - Improved active-input shortcut hints and the busy-input queueing hint for clearer in-session guidance (#1022, #1024).
 - Fixed the Ultragoal ask guard blocking the `ask` tool when no GJC session can be resolved. `ultragoalReadPaths` falls back to the legacy/global `.gjc/ultragoal` directory when neither `GJC_SESSION_ID` nor an auto-detectable active session is present, but the follow-up `readUltragoalPlan`/`readUltragoalLedger` reads ignored that resolution and re-ran session detection, throwing `no active GJC session found` and surfacing `durable_state_unreadable` — which blocked `ask` for every agent even with no active Ultragoal run. `ultragoalReadPaths` now returns the resolved session id (or `null`); the ask guard treats a null session as inactive and falls open, and threads the resolved id into the plan/ledger reads so they no longer re-resolve. An inconsistent state (state dir present but `goals.json` missing/empty) still fails closed so the pause guard keeps blocking give-ups.
+### Added
+
+- Added a user-level `completion.notifyCommand` hook that runs a shell command with `GJC_NOTIFICATION_*` payload environment variables when an agent turn completes, enabling cmux/desktop/webhook completion alerts without project-config command execution.
 
 ## [0.7.1] - 2026-06-23
 ### Fixed

@@ -3,6 +3,7 @@ import { calculatePromptTokens } from "@gajae-code/agent-core/compaction/compact
 import type { AssistantMessage, ImageContent } from "@gajae-code/ai";
 import { parseRateLimitReason } from "@gajae-code/ai";
 import { type Component, Loader, TERMINAL, Text } from "@gajae-code/tui";
+import { logger } from "@gajae-code/utils";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import {
@@ -15,6 +16,7 @@ import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import { summaryFromMessage } from "../../notifications/helpers";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
@@ -25,6 +27,44 @@ import { buildAbortDisplayMessage } from "../utils/abort-message";
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
+const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
+
+interface CompletionNotifyPayload {
+	type: "agent-turn-complete";
+	title: string;
+	body: string;
+	cwd: string;
+	sessionId?: string;
+	sessionName?: string;
+	lastAssistantMessage?: string;
+	stopReason?: string;
+}
+
+function completionNotifyShellCommand(command: string): string[] {
+	if (process.platform === "win32") {
+		return ["cmd.exe", "/d", "/s", "/c", command];
+	}
+	return ["/bin/sh", "-c", command];
+}
+
+function cleanNotificationEnvValue(value: string | undefined, max = 4000): string {
+	if (!value) return "";
+	return value.replaceAll("\0", "").slice(0, max);
+}
+
+function buildCompletionNotifyEnv(payload: CompletionNotifyPayload): Record<string, string> {
+	return {
+		GJC_NOTIFICATION_TYPE: payload.type,
+		GJC_NOTIFICATION_TITLE: cleanNotificationEnvValue(payload.title, 500),
+		GJC_NOTIFICATION_BODY: cleanNotificationEnvValue(payload.body),
+		GJC_NOTIFICATION_CWD: cleanNotificationEnvValue(payload.cwd, 2000),
+		GJC_NOTIFICATION_SESSION_ID: cleanNotificationEnvValue(payload.sessionId, 500),
+		GJC_NOTIFICATION_SESSION_NAME: cleanNotificationEnvValue(payload.sessionName, 500),
+		GJC_NOTIFICATION_LAST_ASSISTANT_MESSAGE: cleanNotificationEnvValue(payload.lastAssistantMessage),
+		GJC_NOTIFICATION_STOP_REASON: cleanNotificationEnvValue(payload.stopReason, 100),
+		GJC_NOTIFICATION_JSON: cleanNotificationEnvValue(JSON.stringify(payload), 8000),
+	};
+}
 
 function friendlyRetryReason(errorMessage: string | undefined): string {
 	if (!errorMessage) return "";
@@ -857,8 +897,46 @@ export class EventController {
 		return lastAssistant?.usage ? calculatePromptTokens(lastAssistant.usage) : 0;
 	}
 
+	#runCompletionNotifyCommand(payload: CompletionNotifyPayload): void {
+		const command = settings.getGlobal("completion.notifyCommand")?.trim();
+		if (!command) return;
+
+		try {
+			const proc = Bun.spawn(completionNotifyShellCommand(command), {
+				cwd: payload.cwd,
+				env: {
+					...process.env,
+					...buildCompletionNotifyEnv(payload),
+				},
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			proc.unref();
+			const timer = setTimeout(() => {
+				try {
+					proc.kill();
+				} catch {}
+			}, COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS);
+			timer.unref?.();
+			void proc.exited
+				.then(exitCode => {
+					clearTimeout(timer);
+					if (exitCode !== 0) {
+						logger.warn("completion notify command exited non-zero", { exitCode });
+					}
+				})
+				.catch(error => {
+					clearTimeout(timer);
+					logger.warn("completion notify command failed", { error: String(error) });
+				});
+		} catch (error) {
+			logger.warn("completion notify command failed to start", { error: String(error) });
+		}
+	}
+
 	sendCompletionNotification(): void {
-		if (this.ctx.isBackgrounded === false) return;
+		const isBackgrounded = this.ctx.isBackgrounded !== false;
 		const notify = settings.get("completion.notify");
 		if (notify === "off") return;
 
@@ -869,9 +947,23 @@ export class EventController {
 		const last = this.ctx.session.getLastAssistantMessage?.();
 		if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
 
-		const title = this.ctx.sessionManager.getSessionName();
-		const message = title ? `${title}: Complete` : "Complete";
-		TERMINAL.sendNotification(message);
+		const sessionName = this.ctx.sessionManager.getSessionName();
+		const title = sessionName ? `${sessionName}: Complete` : "Complete";
+		const summary = summaryFromMessage(last, 1000);
+		const body = summary ?? "Complete";
+		const sessionManager = this.ctx.sessionManager as { getCwd?: () => string; getSessionId?: () => string };
+		const payload: CompletionNotifyPayload = {
+			type: "agent-turn-complete",
+			title,
+			body,
+			cwd: sessionManager.getCwd?.() ?? settings.getCwd(),
+			sessionId: sessionManager.getSessionId?.(),
+			sessionName: sessionName || undefined,
+			lastAssistantMessage: summary,
+			stopReason: last?.stopReason,
+		};
+		if (isBackgrounded) TERMINAL.sendNotification(title);
+		this.#runCompletionNotifyCommand(payload);
 	}
 
 	async handleBackgroundEvent(event: AgentSessionEvent): Promise<void> {

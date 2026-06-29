@@ -145,7 +145,7 @@ Effects:
 - `message_update`: updates streaming assistant content; creates/updates tool execution components as tool calls appear.
 - `tool_execution_update/end`: updates tool result components and completion state.
 - `message_end`: finalizes assistant stream, handles aborted/error annotations, marks pending tool args complete on normal stop.
-- `agent_end`: stops loaders, clears transient stream state, flushes deferred model switch, issues completion notification if backgrounded.
+- `agent_end`: stops loaders, clears transient stream state, flushes deferred model switch, issues terminal completion notification if backgrounded, and runs the user-level completion command hook when configured.
 
 Read-tool grouping is intentionally stateful (`#lastReadGroup`) to coalesce consecutive read tool calls into one visual block until a non-read break occurs.
 
@@ -195,7 +195,7 @@ Escape exits inactive mode by clearing editor text and restoring border color; w
 - Subscribes background event handler (primarily waits for `agent_end`).
 - Stops TUI and sends `SIGTSTP` (POSIX job control path).
 
-On `agent_end` in background with no queued work, controller sends completion notification and shuts down.
+On `agent_end` in background with no queued work, controller sends the terminal completion notification and shuts down. The configured `completion.notifyCommand` hook is not limited to background mode; it runs on completed agent turns so local tools such as cmux can receive foreground and background completion events.
 
 ## Cancellation paths
 
