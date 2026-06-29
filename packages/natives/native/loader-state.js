@@ -31,13 +31,6 @@ import { embeddedAddon } from "./embedded-addon.js";
  */
 
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
-const PLATFORM_NATIVE_PACKAGES = {
-	"linux-x64": "@gajae-code/natives-linux-x64",
-	"linux-arm64": "@gajae-code/natives-linux-arm64",
-	"darwin-x64": "@gajae-code/natives-darwin-x64",
-	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
-	"win32-x64": "@gajae-code/natives-win32-x64",
-};
 
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
@@ -120,7 +113,6 @@ export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, native
  *   isCompiledBinary: boolean;
  *   stageFromNodeModules?: boolean;
  *   nativeDir: string;
- *   platformNativeDirs?: string[];
  *   execDir: string;
  *   versionedDir: string;
  *   userDataDir: string;
@@ -132,14 +124,11 @@ export function resolveLoaderCandidates({
 	isCompiledBinary,
 	stageFromNodeModules = false,
 	nativeDir,
-	platformNativeDirs = [],
 	execDir,
 	versionedDir,
 	userDataDir,
 }) {
-	const platformPackageCandidates = platformNativeDirs.flatMap(dir => addonFilenames.map(filename => path.join(dir, filename)));
 	const baseReleaseCandidates = addonFilenames.flatMap(filename => [
-		...platformNativeDirs.map(dir => path.join(dir, filename)),
 		path.join(nativeDir, filename),
 		path.join(execDir, filename),
 	]);
@@ -156,7 +145,7 @@ export function resolveLoaderCandidates({
 	} else {
 		releaseCandidates = baseReleaseCandidates;
 	}
-	return [...new Set(releaseCandidates.length > 0 ? releaseCandidates : platformPackageCandidates)];
+	return [...new Set(releaseCandidates)];
 }
 
 // =========================================================================
@@ -237,17 +226,6 @@ function selectEmbeddedAddonFile(selectedVariant) {
 		);
 	}
 	return embeddedAddon.files.find(file => file.variant === "baseline") || null;
-}
-
-function resolvePlatformNativeDirs(platformTag) {
-	const packageName = PLATFORM_NATIVE_PACKAGES[platformTag];
-	if (!packageName) return [];
-	try {
-		const packageJsonPath = createRequire(import.meta.url).resolve(`${packageName}/package.json`);
-		return [path.join(path.dirname(packageJsonPath), "native")];
-	} catch {
-		return [];
-	}
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
@@ -369,7 +347,6 @@ function initLoaderContext() {
 	const platformTag = `${process.platform}-${process.arch}`;
 	const packageVersion = packageJson.version;
 	const nativeDir = path.join(import.meta.dir, "..", "native");
-	const platformNativeDirs = resolvePlatformNativeDirs(platformTag);
 	const execDir = path.dirname(process.execPath);
 	const versionedDir = path.join(getNativesDir(), packageVersion);
 	const userDataDir =
@@ -397,7 +374,6 @@ function initLoaderContext() {
 		isCompiledBinary,
 		stageFromNodeModules,
 		nativeDir,
-		platformNativeDirs,
 		execDir,
 		versionedDir,
 		userDataDir,
@@ -421,7 +397,6 @@ function initLoaderContext() {
 		versionedDir,
 		isCompiledBinary,
 		stageFromNodeModules,
-		platformNativeDirs,
 		selectedVariant,
 		addonFilenames,
 		addonLabel,

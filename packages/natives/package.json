@@ -53,11 +53,8 @@
 		"triples": {}
 	},
 	"files": [
-		"native/index.js",
-		"native/index.d.ts",
-		"native/loader-state.js",
-		"native/loader-state.d.ts",
-		"native/embedded-addon.js",
+		"src",
+		"native",
 		"README.md"
 	],
 	"exports": {
@@ -66,12 +63,5 @@
 			"import": "./native/index.js",
 			"default": "./native/index.js"
 		}
-	},
-	"optionalDependencies": {
-		"@gajae-code/natives-linux-x64": "catalog:",
-		"@gajae-code/natives-linux-arm64": "catalog:",
-		"@gajae-code/natives-darwin-x64": "catalog:",
-		"@gajae-code/natives-darwin-arm64": "catalog:",
-		"@gajae-code/natives-win32-x64": "catalog:"
 	}
 }

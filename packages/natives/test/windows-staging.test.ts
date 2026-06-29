@@ -107,25 +107,6 @@ describe("windows native addon staging", () => {
 		expect(candidates).not.toContain(userDataBaseline);
 	});
 
-	it("prefers platform optional package candidates when staging is off", () => {
-		const versionedDir = "/home/u/.gjc/natives/15.0.1";
-		const platformNativeDir = "/home/u/proj/node_modules/@gajae-code/natives-linux-x64/native";
-		const candidates = resolveLoaderCandidates({
-			addonFilenames: getAddonFilenames({ tag: "linux-x64", arch: "x64", variant: "baseline" }),
-			isCompiledBinary: false,
-			stageFromNodeModules: false,
-			nativeDir: posixNodeModulesNativeDir,
-			platformNativeDirs: [platformNativeDir],
-			execDir: "/usr/bin",
-			versionedDir,
-			userDataDir: "/home/u/.local/bin",
-		});
-
-		const platformBaseline = path.join(platformNativeDir, "pi_natives.linux-x64-baseline.node");
-		const nodeModulesBaseline = path.join(posixNodeModulesNativeDir, "pi_natives.linux-x64-baseline.node");
-		expect(candidates.indexOf(platformBaseline)).toBeLessThan(candidates.indexOf(nodeModulesBaseline));
-	});
-
 	it("falls back to the node_modules-only candidate list when staging is off", () => {
 		// Mirrors the non-Windows / workspace-dev path: same behavior as before
 		// the staging feature was introduced.

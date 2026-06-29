@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
-import { syncNativePlatformPackages } from "../../../scripts/native-platform-packages";
 import { generateEnumExports } from "./gen-enums";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
@@ -215,7 +214,6 @@ try {
 	);
 
 	await generateEnumExports();
-	await syncNativePlatformPackages(repoRoot);
 
 	console.log("Build complete.");
 } finally {

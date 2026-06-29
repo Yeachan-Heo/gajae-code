@@ -18,7 +18,6 @@
 
 import * as path from "node:path";
 import { $ } from "bun";
-import { syncNativePlatformPackages } from "./native-platform-packages";
 
 interface PublishPackage {
 	dir: string;
@@ -47,11 +46,6 @@ export const packages: PublishPackage[] = [
 	{ dir: "packages/utils", kind: "typescript" },
 	{ dir: "packages/ai", kind: "typescript" },
 	{ dir: "packages/natives", kind: "native" },
-	{ dir: "packages/natives-linux-x64", kind: "manifest" },
-	{ dir: "packages/natives-linux-arm64", kind: "manifest" },
-	{ dir: "packages/natives-darwin-x64", kind: "manifest" },
-	{ dir: "packages/natives-darwin-arm64", kind: "manifest" },
-	{ dir: "packages/natives-win32-x64", kind: "manifest" },
 	{ dir: "packages/tui", kind: "typescript" },
 	{
 		dir: "packages/stats",
@@ -244,7 +238,6 @@ async function publishPackage(pkg: PublishPackage): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	await syncNativePlatformPackages(repoRoot, { strict: !isDryRun });
 	for (const pkg of packages) {
 		await publishPackage(pkg);
 	}
