@@ -255,15 +255,20 @@ function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, r
 	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
-	// The inner `&` invocation must wrap the resolved gjc command in a
-	// script-block so the trailing PowerShell exec-policy flags from the
-	// outer invocation are not forwarded into the bun / node / .bat
-	// binary the gjc command resolves to. Without the wrapping, the flags
-	// reach the runtime binary and cause an immediate failure that closes
-	// the psmux pane before the gjc --tmux attach can land.
+	// Resolve the inner command and arguments. PowerShell's `&` call operator
+	// accepts a single command followed by its arguments directly (no script
+	// block needed). Wrapping the call in `& { ... }` would be invalid because
+	// adjacent single-quoted tokens inside a script block body are a parser
+	// error: `& { 'a' 'b' }` fails with "Unexpected token 'b'" because PowerShell
+	// only concatenates adjacent *double-quoted* strings, and even then only in
+	// expression position. Emitting the arguments as a comma-separated array
+	// (`& 'cmd' @('a','b')`) is also rejected because arrays are not valid as
+	// the second-and-later positional arguments to `&` in command position. The
+	// correct form is `& 'cmd' 'arg1' 'arg2'` — exactly what the joined
+	// resolvedCommand + innerArgs produces below.
 	const resolvedCommand = command.map(powershellQuote).join(" ");
 	const innerArgs = stripRootTmuxFlag(rawArgs).map(powershellQuote).join(" ");
-	const invocation = `& { ${resolvedCommand} ${innerArgs} }`;
+	const invocation = `& ${resolvedCommand} ${innerArgs}`;
 	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
 	const script = [...envLines, invocation, exitLine].join("\n");
 	// PowerShell -EncodedCommand requires a UTF-16LE BOM (0xFF 0xFE) at the
