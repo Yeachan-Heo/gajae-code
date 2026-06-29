@@ -49,6 +49,7 @@ interface ThresholdModel {
 type DeepInterviewModel = RoundQuestionModel | TopologyQuestionModel | ProgressModel | ThresholdModel;
 
 function normalizeText(text: string): string {
+	if (typeof text !== "string") return "";
 	return text.trim().replaceAll("\r\n", "\n");
 }
 
