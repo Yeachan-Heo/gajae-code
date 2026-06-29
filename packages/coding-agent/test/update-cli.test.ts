@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,7 +9,9 @@ import {
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	replaceBinaryForUpdate,
+	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
+	runPackageManagerUpdateForTest,
 } from "../src/cli/update-cli";
 
 const tempDirs: string[] = [];
@@ -40,6 +43,50 @@ describe("update-cli install target detection", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.local/bin/gjc", undefined);
 
 		expect(method).toBe("binary");
+	});
+
+	it("detects a Windows npm wrapper shim and avoids one-file binary replacement", () => {
+		const seenRoots: Array<{ packageName: string; packageRoot: string }> = [];
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.cmd",
+			"win32",
+			(packageName, packageRoot) => {
+				seenRoots.push({ packageName, packageRoot });
+				return packageName === "gajae-code";
+			},
+		);
+
+		expect(target).toEqual({ manager: "npm", packageName: "gajae-code" });
+		expect(seenRoots[0]).toEqual({
+			packageName: "gajae-code",
+			packageRoot: "C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\gajae-code",
+		});
+	});
+
+	it("detects PowerShell npm wrapper shims so gjc.ps1 is updated through npm too", () => {
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.ps1",
+			"win32",
+			packageName => packageName === "gajae-code",
+		);
+
+		expect(target).toEqual({ manager: "npm", packageName: "gajae-code" });
+	});
+
+	it("does not classify missing Windows node_modules roots as npm-managed", () => {
+		const target = resolveNpmManagedTargetForTest(
+			"C:\\Users\\alice\\AppData\\Roaming\\npm\\gjc.cmd",
+			"win32",
+			() => false,
+		);
+
+		expect(target).toBeUndefined();
+	});
+
+	it("keeps non-Windows package-manager-like shims on the existing bun/binary classifier", () => {
+		const target = resolveNpmManagedTargetForTest("/usr/local/bin/gjc", "linux", () => true);
+
+		expect(target).toBeUndefined();
 	});
 });
 
@@ -126,6 +173,56 @@ describe("update-cli binary release assets", () => {
 	});
 });
 
+describe("update-cli package-manager verification", () => {
+	it("treats a nonzero bun install as successful when the installed runtime verifies", async () => {
+		const warnings: string[] = [];
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(message => {
+			warnings.push(String(message));
+		});
+		try {
+			const result = await runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({
+					exitCode: 1,
+					text: () => 'Fail extracting tarball for "@gajae-code/natives"',
+				}),
+				verifyInstalledRuntime: async expectedVersion => ({
+					ok: true,
+					actual: expectedVersion,
+					path: "/Users/test/.bun/bin/gjc",
+				}),
+				printRecoveredVerification: () => {},
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.actual).toBe("0.7.8");
+			expect(warnings.join("\n")).toContain("bun exited with 1");
+			expect(warnings.join("\n")).toContain("Treating the update as installed");
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("keeps package-manager nonzero failures hard when runtime verification does not prove the update landed", async () => {
+		await expect(
+			runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({
+					exitCode: 1,
+					text: () => 'Fail extracting tarball for "@gajae-code/natives"',
+				}),
+				verifyInstalledRuntime: async () => ({
+					ok: false,
+					actual: "0.7.7",
+					path: "/Users/test/.bun/bin/gjc",
+				}),
+			}),
+		).rejects.toThrow("Fail extracting tarball");
+	});
+});
+
 describe("update-cli binary replacement", () => {
 	it("restores the previous binary when the replacement fails verification", async () => {
 		const dir = await makeTempDir();
@@ -148,6 +245,43 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+
+	it("keeps a verified replacement when backup cleanup hits EPERM", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.cmd");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(targetPath, "old binary");
+		await Bun.write(tempPath, "new binary");
+		const originalUnlink = fsNode.promises.unlink;
+		const unlinkSpy = vi.spyOn(fsNode.promises, "unlink").mockImplementation(async filePath => {
+			if (String(filePath) === backupPath && fsNode.existsSync(backupPath)) {
+				const err = new Error("EPERM: operation not permitted, unlink");
+				(err as NodeJS.ErrnoException).code = "EPERM";
+				throw err;
+			}
+			return await originalUnlink(filePath);
+		});
+
+		try {
+			const result = await replaceBinaryForUpdate({
+				targetPath,
+				tempPath,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.cleanupWarning).toContain("Installed update, but could not remove backup file");
+			expect(result.cleanupWarning).toContain(backupPath);
+			expect(await Bun.file(targetPath).text()).toBe("new binary");
+			expect(await Bun.file(tempPath).exists()).toBe(false);
+			expect(await Bun.file(backupPath).text()).toBe("old binary");
+		} finally {
+			unlinkSpy.mockRestore();
+		}
 	});
 
 	it("keeps the replacement only after it reports the expected version", async () => {

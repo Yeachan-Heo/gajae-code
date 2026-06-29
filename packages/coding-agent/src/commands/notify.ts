@@ -55,7 +55,7 @@ export default class Notify extends Command {
 			redact: Boolean(flags.redact),
 		};
 
-		await initTheme();
+		if (action !== "daemon-internal") await initTheme();
 		await runNotifyCommand(cmd);
 	}
 }

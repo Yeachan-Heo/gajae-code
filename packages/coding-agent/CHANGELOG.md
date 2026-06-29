@@ -1,8 +1,23 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Terminal bell notifications can now be enabled for agent completion, approval, and ask/user-input prompts (#1277).
+- Added a generic `providers.local.openaiCompat` models config path for OpenAI-compatible local endpoints plus `gjc local-provider smoke` for bounded streaming chat-completion checks (#1246).
+- Added `gjc local-provider discover` / `models` to list model IDs from a configured local OpenAI-compatible provider via `GET /v1/models`, with clear network and response-shape errors and no chat-completion request (#1247).
+
+### Fixed
+
+- `gjc update` now verifies the installed runtime after package-manager failures and treats a nonzero Bun/npm exit as recoverable when the requested version and smoke test actually landed, avoiding false failures from Bun tarball extraction errors (#1280).
+- Submitted user prompts now use the live terminal viewport width in wide Windows Terminal/PowerShell sessions, keeping Korean/CJK prompt wrapping responsive without changing narrow layouts (#1239).
+- Coordinator MCP now fails tmux-delivered turns that never receive a runtime prompt acknowledgement/`turn_start`, surfacing an explicit unacknowledged delivery reason instead of leaving Hermes/Oren waiting on a normal active/running state (#1237).
+- Telegram now advertises `/session_create`, `/session_recent`, `/session_close`, and `/session_resume` in the bot command menu so lifecycle control commands are discoverable from `/` autocomplete.
 
 ## [0.7.7] - 2026-06-28
+### Added
+
+- Added a `#` prompt action that enters tmux copy-mode and searches backward to the previous rendered `user` input marker, providing a tmux-local previous-input scroll jump without relying on terminal-specific modified key chords.
 
 ### Fixed
 
@@ -22,7 +37,6 @@
 - Elided runaway thinking-token loops in the assistant message renderer so repeated thinking output no longer grows without bound (#1196).
 - Made `gjc session` create/list work on psmux-backed multiplexers (#1192).
 - Sanitized dot-prefixed cwd window titles so tmux window names render correctly (#1198).
-
 ## [0.7.4] - 2026-06-27
 
 ### Added
@@ -126,6 +140,9 @@
 - Corrected the auto-compaction output reserve so post-compaction responses keep adequate headroom (#1021).
 - Improved active-input shortcut hints and the busy-input queueing hint for clearer in-session guidance (#1022, #1024).
 - Fixed the Ultragoal ask guard blocking the `ask` tool when no GJC session can be resolved. `ultragoalReadPaths` falls back to the legacy/global `.gjc/ultragoal` directory when neither `GJC_SESSION_ID` nor an auto-detectable active session is present, but the follow-up `readUltragoalPlan`/`readUltragoalLedger` reads ignored that resolution and re-ran session detection, throwing `no active GJC session found` and surfacing `durable_state_unreadable` — which blocked `ask` for every agent even with no active Ultragoal run. `ultragoalReadPaths` now returns the resolved session id (or `null`); the ask guard treats a null session as inactive and falls open, and threads the resolved id into the plan/ledger reads so they no longer re-resolve. An inconsistent state (state dir present but `goals.json` missing/empty) still fails closed so the pause guard keeps blocking give-ups.
+### Added
+
+- Added a user-level `completion.notifyCommand` hook that runs a shell command with `GJC_NOTIFICATION_*` payload environment variables when an agent turn completes, enabling cmux/desktop/webhook completion alerts without project-config command execution.
 
 ## [0.7.1] - 2026-06-23
 ### Fixed

@@ -274,6 +274,43 @@ export const SETTINGS_SCHEMA = {
 		validate: (value: number) => Number.isFinite(value) && value > 0,
 	},
 
+	"notifications.terminalBell": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Terminal Bell",
+			description: "Emit a BEL character for local terminal notifications",
+		},
+	},
+	"notifications.bellOnComplete": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Bell on Completion",
+			description: "Ring the terminal bell when an agent turn completes",
+		},
+	},
+	"notifications.bellOnApproval": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Bell on Approval",
+			description: "Ring the terminal bell when a plan or approval prompt needs attention",
+		},
+	},
+	"notifications.bellOnAsk": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Bell on Ask",
+			description: "Ring the terminal bell when an ask/user-input prompt needs attention",
+		},
+	},
+
 	autoResume: {
 		type: "boolean",
 		default: false,
@@ -1134,6 +1171,16 @@ export const SETTINGS_SCHEMA = {
 		values: ["on", "off"] as const,
 		default: "on",
 		ui: { tab: "interaction", label: "Completion Notification", description: "Notify when the agent completes" },
+	},
+	"completion.notifyCommand": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			label: "Completion Notification Command",
+			description:
+				"Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables.",
+		},
 	},
 
 	"ask.timeout": {

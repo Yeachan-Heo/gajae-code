@@ -99,6 +99,33 @@ describe("redesigned interactive shell chrome", () => {
 		expect(assistant).not.toContain("▌");
 	});
 
+	it("sizes submitted Korean user prompts to the current viewport width", () => {
+		const prompt = "안녕하세요 ".repeat(30);
+		const narrowLines = new UserMessageComponent(prompt).render(80);
+		const wideLines = new UserMessageComponent(prompt).render(160);
+		const contentWidths = (lines: string[]) =>
+			lines
+				.map(line =>
+					Bun.stripANSI(line)
+						.replace(/\x1b\]133;[ABC]\x07/g, "")
+						.trimEnd(),
+				)
+				.filter(line => line.includes("안녕하세요"))
+				.map(line => visibleWidth(line));
+
+		const narrowContentWidths = contentWidths(narrowLines);
+		const wideContentWidths = contentWidths(wideLines);
+
+		expect(wideContentWidths.length).toBeLessThan(narrowContentWidths.length);
+		expect(Math.max(...wideContentWidths)).toBeGreaterThan(120);
+		for (const line of narrowLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+		}
+		for (const line of wideLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(160);
+		}
+	});
+
 	it("keeps the GJC forge launch surface responsive", () => {
 		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai");
 		const lines = component.render(54);

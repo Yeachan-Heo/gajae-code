@@ -40,6 +40,7 @@ export interface StatusLineSettings {
 	rightSegments?: StatusLineSegmentId[];
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
+	previewHighlightSegment?: StatusLineSegmentId;
 	showHookStatus?: boolean;
 	showSkillHud?: boolean;
 	sessionAccent?: boolean;
@@ -181,11 +182,8 @@ export class StatusLineComponent implements Component {
 	#lastTokensPerSecond: number | null = null;
 	#lastTokensPerSecondTimestamp: number | null = null;
 
-	// Anthropic usage caching (5-min TTL, OAuth/sub only)
-	#cachedUsage: {
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-	} | null = null;
+	// Provider usage caching (5-min TTL, OAuth/sub only)
+	#cachedUsage: SegmentContext["usage"] = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
 	// Context breakdown — incremental cache. Replaces the previous 2-second
@@ -221,7 +219,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
-		this.#settings = { ...this.#settings, ...settings };
+		this.#settings = { ...this.#settings, previewHighlightSegment: undefined, ...settings };
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
@@ -462,9 +460,9 @@ export class StatusLineComponent implements Component {
 	}
 
 	/**
-	 * Background-refresh the Anthropic OAuth quota report. Guarded by a 5-min
-	 * TTL on both success (cache lifetime) and error (backoff). Exposed
-	 * (non-private) so unit tests can verify the backoff invariant.
+	 * Background-refresh the OAuth quota report. Guarded by a 5-min TTL on both
+	 * success (cache lifetime) and error (backoff). Exposed (non-private) so
+	 * unit tests can verify the backoff invariant.
 	 */
 	refreshUsageInBackground(): void {
 		const now = Date.now();
@@ -478,6 +476,9 @@ export class StatusLineComponent implements Component {
 			.then(reports => {
 				this.#cachedUsage = this.#normalizeUsageReports(reports);
 				this.#usageFetchedAt = Date.now();
+				if (this.#onBranchChange) {
+					this.#onBranchChange();
+				}
 			})
 			.catch(() => {
 				// Backoff on error: stamp the fetch time so the 5-min TTL guard
@@ -491,47 +492,77 @@ export class StatusLineComponent implements Component {
 			});
 	}
 
-	#normalizeUsageReports(reports: unknown): {
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
-	} | null {
+	#normalizeUsageReports(reports: unknown): SegmentContext["usage"] {
 		if (!Array.isArray(reports)) return null;
-		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
-		let sevenDay: { percent: number; resetHours?: number } | undefined;
+		const windows: NonNullable<SegmentContext["usage"]>["windows"] = [];
+		const seen = new Set<string>();
 		const now = Date.now();
+
+		const codexWindowLabel = (windowId: string | undefined, fallback: string): string => {
+			if (windowId && /^\d+[hd]$/.test(windowId)) return windowId;
+			return fallback;
+		};
+		const codexResetUnit = (label: string): "m" | "h" => (label.endsWith("d") ? "h" : "m");
+
+		const pushWindow = (
+			key: string,
+			label: string,
+			fraction: number,
+			resetsAt: number | undefined,
+			resetUnit: "m" | "h",
+		) => {
+			if (seen.has(key)) return;
+			seen.add(key);
+			windows.push({
+				label,
+				percent: fraction * 100,
+				resetValue:
+					typeof resetsAt === "number"
+						? Math.max(0, Math.round((resetsAt - now) / (resetUnit === "m" ? 60_000 : 3_600_000)))
+						: undefined,
+				resetUnit,
+			});
+		};
+
 		for (const report of reports) {
 			if (!report || typeof report !== "object") continue;
+			const provider = (report as { provider?: unknown }).provider;
+			const providerId = typeof provider === "string" ? provider : undefined;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
 				if (!limit || typeof limit !== "object") continue;
 				const l = limit as {
-					scope?: { windowId?: string; tier?: string };
-					window?: { resetsAt?: number };
+					id?: unknown;
+					scope?: { windowId?: string; tier?: string; modelId?: string };
+					window?: { id?: string; resetsAt?: number };
 					amount?: { usedFraction?: number };
 				};
 				const fraction = l.amount?.usedFraction;
 				if (typeof fraction !== "number") continue;
-				const windowId = l.scope?.windowId;
+				const id = typeof l.id === "string" ? l.id : "";
+				const windowId = l.scope?.windowId ?? l.window?.id;
 				const tier = l.scope?.tier;
+				const modelId = l.scope?.modelId;
 				const resetsAt = l.window?.resetsAt;
-				if (windowId === "5h" && !tier && !fiveHour) {
-					fiveHour = {
-						percent: fraction * 100,
-						resetMinutes:
-							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 60_000)) : undefined,
-					};
-				} else if (windowId === "7d" && !tier && !sevenDay) {
-					sevenDay = {
-						percent: fraction * 100,
-						resetHours:
-							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 3_600_000)) : undefined,
-					};
+
+				if (providerId === "openai-codex") {
+					if (id === "openai-codex:primary" || (!id && !!windowId && windowId !== "7d" && !modelId)) {
+						const label = codexWindowLabel(windowId, "primary");
+						pushWindow("codex:primary", label, fraction, resetsAt, codexResetUnit(label));
+					} else if (id === "openai-codex:secondary" || (!id && windowId === "7d" && !modelId)) {
+						const label = codexWindowLabel(windowId, "secondary");
+						pushWindow("codex:secondary", label, fraction, resetsAt, codexResetUnit(label));
+					}
+				} else if (windowId === "5h" && !tier) {
+					pushWindow(`${providerId ?? "provider"}:5h`, "5h", fraction, resetsAt, "m");
+				} else if (windowId === "7d" && !tier) {
+					pushWindow(`${providerId ?? "provider"}:7d`, "7d", fraction, resetsAt, "h");
 				}
 			}
 		}
-		if (!fiveHour && !sevenDay) return null;
-		return { fiveHour, sevenDay };
+
+		return windows.length > 0 ? { windows } : null;
 	}
 
 	/**
@@ -684,12 +715,15 @@ export class StatusLineComponent implements Component {
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 
 		// Collect visible segment contents
+		const highlightSegment = (segId: StatusLineSegmentId, content: string): string =>
+			effectiveSettings.previewHighlightSegment === segId ? `\x1b[7m${content}\x1b[27m` : content;
+
 		const leftParts: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
 		for (const segId of effectiveSettings.leftSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
-				leftParts.push(rendered.content);
+				leftParts.push(highlightSegment(segId, rendered.content));
 				leftSegIds.push(segId);
 			}
 		}
@@ -698,7 +732,7 @@ export class StatusLineComponent implements Component {
 		for (const segId of effectiveSettings.rightSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
-				rightParts.push(rendered.content);
+				rightParts.push(highlightSegment(segId, rendered.content));
 			}
 		}
 
@@ -765,7 +799,7 @@ export class StatusLineComponent implements Component {
 							if (!adjusted.visible || !adjusted.content) break;
 							reRendered = adjusted;
 						}
-						left[pathIdx] = reRendered.content;
+						left[pathIdx] = highlightSegment("path", reRendered.content);
 						leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
 					}
 				}

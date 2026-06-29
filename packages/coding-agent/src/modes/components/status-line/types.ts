@@ -51,8 +51,12 @@ export interface SegmentContext {
 		pr: { number: number; url: string } | null;
 	};
 	usage: {
-		fiveHour?: { percent: number; resetMinutes?: number };
-		sevenDay?: { percent: number; resetHours?: number };
+		windows: Array<{
+			label: string;
+			percent: number;
+			resetValue?: number;
+			resetUnit?: "m" | "h";
+		}>;
 	} | null;
 }
 

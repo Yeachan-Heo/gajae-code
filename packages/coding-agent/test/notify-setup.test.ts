@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { parseNotifyArgs, runNotifyCommand } from "../src/cli/notify-cli";
 import { Settings } from "../src/config/settings";
 import { getNotificationConfig, maskToken } from "../src/notifications/config";
+import {
+	createLightweightDaemonSettings,
+	loadLightweightDaemonSettings,
+	ownerPidFromOwnerId,
+	runDaemonInternal,
+} from "../src/notifications/telegram-daemon-cli";
 
 type FakeCall = { method: string; body: Record<string, unknown> };
 
@@ -505,5 +514,82 @@ describe("notify setup threaded mode verification", () => {
 			),
 		).rejects.toThrow("Pairing rejected supergroup chat");
 		expect(getNotificationConfig(settings).enabled).toBe(false);
+	});
+});
+
+describe("notify daemon-internal lightweight startup", () => {
+	function tempAgentDir(): string {
+		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));
+	}
+
+	test("lightweight daemon settings read only notification keys from config.yml", async () => {
+		const agentDir = tempAgentDir();
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`notifications:
+  enabled: true
+  telegram:
+    botToken: 1234:token
+    chatId: "999"
+  redact: true
+  verbosity: verbose
+  daemon:
+    idleTimeoutMs: 12345
+`,
+		);
+
+		const settings = await loadLightweightDaemonSettings(agentDir);
+		const cfg = getNotificationConfig(settings as Settings);
+		expect(settings.getAgentDir()).toBe(agentDir);
+		expect(cfg.enabled).toBe(true);
+		expect(cfg.botToken).toBe("1234:token");
+		expect(cfg.chatId).toBe("999");
+		expect(cfg.redact).toBe(true);
+		expect(cfg.verbosity).toBe("verbose");
+		expect(cfg.idleTimeoutMs).toBe(12345);
+	});
+
+	test("lightweight daemon settings fall back to safe notification defaults", () => {
+		const settings = createLightweightDaemonSettings({ agentDir: "/tmp/gjc-agent", rawConfig: {} });
+		const cfg = getNotificationConfig(settings as Settings);
+		expect(cfg.enabled).toBe(false);
+		expect(cfg.botToken).toBeUndefined();
+		expect(cfg.chatId).toBeUndefined();
+		expect(cfg.redact).toBe(false);
+		expect(cfg.verbosity).toBe("lean");
+		expect(cfg.idleTimeoutMs).toBe(60_000);
+	});
+
+	test("daemon-internal exits before loading settings when owner pid is stale", async () => {
+		let settingsLoaded = false;
+		let daemonConstructed = false;
+		const { stderr } = await captureOutput(() =>
+			runDaemonInternal(["--owner-id", "12345-dead", "--agent-dir", tempAgentDir()], {
+				pidAlive: () => false,
+				SettingsImpl: {
+					async init() {
+						settingsLoaded = true;
+						return createLightweightDaemonSettings({ agentDir: "/tmp/gjc-agent", rawConfig: {} });
+					},
+				},
+				DaemonImpl: class {
+					constructor() {
+						daemonConstructed = true;
+					}
+					requestStop(): void {}
+					async run(): Promise<void> {}
+				} as never,
+			}),
+		);
+		expect(stderr).toContain("owner process");
+		expect(settingsLoaded).toBe(false);
+		expect(daemonConstructed).toBe(false);
+	});
+
+	test("owner pid parser accepts pid-prefixed owner ids only", () => {
+		expect(ownerPidFromOwnerId("12345-kabc-random")).toBe(12345);
+		expect(ownerPidFromOwnerId("12345")).toBe(12345);
+		expect(ownerPidFromOwnerId("owner-12345")).toBeUndefined();
+		expect(ownerPidFromOwnerId("0-dead")).toBeUndefined();
 	});
 });

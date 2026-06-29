@@ -119,7 +119,7 @@ interface TurnRecord {
 		target: string | null;
 		tmux_keys_sent?: boolean;
 		prompt_acknowledged?: boolean;
-		state?: "queued" | "tmux_keys_sent" | "acknowledged" | "unavailable";
+		state?: "queued" | "tmux_keys_sent" | "acknowledged" | "unavailable" | "unacknowledged";
 		attempts: Array<{
 			delivered: boolean;
 			created_at: string;
@@ -214,6 +214,9 @@ interface CoordinatorEventInput {
 }
 
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
+const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
+const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
+const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -317,8 +320,14 @@ function toolSchema(name: CoordinatorToolName): {
 				properties: {
 					session_id: sessionId,
 					turn_id: { type: "string" },
-					timeout_ms: { type: "number" },
-					poll_interval_ms: { type: "number" },
+					timeout_ms: {
+						type: "number",
+						description: "Bounded await timeout in milliseconds, capped at 30 minutes.",
+					},
+					poll_interval_ms: {
+						type: "number",
+						description: "Bounded polling interval in milliseconds, capped at 10 seconds.",
+					},
 					lines: { type: "number" },
 				},
 				required: ["turn_id"],
@@ -406,7 +415,10 @@ function toolSchema(name: CoordinatorToolName): {
 					after_seq: { type: "number" },
 					session_id: sessionId,
 					event_types: { type: "array", items: { type: "string" } },
-					timeout_ms: { type: "number" },
+					timeout_ms: {
+						type: "number",
+						description: "Bounded event long-poll timeout in milliseconds, capped at 30 seconds.",
+					},
 					limit: { type: "number" },
 				},
 			},
@@ -447,7 +459,8 @@ function toolSchema(name: CoordinatorToolName): {
 					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
 					timeout_ms: {
 						type: "number",
-						description: "Bounded await timeout; same cap semantics as gjc_coordinator_await_turn.",
+						description:
+							"Bounded await timeout in milliseconds, capped at 30 minutes like gjc_coordinator_await_turn.",
 					},
 					poll_interval_ms: { type: "number", description: "Bounded await polling interval." },
 					lines: { type: "number", description: "Bounded advisory tail lines returned with await/read payloads." },
@@ -1039,6 +1052,135 @@ async function markTurnTerminalFromSessionState(
 	return resolved;
 }
 
+function runtimeStateAcknowledgesTurn(turn: TurnRecord, sessionState: CoordinatorSessionState | null): boolean {
+	return (
+		sessionState?.source === "agent_session_event" &&
+		sessionState.current_turn_id === turn.turn_id &&
+		(sessionState.state === "running" ||
+			sessionState.state === "needs_user_input" ||
+			sessionState.state === "completed" ||
+			sessionState.state === "errored")
+	);
+}
+
+async function markTurnAcknowledgedFromRuntimeState(
+	namespaceDir: string,
+	turn: TurnRecord,
+	sessionState: CoordinatorSessionState,
+): Promise<TurnRecord> {
+	if (turn.delivery.prompt_acknowledged === true && turn.delivery.state === "acknowledged") return turn;
+	const timestamp = new Date().toISOString();
+	const acknowledged: TurnRecord = {
+		...turn,
+		delivery: {
+			...turn.delivery,
+			delivered: true,
+			prompt_acknowledged: true,
+			state: "acknowledged",
+			attempts: [
+				...turn.delivery.attempts,
+				{
+					delivered: true,
+					created_at: sessionState.updated_at,
+					reason: "runtime_prompt_acknowledged",
+					channel: "runtime_ack",
+					tmux_keys_sent: turn.delivery.tmux_keys_sent,
+				},
+			],
+		},
+		updated_at: timestamp,
+	};
+	await writeTurnRecord(namespaceDir, acknowledged);
+	await writeActiveTurn(namespaceDir, acknowledged);
+	return acknowledged;
+}
+
+function turnAwaitingRuntimeAckExpired(turn: TurnRecord, nowMs: number, ackTimeoutMs: number): boolean {
+	if (!ACTIVE_TURN_STATUSES.has(turn.status)) return false;
+	if (turn.delivery.tmux_keys_sent !== true) return false;
+	if (turn.delivery.prompt_acknowledged === true) return false;
+	if (turn.delivery.state !== "tmux_keys_sent") return false;
+	const deliveredAt =
+		turn.delivery.attempts.findLast(attempt => attempt.channel === "tmux_keys")?.created_at ?? turn.updated_at;
+	const deliveredMs = Date.parse(deliveredAt);
+	return Number.isFinite(deliveredMs) && nowMs - deliveredMs >= ackTimeoutMs;
+}
+
+async function markTurnFailedForUnacknowledgedDelivery(
+	namespaceDir: string,
+	turn: TurnRecord,
+	ackTimeoutMs: number,
+): Promise<TurnRecord> {
+	const timestamp = new Date().toISOString();
+	const message = `Tmux key delivery succeeded, but the GJC runtime did not acknowledge the prompt or emit turn_start within ${ackTimeoutMs}ms. The turn never started; stop waiting and inspect/retry the coordinator session.`;
+	const failed: TurnRecord = {
+		...turn,
+		status: "failed",
+		delivery: {
+			...turn.delivery,
+			delivered: false,
+			queued: false,
+			prompt_acknowledged: false,
+			state: "unacknowledged",
+			attempts: [
+				...turn.delivery.attempts,
+				{
+					delivered: false,
+					created_at: timestamp,
+					reason: PROMPT_ACK_TIMEOUT_REASON,
+					channel: "runtime_ack",
+					tmux_keys_sent: true,
+				},
+			],
+		},
+		final_response: {
+			text: message,
+			format: "markdown",
+			source: "coordinator_delivery_ack_timeout",
+			artifact_path: null,
+			truncated: false,
+		},
+		error: { code: PROMPT_ACK_TIMEOUT_REASON, message, recoverable: true },
+		evidence: [
+			...turn.evidence,
+			{
+				type: PROMPT_ACK_TIMEOUT_REASON,
+				message,
+				tmux_keys_sent: true,
+				prompt_acknowledged: false,
+				created_at: timestamp,
+			},
+		],
+		liveness: { checked_at: timestamp, live: turn.liveness.live, reason: PROMPT_ACK_TIMEOUT_REASON },
+		updated_at: timestamp,
+		completed_at: timestamp,
+	};
+	await writeTurnRecord(namespaceDir, failed);
+	await clearActiveTurn(namespaceDir, failed);
+	await writeSessionState(namespaceDir, failed.session_id, "stale", {
+		lastTurnId: failed.turn_id,
+		live: failed.liveness.live,
+		reason: PROMPT_ACK_TIMEOUT_REASON,
+	});
+	return failed;
+}
+
+async function reconcileRuntimeAcknowledgement(
+	namespaceDir: string,
+	turn: TurnRecord,
+	sessionState: CoordinatorSessionState | null,
+	ackTimeoutMs: number,
+	options: { failOnTimeout: boolean } = { failOnTimeout: true },
+): Promise<TurnRecord> {
+	if (sessionState && runtimeStateAcknowledgesTurn(turn, sessionState)) {
+		return await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
+	}
+	if (options.failOnTimeout && turnAwaitingRuntimeAckExpired(turn, Date.now(), ackTimeoutMs)) {
+		return await markTurnFailedForUnacknowledgedDelivery(namespaceDir, turn, ackTimeoutMs);
+	}
+	return turn;
+}
+
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -1086,16 +1228,33 @@ function asTerminalTurnStatus(status: unknown): TurnStatus | null {
 	return null;
 }
 
-function boundedTimeoutMs(value: unknown): number {
+export const COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+export const COORDINATOR_RUNTIME_PROMPT_ACK_TIMEOUT_MAX_MS = MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS;
+export const COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS = 30_000;
+export const COORDINATOR_POLL_INTERVAL_MAX_MS = 10_000;
+
+function parsePositiveIntegerMs(value: unknown, fallback: number): number {
 	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return 1000;
-	return Math.min(parsed, 30_000);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function boundedPollIntervalMs(value: unknown): number {
-	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return 100;
-	return Math.min(Math.max(parsed, 10), 1000);
+export function boundedAwaitTurnTimeoutMs(value: unknown): number {
+	return Math.min(parsePositiveIntegerMs(value, 1000), COORDINATOR_AWAIT_TURN_TIMEOUT_MAX_MS);
+}
+
+export function boundedRuntimePromptAckTimeoutMs(value: unknown): number {
+	return Math.min(
+		parsePositiveIntegerMs(value, DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS),
+		COORDINATOR_RUNTIME_PROMPT_ACK_TIMEOUT_MAX_MS,
+	);
+}
+
+export function boundedEventWatchTimeoutMs(value: unknown): number {
+	return Math.min(parsePositiveIntegerMs(value, 1000), COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS);
+}
+
+export function boundedPollIntervalMs(value: unknown): number {
+	return Math.min(Math.max(parsePositiveIntegerMs(value, 100), 10), COORDINATOR_POLL_INTERVAL_MAX_MS);
 }
 async function runCommand(command: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
@@ -1387,7 +1546,9 @@ export async function readCoordinatorArtifact(
 }
 
 export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions = {}) {
-	const config = buildCoordinatorMcpConfig(options.env ?? process.env);
+	const env = options.env ?? process.env;
+	const config = buildCoordinatorMcpConfig(env);
+	const promptAckTimeoutMs = boundedRuntimePromptAckTimeoutMs(env.GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS);
 	const services = options.services ?? {};
 	const namespaceDir = coordinatorNamespacePath(config);
 	const commandRunner = services.commandRunner ?? runCommand;
@@ -1485,14 +1646,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await writeTurnRecord(namespaceDir, activeTurn);
 		await writeActiveTurn(namespaceDir, activeTurn);
 		const sessionState = await readSessionState(namespaceDir, activeTurn.session_id);
-		const runtimeStateAlreadySettled =
-			sessionState?.current_turn_id === activeTurn.turn_id &&
-			(sessionState.state === "completed" || sessionState.state === "errored");
-		if (!runtimeStateAlreadySettled) {
-			await writeSessionState(namespaceDir, activeTurn.session_id, tmuxKeysSent ? "running" : "stale", {
+		const runtimeStateAlreadyAcknowledged =
+			sessionState !== null && runtimeStateAcknowledgesTurn(activeTurn, sessionState);
+		const resolvedTurn =
+			runtimeStateAlreadyAcknowledged && sessionState
+				? await markTurnAcknowledgedFromRuntimeState(namespaceDir, activeTurn, sessionState)
+				: activeTurn;
+		if (!runtimeStateAlreadyAcknowledged && !tmuxKeysSent) {
+			await writeSessionState(namespaceDir, activeTurn.session_id, "stale", {
 				currentTurnId: activeTurn.turn_id,
 				live,
-				reason: tmuxKeysSent ? null : "tmux_delivery_unavailable",
+				reason: "tmux_delivery_unavailable",
 			});
 		}
 		await appendCoordinatorEvent(namespaceDir, {
@@ -1505,7 +1669,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, activeTurn.turn_id)),
 			metadata: { target: typeof target === "string" ? target : null, live },
 		});
-		return activeTurn;
+		return resolvedTurn;
 	}
 
 	async function promoteNextQueuedTurn(sessionId: string): Promise<TurnRecord | null> {
@@ -1533,33 +1697,67 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		let resolvedTurn = turn;
 		let advisoryStatus: Record<string, unknown> = { live: false };
 		let sessionState = await readSessionState(namespaceDir, turn.session_id);
+		resolvedTurn = await reconcileRuntimeAcknowledgement(
+			namespaceDir,
+			resolvedTurn,
+			sessionState,
+			promptAckTimeoutMs,
+			{ failOnTimeout: false },
+		);
+		if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		if (
 			sessionState &&
-			ACTIVE_TURN_STATUSES.has(turn.status) &&
-			sessionState.current_turn_id === turn.turn_id &&
+			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			(sessionState.current_turn_id === resolvedTurn.turn_id ||
+				(sessionState.state === "errored" &&
+					sessionState.source === "agent_session_event" &&
+					sessionState.current_turn_id == null)) &&
 			(sessionState.state === "completed" || sessionState.state === "errored")
 		) {
-			resolvedTurn = await markTurnTerminalFromSessionState(namespaceDir, turn, sessionState);
+			resolvedTurn = await markTurnTerminalFromSessionState(namespaceDir, resolvedTurn, sessionState);
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		} else if (
 			sessionState &&
-			ACTIVE_TURN_STATUSES.has(turn.status) &&
-			sessionState.current_turn_id === turn.turn_id &&
+			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			sessionState.current_turn_id === resolvedTurn.turn_id &&
 			sessionState.state === "stale" &&
 			sessionState.reason === "tmux_delivery_unavailable" &&
-			turn.delivery.state === "unavailable" &&
+			resolvedTurn.delivery.state === "unavailable" &&
 			session &&
 			hasTmuxIdentity(session)
 		) {
-			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "tmux_delivery_unavailable");
+			resolvedTurn = await markTurnFailedForUnavailableSession(
+				namespaceDir,
+				resolvedTurn,
+				"tmux_delivery_unavailable",
+			);
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		} else if (!session && ACTIVE_TURN_STATUSES.has(turn.status)) {
-			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "session_record_missing");
+		} else if (!session && ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "session_record_missing");
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		} else if (session) {
 			advisoryStatus = await inspectTmuxSession(session, boundedLineCount(lines), commandRunner);
-			if (ACTIVE_TURN_STATUSES.has(turn.status) && hasTmuxIdentity(session) && advisoryStatus.live === false) {
-				resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, turn, "tmux_session_missing");
+			if (
+				ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+				hasTmuxIdentity(session) &&
+				advisoryStatus.live === false
+			) {
+				resolvedTurn = await markTurnFailedForUnavailableSession(
+					namespaceDir,
+					resolvedTurn,
+					"tmux_session_missing",
+				);
+				sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
+			}
+		}
+		if (ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+			resolvedTurn = await reconcileRuntimeAcknowledgement(
+				namespaceDir,
+				resolvedTurn,
+				sessionState,
+				promptAckTimeoutMs,
+			);
+			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
 				sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 			}
 		}
@@ -1577,6 +1775,46 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					}
 				: {}),
 		};
+	}
+
+	async function reconcileActiveTurnAcknowledgements(): Promise<void> {
+		const turns = (await listJsonFiles(turnsDir(namespaceDir)))
+			.map(turn => asRecord(turn) as TurnRecord | null)
+			.filter((turn): turn is TurnRecord => turn !== null && ACTIVE_TURN_STATUSES.has(turn.status));
+		for (const turn of turns) {
+			let sessionState = await readSessionState(namespaceDir, turn.session_id);
+			const resolvedTurn = await reconcileRuntimeAcknowledgement(
+				namespaceDir,
+				turn,
+				sessionState,
+				promptAckTimeoutMs,
+				{ failOnTimeout: false },
+			);
+			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) continue;
+			if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
+			const session = asRecord(await readJsonFile(sessionFile(resolvedTurn.session_id)));
+			if (
+				sessionState &&
+				sessionState.current_turn_id === resolvedTurn.turn_id &&
+				sessionState.state === "stale" &&
+				sessionState.reason === "tmux_delivery_unavailable" &&
+				resolvedTurn.delivery.state === "unavailable" &&
+				session &&
+				hasTmuxIdentity(session)
+			) {
+				await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "tmux_delivery_unavailable");
+				continue;
+			}
+			if (!session) {
+				await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "session_record_missing");
+				continue;
+			}
+			if (hasTmuxIdentity(session) && (await hasTmuxSession(session, commandRunner)) === false) {
+				await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "tmux_session_missing");
+				continue;
+			}
+			await reconcileRuntimeAcknowledgement(namespaceDir, resolvedTurn, sessionState, promptAckTimeoutMs);
+		}
 	}
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -1619,6 +1857,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 			}
 			if (name === "gjc_coordinator_read_status") {
+				await reconcileActiveTurnAcknowledgements();
 				const sessionId = args.session_id;
 				if (sessionId) {
 					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
@@ -1651,6 +1890,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
 			if (name === "gjc_coordinator_read_coordination_status") {
+				await reconcileActiveTurnAcknowledgements();
 				const sessions = jsonRecords(await listSessions());
 				const sessionStates = jsonRecords(await listJsonFiles(path.join(namespaceDir, "session-states")));
 				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir)));
@@ -1684,13 +1924,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 			}
 			if (name === "gjc_coordinator_watch_events") {
+				await reconcileActiveTurnAcknowledgements();
 				const limit = boundedEventLimit(args.limit);
-				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				const timeoutMs = boundedEventWatchTimeoutMs(args.timeout_ms);
 				let events = await readCoordinatorEvents(namespaceDir);
 				let matched = filterCoordinatorEvents(events, args, limit);
 				let timedOut = false;
 				if (matched.length === 0 && timeoutMs > 0) {
 					await waitForCoordinatorEvents(namespaceDir, timeoutMs);
+					await reconcileActiveTurnAcknowledgements();
 					events = await readCoordinatorEvents(namespaceDir);
 					matched = filterCoordinatorEvents(events, args, limit);
 					timedOut = matched.length === 0;
@@ -1819,7 +2061,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				if (promptAliasIgnored) base.prompt_alias_ignored = true;
 				if (args.await_completion === true && !shouldQueue) {
-					const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+					const timeoutMs = boundedAwaitTurnTimeoutMs(args.timeout_ms);
 					const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
 					const deadline = Date.now() + timeoutMs;
 					let payload = await readTurnPayload(turn.turn_id, sessionId, args.lines);
@@ -1979,7 +2221,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return await readTurnPayload(args.turn_id, args.session_id, args.lines);
 			}
 			if (name === "gjc_coordinator_await_turn") {
-				const timeoutMs = boundedTimeoutMs(args.timeout_ms);
+				const timeoutMs = boundedAwaitTurnTimeoutMs(args.timeout_ms);
 				const pollIntervalMs = boundedPollIntervalMs(args.poll_interval_ms);
 				const deadline = Date.now() + timeoutMs;
 				let payload = await readTurnPayload(args.turn_id, args.session_id, args.lines);

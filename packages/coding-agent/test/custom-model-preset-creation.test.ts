@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
+import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { CustomModelPresetWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-model-preset-wizard";
 import {
@@ -16,6 +20,22 @@ import { YAML } from "bun";
 
 let tempDir: string;
 let authStorage: AuthStorage;
+
+const currentModel = (provider: string, id: string): Model =>
+	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
+
+const snapshot: ModelProfileConfig = {
+	required_providers: ["my-oai"],
+	model_mapping: { default: "my-oai/gpt-custom:low" },
+};
+
+const placeholderProfile: ModelProfileDefinition = {
+	name: "placeholder",
+	displayName: "Placeholder",
+	requiredProviders: ["my-oai"],
+	modelMapping: { default: "my-oai/gpt-custom" },
+	source: "user",
+};
 
 beforeEach(async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-custom-preset-"));
@@ -37,27 +57,61 @@ function normalizeRenderedText(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
+interface TestRegistryOptions {
+	readonly models?: readonly Model[];
+	readonly resolveCanonicalModel?: (canonicalId: string) => Model | undefined;
+}
+
+function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [], options: TestRegistryOptions = {}) {
+	const profileMap = new Map(profiles);
+	const models = [...(options.models ?? [currentModel("my-oai", "gpt-custom"), currentModel("anthropic", "claude")])];
+	return {
+		refresh: async () => {},
+		getError: () => undefined,
+		getAvailable: () => [...models],
+		getAll: () => [...models],
+		getProviders: () => [],
+		getCanonicalModels: () => [],
+		getDiscoverableProviders: () => [],
+		findCanonicalModel: () => undefined,
+		resolveCanonicalModel: options.resolveCanonicalModel ?? (() => undefined),
+		getModelProfiles: () => new Map(profileMap),
+		getModelProfile: (name: string) => profileMap.get(name),
+		getApiKeyForProvider: async () => "key",
+	} as unknown as ModelRegistry;
+}
+
 describe("custom model preset creation", () => {
-	it("validates wizard input with human-readable errors and never asks for secrets", () => {
+	it("validates the one-name wizard and never asks for secrets", () => {
 		const submitted: unknown[] = [];
 		const wizard = new CustomModelPresetWizardComponent(
+			snapshot,
 			input => submitted.push(input),
 			() => {},
 			() => {},
 		);
 
 		typeText(wizard, "Bad Name");
-		let text = normalizeRenderedText(wizard.render(120).join("\n"));
+		const text = normalizeRenderedText(wizard.render(120).join("\n"));
 		expect(text).toContain("Preset id must use lowercase letters, numbers, dots, underscores, or hyphens.");
+		expect(text).not.toContain("Display name");
+		expect(text).not.toContain("Provider");
+		expect(text).not.toContain("Model");
 		expect(text).not.toContain("API key");
 		expect(text).not.toContain("secret");
+		expect(submitted).toEqual([]);
 
 		typeText(wizard, "my-fast");
-		typeText(wizard, "My Fast");
-		typeText(wizard, "bad provider");
-		text = normalizeRenderedText(wizard.render(120).join("\n"));
-		expect(text).toContain("Provider id must use lowercase letters, numbers, dots, underscores, or hyphens.");
-		expect(submitted).toEqual([]);
+		expect(submitted).toEqual([
+			{
+				name: "my-fast",
+				profile: {
+					display_name: "my-fast",
+					required_providers: ["my-oai"],
+					model_mapping: { default: "my-oai/gpt-custom:low" },
+				},
+			},
+		]);
 	});
 
 	it("persists a custom preset and includes it in later registry sessions", async () => {
@@ -65,12 +119,12 @@ describe("custom model preset creation", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 
 		const profile = await registry.saveCustomModelProfile("my-fast", {
-			display_name: "My Fast",
+			display_name: "my-fast",
 			required_providers: ["my-oai"],
 			model_mapping: { default: "my-oai/gpt-custom:low" },
 		});
 
-		expect(profile.displayName).toBe("My Fast");
+		expect(profile.displayName).toBe("my-fast");
 		expect(registry.getModelProfile("my-fast")?.modelMapping.default).toBe("my-oai/gpt-custom:low");
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
 			profiles: Record<
@@ -78,13 +132,13 @@ describe("custom model preset creation", () => {
 				{ display_name?: string; required_providers: string[]; model_mapping: Record<string, string> }
 			>;
 		};
-		expect(parsed.profiles["my-fast"]?.display_name).toBe("My Fast");
+		expect(parsed.profiles["my-fast"]?.display_name).toBe("my-fast");
 		expect(parsed.profiles["my-fast"]?.required_providers).toEqual(["my-oai"]);
 		expect(parsed.profiles["my-fast"]?.model_mapping.default).toBe("my-oai/gpt-custom:low");
 
 		const laterRegistry = new ModelRegistry(authStorage, modelsPath);
 		expect(laterRegistry.getAvailableModelProfileNames()).toContain("my-fast");
-		expect(laterRegistry.getModelProfile("my-fast")?.displayName).toBe("My Fast");
+		expect(laterRegistry.getModelProfile("my-fast")?.displayName).toBe("my-fast");
 	});
 
 	it("rejects creating a preset when existing models config is invalid and preserves it", async () => {
@@ -107,7 +161,7 @@ describe("custom model preset creation", () => {
 
 		await expect(
 			registry.saveCustomModelProfile("my-fast", {
-				display_name: "My Fast",
+				display_name: "my-fast",
 				required_providers: ["my-oai"],
 				model_mapping: { default: "my-oai/gpt-custom:low" },
 			}),
@@ -184,57 +238,193 @@ describe("custom model preset creation", () => {
 		).rejects.toThrow("Expected provider/modelId with optional :effort suffix");
 	});
 
-	it("surfaces create custom preset as a separate preset action", async () => {
-		const registry = {
-			refresh: async () => {},
-			getError: () => undefined,
-			getAll: () => [],
-			getProviders: () => [],
-			getCanonicalModels: () => [],
-			getDiscoverableProviders: () => [],
-			findCanonicalModel: () => undefined,
-			resolveCanonicalModel: () => undefined,
-			getModelProfiles: () =>
-				new Map([
-					[
-						"my-fast",
-						{
-							name: "my-fast",
-							displayName: "My Fast",
-							requiredProviders: ["my-oai"],
-							modelMapping: { default: "my-oai/gpt-custom" },
-							source: "user" as const,
-						},
-					],
-				]),
-			getModelProfile: (name: string) => registry.getModelProfiles().get(name),
-			getApiKeyForProvider: async () => "key",
-		} as unknown as ModelRegistry;
+	it("surfaces create custom preset with the generated current model snapshot", async () => {
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": {
+				executor: "anthropic/claude:high",
+				architect: "pi/default",
+				planner: "pi/default:high",
+				critic: "my-oai/gpt-custom",
+			},
+		});
+		const otherProfile: ModelProfileDefinition = {
+			name: "other",
+			displayName: "Other",
+			requiredProviders: ["other-provider"],
+			modelMapping: { default: "other-provider/model" },
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			settings,
+			createRegistry([[otherProfile.name, otherProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Create custom preset");
+		expect(text).toContain("Browse all models");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([
+			{
+				kind: "createProfile",
+				profile: {
+					required_providers: ["anthropic", "my-oai"],
+					model_mapping: {
+						default: "my-oai/gpt-custom:low",
+						executor: "anthropic/claude:high",
+						planner: "my-oai/gpt-custom:high",
+						critic: "my-oai/gpt-custom",
+					},
+				},
+			},
+		]);
+	});
+
+	it("keeps create custom preset visible when raw required provider order differs", async () => {
+		const orderMismatchProfile: ModelProfileDefinition = {
+			name: "order-mismatch",
+			displayName: "Order Mismatch",
+			requiredProviders: ["my-oai", "anthropic"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "anthropic/claude:high",
+			},
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({ "task.agentModelOverrides": { executor: "anthropic/claude:high" } }),
+			createRegistry([[orderMismatchProfile.name, orderMismatchProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Create custom preset");
+		expect(text).not.toContain("Already saved as order-mismatch");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections[0]?.kind).toBe("createProfile");
+	});
+
+	it("resolves canonical ids and role aliases before creating the snapshot", async () => {
+		const canonicalModel = currentModel("my-oai", "gpt-custom");
+		const settings = Settings.isolated({
+			modelRoles: { default: "best-coder" },
+			"task.agentModelOverrides": {
+				executor: "pi/default:low",
+				critic: "anthropic/claude:max",
+			},
+		});
 		const selections: ModelSelectorSelection[] = [];
 		const selector = new ModelSelectorComponent(
 			{ requestRender: () => {} } as unknown as TUI,
 			undefined,
-			Settings.isolated({}),
-			registry,
+			settings,
+			createRegistry([[placeholderProfile.name, placeholderProfile]], {
+				resolveCanonicalModel: canonicalId => (canonicalId === "best-coder" ? canonicalModel : undefined),
+			}),
 			[],
 			selection => {
 				selections.push(selection);
 			},
 			() => {},
 		);
-		await new Promise(resolve => setTimeout(resolve, 0));
+		await Bun.sleep(0);
 
-		let text = normalizeRenderedText(selector.render(180).join("\n"));
-		expect(text).toContain("CUSTOM");
-		selector.handleInput("\x1b[C");
-		text = normalizeRenderedText(selector.render(180).join("\n"));
-		expect(text).toContain("My Fast");
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
 		expect(text).toContain("Create custom preset");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([
+			{
+				kind: "createProfile",
+				profile: {
+					required_providers: ["anthropic", "my-oai"],
+					model_mapping: {
+						default: "my-oai/gpt-custom",
+						executor: "my-oai/gpt-custom:low",
+						critic: "anthropic/claude:max",
+					},
+				},
+			},
+		]);
+	});
+
+	it("disables custom preset creation when no concrete snapshot can be generated", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			undefined,
+			Settings.isolated({}),
+			createRegistry([[placeholderProfile.name, placeholderProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Select a model before creating a custom preset");
+		expect(text).not.toContain("Create custom preset");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([]);
+	});
+
+	it("replaces create custom preset with a disabled already-saved row for duplicate raw payloads", async () => {
+		const duplicateProfile: ModelProfileDefinition = {
+			name: "saved-current",
+			displayName: "Saved Current",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({}),
+			createRegistry([[duplicateProfile.name, duplicateProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Already saved as saved-current");
+		expect(text).not.toContain("Create custom preset");
 		expect(text).toContain("Browse all models");
 
 		selector.handleInput("\x1b[B");
-		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
-		expect(selections).toEqual([{ kind: "createProfile" }]);
+		expect(selections).toEqual([]);
 	});
 });

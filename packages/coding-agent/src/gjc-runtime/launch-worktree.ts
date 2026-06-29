@@ -118,6 +118,20 @@ function findWorktreeByPath(entries: GitWorktreeEntry[], worktreePath: string): 
 	return entries.find(entry => path.resolve(entry.path) === resolved) ?? null;
 }
 
+function describeWorktreeEntry(entry: GitWorktreeEntry): string {
+	return entry.detached ? `detached HEAD ${entry.head}` : (entry.branchRef ?? `HEAD ${entry.head}`);
+}
+
+function formatWorktreeTargetMismatch(plan: GjcLaunchWorktreePlan, existing: GitWorktreeEntry): string {
+	const expected = plan.detached ? `detached HEAD ${plan.baseRef}` : `branch refs/heads/${plan.branchName ?? ""}`;
+	return [
+		`worktree_target_mismatch:${plan.worktreePath}`,
+		`GJC launch worktree target is already registered for ${describeWorktreeEntry(existing)}, but this launch expects ${expected}.`,
+		`Path: ${plan.worktreePath}`,
+		"Refusing to delete or reuse the conflicting worktree automatically. Safe remediation: inspect the path, commit/stash any work, then remove or prune the stale worktree with git worktree remove <path> when it is no longer needed, or choose a different --worktree name.",
+	].join("\n");
+}
+
 function hasBranchInUse(entries: GitWorktreeEntry[], branchName: string, worktreePath: string): boolean {
 	const expectedRef = `refs/heads/${branchName}`;
 	const resolvedPath = path.resolve(worktreePath);
@@ -228,7 +242,7 @@ export function ensureLaunchWorktree(
 		let dirty = isWorktreeDirty(plan.worktreePath);
 		if (plan.detached) {
 			if (!existingAtPath.detached) {
-				throw new Error(`worktree_target_mismatch:${plan.worktreePath}`);
+				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
 			}
 			if (existingAtPath.head !== plan.baseRef) {
 				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
@@ -236,7 +250,7 @@ export function ensureLaunchWorktree(
 				dirty = false;
 			}
 		} else if (existingAtPath.branchRef !== expectedBranchRef) {
-			throw new Error(`worktree_target_mismatch:${plan.worktreePath}`);
+			throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
 		}
 		return {
 			...plan,

@@ -8,6 +8,7 @@ import { activateModelProfile, materializeActiveModelProfileAssignment } from ".
 import { recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
+import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -239,7 +240,7 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
-	showCustomModelPresetWizard(): void {
+	showCustomModelPresetWizard(snapshot: ModelProfileConfig): void {
 		this.showSelector(done => {
 			let wizard: CustomModelPresetWizardComponent;
 			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
@@ -256,6 +257,7 @@ export class SelectorController {
 				}
 			};
 			wizard = new CustomModelPresetWizardComponent(
+				snapshot,
 				input => {
 					void submit(input);
 				},
@@ -336,14 +338,16 @@ export class SelectorController {
 								separator: settings.get("statusLine.separator"),
 								showHookStatus: settings.get("statusLine.showHookStatus"),
 								sessionAccent: settings.get("statusLine.sessionAccent"),
+								segmentOptions: settings.get("statusLine.segmentOptions"),
 								...previewSettings,
 							});
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
-						getStatusLinePreview: () => {
+						getStatusLinePreview: (width?: number) => {
 							// Return the rendered status line for inline preview
-							const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
+							const availableWidth =
+								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getTopBorder(availableWidth).content;
 						},
 						onPluginsChanged: () => {
@@ -359,6 +363,7 @@ export class SelectorController {
 								separator: settings.get("statusLine.separator"),
 								showHookStatus: settings.get("statusLine.showHookStatus"),
 								sessionAccent: settings.get("statusLine.sessionAccent"),
+								segmentOptions: settings.get("statusLine.segmentOptions"),
 							});
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
@@ -603,6 +608,9 @@ export class SelectorController {
 			case "statusLineShowHooks":
 			case "statusLine.showHookStatus":
 			case "statusLine.sessionAccent":
+			case "statusLine.leftSegments":
+			case "statusLine.rightSegments":
+			case "statusLine.segmentOptions":
 			case "statusLineSegments":
 			case "statusLineModelThinking":
 			case "statusLinePathAbbreviate":
@@ -682,7 +690,7 @@ export class SelectorController {
 					try {
 						if (selection.kind === "createProfile") {
 							done();
-							this.showCustomModelPresetWizard();
+							this.showCustomModelPresetWizard(selection.profile);
 							return;
 						}
 						if (selection.kind === "profile") {

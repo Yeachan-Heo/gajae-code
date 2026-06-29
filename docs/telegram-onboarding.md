@@ -227,6 +227,13 @@ Reply paths:
   - `/lean`
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
+- send paired-chat lifecycle commands from the Telegram command menu or by typing:
+  - `/session_create path <dir>`
+  - `/session_create worktree <repo> <branch>`
+  - `/session_create dir <newdir>`
+  - `/session_recent [create|resume]`
+  - `/session_close <sessionId>`
+  - `/session_resume <sessionId|prefix>`
 
 The removed legacy `/answer <session-tag> <answer>` flow is not the primary UX;
 Telegram topic routing identifies the target session when the configured chat

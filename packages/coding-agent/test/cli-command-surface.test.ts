@@ -32,6 +32,7 @@ describe("GJC public CLI command surface", () => {
 			"notify",
 			"daemon",
 			"web-search",
+			"local-provider",
 			"mcp-serve",
 			"mcp",
 			"contribute-pr",

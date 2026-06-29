@@ -124,6 +124,46 @@ export interface Terminal {
 	get appearance(): TerminalAppearance | undefined;
 }
 
+interface TerminalSizeStream {
+	columns?: number;
+	rows?: number;
+	getWindowSize?: () => [number, number] | number[];
+}
+
+function positiveDimension(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	const dimension = Math.trunc(value);
+	return dimension > 0 ? dimension : undefined;
+}
+
+export function resolveTerminalColumns(
+	stream: TerminalSizeStream = process.stdout,
+	envColumns: string | undefined = Bun.env.COLUMNS,
+): number {
+	try {
+		const windowSize = stream.getWindowSize?.();
+		const liveColumns = positiveDimension(windowSize?.[0]);
+		if (liveColumns !== undefined) return liveColumns;
+	} catch {
+		// Fall back below when the stream cannot report a live TTY size.
+	}
+	return positiveDimension(stream.columns) ?? positiveDimension(Number(envColumns)) ?? 80;
+}
+
+export function resolveTerminalRows(
+	stream: TerminalSizeStream = process.stdout,
+	envRows: string | undefined = Bun.env.LINES,
+): number {
+	try {
+		const windowSize = stream.getWindowSize?.();
+		const liveRows = positiveDimension(windowSize?.[1]);
+		if (liveRows !== undefined) return liveRows;
+	} catch {
+		// Fall back below when the stream cannot report a live TTY size.
+	}
+	return positiveDimension(stream.rows) ?? positiveDimension(Number(envRows)) ?? 24;
+}
+
 function isWindowsSubsystemForLinux(): boolean {
 	return process.platform === "linux" && (!!$env.WSL_DISTRO_NAME || !!$env.WSL_INTEROP);
 }
@@ -740,11 +780,11 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	get columns(): number {
-		return process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
+		return resolveTerminalColumns();
 	}
 
 	get rows(): number {
-		return process.stdout.rows || Number(Bun.env.LINES) || 24;
+		return resolveTerminalRows();
 	}
 
 	moveBy(lines: number): void {
