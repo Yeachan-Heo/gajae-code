@@ -40,7 +40,7 @@ Then in gjc:
 
 ## Writing Custom Tools
 
-See [docs/custom-tools.md](../../docs/custom-tools.md) for full documentation.
+See the [GJC plugin guide](../../../../docs/gjc-plugins.md) for bundle-level custom tool policy.
 
 ### Key Points
 

@@ -9,7 +9,7 @@ edition = "2024"
 license = "MIT"
 authors = ["Yeachan-Heo"]
 homepage = "https://gaebal-gajae.dev/"
-repository = "https://github.com/can1357/gajae-code"
+repository = "https://github.com/Yeachan-Heo/gajae-code"
 
 [patch.crates-io]
 brush-core = { path = "crates/brush-core-vendored" }

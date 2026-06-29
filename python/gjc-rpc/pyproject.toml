@@ -24,8 +24,8 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://gaebal-gajae.dev/"
-Repository = "https://github.com/can1357/gajae-code"
-Documentation = "https://github.com/can1357/gajae-code/blob/main/docs/rpc.md"
+Repository = "https://github.com/Yeachan-Heo/gajae-code"
+Documentation = "https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/rpc.md"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

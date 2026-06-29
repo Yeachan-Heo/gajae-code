@@ -4,7 +4,7 @@ Core implementation package for the `gjc` coding agent in the `gajae-code` monor
 
 For installation, setup, provider configuration, model roles, slash commands, and full CLI reference, see:
 - [Monorepo README (local)](../../README.md)
-- [Monorepo README (GitHub)](https://github.com/can1357/gajae-code#readme)
+- [Monorepo README (GitHub)](https://github.com/Yeachan-Heo/gajae-code#readme)
 
 Package-specific references:
 - [CHANGELOG](./CHANGELOG.md)
