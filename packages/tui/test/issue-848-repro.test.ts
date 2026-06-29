@@ -48,4 +48,20 @@ describe("issue #848: truncateToWidth wrapper rejects nullish napi inputs", () =
 		const result = truncateToWidth("hello world", undefined as unknown as number, Ellipsis.Omit, null);
 		expect(typeof result).toBe("string");
 	});
+
+	it("does not throw a napi conversion error when text is undefined", () => {
+		// Renderers passed an optional/possibly-undefined field straight into
+		// truncateToWidth (e.g. an ask/git_log detail whose field was omitted),
+		// which crashed with "undefined is not an object" / a napi String
+		// conversion error. The wrapper must coerce text to a safe string.
+		const result = truncateToWidth(undefined as unknown as string, 50, Ellipsis.Unicode, null);
+		expect(typeof result).toBe("string");
+		expect(result).toBe("");
+	});
+
+	it("does not throw a napi conversion error when text is null", () => {
+		const result = truncateToWidth(null as unknown as string, 50, Ellipsis.Unicode, null);
+		expect(typeof result).toBe("string");
+		expect(result).toBe("");
+	});
 });

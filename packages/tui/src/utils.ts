@@ -45,14 +45,18 @@ export function truncateToWidth(
 	// Guard nullish napi inputs: napi-rs 3 on the Windows prebuilt rejects
 	// `null` for `Option<u8>` (Ellipsis) / `Option<bool>` (pad) (issue #848),
 	// and `maxWidth` is a required `u32` that throws on `null`/`undefined`
-	// everywhere. Pass concrete defaults that mirror the Rust `unwrap_or`s.
+	// everywhere. The `text` arg is a required `String` that likewise throws on
+	// `null`/`undefined` on every platform, which crashed renderers that passed
+	// an optional/possibly-undefined field. Pass concrete defaults that mirror
+	// the Rust `unwrap_or`s.
+	const safeText = typeof text === "string" ? text : String(text ?? "");
 	const safeWidth = Number.isFinite(maxWidth) ? Math.max(0, Math.trunc(maxWidth)) : 0;
 	let resolvedEllipsis: Ellipsis | null | undefined | string = ellipsisKind;
 	if (typeof resolvedEllipsis === "string") {
 		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
 	}
 	return nativeTruncateToWidth(
-		text,
+		safeText,
 		safeWidth,
 		resolvedEllipsis ?? Ellipsis.Unicode,
 		pad ?? false,

@@ -8,6 +8,8 @@ import {
 	formatDiagnostics,
 	formatParseErrors,
 	formatScreenshot,
+	getPreviewLines,
+	shortenPath,
 } from "@gajae-code/coding-agent/tools/render-utils";
 
 describe("parse error formatting", () => {
@@ -182,5 +184,25 @@ describe("formatCodeFrameLine", () => {
 		expect(formatCodeFrameLine("*", 448, "match", 3)).toBe("*448│match");
 		expect(formatCodeFrameLine("+", 11, "added", 3)).toBe(" +11│added");
 		expect(formatCodeFrameLine("+", 235, "added", 3)).toBe("+235│added");
+	});
+});
+
+describe("render helper null-safety", () => {
+	it("getPreviewLines returns [] for non-string input instead of throwing", () => {
+		// Mirrors the normalizeText-class bug: a (text: string) helper doing a
+		// first-action string op crashes when a renderer passes an optional field.
+		expect(() => getPreviewLines(undefined as unknown as string, 3, 80)).not.toThrow();
+		expect(getPreviewLines(undefined as unknown as string, 3, 80)).toEqual([]);
+		expect(getPreviewLines(null as unknown as string, 3, 80)).toEqual([]);
+		// Sanity: real input still works.
+		expect(getPreviewLines("a\nb\nc\nd", 2, 80)).toEqual(["a", "b"]);
+	});
+
+	it("shortenPath returns '' for non-string input instead of throwing", () => {
+		expect(() => shortenPath(undefined as unknown as string)).not.toThrow();
+		expect(shortenPath(undefined as unknown as string)).toBe("");
+		expect(shortenPath(null as unknown as string)).toBe("");
+		// Sanity: real input still works.
+		expect(shortenPath("/home/u/x", "/home/u")).toBe("~/x");
 	});
 });

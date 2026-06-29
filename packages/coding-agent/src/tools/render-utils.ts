@@ -86,6 +86,7 @@ export const EXPAND_HINT = "(Ctrl+O for more)";
  * Get first N lines of text as preview, with each line truncated.
  */
 export function getPreviewLines(text: string, maxLines: number, maxLineLen: number, ellipsis?: Ellipsis): string[] {
+	if (typeof text !== "string") return [];
 	const lines = text.split("\n").filter(l => l.trim());
 	return lines.slice(0, maxLines).map(l => truncateToWidth(l.trim(), maxLineLen, ellipsis));
 }
@@ -568,6 +569,7 @@ export function truncateDiffByHunk(
 // =============================================================================
 
 export function shortenPath(filePath: string, homeDir?: string): string {
+	if (typeof filePath !== "string") return "";
 	const home = homeDir ?? os.homedir();
 	if (home && filePath.startsWith(home)) {
 		return `~${filePath.slice(home.length)}`;
