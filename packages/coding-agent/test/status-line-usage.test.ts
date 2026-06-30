@@ -87,6 +87,45 @@ describe("status line usage segment", () => {
 		component.dispose();
 	});
 
+	it("renders remaining quota when usage mode is remaining", async () => {
+		const now = Date.now();
+		const session = makeSession(async () => [
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				limits: [
+					{
+						id: "openai-codex:primary",
+						scope: { provider: "openai-codex", windowId: "5h", tier: "pro" },
+						window: { id: "5h", resetsAt: now + 180 * 60_000 },
+						amount: { usedFraction: 0.24, unit: "percent" },
+					},
+					{
+						id: "openai-codex:secondary",
+						scope: { provider: "openai-codex", windowId: "7d", tier: "pro" },
+						window: { id: "7d", resetsAt: now + 49 * 3_600_000 },
+						amount: { usedFraction: 0.51, unit: "percent" },
+					},
+				],
+			},
+		]);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["usage"],
+			segmentOptions: { usage: { mode: "remaining" } },
+			showSkillHud: false,
+		});
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("5h 76% (3h)");
+		expect(text).toContain("7d 49% (2d 1h)");
+		expect(text).not.toContain("24%");
+		component.dispose();
+	});
+
 	it("keeps rendering non-tiered Anthropic usage windows", async () => {
 		const now = Date.now();
 		const session = makeSession(async () => [
