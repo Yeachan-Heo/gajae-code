@@ -115,8 +115,10 @@ describe("shouldSendServiceTier", () => {
 		expect(shouldSendServiceTier("scale", "openai-codex")).toBe(true);
 	});
 
-	it("returns true for DeepInfra priority tier", () => {
+	it("returns true only for DeepInfra priority tier", () => {
 		expect(shouldSendServiceTier("priority", "deepinfra")).toBe(true);
+		expect(shouldSendServiceTier("flex", "deepinfra")).toBe(false);
+		expect(shouldSendServiceTier("scale", "deepinfra")).toBe(false);
 	});
 
 	it("returns false for default tier on OpenAI-compatible service-tier providers", () => {

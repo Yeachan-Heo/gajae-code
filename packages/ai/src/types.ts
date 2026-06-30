@@ -232,8 +232,9 @@ export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): boolean {
-	if (provider !== "openai" && provider !== "openai-codex" && provider !== "deepinfra") return false;
 	const resolved = resolveServiceTier(serviceTier, provider);
+	if (provider === "deepinfra") return resolved === "priority";
+	if (provider !== "openai" && provider !== "openai-codex") return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
 }
 

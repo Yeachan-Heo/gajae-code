@@ -3,7 +3,7 @@ import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provide
 import { MODELS_DEV_PROVIDER_DESCRIPTORS } from "../src/provider-models/openai-compat";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { getEnvApiKey } from "../src/stream";
-import type { Context, Model } from "../src/types";
+import type { Context, Model, ServiceTier } from "../src/types";
 import { getOAuthProviders } from "../src/utils/oauth";
 
 const originalFetch = global.fetch;
@@ -64,7 +64,7 @@ describe("DeepInfra provider support (issue #1313)", () => {
 		expect(descriptor?.baseUrl).toBe("https://api.deepinfra.com/v1/openai");
 	});
 
-	test("forwards priority service_tier to DeepInfra chat completions", async () => {
+	async function captureDeepInfraBody(serviceTier: ServiceTier): Promise<Record<string, unknown>> {
 		const model: Model<"openai-completions"> = {
 			id: "deepseek-ai/DeepSeek-V3.2",
 			name: "DeepSeek-V3.2",
@@ -86,12 +86,24 @@ describe("DeepInfra provider support (issue #1313)", () => {
 		});
 		global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
 
-		const stream = streamOpenAICompletions(model, context, { apiKey: "test-key", serviceTier: "priority" });
+		const stream = streamOpenAICompletions(model, context, { apiKey: "test-key", serviceTier });
 		for await (const event of stream) {
 			if (event.type === "done" || event.type === "error") break;
 		}
+		return capturedBody;
+	}
+
+	test("forwards priority service_tier to DeepInfra chat completions", async () => {
+		const capturedBody = await captureDeepInfraBody("priority");
 
 		expect(capturedBody.model).toBe("deepseek-ai/DeepSeek-V3.2");
 		expect(capturedBody.service_tier).toBe("priority");
+	});
+
+	test.each(["flex", "scale"] as const)("does not forward %s service_tier to DeepInfra", async serviceTier => {
+		const capturedBody = await captureDeepInfraBody(serviceTier);
+
+		expect(capturedBody.model).toBe("deepseek-ai/DeepSeek-V3.2");
+		expect(capturedBody).not.toHaveProperty("service_tier");
 	});
 });
