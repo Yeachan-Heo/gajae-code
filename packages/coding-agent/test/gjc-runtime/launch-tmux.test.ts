@@ -1442,3 +1442,68 @@ it("retries new-session when the psmux server has not yet registered the session
 	expect(newSessionCalls.length).toBe(2);
 	expect(calls.some(call => call.command === "has-session" && call.args[2] === `=${capturedSessionName}`)).toBe(true);
 });
+
+it("retries new-session when the psmux server has not yet registered the session before profile tagging (Windows race)", () => {
+	// Regression: on Windows + psmux 3.3.0/3.3.6, the new-session spawn can
+	// return exit 0 and then the psmux server can die before it finishes
+	// registering the session on its control socket. The follow-up
+	// set-option @gjc-profile call that runs inside applyGjcTmuxProfile()
+	// then fails with "psmux: can't find session '=NAME' (no server
+	// running)". The control flow must probe + retry new-session before
+	// declaring profile tagging failed; otherwise a legitimate race
+	// would be misclassified as a persistence-tag rejection and the
+	// session would be killed without retry.
+	const calls: Array<{ command: string; args: string[] }> = [];
+	let newSessionCount = 0;
+	let setOptionCount = 0;
+	let capturedSessionName = "";
+	const result = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: {},
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: () => {},
+		spawnSync: (_command, spawnArgs) => {
+			calls.push({ command: spawnArgs[0], args: spawnArgs });
+			if (spawnArgs[0] === "new-session") {
+				capturedSessionName = spawnArgs[3] ?? capturedSessionName;
+				newSessionCount++;
+				return { exitCode: 0, stderr: "" };
+			}
+			if (spawnArgs[0] === "has-session") {
+				if (newSessionCount === 1) {
+					return {
+						exitCode: 1,
+						stderr: `psmux: can't find session '=${capturedSessionName}' (no server running)`,
+					};
+				}
+				return { exitCode: 0 };
+			}
+			// After the second successful new-session, psmux persists
+			// the @gjc-profile tag, so applyGjcTmuxProfile must succeed.
+			if (spawnArgs.some(arg => typeof arg === "string" && arg.includes("@gjc-profile"))) {
+				setOptionCount++;
+				return { exitCode: 0, stderr: "" };
+			}
+			if (spawnArgs[0] === "set-option" && setOptionCount === 0 && newSessionCount === 1) {
+				setOptionCount++;
+				return {
+					exitCode: 1,
+					stderr: `psmux: can't find session '=${capturedSessionName}' (no server running)`,
+				};
+			}
+			return { exitCode: 0 };
+		},
+	});
+	expect(result).toBe(true);
+	const newSessionCalls = calls.filter(call => call.command === "new-session");
+	expect(newSessionCalls.length).toBe(2);
+	expect(calls.filter(call => call.command === "has-session").length).toBeGreaterThanOrEqual(2);
+});
