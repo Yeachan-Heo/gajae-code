@@ -1,6 +1,6 @@
 # robogjc
 
-Self-hosted GitHub triage bot. Drives [`gjc --mode rpc`](https://github.com/can1357/gajae-code)
+Self-hosted GitHub triage bot. Drives [`gjc --mode rpc`](https://github.com/Yeachan-Heo/gajae-code)
 as a subprocess against a per-issue git worktree, then writes back to GitHub
 through a sidecar that holds the PAT.
 

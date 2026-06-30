@@ -8,7 +8,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/gajae-ai/gajae-code.git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-code.git",
 		"directory": "packages/typescript-edit-benchmark"
 	},
 	"main": "./src/index.ts",
@@ -47,5 +47,5 @@
 	"engines": {
 		"bun": ">=1.3.14"
 	},
-	"homepage": "https://gaebal-gajae.dev"
+	"homepage": "https://gajae-code.com"
 }

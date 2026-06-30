@@ -16,6 +16,6 @@ Example custom tools that extend the agent's capabilities.
 ## Documentation
 
 - [SDK Reference](sdk/README.md)
-- [Hooks Documentation](../docs/hooks.md)
-- [Custom Tools Documentation](../docs/custom-tools.md)
-- [Skills Documentation](../docs/skills.md)
+- [Hooks Examples](hooks/README.md)
+- [Custom Tools Examples](custom-tools/README.md)
+- [Workflow Skills Documentation](../../../README.md#workflow-surface)
