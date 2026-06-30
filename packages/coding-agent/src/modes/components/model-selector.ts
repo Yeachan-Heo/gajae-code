@@ -107,6 +107,14 @@ export type ModelSelectorSelection =
 	| {
 			kind: "createProfile";
 			profile: ModelProfileConfig;
+	  }
+	| {
+			kind: "renameProfile";
+			profileName: string;
+	  }
+	| {
+			kind: "deleteProfile";
+			profileName: string;
 	  };
 
 interface PendingThinkingChoice {
@@ -164,7 +172,7 @@ interface PresetCreateUnavailableRow {
 
 interface PresetAlreadySavedRow {
 	kind: "alreadySaved";
-	profileName: string;
+	profile: ModelProfileDefinition;
 }
 
 interface PresetBrowseRow {
@@ -195,7 +203,7 @@ function presetRowIdentity(row: PresetLandingRow): string {
 		case "createUnavailable":
 			return "createUnavailable";
 		case "alreadySaved":
-			return `alreadySaved:${row.profileName}`;
+			return `alreadySaved:${row.profile.name}`;
 	}
 }
 
@@ -207,6 +215,7 @@ const PROFILE_ROLE_PREVIEW_ORDER: GjcModelAssignmentTargetId[] = [
 	"architect",
 ];
 const PRESET_SCOPE_LABELS = ["Apply for this session", "Set as default"];
+const CUSTOM_PRESET_SCOPE_LABELS = ["Apply for this session", "Set as default", "Rename", "Delete"];
 
 function isPrintableCharacter(keyData: string): boolean {
 	return keyData.length === 1 && keyData >= " " && keyData !== "\x7f";
@@ -272,6 +281,10 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 
 function hasPersistableProfileSnapshot(snapshot: ModelProfileConfig): boolean {
 	return Object.keys(snapshot.model_mapping).length > 0 && snapshot.required_providers.length > 0;
+}
+
+function isCustomUserProfile(profile: ModelProfileDefinition): boolean {
+	return profile.source === "user";
 }
 /**
  * Component that renders a canonical model selector with provider tabs.
@@ -885,9 +898,7 @@ export class ModelSelectorComponent extends Container {
 		const snapshot = this.#buildCustomModelProfileSnapshot();
 		if (hasPersistableProfileSnapshot(snapshot)) {
 			const duplicateProfile = this.#findDuplicateGeneratedProfile(snapshot);
-			rows.push(
-				duplicateProfile ? { kind: "alreadySaved", profileName: duplicateProfile.name } : { kind: "create" },
-			);
+			rows.push(duplicateProfile ? { kind: "alreadySaved", profile: duplicateProfile } : { kind: "create" });
 		} else {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
@@ -961,7 +972,14 @@ export class ModelSelectorComponent extends Container {
 		this.#presetCursor = relocated;
 		return true;
 	}
-
+	#relocatePresetCursorForProfile(profileName: string): boolean {
+		for (const [groupId, profiles] of this.#getPresetGroups()) {
+			if (!profiles.some(profile => profile.name === profileName)) continue;
+			this.#expandedPresetProviderId = groupId;
+			return this.#relocatePresetCursor(`profile:${groupId}:${profileName}`);
+		}
+		return false;
+	}
 	#expandSelectedPresetProvider(): void {
 		const selected = this.#getSelectedPresetRow();
 		if (
@@ -1029,7 +1047,8 @@ export class ModelSelectorComponent extends Container {
 				continue;
 			}
 			if (row.kind === "alreadySaved") {
-				const label = `Already saved as ${row.profileName}`;
+				const presentation = getModelProfilePresentation(row.profile);
+				const label = `Already saved as ${presentation.displayName}`;
 				const renderedLabel = selected ? theme.fg("accent", label) : theme.fg("dim", label);
 				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
 				continue;
@@ -1082,8 +1101,9 @@ export class ModelSelectorComponent extends Container {
 		}
 		this.#listContainer.addChild(new Spacer(1));
 		if (this.#presetScopeMenuOpen) {
-			for (let i = 0; i < PRESET_SCOPE_LABELS.length; i++) {
-				const label = PRESET_SCOPE_LABELS[i] ?? "";
+			const actionLabels = this.#getPresetScopeLabels(profile);
+			for (let i = 0; i < actionLabels.length; i++) {
+				const label = actionLabels[i] ?? "";
 				const prefix = i === this.#presetScopeIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 				this.#listContainer.addChild(
 					new Text(`${prefix}${i === this.#presetScopeIndex ? theme.fg("accent", label) : label}`, 0, 0),
@@ -1394,8 +1414,8 @@ export class ModelSelectorComponent extends Container {
 			const rows = this.#getPresetRows();
 			if (rows.length === 0) return;
 			if (this.#presetScopeMenuOpen) {
-				this.#presetScopeIndex =
-					this.#presetScopeIndex === 0 ? PRESET_SCOPE_LABELS.length - 1 : this.#presetScopeIndex - 1;
+				const actionCount = this.#getPreviewPresetScopeLabels().length;
+				this.#presetScopeIndex = this.#presetScopeIndex === 0 ? actionCount - 1 : this.#presetScopeIndex - 1;
 			} else {
 				this.#presetCursor = this.#presetCursor === 0 ? rows.length - 1 : this.#presetCursor - 1;
 				this.#previewProfileName = undefined;
@@ -1409,7 +1429,7 @@ export class ModelSelectorComponent extends Container {
 			const rows = this.#getPresetRows();
 			if (rows.length === 0) return;
 			if (this.#presetScopeMenuOpen) {
-				this.#presetScopeIndex = (this.#presetScopeIndex + 1) % PRESET_SCOPE_LABELS.length;
+				this.#presetScopeIndex = (this.#presetScopeIndex + 1) % this.#getPreviewPresetScopeLabels().length;
 			} else {
 				this.#presetCursor = (this.#presetCursor + 1) % rows.length;
 				this.#previewProfileName = undefined;
@@ -1464,6 +1484,22 @@ export class ModelSelectorComponent extends Container {
 
 	#handlePresetEnter(): void {
 		if (this.#presetScopeMenuOpen && this.#previewProfileName) {
+			const profile = this.#getProfileByName(this.#previewProfileName);
+			if (!profile) return;
+			if (this.#presetScopeIndex === 2 && isCustomUserProfile(profile)) {
+				this.#onSelectCallback({ kind: "renameProfile", profileName: this.#previewProfileName });
+				return;
+			}
+			if (this.#presetScopeIndex === 3 && isCustomUserProfile(profile)) {
+				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
+				return;
+			}
+			const missing = this.#getMissingProviders(profile);
+			if (missing.length > 0) {
+				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+				this.#renderPresetLanding();
+				return;
+			}
 			this.#onSelectCallback({
 				kind: "profile",
 				profileName: this.#previewProfileName,
@@ -1502,7 +1538,7 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		const missing = this.#getMissingProviders(row.profile);
-		if (missing.length > 0) {
+		if (missing.length > 0 && !isCustomUserProfile(row.profile)) {
 			this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
 			this.#renderPresetLanding();
 			return;
@@ -1510,6 +1546,31 @@ export class ModelSelectorComponent extends Container {
 		this.#previewProfileName = row.profile.name;
 		this.#presetLoginHint = undefined;
 		this.#renderPresetLanding();
+	}
+
+	#getPresetScopeLabels(profile: ModelProfileDefinition): string[] {
+		return isCustomUserProfile(profile) ? CUSTOM_PRESET_SCOPE_LABELS : PRESET_SCOPE_LABELS;
+	}
+
+	#getPreviewPresetScopeLabels(): string[] {
+		const profile = this.#getProfileByName(this.#previewProfileName);
+		return profile ? this.#getPresetScopeLabels(profile) : PRESET_SCOPE_LABELS;
+	}
+
+	refreshPresetProfiles(profileName?: string): void {
+		if (profileName) {
+			this.#previewProfileName = profileName;
+			this.#presetLoginHint = undefined;
+			if (!this.#relocatePresetCursorForProfile(profileName)) this.#clampPresetCursor();
+		} else {
+			this.#previewProfileName = undefined;
+			this.#presetScopeMenuOpen = false;
+			this.#presetScopeIndex = 0;
+			this.#presetLoginHint = undefined;
+			this.#clampPresetCursor();
+		}
+		this.#renderPresetLanding();
+		this.#tui.requestRender();
 	}
 
 	#beginActionMenuOrSelect(item: ModelItem | CanonicalModelItem): void {
@@ -1630,6 +1691,16 @@ export class ModelSelectorComponent extends Container {
 	}
 	async __testSelectProfile(profileName: string, setDefault: boolean): Promise<void> {
 		await this.#onSelectCallback({ kind: "profile", profileName, setDefault });
+	}
+	async __testSelectPresetAction(profileName: string, action: "rename" | "delete"): Promise<void> {
+		await this.#onSelectCallback({
+			kind: action === "rename" ? "renameProfile" : "deleteProfile",
+			profileName,
+		});
+	}
+	__testSelectedPresetRowIdentity(): string | undefined {
+		const row = this.#getSelectedPresetRow();
+		return row ? presetRowIdentity(row) : undefined;
 	}
 }
 

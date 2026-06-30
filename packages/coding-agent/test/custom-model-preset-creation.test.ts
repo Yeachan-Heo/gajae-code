@@ -1,9 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import {
+	materializeModelProfileForDeletion,
+	restoreMaterializedModelProfileForDeletion,
+} from "@gajae-code/coding-agent/config/model-profile-activation";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
@@ -13,6 +17,7 @@ import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
+import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
@@ -60,6 +65,7 @@ function normalizeRenderedText(text: string): string {
 interface TestRegistryOptions {
 	readonly models?: readonly Model[];
 	readonly resolveCanonicalModel?: (canonicalId: string) => Model | undefined;
+	readonly apiKeyForProvider?: (providerId: string) => string | undefined;
 }
 
 function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [], options: TestRegistryOptions = {}) {
@@ -77,7 +83,7 @@ function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [
 		resolveCanonicalModel: options.resolveCanonicalModel ?? (() => undefined),
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
-		getApiKeyForProvider: async () => "key",
+		getApiKeyForProvider: async (providerId: string) => options.apiKeyForProvider?.(providerId) ?? "key",
 	} as unknown as ModelRegistry;
 }
 
@@ -139,6 +145,78 @@ describe("custom model preset creation", () => {
 		const laterRegistry = new ModelRegistry(authStorage, modelsPath);
 		expect(laterRegistry.getAvailableModelProfileNames()).toContain("my-fast");
 		expect(laterRegistry.getModelProfile("my-fast")?.displayName).toBe("my-fast");
+	});
+
+	it("renames a custom preset display name without changing profile identity", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		await registry.saveCustomModelProfile("my-fast", {
+			display_name: "my-fast",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom:low" },
+		});
+
+		const renamed = await registry.renameCustomModelProfile("my-fast", "renamed-fast");
+
+		expect(renamed.name).toBe("my-fast");
+		expect(renamed.displayName).toBe("renamed-fast");
+		expect(registry.getModelProfile("my-fast")?.displayName).toBe("renamed-fast");
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { display_name?: string; model_mapping: Record<string, string> }>;
+		};
+		expect(parsed.profiles["my-fast"]?.display_name).toBe("renamed-fast");
+		expect(parsed.profiles["renamed-fast"]).toBeUndefined();
+		expect(parsed.profiles["my-fast"]?.model_mapping.default).toBe("my-oai/gpt-custom:low");
+	});
+
+	it("deletes only the selected custom preset", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		await registry.saveCustomModelProfile("first", {
+			display_name: "first",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		});
+		await registry.saveCustomModelProfile("second", {
+			display_name: "second",
+			required_providers: ["anthropic"],
+			model_mapping: { default: "anthropic/claude" },
+		});
+
+		const deleted = await registry.deleteCustomModelProfile("first");
+
+		expect(deleted).toEqual({
+			display_name: "first",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		});
+
+		expect(registry.getModelProfile("first")).toBeUndefined();
+		expect(registry.getModelProfile("second")?.displayName).toBe("second");
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { display_name?: string }>;
+		};
+		expect(parsed.profiles.first).toBeUndefined();
+		expect(parsed.profiles.second?.display_name).toBe("second");
+	});
+
+	it("rejects empty rename input and built-in delete without mutating config", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		await registry.saveCustomModelProfile("my-fast", {
+			display_name: "my-fast",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		});
+		const before = await Bun.file(modelsPath).text();
+
+		await expect(registry.renameCustomModelProfile("my-fast", "   ")).rejects.toThrow(
+			"Profile display name is required.",
+		);
+		await expect(registry.deleteCustomModelProfile("codex-medium")).rejects.toThrow(
+			"Cannot delete bundled model profile",
+		);
+		expect(await Bun.file(modelsPath).text()).toBe(before);
 	});
 
 	it("rejects creating a preset when existing models config is invalid and preserves it", async () => {
@@ -419,12 +497,300 @@ describe("custom model preset creation", () => {
 		await Bun.sleep(0);
 
 		const text = normalizeRenderedText(selector.render(180).join("\n"));
-		expect(text).toContain("Already saved as saved-current");
+		expect(text).toContain("Already saved as Saved Current");
 		expect(text).not.toContain("Create custom preset");
 		expect(text).toContain("Browse all models");
 
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 		expect(selections).toEqual([]);
+	});
+	it("emits custom preset rename and delete actions from preset rows", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-row",
+			displayName: "Custom Row",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom" },
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({}),
+			createRegistry([[customProfile.name, customProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		await selector.__testSelectPresetAction("custom-row", "rename");
+		await selector.__testSelectPresetAction("custom-row", "delete");
+
+		expect(selections).toEqual([
+			{ kind: "renameProfile", profileName: "custom-row" },
+			{ kind: "deleteProfile", profileName: "custom-row" },
+		]);
+	});
+
+	it("keeps rename and delete reachable for unauthenticated custom preset rows", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "needs-login",
+			displayName: "Needs Login",
+			requiredProviders: ["locked-provider"],
+			modelMapping: { default: "locked-provider/model" },
+			source: "user",
+		};
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({}),
+			createRegistry([[customProfile.name, customProfile]], { apiKeyForProvider: () => undefined }),
+			[],
+			() => {},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		selector.handleInput("\x1b[C");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+
+		expect(text).toContain("Rename");
+		expect(text).toContain("Delete");
+		expect(text).not.toContain("Run /login locked-provider");
+		expect(selector.__testSelectedPresetRowIdentity()).toBe("profile:CUSTOM:needs-login");
+		selector.refreshPresetProfiles();
+		const refreshedText = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(refreshedText).not.toContain("Rename");
+		expect(refreshedText).not.toContain("Delete");
+	});
+
+	it("keeps the cursor on a refreshed custom preset row by actual group identity", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-row",
+			displayName: "Custom Row",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom" },
+			source: "user",
+		};
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({}),
+			createRegistry([[customProfile.name, customProfile]]),
+			[],
+			() => {},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		selector.refreshPresetProfiles("custom-row");
+
+		expect(selector.__testSelectedPresetRowIdentity()).toBe("profile:CUSTOM:custom-row");
+	});
+
+	it("materializes and restores a default custom preset deletion snapshot", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+			modelRoles: { default: "old/default" },
+			"task.agentModelOverrides": { critic: "old/critic" },
+		});
+		const activeProfiles: (string | undefined)[] = ["other-session"];
+		const session = {
+			model: currentModel("other", "active"),
+			thinkingLevel: undefined,
+			sessionId: "session",
+			setActiveModelProfile: (profileName: string | undefined) => {
+				activeProfiles.push(profileName);
+			},
+			getActiveModelProfile: () => activeProfiles.at(-1),
+		};
+
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			settings,
+			modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+			profileName: "custom-default",
+		});
+
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("modelRoles").default).toBe("my-oai/gpt-custom:low");
+		expect(settings.get("task.agentModelOverrides").executor).toBe("my-oai/gpt-custom");
+		expect(activeProfiles.at(-1)).toBeUndefined();
+
+		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
+
+		expect(settings.get("modelProfile.default")).toBe("custom-default");
+		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
+		expect(activeProfiles.at(-1)).toBe("other-session");
+	});
+	it("rolls back deletion materialization when settings flush fails", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+			modelRoles: { default: "old/default" },
+			"task.agentModelOverrides": { critic: "old/critic" },
+		});
+		const activeProfiles: (string | undefined)[] = ["custom-default"];
+		const session = {
+			model: currentModel("other", "active"),
+			thinkingLevel: undefined,
+			sessionId: "session",
+			setActiveModelProfile: (profileName: string | undefined) => {
+				activeProfiles.push(profileName);
+			},
+			getActiveModelProfile: () => activeProfiles.at(-1),
+		};
+		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+
+		try {
+			await expect(
+				materializeModelProfileForDeletion({
+					session,
+					settings,
+					modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+					profileName: "custom-default",
+				}),
+			).rejects.toThrow("flush failed");
+		} finally {
+			flushSpy.mockRestore();
+		}
+
+		expect(settings.get("modelProfile.default")).toBe("custom-default");
+		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
+		expect(activeProfiles.at(-1)).toBe("custom-default");
+	});
+	it("restores a deleted custom preset when post-delete notification fails", async () => {
+		const profiles = new Map<string, ModelProfileDefinition>([
+			[
+				"custom-default",
+				{
+					name: "custom-default",
+					displayName: "Custom Default",
+					requiredProviders: ["my-oai"],
+					modelMapping: { default: "my-oai/gpt-custom:low" },
+					source: "user",
+				},
+			],
+		]);
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+			modelRoles: { default: "old/default" },
+			"task.agentModelOverrides": { critic: "old/critic" },
+		});
+		const activeProfiles: (string | undefined)[] = ["custom-default"];
+		let restoredProfile:
+			| {
+					display_name?: string;
+					required_providers: string[];
+					model_mapping: Record<string, string>;
+			  }
+			| undefined;
+		const registry = {
+			...createRegistry(profiles),
+			getModelProfiles: () => new Map(profiles),
+			getModelProfile: (name: string) => profiles.get(name),
+			getAvailableModelProfileNames: () => [...profiles.keys()],
+			deleteCustomModelProfile: async (name: string) => {
+				const profile = profiles.get(name);
+				if (!profile) throw new Error("missing profile");
+				const config = {
+					display_name: profile.displayName,
+					required_providers: [...profile.requiredProviders],
+					model_mapping: { ...profile.modelMapping },
+				};
+				profiles.delete(name);
+				return config;
+			},
+			saveCustomModelProfile: async (
+				name: string,
+				config: { display_name?: string; required_providers: string[]; model_mapping: Record<string, string> },
+			) => {
+				restoredProfile = config;
+				profiles.set(name, {
+					name,
+					displayName: config.display_name,
+					requiredProviders: [...config.required_providers],
+					modelMapping: { ...config.model_mapping },
+					source: "user",
+				});
+				return profiles.get(name);
+			},
+			refresh: async () => {},
+		};
+		let selector: ModelSelectorComponent | undefined;
+		let confirmTitle: string | undefined;
+		const ctx = {
+			ui: { setFocus: () => {}, requestRender: () => {} },
+			editorContainer: {
+				clear: () => {},
+				addChild: (child: unknown) => {
+					if (child instanceof ModelSelectorComponent) selector = child;
+				},
+			},
+			editor: {},
+			settings,
+			session: {
+				model: currentModel("my-oai", "gpt-custom"),
+				thinkingLevel: ThinkingLevel.Low,
+				sessionId: "session",
+				scopedModels: [],
+				modelRegistry: registry,
+				setActiveModelProfile: (profileName: string | undefined) => activeProfiles.push(profileName),
+				getActiveModelProfile: () => activeProfiles.at(-1),
+				isFastForProvider: () => false,
+				isFastForSubagentProvider: () => false,
+				isFastModeActive: () => false,
+			},
+			statusLine: { invalidate: () => {} },
+			updateEditorBorderColor: () => {},
+			showStatus: () => {},
+			showError: (message: string) => {
+				expect(message).toBe("Preset delete failed: notify failed");
+			},
+			showHookConfirm: async (title: string) => {
+				confirmTitle = title;
+				return true;
+			},
+			notifyConfigChanged: async () => {
+				throw new Error("notify failed");
+			},
+		};
+
+		new SelectorController(ctx as never).showModelSelector();
+		await Bun.sleep(0);
+		await selector?.__testSelectPresetAction("custom-default", "delete");
+
+		expect(confirmTitle).toBe("Delete custom model preset: Custom Default");
+		expect(restoredProfile?.display_name).toBe("Custom Default");
+		expect(profiles.get("custom-default")?.displayName).toBe("Custom Default");
+		expect(settings.get("modelProfile.default")).toBe("custom-default");
+		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
+		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
 });

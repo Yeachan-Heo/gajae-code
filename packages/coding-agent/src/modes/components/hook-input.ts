@@ -23,7 +23,7 @@ export class HookInputComponent extends Container {
 
 	constructor(
 		title: string,
-		_placeholder: string | undefined,
+		initialValue: string | undefined,
 		onSubmit: (value: string) => void,
 		onCancel: () => void,
 		opts?: HookInputOptions,
@@ -54,6 +54,9 @@ export class HookInputComponent extends Container {
 		}
 
 		this.#input = new Input();
+		if (initialValue) {
+			this.#input.setValue(initialValue);
+		}
 		this.addChild(this.#input);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("dim", "enter submit  esc cancel"), 1, 0));

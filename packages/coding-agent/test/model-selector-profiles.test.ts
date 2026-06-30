@@ -32,6 +32,7 @@ const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
 const profile: ModelProfileDefinition = {
 	name: "profile-a",
+	displayName: "Profile Alpha",
 	requiredProviders: ["provider-a"],
 	modelMapping: { default: "provider-a/default:high", executor: "provider-a/alternate" },
 	source: "user",
@@ -261,7 +262,7 @@ describe("model selector profiles", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
-		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: profile-a");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
@@ -269,10 +270,10 @@ describe("model selector profiles", () => {
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller, true);
 
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: profile-a");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(flush).toHaveBeenCalledTimes(1);
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: profile-a");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
 	test("credential failure shows error and leaves model and overrides unchanged", async () => {
@@ -281,7 +282,7 @@ describe("model selector profiles", () => {
 		await selectFirstProfile(controller);
 
 		expect(ctx.showError).toHaveBeenCalledWith(
-			'Model profile "profile-a" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
+			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
 		);
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model).toBe(alternateModel);

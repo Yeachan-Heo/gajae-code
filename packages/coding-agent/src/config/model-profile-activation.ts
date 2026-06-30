@@ -46,7 +46,7 @@ export interface PrepareModelProfileActivationOptions {
 export interface PreparedModelProfileActivation {
 	profileName: string;
 	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
-	settings: Pick<Settings, "get" | "override" | "set" | "flush">;
+	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "override" | "set" | "flush">;
 	previousModel: Model<Api> | undefined;
 	previousThinkingLevel: ThinkingLevel | undefined;
 	previousAgentModelOverrides: Record<string, string>;
@@ -108,8 +108,8 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 	return true;
 }
 
-export function formatModelProfileCredentialError(profileName: string, providers: readonly string[]): string {
-	return `Model profile "${profileName}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
+export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
+	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
 
 function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
@@ -183,6 +183,7 @@ export async function prepareModelProfileActivation(
 		const available = formatAvailableProfileNames(profiles);
 		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
 	}
+	const profileLabel = profile.displayName ?? options.profileName;
 
 	const allProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
 	const alternativeGroups = profile.alternativeProviderGroups ?? [];
@@ -202,19 +203,19 @@ export async function prepareModelProfileActivation(
 	// Check strict (non-alternative) providers — all must be authenticated.
 	const strictMissing = missingProviders.filter(p => !alternativeSet.has(p));
 	if (strictMissing.length > 0) {
-		throw new Error(formatModelProfileCredentialError(options.profileName, strictMissing));
+		throw new Error(formatModelProfileCredentialError(profileLabel, strictMissing));
 	}
 
 	// Check alternative groups — at least one provider per group must be authenticated.
 	for (const group of alternativeGroups) {
 		const groupAuthenticated = group.some(p => authenticatedProviders.includes(p));
 		if (!groupAuthenticated) {
-			throw new Error(formatModelProfileCredentialError(options.profileName, [...group]));
+			throw new Error(formatModelProfileCredentialError(profileLabel, [...group]));
 		}
 	}
 
 	if (authenticatedProviders.length === 0) {
-		throw new Error(formatModelProfileCredentialError(options.profileName, missingProviders));
+		throw new Error(formatModelProfileCredentialError(profileLabel, missingProviders));
 	}
 
 	const availableModels = options.modelRegistry.getAll();
@@ -229,9 +230,7 @@ export async function prepareModelProfileActivation(
 			})
 		: undefined;
 	if (bindings.defaultSelector && !resolvedDefault?.model) {
-		throw new Error(
-			`Model profile "${options.profileName}" default selector did not resolve: ${bindings.defaultSelector}`,
-		);
+		throw new Error(`Model profile "${profileLabel}" default selector did not resolve: ${bindings.defaultSelector}`);
 	}
 
 	const modelRoles: Record<string, string> = {};
@@ -241,7 +240,7 @@ export async function prepareModelProfileActivation(
 			modelRegistry: options.modelRegistry,
 		});
 		if (!resolved.model) {
-			throw new Error(`Model profile "${options.profileName}" ${role} selector did not resolve: ${selector}`);
+			throw new Error(`Model profile "${profileLabel}" ${role} selector did not resolve: ${selector}`);
 		}
 		modelRoles[role] = formatClampedModelSelector(selector, resolved.model);
 	}
@@ -256,7 +255,7 @@ export async function prepareModelProfileActivation(
 			modelRegistry: options.modelRegistry,
 		});
 		if (!resolved.model) {
-			throw new Error(`Model profile "${options.profileName}" ${role} selector did not resolve: ${selector}`);
+			throw new Error(`Model profile "${profileLabel}" ${role} selector did not resolve: ${selector}`);
 		}
 		agentModelOverrides[role] = formatClampedModelSelector(selector, resolved.model);
 	}
@@ -355,6 +354,87 @@ export async function applyPreparedModelProfileActivation(
 		}
 		throw error;
 	}
+}
+
+export interface MaterializeModelProfileForDeletionResult {
+	modelRoles: Record<string, string>;
+	agentModelOverrides: Record<string, string>;
+	previousModelRoles: Record<string, string>;
+	previousAgentModelOverrides: Record<string, string>;
+	previousDefaultProfile: string | undefined;
+	previousPersistedDefaultProfile: string | undefined;
+	previousActiveModelProfile: string | undefined;
+}
+
+export async function materializeModelProfileForDeletion(
+	options: PrepareModelProfileActivationOptions & {
+		settings: Pick<Settings, "clearOverride" | "flush" | "get" | "getGlobal" | "override" | "set">;
+	},
+): Promise<MaterializeModelProfileForDeletionResult> {
+	const prepared = await prepareModelProfileActivation(options);
+	const previousDefaultProfile = prepared.settings.get("modelProfile.default");
+	const previousPersistedDefaultProfile = prepared.settings.getGlobal("modelProfile.default");
+	const nextModelRoles = {
+		...prepared.previousModelRoles,
+		...(prepared.defaultModel
+			? {
+					default: formatModelSelectorValue(
+						`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`,
+						prepared.defaultThinkingLevel,
+					),
+				}
+			: {}),
+		...prepared.modelRoles,
+	};
+	const nextAgentModelOverrides = {
+		...prepared.previousAgentModelOverrides,
+		...prepared.agentModelOverrides,
+	};
+
+	try {
+		prepared.settings.set("modelRoles", nextModelRoles);
+		prepared.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
+		prepared.settings.set("modelProfile.default", undefined);
+		prepared.settings.clearOverride("modelProfile.default");
+		prepared.settings.override("modelRoles", nextModelRoles);
+		prepared.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+		prepared.session.setActiveModelProfile?.(undefined);
+		await prepared.settings.flush();
+	} catch (error) {
+		prepared.settings.set("modelRoles", prepared.previousModelRoles);
+		prepared.settings.set("task.agentModelOverrides", prepared.previousAgentModelOverrides);
+		prepared.settings.set("modelProfile.default", previousPersistedDefaultProfile);
+		prepared.settings.override("modelRoles", prepared.previousModelRoles);
+		prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverrides);
+		prepared.settings.override("modelProfile.default", previousDefaultProfile);
+		prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile);
+		throw error;
+	}
+
+	return {
+		modelRoles: nextModelRoles,
+		agentModelOverrides: nextAgentModelOverrides,
+		previousModelRoles: prepared.previousModelRoles,
+		previousAgentModelOverrides: prepared.previousAgentModelOverrides,
+		previousDefaultProfile,
+		previousPersistedDefaultProfile,
+		previousActiveModelProfile: prepared.previousActiveModelProfile,
+	};
+}
+
+export async function restoreMaterializedModelProfileForDeletion(options: {
+	settings: Pick<Settings, "flush" | "override" | "set">;
+	session: Pick<ModelProfileActivationSession, "setActiveModelProfile">;
+	snapshot: MaterializeModelProfileForDeletionResult;
+}): Promise<void> {
+	options.settings.set("modelRoles", options.snapshot.previousModelRoles);
+	options.settings.set("task.agentModelOverrides", options.snapshot.previousAgentModelOverrides);
+	options.settings.set("modelProfile.default", options.snapshot.previousPersistedDefaultProfile);
+	options.settings.override("modelRoles", options.snapshot.previousModelRoles);
+	options.settings.override("task.agentModelOverrides", options.snapshot.previousAgentModelOverrides);
+	options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfile);
+	options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile);
+	await options.settings.flush();
 }
 
 export async function activateModelProfile(

@@ -1,11 +1,9 @@
 import { Container, Input, matchesKey, Spacer, Text, TruncatedText } from "@gajae-code/tui";
+import { MODEL_PROFILE_NAME_PATTERN } from "../../config/model-registry";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { theme } from "../theme/theme";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 import { DynamicBorder } from "./dynamic-border";
-
-const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
-
 export interface CustomModelPresetWizardSubmit {
 	name: string;
 	profile: ModelProfileConfig;
@@ -113,7 +111,7 @@ export class CustomModelPresetWizardComponent extends Container {
 			this.#onRender();
 			return;
 		}
-		if (!PROFILE_NAME_PATTERN.test(value)) {
+		if (!MODEL_PROFILE_NAME_PATTERN.test(value)) {
 			this.#lastError = "Preset id must use lowercase letters, numbers, dots, underscores, or hyphens.";
 			this.#renderStep();
 			this.#onRender();

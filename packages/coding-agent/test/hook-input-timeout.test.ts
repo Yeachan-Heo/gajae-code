@@ -69,6 +69,16 @@ describe("HookInputComponent timeout", () => {
 		expect(onSubmit).toHaveBeenCalledWith("hi");
 		expect(onCancel).not.toHaveBeenCalled();
 		expect(onTimeout).not.toHaveBeenCalled();
+		component.dispose();
+	});
+
+	it("prefills the submitted value when an initial value is provided", () => {
+		const onSubmit = vi.fn();
+		const component = new HookInputComponent("Prompt", "Existing preset", onSubmit, vi.fn());
+
+		component.handleInput("\n");
+
+		expect(onSubmit).toHaveBeenCalledWith("Existing preset");
 
 		component.dispose();
 	});

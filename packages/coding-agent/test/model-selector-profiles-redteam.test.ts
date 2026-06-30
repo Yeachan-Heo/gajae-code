@@ -34,6 +34,7 @@ const flatModel = model("provider-b", "zzz-flat-model");
 
 const userProfile: ModelProfileDefinition = {
 	name: "profile-a",
+	displayName: "Profile Alpha",
 	requiredProviders: ["provider-a"],
 	modelMapping: { default: "provider-a/default:high", executor: "provider-a/alternate" },
 	source: "user",
@@ -166,7 +167,7 @@ describe("model selector profile red-team", () => {
 		selector.handleInput("\x1b[C");
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
-		expect(rendered.match(/profile-a/g) ?? []).toHaveLength(1);
+		expect(rendered.match(/Profile Alpha/g) ?? []).toHaveLength(1);
 	});
 
 	test("profile actions wire Apply for this session to persistDefault false and Set as default to true", async () => {
@@ -204,14 +205,14 @@ describe("model selector profile red-team", () => {
 
 		expect(sessionOnly.setCalls).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(sessionOnly.settings.get("modelProfile.default")).toBe("old-profile");
-		expect(sessionOnly.ctx.showStatus).toHaveBeenCalledWith("Model profile: profile-a");
+		expect(sessionOnly.ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
 
 		const persistent = createControllerContext();
 		await selectProfileThroughController(new SelectorController(persistent.ctx as never), true);
 
 		expect(persistent.setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(persistent.flush).toHaveBeenCalledTimes(1);
-		expect(persistent.ctx.showStatus).toHaveBeenCalledWith("Default model profile: profile-a");
+		expect(persistent.ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
 	test("activation credential error shows error and preserves active model, thinking, overrides, and default", async () => {
@@ -219,7 +220,7 @@ describe("model selector profile red-team", () => {
 		await selectProfileThroughController(new SelectorController(ctx as never), false);
 
 		expect(ctx.showError).toHaveBeenCalledWith(
-			'Model profile "profile-a" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
+			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
 		);
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model).toBe(alternateModel);
@@ -234,6 +235,7 @@ describe("model selector profile red-team", () => {
 		const weirdProfile: ModelProfileDefinition = {
 			...userProfile,
 			name: "Team/Profile: β 🚀 [default] {x}|$",
+			displayName: "Team/Profile: β 🚀 [default] {x}|$",
 		};
 		const selector = createSelector(() => {}, { profiles: [weirdProfile] });
 		await renderSelector(selector);
@@ -257,4 +259,74 @@ describe("model selector profile red-team", () => {
 		expect(rendered).toContain("provider-a/default");
 		expect(rendered).toContain("provider-b/zzz-flat-model");
 	});
+});
+
+test("delete action restores the profile when post-delete notification fails", async () => {
+	const profiles = new Map<string, ModelProfileDefinition>([[userProfile.name, { ...userProfile }]]);
+	const deletedConfigs: Record<string, { required_providers: string[]; model_mapping: Record<string, string> }> = {};
+	const registry = {
+		...createRegistry({ profiles: [...profiles.values()] }),
+		getModelProfiles: () => new Map(profiles),
+		getModelProfile: (name: string) => profiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		deleteCustomModelProfile: vi.fn(async (name: string) => {
+			const profile = profiles.get(name);
+			if (!profile) throw new Error("missing profile");
+			const config = {
+				required_providers: [...profile.requiredProviders],
+				model_mapping: { ...profile.modelMapping },
+			};
+			deletedConfigs[name] = config;
+			profiles.delete(name);
+			return config;
+		}),
+		saveCustomModelProfile: vi.fn(
+			async (name: string, config: { required_providers: string[]; model_mapping: Record<string, string> }) => {
+				profiles.set(name, {
+					name,
+					requiredProviders: [...config.required_providers],
+					modelMapping: { ...config.model_mapping },
+					source: "user",
+				});
+				return profiles.get(name);
+			},
+		),
+		refresh: vi.fn(async () => {}),
+	};
+	const settings = Settings.isolated({ "modelProfile.default": "unrelated" });
+	const ctx = {
+		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editor: {},
+		settings,
+		session: {
+			model: alternateModel,
+			thinkingLevel: ThinkingLevel.Low,
+			sessionId: "session-1",
+			scopedModels: [],
+			modelRegistry: registry,
+			getActiveModelProfile: () => undefined,
+			isFastForProvider: () => false,
+			isFastForSubagentProvider: () => false,
+			isFastModeActive: () => false,
+		},
+		statusLine: { invalidate: vi.fn() },
+		updateEditorBorderColor: vi.fn(),
+		showStatus: vi.fn(),
+		showError: vi.fn(),
+		showHookConfirm: vi.fn(async () => true),
+		notifyConfigChanged: vi.fn(async () => {
+			throw new Error("notify failed");
+		}),
+	};
+	const controller = new SelectorController(ctx as never);
+
+	controller.showModelSelector();
+	const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+	await selector.__testSelectPresetAction("profile-a", "delete");
+
+	expect(registry.deleteCustomModelProfile).toHaveBeenCalledWith("profile-a");
+	expect(registry.saveCustomModelProfile).toHaveBeenCalledWith("profile-a", deletedConfigs["profile-a"]);
+	expect(profiles.has("profile-a")).toBe(true);
+	expect(ctx.showError).toHaveBeenCalledWith("Preset delete failed: notify failed");
 });
