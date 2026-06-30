@@ -5,6 +5,7 @@ import { formatClampedModelSelector } from "../thinking";
 import {
 	aggregateModelProfileRequiredProviders,
 	formatAvailableProfileNames,
+	formatModelProfileDisplayLabel,
 	resolveProfileBindings,
 } from "./model-profiles";
 import {
@@ -183,7 +184,7 @@ export async function prepareModelProfileActivation(
 		const available = formatAvailableProfileNames(profiles);
 		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
 	}
-	const profileLabel = profile.displayName ?? options.profileName;
+	const profileLabel = formatModelProfileDisplayLabel(profile);
 
 	const allProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
 	const alternativeGroups = profile.alternativeProviderGroups ?? [];

@@ -1,3 +1,4 @@
+import { sanitizeText } from "@gajae-code/utils";
 import type { GjcModelAssignmentTargetId } from "./model-registry";
 import type { ModelsConfig } from "./models-config-schema";
 
@@ -267,6 +268,10 @@ export interface ModelProfilePresentation {
 	providerGroup: string;
 }
 
+function sanitizeModelProfileLabel(value: string): string {
+	return sanitizeText(value).replace(/\s+/g, " ").trim();
+}
+
 const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-eco": { displayName: "Codex Eco", providerGroup: "CODEX" },
 	"codex-medium": { displayName: "Codex Medium", providerGroup: "CODEX" },
@@ -332,7 +337,15 @@ export function getModelProfilePresentation(
 	const displayName = typeof profile === "string" ? undefined : profile.displayName;
 	const presentation = PROFILE_PRESENTATION[name];
 	if (presentation) return presentation;
-	return { displayName: displayName ?? name, providerGroup: "CUSTOM" };
+	return { displayName: formatModelProfileDisplayLabel({ name, displayName }), providerGroup: "CUSTOM" };
+}
+
+export function formatModelProfileDisplayLabel(profile: Pick<ModelProfileDefinition, "name" | "displayName">): string {
+	return (
+		sanitizeModelProfileLabel(profile.displayName ?? profile.name) ||
+		sanitizeModelProfileLabel(profile.name) ||
+		"Unnamed profile"
+	);
 }
 
 export function groupModelProfilesForPresetLanding(

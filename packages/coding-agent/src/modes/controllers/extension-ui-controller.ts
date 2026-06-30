@@ -715,6 +715,7 @@ export class ExtensionUiController {
 		title: string,
 		placeholder?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
+		inputOptions?: { readonly initialValue?: string },
 	): Promise<string | undefined> {
 		const { promise, finish, attachAbort } = this.#createHookDialogState(
 			() => this.hideHookInput(),
@@ -732,6 +733,7 @@ export class ExtensionUiController {
 				finish(undefined);
 			},
 			{
+				initialValue: inputOptions?.initialValue,
 				timeout: dialogOptions?.timeout,
 				onTimeout: dialogOptions?.onTimeout,
 				tui: this.ctx.ui,

@@ -247,6 +247,22 @@ describe("model selector profile red-team", () => {
 		expect(rendered).toContain("Browse all models");
 	});
 
+	test("custom profile display names strip terminal control characters before rendering", async () => {
+		const unsafeProfile: ModelProfileDefinition = {
+			...userProfile,
+			name: "unsafe-profile",
+			displayName: "Unsafe\x1b[31mRed\x1b[0m\nNext\tName",
+		};
+		const selector = createSelector(() => {}, { profiles: [unsafeProfile] });
+		await renderSelector(selector);
+		selector.handleInput("\x1b[C");
+		const rendered = selector.render(240).join("\n");
+		const plain = Bun.stripANSI(rendered);
+
+		expect(plain).toContain("UnsafeRed Next Name");
+		expect(plain).not.toContain("UnsafeRed\nNext");
+	});
+
 	test("Browse all models switches to flat model rows", async () => {
 		const selector = createSelector(() => {});
 		await renderSelector(selector);

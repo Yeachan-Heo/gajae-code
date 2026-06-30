@@ -8,6 +8,7 @@ import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
 
 export interface HookInputOptions {
+	initialValue?: string;
 	tui?: TUI;
 	timeout?: number;
 	onTimeout?: () => void;
@@ -23,7 +24,7 @@ export class HookInputComponent extends Container {
 
 	constructor(
 		title: string,
-		initialValue: string | undefined,
+		_placeholder: string | undefined,
 		onSubmit: (value: string) => void,
 		onCancel: () => void,
 		opts?: HookInputOptions,
@@ -54,8 +55,8 @@ export class HookInputComponent extends Container {
 		}
 
 		this.#input = new Input();
-		if (initialValue) {
-			this.#input.setValue(initialValue);
+		if (opts?.initialValue) {
+			this.#input.setValue(opts.initialValue);
 		}
 		this.addChild(this.#input);
 		this.addChild(new Spacer(1));

@@ -685,12 +685,13 @@ describe("custom model preset creation", () => {
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
 	it("restores a deleted custom preset when post-delete notification fails", async () => {
+		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
 				"custom-default",
 				{
 					name: "custom-default",
-					displayName: "Custom Default",
+					displayName: unsafeDisplayName,
 					requiredProviders: ["my-oai"],
 					modelMapping: { default: "my-oai/gpt-custom:low" },
 					source: "user",
@@ -785,9 +786,9 @@ describe("custom model preset creation", () => {
 		await Bun.sleep(0);
 		await selector?.__testSelectPresetAction("custom-default", "delete");
 
-		expect(confirmTitle).toBe("Delete custom model preset: Custom Default");
-		expect(restoredProfile?.display_name).toBe("Custom Default");
-		expect(profiles.get("custom-default")?.displayName).toBe("Custom Default");
+		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
+		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
+		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
 		expect(settings.get("modelProfile.default")).toBe("custom-default");
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });

@@ -72,9 +72,22 @@ describe("HookInputComponent timeout", () => {
 		component.dispose();
 	});
 
-	it("prefills the submitted value when an initial value is provided", () => {
+	it("keeps placeholder text out of the submitted value", () => {
 		const onSubmit = vi.fn();
 		const component = new HookInputComponent("Prompt", "Existing preset", onSubmit, vi.fn());
+
+		component.handleInput("\n");
+
+		expect(onSubmit).toHaveBeenCalledWith("");
+
+		component.dispose();
+	});
+
+	it("prefills the submitted value when an explicit initial value is provided", () => {
+		const onSubmit = vi.fn();
+		const component = new HookInputComponent("Prompt", undefined, onSubmit, vi.fn(), {
+			initialValue: "Existing preset",
+		});
 
 		component.handleInput("\n");
 
