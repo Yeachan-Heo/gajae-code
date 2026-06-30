@@ -273,6 +273,7 @@ class StatusLineCustomEditor extends Container {
 			(id, value) => this.#handleChange(id, value),
 			() => this.#cancel(),
 			item => this.#setSelectedItem(item),
+			2,
 		);
 		this.addChild(this.#list);
 	}

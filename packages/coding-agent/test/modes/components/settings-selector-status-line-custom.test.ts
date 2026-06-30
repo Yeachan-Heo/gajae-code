@@ -110,6 +110,21 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 			]),
 		);
 	});
+	it("keeps the description area height stable while navigating custom rows", () => {
+		settings.set("statusLine.preset", "minimal");
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+
+		for (let i = 0; i < 5; i++) component.handleInput("\x1b[B"); // Segment: mode.
+		const segmentLines = component.render(120).length;
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Segment: mode");
+
+		component.handleInput("\x1b[B"); // Move left: mode.
+		const moveLines = component.render(120).length;
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Move left: mode");
+		expect(moveLines).toBe(segmentLines);
+	});
 	it("clones preset segment option defaults when saving from a preset", () => {
 		settings.set("statusLine.preset", "minimal");
 		settings.set("statusLine.segmentOptions", {});

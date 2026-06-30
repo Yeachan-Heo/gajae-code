@@ -33,6 +33,7 @@ export class SettingsList implements Component {
 	#onChange: (id: string, newValue: string) => void;
 	#onCancel: () => void;
 	#onSelectionChange?: (item: SettingItem | undefined) => void;
+	#descriptionRows: number;
 
 	// Submenu state
 	#submenuComponent: Component | null = null;
@@ -45,6 +46,7 @@ export class SettingsList implements Component {
 		onChange: (id: string, newValue: string) => void,
 		onCancel: () => void,
 		onSelectionChange?: (item: SettingItem | undefined) => void,
+		descriptionRows = 0,
 	) {
 		this.#items = items;
 		this.#maxVisible = maxVisible;
@@ -52,6 +54,7 @@ export class SettingsList implements Component {
 		this.#onChange = onChange;
 		this.#onCancel = onCancel;
 		this.#onSelectionChange = onSelectionChange;
+		this.#descriptionRows = Math.max(0, descriptionRows);
 		this.#notifySelectionChange();
 	}
 
@@ -147,9 +150,18 @@ export class SettingsList implements Component {
 			lines.push(this.#theme.hint(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
 		}
 
-		// Add description for selected item
+		// Add description for selected item. Some hosts reserve a fixed
+		// description area so keyboard navigation does not resize the TUI when
+		// moving between described and undescribed rows.
 		const selectedItem = this.#items[this.#selectedIndex];
-		if (selectedItem?.description) {
+		if (this.#descriptionRows > 0) {
+			lines.push("");
+			const wrappedDesc = selectedItem?.description ? wrapTextWithAnsi(selectedItem.description, width - 4) : [];
+			for (let i = 0; i < this.#descriptionRows; i++) {
+				const line = wrappedDesc[i] ?? "";
+				lines.push(line ? this.#theme.description(`  ${line}`) : "");
+			}
+		} else if (selectedItem?.description) {
 			lines.push("");
 			const wrappedDesc = wrapTextWithAnsi(selectedItem.description, width - 4);
 			for (const line of wrappedDesc) {
