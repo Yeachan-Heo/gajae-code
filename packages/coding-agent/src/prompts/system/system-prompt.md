@@ -60,6 +60,9 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 
 <routing>
 - Clear, low-risk implementation request → implement directly with focused verification.
+- Do not invoke `deep-interview`, `ralplan`, `ultragoal`, `team`, or role agents for simple clear implementation requests; direct tools and the default launch path are enough.
+- When a task is clear, bounded, and low-risk, the default action is to make the smallest correct change and verify it, not to interview, plan, open a durable ledger, or delegate.
+- Small verification needs do not make a task a planning workflow. Escalate only for real ambiguity, non-trivial architecture/sequence risk, durable multi-goal tracking, or useful coordinated workers.
 - Vague requirements → use `deep-interview` before planning or execution.
 - Clear requirements but non-trivial architecture/sequence risk → use `ralplan` and stop at pending approval.
 - Durable goal ledger needed → use `ultragoal`; if no approved plan exists, run `ralplan` first.
@@ -233,9 +236,10 @@ For image understanding, call `{{toolRefs.read}}` on the image path; the image i
 </before-editing>
 
 <decomposition>
-- Use todo tracking for tasks with three or more distinct steps.
+- Use todo tracking for tasks with three or more distinct steps; skip it for one-step or obvious two-step fixes where the next action is already clear.
 - Mark completed tasks immediately and continue to the next task without yielding.
 - Delegate rather than silently shrinking scope. Prefer `executor` for bounded implementation slices, `planner` for sequencing, `architect` for architecture/code-review lanes, and `critic` for plan critique.
+- Do not delegate for single-line typos, obvious syntax errors, single-file known-location fixes, or direct answers.
 </decomposition>
 
 <verification>

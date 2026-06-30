@@ -23,6 +23,13 @@ const tempRoots: string[] = [];
 const roleAgentNames = ["architect", "critic", "executor", "planner"] as const;
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 
+function extractPromptSection(content: string, sectionName: string): string {
+	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
+	const sectionContent = sectionMatch?.[1];
+	if (sectionContent === undefined) throw new Error(`missing <${sectionName}> section`);
+	return sectionContent;
+}
+
 async function makeTempRoot(): Promise<string> {
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-definitions-"));
 	tempRoots.push(tempRoot);
@@ -300,6 +307,34 @@ Project executor override body.
 		expect(ultragoal).toContain("the subagent has actually failed");
 		expect(ultragoal).toContain("gone off-track");
 		expect(ultragoal).toContain("become unrecoverably wrong");
+	});
+
+	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
+		const systemPrompt = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
+		).text();
+		const routing = extractPromptSection(systemPrompt, "routing");
+		const decomposition = extractPromptSection(systemPrompt, "decomposition");
+
+		expect(routing).toMatch(/Clear,\s+low-risk implementation request\s+→\s+implement directly/i);
+		expect(routing).toMatch(/simple clear implementation requests[\s\S]*direct tools[\s\S]*default launch path/i);
+		expect(routing).toMatch(/clear,\s+bounded,\s+and low-risk[\s\S]*smallest correct change[\s\S]*verify/i);
+		expect(routing).toMatch(/Small verification needs[\s\S]*do not make[\s\S]*planning workflow/i);
+		for (const escalationTrigger of [
+			"Vague requirements",
+			"non-trivial architecture/sequence risk",
+			"Durable goal ledger",
+			"coordinated persistent workers",
+		]) {
+			expect(routing).toContain(escalationTrigger);
+		}
+
+		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
+		expect(decomposition).toMatch(/Do not delegate[\s\S]*single-line typos[\s\S]*known-location fixes/i);
+		const simpleRequestRule = routing.split("\n").find(line => line.includes("simple clear implementation requests"));
+		expect(simpleRequestRule).toBeDefined();
+		expect(simpleRequestRule).not.toMatch(/use `deep-interview`|use `ralplan`|use `ultragoal`|use `team`|delegate/i);
+		expect(simpleRequestRule).toMatch(/Do not invoke/i);
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
