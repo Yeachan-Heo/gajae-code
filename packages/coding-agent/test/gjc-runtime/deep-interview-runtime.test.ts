@@ -152,6 +152,23 @@ describe("native gjc deep-interview runtime", () => {
 		await expect(fs.access(sessionPlansDir(root, TEST_SESSION_ID))).rejects.toThrow();
 	});
 
+	it("accepts a long inline --spec that exceeds the OS path-length limit", async () => {
+		const root = await tempDir();
+		// A spec far longer than PATH_MAX so path.resolve(...) + fs.stat throws ENAMETOOLONG
+		// instead of ENOENT; the runtime must fall through to treating --spec as inline content.
+		const inlineSpec = `# Final Spec\n\n${"acceptance criterion line ".repeat(2000)}`;
+		expect(inlineSpec.length).toBeGreaterThan(4096);
+
+		const result = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "long-inline", "--spec", inlineSpec, "--json"],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.path).toBe(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-long-inline.md"));
+		expect(await fs.readFile(payload.path, "utf-8")).toBe(`${inlineSpec}\n`);
+	});
+
 	it("uses --deliberate to persist the final spec and hand off to ralplan", async () => {
 		const root = await tempDir();
 		const result = await runNativeDeepInterviewCommand(

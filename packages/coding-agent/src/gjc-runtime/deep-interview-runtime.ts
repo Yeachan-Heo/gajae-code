@@ -100,7 +100,7 @@ async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string>
 		if (stat.isFile()) return await fs.readFile(candidate, "utf-8");
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
-		if (err.code !== "ENOENT" && err.code !== "ENOTDIR") {
+		if (err.code !== "ENOENT" && err.code !== "ENOTDIR" && err.code !== "ENAMETOOLONG") {
 			throw new DeepInterviewCommandError(2, `failed to read --spec ${candidate}: ${err.message}`);
 		}
 	}
