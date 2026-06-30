@@ -1,8 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	activeSnapshotPath,
+	modeStatePath,
+	sessionActivityPath,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { isUltragoalAskBlocked } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	computeUltragoalPlanGeneration,
@@ -10,6 +15,7 @@ import {
 	getUltragoalPaths,
 	hashStructuredValue,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
@@ -25,19 +31,24 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+beforeAll(async () => {
+	await initTheme(false);
+});
+
 afterEach(async () => {
 	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
-function createSession(cwd: string): ToolSession {
+function createSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
 		cwd,
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated(),
+		...overrides,
 	};
 }
 
@@ -50,6 +61,39 @@ function createContext(select: () => Promise<string | undefined>): AgentToolCont
 		},
 		abort: () => {},
 	} as unknown as AgentToolContext;
+}
+
+async function writeActivityMarker(cwd: string, sessionId: string, updatedAt: string): Promise<void> {
+	await Bun.write(
+		sessionActivityPath(cwd, sessionId),
+		`${JSON.stringify({ session_id: sessionId, updated_at: updatedAt, writer: "test" }, null, 2)}\n`,
+	);
+}
+
+async function writeActiveDeepInterviewState(cwd: string, sessionId: string): Promise<void> {
+	const now = new Date().toISOString();
+	const activeState = {
+		version: 1,
+		active: true,
+		skill: "deep-interview",
+		phase: "interviewing",
+		updated_at: now,
+		session_id: sessionId,
+		active_skills: [
+			{
+				skill: "deep-interview",
+				phase: "interviewing",
+				active: true,
+				updated_at: now,
+				session_id: sessionId,
+			},
+		],
+	};
+	await Bun.write(activeSnapshotPath(cwd, sessionId), `${JSON.stringify(activeState, null, 2)}\n`);
+	await Bun.write(
+		modeStatePath(cwd, sessionId, "deep-interview"),
+		`${JSON.stringify({ active: true, current_phase: "interviewing", session_id: sessionId }, null, 2)}\n`,
+	);
 }
 
 function stubAskTool(execute: () => Promise<void>): AgentTool {
@@ -153,6 +197,71 @@ describe("ultragoal ask guard", () => {
 			tool.execute(
 				"call",
 				{ questions: [{ id: "q", question: "Ask?", options: [{ label: "Yes" }] }] },
+				undefined,
+				undefined,
+				createContext(select),
+			),
+		).rejects.toThrow(/try-harder nudge/);
+		expect(select).not.toHaveBeenCalled();
+	});
+	it("allows active deep-interview ask when latest ultragoal sessions are ambiguous", async () => {
+		const cwd = await tempDir();
+		const deepSessionId = "deep-interview-active-session";
+		const ultragoalSessionA = "ultragoal-ambiguous-a";
+		const ultragoalSessionB = "ultragoal-ambiguous-b";
+		const tiedActivity = "2026-06-29T00:00:00.000Z";
+
+		process.env.GJC_SESSION_ID = ultragoalSessionA;
+		await createUltragoalPlan({ cwd, brief: "Implement the first stale story" });
+		process.env.GJC_SESSION_ID = ultragoalSessionB;
+		await createUltragoalPlan({ cwd, brief: "Implement the second stale story" });
+		delete process.env.GJC_SESSION_ID;
+
+		await writeActivityMarker(cwd, ultragoalSessionA, tiedActivity);
+		await writeActivityMarker(cwd, ultragoalSessionB, tiedActivity);
+		await writeActiveDeepInterviewState(cwd, deepSessionId);
+
+		const select = vi.fn(async () => "Continue");
+		const tool = new AskTool(
+			createSession(cwd, {
+				getSessionId: () => deepSessionId,
+				getActiveSkillState: () => ({ skill: "deep-interview", session_id: deepSessionId }),
+			}),
+		);
+
+		const result = await tool.execute(
+			"call",
+			{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
+			undefined,
+			undefined,
+			createContext(select),
+		);
+
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.content[0]).toMatchObject({ type: "text" });
+	});
+
+	it("blocks active deep-interview ask when the same session has active ultragoal state", async () => {
+		const cwd = await tempDir();
+		const sessionId = "deep-interview-with-ultragoal-state";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		delete process.env.GJC_SESSION_ID;
+		await writeActiveDeepInterviewState(cwd, sessionId);
+
+		const select = vi.fn(async () => "Continue");
+		const tool = new AskTool(
+			createSession(cwd, {
+				getSessionId: () => sessionId,
+				getActiveSkillState: () => ({ skill: "deep-interview", session_id: sessionId }),
+			}),
+		);
+
+		await expect(
+			tool.execute(
+				"call",
+				{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
 				undefined,
 				undefined,
 				createContext(select),

@@ -1,8 +1,14 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	formatDeepInterviewSelectorPrompt,
+	isDeepInterviewAskQuestion,
+	renderDeepInterviewAskQuestion,
+} from "@gajae-code/coding-agent/deep-interview/render-middleware";
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
 
 function createAssistantMessage(text: string): AssistantMessage {
 	return {
@@ -106,5 +112,43 @@ describe("deep-interview assistant render middleware", () => {
 		expect(rendered).toContain("한국어 출력이 리터럴로 보여야 합니다");
 		expect(rendered).toContain("한국어 기준을 명확히 합니다");
 		expect(rendered).not.toContain("\\u");
+	});
+});
+
+describe("deep-interview render middleware null-safety", () => {
+	for (const value of [undefined, null] as const) {
+		it(`does not throw on ${String(value)} question input`, () => {
+			// @ts-expect-error exercising defensive guard against missing question text
+			expect(() => isDeepInterviewAskQuestion(value)).not.toThrow();
+			// @ts-expect-error exercising defensive guard against missing question text
+			expect(() => formatDeepInterviewSelectorPrompt(value)).not.toThrow();
+			// @ts-expect-error exercising defensive guard against missing question text
+			expect(() => renderDeepInterviewAskQuestion(value, theme)).not.toThrow();
+			// @ts-expect-error exercising defensive guard against missing question text
+			expect(isDeepInterviewAskQuestion(value)).toBe(false);
+			// @ts-expect-error exercising defensive guard against missing question text
+			expect(renderDeepInterviewAskQuestion(value, theme)).toBeNull();
+		});
+	}
+
+	it("renders an ask result with a missing question field without crashing", () => {
+		const result = {
+			content: [{ type: "text", text: "User answers:" }],
+			details: {
+				results: [
+					{
+						id: "q1",
+						// question intentionally omitted to mirror malformed/partial ask details
+						options: ["a", "b"],
+						multi: false,
+						selectedOptions: ["a"],
+					},
+				],
+			},
+		};
+		expect(() =>
+			// @ts-expect-error partial details deliberately omit the question field
+			askToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme).render(100),
+		).not.toThrow();
 	});
 });

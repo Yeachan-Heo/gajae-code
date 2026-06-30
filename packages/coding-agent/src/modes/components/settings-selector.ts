@@ -179,6 +179,10 @@ const TIME_FORMAT_OPTIONS: SelectItem[] = [
 	{ value: "24h", label: "24h" },
 	{ value: "12h", label: "12h" },
 ];
+const USAGE_MODE_OPTIONS: SelectItem[] = [
+	{ value: "used", label: "Used" },
+	{ value: "remaining", label: "Remaining" },
+];
 
 function cloneSegmentOptions(options: StatusLineSegmentOptions | undefined): StatusLineSegmentOptions {
 	return mergeSegmentOptions(undefined, options);
@@ -193,6 +197,7 @@ function mergeSegmentOptions(
 		path: base?.path || overrides?.path ? { ...(base?.path ?? {}), ...(overrides?.path ?? {}) } : undefined,
 		git: base?.git || overrides?.git ? { ...(base?.git ?? {}), ...(overrides?.git ?? {}) } : undefined,
 		time: base?.time || overrides?.time ? { ...(base?.time ?? {}), ...(overrides?.time ?? {}) } : undefined,
+		usage: base?.usage || overrides?.usage ? { ...(base?.usage ?? {}), ...(overrides?.usage ?? {}) } : undefined,
 	};
 }
 
@@ -388,6 +393,22 @@ class StatusLineCustomEditor extends Container {
 					},
 				);
 			}
+			if (id === "usage") {
+				items.push({
+					id: "option.usage.mode",
+					label: "Usage: mode",
+					currentValue: this.#draft.segmentOptions.usage?.mode ?? "used",
+					submenu: (currentValue, done) =>
+						new SelectSubmenu(
+							"Usage mode",
+							"Show used quota or remaining quota in the usage segment.",
+							USAGE_MODE_OPTIONS,
+							currentValue,
+							done,
+							() => done(),
+						),
+				});
+			}
 		}
 
 		items.push(
@@ -551,6 +572,12 @@ class StatusLineCustomEditor extends Container {
 				break;
 			case "time.showSeconds":
 				this.#draft.segmentOptions.time = { ...(this.#draft.segmentOptions.time ?? {}), showSeconds: bool };
+				break;
+			case "usage.mode":
+				this.#draft.segmentOptions.usage = {
+					...(this.#draft.segmentOptions.usage ?? {}),
+					mode: value === "remaining" ? "remaining" : "used",
+				};
 				break;
 		}
 	}

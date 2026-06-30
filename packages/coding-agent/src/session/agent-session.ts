@@ -3920,7 +3920,16 @@ export class AgentSession {
 
 	#prepareToolForExecution<T extends AgentTool>(tool: T): T {
 		return this.#wrapToolForDeepInterviewMutationGuard(
-			this.#wrapToolForAcpPermission(guardToolForUltragoalAsk(tool, () => this.sessionManager.getCwd())),
+			this.#wrapToolForAcpPermission(
+				guardToolForUltragoalAsk(
+					tool,
+					() => this.sessionManager.getCwd(),
+					() => ({
+						activeSkillState: this.getActiveSkillState(),
+						sessionId: this.sessionManager.getSessionId(),
+					}),
+				),
+			),
 		);
 	}
 

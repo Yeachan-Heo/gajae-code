@@ -144,6 +144,23 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		expect(settings.get("statusLine.rightSegments")).toEqual([]);
 	});
 
+	it("places usage mode next to the usage segment", () => {
+		settings.set("statusLine.preset", "minimal");
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+
+		for (let i = 0; i < 80; i++) {
+			const rendered = Bun.stripANSI(component.render(120).join("\n"));
+			if (rendered.includes("❯ Segment: usage")) break;
+			component.handleInput("\x1b[B");
+		}
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Segment: usage");
+		component.handleInput("\x1b[B");
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Usage: mode");
+	});
+
 	it("edits segment placement and typed options before saving", () => {
 		settings.set("statusLine.preset", "minimal");
 		const { component } = createSelector();
@@ -169,7 +186,7 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 
 		openCustomEditor(component);
 
-		component.handleInput("\x1b[A"); // Wrap from Save to the final Time: show seconds option.
+		component.handleInput("\x1b[A"); // Wrap from Save to Time: show seconds.
 		expect(previews.at(-1)?.previewHighlightSegment).toBe("time");
 		component.handleInput("\n");
 		expect(previews.at(-1)?.segmentOptions?.time?.showSeconds).toBe(true);
