@@ -93,6 +93,40 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheWrite).toBe(0);
 		expect(usage.totalTokens).toBe(6_250);
 	});
+
+	it("maps DeepSeek prompt cache hit and miss fields", () => {
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 6_000,
+				completion_tokens: 250,
+				prompt_cache_hit_tokens: 5_800,
+				prompt_cache_miss_tokens: 200,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		expect(usage.input).toBe(200);
+		expect(usage.cacheRead).toBe(5_800);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("does not infer cache usage when routed providers omit cache metadata", () => {
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 6_000,
+				completion_tokens: 250,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		expect(usage.input).toBe(6_000);
+		expect(usage.cacheRead).toBe(0);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(6_250);
+	});
 });
 
 describe("anthropic applyAnthropicUsageExtras", () => {

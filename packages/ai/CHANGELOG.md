@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Mapped DeepSeek-style `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` usage fields into OpenAI-compatible prompt-cache accounting (#1329).
+
 ## [0.7.5] - 2026-06-27
 
 ### Fixed

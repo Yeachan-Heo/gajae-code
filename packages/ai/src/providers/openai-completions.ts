@@ -1355,9 +1355,12 @@ export function parseChunkUsage(
 ): AssistantMessage["usage"] {
 	const promptTokenDetails = getOptionalObjectProperty(rawUsage, "prompt_tokens_details");
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
+	const deepSeekCacheHitTokens = getOptionalNumberProperty(rawUsage, "prompt_cache_hit_tokens");
+	const deepSeekCacheMissTokens = getOptionalNumberProperty(rawUsage, "prompt_cache_miss_tokens");
 	const cachedTokens =
 		getOptionalNumberProperty(rawUsage, "cached_tokens") ??
 		(promptTokenDetails ? getOptionalNumberProperty(promptTokenDetails, "cached_tokens") : undefined) ??
+		deepSeekCacheHitTokens ??
 		0;
 	// OpenRouter exposes cache writes via `prompt_tokens_details.cache_write_tokens`
 	// and INCLUDES them in `prompt_tokens`. Without subtracting, cache-write tokens
@@ -1369,7 +1372,7 @@ export function parseChunkUsage(
 	const reasoningTokens =
 		(completionTokenDetails ? getOptionalNumberProperty(completionTokenDetails, "reasoning_tokens") : undefined) ?? 0;
 	const promptTokens = getOptionalNumberProperty(rawUsage, "prompt_tokens") ?? 0;
-	const input = Math.max(0, promptTokens - cachedTokens - cacheWriteTokens);
+	const input = Math.max(0, deepSeekCacheMissTokens ?? promptTokens - cachedTokens - cacheWriteTokens);
 	// Per OpenAI's CompletionUsage spec, `reasoning_tokens` is a subset of
 	// `completion_tokens` (which is the total billed output). Adding them would
 	// double-count.
