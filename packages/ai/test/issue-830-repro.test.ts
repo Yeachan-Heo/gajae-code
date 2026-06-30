@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { getBundledModel } from "../src/models";
+import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { MODELS_DEV_PROVIDER_DESCRIPTORS } from "../src/provider-models/openai-compat";
 import { getEnvApiKey } from "../src/stream";
 import type { OpenAICompat } from "../src/types";
@@ -63,7 +63,6 @@ describe("deepseek built-in provider (issue #830)", () => {
 		});
 	});
 });
-
 
 describe("Anthropic Sonnet 5 model catalog support", () => {
 	test("uses Sonnet 5 as the first-class Anthropic default while preserving older Sonnet entries", () => {
