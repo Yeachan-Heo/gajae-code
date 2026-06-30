@@ -68,7 +68,7 @@ RUN cat > /repo/scripts/publish-local.sh <<'SCRIPT'
 set -e
 
 REGISTRY="http://localhost:4873"
-PACKAGES=(utils natives ai agent tui stats coding-agent gajae-code)
+PACKAGES=(utils ai natives-darwin-arm64 natives-darwin-x64 natives-linux-arm64 natives-linux-x64 natives-win32-x64 natives tui stats agent coding-agent gajae-code)
 
 # Build version maps from local workspaces and the root catalog.
 jq '.workspaces.catalog // {}' /repo/package.json > /tmp/catalog-versions.json
@@ -80,6 +80,34 @@ for pkg in "${PACKAGES[@]}"; do
     mv /tmp/workspace-versions.next.json /tmp/workspace-versions.json
     echo "Found $name@$version"
 done
+stage_native_platform_artifacts() {
+    local pkg="$1"
+    local prefix=""
+    case "$pkg" in
+        natives-darwin-arm64) prefix="pi_natives.darwin-arm64" ;;
+        natives-darwin-x64) prefix="pi_natives.darwin-x64" ;;
+        natives-linux-arm64) prefix="pi_natives.linux-arm64" ;;
+        natives-linux-x64) prefix="pi_natives.linux-x64" ;;
+        natives-win32-x64) prefix="pi_natives.win32-x64" ;;
+        *) return 0 ;;
+    esac
+
+    rm -rf native
+    mkdir -p native
+    shopt -s nullglob
+    local artifacts=("/repo/packages/natives/native/${prefix}"*.node)
+    shopt -u nullglob
+    if [ "${#artifacts[@]}" -eq 0 ]; then
+        rmdir native
+        if [ "$pkg" = "natives-linux-x64" ]; then
+            echo "Expected linux-x64 native artifact matching ${prefix}*.node"
+            exit 1
+        fi
+        return 0
+    fi
+    cp "${artifacts[@]}" native/
+}
+
 
 # Resolve workspace:* and catalog: specs in each package.json and publish
 for pkg in "${PACKAGES[@]}"; do
@@ -108,6 +136,7 @@ for pkg in "${PACKAGES[@]}"; do
         rewrite_field("peerDependencies") |
         rewrite_field("optionalDependencies")
     ' package.json > package.json.tmp && mv package.json.tmp package.json
+    stage_native_platform_artifacts "$pkg"
     
     # Show what we're publishing
     echo "Dependencies:"

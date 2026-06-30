@@ -559,6 +559,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		if (isReleasePublishPath(changedPath)) {
 			add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
 			add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+			if (isUnscopedWrapperPath(changedPath)) {
+				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+			}
 			continue;
 		}
 
