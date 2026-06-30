@@ -62,6 +62,11 @@ const DeepInterviewMeta = z.object({
 	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
 });
 
+const WorkflowGateMeta = z.object({
+	stage: z.enum(["deep-interview", "ralplan", "ultragoal"]).describe("workflow gate stage"),
+	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
+});
+
 const QuestionItem = z.object({
 	id: z.string().describe("question id"),
 	question: z.string().describe("question text"),
@@ -69,6 +74,7 @@ const QuestionItem = z.object({
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
 	deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
+	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 });
 
 export const askSchema = z.object({
@@ -665,6 +671,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					multi: q.multi,
 					recommended: q.recommended,
 					deepInterview: q.deepInterview,
+					workflowGate: q.workflowGate,
 				};
 				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				const decoded = gateAnswerToResult(gateQuestion, answer);

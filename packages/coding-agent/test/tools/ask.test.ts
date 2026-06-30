@@ -1838,6 +1838,55 @@ describe("AskTool deep-interview recorder persistence", () => {
 		]);
 	});
 
+	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
+		const defaultGateEmitter = {
+			isUnattended: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
+		};
+		await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => defaultGateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-default-workflow-gate",
+			{
+				questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Budget" }, { label: "Timeline" }] }],
+			},
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		expect(defaultGateEmitter.emitGate).toHaveBeenCalledWith(
+			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
+		);
+
+		const ralplanGateEmitter = {
+			isUnattended: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
+		};
+		await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => ralplanGateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-ralplan-workflow-gate",
+			{
+				questions: [
+					{
+						id: "final-approval",
+						question: "Approve this plan?",
+						options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
+						workflowGate: { stage: "ralplan", kind: "approval" },
+					},
+				],
+			},
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
+			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
+		);
+	});
+
 	it("keeps deepInterview optional and rejects malformed metadata", () => {
 		expect(
 			askSchema.safeParse({ questions: [{ id: "q", question: "Pick?", options: [{ label: "A" }] }] }).success,

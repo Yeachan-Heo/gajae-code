@@ -11,7 +11,7 @@
  * the interactive select/editor UI) when an unattended controller + gate broker
  * are attached is wired with the transport in #321 and exercised by #323.
  */
-import type { RpcJsonSchema } from "../../rpc/rpc-types";
+import type { RpcJsonSchema, RpcWorkflowGateKind, RpcWorkflowStage } from "../../rpc/rpc-types";
 import type { OpenGateInput } from "./workflow-gate-broker";
 
 /** "Other (type your own)" sentinel, mirroring the interactive ask tool. */
@@ -26,6 +26,11 @@ export interface AskGateDeepInterviewState {
 	ambiguity: number;
 }
 
+export interface AskGateWorkflowGateMeta {
+	stage: RpcWorkflowStage;
+	kind: RpcWorkflowGateKind;
+}
+
 export interface AskGateQuestion {
 	id: string;
 	question: string;
@@ -37,6 +42,8 @@ export interface AskGateQuestion {
 	 * `stage_state`; when absent, the question text is regex-parsed as a fallback.
 	 */
 	deepInterview?: AskGateDeepInterviewState;
+	/** Override the emitted workflow gate address for non-deep-interview ask prompts. */
+	workflowGate?: AskGateWorkflowGateMeta;
 }
 
 export interface AskGateResult {
@@ -157,13 +164,13 @@ function structuredDeepInterviewState(meta: AskGateDeepInterviewState): Record<s
 	return state;
 }
 
-/** Build the `workflow_gate` open-input for one deep-interview question. */
+/** Build the `workflow_gate` open-input for one ask question. */
 export function questionToGate(question: AskGateQuestion): OpenGateInput {
 	const labels = question.options.map(o => o.label);
 	const schema = questionAnswerSchema(question, labels);
 	return {
-		stage: "deep-interview",
-		kind: "question",
+		stage: question.workflowGate?.stage ?? "deep-interview",
+		kind: question.workflowGate?.kind ?? "question",
 		schema,
 		options: question.options.map((o, i) => ({
 			value: o.label,
