@@ -1273,8 +1273,10 @@ async function sendTmuxPromptKeys(
 	prompt: string,
 	runner: CommandRunner = runCommand,
 ): Promise<boolean> {
-	const sent = await runner(["tmux", "send-keys", "-t", target, prompt, "C-m", "C-m"]);
-	return sent.exitCode === 0;
+	const typed = await runner(["tmux", "send-keys", "-t", target, "-l", prompt]);
+	if (typed.exitCode !== 0) return false;
+	const submitted = await runner(["tmux", "send-keys", "-t", target, "-l", "\x1b[13;5u"]);
+	return submitted.exitCode === 0;
 }
 
 function boundedLineCount(value: unknown): number {

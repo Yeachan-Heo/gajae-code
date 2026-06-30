@@ -362,6 +362,12 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		// Main chat prompt uses Enter for multiline editing; Ctrl+Enter is the explicit submit chord.
+		if (!this.isAutocompleteOpen() && (data === "\r" || matchesKey(data, "enter") || matchesKey(data, "return"))) {
+			super.handleInput("\x1b[13;2u");
+			return;
+		}
+
 		// Check custom key handlers (extensions)
 		for (const [keyId, handler] of this.#customKeyHandlers) {
 			if (matchesKey(data, keyId)) {

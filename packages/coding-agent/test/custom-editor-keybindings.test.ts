@@ -83,6 +83,19 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("");
 	});
 
+	it("keeps plain Enter as a multiline newline chord", () => {
+		const editor = createEditor();
+		const onSubmit = vi.fn();
+		editor.onSubmit = onSubmit;
+
+		editor.handleInput("a");
+		editor.handleInput("\r");
+		editor.handleInput("b");
+
+		expect(onSubmit).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("a\nb");
+	});
+
 	it("routes Ctrl+Enter through slash command completion before submit", () => {
 		const editor = createEditor();
 		const onSubmit = vi.fn();

@@ -195,7 +195,12 @@ describe("Coordinator MCP server protocol", () => {
 			status: "active",
 			delivery: { target: "visible-session:0.0", tmux_keys_sent: true, state: "tmux_keys_sent" },
 		});
-		expect(commands).toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "do work", "C-m", "C-m"]);
+		expect(commands).toEqual(
+			expect.arrayContaining([
+				["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "do work"],
+				["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"],
+			]),
+		);
 	});
 
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {
@@ -301,6 +306,52 @@ describe("Coordinator MCP server protocol", () => {
 				error: { code: "runtime_prompt_ack_timeout" },
 			},
 		});
+	});
+
+	it("submits tmux-delivered prompts with the runtime submit chord instead of plain Enter", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "submit-chord-delivery");
+		const sendKeyCommands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
+					if (command[1] === "send-keys") {
+						sendKeyCommands.push(command);
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
+					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "visible-session",
+			cwd: root,
+			tmux_session: "visible-session",
+			tmux_target: "visible-session:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "line one\nline two",
+			allow_mutation: true,
+		});
+
+		expect(sendKeyCommands).toEqual([
+			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "line one\nline two"],
+			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"],
+		]);
 	});
 
 	it("marks tmux-delivered turns acknowledged when runtime state accepts the current turn", async () => {
@@ -522,7 +573,8 @@ describe("Coordinator MCP server protocol", () => {
 		expect(response.ok).toBe(true);
 		expect(activeTurnExistedAtSend).toBe(true);
 		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
-			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "hello", "C-m", "C-m"],
+			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "-l", "hello"],
+			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "-l", "\x1b[13;5u"],
 		]);
 	});
 
