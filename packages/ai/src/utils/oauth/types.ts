@@ -15,6 +15,7 @@ export type OAuthProvider =
 	| "cloudflare-ai-gateway"
 	| "cursor"
 	| "deepseek"
+	| "deepinfra"
 	| "fireworks"
 	| "firepass"
 	| "fugu"

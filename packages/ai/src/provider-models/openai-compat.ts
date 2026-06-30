@@ -665,6 +665,17 @@ export function deepseekModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	return createSimpleOpenAICompletionsOptions("deepseek", "https://api.deepseek.com", config);
 }
+
+export interface DeepInfraModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function deepinfraModelManagerOptions(
+	config?: DeepInfraModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("deepinfra", "https://api.deepinfra.com/v1/openai", config);
+}
 // ---------------------------------------------------------------------------
 // 7.5 Fireworks
 // ---------------------------------------------------------------------------
@@ -2282,6 +2293,8 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 			requiresAssistantContentForToolCalls: true,
 		},
 	}),
+	// --- DeepInfra ---
+	openAiCompletionsDescriptor("deepinfra", "deepinfra", "https://api.deepinfra.com/v1/openai"),
 ];
 
 const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDescriptor[] = [

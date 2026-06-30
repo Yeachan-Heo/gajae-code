@@ -32,6 +32,7 @@ import { kimiUsageProvider } from "./usage/kimi";
 import { codexRankingStrategy, openaiCodexUsageProvider } from "./usage/openai-codex";
 import { zaiUsageProvider } from "./usage/zai";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
+import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
@@ -1590,6 +1591,11 @@ export class AuthStorage {
 			}
 			case "deepseek": {
 				const apiKey = await loginDeepSeek(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "deepinfra": {
+				const apiKey = await loginDeepInfra(ctrl);
 				await saveApiKeyCredential(apiKey);
 				return;
 			}

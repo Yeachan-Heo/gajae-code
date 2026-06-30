@@ -116,6 +116,7 @@ export type KnownProvider =
 	| "gitlab-duo"
 	| "cursor"
 	| "deepseek"
+	| "deepinfra"
 	| "xai"
 	| "groq"
 	| "cerebras"
@@ -186,7 +187,7 @@ export type CacheRetention = "none" | "short" | "long";
  *
  * The unscoped values (`"auto"`, `"default"`, `"flex"`, `"scale"`,
  * `"priority"`) are passed through to providers that understand them
- * (OpenAI's `service_tier` field directly; Anthropic translates
+ * (OpenAI and DeepInfra's `service_tier` field directly; Anthropic translates
  * `"priority"` into `speed: "fast"` on supported Opus models).
  *
  * The scoped values target a specific provider family and behave as the
@@ -223,16 +224,15 @@ export function resolveServiceTier(
 }
 
 /**
- * True when the (possibly scoped) tier should be sent as OpenAI's
- * `service_tier` request field for the given provider. Non-OpenAI
- * providers, unsupported tiers (`"auto"`, `"default"`), and scope
- * mismatches all return false.
+ * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
+ * `service_tier` request field for providers that support it. Unsupported tiers
+ * (`"auto"`, `"default"`) and scope mismatches all return false.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): boolean {
-	if (provider !== "openai" && provider !== "openai-codex") return false;
+	if (provider !== "openai" && provider !== "openai-codex" && provider !== "deepinfra") return false;
 	const resolved = resolveServiceTier(serviceTier, provider);
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
 }
@@ -252,7 +252,9 @@ export function getPriorityPremiumRequests(
 	if (resolveServiceTier(serviceTier, provider) !== "priority") return 0;
 	// Only providers that realize `priority` on the wire bill the user.
 	// Everywhere else, the field is silently dropped and nothing is charged.
-	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" ? 1 : 0;
+	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" || provider === "deepinfra"
+		? 1
+		: 0;
 }
 
 export interface ProviderSessionState {

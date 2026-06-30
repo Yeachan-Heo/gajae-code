@@ -111,6 +111,7 @@ Providers:
   zai               Z.AI (GLM Coding Plan)
   glm-zcode         GLM ZCode OAuth (unofficial, opt-in; at your own risk)
   deepseek          DeepSeek
+  deepinfra         DeepInfra
   xai               xAI
   nanogpt           NanoGPT
   minimax-code      MiniMax Coding Plan (International)

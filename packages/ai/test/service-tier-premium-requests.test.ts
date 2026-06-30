@@ -10,6 +10,10 @@ describe("getPriorityPremiumRequests", () => {
 		expect(getPriorityPremiumRequests("priority", "openai-codex")).toBe(1);
 	});
 
+	it("counts priority tier as one premium request on DeepInfra", () => {
+		expect(getPriorityPremiumRequests("priority", "deepinfra")).toBe(1);
+	});
+
 	it("ignores non-priority paid tiers", () => {
 		expect(getPriorityPremiumRequests("flex", "openai")).toBe(0);
 		expect(getPriorityPremiumRequests("scale", "openai")).toBe(0);
@@ -21,8 +25,8 @@ describe("getPriorityPremiumRequests", () => {
 	});
 
 	it("ignores priority tier on providers that drop service_tier", () => {
-		// `priority` is realized on `openai`, `OpenAI code provider`, and direct `anthropic`
-		// (as fast mode). Everywhere else it's silently dropped, so it must not
+		// `priority` is realized on `openai`, `OpenAI code provider`, `deepinfra`, and direct
+		// `anthropic` (as fast mode). Everywhere else it's silently dropped, so it must not
 		// be billed as premium.
 		expect(getPriorityPremiumRequests("priority", "github-copilot")).toBe(0);
 		expect(getPriorityPremiumRequests("priority", "azure")).toBe(0);
@@ -93,7 +97,7 @@ describe("resolveServiceTier", () => {
 });
 
 describe("shouldSendServiceTier", () => {
-	it("returns false for non-OpenAI providers", () => {
+	it("returns false for providers that do not accept service_tier", () => {
 		expect(shouldSendServiceTier("priority", "fireworks")).toBe(false);
 		expect(shouldSendServiceTier("flex", "azure-openai-responses")).toBe(false);
 		expect(shouldSendServiceTier("scale", "firepass")).toBe(false);
@@ -111,14 +115,20 @@ describe("shouldSendServiceTier", () => {
 		expect(shouldSendServiceTier("scale", "openai-codex")).toBe(true);
 	});
 
-	it("returns false for default tier on OpenAI providers", () => {
-		expect(shouldSendServiceTier("default", "openai")).toBe(false);
-		expect(shouldSendServiceTier("default", "openai-codex")).toBe(false);
+	it("returns true for DeepInfra priority tier", () => {
+		expect(shouldSendServiceTier("priority", "deepinfra")).toBe(true);
 	});
 
-	it("returns false for auto tier on OpenAI providers", () => {
+	it("returns false for default tier on OpenAI-compatible service-tier providers", () => {
+		expect(shouldSendServiceTier("default", "openai")).toBe(false);
+		expect(shouldSendServiceTier("default", "openai-codex")).toBe(false);
+		expect(shouldSendServiceTier("default", "deepinfra")).toBe(false);
+	});
+
+	it("returns false for auto tier on OpenAI-compatible service-tier providers", () => {
 		expect(shouldSendServiceTier("auto", "openai")).toBe(false);
 		expect(shouldSendServiceTier("auto", "openai-codex")).toBe(false);
+		expect(shouldSendServiceTier("auto", "deepinfra")).toBe(false);
 	});
 
 	it("returns false for undefined/null tier", () => {

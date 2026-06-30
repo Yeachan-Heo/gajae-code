@@ -13,6 +13,7 @@ import {
 	anthropicModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
+	deepinfraModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
@@ -167,6 +168,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"deepseek-v4-pro",
 		config => deepseekModelManagerOptions(config),
 		catalog("DeepSeek", ["DEEPSEEK_API_KEY"]),
+	),
+	catalogDescriptor(
+		"deepinfra",
+		"deepseek-ai/DeepSeek-V3.2",
+		config => deepinfraModelManagerOptions(config),
+		catalog("DeepInfra", ["DEEPINFRA_API_KEY"]),
 	),
 	descriptor("mistral", "devstral-medium-latest", config => mistralModelManagerOptions(config)),
 	catalogDescriptor(
