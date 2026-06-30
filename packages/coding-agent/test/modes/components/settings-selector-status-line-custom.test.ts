@@ -80,14 +80,14 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		settings.set("statusLine.leftSegments", []);
 		settings.set("statusLine.rightSegments", []);
 		settings.set("statusLine.segmentOptions", { path: { maxLength: 24 }, git: { showUntracked: false } });
-		const { component, previews, changedSettings, previewWidths } = createSelector();
+		const { component, previews, changedSettings } = createSelector();
 
 		openCustomEditor(component);
 
 		const opened = Bun.stripANSI(component.render(120).join("\n"));
 		expect(opened).toContain("Status Line Custom Editor");
-		expect(opened).toContain("Narrow width preview");
-		expect(previewWidths).toContain(40);
+		expect(opened).not.toContain("Current width preview");
+		expect(opened).not.toContain("Narrow width preview");
 		expect(previews.at(-1)).toMatchObject({
 			preset: "custom",
 			leftSegments: getPreset("minimal").leftSegments,

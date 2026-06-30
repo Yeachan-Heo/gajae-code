@@ -235,8 +235,6 @@ function segmentPlacement(
 class StatusLineCustomEditor extends Container {
 	#list!: SettingsList;
 	#draft: StatusLineDraft;
-	#currentWidthPreviewText!: Text;
-	#narrowWidthPreviewText!: Text;
 	#previewHighlightSegment: StatusLineSegmentId | undefined;
 
 	constructor(
@@ -268,13 +266,6 @@ class StatusLineCustomEditor extends Container {
 		this.clear();
 		this.addChild(new Text(theme.bold(theme.fg("accent", "Status Line Custom Editor")), 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("muted", "Current width preview:"), 0, 0));
-		this.#currentWidthPreviewText = new Text(this.#statusLinePreview(), 0, 0);
-		this.addChild(this.#currentWidthPreviewText);
-		this.addChild(new Text(theme.fg("muted", "Narrow width preview:"), 0, 0));
-		this.#narrowWidthPreviewText = new Text(this.#statusLinePreview(40), 0, 0);
-		this.addChild(this.#narrowWidthPreviewText);
-		this.addChild(new Spacer(1));
 		this.#list = new SettingsList(
 			this.#items(),
 			14,
@@ -287,22 +278,11 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	#refresh(): void {
-		this.#refreshPreview();
 		this.#list.setItems(this.#items());
-	}
-
-	#refreshPreview(): void {
-		this.#currentWidthPreviewText.setText(this.#statusLinePreview());
-		this.#narrowWidthPreviewText.setText(this.#statusLinePreview(40));
-	}
-
-	#statusLinePreview(width?: number): string {
-		return this.callbacks.getStatusLinePreview?.(width) ?? theme.fg("dim", "(preview not available)");
 	}
 	#setSelectedItem(item: SettingItem | undefined): void {
 		this.#previewHighlightSegment = this.#highlightSegmentForItem(item);
 		this.#preview();
-		this.#refreshPreview();
 	}
 
 	#highlightSegmentForItem(item: SettingItem | undefined): StatusLineSegmentId | undefined {
