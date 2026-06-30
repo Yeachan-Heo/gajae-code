@@ -7,6 +7,13 @@ const skillPath = join(dirname(fileURLToPath(import.meta.url)), "../src/defaults
 
 const skill = readFileSync(skillPath, "utf8");
 
+function extractSection(content: string, sectionName: string): string {
+	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
+	const sectionContent = sectionMatch?.[1];
+	if (sectionContent === undefined) throw new Error(`missing <${sectionName}> section`);
+	return sectionContent;
+}
+
 describe("deep-interview skill conflict-aware scoring contract", () => {
 	it("documents the ambiguity-raising triggers and established facts", () => {
 		expect(skill).toContain("A direct contradiction");
@@ -43,6 +50,37 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 		expect(skill).toMatch(/Convergence Pacing deferral/i);
 		expect(skill).toMatch(/min-round floor, score-drop cap, (confidence )?dampening/i);
 		expect(skill).toMatch(/Bidirectional scoring is the pacing mechanism/i);
+	});
+});
+
+describe("deep-interview simple-request escape hatch", () => {
+	it("stops before interview state, Round 0, or spec writing when the request is already clear and small", () => {
+		const doNotUseWhen = extractSection(skill, "Do_Not_Use_When");
+		const steps = extractSection(skill, "Steps");
+		const suitabilityGateIndex = steps.indexOf("## Phase 0.5: Suitability Gate");
+		const initializeIndex = steps.indexOf("## Phase 1: Initialize");
+		const roundZeroIndex = steps.indexOf("## Round 0: Topology Enumeration Gate");
+		const executionBridgeIndex = steps.indexOf("## Phase 5: Execution Bridge");
+
+		expect(doNotUseWhen).toMatch(/detailed,\s+specific request[\s\S]*execute directly/i);
+		expect(doNotUseWhen).toMatch(/quick fix or single change[\s\S]*direct execution/i);
+		expect(suitabilityGateIndex).toBeGreaterThanOrEqual(0);
+		expect(suitabilityGateIndex).toBeLessThan(initializeIndex);
+		expect(suitabilityGateIndex).toBeLessThan(roundZeroIndex);
+		expect(suitabilityGateIndex).toBeLessThan(executionBridgeIndex);
+
+		const suitabilityGate = steps.slice(suitabilityGateIndex, initializeIndex);
+		expect(suitabilityGate).toMatch(/clear,\s+bounded,\s+low-risk/i);
+		expect(suitabilityGate).toContain("gjc state read --mode deep-interview --json");
+		expect(suitabilityGate).toContain("gjc state clear --force --mode deep-interview");
+		expect(suitabilityGate).toMatch(/newly seeded empty interview/i);
+		expect(suitabilityGate).toMatch(/no recorded `rounds`[\s\S]*no `spec_path`[\s\S]*no `handoff_from`/i);
+		expect(suitabilityGate).toMatch(/If state already contains rounds[\s\S]*do not clear it/i);
+		expect(suitabilityGate).toMatch(/Preserve the active interview/i);
+		expect(suitabilityGate).toMatch(/do not initialize deep-interview state/i);
+		expect(suitabilityGate).toMatch(/do not run Round 0/i);
+		expect(suitabilityGate).toMatch(/do not write a pending-approval spec/i);
+		expect(suitabilityGate).toMatch(/direct implementation/i);
 	});
 });
 

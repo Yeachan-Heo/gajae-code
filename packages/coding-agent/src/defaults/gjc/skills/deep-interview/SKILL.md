@@ -21,13 +21,14 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 - User wants to avoid "that's not what I meant" outcomes from autonomous execution
 - Task is complex enough that jumping to code would waste cycles on scope discovery
 - User wants mathematically-validated clarity before committing to execution
+- User explicitly requests deep-interview even after being told the request is already clear, bounded, and low-risk
 </Use_When>
 
 <Do_Not_Use_When>
 - User has a detailed, specific request with file paths, function names, or acceptance criteria -- execute directly
 - User wants to explore options or brainstorm -- use `ralplan` skill instead
-- User wants a quick fix or single change -- delegate to executor or execution
-- User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by ending interview and writing a `pending approval` spec, not by mutating files or delegating execution
+- User wants a quick fix or single change -- use direct execution, not deep-interview or role-agent delegation
+- User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by exiting deep-interview, not by writing a `pending approval` spec
 - User already has a PRD or plan file and explicitly asks to execute it -- use the requested execution skill with that plan
 </Do_Not_Use_When>
 
@@ -102,6 +103,27 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
    - Include both threshold and source in the final spec metadata.
 - Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
+
+## Phase 0.5: Suitability Gate
+
+Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, `gjc state write`, Round 0, ambiguity scoring, or spec writing.
+
+If `{{ARGUMENTS}}` is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
+
+1. **Stop deep-interview immediately**:
+   - First inspect current-session state with `gjc state read --mode deep-interview --json` (include `--session-id <current-session-id>` when available).
+   - Clear through `gjc state clear --force --mode deep-interview --json` only when the state is a newly seeded empty interview: no recorded `rounds`, no `spec_path`, no `handoff_from`, no final/pending spec, and no user-confirmed topology.
+   - If state already contains rounds, a spec path, handoff metadata, pending approval, or confirmed topology, do not clear it. Preserve the active interview and ask the user whether to continue, cancel, or explicitly clear the workflow.
+   - Do not initialize deep-interview state.
+   - Do not run Round 0.
+   - Do not write a pending-approval spec.
+   - Do not hand off to `ralplan`, `ultragoal`, `team`, or a role agent.
+2. **Return the request to direct implementation**:
+   - Say briefly that deep-interview is unnecessary because the request is already clear and small.
+   - State the direct implementation path the normal coding agent should take.
+   - If the user explicitly insists on deep-interview anyway, continue to Phase 1.
+
+This gate exists to prevent deep-interview from making easy problems harder. A small verification need does not make a request interview-worthy.
 
 ## Phase 1: Initialize
 
