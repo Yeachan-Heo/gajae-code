@@ -556,6 +556,12 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 			continue;
 		}
+		if (isReleasePublishPath(changedPath)) {
+			add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
+			add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+			continue;
+		}
+
 
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
 		if (mappedTests.length > 0) {
@@ -575,10 +581,6 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
-			}
-			if (isReleasePublishPath(changedPath)) {
-				add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
-				add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
 			}
 			continue;
 		}
@@ -824,7 +826,12 @@ function isToolingScriptPath(changedPath: string): boolean {
 }
 
 function isReleasePublishPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-release-publish.ts" || changedPath.startsWith("packages/gajae-code/");
+	return (
+		changedPath === "scripts/ci-release-publish.ts" ||
+		changedPath.startsWith("packages/gajae-code/") ||
+		changedPath.startsWith("packages/natives-") ||
+		changedPath === "packages/natives/package.json"
+	);
 }
 
 function isUnscopedWrapperPath(changedPath: string): boolean {

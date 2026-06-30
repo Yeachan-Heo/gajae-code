@@ -27,7 +27,13 @@
 
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { detectCompiledBinary, getAddonFilenames, resolveLoaderCandidates } from "../native/loader-state.js";
+import {
+	detectCompiledBinary,
+	getAddonFilenames,
+	getOptionalPackageNames,
+	resolveLoaderCandidates,
+	resolveOptionalPackageNativeDirs,
+} from "../native/loader-state.js";
 
 describe("issue 823: standalone-binary native loader path resolution", () => {
 	it("detects compiled-binary mode from embedded-addon presence when env and url markers are absent", () => {
@@ -128,5 +134,46 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		});
 		expect(candidates).not.toContain(path.join(versionedDir, "pi_natives.linux-x64-baseline.node"));
 		expect(candidates).not.toContain(path.join(userDataDir, "pi_natives.linux-x64-baseline.node"));
+	});
+
+	it("prefers host optional package candidates before legacy bundled candidates", () => {
+		const optionalNativeDir = "/repo/node_modules/@gajae-code/natives-linux-x64/native";
+		const nativeDir = "/repo/node_modules/@gajae-code/natives/native";
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: getAddonFilenames({ tag: "linux-x64", arch: "x64", variant: "modern" }),
+			isCompiledBinary: false,
+			stageFromNodeModules: false,
+			optionalPackageNativeDirs: [optionalNativeDir],
+			nativeDir,
+			execDir: "/usr/bin",
+			versionedDir: "/home/u/.gjc/natives/14.5.2",
+			userDataDir: "/home/u/.local/bin",
+		});
+
+		const optionalModern = path.join(optionalNativeDir, "pi_natives.linux-x64-modern.node");
+		const optionalBaseline = path.join(optionalNativeDir, "pi_natives.linux-x64-baseline.node");
+		const legacyModern = path.join(nativeDir, "pi_natives.linux-x64-modern.node");
+		expect(candidates).toContain(optionalModern);
+		expect(candidates).toContain(legacyModern);
+		expect(candidates.indexOf(optionalModern)).toBeLessThan(candidates.indexOf(legacyModern));
+		expect(candidates.indexOf(optionalBaseline)).toBeLessThan(candidates.indexOf(legacyModern));
+	});
+
+	it("resolves only the current host optional package directory when installed", () => {
+		const packageNames = getOptionalPackageNames("darwin-arm64");
+		expect(packageNames).toEqual(["@gajae-code/natives-darwin-arm64"]);
+
+		const dirs = resolveOptionalPackageNativeDirs({
+			packageNames,
+			requireResolve: id => {
+				if (id === "@gajae-code/natives-darwin-arm64/package.json") {
+					return "/repo/node_modules/@gajae-code/natives-darwin-arm64/package.json";
+				}
+				throw new Error(`missing ${id}`);
+			},
+		});
+
+		expect(dirs).toEqual(["/repo/node_modules/@gajae-code/natives-darwin-arm64/native"]);
+		expect(getOptionalPackageNames("freebsd-x64")).toEqual([]);
 	});
 });

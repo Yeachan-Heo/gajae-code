@@ -31,6 +31,14 @@ import { embeddedAddon } from "./embedded-addon.js";
  */
 
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
+const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
+	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
+	"darwin-x64": "@gajae-code/natives-darwin-x64",
+	"linux-arm64": "@gajae-code/natives-linux-arm64",
+	"linux-x64": "@gajae-code/natives-linux-x64",
+	"win32-x64": "@gajae-code/natives-win32-x64",
+};
+
 
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
@@ -79,6 +87,32 @@ export function getAddonFilenames({ tag, arch, variant }) {
 }
 
 /**
+ * @param {string} platformTag
+ * @returns {string[]}
+ */
+export function getOptionalPackageNames(platformTag) {
+	const packageName = OPTIONAL_PACKAGE_BY_PLATFORM_TAG[platformTag];
+	return packageName ? [packageName] : [];
+}
+
+/**
+ * @param {{ packageNames: string[]; requireResolve: (id: string) => string }} input
+ * @returns {string[]}
+ */
+export function resolveOptionalPackageNativeDirs({ packageNames, requireResolve }) {
+	const dirs = [];
+	for (const packageName of packageNames) {
+		try {
+			const manifestPath = requireResolve(`${packageName}/package.json`);
+			dirs.push(path.join(path.dirname(manifestPath), "native"));
+		} catch {
+			// Optional dependency is absent on non-matching platforms or older installs.
+		}
+	}
+	return dirs;
+}
+
+/**
  * Decide whether the loader should mirror the package's `native/<filename>.node`
  * into the per-version cache directory (`~/.gjc/natives/<version>/`) before loading.
  *
@@ -112,6 +146,7 @@ export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, native
  *   addonFilenames: string[];
  *   isCompiledBinary: boolean;
  *   stageFromNodeModules?: boolean;
+ *   optionalPackageNativeDirs?: string[];
  *   nativeDir: string;
  *   execDir: string;
  *   versionedDir: string;
@@ -123,15 +158,20 @@ export function resolveLoaderCandidates({
 	addonFilenames,
 	isCompiledBinary,
 	stageFromNodeModules = false,
+	optionalPackageNativeDirs = [],
 	nativeDir,
 	execDir,
 	versionedDir,
 	userDataDir,
 }) {
-	const baseReleaseCandidates = addonFilenames.flatMap(filename => [
+	const optionalPackageCandidates = optionalPackageNativeDirs.flatMap(optionalNativeDir =>
+		addonFilenames.map(filename => path.join(optionalNativeDir, filename)),
+	);
+	const legacyReleaseCandidates = addonFilenames.flatMap(filename => [
 		path.join(nativeDir, filename),
 		path.join(execDir, filename),
 	]);
+	const baseReleaseCandidates = [...optionalPackageCandidates, ...legacyReleaseCandidates];
 	const compiledCandidates = addonFilenames.flatMap(filename => [
 		path.join(versionedDir, filename),
 		path.join(userDataDir, filename),
@@ -259,25 +299,26 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 }
 
 /**
- * Mirror `nativeDir/<filename>.node` to `versionedDir/<filename>.node` on Windows
- * installs so the running process keeps its OS-level handle on a versioned
- * cache path, never on the `node_modules` copy that bun must overwrite on
- * update. No-op on non-Windows, in workspace dev, and for compiled binaries —
- * see `shouldStageNodeModulesAddon` for the gating rules.
+ * Mirror the optional-package or legacy bundled `native/<filename>.node` into
+ * `versionedDir/<filename>.node` on Windows installs so the running process
+ * keeps its OS-level handle on a versioned cache path, never on the
+ * `node_modules` copy that bun must overwrite on update. No-op on non-Windows,
+ * in workspace dev, and for compiled binaries — see `shouldStageNodeModulesAddon`.
  */
 function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
+	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
-		const sourcePath = path.join(ctx.nativeDir, filename);
 		const targetPath = path.join(ctx.versionedDir, filename);
 
 		if (fs.existsSync(targetPath)) {
 			stagedPath = stagedPath || targetPath;
 			continue;
 		}
-		if (!fs.existsSync(sourcePath)) continue;
+		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
+		if (!sourcePath) continue;
 
 		try {
 			fs.mkdirSync(ctx.versionedDir, { recursive: true });
@@ -343,7 +384,7 @@ function buildHelpMessage(ctx) {
  * Called from `loadNative()` rather than at module scope so importing pure
  * helpers from this file doesn't trigger AVX2 detection or filesystem probes.
  */
-function initLoaderContext() {
+function initLoaderContext(require_) {
 	const platformTag = `${process.platform}-${process.arch}`;
 	const packageVersion = packageJson.version;
 	const nativeDir = path.join(import.meta.dir, "..", "native");
@@ -368,11 +409,17 @@ function initLoaderContext() {
 	const selectedVariant = resolveCpuVariant(getVariantOverride());
 	const addonFilenames = getAddonFilenames({ tag: platformTag, arch: process.arch, variant: selectedVariant });
 	const addonLabel = selectedVariant ? `${platformTag} (${selectedVariant})` : platformTag;
+	const optionalPackageNativeDirs = resolveOptionalPackageNativeDirs({
+		packageNames: getOptionalPackageNames(platformTag),
+		requireResolve: id => require_.resolve(id),
+	});
+
 
 	const candidates = resolveLoaderCandidates({
 		addonFilenames,
 		isCompiledBinary,
 		stageFromNodeModules,
+		optionalPackageNativeDirs,
 		nativeDir,
 		execDir,
 		versionedDir,
@@ -399,6 +446,7 @@ function initLoaderContext() {
 		stageFromNodeModules,
 		selectedVariant,
 		addonFilenames,
+		optionalPackageNativeDirs,
 		addonLabel,
 		candidates,
 		versionSentinelExport,
@@ -407,8 +455,8 @@ function initLoaderContext() {
 }
 
 export function loadNative() {
-	const ctx = initLoaderContext();
 	const require_ = createRequire(import.meta.url);
+	const ctx = initLoaderContext(require_);
 
 	const errors = [];
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);

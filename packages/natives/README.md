@@ -54,11 +54,11 @@ crates/pi-natives/       # Rust source (workspace member)
   src/lib.rs             # N-API exports
   src/sixel.rs           # SIXEL terminal-image encoding
   Cargo.toml             # Rust dependencies
-native/                  # Native addon binaries
-  pi_natives.<platform>-<arch>-modern.node   # x64 modern ISA (AVX2)
-  pi_natives.<platform>-<arch>-baseline.node # x64 baseline ISA
-  pi_natives.<platform>-<arch>.node          # non-x64 build artifact
-src/                     # TypeScript wrappers
-  native.ts              # Native addon loader
-  index.ts               # Public API
+native/                  # Stable JS/types loader files
+  index.js               # Loads the host addon
+  index.d.ts             # Generated public API types
+packages/natives-*/      # Optional per-platform prebuilt addon packages
+  native/pi_natives.<platform>-<arch>-modern.node   # x64 modern ISA (AVX2)
+  native/pi_natives.<platform>-<arch>-baseline.node # x64 baseline ISA
+  native/pi_natives.<platform>-<arch>.node          # non-x64 build artifact
 ```

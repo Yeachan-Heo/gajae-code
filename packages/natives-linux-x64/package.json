@@ -1,0 +1,30 @@
+{
+	"name": "@gajae-code/natives-linux-x64",
+	"version": "0.7.7",
+	"description": "Linux x64 native addons for @gajae-code/natives",
+	"type": "module",
+	"homepage": "https://gaebal-gajae.dev",
+	"author": "Yeachan-Heo",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gajae-ai/gajae-code.git",
+		"directory": "packages/natives-linux-x64"
+	},
+	"bugs": {
+		"url": "https://github.com/gajae-ai/gajae-code/issues"
+	},
+	"os": [
+		"linux"
+	],
+	"cpu": [
+		"x64"
+	],
+	"files": [
+		"native",
+		"README.md"
+	],
+	"exports": {
+		"./package.json": "./package.json"
+	}
+}

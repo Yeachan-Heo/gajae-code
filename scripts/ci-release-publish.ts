@@ -16,18 +16,21 @@
  * locally, expect a dirty working tree and `git restore` after.
  */
 
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
 
 interface PublishPackage {
 	dir: string;
-	kind: "typescript" | "native" | "manifest";
+	kind: "typescript" | "native" | "native-platform" | "manifest";
 	/** Extra build steps before manifest rewrite (e.g. esbuild bundles). */
 	preBuild?: readonly (readonly string[])[];
 	/** Extra entries to splice into `files`. */
 	extraFiles?: readonly string[];
 	/** Extra tsgo invocations beyond `tsconfig.publish.json`. */
 	extraTypeConfigs?: readonly string[];
+	/** Native addon filename prefixes staged into a per-platform optional package. */
+	nativePrefixes?: readonly string[];
 }
 
 type JsonValue = string | number | boolean | null | JsonObject | JsonValue[];
@@ -42,9 +45,18 @@ interface PackageManifest extends JsonObject {
 
 const repoRoot = path.join(import.meta.dir, "..");
 const isDryRun = process.argv.includes("--dry-run");
+const nativePlatformPackages: readonly PublishPackage[] = [
+	{ dir: "packages/natives-darwin-arm64", kind: "native-platform", nativePrefixes: ["pi_natives.darwin-arm64"] },
+	{ dir: "packages/natives-darwin-x64", kind: "native-platform", nativePrefixes: ["pi_natives.darwin-x64"] },
+	{ dir: "packages/natives-linux-arm64", kind: "native-platform", nativePrefixes: ["pi_natives.linux-arm64"] },
+	{ dir: "packages/natives-linux-x64", kind: "native-platform", nativePrefixes: ["pi_natives.linux-x64"] },
+	{ dir: "packages/natives-win32-x64", kind: "native-platform", nativePrefixes: ["pi_natives.win32-x64"] },
+];
+
 export const packages: PublishPackage[] = [
 	{ dir: "packages/utils", kind: "typescript" },
 	{ dir: "packages/ai", kind: "typescript" },
+	...nativePlatformPackages,
 	{ dir: "packages/natives", kind: "native" },
 	{ dir: "packages/tui", kind: "typescript" },
 	{
@@ -195,8 +207,38 @@ async function rewriteNativeManifest(pkgDir: string): Promise<PackageManifest> {
 	return manifest;
 }
 
+async function stageNativePlatformArtifacts(pkg: PublishPackage): Promise<void> {
+	const prefixes = pkg.nativePrefixes ?? [];
+	if (prefixes.length === 0) throw new Error(`Native platform package ${pkg.dir} has no nativePrefixes`);
+	const sourceDir = path.join(repoRoot, "packages", "natives", "native");
+	const targetDir = path.join(repoRoot, pkg.dir, "native");
+	if (isDryRun) {
+		console.log(`DRY RUN stage ${prefixes.join(",")} into ${pkg.dir}/native`);
+		return;
+	}
+
+	const entries = await fs.readdir(sourceDir).catch((err: unknown) => {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Cannot read native artifact directory ${sourceDir}: ${message}`);
+	});
+	const matching = entries.filter(entry => entry.endsWith(".node") && prefixes.some(prefix => entry.startsWith(prefix)));
+	if (matching.length === 0) {
+		throw new Error(`No native artifacts matching ${prefixes.join(", ")} found in ${sourceDir}`);
+	}
+
+	await fs.rm(targetDir, { recursive: true, force: true });
+	await fs.mkdir(targetDir, { recursive: true });
+	for (const entry of matching) {
+		await fs.copyFile(path.join(sourceDir, entry), path.join(targetDir, entry));
+	}
+}
+
 async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
 	const pkgDir = path.join(repoRoot, pkg.dir);
+	if (pkg.kind === "native-platform") {
+		await stageNativePlatformArtifacts(pkg);
+		return rewriteNativeManifest(pkgDir);
+	}
 	if (pkg.kind === "native" || pkg.kind === "manifest") {
 		return rewriteNativeManifest(pkgDir);
 	}
@@ -210,25 +252,31 @@ async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
 	return rewriteManifest(pkgDir, pkg.extraFiles ?? []);
 }
 
+async function readPackageManifest(pkgDir: string): Promise<PackageManifest> {
+	return (await Bun.file(path.join(pkgDir, "package.json")).json()) as PackageManifest;
+}
+
+
 async function publishPackage(pkg: PublishPackage): Promise<void> {
 	const pkgDir = path.join(repoRoot, pkg.dir);
-	const manifest = await preparePackage(pkg);
+	const manifest = isDryRun ? await readPackageManifest(pkgDir) : await preparePackage(pkg);
 	const name = manifest.name ?? path.basename(pkg.dir);
 	if (manifest.private) {
 		console.log(`Skipping ${name} (private)`);
 		return;
 	}
+	if (isDryRun) {
+		if (pkg.kind === "native-platform") await stageNativePlatformArtifacts(pkg);
+		console.log(`DRY RUN npm publish --access public (${pkg.dir})`);
+		return;
+	}
 	const version = typeof manifest.version === "string" ? manifest.version : undefined;
-	if (!isDryRun && version !== undefined) {
+	if (version !== undefined) {
 		const existing = await $`npm view ${`${name}@${version}`} version --json`.quiet().nothrow();
 		if (existing.exitCode === 0) {
 			console.log(`Skipping ${name}@${version} (already published)`);
 			return;
 		}
-	}
-	if (isDryRun) {
-		console.log(`DRY RUN npm publish --access public (${pkg.dir})`);
-		return;
 	}
 	console.log(`Publishing ${name}…`);
 	const result = await $`npm publish --access public`.cwd(pkgDir).quiet().nothrow();

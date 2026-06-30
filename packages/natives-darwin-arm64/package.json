@@ -1,0 +1,30 @@
+{
+	"name": "@gajae-code/natives-darwin-arm64",
+	"version": "0.7.7",
+	"description": "Darwin arm64 native addon for @gajae-code/natives",
+	"type": "module",
+	"homepage": "https://gaebal-gajae.dev",
+	"author": "Yeachan-Heo",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gajae-ai/gajae-code.git",
+		"directory": "packages/natives-darwin-arm64"
+	},
+	"bugs": {
+		"url": "https://github.com/gajae-ai/gajae-code/issues"
+	},
+	"os": [
+		"darwin"
+	],
+	"cpu": [
+		"arm64"
+	],
+	"files": [
+		"native",
+		"README.md"
+	],
+	"exports": {
+		"./package.json": "./package.json"
+	}
+}

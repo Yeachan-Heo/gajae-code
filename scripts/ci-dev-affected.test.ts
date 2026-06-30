@@ -376,6 +376,13 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
 	});
 
+	test("native platform package changes plan release publish validation", () => {
+		const tasks = targeted(["packages/natives-linux-x64/package.json"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("release-publish-contract");
+		expect(keys).toContain("release-publish-dry-run");
+	});
+
 	test("root-level codeish changes that fall back to root-check provide native artifacts", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);

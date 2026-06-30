@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Split published prebuilt `.node` artifacts into per-platform optional `@gajae-code/natives-*` packages while keeping `@gajae-code/natives` as the stable loader/types package with legacy local fallback resolution (#1280).
+
 ## [0.7.0] - 2026-06-22
 
 ### Added

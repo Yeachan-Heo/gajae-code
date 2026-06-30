@@ -107,6 +107,33 @@
         "@types/bun": "catalog:",
         "@types/ws": "catalog:",
       },
+      "optionalDependencies": {
+        "@gajae-code/natives-darwin-arm64": "workspace:*",
+        "@gajae-code/natives-darwin-x64": "workspace:*",
+        "@gajae-code/natives-linux-arm64": "workspace:*",
+        "@gajae-code/natives-linux-x64": "workspace:*",
+        "@gajae-code/natives-win32-x64": "workspace:*",
+      },
+    },
+    "packages/natives-darwin-arm64": {
+      "name": "@gajae-code/natives-darwin-arm64",
+      "version": "0.7.7",
+    },
+    "packages/natives-darwin-x64": {
+      "name": "@gajae-code/natives-darwin-x64",
+      "version": "0.7.7",
+    },
+    "packages/natives-linux-arm64": {
+      "name": "@gajae-code/natives-linux-arm64",
+      "version": "0.7.7",
+    },
+    "packages/natives-linux-x64": {
+      "name": "@gajae-code/natives-linux-x64",
+      "version": "0.7.7",
+    },
+    "packages/natives-win32-x64": {
+      "name": "@gajae-code/natives-win32-x64",
+      "version": "0.7.7",
     },
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
@@ -225,6 +252,11 @@
     "@gajae-code/bridge-client": "0.7.7",
     "@gajae-code/coding-agent": "0.7.7",
     "@gajae-code/natives": "0.7.7",
+    "@gajae-code/natives-darwin-arm64": "0.7.7",
+    "@gajae-code/natives-darwin-x64": "0.7.7",
+    "@gajae-code/natives-linux-arm64": "0.7.7",
+    "@gajae-code/natives-linux-x64": "0.7.7",
+    "@gajae-code/natives-win32-x64": "0.7.7",
     "@gajae-code/stats": "0.7.7",
     "@gajae-code/tui": "0.7.7",
     "@gajae-code/utils": "0.7.7",
@@ -408,6 +440,16 @@
     "@gajae-code/coding-agent": ["@gajae-code/coding-agent@workspace:packages/coding-agent"],
 
     "@gajae-code/natives": ["@gajae-code/natives@workspace:packages/natives"],
+
+    "@gajae-code/natives-darwin-arm64": ["@gajae-code/natives-darwin-arm64@workspace:packages/natives-darwin-arm64"],
+
+    "@gajae-code/natives-darwin-x64": ["@gajae-code/natives-darwin-x64@workspace:packages/natives-darwin-x64"],
+
+    "@gajae-code/natives-linux-arm64": ["@gajae-code/natives-linux-arm64@workspace:packages/natives-linux-arm64"],
+
+    "@gajae-code/natives-linux-x64": ["@gajae-code/natives-linux-x64@workspace:packages/natives-linux-x64"],
+
+    "@gajae-code/natives-win32-x64": ["@gajae-code/natives-win32-x64@workspace:packages/natives-win32-x64"],
 
     "@gajae-code/orchestration-token-benchmark": ["@gajae-code/orchestration-token-benchmark@workspace:packages/orchestration-token-benchmark"],
 

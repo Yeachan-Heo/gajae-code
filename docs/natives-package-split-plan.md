@@ -1,8 +1,8 @@
-# Native package split follow-up plan
+# Native package split plan
 
-Issue #1280 reports Bun 1.3.14 extraction failures when installing the published `@gajae-code/natives` tarball because the package ships every platform's prebuilt `.node` file in one mandatory dependency. The safe minimal fix in this PR is to make `gjc update` verify the resulting install state before treating a package-manager nonzero exit as fatal.
+Issue #1280 reports Bun 1.3.14 extraction failures when installing the published `@gajae-code/natives` tarball because the package ships every platform's prebuilt `.node` file in one mandatory dependency. PR #1281 added the safe `gjc update` partial-success verifier; this follow-up implements the package-topology split that prevents the oversized native tarball in the first place.
 
-A full per-platform native split should be a separate release-engineering change because it changes published package topology and must be validated on every release runner.
+The stable loader package remains `@gajae-code/natives`; platform binaries now publish as optional packages so package managers install only the host package.
 
 ## Target package topology
 
@@ -17,13 +17,12 @@ A full per-platform native split should be a separate release-engineering change
 - Publish each platform package with exactly its relevant `pi_natives.<platform>-<arch>*.node` file(s), `README.md`, and `package.json` using `os` / `cpu` fields so non-host package-manager failures remain optional.
 - Update `native/loader-state.js` to search the host optional package before falling back to the legacy bundled `native/` directory and compiled-binary embedded addons.
 
-## Required release-script work
+## Release-script work
 
-1. Teach the native release artifact download step to stage every `pi_natives.*.node` into the matching platform package directory.
-2. Teach `scripts/ci-release-publish.ts` to publish the optional native packages before `@gajae-code/natives` / `@gajae-code/coding-agent`.
-3. Keep the existing monorepo release version bump in lockstep for the new package manifests.
-4. Add package-smoke tests that pack `@gajae-code/natives` and prove the host tarball no longer includes all non-host `.node` files.
-5. Add loader tests for optional-package resolution and fallback to the legacy bundled path.
+1. The release npm job still downloads every `pi_natives.*.node` artifact into `packages/natives/native`.
+2. `scripts/ci-release-publish.ts` stages matching artifacts into the platform package directories and publishes the optional native packages before `@gajae-code/natives` / `@gajae-code/coding-agent`.
+3. The monorepo release version bump keeps all new package manifests in lockstep.
+4. Release/loader tests pin publish ordering, stable-package file inclusion, optional-package resolution, and fallback to the legacy bundled path.
 
 ## Compatibility notes
 

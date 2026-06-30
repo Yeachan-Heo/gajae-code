@@ -53,10 +53,20 @@
 		"triples": {}
 	},
 	"files": [
-		"src",
-		"native",
+		"native/index.js",
+		"native/index.d.ts",
+		"native/loader-state.js",
+		"native/loader-state.d.ts",
+		"native/embedded-addon.js",
 		"README.md"
 	],
+	"optionalDependencies": {
+		"@gajae-code/natives-darwin-arm64": "workspace:*",
+		"@gajae-code/natives-darwin-x64": "workspace:*",
+		"@gajae-code/natives-linux-arm64": "workspace:*",
+		"@gajae-code/natives-linux-x64": "workspace:*",
+		"@gajae-code/natives-win32-x64": "workspace:*"
+	},
 	"exports": {
 		".": {
 			"types": "./native/index.d.ts",
