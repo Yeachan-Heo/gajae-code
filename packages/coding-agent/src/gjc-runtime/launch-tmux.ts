@@ -585,7 +585,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			);
 			return true;
 		}
-		if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
 	}
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(
@@ -593,7 +592,10 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
 		options,
 	);
-	if (attached.exitCode === 0) return true;
+	if (attached.exitCode === 0) {
+		if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
+		return true;
+	}
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
 		return true;

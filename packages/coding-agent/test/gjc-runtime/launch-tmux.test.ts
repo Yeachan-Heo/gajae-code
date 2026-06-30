@@ -169,8 +169,8 @@ describe("default GJC tmux launch", () => {
 			const attachIndex = events.lastIndexOf("spawn:attach-session");
 
 			expect(newSessionIndex).toBeGreaterThanOrEqual(0);
-			expect(titleIndex).toBeGreaterThan(newSessionIndex);
-			expect(attachIndex).toBeGreaterThan(titleIndex);
+			expect(attachIndex).toBeGreaterThan(newSessionIndex);
+			expect(titleIndex).toBeGreaterThan(attachIndex);
 			expect(writeSpy).toHaveBeenCalledTimes(1);
 		} finally {
 			stdout.isTTY = previousIsTTY;
@@ -691,31 +691,41 @@ describe("default GJC tmux launch", () => {
 	it("cleans up a newly created managed session when attach fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ tmux: true }),
-			rawArgs: [],
-			cwd: "/repo",
-			env: {},
-			argv: ["/usr/local/bin/gjc"],
-			execPath: "/bin/bun",
-			platform: "darwin",
-			tty: interactiveTty,
-			tmuxAvailable: true,
-			currentBranch: "",
-			existingBranchSessionName: null,
-			diagnosticWriter: message => diagnostics.push(message),
-			spawnSync: (command, spawnArgs, options) => {
-				calls.push({ command, args: spawnArgs, options });
-				if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
-				return { exitCode: 0 };
-			},
-		});
+		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
+		const previousIsTTY = stdout.isTTY;
+		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
+		stdout.isTTY = true;
 
-		expect(handled).toBe(true);
-		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
-		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
-		expect(calls.some(call => call.args[0] === "kill-session")).toBe(true);
-		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+		try {
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ tmux: true }),
+				rawArgs: [],
+				cwd: "/repo",
+				env: {},
+				argv: ["/usr/local/bin/gjc"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+				spawnSync: (command, spawnArgs, options) => {
+					calls.push({ command, args: spawnArgs, options });
+					if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled).toBe(true);
+			expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+			expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+			expect(calls.some(call => call.args[0] === "kill-session")).toBe(true);
+			expect(writeSpy).not.toHaveBeenCalled();
+			expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+		} finally {
+			stdout.isTTY = previousIsTTY;
+		}
 	});
 
 	it("builds a session-scoped tmux profile without global tmux mutation", () => {
