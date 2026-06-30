@@ -600,6 +600,17 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	};
 	const attachOptions: TmuxSpawnOptions = { ...options };
 	const controlOptions: TmuxSpawnOptions = { ...options, captureStderr: true };
+	// has-session / new-session retry / profile-tagging probe share these
+	// pipe-stdio options. PTY-bound commands (attach-session, rename-window,
+	// set-option in applyGjcTmuxProfile when we explicitly need the live TTY)
+	// use `options` or `attachOptions` instead.
+	const probeOptions: TmuxSpawnOptions = {
+		...options,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		captureStderr: true,
+	};
 	// new-session needs pipe stdio (not inherit) because the user terminal must
 	// remain untouched until attach-session takes over. Inheriting psmux's
 	// stdout/stderr for new-session can corrupt the terminal state or race with
@@ -625,15 +636,14 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	}
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
 	if (created.exitCode === 0) {
-		renameTmuxWindow(
-			plan.tmuxCommand,
-			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
-			spawnSync,
-			controlOptions,
-			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
-		);
-
-		const profile = applyGjcTmuxProfile({
+		// On Windows + psmux 3.3.0/3.3.6, new-session can return exit 0
+		// before the psmux server finishes registering the session on its
+		// control socket. The follow-up set-option / attach-session then
+		// fails with "can't find session / no server running". Probe the
+		// server first, and if the race fired, retry new-session before
+		// we hand the session to rename-window / applyGjcTmuxProfile so the
+		// profile-tagging path always sees a registered session.
+		const buildProfileInputs = (): GjcTmuxProfileContext => ({
 			tmuxCommand: plan.tmuxCommand,
 			target: plan.sessionName,
 			cwd: plan.cwd,
@@ -645,13 +655,77 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			sessionStateFile: plan.sessionStateFile ?? null,
 			version: VERSION,
 		});
+		const probeHasSession = (): TmuxSpawnResult =>
+			spawnSync(
+				plan.tmuxCommand,
+				["has-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
+				probeOptions,
+			);
+		const probeResult = probeHasSession();
+		if (probeResult.exitCode !== 0) {
+			const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
+			const retryProbe = probeHasSession();
+			if (retry.exitCode !== 0 || retryProbe.exitCode !== 0) {
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic(
+						"new-session retry failed after missing session",
+						retry.stderr ?? retryProbe.stderr ?? created.stderr,
+					),
+				);
+				cleanupCreatedTmuxSession(plan, spawnSync, options);
+				return false;
+			}
+		}
+		renameTmuxWindow(
+			plan.tmuxCommand,
+			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
+			spawnSync,
+			controlOptions,
+			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
+		);
+		const profile = applyGjcTmuxProfile(buildProfileInputs());
+		// If the @gjc-profile ownership write failed, the cause can be
+		// either (a) a real psmux persistence-tag rejection (e.g.
+		// unsupported option on this server), or (b) the same new-session
+		// registration race above — psmux returned 0 but the server died
+		// before registering, so the follow-up set-option failed with
+		// "can't find session". Distinguish the two: re-probe; if the
+		// session is genuinely missing, retry new-session and re-apply the
+		// profile. Otherwise, surface the persistence-tag failure.
 		const ownershipFailure = profile.failures.find(item => item.command.args.includes("@gjc-profile"));
 		if (ownershipFailure) {
-			cleanupCreatedTmuxSession(plan, spawnSync, options);
-			(context.diagnosticWriter ?? safeStderrWrite)(
-				formatTmuxLaunchDiagnostic("profile tagging failed", ownershipFailure.stderr),
-			);
-			return true;
+			const probeAfterOwnership = probeHasSession();
+			if (probeAfterOwnership.exitCode === 0) {
+				// Session is present; tagging failed for a real reason.
+				cleanupCreatedTmuxSession(plan, spawnSync, options);
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("profile tagging failed", ownershipFailure.stderr),
+				);
+				return true;
+			}
+			// Session is missing — retry.
+			const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
+			const retryProbe = probeHasSession();
+			if (retry.exitCode !== 0 || retryProbe.exitCode !== 0) {
+				cleanupCreatedTmuxSession(plan, spawnSync, options);
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic(
+						"new-session retry failed after ownership failure",
+						retry.stderr ?? retryProbe.stderr ?? ownershipFailure.stderr,
+					),
+				);
+				return true;
+			}
+			const retryProfile = applyGjcTmuxProfile(buildProfileInputs());
+			const retryOwnershipFailure = retryProfile.failures.find(item => item.command.args.includes("@gjc-profile"));
+			if (retryOwnershipFailure) {
+				cleanupCreatedTmuxSession(plan, spawnSync, options);
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("profile tagging failed after retry", retryOwnershipFailure.stderr),
+				);
+				return true;
+			}
+			// Recovery succeeded via retry — fall through to attach-session below.
 		}
 	}
 	const probeWarning = detectCorruptedGjcWrapper();
@@ -668,33 +742,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return false;
 	}
-	// Verify the psmux server is still alive and the session is registered
-	// before we attach. On Windows, psmux 3.3.0/3.3.6 can race: new-session
-	// returns exit 0 but the psmux server dies before it finishes registering
-	// the session on its control socket. The follow-up attach-session then
-	// fails with "no server running". Re-run new-session once if has-session
-	// reports the session is missing, and capture the probe's stderr so the
-	// diagnostic message names the actual psmux rejection.
-	const probeOptions: TmuxSpawnOptions = {
-		...options,
-		stdin: "pipe",
-		stdout: "pipe",
-		stderr: "pipe",
-		captureStderr: true,
-	};
-	const hasSession = spawnSync(plan.tmuxCommand, ["has-session", "-t", `=${plan.sessionName}`], probeOptions);
-	if (hasSession.exitCode !== 0) {
-		const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
-		if (retry.exitCode !== 0) {
-			(context.diagnosticWriter ?? safeStderrWrite)(
-				formatTmuxLaunchDiagnostic(
-					"new-session retry failed after missing session",
-					retry.stderr ?? hasSession.stderr,
-				),
-			);
-			return true;
-		}
-	}
+	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	const attached = spawnSync(
 		plan.tmuxCommand,
