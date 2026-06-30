@@ -3583,6 +3583,31 @@
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
+		},
+		"claude-sonnet-5": {
+			"id": "claude-sonnet-5",
+			"name": "Anthropic Sonnet 5",
+			"api": "anthropic-messages",
+			"provider": "anthropic",
+			"baseUrl": "https://api.anthropic.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3,
+				"output": 15,
+				"cacheRead": 0.3,
+				"cacheWrite": 3.75
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		}
 	},
 	"azure-openai": {

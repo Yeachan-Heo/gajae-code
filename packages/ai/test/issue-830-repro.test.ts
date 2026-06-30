@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
+import { getBundledModel } from "../src/models";
 import { MODELS_DEV_PROVIDER_DESCRIPTORS } from "../src/provider-models/openai-compat";
 import { getEnvApiKey } from "../src/stream";
 import type { OpenAICompat } from "../src/types";
@@ -60,5 +61,21 @@ describe("deepseek built-in provider (issue #830)", () => {
 			high: "high",
 			xhigh: "max",
 		});
+	});
+});
+
+
+describe("Anthropic Sonnet 5 model catalog support", () => {
+	test("uses Sonnet 5 as the first-class Anthropic default while preserving older Sonnet entries", () => {
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "anthropic");
+		expect(descriptor).toBeDefined();
+		expect(descriptor?.defaultModel).toBe("claude-sonnet-5");
+		expect(DEFAULT_MODEL_PER_PROVIDER.anthropic).toBe("claude-sonnet-5");
+
+		const sonnet5 = getBundledModel("anthropic", "claude-sonnet-5");
+		const sonnet46 = getBundledModel("anthropic", "claude-sonnet-4-6");
+		expect(sonnet5?.api).toBe("anthropic-messages");
+		expect(sonnet5?.reasoning).toBe(true);
+		expect(sonnet46?.api).toBe("anthropic-messages");
 	});
 });

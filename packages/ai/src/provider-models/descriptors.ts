@@ -128,7 +128,7 @@ function catalogDescriptor(
  * OpenAI code provider) are handled separately because they require different config shapes.
  */
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
-	descriptor("anthropic", "claude-sonnet-4-6", config => anthropicModelManagerOptions(config)),
+	descriptor("anthropic", "claude-sonnet-5", config => anthropicModelManagerOptions(config)),
 	catalogDescriptor(
 		"alibaba-coding-plan",
 		"qwen3.5-plus",

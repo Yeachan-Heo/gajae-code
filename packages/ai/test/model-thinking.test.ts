@@ -107,10 +107,16 @@ describe("model thinking metadata", () => {
 			api: "anthropic-messages",
 			provider: "anthropic",
 		});
+		const sonnet5 = createModel({
+			id: "claude-sonnet-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
 
 		expect(opus45.thinking?.mode).toBe("anthropic-budget-effort");
 		expect(opus46.thinking?.mode).toBe("anthropic-adaptive");
 		expect(sonnet46.thinking?.mode).toBe("anthropic-adaptive");
+		expect(sonnet5.thinking?.mode).toBe("anthropic-adaptive");
 		expect(opus46.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
@@ -118,6 +124,11 @@ describe("model thinking metadata", () => {
 			levels: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		});
 		expect(sonnet46.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.High,
+		});
+		expect(sonnet5.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
 			maxLevel: Effort.High,
@@ -133,6 +144,7 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.High)).toBe("high");
 	});
 });
 

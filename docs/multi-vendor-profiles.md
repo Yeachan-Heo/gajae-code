@@ -76,7 +76,7 @@ Current axis leaders and the cheaper second option, with metered price ($/1M in/
 
 | Need | First pick | Cheaper option |
 | --- | --- | --- |
-| Router / tool-calling (`default`) | `anthropic/claude-opus-4-8` (5/25) | `anthropic/claude-sonnet-4-6` (3/15) |
+| Router / tool-calling (`default`) | `anthropic/claude-opus-4-8` (5/25) | `anthropic/claude-sonnet-5` (3/15) |
 | Coding (`executor`) | `anthropic/claude-opus-4-8` — SWE-bench Verified ~88.6 (5/25) | `openai-codex/gpt-5.4` (2.5/15) · `opencode-go/deepseek-v4-flash` (0.14/0.28) |
 | Reasoning (`planner`) | `openai-codex/gpt-5.5` (ARC-AGI-2) / `google-antigravity/gemini-3.1-pro-low:high` (GPQA) | `xai/grok-4-1-fast` (0.2/0.5) |
 | Large context (`architect`) | `anthropic/claude-opus-4-8` (effective long-context) | `xai/grok-4-fast` (2M nominal, 0.2/0.5) |

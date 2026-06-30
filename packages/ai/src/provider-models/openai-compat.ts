@@ -1720,7 +1720,7 @@ export interface GithubCopilotModelManagerConfig {
 }
 
 function inferCopilotApi(modelId: string): Api {
-	if (/^claude-(haiku|sonnet|opus)-4([.-]|$)/.test(modelId)) {
+	if (/^claude-(haiku|sonnet|opus)-(?:4|5)([.-]|$)/.test(modelId)) {
 		return "anthropic-messages";
 	}
 	if (modelId.startsWith("gpt-5") || modelId.startsWith("oswe")) {
@@ -2149,7 +2149,7 @@ const COPILOT_DEFAULT_RESOLUTION = {
 
 const COPILOT_API_RESOLUTION_RULES: readonly ApiResolutionRule[] = [
 	{
-		matches: modelId => /^claude-(haiku|sonnet|opus)-4([.-]|$)/.test(modelId),
+		matches: modelId => /^claude-(haiku|sonnet|opus)-(?:4|5)([.-]|$)/.test(modelId),
 		resolved: { api: "anthropic-messages", baseUrl: COPILOT_BASE_URL },
 	},
 	{

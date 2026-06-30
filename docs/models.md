@@ -195,7 +195,7 @@ profiles:
     required_providers: [openai, anthropic]
     model_mapping:
       default: openai/gpt-5.2
-      executor: anthropic/claude-sonnet-4-6:medium
+      executor: anthropic/claude-sonnet-5:medium
       architect: openai/o3:high
       planner: openai/o3:high
       critic: openai/o3:high
