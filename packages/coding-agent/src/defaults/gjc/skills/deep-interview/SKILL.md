@@ -51,6 +51,10 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
 - If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
 - Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
+- Treat user wording such as `implementation`, "implementation plan", Korean `구현`, or "구현 계획" as describing the eventual target, not permission to implement now.
+- While still in deep-interview, do not implement, edit/write code, launch implementation workers, or start task/skill/ultragoal implementation; continue interviewing for scope, risks, acceptance criteria, and unknowns.
+- When the user wants interview output for eventual implementation, say: "I can interview for an implementation plan, but I won't implement during deep-interview." Then continue clarifying scope, risks, acceptance criteria, and unknowns.
+- Implementation requires an explicit phase transition/approval after the interview: deep-interview must first produce its spec/handoff, the workflow phase must explicitly transition out of deep-interview, and execution approval must be captured by a downstream execution path.
 - Allow early exit with a clear warning if ambiguity is still high
 - Persist interview state for resume across session interruptions
 - A multi-persona lateral-review panel convenes at ambiguity-milestone transitions (and before synthesizing any agent-supplied answer) to expose blind spots from independent perspectives

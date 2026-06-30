@@ -78,3 +78,22 @@ describe("deep-interview self-proofread output rule", () => {
 		expect(skill).toContain("was silently self-proofread once according to");
 	});
 });
+
+describe("deep-interview implementation wording boundary", () => {
+	it("treats English and Korean implementation wording as eventual target wording, not execution approval", () => {
+		expect(skill).toContain('`implementation`, "implementation plan", Korean `구현`, or "구현 계획"');
+		expect(skill).toContain("describing the eventual target, not permission to implement now");
+		expect(skill).toContain("do not implement, edit/write code, launch implementation workers");
+		expect(skill).toContain("start task/skill/ultragoal implementation");
+	});
+
+	it("states the deep-interview implementation boundary and required phase transition", () => {
+		expect(skill).toContain(
+			"I can interview for an implementation plan, but I won't implement during deep-interview.",
+		);
+		expect(skill).toContain("continue clarifying scope, risks, acceptance criteria, and unknowns");
+		expect(skill).toContain("Implementation requires an explicit phase transition/approval after the interview");
+		expect(skill).toContain("workflow phase must explicitly transition out of deep-interview");
+		expect(skill).toContain("execution approval must be captured by a downstream execution path");
+	});
+});

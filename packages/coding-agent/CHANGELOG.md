@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Deep Interview now treats English `implementation` and Korean `구현` wording as eventual-target language, not permission to edit code or launch implementation before post-interview approval (#1320).
 - Compiled binaries can now include the hidden Telegram daemon CLI entrypoint without hanging root startup, and release builds preserve that entry so `gjc notify daemon-internal --smoke` is available in standalone binaries (#1288).
 - Documented Windows Terminal BEL limitations for terminal bell notifications and added a PowerShell `completion.notifyCommand` beep workaround example (#1318).
 
