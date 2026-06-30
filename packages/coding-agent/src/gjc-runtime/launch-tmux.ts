@@ -361,10 +361,32 @@ function buildGjcTmuxRootTerminalTitle(cwd: string, branch: string | null | unde
 	return buildGjcTmuxPrefixedTitle(GJC_TMUX_TERMINAL_TITLE_PREFIX, cwd, branch);
 }
 
-function setGjcTmuxRootTerminalTitle(title: string): void {
-	if (!process.stdout.isTTY) return;
-	const sanitized = title.replace(TERMINAL_TITLE_CONTROL_CHARS, "").trim() || "GJC";
-	process.stdout.write(`\x1b]0;${sanitized}\x07`);
+function sanitizeGjcTmuxRootTerminalTitle(title: string): string {
+	return title.replace(TERMINAL_TITLE_CONTROL_CHARS, "").trim() || "GJC";
+}
+
+function buildGjcTmuxRootTerminalTitleCommands(target: string, title: string): GjcTmuxProfileCommand[] {
+	const sanitized = sanitizeGjcTmuxRootTerminalTitle(title);
+	return [
+		{ description: "enable tmux client terminal title", args: ["set-option", "-t", target, "set-titles", "on"] },
+		{
+			description: "set tmux client terminal title",
+			args: ["set-option", "-t", target, "set-titles-string", sanitized],
+		},
+	];
+}
+
+function applyGjcTmuxRootTerminalTitleProfile(context: {
+	tmuxCommand: string;
+	target: string;
+	title: string | undefined;
+	spawnSync: TmuxSpawnSync;
+	options: TmuxSpawnOptions;
+}): void {
+	if (!context.title) return;
+	for (const command of buildGjcTmuxRootTerminalTitleCommands(context.target, context.title)) {
+		context.spawnSync(context.tmuxCommand, command.args, context.options);
+	}
 }
 
 function shouldSetGjcTmuxRootTerminalTitle(parsed: Args, env: NodeJS.ProcessEnv): boolean {
@@ -544,15 +566,19 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		: undefined;
 
 	if (plan.attachSessionName) {
+		applyGjcTmuxRootTerminalTitleProfile({
+			tmuxCommand: plan.tmuxCommand,
+			target: plan.attachSessionName,
+			title: rootTerminalTitle,
+			spawnSync,
+			options,
+		});
 		const attached = spawnSync(
 			plan.tmuxCommand,
 			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
 			options,
 		);
-		if (attached.exitCode === 0) {
-			if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
-			return true;
-		}
+		if (attached.exitCode === 0) return true;
 	}
 
 	const created = spawnSync(plan.tmuxCommand, plan.newSessionArgs, options);
@@ -585,6 +611,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			);
 			return true;
 		}
+		applyGjcTmuxRootTerminalTitleProfile({
+			tmuxCommand: plan.tmuxCommand,
+			target: plan.sessionName,
+			title: rootTerminalTitle,
+			spawnSync,
+			options,
+		});
 	}
 	if (created.exitCode !== 0) return false;
 	const attached = spawnSync(
@@ -592,10 +625,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
 		options,
 	);
-	if (attached.exitCode === 0) {
-		if (rootTerminalTitle) setGjcTmuxRootTerminalTitle(rootTerminalTitle);
-		return true;
-	}
+	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
 		return true;

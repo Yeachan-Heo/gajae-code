@@ -134,105 +134,101 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
-	it("sets the root terminal title after creating managed tmux", () => {
-		const events: string[] = [];
-		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
-		const previousIsTTY = stdout.isTTY;
-		const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
-			events.push(`title:${String(chunk)}`);
-			return true;
+	it("configures the tmux client terminal title before managed attach", () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
 		});
-		stdout.isTTY = true;
 
-		try {
-			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello world"], tmux: true }),
-				rawArgs: ["--tmux", "hello world"],
-				cwd: "/repo",
-				env: {},
-				argv: ["bun", "packages/coding-agent/src/cli.ts"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				existingBranchSessionName: null,
-				currentBranch: "feature/demo",
-				spawnSync: (_command, spawnArgs) => {
-					events.push(`spawn:${spawnArgs[0] ?? ""}`);
-					return { exitCode: 0 };
-				},
-			});
+		expect(handled).toBe(true);
+		const newSessionIndex = calls.findIndex(call => call.args[0] === "new-session");
+		const titleIndex = calls.findIndex(call => call.args[3] === "set-titles-string");
+		const attachIndex = calls.findIndex(call => call.args[0] === "attach-session");
 
-			expect(handled).toBe(true);
-			const newSessionIndex = events.indexOf("spawn:new-session");
-			const titleIndex = events.indexOf("title:\x1b]0;GJC: repo-feature/demo\x07");
-			const attachIndex = events.lastIndexOf("spawn:attach-session");
-
-			expect(newSessionIndex).toBeGreaterThanOrEqual(0);
-			expect(attachIndex).toBeGreaterThan(newSessionIndex);
-			expect(titleIndex).toBeGreaterThan(attachIndex);
-			expect(writeSpy).toHaveBeenCalledTimes(1);
-		} finally {
-			stdout.isTTY = previousIsTTY;
-		}
+		expect(newSessionIndex).toBeGreaterThanOrEqual(0);
+		expect(titleIndex).toBeGreaterThan(newSessionIndex);
+		expect(titleIndex).toBeLessThan(attachIndex);
+		expect(calls[titleIndex]?.args).toEqual([
+			"set-option",
+			"-t",
+			expect.stringMatching(/^gajae_code_/),
+			"set-titles-string",
+			"GJC: repo-feature/demo",
+		]);
+		expect(calls.some(call => call.args[3] === "set-titles" && call.args[4] === "on")).toBe(true);
+		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
 	it("honors title opt-out while launching managed tmux", () => {
-		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
-		const previousIsTTY = stdout.isTTY;
+		const calls: Array<{ command: string; args: string[] }> = [];
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		stdout.isTTY = true;
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true, noTitle: true }),
+			rawArgs: ["--tmux", "--no-title", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
+		});
 
-		try {
-			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello world"], tmux: true, noTitle: true }),
-				rawArgs: ["--tmux", "--no-title", "hello world"],
-				cwd: "/repo",
-				env: {},
-				argv: ["bun", "packages/coding-agent/src/cli.ts"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				existingBranchSessionName: null,
-				currentBranch: "feature/demo",
-				spawnSync: () => ({ exitCode: 0 }),
-			});
-
-			expect(handled).toBe(true);
-			expect(writeSpy).not.toHaveBeenCalled();
-		} finally {
-			stdout.isTTY = previousIsTTY;
-		}
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args.includes("set-titles") || call.args.includes("set-titles-string"))).toBe(
+			false,
+		);
+		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
 	it("honors PI_NO_TITLE while launching managed tmux", () => {
-		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
-		const previousIsTTY = stdout.isTTY;
+		const calls: Array<{ command: string; args: string[] }> = [];
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		stdout.isTTY = true;
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { PI_NO_TITLE: "1" },
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
+		});
 
-		try {
-			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello world"], tmux: true }),
-				rawArgs: ["--tmux", "hello world"],
-				cwd: "/repo",
-				env: { PI_NO_TITLE: "1" },
-				argv: ["bun", "packages/coding-agent/src/cli.ts"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				existingBranchSessionName: null,
-				currentBranch: "feature/demo",
-				spawnSync: () => ({ exitCode: 0 }),
-			});
-
-			expect(handled).toBe(true);
-			expect(writeSpy).not.toHaveBeenCalled();
-		} finally {
-			stdout.isTTY = previousIsTTY;
-		}
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args.includes("set-titles") || call.args.includes("set-titles-string"))).toBe(
+			false,
+		);
+		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
 	it("passes prefixed tmux window titles after the tmux option separator", () => {
@@ -520,7 +516,11 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(true);
-		expect(calls[0]?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
+		expect(calls.find(call => call.args[0] === "attach-session")?.args).toEqual([
+			"attach-session",
+			"-t",
+			"=gajae_code_feature",
+		]);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
 		expect(calls.some(call => call.args[0] === "attach-session" && call.args[2] !== "=gajae_code_feature")).toBe(
 			true,
