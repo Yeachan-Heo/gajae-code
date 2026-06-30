@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added an optional Tavily web search provider selectable through `providers.webSearch`, using `TAVILY_API_KEY` only when Tavily is selected (#1323).
+
 ### Fixed
 
 - Deep Interview now treats English `implementation` and Korean `구현` wording as eventual-target language, not permission to edit code or launch implementation before post-interview approval (#1320).

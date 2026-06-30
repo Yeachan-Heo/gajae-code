@@ -172,6 +172,10 @@ describe("red-team provider chain resolution", () => {
 		).resolves.toEqual(["anthropic", "tavily", "duckduckgo"]);
 	});
 
+	it("falls back to DuckDuckGo when Tavily is selected without credentials", async () => {
+		await expect(chainIds(undefined, { preferred: "tavily" })).resolves.toEqual(["duckduckgo"]);
+	});
+
 	it("does not inject openai-compatible in a generic no-credential context", async () => {
 		await expect(
 			chainIds({ ...hostedOpenAI, provider: "no-key" }, { auth: ["openai-codex"] }),

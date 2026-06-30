@@ -41,6 +41,8 @@ describe("web search config schema", () => {
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "xai", label: "xAI" }));
 		expect(webSearch.values).toContain("insane");
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "insane", label: "Insane" }));
+		expect(webSearch.values).toContain("tavily");
+		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "tavily", label: "Tavily" }));
 	});
 
 	it("defines web.insaneFallback as a boolean defaulting to false", () => {
