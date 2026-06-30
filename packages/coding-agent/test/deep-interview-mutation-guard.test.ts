@@ -8,6 +8,7 @@ import {
 	modeStatePath,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	assertDeepInterviewMutationRawPathsAllowed,
 	DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
@@ -86,6 +87,11 @@ function tool(name: string, extra: Record<string, unknown> = {}): AgentTool {
 		execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
 		...extra,
 	} as AgentTool;
+}
+
+function parseStateCommandJson(stdout: string | undefined): Record<string, unknown> {
+	if (!stdout) throw new Error("missing state command stdout");
+	return JSON.parse(stdout) as Record<string, unknown>;
 }
 
 afterEach(async () => {
@@ -322,6 +328,40 @@ describe("deep-interview mutation guard", () => {
 			args: { path: "src/product.ts", content: "x" },
 		});
 		expect(decision.blocked).toBe(false);
+	});
+
+	it("allows direct work after the deep-interview suitability gate clears seeded state", async () => {
+		const cwd = await makeTempRoot();
+		const sessionId = "session-a";
+		await writeActiveDeepInterview(cwd, sessionId);
+
+		const beforeClear = await getDeepInterviewMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("write"),
+			args: { path: "src/product.ts", content: "x" },
+		});
+		expect(beforeClear.blocked).toBe(true);
+
+		const clear = await runNativeStateCommand(
+			["clear", "--mode", "deep-interview", "--session-id", sessionId, "--force", "--json"],
+			cwd,
+		);
+		expect(clear.status).toBe(0);
+		expect(parseStateCommandJson(clear.stdout)).toMatchObject({
+			ok: true,
+			skill: "deep-interview",
+			active: false,
+			current_phase: "complete",
+		});
+
+		const afterClear = await getDeepInterviewMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("write"),
+			args: { path: "src/product.ts", content: "x" },
+		});
+		expect(afterClear.blocked).toBe(false);
 	});
 
 	it("allows writes and logs when deep-interview mode state is invalid", async () => {
