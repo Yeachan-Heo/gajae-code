@@ -7,6 +7,7 @@ import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import { GJC_COORDINATOR_SESSION_ID_ENV, GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "./session-state-sidecar";
 import {
+	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
@@ -36,6 +37,7 @@ export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 type LaunchPolicy = "direct" | "tmux";
 
@@ -386,6 +388,8 @@ function truncateVisibleTail(value: string, maxWidth: number): string {
 }
 
 const GJC_TMUX_WINDOW_BRANCH_SEPARATOR = "-";
+const GJC_TMUX_WINDOW_TITLE_PREFIX = "GJC-";
+const GJC_TMUX_TERMINAL_TITLE_PREFIX = "GJC: ";
 
 function sanitizeTmuxWindowTitleSegment(value: string): string {
 	return value.replace(/:+/g, "-");
@@ -398,20 +402,68 @@ function sanitizeTmuxWindowProjectName(project: string): string {
 	return sanitizeTmuxWindowTitleSegment(trimmed);
 }
 
-export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
+function buildGjcTmuxPrefixedTitle(prefix: string, cwd: string, branch: string | null | undefined): string {
 	const project = sanitizeTmuxWindowProjectName(path.basename(path.resolve(cwd)) || "gjc");
+	const projectTitle = `${prefix}${project}`;
 	const trimmedBranch = sanitizeTmuxWindowTitleSegment(branch?.trim() ?? "");
-	if (!trimmedBranch) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+	if (!trimmedBranch) return truncateVisible(projectTitle, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
 	const separatorWidth = visibleWidth(GJC_TMUX_WINDOW_BRANCH_SEPARATOR);
-	const projectWidth = visibleWidth(project);
-	const fullTitle = `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${trimmedBranch}`;
+	const projectWidth = visibleWidth(projectTitle);
+	const fullTitle = `${projectTitle}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${trimmedBranch}`;
 	if (visibleWidth(fullTitle) <= GJC_TMUX_WINDOW_LABEL_MAX_WIDTH) return fullTitle;
 
 	const remainingBranchWidth = GJC_TMUX_WINDOW_LABEL_MAX_WIDTH - projectWidth - separatorWidth;
-	if (remainingBranchWidth <= 0) return truncateVisible(project, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
+	if (remainingBranchWidth <= 0) return truncateVisible(projectTitle, GJC_TMUX_WINDOW_LABEL_MAX_WIDTH);
 
-	return `${project}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
+	return `${projectTitle}${GJC_TMUX_WINDOW_BRANCH_SEPARATOR}${truncateVisibleTail(trimmedBranch, remainingBranchWidth)}`;
+}
+
+export function buildGjcTmuxWindowTitle(cwd: string, branch: string | null | undefined): string {
+	return buildGjcTmuxPrefixedTitle(GJC_TMUX_WINDOW_TITLE_PREFIX, cwd, branch);
+}
+
+function buildGjcTmuxRootTerminalTitle(cwd: string, branch: string | null | undefined): string {
+	return buildGjcTmuxPrefixedTitle(GJC_TMUX_TERMINAL_TITLE_PREFIX, cwd, branch);
+}
+
+function sanitizeGjcTmuxRootTerminalTitle(title: string): string {
+	return title.replace(TERMINAL_TITLE_CONTROL_CHARS, "").trim() || "GJC";
+}
+
+function escapeTmuxFormatLiteral(value: string): string {
+	return value.replace(/#/g, "##");
+}
+
+function buildGjcTmuxRootTerminalTitleCommands(target: string, title: string): GjcTmuxProfileCommand[] {
+	const sanitized = escapeTmuxFormatLiteral(sanitizeGjcTmuxRootTerminalTitle(title));
+	return [
+		{ description: "enable tmux client terminal title", args: ["set-option", "-t", target, "set-titles", "on"] },
+		{
+			description: "set tmux client terminal title",
+			args: ["set-option", "-t", target, "set-titles-string", sanitized],
+		},
+	];
+}
+
+function applyGjcTmuxRootTerminalTitleProfile(context: {
+	tmuxCommand: string;
+	target: string;
+	title: string | undefined;
+	spawnSync: TmuxSpawnSync;
+	options: TmuxSpawnOptions;
+}): void {
+	if (!context.title) return;
+	for (const command of buildGjcTmuxRootTerminalTitleCommands(
+		buildGjcTmuxExactOptionTarget(context.target, { env: context.options.env }),
+		context.title,
+	)) {
+		context.spawnSync(context.tmuxCommand, command.args, context.options);
+	}
+}
+
+function shouldSetGjcTmuxRootTerminalTitle(parsed: Args, env: NodeJS.ProcessEnv): boolean {
+	return !parsed.noTitle && !env.PI_NO_TITLE;
 }
 
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {
@@ -626,7 +678,19 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		captureStderr: true,
 	};
 
+	const windowTitle = buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch);
+	const rootTerminalTitle = shouldSetGjcTmuxRootTerminalTitle(context.parsed, env)
+		? buildGjcTmuxRootTerminalTitle(plan.project ?? plan.cwd, plan.branch)
+		: undefined;
+
 	if (plan.attachSessionName) {
+		applyGjcTmuxRootTerminalTitleProfile({
+			tmuxCommand: plan.tmuxCommand,
+			target: plan.attachSessionName,
+			title: rootTerminalTitle,
+			spawnSync,
+			options,
+		});
 		const attached = spawnSync(
 			plan.tmuxCommand,
 			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.attachSessionName, { env })],
@@ -678,7 +742,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 		renameTmuxWindow(
 			plan.tmuxCommand,
-			buildGjcTmuxWindowTitle(plan.project ?? plan.cwd, plan.branch),
+			windowTitle,
 			spawnSync,
 			controlOptions,
 			buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
@@ -727,6 +791,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
 		}
+		applyGjcTmuxRootTerminalTitleProfile({
+			tmuxCommand: plan.tmuxCommand,
+			target: plan.sessionName,
+			title: rootTerminalTitle,
+			spawnSync,
+			options,
+		});
 	}
 	const probeWarning = detectCorruptedGjcWrapper();
 	if (created.exitCode !== 0) {
@@ -742,7 +813,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
 		return false;
 	}
-	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 	const attached = spawnSync(
 		plan.tmuxCommand,

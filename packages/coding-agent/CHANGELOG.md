@@ -22,6 +22,7 @@
 - Submitted user prompts now use the live terminal viewport width in wide Windows Terminal/PowerShell sessions, keeping Korean/CJK prompt wrapping responsive without changing narrow layouts (#1239).
 - Coordinator MCP now fails tmux-delivered turns that never receive a runtime prompt acknowledgement/`turn_start`, surfacing an explicit unacknowledged delivery reason instead of leaving Hermes/Oren waiting on a normal active/running state (#1237).
 - Telegram now advertises `/session_create`, `/session_recent`, `/session_close`, and `/session_resume` in the bot command menu so lifecycle control commands are discoverable from `/` autocomplete.
+- `gjc --tmux` now prefixes the root terminal title (`GJC: tmp`) and managed tmux window names (`GJC-tmp`) with a GJC workspace label so terminal multiplexers and workspace switchers do not fall back to noisy launch paths.
 
 ## [0.7.7] - 2026-06-28
 ### Added
