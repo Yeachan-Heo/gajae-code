@@ -69,6 +69,22 @@ gjc --mode acp
 # equivalent ACP subcommand for ACP clients that prefer command-style launch
 gjc acp
 ```
+For Zed custom-agent setup, add a custom `agent_servers` entry that launches the same stdio server explicitly:
+
+```json
+{
+  "agent_servers": {
+    "gjc": {
+      "type": "custom",
+      "command": "gjc",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Zed owns the ACP client connection and may forward editor-owned MCP servers over ACP; GJC keeps this isolated from standalone `.mcp.json` discovery and only starts ACP behavior through the explicit entrypoint.
 
 Primary references:
 

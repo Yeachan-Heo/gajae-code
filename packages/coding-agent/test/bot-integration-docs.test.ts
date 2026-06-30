@@ -92,6 +92,7 @@ describe("external controller integration docs", () => {
 
 	it("classifies external control surface readiness against code and smoke coverage", async () => {
 		const readiness = await readRepoFile("docs", "external-control-readiness.md");
+		const cli = await readRepoFile("packages", "coding-agent", "src", "cli.ts");
 		const cliArgs = await readRepoFile("packages", "coding-agent", "src", "cli", "args.ts");
 		const acpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "acp.ts");
 		const mcpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "mcp-serve.ts");
@@ -116,6 +117,9 @@ describe("external controller integration docs", () => {
 		]) {
 			expect(readiness).toContain(command);
 		}
+		expect(readiness).toContain('"agent_servers"');
+		expect(readiness).toContain('"command": "gjc"');
+		expect(readiness).toContain('"args": ["acp"]');
 
 		for (const smoke of [
 			"packages/coding-agent/test/coordinator-mcp.test.ts",
@@ -131,6 +135,7 @@ describe("external controller integration docs", () => {
 		}
 
 		expect(cliArgs).toContain('export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge"');
+		expect(cli).toContain('{ name: "acp", load: () => import("./commands/acp").then(m => m.default) }');
 		expect(acpCommand).toContain("Run Gajae Code as an ACP (Agent Client Protocol) server over stdio");
 		expect(mcpCommand).toContain('server !== "coordinator" && server !== "hermes"');
 		expect(bridgeMode).toContain("const FAIL_CLOSED_BRIDGE_ENDPOINTS");

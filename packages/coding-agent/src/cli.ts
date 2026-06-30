@@ -26,6 +26,7 @@ export const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
 	{ name: "state", load: () => import("./commands/state").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
+	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
