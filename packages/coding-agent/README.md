@@ -24,6 +24,12 @@ For simple local side effects that do not need a full extension, set the user-le
 gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_TITLE" --body "$GJC_NOTIFICATION_BODY"'
 ```
 
+Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
+
+```powershell
+gjc config set completion.notifyCommand 'powershell.exe -NoProfile -Command "[Console]::Beep(880, 300)"'
+```
+
 `cmux notify` returning successfully means GJC handed the completion event to cmux. cmux may still suppress the native desktop banner when the app/window is focused, the emitting workspace is active, or the notification panel is open. In those cases, check cmux's notification panel or unread workspace state instead of treating the missing banner as a GJC delivery failure.
 
 Recommended external mapping:
