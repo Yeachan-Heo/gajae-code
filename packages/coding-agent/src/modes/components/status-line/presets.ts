@@ -12,6 +12,17 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 		},
 	},
 
+	"default-usage": {
+		leftSegments: ["model", "mode", "git", "pr", "path"],
+		rightSegments: ["session_name", "jobs", "token_rate", "usage", "context_pct", "cost"],
+		separator: "slash",
+		segmentOptions: {
+			model: { showThinkingLevel: true },
+			path: { abbreviate: true, maxLength: 32, stripWorkPrefix: true },
+			git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: true },
+		},
+	},
+
 	minimal: {
 		leftSegments: ["path", "git"],
 		rightSegments: ["session_name", "jobs", "mode", "context_pct"],

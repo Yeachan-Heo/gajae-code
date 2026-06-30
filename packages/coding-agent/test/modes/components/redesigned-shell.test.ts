@@ -299,6 +299,19 @@ describe("redesigned interactive shell chrome", () => {
 		expect(STATUS_LINE_PRESETS.default.segmentOptions?.path?.maxLength).toBe(32);
 	});
 
+	it("adds a default plus usage status preset without changing default", () => {
+		expect(STATUS_LINE_PRESETS["default-usage"].leftSegments).toEqual(STATUS_LINE_PRESETS.default.leftSegments);
+		expect(STATUS_LINE_PRESETS["default-usage"].rightSegments).toEqual([
+			"session_name",
+			"jobs",
+			"token_rate",
+			"usage",
+			"context_pct",
+			"cost",
+		]);
+		expect(STATUS_LINE_PRESETS["default-usage"].segmentOptions).toEqual(STATUS_LINE_PRESETS.default.segmentOptions);
+	});
+
 	it("keeps forge launch rendering on the bounded-work path", () => {
 		const component = new WelcomeComponent("1.2.3", "gpt-5.5", "openai", [
 			{ name: "very-long-session-name".repeat(10), timeAgo: "2h" },

@@ -75,6 +75,41 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		expect(presetMenu).toContain("Status Line Preset");
 		expect(presetMenu).not.toContain("Custom");
 	});
+	it("shows usage mode on the appearance tab and persists it", () => {
+		settings.set("statusLine.preset", "default");
+		settings.set("statusLine.segmentOptions", {});
+		const { component, changedSettings, previews } = createSelector();
+
+		for (let i = 0; i < 40; i++) {
+			const rendered = Bun.stripANSI(component.render(120).join("\n"));
+			if (rendered.includes("❯ Status Line Usage Mode")) break;
+			component.handleInput("\x1b[B");
+		}
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Status Line Usage Mode");
+		component.handleInput("\n");
+
+		expect(settings.get("statusLine.segmentOptions")).toMatchObject({ usage: { mode: "remaining" } });
+		expect(changedSettings.at(-1)).toMatchObject({
+			path: "statusLine.segmentOptions",
+			value: { usage: { mode: "remaining" } },
+		});
+		expect(previews.at(-1)?.segmentOptions).toMatchObject({ usage: { mode: "remaining" } });
+	});
+	it("shows usage mode even when usage is hidden", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model"]);
+		settings.set("statusLine.rightSegments", ["context_pct"]);
+		const { component } = createSelector();
+
+		for (let i = 0; i < 40; i++) {
+			const rendered = Bun.stripANSI(component.render(120).join("\n"));
+			if (rendered.includes("❯ Status Line Usage Mode")) break;
+			component.handleInput("\x1b[B");
+		}
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("❯ Status Line Usage Mode");
+	});
 	it("seeds custom layout from the active preset, previews segment options, and saves to settings", () => {
 		settings.set("statusLine.preset", "minimal");
 		settings.set("statusLine.leftSegments", []);

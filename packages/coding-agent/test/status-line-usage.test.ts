@@ -17,7 +17,9 @@ function makeSession(fetchUsageReports: () => Promise<unknown>): AgentSession {
 		agent: { state: { tools: [] } },
 		skills: [],
 		model: { id: "openai-codex/gpt-5", contextWindow: 200_000 },
+		modelRegistry: { isUsingOAuth: () => false },
 		isStreaming: false,
+		isFastModeActive: () => false,
 		fetchUsageReports,
 		sessionManager: {
 			getUsageStatistics: () => usageStats,
@@ -123,6 +125,69 @@ describe("status line usage segment", () => {
 		expect(text).toContain("5h 76% (3h)");
 		expect(text).toContain("7d 49% (2d 1h)");
 		expect(text).not.toContain("24%");
+		component.dispose();
+	});
+
+	it("renders remaining quota in the default usage preset", async () => {
+		const now = Date.now();
+		const session = makeSession(async () => [
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				limits: [
+					{
+						id: "openai-codex:primary",
+						scope: { provider: "openai-codex", windowId: "5h", tier: "pro" },
+						window: { id: "5h", resetsAt: now + 180 * 60_000 },
+						amount: { usedFraction: 0.24, unit: "percent" },
+					},
+				],
+			},
+		]);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({
+			preset: "default-usage",
+			segmentOptions: { usage: { mode: "remaining" } },
+			showSkillHud: false,
+		});
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("5h 76% (3h)");
+		component.dispose();
+	});
+
+	it("does not render usage mode when the usage segment is hidden", async () => {
+		const now = Date.now();
+		const session = makeSession(async () => [
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				limits: [
+					{
+						id: "openai-codex:primary",
+						scope: { provider: "openai-codex", windowId: "5h", tier: "pro" },
+						window: { id: "5h", resetsAt: now + 180 * 60_000 },
+						amount: { usedFraction: 0.24, unit: "percent" },
+					},
+				],
+			},
+		]);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["context_pct"],
+			segmentOptions: { usage: { mode: "remaining" } },
+			showSkillHud: false,
+		});
+
+		component.getTopBorder(120);
+		await Bun.sleep(10);
+		const text = stripAnsi(component.getTopBorder(120).content);
+
+		expect(text).not.toContain("5h");
+		expect(text).not.toContain("76%");
 		component.dispose();
 	});
 

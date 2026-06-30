@@ -454,7 +454,7 @@ export const SETTINGS_SCHEMA = {
 	// Status line
 	"statusLine.preset": {
 		type: "enum",
-		values: ["default", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
+		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
 		default: "default",
 		ui: {
 			tab: "appearance",
@@ -462,6 +462,11 @@ export const SETTINGS_SCHEMA = {
 			description: "Pre-built status line configurations",
 			options: [
 				{ value: "default", label: "Default", description: "Model, path, git, context, tokens, cost" },
+				{
+					value: "default-usage",
+					label: "Default + Usage",
+					description: "Default layout with provider usage quota",
+				},
 				{ value: "minimal", label: "Minimal", description: "Path and git only" },
 				{ value: "compact", label: "Compact", description: "Model, git, cost, context" },
 				{ value: "full", label: "Full", description: "All segments including time" },
