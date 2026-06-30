@@ -67,7 +67,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["anthropic"],
 		mapping: {
 			default: "anthropic/claude-opus-4-8:xhigh",
-			executor: "anthropic/claude-sonnet-4-6",
+			executor: "anthropic/claude-sonnet-5",
 			planner: "anthropic/claude-opus-4-8:low",
 			critic: "anthropic/claude-opus-4-8:high",
 			architect: "anthropic/claude-opus-4-8:xhigh",
