@@ -20,6 +20,7 @@ describe("GJC public CLI command surface", () => {
 			"codex-native-hook",
 			"state",
 			"setup",
+			"acp",
 			"skills",
 			"session",
 			"harness",
