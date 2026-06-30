@@ -1000,13 +1000,20 @@ export class SettingsSelectorComponent extends Container {
 	#buildItemsForTab(defs: SettingDef[], tabId: SettingTab): SettingItem[] {
 		const items = this.#buildItemsForDefs(defs);
 		if (tabId === "appearance") {
+			const customEditorCallbacks: SettingsCallbacks = {
+				...this.callbacks,
+				onStatusLinePreview: previewSettings => {
+					this.callbacks.onStatusLinePreview?.(previewSettings);
+					this.#updateStatusPreview();
+				},
+			};
 			const customEditorItem: SettingItem = {
 				id: STATUS_LINE_CUSTOM_EDITOR_ID,
 				label: "Status Line Custom Editor",
 				description:
 					"Edit custom status line segments, placement, separator, and typed segment options with live previews.",
 				currentValue: "open",
-				submenu: (_currentValue, done) => new StatusLineCustomEditor(this.callbacks, done),
+				submenu: (_currentValue, done) => new StatusLineCustomEditor(customEditorCallbacks, done),
 			};
 			const presetIndex = items.findIndex(item => item.id === "statusLine.preset");
 			if (presetIndex >= 0) {

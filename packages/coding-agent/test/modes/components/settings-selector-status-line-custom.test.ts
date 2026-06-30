@@ -16,6 +16,11 @@ interface ChangedSetting {
 	value: unknown;
 }
 
+interface SelectorOptions {
+	getStatusLinePreview?: (width?: number) => string;
+	onStatusLinePreview?: (preview: StatusLinePreviewSettings) => void;
+}
+
 beforeAll(async () => {
 	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
 });
@@ -26,7 +31,7 @@ beforeEach(async () => {
 	vi.restoreAllMocks();
 });
 
-function createSelector() {
+function createSelector(options: SelectorOptions = {}) {
 	const previews: StatusLinePreviewSettings[] = [];
 	const changedSettings: ChangedSetting[] = [];
 	const previewWidths: Array<number | undefined> = [];
@@ -39,10 +44,13 @@ function createSelector() {
 		},
 		{
 			onChange: (path, value) => changedSettings.push({ path, value }),
-			onStatusLinePreview: preview => previews.push(preview),
+			onStatusLinePreview: preview => {
+				previews.push(preview);
+				options.onStatusLinePreview?.(preview);
+			},
 			getStatusLinePreview: width => {
 				previewWidths.push(width);
-				return `preview-${width ?? "current"}`;
+				return options.getStatusLinePreview?.(width) ?? `preview-${width ?? "current"}`;
 			},
 			onCancel: () => {},
 		},
@@ -109,6 +117,30 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 				"statusLine.segmentOptions",
 			]),
 		);
+	});
+	it("refreshes the parent preview while editing and cancelling custom rows", () => {
+		settings.set("statusLine.preset", "minimal");
+		let renderedPreview = "initial-preview";
+		const { component } = createSelector({
+			onStatusLinePreview: preview => {
+				renderedPreview = `preset:${preview.preset ?? "same"} left:${preview.leftSegments?.join(",") ?? "same"} highlight:${preview.previewHighlightSegment ?? "none"}`;
+			},
+			getStatusLinePreview: () => renderedPreview,
+		});
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("initial-preview");
+
+		openCustomEditor(component);
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("preset:custom");
+
+		for (let i = 0; i < 3; i++) component.handleInput("\x1b[B"); // Segment: gajae.
+		component.handleInput("\n"); // hidden -> left.
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("left:path,git,gajae");
+
+		component.handleInput("\x1b"); // Cancel restores the parent preview too.
+		const restored = Bun.stripANSI(component.render(120).join("\n"));
+		expect(restored).toContain("preset:minimal");
+		expect(restored).not.toContain("left:path,git,gajae");
 	});
 	it("keeps the description area height stable while navigating custom rows", () => {
 		settings.set("statusLine.preset", "minimal");
