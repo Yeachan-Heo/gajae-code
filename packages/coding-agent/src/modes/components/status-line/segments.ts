@@ -480,7 +480,12 @@ const sessionNameSegment: StatusLineSegment = {
 	},
 };
 
-function pickUsageColor(percent: number): "muted" | "warning" | "error" {
+function pickUsageColor(percent: number, mode: "used" | "remaining"): "muted" | "warning" | "error" {
+	if (mode === "remaining") {
+		if (percent <= 20) return "error";
+		if (percent <= 50) return "warning";
+		return "muted";
+	}
 	if (percent >= 80) return "error";
 	if (percent >= 50) return "warning";
 	return "muted";
@@ -508,8 +513,11 @@ const usageSegment: StatusLineSegment = {
 		if (!u || u.windows.length === 0) {
 			return { content: "", visible: false };
 		}
+		const mode = ctx.options.usage?.mode === "remaining" ? "remaining" : "used";
 		const parts = u.windows.map(window => {
-			const pctText = theme.fg(pickUsageColor(window.percent), `${Math.round(window.percent)}%`);
+			const displayPercent =
+				mode === "remaining" ? Math.max(0, Math.min(100, 100 - window.percent)) : window.percent;
+			const pctText = theme.fg(pickUsageColor(displayPercent, mode), `${Math.round(displayPercent)}%`);
 			const reset =
 				window.resetValue !== undefined && window.resetUnit !== undefined
 					? theme.fg("muted", ` (${formatUsageReset(window.resetValue, window.resetUnit)})`)

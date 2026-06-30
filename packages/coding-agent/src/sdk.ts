@@ -2007,7 +2007,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			.map(name => toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool !== undefined)
 			// AgentSession tool wrapping is not installed until after Agent construction.
-			.map(tool => guardToolForUltragoalAsk(tool, () => sessionManager.getCwd()));
+			.map(tool =>
+				guardToolForUltragoalAsk(
+					tool,
+					() => sessionManager.getCwd(),
+					() => ({
+						activeSkillState: session?.getActiveSkillState(),
+						sessionId: sessionManager.getSessionId?.() ?? null,
+					}),
+				),
+			);
 
 		const openaiWebsocketSetting = settings.get("providers.openaiWebsockets") ?? "off";
 		const preferOpenAICodexWebsockets =
