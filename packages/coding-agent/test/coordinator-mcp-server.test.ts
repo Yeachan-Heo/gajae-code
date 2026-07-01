@@ -134,7 +134,7 @@ describe("Coordinator MCP server protocol", () => {
 		).toEqual({ ok: false, reason: "invalid_tmux_session" });
 	});
 
-	it("registers a visible tmux session and sends prompts to the same authoritative target", async () => {
+	it("registers a visible tmux session and submits prompts with Enter-compatible tmux C-m", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "visible-register");
 		const commands: string[][] = [];
@@ -198,9 +198,14 @@ describe("Coordinator MCP server protocol", () => {
 		expect(commands).toEqual(
 			expect.arrayContaining([
 				["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "do work"],
-				["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"],
+				["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"],
 			]),
 		);
+		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"]);
+		expect(commands.slice(-2)).toEqual([
+			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "do work"],
+			["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"],
+		]);
 	});
 
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {
@@ -308,7 +313,7 @@ describe("Coordinator MCP server protocol", () => {
 		});
 	});
 
-	it("submits tmux-delivered prompts with the runtime submit chord instead of plain Enter", async () => {
+	it("submits tmux-delivered prompts with Enter-compatible tmux C-m after literal typing", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "submit-chord-delivery");
 		const sendKeyCommands: string[][] = [];
@@ -350,7 +355,15 @@ describe("Coordinator MCP server protocol", () => {
 
 		expect(sendKeyCommands).toEqual([
 			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "line one\nline two"],
-			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"],
+			["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"],
+		]);
+		expect(sendKeyCommands).not.toContainEqual([
+			"tmux",
+			"send-keys",
+			"-t",
+			"visible-session:0.0",
+			"-l",
+			"\x1b[13;5u",
 		]);
 	});
 
@@ -574,7 +587,7 @@ describe("Coordinator MCP server protocol", () => {
 		expect(activeTurnExistedAtSend).toBe(true);
 		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
 			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "-l", "hello"],
-			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "-l", "\x1b[13;5u"],
+			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "C-m"],
 		]);
 	});
 
