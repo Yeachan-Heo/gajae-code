@@ -59,6 +59,10 @@ deep-interview -> ralplan -> ultragoal
                          └─ optional team execution when parallel tmux workers help
 ```
 
+<p align="center">
+  <img src="assets/character.png" alt="Gajae-Code mascot guiding the deep-interview to ralplan to ultragoal workflow loop" width="240" />
+</p>
+
 It is intentionally not a hidden plugin for Codex CLI, Claude Code, OpenCode, or Claw Code. Start `gjc` beside those tools when you want structured planning, persistent evidence, tmux-backed workers, or an isolated worktree.
 
 ## Install
