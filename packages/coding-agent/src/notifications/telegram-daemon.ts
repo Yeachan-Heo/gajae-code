@@ -11,7 +11,7 @@ import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
-import { buildCompactChoiceGrid, TELEGRAM_PARSE_MODE } from "./html-format";
+import { buildCompactChoiceGrid, chunkTelegramHtml, code, TELEGRAM_PARSE_MODE } from "./html-format";
 import type {
 	SessionCloseTarget,
 	SessionCreateTarget,
@@ -1053,14 +1053,18 @@ export class TelegramNotificationDaemon {
 		threadId: number | undefined,
 	): Promise<boolean> {
 		if (!isLifecycleCommandText(text)) return false;
-		const reply = (body: string) =>
-			this.botApi
-				.call("sendMessage", {
-					chat_id: this.opts.chatId,
-					...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-					text: body,
-				})
-				.catch(() => undefined);
+		const reply = async (body: string, parseMode?: string) => {
+			for (const chunk of chunkTelegramHtml(body)) {
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+						text: chunk,
+						...(parseMode ? { parse_mode: parseMode } : {}),
+					})
+					.catch(() => undefined);
+			}
+		};
 
 		if (!this.lifecycleControlActive) {
 			await reply("Session lifecycle control is not available right now.");
@@ -1083,7 +1087,7 @@ export class TelegramNotificationDaemon {
 			const lines = recent.length
 				? recent.map(e => `\u2022 ${e.sessionId}${e.path ? ` (${e.path})` : ""}`).join("\n")
 				: "No recent sessions.";
-			await reply(lines);
+			await reply(code(lines), TELEGRAM_PARSE_MODE);
 			return true;
 		}
 
@@ -1612,12 +1616,14 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.text) {
-					await this.botApi.call("sendMessage", {
-						chat_id: this.opts.chatId,
-						...threadField,
-						text: send.text,
-						parse_mode: TELEGRAM_PARSE_MODE,
-					});
+					for (const chunk of chunkTelegramHtml(send.text)) {
+						await this.botApi.call("sendMessage", {
+							chat_id: this.opts.chatId,
+							...threadField,
+							text: chunk,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						});
+					}
 				}
 			} catch {
 				// Best-effort: a failed send must never stop the daemon.

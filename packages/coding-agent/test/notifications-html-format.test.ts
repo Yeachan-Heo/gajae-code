@@ -6,6 +6,7 @@ import {
 	buildCompactChoiceGrid,
 	buttonLabel,
 	choiceButtonLabel,
+	chunkTelegramHtml,
 	code,
 	escapeHtml,
 	markdownToTelegramHtml,
@@ -100,6 +101,45 @@ describe("truncateTelegramHtml (AC7)", () => {
 		expect(out.length).toBeLessThanOrEqual(18);
 		expect(out).not.toMatch(/&amp$/);
 		expect(out).not.toMatch(/&$/);
+	});
+});
+
+describe("chunkTelegramHtml", () => {
+	test("short messages return a single chunk unchanged", () => {
+		expect(chunkTelegramHtml("hello")).toEqual(["hello"]);
+	});
+
+	test("long plain text splits into ordered chunks each within the limit", () => {
+		const chunks = chunkTelegramHtml("a".repeat(10_000));
+		expect(chunks.length).toBeGreaterThan(1);
+		for (const chunk of chunks) {
+			expect(chunk.length).toBeLessThanOrEqual(TELEGRAM_MESSAGE_LIMIT);
+		}
+		expect(chunks.join("")).toBe("a".repeat(10_000));
+	});
+
+	test("closes and reopens an open tag across a boundary", () => {
+		const msg = `<code>${"x".repeat(30)}</code>`;
+		const chunks = chunkTelegramHtml(msg, 20);
+		expect(chunks.length).toBeGreaterThan(1);
+		for (const chunk of chunks) {
+			expect(chunk.length).toBeLessThanOrEqual(20);
+			expect(chunk.startsWith("<code>")).toBe(true);
+			expect(chunk.endsWith("</code>")).toBe(true);
+		}
+		// Concatenating the payloads (minus the injected close/reopen) reproduces the content.
+		const payload = chunks.map(c => c.replace(/^<code>/, "").replace(/<\/code>$/, "")).join("");
+		expect(payload).toBe("x".repeat(30));
+	});
+
+	test("never splits an entity across chunks", () => {
+		const msg = `${"a".repeat(15)}&amp;${"b".repeat(15)}`;
+		const chunks = chunkTelegramHtml(msg, 18);
+		for (const chunk of chunks) {
+			expect(chunk).not.toMatch(/&amp$/);
+			expect(chunk).not.toMatch(/&$/);
+		}
+		expect(chunks.join("")).toBe(msg);
 	});
 });
 
