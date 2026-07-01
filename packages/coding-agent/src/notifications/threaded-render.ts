@@ -49,6 +49,7 @@ interface ThreadedFrame {
 	tokenUsage?: unknown;
 	model?: unknown;
 	diff?: unknown;
+	cwd?: unknown;
 	// turn_stream
 	phase?: unknown;
 	text?: unknown;
@@ -89,18 +90,25 @@ export function formatIdentityHeader(frame: {
 /** Format a streamed context update into a compact block (omitting empty fields). */
 export function formatContextUpdate(frame: ThreadedFrame): string | undefined {
 	const lines: string[] = [];
+	const session = str(frame.sessionId);
+	const cwd = str(frame.cwd);
 	const last = str(frame.lastMessage);
-	if (last) lines.push(escapeHtml(truncate(last, 600)));
 	const task = str(frame.task);
-	if (task) lines.push(`${italic("task:")} ${escapeHtml(task)}`);
 	const goal = str(frame.goal);
-	if (goal) lines.push(`${italic("goal:")} ${escapeHtml(goal)}`);
 	const usage = str(frame.tokenUsage);
 	const model = str(frame.model);
-	if (usage || model) lines.push(`ctx: ${code([usage, model].filter(Boolean).join(" · "))}`);
 	const diff = str(frame.diff);
+	if (!cwd && !last && !task && !goal && !usage && !model && !diff) return undefined;
+	const meta = [session ? `session: ${code(session)}` : undefined, cwd ? `cwd: ${code(cwd)}` : undefined].filter(
+		Boolean,
+	);
+	if (meta.length > 0) lines.push(meta.join(" · "));
+	if (last) lines.push(escapeHtml(truncate(last, 600)));
+	if (task) lines.push(`${italic("task:")} ${escapeHtml(task)}`);
+	if (goal) lines.push(`${italic("goal:")} ${escapeHtml(goal)}`);
+	if (usage || model) lines.push(`ctx: ${code([usage, model].filter(Boolean).join(" · "))}`);
 	if (diff) lines.push(`diff:\n${pre(truncate(diff, 1200))}`);
-	return lines.length ? lines.join("\n") : undefined;
+	return lines.join("\n");
 }
 
 /**

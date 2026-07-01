@@ -23,7 +23,17 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
-type Frame = { type: string; text?: string; verbosity?: "lean" | "verbose"; tokenUsage?: string; model?: string };
+type Frame = {
+	type: string;
+	text?: string;
+	verbosity?: "lean" | "verbose";
+	tokenUsage?: string;
+	model?: string;
+	cwd?: string;
+};
+
+type TestContextUsage = { tokens: number | null; contextWindow: number };
+type TestModel = { id?: string };
 
 const tempDirs: string[] = [];
 const openSockets: WebSocket[] = [];
@@ -33,7 +43,7 @@ afterEach(() => {
 });
 
 /** Boot the notifications extension against a real NotificationServer + WS client. */
-async function setup(): Promise<{
+async function setup(options: { contextUsage?: TestContextUsage | false; model?: TestModel | false } = {}): Promise<{
 	handlers: Map<string, Handler>;
 	ctx: unknown;
 	frames: Frame[];
@@ -62,8 +72,9 @@ async function setup(): Promise<{
 			getArtifactsDir: () => cwd,
 			getCwd: () => cwd,
 		},
-		getContextUsage: () => ({ tokens: 12, contextWindow: 100 }),
-		getModel: () => ({ id: "test-model" }),
+		getContextUsage: () =>
+			options.contextUsage === false ? undefined : (options.contextUsage ?? { tokens: 12, contextWindow: 100 }),
+		getModel: () => (options.model === false ? undefined : (options.model ?? { id: "test-model" })),
 	} as never;
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
@@ -180,7 +191,13 @@ test("inbound /verbose and /lean update runtime verbosity and confirmation polic
 
 		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
 		await waitFor(
-			() => contextUpdates().some(f => f.tokenUsage === "12/100" && f.model === "test-model"),
+			() =>
+				contextUpdates().some(
+					f =>
+						f.tokenUsage === "12/100" &&
+						f.model === "test-model" &&
+						f.cwd === path.basename((ctx as { cwd: string }).cwd),
+				),
 			3000,
 			"verbose context_update",
 		);
@@ -192,6 +209,35 @@ test("inbound /verbose and /lean update runtime verbosity and confirmation polic
 		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
 		await sleep(200);
 		expect(contextUpdates().length).toBe(beforeLeanIdle);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("verbose idle context includes compact cwd without usage metadata", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup({ contextUsage: false, model: false });
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+		const contextUpdates = () => frames.filter(f => f.type === "context_update");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "verbose"), 3000, "verbose config_update");
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(
+			() =>
+				contextUpdates().some(
+					f =>
+						f.cwd === path.basename((ctx as { cwd: string }).cwd) &&
+						f.tokenUsage === undefined &&
+						f.model === undefined,
+				),
+			3000,
+			"cwd-only verbose context_update",
+		);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;

@@ -251,6 +251,9 @@ pub struct IdentityHeader {
 pub struct ContextUpdate {
 	/// The session this update belongs to.
 	pub session_id:   String,
+	/// Compact current working directory label; never the full host path by default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cwd:          Option<String>,
 	/// Last assistant message text.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_message: Option<String>,
@@ -671,11 +674,13 @@ mod tests {
 			token_usage:  Some("12k/200k".into()),
 			model:        Some("opus".into()),
 			diff:         None,
+			cwd:          Some("repo-worktree".into()),
 		});
 		let v = serde_json::to_value(&msg).unwrap();
 		assert_eq!(v["type"], "context_update");
 		assert_eq!(v["lastMessage"], "done");
 		assert_eq!(v["tokenUsage"], "12k/200k");
+		assert_eq!(v["cwd"], "repo-worktree");
 		assert!(v.get("task").is_none());
 		assert!(v.get("diff").is_none());
 	}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatIdentityHeader, renderThreadedFrame } from "../src/notifications/threaded-render";
+import { formatContextUpdate, formatIdentityHeader, renderThreadedFrame } from "../src/notifications/threaded-render";
 
 describe("renderThreadedFrame", () => {
 	test("identity_header renders pinned bullets with identity flag", () => {
@@ -50,6 +50,11 @@ describe("renderThreadedFrame", () => {
 		expect(send?.lane).toBe("live");
 		expect(send?.coalesceKey).toBe("ctx:s");
 		expect(send?.text).toContain("ctx: <code>12k/200k · opus</code>");
+		expect(send?.text).toContain("session: <code>s</code>");
+
+		const withCwd = formatContextUpdate({ type: "context_update", sessionId: "session-full", cwd: "gajae-worktree" });
+		expect(withCwd).toContain("session: <code>session-full</code>");
+		expect(withCwd).toContain("cwd: <code>gajae-worktree</code>");
 	});
 
 	test("image_attachment renders a sendPhoto with caption", () => {

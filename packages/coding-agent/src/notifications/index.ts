@@ -297,6 +297,15 @@ function buildIdentity(
 	return { repo, branch, machine: os.hostname(), title: sessionName };
 }
 
+/** Compact cwd label for remote session identity; never emits the full host path by default. */
+function compactCwd(cwd: string): string | undefined {
+	const home = os.homedir();
+	const resolved = path.resolve(cwd);
+	if (resolved === home) return "~";
+	const base = path.basename(resolved);
+	return base || path.parse(resolved).root || undefined;
+}
+
 const execFileAsync = promisify(execFile);
 
 /** Best-effort working-tree diff stat for the context update (no throw). */
@@ -973,7 +982,8 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 			const tokenUsage = usage && usage.tokens != null ? `${usage.tokens}/${usage.contextWindow}` : undefined;
 			const modelId = model?.id;
 			void readGitDiffStat(ctx.cwd).then(diff => {
-				if (!diff && !tokenUsage && !modelId) return;
+				const cwd = compactCwd(ctx.cwd);
+				if (!diff && !tokenUsage && !modelId && !cwd) return;
 				try {
 					rt.server.pushFrame(
 						JSON.stringify({
@@ -982,6 +992,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 							tokenUsage,
 							model: modelId,
 							diff,
+							cwd,
 						}),
 					);
 				} catch (e) {
