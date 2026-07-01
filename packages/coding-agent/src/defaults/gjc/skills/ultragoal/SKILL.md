@@ -167,13 +167,30 @@ Ultragoal execution should use GJC's bundled role-agent roster when a durable st
 - Use `architect` for read-only architecture and code-review lanes, including `CLEAR` / `WATCH` / `BLOCK` status.
 - Use `critic` for read-only plan or handoff critique before execution proceeds.
 
+### Mandatory implementation delegation on big scope
+
+When a story's implementation scope is **big enough**, the Ultragoal leader MUST delegate the implementation to one or more `executor` subagents instead of writing the code inline itself. This is a hard requirement, not a preference: solo inline implementation of a big-scope story is a gate violation, and the completion cleanup/review gate must treat missing delegation on a big-scope story as a blocker.
+
+A story's implementation scope is **big enough** to force delegation when any of the following hold:
+
+- It spans **3+ files** or **2+ cleanly separable surfaces/modules** that can be implemented against bounded, independent acceptance criteria.
+- It is estimated at **~200+ lines of net implementation change**, or is otherwise large enough that a single inline pass would crowd out the leader's checkpoint/verification duties.
+- It decomposes into **independent slices** that can proceed in parallel without shared-file contention.
+- The leader has already made **2+ inline edit passes** on the same story and implementation is still materially incomplete.
+
+Forced-delegation rules:
+
+- Split the story into cleanly separable slices, give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
+- Prefer **parallel** `executor` subagents for independent slices; sequence only slices with a real dependency.
+- If a big-scope story cannot be cleanly split, record the reason as a durable ledger note and delegate the whole implementation to a single `executor` rather than doing it inline; the leader still owns verification.
+- Small, atomic, single-file changes below these thresholds stay with the leader — do not over-delegate trivial work.
+- After integrating delegated slices, run `architect` / `critic` review lanes; worker agents never mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
+
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
 If an Ultragoal request has no approved plan or consensus artifact, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Do not silently substitute ad-hoc execution for missing planning.
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
-
-For large subgoals with independent slices, the Ultragoal leader must spawn parallel `executor` subagents instead of doing serial solo work. Split only cleanly separable files/surfaces, give each executor bounded targets and acceptance criteria, and keep checkpoint ownership in the leader. Use `architect` / `critic` review lanes after integration; do not let worker agents mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
 
 ## Use Ultragoal and Team together
 
@@ -235,7 +252,7 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
     "productStatus": "CLEAR",
     "codeStatus": "CLEAR",
     "recommendation": "APPROVE",
-    "evidence": "architect review synthesis with architecture/product/code coverage",
+    "evidence": "architect review synthesis across architecture/product/code",
     "commands": ["architect review command or agent evidence id"],
     "blockers": []
   },
@@ -247,122 +264,30 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
     "e2eCommands": ["bun test:e2e"],
     "redTeamCommands": ["bun test:red-team"],
     "artifactRefs": [
-      {
-        "id": "browser-run",
-        "kind": "browser-automation",
-        "path": "artifacts/browser-run.json",
-        "description": "valid automation transcript with actions, monotonic timestamps, and selectors"
-      },
-      {
-        "id": "gui-screenshot",
-        "kind": "screenshot",
-        "path": "artifacts/gui-screenshot.png",
-        "description": "non-uniform screenshot evidence for the GUI/web result"
-      },
-      {
-        "id": "cli-replay",
-        "kind": "command-replay",
-        "path": "artifacts/cli-replay.json",
-        "description": "artifact file containing argv-only CLI replay JSON: schemaVersion 1, kind cli-replay, replaySafe true, allowlisted command such as bun/node --version or deterministic bun/node -e console.log(...), recordedStdout"
-      },
-      {
-        "id": "adversarial-report",
-        "kind": "failure-mode-test",
-        "path": "artifacts/adversarial-report.txt",
-        "description": "boundary, property, adversarial, or failure-mode result"
-      },
-      {
-        "id": "api-package-report",
-        "kind": "api-package-test-report",
-        "path": "artifacts/api-package-report.txt",
-        "description": "API/package consumer or endpoint verification output"
-      },
-      {
-        "id": "algorithm-report",
-        "kind": "property-test-report",
-        "path": "artifacts/algorithm-report.txt",
-        "description": "Algorithm/math property, boundary, or invariant verification output"
-      }
+      { "id": "<ref-id>", "kind": "<surface-appropriate kind; see step 6>", "path": "artifacts/<file>", "description": "live-surface evidence" }
     ],
     "contractCoverage": [
-      {
-        "id": "contract-goal",
-        "contractRef": "approved plan/spec/acceptance criterion or user-facing contract id",
-        "obligation": "required behavior from the approved contract",
-        "status": "covered",
-        "surfaceEvidenceRefs": ["surface-gui"],
-        "adversarialCaseRefs": ["case-invalid-input"]
-      },
-      {
-        "id": "contract-out-of-scope",
-        "contractRef": "contract intentionally outside this story",
-        "obligation": "explicitly omitted approved-contract surface",
-        "status": "not_applicable",
-        "reason": "why this contract does not apply to the current story"
-      }
+      { "id": "<id>", "contractRef": "<approved contract id>", "obligation": "<required behavior>", "status": "covered", "surfaceEvidenceRefs": ["<surface-id>"], "adversarialCaseRefs": ["<case-id>"] }
     ],
     "surfaceEvidence": [
-      {
-        "id": "surface-gui",
-        "contractRef": "user-facing surface or public interface under test",
-        "surface": "gui|web|cli|api|package|algorithm|math|native|desktop|tui",
-        "invocation": "real browser action, CLI command, API/package consumer call, or algorithm/property check",
-        "verdict": "passed",
-        "artifactRefs": ["browser-run", "gui-screenshot"]
-      },
-      {
-        "id": "surface-cli",
-        "contractRef": "CLI or command-line interface under test",
-        "surface": "cli",
-        "invocation": "argv replay executed by the Ultragoal runtime",
-        "verdict": "passed",
-        "artifactRefs": ["cli-replay"]
-      },
-      {
-        "id": "surface-api",
-        "contractRef": "API/package public interface under test",
-        "surface": "api/package",
-        "invocation": "real endpoint call, package consumer call, or schema contract check",
-        "verdict": "passed",
-        "artifactRefs": ["api-package-report"]
-      },
-      {
-        "id": "surface-algorithm",
-        "contractRef": "algorithm/math invariant under test",
-        "surface": "algorithm/math",
-        "invocation": "property, boundary, or invariant test run",
-        "verdict": "passed",
-        "artifactRefs": ["algorithm-report"]
-      },
-      {
-        "id": "surface-out-of-scope",
-        "contractRef": "surface intentionally outside this story",
-        "surface": "gui|web|cli|api|package|algorithm|math|native|desktop|tui",
-        "status": "not_applicable",
-        "reason": "why this surface does not apply to the current story"
-      }
+      { "id": "<surface-id>", "contractRef": "<surface under test>", "surface": "gui|web|cli|api|package|algorithm|math|native|desktop|tui", "invocation": "<real invocation>", "verdict": "passed", "artifactRefs": ["<ref-id>"] }
     ],
     "adversarialCases": [
-      {
-        "id": "case-invalid-input",
-        "contractRef": "approved plan/spec/acceptance criterion or user-facing contract id",
-        "scenario": "boundary/property/adversarial/failure-mode input or user action",
-        "expectedBehavior": "contract-required rejection, handling, or invariant preservation",
-        "verdict": "passed",
-        "artifactRefs": ["adversarial-report"]
-      }
+      { "id": "<case-id>", "contractRef": "<approved contract id>", "scenario": "<boundary/adversarial input>", "expectedBehavior": "<required handling>", "verdict": "passed", "artifactRefs": ["<ref-id>"] }
     ],
     "blockers": []
   },
   "iteration": {
     "status": "passed",
-    "evidence": "blockers were absent or resolved and the full verification loop was rerun cleanly",
+    "evidence": "blockers absent or resolved and the full loop was rerun cleanly",
     "fullRerun": true,
     "rerunCommands": ["bun test:e2e", "bun test:red-team"],
     "blockers": []
   }
 }
 ```
+
+Provide one `artifactRefs` entry per live surface actually exercised, using the surface-appropriate `kind` and evidence rules from steps 6–7 above; the CLI rejects missing or shallow gates. `status: "not_applicable"` rows are allowed only in `contractCoverage` and `surfaceEvidence` and each requires `contractRef` plus `reason`.
 
 For CLI replay artifacts, the JSON at `path` must be an object like `{"schemaVersion":1,"kind":"cli-replay","replaySafe":true,"command":["bun","-e","console.log(\"ultragoal-cli-ok\")"],"recordedStdout":"ultragoal-cli-ok\n"}`. Use `replayExempt` only for audited unsafe/non-deterministic invocations, with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs`. `reason` must be substantive and audited, `approvedBy` must identify the verifier, and `fallbackArtifactRefs` must reference same-surface structurally valid fallback artifacts. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
 
