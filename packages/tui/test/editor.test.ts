@@ -6,7 +6,6 @@ import { Editor } from "@gajae-code/tui/components/editor";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
-import { isKittyProtocolActive, setKittyProtocolActive } from "../src/keys";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
@@ -493,10 +492,38 @@ describe("Editor component", () => {
 			expect(editor.getText()).toBe("a1");
 		});
 
-		it("submits Ctrl+Enter variants with NumLock or keypad Enter metadata", () => {
+		it("inserts a newline for Ctrl+Enter variants with NumLock or keypad Enter metadata", () => {
 			const variants = ["\x1b[13;133u", "\x1b[57414;5u", "\x1b[57414;133u"];
 
 			for (const variant of variants) {
+				const editor = new Editor(defaultEditorTheme);
+
+				editor.handleInput("a");
+				editor.handleInput(variant);
+				editor.handleInput("b");
+
+				expect(editor.getText()).toBe("a\nb");
+			}
+		});
+
+		it("inserts a newline for Ctrl+Shift+Enter terminal protocol variants", () => {
+			const variants = ["\x1b[13;6u", "\x1b[27;6;13~", "\x1b[13;6~", "\x1b[13;2~", "\x1b[13;2u"];
+
+			for (const [index, variant] of variants.entries()) {
+				const editor = new Editor(defaultEditorTheme);
+				const prefix = index === 0 ? "alpha" : "beta";
+
+				editor.setText(prefix);
+				editor.handleInput(variant);
+
+				expect(editor.getText()).toBe(`${prefix}\n`);
+			}
+		});
+
+		it("inserts a newline for raw LF on Windows terminal sendInput mappings", () => {
+			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+			Object.defineProperty(process, "platform", { value: "win32" });
+			try {
 				const editor = new Editor(defaultEditorTheme);
 				let submitted = "";
 				editor.onSubmit = text => {
@@ -504,76 +531,14 @@ describe("Editor component", () => {
 				};
 
 				editor.handleInput("a");
-				editor.handleInput(variant);
+				editor.handleInput("\n");
+				editor.handleInput("b");
 
-				expect(submitted).toBe("a");
-				expect(editor.getText()).toBe("");
-			}
-		});
-
-		it("submits Ctrl+Shift+Enter terminal protocol variants while Shift+Enter inserts newline", () => {
-			const submitVariants = ["\x1b[13;6u", "\x1b[27;6;13~", "\x1b[13;6~"];
-			const newlineVariants = ["\x1b[13;2~", "\x1b[13;2u"];
-
-			for (const variant of submitVariants) {
-				const editor = new Editor(defaultEditorTheme);
-				let submitted = "";
-				editor.onSubmit = text => {
-					submitted = text;
-				};
-
-				editor.setText("alpha");
-				editor.handleInput(variant);
-
-				expect(submitted).toBe("alpha");
-				expect(editor.getText()).toBe("");
-			}
-
-			for (const variant of newlineVariants) {
-				const editor = new Editor(defaultEditorTheme);
-
-				editor.setText("beta");
-				editor.handleInput(variant);
-
-				expect(editor.getText()).toBe("beta\n");
-			}
-		});
-
-		it("submits raw LF as Enter regardless of Kitty protocol state", () => {
-			const wasKittyActive = isKittyProtocolActive();
-			try {
-				for (const kittyActive of [false, true]) {
-					setKittyProtocolActive(kittyActive);
-					const editor = new Editor(defaultEditorTheme);
-					let submitted: string | null = null;
-					editor.onSubmit = text => {
-						submitted = text;
-					};
-
-					editor.handleInput("a");
-					editor.handleInput("\n");
-
-					expect(submitted).toBe("a");
-					expect(editor.getText()).toBe("");
-				}
+				expect(submitted).toBe("");
+				expect(editor.getText()).toBe("a\nb");
 			} finally {
-				setKittyProtocolActive(wasKittyActive);
+				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 			}
-		});
-
-		it("inserts a newline for a Shift+Enter sequence", () => {
-			const editor = new Editor(defaultEditorTheme);
-			let submitted: string | null = null;
-			editor.onSubmit = text => {
-				submitted = text;
-			};
-
-			editor.handleInput("a");
-			editor.handleInput("\x1b[13;2~"); // Shift+Enter (legacy)
-			editor.handleInput("b");
-
-			expect(submitted).toBeNull();
-			expect(editor.getText()).toBe("a\nb");
 		});
 
 		it("still submits plain CR Enter on Windows", () => {
@@ -667,7 +632,7 @@ describe("Editor component", () => {
 			editor.handleInput("ä");
 			editor.handleInput("ö");
 			editor.handleInput("ü");
-			editor.handleInput("\x1b[13;2~"); // Shift+Enter → new line
+			editor.handleInput("\n"); // new line
 			editor.handleInput("Ä");
 			editor.handleInput("Ö");
 			editor.handleInput("Ü");

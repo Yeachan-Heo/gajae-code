@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Restored default Enter = submit / Shift+Enter = newline in the composer. A bare LF (`\n`) now always submits, because terminals emit a bare LF for a plain Enter and that byte is indistinguishable from a `shift+enter → \n` text mapping — Enter-submits is the default. Newlines still come from the dedicated Shift+Enter sequences. This reverts the regression from #959, which made a bare LF always insert a newline and swallowed Enter submissions.
+- Reverted the composer Enter/Shift+Enter handling to the 0.7.8 behavior. A recent restructure (#1298 and follow-ups) changed how plain Enter, Ctrl+Enter, and bare-LF Enter were routed and regressed prompt submission for some terminals; the submit/newline branches are now restored to their 0.7.8 form so Enter submits and Shift+Enter inserts a newline.
 
 ## [0.7.8] - 2026-06-30
 

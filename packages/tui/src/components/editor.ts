@@ -1249,14 +1249,16 @@ export class Editor implements Component, Focusable {
 				this.#addNewLine();
 			}
 		}
-		// New line. Shift+Enter is the dedicated multiline chord; Ctrl+Enter submits.
-		// A bare LF (\n) is intentionally NOT treated as a newline here: terminals emit a
-		// bare LF for a plain Enter too, and that byte cannot be distinguished from a
-		// Shift+Enter→\n text mapping. Enter-submits is the default, so bare LF falls through
-		// to the submit branch below. Real Shift+Enter arrives as its own CSI sequence.
+		// New line
 		else if (
+			(data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
+			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
+			matchesKey(data, "ctrl+shift+enter") || // Ctrl+Shift+Enter (Kitty/modifyOtherKeys combined modifier)
+			data === "\x1b\r" || // Option+Enter in some terminals (legacy)
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
-			kb.matches(data, "tui.input.newLine") // Shift+Enter (Kitty protocol, handles lock bits)
+			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
+			(data.length > 1 && data.includes("\x1b") && data.includes("\r")) ||
+			(data === "\n" && data.length === 1) // Shift+Enter from terminal sendInput mapping
 		) {
 			if (this.#shouldSubmitOnBackslashEnter(data, kb)) {
 				this.#handleBackspace();
@@ -1265,13 +1267,8 @@ export class Editor implements Component, Focusable {
 			}
 			this.#addNewLine();
 		}
-		// Enter/Ctrl+Enter - submit (handles both legacy \r and Kitty protocol with lock bits)
-		else if (
-			matchesKey(data, "ctrl+enter") ||
-			matchesKey(data, "ctrl+shift+enter") ||
-			kb.matches(data, "tui.input.submit") ||
-			data === "\n"
-		) {
+		// Plain Enter - submit (handles both legacy \r and Kitty protocol with lock bits)
+		else if (kb.matches(data, "tui.input.submit") || data === "\n") {
 			// If submit is disabled, do nothing
 			if (this.disableSubmit) {
 				return;
