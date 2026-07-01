@@ -2,7 +2,7 @@ import { getProjectDir, logger } from "@gajae-code/utils";
 import type { AutocompleteProvider, CombinedAutocompleteProvider } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
-import { extractPrintableText, isKittyProtocolActive, matchesKey } from "../keys";
+import { extractPrintableText, matchesKey } from "../keys";
 import { KillRing } from "../kill-ring";
 import type { SymbolTheme } from "../symbols";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
@@ -1250,12 +1250,13 @@ export class Editor implements Component, Focusable {
 			}
 		}
 		// New line. Shift+Enter is the dedicated multiline chord; Ctrl+Enter submits.
+		// A bare LF (\n) is intentionally NOT treated as a newline here: terminals emit a
+		// bare LF for a plain Enter too, and that byte cannot be distinguished from a
+		// Shift+Enter→\n text mapping. Enter-submits is the default, so bare LF falls through
+		// to the submit branch below. Real Shift+Enter arrives as its own CSI sequence.
 		else if (
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
-			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
-			// Bare LF is Shift+Enter only under a Kitty/Ghostty custom LF mapping (protocol active).
-			// With the protocol off, a bare LF is a plain Enter and must submit, not insert a newline.
-			(data === "\n" && data.length === 1 && isKittyProtocolActive())
+			kb.matches(data, "tui.input.newLine") // Shift+Enter (Kitty protocol, handles lock bits)
 		) {
 			if (this.#shouldSubmitOnBackslashEnter(data, kb)) {
 				this.#handleBackspace();

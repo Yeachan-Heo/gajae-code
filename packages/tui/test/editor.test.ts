@@ -539,45 +539,41 @@ describe("Editor component", () => {
 			}
 		});
 
-		it("submits raw LF as Enter when the Kitty protocol is inactive", () => {
+		it("submits raw LF as Enter regardless of Kitty protocol state", () => {
 			const wasKittyActive = isKittyProtocolActive();
-			setKittyProtocolActive(false);
 			try {
-				const editor = new Editor(defaultEditorTheme);
-				let submitted = "";
-				editor.onSubmit = text => {
-					submitted = text;
-				};
+				for (const kittyActive of [false, true]) {
+					setKittyProtocolActive(kittyActive);
+					const editor = new Editor(defaultEditorTheme);
+					let submitted: string | null = null;
+					editor.onSubmit = text => {
+						submitted = text;
+					};
 
-				editor.handleInput("a");
-				editor.handleInput("\n");
+					editor.handleInput("a");
+					editor.handleInput("\n");
 
-				expect(submitted).toBe("a");
-				expect(editor.getText()).toBe("");
+					expect(submitted).toBe("a");
+					expect(editor.getText()).toBe("");
+				}
 			} finally {
 				setKittyProtocolActive(wasKittyActive);
 			}
 		});
 
-		it("inserts a newline for raw LF when the Kitty protocol is active (Ghostty Shift+Enter mapping)", () => {
-			const wasKittyActive = isKittyProtocolActive();
-			setKittyProtocolActive(true);
-			try {
-				const editor = new Editor(defaultEditorTheme);
-				let submitted = "";
-				editor.onSubmit = text => {
-					submitted = text;
-				};
+		it("inserts a newline for a Shift+Enter sequence", () => {
+			const editor = new Editor(defaultEditorTheme);
+			let submitted: string | null = null;
+			editor.onSubmit = text => {
+				submitted = text;
+			};
 
-				editor.handleInput("a");
-				editor.handleInput("\n");
-				editor.handleInput("b");
+			editor.handleInput("a");
+			editor.handleInput("\x1b[13;2~"); // Shift+Enter (legacy)
+			editor.handleInput("b");
 
-				expect(submitted).toBe("");
-				expect(editor.getText()).toBe("a\nb");
-			} finally {
-				setKittyProtocolActive(wasKittyActive);
-			}
+			expect(submitted).toBeNull();
+			expect(editor.getText()).toBe("a\nb");
 		});
 
 		it("still submits plain CR Enter on Windows", () => {
