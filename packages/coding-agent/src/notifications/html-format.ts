@@ -330,6 +330,55 @@ export function truncateTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIM
 	return out + closersFor(stack) + effectiveMarker;
 }
 
+/**
+ * Split a finished Telegram HTML message into ordered chunks that each fit
+ * within `max` chars, without splitting a tag or entity. Any allowed tags left
+ * open at a chunk boundary are closed at the end of that chunk and reopened at
+ * the start of the next, so every chunk is independently valid HTML. Returns a
+ * single-element array when the message already fits.
+ */
+export function chunkTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
+	if (message.length <= max) return [message];
+
+	const tokens = tokenize(message);
+	const openersFor = (s: string[]): string => s.map(t => `<${t}>`).join("");
+	const closersFor = (s: string[]): string =>
+		s
+			.map(t => `</${t}>`)
+			.reverse()
+			.join("");
+
+	const chunks: string[] = [];
+	const stack: string[] = [];
+	let chunkStart: string[] = [];
+	let out = "";
+
+	for (const token of tokens) {
+		const nextStack = [...stack];
+		if (token.open) nextStack.push(token.open);
+		else if (token.close) {
+			const idx = nextStack.lastIndexOf(token.close);
+			if (idx !== -1) nextStack.splice(idx, 1);
+		}
+		const projected = openersFor(chunkStart).length + out.length + token.value.length + closersFor(nextStack).length;
+		// Flush the current chunk before it would overflow, but never emit an
+		// empty chunk (a single oversized token is kept whole).
+		if (projected > max && out.length > 0) {
+			chunks.push(openersFor(chunkStart) + out + closersFor(stack));
+			chunkStart = [...stack];
+			out = "";
+		}
+		out += token.value;
+		if (token.open) stack.push(token.open);
+		else if (token.close) {
+			const idx = stack.lastIndexOf(token.close);
+			if (idx !== -1) stack.splice(idx, 1);
+		}
+	}
+	if (out.length > 0) chunks.push(openersFor(chunkStart) + out + closersFor(stack));
+	return chunks;
+}
+
 /** Finalize an optional message: undefined passthrough, else safe-truncate. */
 export function finalizeTelegramHtml(message?: string): string | undefined {
 	if (message === undefined) return undefined;
