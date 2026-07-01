@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Settings } from "../src/config/settings";
+import { TELEGRAM_PARSE_MODE } from "../src/notifications/html-format";
 import { TelegramNotificationDaemon } from "../src/notifications/telegram-daemon";
 
 function settings(agentDir: string): Settings {
@@ -51,6 +52,14 @@ function msg(chatId: string, text: string, updateId: number): unknown {
 	return { update_id: updateId, message: { chat: { id: chatId }, text, message_id: updateId } };
 }
 
+function writeSession(agentDir: string, project: string, id: string, header: object, mtimeMs: number): void {
+	const dir = path.join(agentDir, "sessions", project);
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `${id}.jsonl`);
+	fs.writeFileSync(file, `${JSON.stringify(header)}\n`);
+	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+}
+
 describe("lifecycle command routing (G009)", () => {
 	test("a paired-chat /session_* command is detected and answered (no injection fallthrough)", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
@@ -83,6 +92,31 @@ describe("lifecycle command routing (G009)", () => {
 		await daemon.handleTelegramUpdate(msg("42", "hello there", 3));
 		// Not a /session_* command -> no lifecycle not-available reply.
 		expect(calls.filter(c => c.method === "sendMessage").length).toBe(0);
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	});
+	test("/session_recent is sent as escaped preformatted HTML chunks", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const { calls, api } = spyBot();
+		const daemon = makeDaemon(agentDir, api);
+		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
+		for (let i = 0; i < 20; i++) {
+			writeSession(
+				agentDir,
+				"repo",
+				`s-${String(i).padStart(3, "0")}`,
+				{ cwd: `/repo/<tag>&branch/${"x".repeat(500)}` },
+				1000 + i,
+			);
+		}
+
+		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 4));
+
+		const sends = calls.filter(c => c.method === "sendMessage");
+		expect(sends.length).toBeGreaterThan(1);
+		expect(sends.every(c => c.body?.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+		expect(sends.every(c => String(c.body?.text).length <= 4096)).toBe(true);
+		expect(String(sends[0]?.body?.text).startsWith("<pre>")).toBe(true);
+		expect(sends.map(c => String(c.body?.text)).join("")).toContain("/repo/&lt;tag&gt;&amp;branch");
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 });

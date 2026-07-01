@@ -133,7 +133,7 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 		case "turn_stream": {
 			const raw = str(frame.text);
 			if (!raw) return undefined;
-			const text = finalizeTelegramHtml(markdownToTelegramHtml(raw));
+			const text = markdownToTelegramHtml(raw);
 			const finalized = frame.phase === "finalized";
 			return {
 				method: "sendMessage",

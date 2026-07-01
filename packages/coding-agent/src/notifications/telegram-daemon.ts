@@ -11,7 +11,13 @@ import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
-import { buildCompactChoiceGrid, TELEGRAM_PARSE_MODE } from "./html-format";
+import {
+	buildCompactChoiceGrid,
+	pre,
+	splitTelegramHtml,
+	TELEGRAM_MESSAGE_LIMIT,
+	TELEGRAM_PARSE_MODE,
+} from "./html-format";
 import type {
 	SessionCloseTarget,
 	SessionCreateTarget,
@@ -121,6 +127,21 @@ const TYPING_REFRESH_INTERVAL_MS = 4_000;
 const QUEUED_REACTION = "👀";
 const PENDING_TOPIC_FRAME_LIMIT = 20;
 const CONSUMED_REACTION = "✅";
+
+function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
+	if (text.length <= max) return [text];
+	const chunks: string[] = [];
+	let out = "";
+	for (const ch of text) {
+		if (out.length + ch.length > max) {
+			chunks.push(out);
+			out = "";
+		}
+		out += ch;
+	}
+	if (out) chunks.push(out);
+	return chunks;
+}
 
 /**
  * Whether `err` is a transient network failure worth retrying. Telegram API
@@ -1053,14 +1074,29 @@ export class TelegramNotificationDaemon {
 		threadId: number | undefined,
 	): Promise<boolean> {
 		if (!isLifecycleCommandText(text)) return false;
-		const reply = (body: string) =>
-			this.botApi
-				.call("sendMessage", {
-					chat_id: this.opts.chatId,
-					...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-					text: body,
-				})
-				.catch(() => undefined);
+		const reply = async (body: string): Promise<void> => {
+			for (const text of splitTelegramPlainText(body)) {
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+						text,
+					})
+					.catch(() => undefined);
+			}
+		};
+		const replyHtml = async (body: string): Promise<void> => {
+			for (const text of splitTelegramHtml(body)) {
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+						text,
+						parse_mode: TELEGRAM_PARSE_MODE,
+					})
+					.catch(() => undefined);
+			}
+		};
 
 		if (!this.lifecycleControlActive) {
 			await reply("Session lifecycle control is not available right now.");
@@ -1081,9 +1117,9 @@ export class TelegramNotificationDaemon {
 				limit: 10,
 			});
 			const lines = recent.length
-				? recent.map(e => `\u2022 ${e.sessionId}${e.path ? ` (${e.path})` : ""}`).join("\n")
+				? recent.map(e => `• ${e.sessionId}${e.path ? ` (${e.path})` : ""}`).join("\n")
 				: "No recent sessions.";
-			await reply(lines);
+			await replyHtml(pre(lines));
 			return true;
 		}
 
@@ -1612,12 +1648,14 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.text) {
-					await this.botApi.call("sendMessage", {
-						chat_id: this.opts.chatId,
-						...threadField,
-						text: send.text,
-						parse_mode: TELEGRAM_PARSE_MODE,
-					});
+					for (const text of splitTelegramHtml(send.text)) {
+						await this.botApi.call("sendMessage", {
+							chat_id: this.opts.chatId,
+							...threadField,
+							text,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						});
+					}
 				}
 			} catch {
 				// Best-effort: a failed send must never stop the daemon.
@@ -1820,13 +1858,17 @@ export class TelegramNotificationDaemon {
 			const inline_keyboard = buildCompactChoiceGrid(options, (i: number) =>
 				this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
 			);
-			const result = (await this.botApi.call("sendMessage", {
-				chat_id: this.opts.chatId,
-				...threadField,
-				text: rendered.text,
-				parse_mode: TELEGRAM_PARSE_MODE,
-				...(inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
-			})) as { result?: { message_id?: number } };
+			const chunks = splitTelegramHtml(rendered.text);
+			let result: { result?: { message_id?: number } } = {};
+			for (let i = 0; i < chunks.length; i++) {
+				result = (await this.botApi.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					...threadField,
+					text: chunks[i]!,
+					parse_mode: TELEGRAM_PARSE_MODE,
+					...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
+				})) as { result?: { message_id?: number } };
+			}
 			const messageId = result.result?.message_id;
 			if (messageId !== undefined)
 				this.messageRoutes.set(String(messageId), { sessionId: session.sessionId, actionId: msg.id });

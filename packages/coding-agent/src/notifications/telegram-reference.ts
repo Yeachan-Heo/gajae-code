@@ -20,8 +20,8 @@ import {
 	buildCompactChoiceGrid,
 	escapeHtml,
 	numberedOptionList,
+	splitTelegramHtml,
 	TELEGRAM_PARSE_MODE,
-	truncateTelegramHtml,
 } from "./html-format";
 import { renderThreadedFrame } from "./threaded-render";
 
@@ -131,14 +131,14 @@ export function buildActionMessage(action: {
 }): RenderedMessage {
 	if (action.kind === "idle") {
 		const text = action.summary ? `🟢 Agent idle\n${escapeHtml(action.summary)}` : "🟢 Agent idle";
-		return { text: truncateTelegramHtml(text) };
+		return { text };
 	}
 	const text = `❓ ${bold(action.question ?? "Question")}`;
 	const options = action.options ?? [];
-	if (options.length === 0) return { text: truncateTelegramHtml(`${text}\n\n(reply with text)`) };
+	if (options.length === 0) return { text: `${text}\n\n(reply with text)` };
 	const body = `${text}\n\n${numberedOptionList(options)}`;
 	const inline_keyboard = buildCompactChoiceGrid(options, i => encodeCallbackData(action.id, i));
-	return { text: truncateTelegramHtml(body), inline_keyboard };
+	return { text: body, inline_keyboard };
 }
 
 /** A protocol `reply` frame the client should send to the server. */
@@ -311,11 +311,16 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 				options: msg.options,
 				summary: msg.summary,
 			});
-			void send("sendMessage", {
-				chat_id: opts.chatId,
-				text: rendered.text,
-				parse_mode: TELEGRAM_PARSE_MODE,
-				...(rendered.inline_keyboard ? { reply_markup: { inline_keyboard: rendered.inline_keyboard } } : {}),
+			const chunks = splitTelegramHtml(rendered.text);
+			chunks.forEach((text, i) => {
+				void send("sendMessage", {
+					chat_id: opts.chatId,
+					text,
+					parse_mode: TELEGRAM_PARSE_MODE,
+					...(i === chunks.length - 1 && rendered.inline_keyboard
+						? { reply_markup: { inline_keyboard: rendered.inline_keyboard } }
+						: {}),
+				});
 			});
 		} else if (msg.type === "action_resolved" && msg.id === latestPendingAskId) {
 			latestPendingAskId = undefined;
@@ -325,7 +330,9 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			// session's forum topic; this reference shows the minimal handling.
 			const threaded = renderThreadedFrame(msg as never);
 			if (threaded?.text) {
-				void send("sendMessage", { chat_id: opts.chatId, text: threaded.text, parse_mode: TELEGRAM_PARSE_MODE });
+				for (const text of splitTelegramHtml(threaded.text)) {
+					void send("sendMessage", { chat_id: opts.chatId, text, parse_mode: TELEGRAM_PARSE_MODE });
+				}
 			}
 		}
 	});

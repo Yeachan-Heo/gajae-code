@@ -248,6 +248,8 @@ interface Token {
 	value: string;
 	/** Tag name if this token opens a tag, else undefined. */
 	open?: string;
+	/** Exact opening tag text, including attributes, for safe chunk reopening. */
+	openTag?: string;
 	/** Tag name if this token closes a tag, else undefined. */
 	close?: string;
 }
@@ -266,8 +268,10 @@ function tokenize(html: string): Token[] {
 				const openMatch = /^<([a-z-]+)(?:\s[^>]*)?>$/i.exec(raw);
 				const token: Token = { value: raw };
 				if (close && ALLOWED_TAGS.has(close[1]!.toLowerCase())) token.close = close[1]!.toLowerCase();
-				else if (openMatch && ALLOWED_TAGS.has(openMatch[1]!.toLowerCase()))
+				else if (openMatch && ALLOWED_TAGS.has(openMatch[1]!.toLowerCase())) {
 					token.open = openMatch[1]!.toLowerCase();
+					token.openTag = raw;
+				}
 				tokens.push(token);
 				i = end + 1;
 				continue;
@@ -328,6 +332,53 @@ export function truncateTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIM
 	}
 
 	return out + closersFor(stack) + effectiveMarker;
+}
+
+interface OpenTag {
+	name: string;
+	tag: string;
+}
+
+/** Split a finished Telegram HTML message into ordered chunks without splitting tags or entities. */
+export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
+	if (message.length <= max) return [message];
+	const chunks: string[] = [];
+	const tokens = tokenize(message);
+	const stack: OpenTag[] = [];
+	let out = "";
+	let chunkHasBody = false;
+
+	const closersFor = (s: OpenTag[]): string =>
+		s
+			.map(t => `</${t.name}>`)
+			.reverse()
+			.join("");
+	const openersFor = (s: OpenTag[]): string => s.map(t => t.tag).join("");
+	const flush = (): void => {
+		if (!chunkHasBody) return;
+		chunks.push(out + closersFor(stack));
+		out = openersFor(stack);
+		chunkHasBody = false;
+	};
+
+	for (const token of tokens) {
+		const nextStack = [...stack];
+		if (token.open) nextStack.push({ name: token.open, tag: token.openTag ?? token.value });
+		else if (token.close) {
+			const idx = nextStack.findLastIndex(t => t.name === token.close);
+			if (idx !== -1) nextStack.splice(idx, 1);
+		}
+		if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+		out += token.value;
+		chunkHasBody = true;
+		if (token.open) stack.push({ name: token.open, tag: token.openTag ?? token.value });
+		else if (token.close) {
+			const idx = stack.findLastIndex(t => t.name === token.close);
+			if (idx !== -1) stack.splice(idx, 1);
+		}
+	}
+	if (chunkHasBody) chunks.push(out + closersFor(stack));
+	return chunks;
 }
 
 /** Finalize an optional message: undefined passthrough, else safe-truncate. */
