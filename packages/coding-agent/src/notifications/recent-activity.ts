@@ -25,6 +25,8 @@ export interface RecentSessionEntry {
 	mtimeMs: number;
 	/** True when a terminal breadcrumb points at this session file. */
 	currentTerminal?: boolean;
+	/** True when this history is an internal helper/sub-agent session. */
+	internal?: boolean;
 }
 
 export interface RecentActivityDeps {
@@ -34,17 +36,18 @@ export interface RecentActivityDeps {
 	breadcrumbPaths?: string[];
 	/** Max entries to return (default 20). */
 	limit?: number;
+	/** Include internal helper/sub-agent sessions (default true). */
+	includeInternal?: boolean;
 	/** Injection seam for tests. */
-	readFirstLine?: (file: string) => string | undefined;
+	readInitialLines?: (file: string, maxLines: number) => string[];
 }
 
-function defaultReadFirstLine(file: string): string | undefined {
+function defaultReadInitialLines(file: string, maxLines: number): string[] {
 	try {
-		const buf = fs.readFileSync(file, "utf8");
-		const nl = buf.indexOf("\n");
-		return nl === -1 ? buf : buf.slice(0, nl);
+		const lines = fs.readFileSync(file, "utf8").split("\n");
+		return lines.slice(0, maxLines);
 	} catch {
-		return undefined;
+		return [];
 	}
 }
 
@@ -63,6 +66,22 @@ function headerMeta(line: string | undefined): { id?: string; path?: string; bra
 	} catch {
 		return {};
 	}
+}
+
+/** Detect task-tool helper sessions from the durable early session_init metadata entry. */
+function isInternalSession(lines: readonly string[]): boolean {
+	for (const line of lines.slice(1)) {
+		if (!line.trim()) continue;
+		try {
+			const obj = JSON.parse(line) as unknown;
+			if (typeof obj === "object" && obj !== null && (obj as { type?: unknown }).type === "session_init") {
+				return true;
+			}
+		} catch {
+			// Ignore malformed JSONL entries; classification is best-effort.
+		}
+	}
+	return false;
 }
 
 /**
@@ -85,7 +104,8 @@ function sessionIdForFile(stem: string, headerId: string | undefined): string {
  */
 export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry[] {
 	const limit = deps.limit ?? 20;
-	const readFirstLine = deps.readFirstLine ?? defaultReadFirstLine;
+	const includeInternal = deps.includeInternal ?? true;
+	const readInitialLines = deps.readInitialLines ?? defaultReadInitialLines;
 	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(p => path.resolve(p)));
 
 	let projectDirs: string[];
@@ -114,7 +134,10 @@ export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry
 			} catch {
 				continue;
 			}
-			const meta = headerMeta(readFirstLine(file));
+			const initialLines = readInitialLines(file, 8);
+			const meta = headerMeta(initialLines[0]);
+			const internal = isInternalSession(initialLines);
+			if (internal && !includeInternal) continue;
 			entries.push({
 				sessionId: sessionIdForFile(name.slice(0, -".jsonl".length), meta.id),
 				path: meta.path,
@@ -123,6 +146,7 @@ export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry
 				sessionStateFile: file,
 				mtimeMs,
 				currentTerminal: breadcrumbs.has(path.resolve(file)) || undefined,
+				internal: internal || undefined,
 			});
 		}
 	}

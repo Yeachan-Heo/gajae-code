@@ -52,11 +52,19 @@ function msg(chatId: string, text: string, updateId: number): unknown {
 	return { update_id: updateId, message: { chat: { id: chatId }, text, message_id: updateId } };
 }
 
-function writeSession(agentDir: string, project: string, id: string, header: object, mtimeMs: number): void {
+function writeSession(
+	agentDir: string,
+	project: string,
+	id: string,
+	header: object,
+	mtimeMs: number,
+	entries: object[] = [],
+): void {
 	const dir = path.join(agentDir, "sessions", project);
 	fs.mkdirSync(dir, { recursive: true });
 	const file = path.join(dir, `${id}.jsonl`);
-	fs.writeFileSync(file, `${JSON.stringify(header)}\n`);
+	const suffix = entries.length > 0 ? `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n` : "";
+	fs.writeFileSync(file, `${JSON.stringify(header)}\n${suffix}`);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 }
 
@@ -117,6 +125,26 @@ describe("lifecycle command routing (G009)", () => {
 		expect(sends.every(c => String(c.body?.text).length <= 4096)).toBe(true);
 		expect(String(sends[0]?.body?.text).startsWith("<pre>")).toBe(true);
 		expect(sends.map(c => String(c.body?.text)).join("")).toContain("/repo/&lt;tag&gt;&amp;branch");
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	});
+	test("/session_recent hides internal helper sessions by default", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const { calls, api } = spyBot();
+		const daemon = makeDaemon(agentDir, api);
+		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
+		writeSession(agentDir, "repo", "user-session", { cwd: "/repo/user" }, 1000);
+		writeSession(agentDir, "repo", "helper-session", { cwd: "/repo/helper" }, 2000, [{ type: "session_init" }]);
+
+		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 5));
+
+		const text = calls
+			.filter(c => c.method === "sendMessage")
+			.map(c => String(c.body?.text))
+			.join("");
+		expect(text).toContain("user-session");
+		expect(text).toContain("/repo/user");
+		expect(text).not.toContain("helper-session");
+		expect(text).not.toContain("/repo/helper");
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 });

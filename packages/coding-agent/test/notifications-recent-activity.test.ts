@@ -15,11 +15,18 @@ afterAll(() => {
 	for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
 });
 
-function writeSession(root: string, project: string, id: string, header: object, mtimeMs: number): string {
+function writeSession(
+	root: string,
+	project: string,
+	id: string,
+	header: object,
+	mtimeMs: number,
+	entries: object[] = [{ type: "message" }],
+): string {
 	const dir = path.join(root, project);
 	fs.mkdirSync(dir, { recursive: true });
 	const file = path.join(dir, `${id}.jsonl`);
-	fs.writeFileSync(file, `${JSON.stringify(header)}\n{"type":"message"}\n`);
+	fs.writeFileSync(file, `${JSON.stringify(header)}\n${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 	return file;
 }
@@ -61,6 +68,32 @@ describe("recent-activity picker", () => {
 		const out = listRecentSessions({ sessionsRoot: root });
 		expect(out).toHaveLength(1);
 		expect(out[0]?.path).toBeUndefined();
+	});
+
+	it("marks internal helper sessions and can exclude them", () => {
+		const root = tempSessionsRoot();
+		writeSession(root, "r", "user", { cwd: "/r" }, 2000);
+		writeSession(root, "r", "helper", { cwd: "/r" }, 3000, [
+			{ type: "session_init", systemPrompt: "subagent", initialTask: "help" },
+		]);
+
+		const defaultOut = listRecentSessions({ sessionsRoot: root });
+		expect(defaultOut.map(e => e.sessionId)).toEqual(["helper", "user"]);
+		expect(defaultOut.find(e => e.sessionId === "helper")?.internal).toBe(true);
+		expect(defaultOut.find(e => e.sessionId === "user")?.internal).toBeUndefined();
+
+		const visibleOnly = listRecentSessions({ sessionsRoot: root, includeInternal: false });
+		expect(visibleOnly.map(e => e.sessionId)).toEqual(["user"]);
+	});
+
+	it("filters internal sessions before applying the limit", () => {
+		const root = tempSessionsRoot();
+		writeSession(root, "r", "older-visible", { cwd: "/r" }, 1000);
+		writeSession(root, "r", "newer-visible", { cwd: "/r" }, 2000);
+		writeSession(root, "r", "newest-helper", { cwd: "/r" }, 3000, [{ type: "session_init" }]);
+
+		const out = listRecentSessions({ sessionsRoot: root, limit: 2, includeInternal: false });
+		expect(out.map(e => e.sessionId)).toEqual(["newer-visible", "older-visible"]);
 	});
 	it("surfaces the authoritative header id (not the timestamped filename stem)", () => {
 		const root = tempSessionsRoot();

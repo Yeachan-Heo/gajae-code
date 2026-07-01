@@ -1115,6 +1115,7 @@ export class TelegramNotificationDaemon {
 			const recent = listRecentSessions({
 				sessionsRoot: path.join(this.opts.settings.getAgentDir(), "sessions"),
 				limit: 10,
+				includeInternal: false,
 			});
 			const lines = recent.length
 				? recent.map(e => `• ${e.sessionId}${e.path ? ` (${e.path})` : ""}`).join("\n")
