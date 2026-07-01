@@ -67,7 +67,7 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("");
 	});
 
-	it("submits Ctrl+Enter instead of inserting a newline", () => {
+	it("keeps Ctrl+Enter as a multiline newline chord", () => {
 		const editor = createEditor();
 		const onQueue = vi.fn();
 		const onSubmit = vi.fn();
@@ -78,25 +78,24 @@ describe("CustomEditor queue keybinding", () => {
 		editor.handleInput("\x1b[13;5u");
 
 		expect(onQueue).not.toHaveBeenCalled();
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("a");
-		expect(editor.getText()).toBe("");
+		expect(onSubmit).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("a\n");
 	});
 
-	it("keeps plain Enter as a multiline newline chord", () => {
+	it("submits plain Enter", () => {
 		const editor = createEditor();
 		const onSubmit = vi.fn();
 		editor.onSubmit = onSubmit;
 
 		editor.handleInput("a");
 		editor.handleInput("\r");
-		editor.handleInput("b");
 
-		expect(onSubmit).not.toHaveBeenCalled();
-		expect(editor.getText()).toBe("a\nb");
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("a");
+		expect(editor.getText()).toBe("");
 	});
 
-	it("routes Ctrl+Enter through slash command completion before submit", () => {
+	it("keeps Ctrl+Enter as newline without routing slash command completion", () => {
 		const editor = createEditor();
 		const onSubmit = vi.fn();
 		editor.onSubmit = onSubmit;
@@ -115,8 +114,8 @@ describe("CustomEditor queue keybinding", () => {
 		editor.handleInput("/mo");
 		editor.handleInput("\x1b[13;5u");
 
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("/model");
+		expect(onSubmit).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("/mo\n");
 	});
 
 	it("keeps Shift+Enter as the multiline newline chord", () => {
