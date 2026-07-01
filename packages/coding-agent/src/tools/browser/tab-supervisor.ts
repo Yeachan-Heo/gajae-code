@@ -55,6 +55,8 @@ export interface TabSession {
 	pending: Map<string, PendingRun>;
 	dialogPolicy?: DialogPolicy;
 	kindTag: BrowserKindTag;
+	/** True when opened via the resolved default backend (headless native or aside), not an explicit app.* path. */
+	defaultBackend: boolean;
 	/** Session that acquired this tab; used for session-scoped teardown (F13). */
 	ownerId?: string;
 	/** Unix-ms timestamp of the last acquire/run activity; drives GC idle + LRU ordering. */
@@ -240,6 +242,7 @@ export async function acquireTab(
 		pending: new Map(),
 		dialogPolicy: opts.dialogs,
 		kindTag: browser.kind.kind,
+		defaultBackend: browser.kind.kind === "headless" || browser.kind.kind === "aside",
 		ownerId: opts.ownerId,
 		lastUsedAt: Date.now(),
 	};
@@ -362,6 +365,29 @@ export async function releaseTabsForOwner(
 export async function dropHeadlessTabs(): Promise<void> {
 	const names = [...tabs.values()].filter(tab => tab.kindTag === "headless").map(tab => tab.name);
 	for (const name of names) await releaseTab(name);
+}
+
+/**
+ * Drop only default-backend tabs (native headless or aside), used when switching
+ * `browser.backend`. Explicit `app.*` tabs (spawned/chrome-profile/connected) are
+ * retained. A busy default-backend tab blocks the switch with a clear error rather
+ * than silently killing an in-flight run, unless `includeBusy` is set.
+ */
+export async function dropDefaultBackendTabs(opts: { includeBusy?: boolean } = {}): Promise<number> {
+	const targets = [...tabs.values()].filter(tab => tab.defaultBackend);
+	if (!opts.includeBusy) {
+		const busy = targets.filter(tab => tab.pending.size > 0).map(tab => tab.name);
+		if (busy.length > 0) {
+			throw new ToolError(
+				`Cannot switch browser backend while default-backend tab(s) are busy: ${busy.map(n => JSON.stringify(n)).join(", ")}. Wait for the run to finish or close the tab, then retry.`,
+			);
+		}
+	}
+	let count = 0;
+	for (const name of targets.map(t => t.name)) {
+		if (await releaseTab(name)) count++;
+	}
+	return count;
 }
 
 async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {

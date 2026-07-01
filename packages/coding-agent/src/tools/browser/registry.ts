@@ -25,11 +25,14 @@ export type BrowserKind =
 			noFocus: boolean;
 			cdpPort?: number;
 	  }
-	| { kind: "connected"; cdpUrl: string };
+	| { kind: "connected"; cdpUrl: string }
+	| { kind: "aside"; cliPath: string; liveProfile: true; defaultBackend: true };
 
 export type BrowserKindTag = BrowserKind["kind"];
 
+/** Native (Puppeteer/CDP) browser handle. `driver` discriminates it from Aside handles. */
 export interface BrowserHandle {
+	driver: "native";
 	key: string;
 	kind: BrowserKind;
 	browser: Browser;
@@ -39,6 +42,26 @@ export interface BrowserHandle {
 	refCount: number;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
+
+/** Alias for the native handle shape (used where the native/Aside split is explicit). */
+export type NativeBrowserHandle = BrowserHandle;
+
+/**
+ * Aside (out-of-process REPL) browser handle. Carries no Puppeteer `Browser`, CDP
+ * session, or stealth state — Aside never fabricates native CDP concepts. Per-tab
+ * REPL child lifecycle lives on the Aside tab session, not here.
+ */
+export interface AsideBrowserHandle {
+	driver: "aside";
+	key: string;
+	kind: Extract<BrowserKind, { kind: "aside" }>;
+	cliPath: string;
+	refCount: number;
+	liveProfile: true;
+}
+
+/** Any browser handle, discriminated by `driver`. */
+export type AnyBrowserHandle = NativeBrowserHandle | AsideBrowserHandle;
 
 type SpawnedChromeProfileKind = Extract<BrowserKind, { kind: "chrome-profile" }>;
 
@@ -61,6 +84,8 @@ function browserKey(kind: BrowserKind): string {
 			return `chrome-profile:${kind.path}:${kind.userDataDir}:${kind.profileDirectory}:${kind.cdpPort ?? 0}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
+		case "aside":
+			return `aside:${kind.cliPath}`;
 	}
 }
 
@@ -89,6 +114,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	if (kind.kind === "headless") {
 		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport });
 		return {
+			driver: "native",
 			key: browserKey(kind),
 			kind,
 			browser,
@@ -106,6 +132,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 		return {
+			driver: "native",
 			key: browserKey(kind),
 			kind,
 			browser,
@@ -118,6 +145,11 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		return await openChromeProfileHandle(kind, opts);
 	}
 
+	if (kind.kind === "aside") {
+		// Aside is a separate out-of-process REPL backend; it is not acquired through the
+		// Puppeteer/CDP registry. Routing is wired in a later phase (aside-driver).
+		throw new ToolError("The Aside browser backend is not yet wired into browser acquisition.");
+	}
 	return await openSpawnedBrowserHandle(kind, opts);
 }
 
@@ -253,6 +285,7 @@ export async function openChromeProfileHandle(
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
+		driver: "native",
 		key: browserKey(kind),
 		kind,
 		browser,
@@ -319,6 +352,7 @@ async function openSpawnedBrowserHandle(
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
+		driver: "native",
 		key: browserKey(kind),
 		kind,
 		browser,

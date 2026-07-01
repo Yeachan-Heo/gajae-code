@@ -16,6 +16,7 @@ function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHan
 		process: () => (opts.pid === undefined ? null : ({ pid: opts.pid } as never)),
 	} as unknown as Browser;
 	const handle: BrowserHandle = {
+		driver: "native",
 		key: "headless:1",
 		kind: { kind: "headless", headless: true },
 		browser,

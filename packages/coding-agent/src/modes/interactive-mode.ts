@@ -67,6 +67,8 @@ import { getRecentSessions } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
+import { probeAsideCli } from "../tools/browser/aside-cli";
+import { browserBackendOptions } from "../tools/browser/backend-select";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
@@ -2497,6 +2499,33 @@ export class InteractiveMode implements InteractiveModeContext {
 	// Selector handling
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
+	}
+
+	showBrowserSelector(): void {
+		const current = (this.settings.get("browser.backend") as "native" | "aside") ?? "native";
+		const options = browserBackendOptions(process.platform);
+		const lines: string[] = ["Browser backend selection", ""];
+		for (const opt of options) {
+			const marker = opt.value === current ? "●" : "○";
+			lines.push(`${marker} ${opt.label}${opt.value === current ? "  (current)" : ""}`);
+			lines.push(`   ${opt.description}`);
+		}
+		lines.push("");
+		if (process.platform === "darwin") {
+			const probe = probeAsideCli();
+			if (probe.ok) {
+				lines.push(`Aside CLI: found at ${probe.path}`);
+			} else {
+				lines.push("Aside CLI: not installed. Install it, then select Aside:");
+				lines.push(`  ${probe.manualInstallCommand}`);
+			}
+		} else {
+			lines.push("Aside is macOS-only and is hidden on this platform.");
+		}
+		lines.push("");
+		lines.push("Switch via /settings → Tools → Browser Backend, or: gjc config set browser.backend <native|aside>");
+		lines.push("Selecting Aside drives your live logged-in Aside profile (not isolated).");
+		this.showStatus(lines.join("\n"));
 	}
 
 	showThemeSelector(): void {

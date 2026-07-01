@@ -4,9 +4,18 @@ import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
+import { probeAsideCli } from "./browser/aside-cli";
+import { AsideTabManager } from "./browser/aside-driver";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
-import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
-import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
+import type { Observation, RunResultOk, ScreenshotResult } from "./browser/tab-protocol";
+import {
+	acquireTab,
+	dropDefaultBackendTabs,
+	getTab,
+	releaseAllTabs,
+	releaseTab,
+	runInTab,
+} from "./browser/tab-supervisor";
 import type { OutputMeta } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -103,6 +112,8 @@ export interface BrowserToolDetails {
 	name?: string;
 	url?: string;
 	browser?: BrowserKindTag;
+	backend?: "native" | "aside";
+	liveProfile?: boolean;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	observation?: Observation;
 	screenshots?: ScreenshotResult[];
@@ -139,6 +150,19 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe };
 	}
+	const backend = (session.settings.get("browser.backend") as "native" | "aside") ?? "native";
+	if (backend === "aside") {
+		if (process.platform !== "darwin") {
+			throw new ToolError("The Aside browser backend is only supported on macOS. Set browser.backend to 'native'.");
+		}
+		const probe = probeAsideCli();
+		if (!probe.ok) {
+			throw new ToolError(
+				`Aside CLI not found (searched: ${probe.searched.join(", ")}). Install it with \`${probe.manualInstallCommand}\` or run /browser, then retry. Explicit app.path/app.browser/app.cdp_url always use the native backend.`,
+			);
+		}
+		return { kind: "aside", cliPath: probe.path, liveProfile: true, defaultBackend: true };
+	}
 	const headless = session.settings.get("browser.headless") as boolean;
 	return { kind: "headless", headless };
 }
@@ -158,15 +182,22 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	readonly strict = true;
 
 	constructor(private readonly session: ToolSession) {}
+	readonly #aside = new AsideTabManager();
 	#description?: string;
 	get description(): string {
 		this.#description ??= prompt.render(browserDescription, {});
 		return this.#description;
 	}
 
-	/** Restart browser to apply mode changes (e.g. headless toggle). Drops only headless browsers. */
+	/**
+	 * Restart the browser to apply mode/backend changes (headless toggle or
+	 * `browser.backend` switch). Drops only default-backend tabs (native headless
+	 * or aside); explicit `app.*` tabs are retained. Throws if a default-backend
+	 * tab is busy so an in-flight run is never silently killed.
+	 */
 	async restartForModeChange(): Promise<void> {
-		await dropHeadlessTabs();
+		await dropDefaultBackendTabs();
+		this.#aside.closeAll();
 	}
 
 	async execute(
@@ -213,6 +244,30 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	): Promise<AgentToolResult<BrowserToolDetails>> {
 		const kind = resolveBrowserKind(params, this.session);
 		details.browser = kind.kind;
+
+		if (kind.kind === "aside") {
+			details.backend = "aside";
+			details.liveProfile = true;
+			if (getTab(name)) {
+				throw new ToolError(
+					`Tab ${JSON.stringify(name)} is bound to the native browser. Close it first before switching to the Aside backend.`,
+				);
+			}
+			const result = await untilAborted(signal, () =>
+				this.#aside.open(name, kind.cliPath, { url: params.url, timeoutMs, signal }),
+			);
+			details.url = result.info.url;
+			details.viewport = result.info.viewport;
+			const verb = result.created ? "Opened" : "Reused";
+			const lines = [
+				`${verb} Aside tab ${JSON.stringify(name)} (live profile)`,
+				`URL: ${result.info.url}`,
+				result.info.title ? `Title: ${result.info.title}` : null,
+				"Aside live profile: commands run in your logged-in Aside browser session.",
+			].filter((l): l is string => typeof l === "string");
+			details.result = lines.join("\n");
+			return toolResult(details).text(lines.join("\n")).done();
+		}
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
 		const existing = getTab(name);
@@ -279,7 +334,14 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		const kill = !!params.kill;
 		if (params.all) {
 			const count = await untilAborted(signal, () => releaseAllTabs({ kill }));
-			details.result = `Closed ${count} tab(s)`;
+			const asideCount = this.#aside.closeAll();
+			details.result = `Closed ${count + asideCount} tab(s)`;
+			return toolResult(details).text(details.result).done();
+		}
+		if (this.#aside.has(name)) {
+			details.backend = "aside";
+			const closed = this.#aside.close(name);
+			details.result = closed ? `Closed Aside tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
 			return toolResult(details).text(details.result).done();
 		}
 		const closed = await untilAborted(signal, () => releaseTab(name, { kill }));
@@ -297,18 +359,25 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		if (!params.code?.trim()) {
 			throw new ToolError("Missing required parameter 'code' for action 'run'.");
 		}
-		const tab = getTab(name);
-		if (tab) {
-			details.browser = tab.browser.kind.kind;
-			details.url = tab.info.url;
+		if (this.#aside.has(name)) {
+			details.backend = "aside";
+			details.liveProfile = true;
+		} else {
+			const tab = getTab(name);
+			if (tab) {
+				details.browser = tab.browser.kind.kind;
+				details.url = tab.info.url;
+			}
 		}
 
-		const { displays, returnValue, screenshots } = await runInTab(name, {
-			code: params.code,
-			timeoutMs,
-			signal,
-			session: this.session,
-		});
+		const { displays, returnValue, screenshots } = this.#aside.has(name)
+			? await this.#aside.run(name, params.code, timeoutMs, signal)
+			: await runInTab(name, {
+					code: params.code,
+					timeoutMs,
+					signal,
+					session: this.session,
+				});
 
 		if (screenshots.length) details.screenshots = screenshots;
 
@@ -338,28 +407,29 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		if (steps.length === 0) {
 			throw new ToolError("Missing required parameter 'actions' for action 'act'.");
 		}
-		const tab = getTab(name);
-		if (!tab) {
-			throw new ToolError(`No tab named ${JSON.stringify(name)}. Open it first with action 'open'.`);
+		let res: RunResultOk;
+		if (this.#aside.has(name)) {
+			details.backend = "aside";
+			details.liveProfile = true;
+			res = await this.#aside.act(name, steps, timeoutMs, signal);
+		} else {
+			const tab = getTab(name);
+			if (!tab) {
+				throw new ToolError(`No tab named ${JSON.stringify(name)}. Open it first with action 'open'.`);
+			}
+			details.browser = tab.browser.kind.kind;
+			details.url = tab.info.url;
+			// compileActionSteps validates each step and produces injection-safe code
+			// (steps embedded as parsed JSON) for the existing in-tab run worker.
+			let code: string;
+			try {
+				code = compileActionSteps(steps);
+			} catch (error) {
+				throw new ToolError(error instanceof Error ? error.message : String(error));
+			}
+			res = await runInTab(name, { code, timeoutMs, signal, session: this.session });
 		}
-		details.browser = tab.browser.kind.kind;
-		details.url = tab.info.url;
-
-		// compileActionSteps validates each step and produces injection-safe code
-		// (steps embedded as parsed JSON) for the existing in-tab run worker.
-		let code: string;
-		try {
-			code = compileActionSteps(steps);
-		} catch (error) {
-			throw new ToolError(error instanceof Error ? error.message : String(error));
-		}
-
-		const { displays, returnValue, screenshots } = await runInTab(name, {
-			code,
-			timeoutMs,
-			signal,
-			session: this.session,
-		});
+		const { displays, returnValue, screenshots } = res;
 
 		if (screenshots.length) details.screenshots = screenshots;
 		const content = [...displays];
@@ -388,6 +458,8 @@ function describeBrowser(handle: BrowserHandle): string {
 			return `Chrome profile ${handle.kind.profileDirectory} at ${handle.kind.userDataDir} (${handle.subprocess ? `pid ${handle.pid ?? "?"}` : "external CDP"})`;
 		case "connected":
 			return `connected ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
+		case "aside":
+			return `Aside live profile (${handle.kind.cliPath})`;
 	}
 }
 
@@ -401,6 +473,8 @@ function describeKind(kind: BrowserKind): string {
 			return `chrome-profile:${kind.path}:${kind.userDataDir}:${kind.profileDirectory}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
+		case "aside":
+			return `aside:${kind.cliPath}`;
 	}
 }
 
@@ -412,6 +486,7 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 		return a.path === b.path && a.userDataDir === b.userDataDir && a.profileDirectory === b.profileDirectory;
 	}
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
+	if (a.kind === "aside" && b.kind === "aside") return a.cliPath === b.cliPath;
 	return false;
 }
 

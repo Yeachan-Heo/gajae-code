@@ -68,12 +68,23 @@ export type WorkerInbound =
 	| { type: "tool-reply"; id: string; reply: ToolReply }
 	| { type: "close" };
 
-export interface ReadyInfo {
+/** Backend-neutral tab info shared by native and Aside drivers (no CDP concepts). */
+export interface BrowserTabInfo {
 	url: string;
 	title?: string;
 	viewport: { width: number; height: number; deviceScaleFactor?: number };
+}
+
+/** Native (Puppeteer/CDP) readiness info: backend-neutral info plus the CDP target id. */
+export interface NativeReadyInfo extends BrowserTabInfo {
 	targetId: string;
 }
+
+/**
+ * Native worker readiness payload. Aliased to NativeReadyInfo so the CDP `targetId`
+ * stays native-only; Aside never produces a fake targetId (it uses BrowserTabInfo).
+ */
+export type ReadyInfo = NativeReadyInfo;
 
 export interface RunResultOk {
 	displays: Array<TextContent | ImageContent>;

@@ -276,6 +276,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	it("kills only a GJC-launched profile browser on cleanup", async () => {
 		const browser = fakeConnectedBrowser();
 		const handle: BrowserHandle = {
+			driver: "native",
 			key: "chrome-profile:test",
 			kind: chromeProfileKind(),
 			browser,
