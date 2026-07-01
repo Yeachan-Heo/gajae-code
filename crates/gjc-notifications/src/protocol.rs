@@ -251,7 +251,8 @@ pub struct IdentityHeader {
 pub struct ContextUpdate {
 	/// The session this update belongs to.
 	pub session_id:   String,
-	/// Compact current working directory label; never the full host path by default.
+	/// Compact current working directory label; never the full host path by
+	/// default.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cwd:          Option<String>,
 	/// Last assistant message text.
