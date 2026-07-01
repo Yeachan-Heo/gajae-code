@@ -84,12 +84,12 @@ describe("isUsageLimitError", () => {
 		expect(isUsageLimitError("resource exhausted")).toBe(false);
 	});
 
-	it("detects Anthropic account exhaustion and large retry-after hints", () => {
+	it("detects Anthropic account exhaustion without treating generic retry-after as usage exhaustion", () => {
 		expect(isUsageLimitError("This request would exceed your account's rate limit. Please try again later.")).toBe(
 			true,
 		);
 		expect(isUsageLimitError("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits")).toBe(true);
-		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=62291000")).toBe(true);
+		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=62291000")).toBe(false);
 		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=5000")).toBe(false);
 	});
 

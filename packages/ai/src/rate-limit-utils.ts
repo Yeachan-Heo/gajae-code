@@ -95,12 +95,6 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 /** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
 const USAGE_LIMIT_PATTERN =
 	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|model.?limit|model_limit_reached|message.?limit|message_limit_reached|limit for this model|quota.?exceeded|out_of_credits|request would exceed your account.?s rate limit|resource has been exhausted[^\n]*(?:quota|limit)/i;
-const LARGE_RETRY_AFTER_HINT_MS = 15 * 60 * 1000;
-
 export function isUsageLimitError(errorMessage: string): boolean {
-	if (USAGE_LIMIT_PATTERN.test(errorMessage)) return true;
-	const retryAfterMatch = /retry-after-ms=(\d+)/i.exec(errorMessage);
-	if (!retryAfterMatch) return false;
-	const retryAfterMs = Number(retryAfterMatch[1]);
-	return Number.isFinite(retryAfterMs) && retryAfterMs >= LARGE_RETRY_AFTER_HINT_MS;
+	return USAGE_LIMIT_PATTERN.test(errorMessage);
 }
