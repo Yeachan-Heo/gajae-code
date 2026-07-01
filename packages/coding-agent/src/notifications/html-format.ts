@@ -354,6 +354,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			.reverse()
 			.join("");
 	const openersFor = (s: OpenTag[]): string => s.map(t => t.tag).join("");
+	const minimumChunkLengthFor = (s: OpenTag[]): number => openersFor(s).length + closersFor(s).length + 1;
 	const flush = (): void => {
 		if (!chunkHasBody) return;
 		chunks.push(out + closersFor(stack));
@@ -361,21 +362,43 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 		chunkHasBody = false;
 	};
 
+	const updateStackForClose = (name: string): boolean => {
+		const idx = stack.findLastIndex(t => t.name === name);
+		if (idx === -1) return false;
+		stack.splice(idx, 1);
+		return true;
+	};
+
 	for (const token of tokens) {
-		const nextStack = [...stack];
-		if (token.open) nextStack.push({ name: token.open, tag: token.openTag ?? token.value });
-		else if (token.close) {
-			const idx = nextStack.findLastIndex(t => t.name === token.close);
-			if (idx !== -1) nextStack.splice(idx, 1);
+		if (token.open) {
+			const nextStack = [...stack, { name: token.open, tag: token.openTag ?? token.value }];
+			if (minimumChunkLengthFor(nextStack) > max) continue;
+			if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+			if (out.length + token.value.length + closersFor(nextStack).length > max) continue;
+			out += token.value;
+			chunkHasBody = true;
+			stack.push({ name: token.open, tag: token.openTag ?? token.value });
+			continue;
 		}
-		if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+
+		if (token.close) {
+			const idx = stack.findLastIndex(t => t.name === token.close);
+			if (idx === -1) continue;
+			const nextStack = stack.toSpliced(idx, 1);
+			if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+			if (out.length + token.value.length + closersFor(nextStack).length > max) {
+				updateStackForClose(token.close);
+				continue;
+			}
+			out += token.value;
+			chunkHasBody = true;
+			updateStackForClose(token.close);
+			continue;
+		}
+
+		if (chunkHasBody && out.length + token.value.length + closersFor(stack).length > max) flush();
 		out += token.value;
 		chunkHasBody = true;
-		if (token.open) stack.push({ name: token.open, tag: token.openTag ?? token.value });
-		else if (token.close) {
-			const idx = stack.findLastIndex(t => t.name === token.close);
-			if (idx !== -1) stack.splice(idx, 1);
-		}
 	}
 	if (chunkHasBody) chunks.push(out + closersFor(stack));
 	return chunks;

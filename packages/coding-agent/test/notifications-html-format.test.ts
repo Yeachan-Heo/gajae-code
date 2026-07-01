@@ -130,6 +130,17 @@ describe("splitTelegramHtml", () => {
 		expect(chunks.every(chunk => !chunk.startsWith("<a>") && !chunk.includes("<a>"))).toBe(true);
 		expect(chunks.filter(chunk => chunk.startsWith("<a ")).length).toBeGreaterThan(1);
 	});
+
+	test("degrades oversized anchor tags instead of emitting over-limit chunks", () => {
+		const url = `https://example.com/${"x".repeat(TELEGRAM_MESSAGE_LIMIT + 100)}`;
+		const chunks = splitTelegramHtml(`<a href="${url}">label</a>`);
+
+		expect(chunks.length).toBeGreaterThan(0);
+		expect(chunks.every(chunk => chunk.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+		expect(chunks.join("")).toBe("label");
+		expect(chunks.join("")).not.toContain("<a");
+		expect(chunks.join("")).not.toContain("</a>");
+	});
 });
 
 describe("button grid (AC6)", () => {
