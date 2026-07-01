@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Deep Interview option-clarification prompts now stay out of the interview transcript and ambiguity recorder, so asking about displayed choices no longer persists as the round answer before the user selects an actual option.
 
 ## [0.7.9] - 2026-07-01
 ### Added

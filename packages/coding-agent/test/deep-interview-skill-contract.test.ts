@@ -97,3 +97,15 @@ describe("deep-interview implementation wording boundary", () => {
 		expect(skill).toContain("execution approval must be captured by a downstream execution path");
 	});
 });
+
+describe("deep-interview ask clarification contract", () => {
+	it("treats clarificationQuestion as a non-answer and re-asks without scoring", () => {
+		expect(skill).toContain("clarificationQuestion");
+		expect(skill).toContain("treat it as a non-answer about the displayed choices");
+		expect(skill).toContain(
+			"call `ask` again with the exact original question, options, and `deepInterview.*` metadata",
+		);
+		expect(skill).toContain("bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring");
+		expect(skill).toContain("must not be recorded as a round answer");
+	});
+});

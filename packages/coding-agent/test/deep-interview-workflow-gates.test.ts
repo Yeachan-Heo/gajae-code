@@ -32,10 +32,10 @@ describe("questionToGate", () => {
 		expect(gate.kind).toBe("question");
 		expect(gate.options?.map(o => o.label)).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.options?.[0]?.description).toBe("recommended");
-		// schema is the documented subset and accepts {selected, custom?}
+		// schema is the documented subset and accepts answers or clarification.
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.schema.properties?.other?.type).toBe("boolean");
-		expect(gate.schema.required).toEqual(["selected"]);
+		expect(gate.schema.properties?.action?.enum).toEqual(["answer", "clarify"]);
 		expect(gate.context?.stage_state).toMatchObject({
 			question_id: "q1",
 			multi: false,
@@ -71,6 +71,12 @@ describe("gateAnswerToResult (human-path parity)", () => {
 		expect(r.selectedOptions).toEqual([]);
 		expect(r.customInput).toBe("Passkeys");
 	});
+	it("handles clarification as a non-answer", () => {
+		const r = gateAnswerToResult(singleQ, { action: "clarify", question: "How are JWT and OAuth2 different?" });
+		expect(r.selectedOptions).toEqual([]);
+		expect(r.customInput).toBeUndefined();
+		expect(r.clarificationQuestion).toBe("How are JWT and OAuth2 different?");
+	});
 
 	it("rejects invalid answers", () => {
 		expect(() => gateAnswerToResult(singleQ, { selected: [] })).toThrow(DeepInterviewGateError);
@@ -78,6 +84,15 @@ describe("gateAnswerToResult (human-path parity)", () => {
 		expect(() => gateAnswerToResult(singleQ, { selected: ["JWT", "OAuth2"] })).toThrow(/single selection/);
 		expect(() => gateAnswerToResult(singleQ, { selected: [], other: true })).toThrow(/custom text is required/);
 		expect(() => gateAnswerToResult(singleQ, { foo: 1 })).toThrow(/answer must be/);
+		expect(() => gateAnswerToResult(singleQ, { action: "clarify", question: " \t\n " })).toThrow(
+			/clarification question is required/,
+		);
+		expect(() =>
+			gateAnswerToResult(singleQ, { action: "clarify", question: "Which one?", selected: ["JWT"] }),
+		).toThrow(/answer must be/);
+		expect(() =>
+			gateAnswerToResult(singleQ, { action: "clarify", question: "Which one?", selected: [], other: false }),
+		).toThrow(/answer must be/);
 	});
 });
 
@@ -101,7 +116,7 @@ describe("end-to-end via the broker", () => {
 		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
 	});
 
-	it("accepts single-select normal selection and Other-only paths", async () => {
+	it("accepts single-select normal selection, Other-only, and clarification paths", async () => {
 		const broker = new WorkflowGateBroker("run-di-valid", new MemoryGateStore());
 		const selectionGate = broker.openGate(questionToGate(singleQ));
 		const selection = await broker.resolve({ gate_id: selectionGate.gate_id, answer: { selected: ["JWT"] } });
@@ -113,6 +128,13 @@ describe("end-to-end via the broker", () => {
 			answer: { selected: [], other: true, custom: "Passkeys" },
 		});
 		expect(other.status).toBe("accepted");
+
+		const clarifyGate = broker.openGate(questionToGate(singleQ));
+		const clarify = await broker.resolve({
+			gate_id: clarifyGate.gate_id,
+			answer: { action: "clarify", question: "What does OAuth2 imply here?" },
+		});
+		expect(clarify.status).toBe("accepted");
 	});
 });
 

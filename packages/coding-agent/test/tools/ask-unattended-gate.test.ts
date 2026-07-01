@@ -154,6 +154,28 @@ describe("ask tool unattended gate emission (G011)", () => {
 		expect(JSON.stringify(result.details)).toContain("Passkeys");
 	});
 
+	it("handles a clarification gate answer without selectedOptions or customInput", async () => {
+		const emitter = new StubEmitter(() => ({ action: "clarify", question: "What does JWT mean here?" }));
+		const tool = new AskTool(createSession(emitter));
+		const result = await tool.execute(
+			"call-clarification",
+			{ questions: [{ id: "auth", question: "Which auth?", options: [{ label: "JWT" }] }] },
+			undefined,
+			undefined,
+			createContext(),
+		);
+
+		expect(result.details).toMatchObject({
+			selectedOptions: [],
+			customInput: undefined,
+			clarificationQuestion: "What does JWT mean here?",
+		});
+		expect(result.content[0]).toMatchObject({
+			type: "text",
+			text: "User asked a clarification question about the choices: What does JWT mean here?",
+		});
+	});
+
 	it("does not emit a gate when the emitter reports attended mode (isUnattended false)", async () => {
 		const received: OpenGateInput[] = [];
 		const attendedEmitter: WorkflowGateEmitter = {

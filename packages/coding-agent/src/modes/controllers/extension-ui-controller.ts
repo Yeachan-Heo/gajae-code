@@ -617,7 +617,8 @@ export class ExtensionUiController {
 		const listChromeRows = dialogOptions?.outline === true ? HOOK_SELECTOR_OUTLINE_ROWS : 0;
 		// Reserve rows for the inline custom-input editor so opening it doesn't
 		// push the scrollable title past the viewport into terminal scrollback.
-		const inlineInputRows = dialogOptions?.customInput ? HOOK_SELECTOR_INLINE_INPUT_ROWS : 0;
+		const inlineInputRows =
+			dialogOptions?.customInput || dialogOptions?.clarificationInput ? HOOK_SELECTOR_INLINE_INPUT_ROWS : 0;
 		const availableTitleRows =
 			this.ctx.ui.terminal.rows - scrollOptionRows - listChromeRows - inlineInputRows - HOOK_SELECTOR_CHROME_ROWS;
 		const scrollTitleRows =
@@ -659,7 +660,10 @@ export class ExtensionUiController {
 				tui: this.ctx.ui,
 				// Share the main prompt editor's autocomplete provider so the
 				// inline "Other (type your own)" editor supports `@` file links.
-				autocompleteProvider: dialogOptions?.customInput ? this.ctx.editor.getAutocompleteProvider() : undefined,
+				autocompleteProvider:
+					dialogOptions?.customInput || dialogOptions?.clarificationInput
+						? this.ctx.editor.getAutocompleteProvider()
+						: undefined,
 				outline: dialogOptions?.outline,
 				wrapFocused: dialogOptions?.wrapFocused,
 				scrollTitleRows,
@@ -671,6 +675,18 @@ export class ExtensionUiController {
 								const optionLabel = dialogOptions.customInput?.optionLabel;
 								this.hideHookSelector();
 								dialogOptions.customInput?.onSubmit(text);
+								finish(optionLabel);
+							},
+						}
+					: undefined,
+				clarificationInput: dialogOptions?.clarificationInput
+					? {
+							optionLabel: dialogOptions.clarificationInput.optionLabel,
+							allowEmpty: dialogOptions.clarificationInput.allowEmpty,
+							onSubmit: text => {
+								const optionLabel = dialogOptions.clarificationInput?.optionLabel;
+								this.hideHookSelector();
+								dialogOptions.clarificationInput?.onSubmit(text);
 								finish(optionLabel);
 							},
 						}

@@ -91,6 +91,7 @@ export interface QuestionResult {
 	multi: boolean;
 	selectedOptions: string[];
 	customInput?: string;
+	clarificationQuestion?: string;
 }
 
 export interface AskToolDetails {
@@ -99,6 +100,7 @@ export interface AskToolDetails {
 	multi?: boolean;
 	selectedOptions?: string[];
 	customInput?: string;
+	clarificationQuestion?: string;
 	/** Multi-part question mode */
 	results?: QuestionResult[];
 }
@@ -108,6 +110,7 @@ export interface AskToolDetails {
 // =============================================================================
 
 const OTHER_OPTION = "Other (type your own)";
+const ASK_CLARIFICATION_OPTION = "Ask about these choices";
 const RECOMMENDED_SUFFIX = " (Recommended)";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
@@ -183,6 +186,7 @@ function numberOptionLabels(labels: string[]): string[] {
 interface SelectionResult {
 	selectedOptions: string[];
 	customInput?: string;
+	clarificationQuestion?: string;
 	timedOut: boolean;
 	navigation?: "back" | "forward";
 	cancelled?: boolean;
@@ -201,6 +205,7 @@ interface AskSingleQuestionOptions {
 	navigation?: NavigationControls;
 	scrollTitleRows?: number;
 	otherOptionLabel?: string;
+	clarificationOptionLabel?: string;
 }
 
 interface UIContext {
@@ -219,6 +224,7 @@ interface UIContext {
 			onRight?: () => void;
 			helpText?: string;
 			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
+			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 		},
 	): Promise<string | undefined>;
 	editor(
@@ -239,6 +245,7 @@ async function askSingleQuestion(
 	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
+	const clarificationOptionLabel = options.clarificationOptionLabel;
 	let selectedOptions = [...(initialSelection?.selectedOptions ?? [])];
 	let customInput = initialSelection?.customInput;
 	let timedOut = false;
@@ -252,15 +259,17 @@ async function askSingleQuestion(
 		timedOut: boolean;
 		navigation?: "back" | "forward";
 		inlineInput?: string;
+		inlineClarification?: string;
 	}> => {
 		let timeoutTriggered = false;
 		const onTimeout = () => {
 			timeoutTriggered = true;
 		};
-		// Inline custom input: the TUI selector keeps the question and option
-		// list on screen and collects the "Other" text below the list, instead
-		// of swapping to a separate editor screen that hides the question.
+		// Inline custom/clarification input: the TUI selector keeps the question
+		// and option list on screen and collects text below the list, instead of
+		// swapping to a separate editor screen that hides the question.
 		let inlineInput: string | undefined;
+		let inlineClarification: string | undefined;
 		let navigationAction: "back" | "forward" | undefined;
 		const baseHelpText = navigation
 			? "up/down navigate  enter select  ←/→ question  esc cancel"
@@ -286,6 +295,15 @@ async function askSingleQuestion(
 					inlineInput = text;
 				},
 			},
+			clarificationInput: clarificationOptionLabel
+				? {
+						optionLabel: clarificationOptionLabel,
+						allowEmpty: false,
+						onSubmit: (text: string) => {
+							inlineClarification = text;
+						},
+					}
+				: undefined,
 			onLeft: navigation?.allowBack
 				? () => {
 						navigationAction = "back";
@@ -304,7 +322,7 @@ async function askSingleQuestion(
 		if (!timeoutTriggered && choice === undefined && typeof timeout === "number") {
 			timeoutTriggered = Date.now() - startMs >= timeout;
 		}
-		return { choice, timedOut: timeoutTriggered, navigation: navigationAction, inlineInput };
+		return { choice, timedOut: timeoutTriggered, navigation: navigationAction, inlineInput, inlineClarification };
 	};
 
 	// Fallback for UI contexts that don't support inline custom input (they
@@ -314,6 +332,13 @@ async function askSingleQuestion(
 		const showCustomInput = () => ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
+	};
+	const promptForClarificationInput = async (): Promise<{ input: string | undefined }> => {
+		const dialogOptions = signal ? { signal } : undefined;
+		const showClarificationInput = () =>
+			ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
+		const input = signal ? await untilAborted(signal, showClarificationInput) : await showClarificationInput();
+		return { input: input !== undefined && input.trim() === "" ? undefined : input };
 	};
 
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
@@ -337,6 +362,9 @@ async function askSingleQuestion(
 				opts.push(doneLabel);
 			}
 			opts.push(otherOptionLabel);
+			if (clarificationOptionLabel) {
+				opts.push(clarificationOptionLabel);
+			}
 
 			const prefix = selected.size > 0 ? `(${selected.size} selected) ` : "";
 			const {
@@ -344,6 +372,7 @@ async function askSingleQuestion(
 				timedOut: selectTimedOut,
 				navigation: arrowNavigation,
 				inlineInput,
+				inlineClarification,
 			} = await selectOption(`${prefix}${promptWithProgress}`, opts, cursorIndex);
 
 			if (arrowNavigation) {
@@ -369,6 +398,18 @@ async function askSingleQuestion(
 				}
 				customInput = input;
 				break;
+			}
+			if (clarificationOptionLabel && choice === clarificationOptionLabel) {
+				if (selectTimedOut) {
+					timedOut = true;
+					break;
+				}
+				const input =
+					inlineClarification !== undefined ? inlineClarification : (await promptForClarificationInput()).input;
+				if (input === undefined) {
+					break;
+				}
+				return { selectedOptions: [], clarificationQuestion: input, timedOut };
 			}
 
 			const selectedIdx = opts.indexOf(choice);
@@ -400,7 +441,9 @@ async function askSingleQuestion(
 		selectedOptions = Array.from(selected);
 	} else {
 		const displayLabels = addRecommendedSuffix(optionLabels, recommended);
-		const optionsWithNavigation = [...displayLabels, otherOptionLabel];
+		const optionsWithNavigation = clarificationOptionLabel
+			? [...displayLabels, otherOptionLabel, clarificationOptionLabel]
+			: [...displayLabels, otherOptionLabel];
 
 		let initialIndex = recommended;
 		const previouslySelected = selectedOptions[0];
@@ -420,6 +463,7 @@ async function askSingleQuestion(
 			timedOut: selectTimedOut,
 			navigation: arrowNavigation,
 			inlineInput,
+			inlineClarification,
 		} = await selectOption(promptWithProgress, optionsWithNavigation, initialIndex);
 		timedOut = selectTimedOut;
 
@@ -436,6 +480,15 @@ async function askSingleQuestion(
 				if (input !== undefined) {
 					customInput = input;
 					selectedOptions = [];
+				}
+				// If input was dismissed (undefined), keep prior selectedOptions/customInput intact
+			}
+		} else if (clarificationOptionLabel && choice === clarificationOptionLabel) {
+			if (!selectTimedOut) {
+				const input =
+					inlineClarification !== undefined ? inlineClarification : (await promptForClarificationInput()).input;
+				if (input !== undefined) {
+					return { selectedOptions: [], clarificationQuestion: input, timedOut };
 				}
 				// If input was dismissed (undefined), keep prior selectedOptions/customInput intact
 			}
@@ -466,6 +519,9 @@ async function askSingleQuestion(
 }
 
 function formatQuestionResult(result: QuestionResult): string {
+	if (result.clarificationQuestion !== undefined) {
+		return `${result.id}: clarification requested: ${result.clarificationQuestion}`;
+	}
 	if (result.customInput !== undefined) {
 		return `${result.id}: "${result.customInput}"`;
 	}
@@ -682,6 +738,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					optionLabels: rawOptionLabels,
 					selectedOptions: decoded.selectedOptions,
 					customInput: decoded.customInput,
+					clarificationQuestion: decoded.clarificationQuestion,
 					navigation: undefined as NavigationControls | undefined,
 					cancelled: false,
 					timedOut: false,
@@ -693,6 +750,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				const displayQuestion = deepInterviewPrompt ?? q.question;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
+				const clarificationOptionLabel = shouldNumberOptions
+					? formatNumberedOptionLabel(ASK_CLARIFICATION_OPTION, optionLabels.length + 1)
+					: undefined;
 				const initialSelection =
 					shouldNumberOptions && options?.previous
 						? {
@@ -706,6 +766,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				const {
 					selectedOptions: displaySelectedOptions,
 					customInput,
+					clarificationQuestion,
 					navigation,
 					cancelled,
 					timedOut,
@@ -719,6 +780,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					otherOptionLabel: shouldNumberOptions
 						? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
 						: undefined,
+					clarificationOptionLabel,
 				});
 				const selectedOptions = shouldNumberOptions
 					? displaySelectedOptions.map(selected => {
@@ -726,7 +788,15 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
-				return { optionLabels: rawOptionLabels, selectedOptions, customInput, navigation, cancelled, timedOut };
+				return {
+					optionLabels: rawOptionLabels,
+					selectedOptions,
+					customInput,
+					clarificationQuestion,
+					navigation,
+					cancelled,
+					timedOut,
+				};
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");
@@ -737,22 +807,40 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 
 		if (params.questions.length === 1) {
 			const [q] = params.questions;
-			const { optionLabels, selectedOptions, customInput, cancelled, timedOut } = await askQuestion(q);
+			const { optionLabels, selectedOptions, customInput, clarificationQuestion, cancelled, timedOut } =
+				await askQuestion(q);
 
-			if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) {
+			if (
+				!timedOut &&
+				(cancelled ||
+					(selectedOptions.length === 0 && customInput === undefined && clarificationQuestion === undefined))
+			) {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
-			await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+			if (clarificationQuestion === undefined) {
+				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+			}
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
 				multi: q.multi ?? false,
 				selectedOptions,
 				customInput,
+				clarificationQuestion,
 			};
 
 			const responseParts: string[] = [];
+			if (clarificationQuestion !== undefined) {
+				responseParts.push(
+					clarificationQuestion.includes("\n")
+						? `User asked a clarification question about the choices:\n${clarificationQuestion
+								.split("\n")
+								.map(line => `  ${line}`)
+								.join("\n")}`
+						: `User asked a clarification question about the choices: ${clarificationQuestion}`,
+				);
+			}
 			if (selectedOptions.length > 0) {
 				responseParts.push(
 					q.multi ? `User selected: ${selectedOptions.join(", ")}` : `User selected: ${selectedOptions[0]}`,
@@ -787,6 +875,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				optionLabels,
 				selectedOptions,
 				customInput,
+				clarificationQuestion,
 				navigation: navAction,
 				cancelled,
 				timedOut,
@@ -804,9 +893,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				multi: q.multi ?? false,
 				selectedOptions,
 				customInput,
+				clarificationQuestion,
 			};
 
-			await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+			if (clarificationQuestion === undefined) {
+				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+			}
 
 			if (navAction === "back") {
 				questionIndex = Math.max(0, questionIndex - 1);
@@ -995,7 +1087,10 @@ export const askToolRenderer = {
 		// Multi-part results
 		if (details.results && details.results.length > 0) {
 			const hasAnySelection = details.results.some(
-				r => r.customInput !== undefined || (r.selectedOptions && r.selectedOptions.length > 0),
+				r =>
+					r.clarificationQuestion !== undefined ||
+					r.customInput !== undefined ||
+					(r.selectedOptions && r.selectedOptions.length > 0),
 			);
 			const header = renderStatusLine(
 				{
@@ -1013,7 +1108,8 @@ export const askToolRenderer = {
 				const isLastQuestion = i === details.results.length - 1;
 				const branch = isLastQuestion ? uiTheme.tree.last : uiTheme.tree.branch;
 				const continuation = isLastQuestion ? "   " : `${uiTheme.fg("dim", uiTheme.tree.vertical)}  `;
-				const hasSelection = r.customInput !== undefined || r.selectedOptions.length > 0;
+				const hasSelection =
+					r.clarificationQuestion !== undefined || r.customInput !== undefined || r.selectedOptions.length > 0;
 				const statusIcon = hasSelection
 					? uiTheme.styledSymbol("status.success", "success")
 					: uiTheme.styledSymbol("status.warning", "warning");
@@ -1028,7 +1124,10 @@ export const askToolRenderer = {
 
 				const answerLines: string[] = [];
 				for (let j = 0; j < r.selectedOptions.length; j++) {
-					const isLast = j === r.selectedOptions.length - 1 && r.customInput === undefined;
+					const isLast =
+						j === r.selectedOptions.length - 1 &&
+						r.customInput === undefined &&
+						r.clarificationQuestion === undefined;
 					const optBranch = isLast ? uiTheme.tree.last : uiTheme.tree.branch;
 					const selectedLabel = renderInlineMarkdown(r.selectedOptions[j], mdTheme, t =>
 						uiTheme.fg("toolOutput", t),
@@ -1042,6 +1141,14 @@ export const askToolRenderer = {
 				}
 				if (r.customInput !== undefined) {
 					container.addChild(new Text(renderCustomInput(uiTheme, continuation, r.customInput, true, false), 0, 0));
+				} else if (r.clarificationQuestion !== undefined) {
+					container.addChild(
+						new Text(
+							renderCustomInput(uiTheme, continuation, `Clarification: ${r.clarificationQuestion}`, true, false),
+							0,
+							0,
+						),
+					);
 				} else if (r.selectedOptions.length === 0) {
 					container.addChild(
 						new Text(
@@ -1063,7 +1170,9 @@ export const askToolRenderer = {
 		}
 
 		const hasSelection =
-			details.customInput !== undefined || (details.selectedOptions && details.selectedOptions.length > 0);
+			details.clarificationQuestion !== undefined ||
+			details.customInput !== undefined ||
+			(details.selectedOptions && details.selectedOptions.length > 0);
 		const header = renderStatusLine({ icon: hasSelection ? "success" : "warning", title: "Ask" }, uiTheme);
 		const container = new Container();
 		container.addChild(new Text(header, 0, 0));
@@ -1075,7 +1184,10 @@ export const askToolRenderer = {
 		const answerLines: string[] = [];
 		if (details.selectedOptions && details.selectedOptions.length > 0) {
 			for (let i = 0; i < details.selectedOptions.length; i++) {
-				const isLast = i === details.selectedOptions.length - 1 && details.customInput === undefined;
+				const isLast =
+					i === details.selectedOptions.length - 1 &&
+					details.customInput === undefined &&
+					details.clarificationQuestion === undefined;
 				const branch = isLast ? uiTheme.tree.last : uiTheme.tree.branch;
 				const selectedLabel = renderInlineMarkdown(details.selectedOptions[i], mdTheme, t =>
 					uiTheme.fg("toolOutput", t),
@@ -1090,6 +1202,14 @@ export const askToolRenderer = {
 		}
 		if (details.customInput !== undefined) {
 			container.addChild(new Text(renderCustomInput(uiTheme, " ", details.customInput, true, false), 0, 0));
+		} else if (details.clarificationQuestion !== undefined) {
+			container.addChild(
+				new Text(
+					renderCustomInput(uiTheme, " ", `Clarification: ${details.clarificationQuestion}`, true, false),
+					0,
+					0,
+				),
+			);
 		} else if (!details.selectedOptions || details.selectedOptions.length === 0) {
 			container.addChild(
 				new Text(

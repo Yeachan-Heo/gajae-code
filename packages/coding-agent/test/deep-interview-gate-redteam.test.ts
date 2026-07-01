@@ -74,6 +74,29 @@ describe("deep-interview question gates red-team", () => {
 			selectedOptions: [],
 			customInput: "Bare metal",
 		});
+
+		const multiOtherAnswer = { selected: ["SQLite"], other: true, custom: "S3-compatible" };
+		const multiOther = await resolveQuestion(multiQ, multiOtherAnswer);
+		expect(multiOther.resolution.status).toBe("accepted");
+		expect(gateAnswerToResult(multiQ, multiOtherAnswer)).toEqual({
+			id: "multi-storage",
+			question: "Which storage backends should be supported?",
+			options: ["SQLite", "Postgres", "S3"],
+			multi: true,
+			selectedOptions: ["SQLite"],
+			customInput: "S3-compatible",
+		});
+		const clarificationAnswer = { action: "clarify", question: "What is the difference between JWT and OAuth2?" };
+		const clarification = await resolveQuestion(singleQ, clarificationAnswer);
+		expect(clarification.resolution.status).toBe("accepted");
+		expect(gateAnswerToResult(singleQ, clarificationAnswer)).toEqual({
+			id: "single-auth",
+			question: "Which auth method should we use?",
+			options: ["JWT", "OAuth2", "Session cookies"],
+			multi: false,
+			selectedOptions: [],
+			clarificationQuestion: "What is the difference between JWT and OAuth2?",
+		});
 	});
 
 	it("rejects malformed answers against the advertised schema via the broker", async () => {
@@ -90,8 +113,18 @@ describe("deep-interview question gates red-team", () => {
 				answer: { selected: ["JWT"], surprise: true },
 				keyword: "additionalProperties",
 			},
-			{ name: "missing selected", answer: { custom: "JWT" }, keyword: "required" },
+			{ name: "missing selected", answer: { custom: "JWT" }, keyword: "anyOf" },
 			{ name: "custom not a string", answer: { selected: [], other: true, custom: 42 }, keyword: "type" },
+			{
+				name: "clarification combines selected option",
+				answer: { action: "clarify", question: "Which one?", selected: ["JWT"] },
+				keyword: "anyOf",
+			},
+			{
+				name: "clarification with empty question",
+				answer: { action: "clarify", question: "" },
+				keyword: "minLength",
+			},
 		];
 
 		for (const c of cases) {
@@ -122,8 +155,12 @@ describe("deep-interview question gates red-team", () => {
 				answer: { selected: [], other: true, custom: " \t\n " },
 				code: "missing_custom",
 			},
+			{
+				name: "clarification with whitespace question",
+				answer: { action: "clarify", question: " \t\n " },
+				code: "missing_clarification",
+			},
 		];
-
 		for (const c of cases) {
 			expect(() => gateAnswerToResult(singleQ, c.answer), c.name).toThrow(DeepInterviewGateError);
 			try {

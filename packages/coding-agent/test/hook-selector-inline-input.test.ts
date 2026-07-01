@@ -16,6 +16,7 @@ const TITLE = "Deep Interview question body\n\nLong explanation line one\nLong e
 const OPTIONS = ["1. Option A", "2. Option B", "3. Other (type your own)"];
 const OTHER = OPTIONS[2]!;
 
+const CLARIFY = "4. Ask about these choices";
 interface Callbacks {
 	selected: string[];
 	cancelled: number;
@@ -138,6 +139,43 @@ describe("HookSelectorComponent inline custom input", () => {
 		component.handleInput("\r");
 
 		expect(calls.submitted).toEqual(["hi"]);
+		expect(calls.selected).toEqual([]);
+		expect(calls.cancelled).toBe(0);
+	});
+
+	it("submits clarification text through the separate inline input callback", () => {
+		const calls: Callbacks = { selected: [], cancelled: 0, submitted: [] };
+		const clarifications: string[] = [];
+		const component = new HookSelectorComponent(
+			TITLE,
+			[...OPTIONS, CLARIFY],
+			option => calls.selected.push(option),
+			() => calls.cancelled++,
+			{
+				customInput: {
+					optionLabel: OTHER,
+					onSubmit: text => calls.submitted.push(text),
+				},
+				clarificationInput: {
+					optionLabel: CLARIFY,
+					allowEmpty: false,
+					onSubmit: text => clarifications.push(text),
+				},
+			},
+		);
+
+		component.handleInput("\x1b[B");
+		component.handleInput("\x1b[B");
+		component.handleInput("\x1b[B");
+		component.handleInput("\r");
+		component.handleInput("\r");
+		expect(clarifications).toEqual([]);
+
+		component.handleInput("?");
+		component.handleInput("\r");
+
+		expect(clarifications).toEqual(["?"]);
+		expect(calls.submitted).toEqual([]);
 		expect(calls.selected).toEqual([]);
 		expect(calls.cancelled).toBe(0);
 	});

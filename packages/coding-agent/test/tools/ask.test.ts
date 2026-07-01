@@ -36,6 +36,7 @@ function createContext(args: {
 			onRight?: () => void;
 			helpText?: string;
 			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
+			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 		},
 	) => Promise<string | undefined>;
 	editor?: (
@@ -1306,7 +1307,12 @@ describe("AskTool deep-interview rendering middleware", () => {
 		);
 
 		expect(select).toHaveBeenCalledTimes(1);
-		expect(select.mock.calls[0]?.[1]).toEqual(["1. Condition A", "2. Condition B", "3. Other (type your own)"]);
+		expect(select.mock.calls[0]?.[1]).toEqual([
+			"1. Condition A",
+			"2. Condition B",
+			"3. Other (type your own)",
+			"4. Ask about these choices",
+		]);
 		const prompt = select.mock.calls[0]?.[0] ?? "";
 		expect(prompt).toContain("Deep Interview · Round 3 · Ambiguity 38%");
 		expect(prompt).toContain("Component: Review UI");
@@ -1345,7 +1351,12 @@ describe("AskTool deep-interview rendering middleware", () => {
 			context,
 		);
 
-		expect(select.mock.calls[0]?.[1]).toEqual(["1. Checklist", "2) Scenario", "3. Other (type your own)"]);
+		expect(select.mock.calls[0]?.[1]).toEqual([
+			"1. Checklist",
+			"2) Scenario",
+			"3. Other (type your own)",
+			"4. Ask about these choices",
+		]);
 		expect(result.details?.selectedOptions).toEqual(["2) Scenario"]);
 	});
 
@@ -1380,6 +1391,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 			"1. Numbered choices are visible",
 			"2. Raw answer labels are preserved",
 			"3. Other (type your own)",
+			"4. Ask about these choices",
 		]);
 		expect(result.details?.selectedOptions).toEqual(["Numbered choices are visible"]);
 	});
@@ -1411,7 +1423,12 @@ describe("AskTool deep-interview rendering middleware", () => {
 			context,
 		);
 
-		expect(select.mock.calls[0]?.[1]).toEqual(["1. Performance", "2. Security", "3. Other (type your own)"]);
+		expect(select.mock.calls[0]?.[1]).toEqual([
+			"1. Performance",
+			"2. Security",
+			"3. Other (type your own)",
+			"4. Ask about these choices",
+		]);
 		expect(editor).toHaveBeenCalledTimes(1);
 		expect(result.details?.selectedOptions).toEqual([]);
 		expect(result.details?.customInput).toBe("Use my own boundary");
@@ -1596,6 +1613,129 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(editor).not.toHaveBeenCalled();
 		expect(result.details?.selectedOptions).toEqual([]);
 		expect(result.details?.customInput).toBe("Clarify the verification boundary before crystallizing.");
+	});
+
+	it("returns deep-interview clarification as a non-answer and skips recorder writes", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
+		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-inline" }));
+		const editor = vi.fn(async () => "editor fallback should not be used");
+		const select = vi.fn(
+			async (
+				_prompt: string,
+				options: string[],
+				dialogOptions?: {
+					clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
+				},
+			) => {
+				expect(options).toContain("4. Ask about these choices");
+				expect(dialogOptions?.clarificationInput?.optionLabel).toBe("4. Ask about these choices");
+				expect(dialogOptions?.clarificationInput?.allowEmpty).toBe(false);
+				dialogOptions?.clarificationInput?.onSubmit("What is the difference between Budget and Timeline?");
+				return "4. Ask about these choices";
+			},
+		);
+		const context = createContext({ select, editor });
+
+		const result = await tool.execute(
+			"call-deep-clarification-inline",
+			{ questions: [singleDeepInterviewQuestion()] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(result.details?.customInput).toBeUndefined();
+		expect(result.details?.clarificationQuestion).toBe("What is the difference between Budget and Timeline?");
+		expect(result.content[0]).toMatchObject({
+			type: "text",
+			text: "User asked a clarification question about the choices: What is the difference between Budget and Timeline?",
+		});
+		expect(editor).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("returns multi-select deep-interview clarification as unresolved even after a provisional pick", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-multi" }));
+		let step = 0;
+		const select = vi.fn(
+			async (
+				_prompt: string,
+				options: string[],
+				dialogOptions?: {
+					clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
+				},
+			) => {
+				step++;
+				if (step === 1) {
+					const budget = options.find(option => option.endsWith("Budget"));
+					if (!budget) throw new Error("Missing Budget option");
+					return budget;
+				}
+				const clarify = options.find(option => option.endsWith("Ask about these choices"));
+				if (!clarify) throw new Error("Missing clarification option");
+				dialogOptions?.clarificationInput?.onSubmit("Does Budget mean engineering time or money?");
+				return clarify;
+			},
+		);
+		const context = createContext({ select });
+
+		const result = await tool.execute(
+			"call-deep-clarification-multi",
+			{ questions: [{ ...singleDeepInterviewQuestion(), multi: true }] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(result.details?.customInput).toBeUndefined();
+		expect(result.details?.clarificationQuestion).toBe("Does Budget mean engineering time or money?");
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("falls back to an editor for deep-interview clarification when inline input is unsupported", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-editor" }));
+		const editor = vi.fn(
+			async (
+				title: string,
+				_prefill?: string,
+				_dialogOptions?: unknown,
+				editorOptions?: { promptStyle?: boolean },
+			) => {
+				expect(title).toBe("Ask a clarification question:");
+				expect(editorOptions?.promptStyle).toBe(true);
+				return "Which option keeps scope smallest?";
+			},
+		);
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[3]);
+		const context = createContext({ select, editor });
+
+		const result = await tool.execute(
+			"call-deep-clarification-editor",
+			{ questions: [singleDeepInterviewQuestion()] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(result.details?.customInput).toBeUndefined();
+		expect(result.details?.clarificationQuestion).toBe("Which option keeps scope smallest?");
+		expect(editor).toHaveBeenCalledTimes(1);
+		expect(recorder).not.toHaveBeenCalled();
 	});
 
 	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {

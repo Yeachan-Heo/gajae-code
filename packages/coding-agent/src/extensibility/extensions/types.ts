@@ -136,6 +136,17 @@ export interface ExtensionUIDialogOptions {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
 	};
+	/**
+	 * Inline free-text input for a non-answer clarification action. It is
+	 * separate from `customInput` so callers can distinguish "ask about these
+	 * choices" from "provide my own answer". Empty/whitespace-only submissions
+	 * may be rejected by the selector when `allowEmpty` is false.
+	 */
+	clarificationInput?: {
+		optionLabel: string;
+		onSubmit: (text: string) => void;
+		allowEmpty?: boolean;
+	};
 }
 
 /** Raw terminal input listener for extensions. */
