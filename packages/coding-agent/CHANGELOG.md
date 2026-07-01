@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- GJC now best-effort renames the containing cmux workspace to the current GJC session name when running inside a cmux terminal.
+
 ### Fixed
 
 - Deep Interview option-clarification prompts now stay out of the interview transcript and ambiguity recorder, so asking about displayed choices no longer persists as the round answer before the user selects an actual option.

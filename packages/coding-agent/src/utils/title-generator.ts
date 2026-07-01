@@ -9,6 +9,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
+import { syncCmuxWorkspaceTitle } from "./cmux-workspace";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
@@ -218,6 +219,7 @@ export function setTerminalTitle(title: string): void {
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
 	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
+	syncCmuxWorkspaceTitle(sessionName);
 }
 
 /**
