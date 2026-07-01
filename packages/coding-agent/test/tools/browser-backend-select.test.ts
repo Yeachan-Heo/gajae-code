@@ -3,6 +3,7 @@ import {
 	type ApplyBackendDeps,
 	applyBrowserBackendChange,
 	browserBackendOptions,
+	runBrowserBackendSelector,
 } from "../../src/tools/browser/backend-select";
 
 function baseDeps(overrides: Partial<ApplyBackendDeps>): ApplyBackendDeps {
@@ -135,5 +136,38 @@ describe("applyBrowserBackendChange", () => {
 	it("is a no-op when target equals current backend", async () => {
 		const res = await applyBrowserBackendChange(baseDeps({ target: "native", getSetting: () => "native" }));
 		expect(res.status).toBe("unchanged");
+	});
+});
+
+describe("runBrowserBackendSelector", () => {
+	it("selects a backend, persists it, and awaits browser restart", async () => {
+		let stored: "native" | "aside" = "native";
+		let restarted = false;
+		let status = "";
+		const result = await runBrowserBackendSelector({
+			platform: "darwin",
+			getSetting: () => stored,
+			setSetting: value => {
+				stored = value;
+			},
+			restart: async () => {
+				restarted = true;
+			},
+			probe: () => ({ ok: true, path: "/x/aside" }),
+			select: async (options, initialIndex, title) => {
+				expect(options.map(option => option.value)).toEqual(["native", "aside"]);
+				expect(initialIndex).toBe(0);
+				expect(title).toContain("Browser backend selection");
+				return "aside";
+			},
+			showStatus: message => {
+				status = message;
+			},
+		});
+
+		expect(result).toEqual({ status: "switched", backend: "aside" });
+		expect(stored as "native" | "aside").toBe("aside");
+		expect(restarted).toBe(true);
+		expect(status).toContain("switched to 'aside'");
 	});
 });

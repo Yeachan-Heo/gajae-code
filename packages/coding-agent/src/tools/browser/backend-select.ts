@@ -1,4 +1,4 @@
-import { ASIDE_INSTALL_COMMAND, ASIDE_INSTALL_URL, probeAsideCli } from "./aside-cli";
+import { ASIDE_INSTALL_COMMAND, ASIDE_INSTALL_URL, type AsideCliProbe, probeAsideCli } from "./aside-cli";
 
 /**
  * Backend-selection logic for the `/browser` selector, decoupled from TUI rendering
@@ -47,7 +47,7 @@ export interface ApplyBackendDeps {
 	/** Await the session-level browser restart (drops default-backend tabs). */
 	restart: () => Promise<void>;
 	/** Probe for the Aside CLI. Defaults to the real probe. */
-	probe?: () => ReturnType<typeof probeAsideCli>;
+	probe?: () => AsideCliProbe;
 	/**
 	 * Typed-confirmation in-app install. Returns true once the user typed the exact
 	 * confirmation AND the install command succeeded. If omitted or it returns false,
@@ -61,6 +61,59 @@ export type ApplyBackendResult =
 	| { status: "install-required"; manualInstallCommand: string; url: string; searched: string[] }
 	| { status: "switched"; backend: BrowserBackend }
 	| { status: "error"; reason: string };
+
+export interface BrowserBackendSelectorDeps extends Omit<ApplyBackendDeps, "target"> {
+	select: (
+		options: readonly BrowserBackendOption[],
+		initialIndex: number,
+		title: string,
+	) => Promise<BrowserBackend | undefined>;
+	showStatus: (message: string) => void;
+}
+
+function formatBrowserBackendSelectorTitle(current: BrowserBackend, platform: NodeJS.Platform): string {
+	const lines = ["Browser backend selection", ""];
+	lines.push("Native is isolated managed Chromium. Aside drives your live logged-in Aside browser profile.");
+	if (platform !== "darwin") lines.push("Aside is macOS-only and is hidden on this platform.");
+	lines.push("");
+	lines.push(`Current backend: ${current}`);
+	return lines.join("\n");
+}
+
+function formatApplyBackendResult(result: ApplyBackendResult): string {
+	switch (result.status) {
+		case "switched":
+			return `Browser backend switched to '${result.backend}'. Default browser tabs were restarted.`;
+		case "install-required":
+			return [
+				"Aside CLI is required before selecting the Aside backend.",
+				`Install: ${result.manualInstallCommand}`,
+				`Docs: ${result.url}`,
+				`Searched: ${result.searched.join(", ")}`,
+			].join("\n");
+		case "unchanged":
+			return result.reason;
+		case "error":
+			return `Browser backend change failed: ${result.reason}`;
+	}
+}
+
+export async function runBrowserBackendSelector(
+	deps: BrowserBackendSelectorDeps,
+): Promise<ApplyBackendResult | undefined> {
+	const platform = deps.platform ?? process.platform;
+	const current = deps.getSetting();
+	const options = browserBackendOptions(platform);
+	const initialIndex = Math.max(
+		0,
+		options.findIndex(option => option.value === current),
+	);
+	const selected = await deps.select(options, initialIndex, formatBrowserBackendSelectorTitle(current, platform));
+	if (!selected) return undefined;
+	const result = await applyBrowserBackendChange({ ...deps, platform, target: selected });
+	deps.showStatus(formatApplyBackendResult(result));
+	return result;
+}
 
 /**
  * Apply a backend change with the secure-by-default installer policy:

@@ -188,6 +188,11 @@ describe("compileAsideActionSteps", () => {
 		// navigate without url is invalid
 		expect(() => compileAsideActionSteps([{ verb: "navigate" }])).toThrow();
 	});
+
+	it("rejects id-addressed click/type actions with a clear Aside error", () => {
+		expect(() => compileAsideActionSteps([{ verb: "click", id: 1 }])).toThrow(/Aside browser act.*numeric ids/i);
+		expect(() => compileAsideActionSteps([{ verb: "type", id: 2, text: "hello" }])).toThrow(/use a selector/i);
+	});
 });
 
 describe("asidePayloadToRunResult", () => {

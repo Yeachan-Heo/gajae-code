@@ -321,6 +321,14 @@ export { resolveAsideCliPath };
  */
 export function compileAsideActionSteps(steps: readonly BrowserActionStep[]): string {
 	validateActionSteps(steps);
+	for (let i = 0; i < steps.length; i += 1) {
+		const step = steps[i]!;
+		if ((step.verb === "click" || step.verb === "type") && step.id !== undefined && step.id !== null) {
+			throw new ToolError(
+				`Aside browser act does not support observed numeric ids for actions[${i}] (${step.verb}); use a selector instead.`,
+			);
+		}
+	}
 	const stepsLiteral = JSON.stringify(JSON.stringify(steps));
 	return `
 const __steps = JSON.parse(${stepsLiteral});

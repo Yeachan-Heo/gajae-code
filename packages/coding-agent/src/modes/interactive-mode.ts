@@ -67,8 +67,7 @@ import { getRecentSessions } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
-import { probeAsideCli } from "../tools/browser/aside-cli";
-import { browserBackendOptions } from "../tools/browser/backend-select";
+import { type BrowserBackend, runBrowserBackendSelector } from "../tools/browser/backend-select";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
@@ -2501,31 +2500,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSettingsSelector();
 	}
 
-	showBrowserSelector(): void {
-		const current = (this.settings.get("browser.backend") as "native" | "aside") ?? "native";
-		const options = browserBackendOptions(process.platform);
-		const lines: string[] = ["Browser backend selection", ""];
-		for (const opt of options) {
-			const marker = opt.value === current ? "●" : "○";
-			lines.push(`${marker} ${opt.label}${opt.value === current ? "  (current)" : ""}`);
-			lines.push(`   ${opt.description}`);
-		}
-		lines.push("");
-		if (process.platform === "darwin") {
-			const probe = probeAsideCli();
-			if (probe.ok) {
-				lines.push(`Aside CLI: found at ${probe.path}`);
-			} else {
-				lines.push("Aside CLI: not installed. Install it, then select Aside:");
-				lines.push(`  ${probe.manualInstallCommand}`);
-			}
-		} else {
-			lines.push("Aside is macOS-only and is hidden on this platform.");
-		}
-		lines.push("");
-		lines.push("Switch via /settings → Tools → Browser Backend, or: gjc config set browser.backend <native|aside>");
-		lines.push("Selecting Aside drives your live logged-in Aside profile (not isolated).");
-		this.showStatus(lines.join("\n"));
+	async showBrowserSelector(): Promise<void> {
+		await runBrowserBackendSelector({
+			platform: process.platform,
+			getSetting: () => (this.settings.get("browser.backend") as BrowserBackend) ?? "native",
+			setSetting: value => {
+				this.settings.set("browser.backend", value);
+			},
+			restart: async () => {
+				const browserTool = this.session.getToolByName("browser") as
+					| { restartForModeChange?: () => Promise<void> }
+					| undefined;
+				await browserTool?.restartForModeChange?.();
+			},
+			select: async (options, initialIndex, title) => {
+				const labels = options.map(option => `${option.label} — ${option.description}`);
+				const selected = await this.showHookSelector(title, labels, { initialIndex });
+				if (!selected) return undefined;
+				const index = labels.indexOf(selected);
+				return index >= 0 ? options[index]?.value : undefined;
+			},
+			showStatus: message => this.showStatus(message),
+		});
 	}
 
 	showThemeSelector(): void {
