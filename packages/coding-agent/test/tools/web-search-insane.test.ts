@@ -1,7 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { hookFetch } from "@gajae-code/utils";
 import type { AuthStorage } from "../../src/session/auth-storage";
-import { runSearchQuery } from "../../src/web/search";
+import { runSearchQuery, setPreferredSearchProvider } from "../../src/web/search";
 import { InsaneProvider, routeInsanePublicUrl, searchInsane } from "../../src/web/search/providers/insane";
 
 const REDDIT_FEED = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
@@ -11,6 +11,10 @@ const REDDIT_FEED = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/At
 function fakeAuth(): AuthStorage {
 	return { hasAuth: () => false, hasOAuth: () => false, getApiKey: () => undefined } as unknown as AuthStorage;
 }
+
+afterEach(() => {
+	setPreferredSearchProvider("auto");
+});
 
 describe("Insane public-route provider", () => {
 	it("is keyless and selectable", () => {
@@ -71,6 +75,26 @@ describe("Insane public-route provider", () => {
 		const result = await runSearchQuery({ query: "reddit test", provider: "insane" }, { authStorage: fakeAuth() });
 		expect(result.details.response.provider).toBe("insane");
 		expect(result.content[0]?.text).toContain("Reddit Post");
+	});
+
+	it("emits a diagnostic when configured Insane falls back to DuckDuckGo", async () => {
+		setPreferredSearchProvider("insane");
+		using _hook = hookFetch(input => {
+			const url = input.toString();
+			if (url.startsWith("https://html.duckduckgo.com")) {
+				return new Response(
+					`<a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent("https://example.com/plain")}">Plain</a><a class="result__snippet">plain snippet</a>`,
+					{ status: 200 },
+				);
+			}
+			return new Response("", { status: 404 });
+		});
+
+		const result = await runSearchQuery({ query: "plain web" }, { authStorage: fakeAuth() });
+		expect(result.details.response.provider).toBe("duckduckgo");
+		expect(result.details.warning).toContain("insane");
+		expect(result.details.warning).toContain("using DuckDuckGo");
+		expect(result.content[0]?.text).toContain("Warning: Web search provider fallback");
 	});
 
 	it("fails closed when only block pages are available", async () => {

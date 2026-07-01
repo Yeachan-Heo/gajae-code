@@ -127,10 +127,10 @@ import {
 	EditTool,
 	EvalTool,
 	FindTool,
+	getConfiguredSearchProviderPreference,
 	getSearchTools,
 	HIDDEN_TOOLS,
 	isConfigurableSearchProviderId,
-	isSearchProviderPreference,
 	type LspStartupServerInfo,
 	loadSshTool,
 	ReadTool,
@@ -932,10 +932,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	slashCommandsPromise.catch(() => {});
 
 	// Initialize provider preferences from settings
-	const webSearchProvider = settings.get("providers.webSearch");
-	if (typeof webSearchProvider === "string" && isSearchProviderPreference(webSearchProvider)) {
-		setPreferredSearchProvider(webSearchProvider);
-	}
+	const webSearchProvider = getConfiguredSearchProviderPreference(settings);
+	setPreferredSearchProvider(webSearchProvider);
 	const webSearchFallback = settings.get("web_search.fallback");
 	if (Array.isArray(webSearchFallback)) {
 		setSearchFallbackProviders(

@@ -9,6 +9,7 @@ import chalk from "chalk";
 import { Settings } from "../config/settings";
 import { initTheme, theme } from "../modes/theme/theme";
 import {
+	getConfiguredSearchProviderPreference,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
 	runSearchQuery,
@@ -170,8 +171,8 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 
 	await initTheme();
 	const settings = await Settings.init();
-	const configuredProvider = settings.get("providers.webSearch");
-	if (typeof configuredProvider === "string" && isSearchProviderPreference(configuredProvider)) {
+	const configuredProvider = getConfiguredSearchProviderPreference(settings);
+	if (isSearchProviderPreference(configuredProvider)) {
 		setPreferredSearchProvider(configuredProvider);
 	}
 	const configuredFallback = settings.get("web_search.fallback");

@@ -1723,6 +1723,30 @@
 					"description": "Enable the web_search tool for web searching",
 					"default": true
 				},
+				"provider": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"duckduckgo",
+						"insane",
+						"exa",
+						"brave",
+						"jina",
+						"kimi",
+						"zai",
+						"anthropic",
+						"perplexity",
+						"gemini",
+						"codex",
+						"xai",
+						"tavily",
+						"parallel",
+						"kagi",
+						"synthetic",
+						"searxng"
+					],
+					"default": "auto"
+				},
 				"fallback": {
 					"type": "array",
 					"items": {

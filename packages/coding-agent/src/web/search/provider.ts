@@ -149,6 +149,21 @@ export function setSearchFallbackProviders(ids: readonly string[]): void {
 	fallbackProvIds = ids.filter(isConfigurableSearchProviderId);
 }
 
+export interface SearchProviderPreferenceSource {
+	get(path: "providers.webSearch" | "web_search.provider"): SearchProviderId | "auto";
+	has(path: "providers.webSearch" | "web_search.provider"): boolean;
+}
+
+export function getConfiguredSearchProviderPreference(
+	settings: SearchProviderPreferenceSource,
+): SearchProviderId | "auto" {
+	const providerPreference = settings.get("providers.webSearch");
+	if (settings.has("providers.webSearch") || providerPreference !== "auto") return providerPreference;
+
+	const legacyProviderPreference = settings.get("web_search.provider");
+	return legacyProviderPreference;
+}
+
 export interface ResolveProviderChainOptions {
 	authStorage: AuthStorage;
 	sessionId?: string;

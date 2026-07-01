@@ -45,6 +45,15 @@ describe("web search config schema", () => {
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "tavily", label: "Tavily" }));
 	});
 
+	it("accepts web_search.provider as a compatibility alias", () => {
+		const webSearchProvider = SETTINGS_SCHEMA["web_search.provider"];
+		expect(webSearchProvider.type).toBe("enum");
+		expect(webSearchProvider.values).toContain("insane");
+		expect(webSearchProvider.values).toContain("duckduckgo");
+		expect(webSearchProvider.default).toBe("auto");
+		expect(Settings.isolated({ "web_search.provider": "insane" }).get("web_search.provider")).toBe("insane");
+	});
+
 	it("defines web.insaneFallback as a boolean defaulting to false", () => {
 		const setting = SETTINGS_SCHEMA["web.insaneFallback"];
 		expect(setting.type).toBe("boolean");

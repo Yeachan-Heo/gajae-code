@@ -2210,6 +2210,11 @@ export const SETTINGS_SCHEMA = {
 		ui: { tab: "tools", label: "Web Search", description: "Enable the web_search tool for web searching" },
 	},
 
+	"web_search.provider": {
+		type: "enum",
+		values: ["auto", ...CONFIGURABLE_SEARCH_PROVIDER_IDS] as const,
+		default: "auto",
+	},
 	"web_search.fallback": {
 		type: "array",
 		default: EMPTY_STRING_ARRAY,

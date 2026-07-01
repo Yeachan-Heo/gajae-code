@@ -68,6 +68,18 @@ function formatProviderError(error: unknown, provider: SearchProvider): string {
 	return `Unknown error from ${provider.label}`;
 }
 
+function formatProviderFailure(error: unknown, provider: SearchProvider): string {
+	if (error instanceof SearchProviderError) return error.message;
+	return `${provider.id}: ${formatProviderError(error, provider)}`;
+}
+
+function formatFallbackWarning(
+	failures: Array<{ provider: SearchProvider; error: unknown }>,
+	provider: SearchProvider,
+): string {
+	return `Web search provider fallback: ${failures.map(f => formatProviderFailure(f.error, f.provider)).join("; ")}; using ${provider.label}.`;
+}
+
 /** Truncate text for tool output */
 function truncateText(text: string, maxLen: number): string {
 	if (text.length <= maxLen) return text;
@@ -185,10 +197,11 @@ async function executeSearch(
 			});
 
 			const text = formatForLLM(response);
+			const warning = failures.length > 0 ? formatFallbackWarning(failures, provider) : undefined;
 
 			return {
-				content: [{ type: "text" as const, text }],
-				details: { response },
+				content: [{ type: "text" as const, text: warning ? `Warning: ${warning}\n\n${text}` : text }],
+				details: { response, ...(warning ? { warning } : {}) },
 			};
 		} catch (error) {
 			// Surface user-initiated cancellation immediately so the session sees
@@ -207,13 +220,7 @@ async function executeSearch(
 		: `Unknown error from ${lastProvider.label}`;
 	const message =
 		providers.length > 1
-			? `All web search providers failed: ${failures
-					.map(f =>
-						f.error instanceof SearchProviderError
-							? f.error.message
-							: `${f.provider.id}: ${formatProviderError(f.error, f.provider)}`,
-					)
-					.join("; ")}`
+			? `All web search providers failed: ${failures.map(f => formatProviderFailure(f.error, f.provider)).join("; ")}`
 			: baseMessage;
 
 	return {
@@ -321,7 +328,12 @@ export function getSearchTools(): CustomTool<any, any>[] {
 	return [webSearchCustomTool];
 }
 
-export { getSearchProvider, setPreferredSearchProvider, setSearchFallbackProviders } from "./provider";
+export {
+	getConfiguredSearchProviderPreference,
+	getSearchProvider,
+	setPreferredSearchProvider,
+	setSearchFallbackProviders,
+} from "./provider";
 export { setSearchHardTimeoutMs } from "./providers/utils";
 export type { SearchProviderId as SearchProvider, SearchResponse } from "./types";
 export { isConfigurableSearchProviderId, isSearchProviderPreference } from "./types";

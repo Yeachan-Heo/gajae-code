@@ -66,6 +66,7 @@ function renderFallbackText(contentText: string, expanded: boolean, theme: Theme
 export interface SearchRenderDetails {
 	response: SearchResponse;
 	error?: string;
+	warning?: string;
 }
 
 /** Render web search result with tree-based layout */
@@ -130,6 +131,8 @@ export function renderSearchResult(
 
 	const metaLines: string[] = [];
 	metaLines.push(`${theme.fg("muted", "Provider:")} ${theme.fg("text", providerLabel)}`);
+	if (details.warning)
+		metaLines.push(`${theme.fg("muted", "Fallback:")} ${theme.fg("warning", truncateToWidth(details.warning, 110))}`);
 	if (response.authMode)
 		metaLines.push(
 			`${theme.fg("muted", "Auth:")} ${theme.fg("text", response.authMode === "oauth" ? "OAuth" : response.authMode === "api_key" ? "API key" : response.authMode)}`,

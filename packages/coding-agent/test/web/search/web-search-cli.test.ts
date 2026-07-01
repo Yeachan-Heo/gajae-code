@@ -120,4 +120,33 @@ describe("web search CLI settings", () => {
 		expect(fetchSpy).toHaveBeenCalled();
 		expect(Bun.stripANSI(output)).toContain("Provider: xAI");
 	});
+
+	it("honors legacy web_search.provider when providers.webSearch is unset", async () => {
+		await Settings.init({
+			agentDir: testAgentDir,
+			inMemory: true,
+			overrides: { "web_search.provider": "insane" },
+		});
+
+		vi.spyOn(globalThis, "fetch").mockImplementation((async input => {
+			const url = input.toString();
+			if (url === "https://www.reddit.com/r/test/.rss") {
+				return new Response(
+					`<?xml version="1.0"?><feed><entry><title>Alias Provider</title><link href="https://www.reddit.com/r/test/comments/1"/><content>via alias</content></entry></feed>`,
+					{ status: 200 },
+				);
+			}
+			return new Response("", { status: 404 });
+		}) as typeof fetch);
+		let output = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+
+		await runSearchCommand({ query: "https://www.reddit.com/r/test", expanded: false });
+
+		expect(Bun.stripANSI(output)).toContain("Provider: Insane");
+		expect(Bun.stripANSI(output)).toContain("Alias Provider");
+	});
 });
