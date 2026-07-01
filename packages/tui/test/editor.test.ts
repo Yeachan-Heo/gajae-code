@@ -545,22 +545,21 @@ describe("Editor component", () => {
 				for (const kittyActive of [false, true]) {
 					setKittyProtocolActive(kittyActive);
 					const editor = new Editor(defaultEditorTheme);
-					let submitted: string | null = null;
+					const submissions: string[] = [];
 					editor.onSubmit = text => {
-						submitted = text;
+						submissions.push(text);
 					};
 
 					editor.handleInput("a");
 					editor.handleInput("\n");
 
-					expect(submitted).toBe("a");
+					expect(submissions).toEqual(["a"]);
 					expect(editor.getText()).toBe("");
 				}
 			} finally {
 				setKittyProtocolActive(wasKittyActive);
 			}
 		});
-
 		it("inserts a newline for a Shift+Enter sequence", () => {
 			const editor = new Editor(defaultEditorTheme);
 			let submitted: string | null = null;
