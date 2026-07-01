@@ -44,6 +44,8 @@ type LaunchPolicy = "direct" | "tmux";
 interface TtyState {
 	stdin: boolean;
 	stdout: boolean;
+	columns?: number;
+	rows?: number;
 }
 
 export interface TmuxLaunchContext {
@@ -68,6 +70,10 @@ export interface TmuxSpawnResult {
 	exitCode: number | null;
 	signalCode?: string | null;
 	stderr?: string;
+}
+export interface TmuxTerminalSize {
+	columns: number;
+	rows: number;
 }
 
 export type TmuxSpawnSync = (command: string, args: string[], options: TmuxSpawnOptions) => TmuxSpawnResult;
@@ -95,6 +101,7 @@ export interface TmuxLaunchPlan {
 	cwd: string;
 	innerCommand: string;
 	newSessionArgs: string[];
+	initialSize?: TmuxTerminalSize;
 	branch?: string | null;
 	attachSessionName?: string;
 	project?: string | null;
@@ -537,6 +544,43 @@ function isTmuxAttachDisconnectError(result: TmuxSpawnResult): boolean {
 	const stderr = result.stderr?.toLowerCase() ?? "";
 	return stderr.includes("eio") || stderr.includes("input/output error");
 }
+function normalizeTmuxTerminalDimension(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return undefined;
+	return value;
+}
+
+function resolveCallerTmuxTerminalSize(tty: TtyState): TmuxTerminalSize | undefined {
+	if (!tty.stdout) return undefined;
+	const columns = normalizeTmuxTerminalDimension(tty.columns);
+	const rows = normalizeTmuxTerminalDimension(tty.rows);
+	if (columns === undefined || rows === undefined) return undefined;
+	return { columns, rows };
+}
+
+function buildTmuxNewSessionSizeArgs(size: TmuxTerminalSize | undefined): string[] {
+	return size ? ["-x", String(size.columns), "-y", String(size.rows)] : [];
+}
+
+function resizeCreatedTmuxWindowToCallerTerminalSize(
+	plan: TmuxLaunchPlan,
+	spawnSync: TmuxSpawnSync,
+	options: TmuxSpawnOptions,
+): void {
+	if (!plan.initialSize) return;
+	spawnSync(
+		plan.tmuxCommand,
+		[
+			"resize-window",
+			"-t",
+			buildGjcTmuxExactOptionTarget(plan.sessionName, { env: options.env }),
+			"-x",
+			String(plan.initialSize.columns),
+			"-y",
+			String(plan.initialSize.rows),
+		],
+		options,
+	);
+}
 
 export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaunchPlan | undefined {
 	const env = context.env ?? process.env;
@@ -544,7 +588,12 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	if (!context.parsed.tmux || policy === "direct") return undefined;
 	if (env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return undefined;
 	const platform = context.platform ?? process.platform;
-	const tty = context.tty ?? { stdin: Boolean(process.stdin.isTTY), stdout: Boolean(process.stdout.isTTY) };
+	const tty = context.tty ?? {
+		stdin: Boolean(process.stdin.isTTY),
+		stdout: Boolean(process.stdout.isTTY),
+		columns: process.stdout.columns,
+		rows: process.stdout.rows,
+	};
 	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
 	const cwd = context.cwd ?? process.cwd();
@@ -592,12 +641,23 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		},
 		context.rawArgs,
 	);
+	const initialSize = resolveCallerTmuxTerminalSize(tty);
 	return {
 		tmuxCommand,
 		sessionName,
 		cwd,
 		innerCommand,
-		newSessionArgs: ["new-session", "-d", "-s", sessionName, "-c", cwd, innerCommand],
+		newSessionArgs: [
+			"new-session",
+			"-d",
+			...buildTmuxNewSessionSizeArgs(initialSize),
+			"-s",
+			sessionName,
+			"-c",
+			cwd,
+			innerCommand,
+		],
+		initialSize,
 		branch,
 		project,
 		sessionId,
@@ -791,6 +851,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
 		}
+		resizeCreatedTmuxWindowToCallerTerminalSize(plan, spawnSync, controlOptions);
 		applyGjcTmuxRootTerminalTitleProfile({
 			tmuxCommand: plan.tmuxCommand,
 			target: plan.sessionName,
