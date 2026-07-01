@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { streamAnthropic } from "../src/providers/anthropic";
-import type { Context, Model } from "../src/types";
+import type { Context, FetchImpl, Model } from "../src/types";
 import { waitForDelayOrAbort } from "./helpers";
 
 const model: Model<"anthropic-messages"> = {
@@ -160,6 +160,50 @@ describe("anthropic first-event timeout retries", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "retry recovered" }]);
 		expect(result.responseId).toBe("msg_retry_success");
+	});
+
+	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "rate_limit_error",
+						message: "This request would exceed your account's rate limit. Please try again later.",
+					},
+				}),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "62291",
+						"anthropic-ratelimit-unified-status": "rejected",
+						"anthropic-ratelimit-unified-7d-status": "rejected",
+						"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+					},
+				},
+			);
+		}) as FetchImpl;
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("rate_limit_error");
+		expect(result.errorMessage).toContain("This request would exceed your account's rate limit");
+		expect(result.errorMessage).toContain("retry-after-ms=62291000");
+		expect(result.errorMessage).toContain("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits");
+		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 	});
 
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {

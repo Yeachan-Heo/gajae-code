@@ -21,6 +21,7 @@ import {
 } from "@gajae-code/utils";
 import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
 import { calculateCost } from "../models";
+import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
 	Api,
@@ -62,6 +63,7 @@ import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
+import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
 	COMBINATOR_KEYS,
@@ -724,6 +726,7 @@ export type AnthropicClientOptionsArgs = {
 	onSseEvent?: AnthropicOptions["onSseEvent"];
 	fetch?: FetchImpl;
 	requestMaxRetries?: number;
+	maxRetryDelayMs?: number;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -875,6 +878,101 @@ function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]):
 		}
 	}
 	return merged;
+}
+
+const ANTHROPIC_RETRY_DELAY_CAP_MS = 60_000;
+const ANTHROPIC_RATE_LIMIT_HEADER_PREFIX = "anthropic-ratelimit-";
+
+function getSafeAnthropicHeaderEvidence(headers: Headers): string[] {
+	const evidence: string[] = [];
+	for (const [name, value] of headers) {
+		const lowerName = name.toLowerCase();
+		if (
+			lowerName === "retry-after" ||
+			lowerName === "retry-after-ms" ||
+			lowerName.startsWith(ANTHROPIC_RATE_LIMIT_HEADER_PREFIX)
+		) {
+			evidence.push(`${lowerName}=${value}`);
+		}
+	}
+	return evidence.sort();
+}
+
+function getStringProperty(source: unknown, key: string): string | undefined {
+	if (!isRecord(source)) return undefined;
+	const value = source[key];
+	return typeof value === "string" ? value : undefined;
+}
+
+function appendAnthropicRateLimitEvidence(bodyText: string, headers: Headers): string {
+	const evidence = getSafeAnthropicHeaderEvidence(headers);
+	if (evidence.length === 0) return bodyText;
+
+	const suffix = ` Anthropic rate-limit evidence: ${evidence.join(", ")}`;
+	try {
+		const parsed = JSON.parse(bodyText) as unknown;
+		if (isRecord(parsed)) {
+			const error = parsed.error;
+			if (isRecord(error) && typeof error.message === "string" && !error.message.includes(suffix)) {
+				return JSON.stringify({ ...parsed, error: { ...error, message: `${error.message}${suffix}` } });
+			}
+			if (typeof parsed.message === "string" && !parsed.message.includes(suffix)) {
+				return JSON.stringify({ ...parsed, message: `${parsed.message}${suffix}` });
+			}
+		}
+	} catch {}
+
+	return bodyText.includes(suffix) ? bodyText : `${bodyText}${suffix}`;
+}
+
+function isAnthropicUsageExhaustionResponse(
+	bodyText: string,
+	headers: Headers,
+	retryAfterMs: number | undefined,
+	retryDelayCapMs: number,
+): boolean {
+	const overageReason = headers.get("anthropic-ratelimit-unified-overage-disabled-reason")?.toLowerCase();
+	if (overageReason === "out_of_credits") return true;
+	if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) return true;
+
+	try {
+		const parsed = JSON.parse(bodyText) as unknown;
+		const error = isRecord(parsed) ? parsed.error : undefined;
+		const type = getStringProperty(error, "type") ?? getStringProperty(parsed, "type");
+		const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
+		return (
+			/rate_limit_error/i.test(type ?? "") &&
+			(/request would exceed your account.?s rate limit/i.test(message) || /out_of_credits/i.test(message))
+		);
+	} catch {
+		return /request would exceed your account.?s rate limit|out_of_credits/i.test(bodyText);
+	}
+}
+
+function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDelayMs: number | undefined): FetchImpl {
+	const retryDelayCapMs = maxRetryDelayMs ?? ANTHROPIC_RETRY_DELAY_CAP_MS;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const response = await baseFetch(input, init);
+			if (response.status !== 429 || retryDelayCapMs === 0) return response;
+
+			const headers = new Headers(response.headers);
+			const retryAfterMs = getRetryAfterMsFromHeaders(headers);
+			const bodyText = await response
+				.clone()
+				.text()
+				.catch(() => "");
+			if (!isAnthropicUsageExhaustionResponse(bodyText, headers, retryAfterMs, retryDelayCapMs)) return response;
+
+			headers.set("x-should-retry", "false");
+			return new Response(appendAnthropicRateLimitEvidence(bodyText, headers), {
+				status: response.status,
+				statusText: response.statusText,
+				headers,
+			});
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
 }
 
 // The Anthropic SDK logs malformed SSE frames directly before rethrowing them.
@@ -1042,6 +1140,7 @@ export function isProviderRetryableError(error: unknown, provider?: string): boo
 	if (!(error instanceof Error)) return false;
 	if (provider === "github-copilot" && isCopilotTransientModelError(error)) return true;
 	const msg = error.message.toLowerCase();
+	if (isUsageLimitError(error.message)) return false;
 	if (
 		isUnexpectedSocketCloseMessage(msg) ||
 		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
@@ -1166,6 +1265,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
+					maxRetryDelayMs: options?.maxRetryDelayMs,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -1723,11 +1823,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
-	const debugFetch = onSseEvent
-		? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model))
-		: args.fetch
-			? baseFetch
-			: undefined;
+	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	const debugFetch = onSseEvent ? wrapFetchForSseDebug(boundedFetch, event => onSseEvent(event, model)) : boundedFetch;
 	if (model.provider === "github-copilot") {
 		const copilotApiKey = parseGitHubCopilotApiKey(apiKey).accessToken;
 		const betaFeatures = [...extraBetas];
@@ -1755,7 +1852,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			...(debugFetch ? { fetch: debugFetch } : {}),
+			fetch: debugFetch,
 			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 		};
 	}
@@ -1789,7 +1886,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			...(debugFetch ? { fetch: debugFetch } : {}),
+			fetch: debugFetch,
 		};
 	}
 
@@ -1802,7 +1899,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
 		logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-		...(debugFetch ? { fetch: debugFetch } : {}),
+		fetch: debugFetch,
 		...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 	};
 }
