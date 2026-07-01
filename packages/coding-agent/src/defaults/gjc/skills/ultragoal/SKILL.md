@@ -179,7 +179,7 @@ For large subgoals with independent slices, the Ultragoal leader must spawn para
 
 Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
 
-The leader checkpoints Ultragoal from Team evidence; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
+The leader checkpoints Ultragoal from Team evidence plus the current-session GJC goal snapshot; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
 
 ```sh
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>
