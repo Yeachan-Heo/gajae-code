@@ -11,7 +11,7 @@ import {
 	type RalplanIndexRow,
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
-import { isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
+import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
@@ -35,8 +35,9 @@ import {
  *    that lives in the bundled `/skill:ralplan` skill — but it accepts every documented flag so
  *    scripted users see a useful response and the active run is visible to the TUI.
  *
- * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N> --artifact
- *    <path-or-string> [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
+ * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
+ *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
+ *    [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
  *    / Critic / revision / post-interview / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
  *    an `index.jsonl` audit log, copies `final` stages to `pending-approval.md`, and advances
  *    the HUD chip to reflect the latest persisted stage.
@@ -81,6 +82,7 @@ const VALUE_FLAGS = new Set([
 	"--stage",
 	"--stage_n",
 	"--artifact",
+	"--artifact-env",
 	"--run-id",
 	"--session-id",
 	"--architect",
@@ -409,8 +411,16 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const stageN = parseStageN(flagValue(args, "--stage_n"));
 
 	const rawArtifact = flagValue(args, "--artifact");
-	if (rawArtifact === undefined || rawArtifact === "") {
-		throw new RalplanCommandError(2, "--artifact is required for ralplan --write");
+	const artifactEnvName = flagValue(args, "--artifact-env");
+	const artifactSources = [rawArtifact, artifactEnvName].filter(value => value !== undefined);
+	if (artifactSources.length === 0 || artifactSources.some(value => value === "")) {
+		throw new RalplanCommandError(2, "--artifact or --artifact-env is required for ralplan --write");
+	}
+	if (artifactSources.length > 1) {
+		throw new RalplanCommandError(2, "--artifact and --artifact-env are mutually exclusive");
+	}
+	if (artifactEnvName !== undefined && artifactEnvName !== GJC_RALPLAN_ARTIFACT_ENV) {
+		throw new RalplanCommandError(2, `--artifact-env must be ${GJC_RALPLAN_ARTIFACT_ENV}`);
 	}
 
 	const session = resolveGjcSessionForWrite(cwd, {
@@ -430,7 +440,13 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const runId = explicitRunId || (await readActiveRunId(cwd, sessionId)) || sessionIdRaw || defaultRunId();
 	assertSafePathComponent(runId, "run-id");
 
-	const artifact = await resolveArtifactContent(rawArtifact, cwd);
+	const artifact =
+		artifactEnvName !== undefined
+			? (process.env[GJC_RALPLAN_ARTIFACT_ENV] ?? "")
+			: await resolveArtifactContent(rawArtifact!, cwd);
+	if (artifact === "") {
+		throw new RalplanCommandError(2, "artifact content is empty");
+	}
 	return { stage: stage as RalplanStage, stageN, runId, artifact, sessionId, json: hasFlag(args, "--json") };
 }
 

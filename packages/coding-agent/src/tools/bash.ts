@@ -8,7 +8,10 @@ import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
-import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "../gjc-runtime/restricted-role-agent-bash";
+import {
+	GJC_RALPLAN_ARTIFACT_ENV,
+	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
+} from "../gjc-runtime/restricted-role-agent-bash";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
@@ -530,13 +533,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const rawCommand = input.command;
 		const allowedPrefixes = this.session.bashAllowedPrefixes;
+		const isRestrictedRalplanArtifactEnv =
+			allowedPrefixes &&
+			allowedPrefixes.length > 0 &&
+			this.session.bashRestrictionProfile !== "read-only" &&
+			env &&
+			Object.keys(env).length === 1 &&
+			Object.hasOwn(env, GJC_RALPLAN_ARTIFACT_ENV) &&
+			rawCommand.includes(`--artifact-env ${GJC_RALPLAN_ARTIFACT_ENV}`);
 		if (
 			(this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes && allowedPrefixes.length > 0)) &&
 			env &&
-			Object.keys(env).length > 0
+			Object.keys(env).length > 0 &&
+			!isRestrictedRalplanArtifactEnv
 		) {
 			const mode = this.session.bashRestrictionProfile === "read-only" ? "Read-only" : "Restricted role-agent";
-			throw new ToolError(`${mode} bash does not allow per-command env overrides.`);
+			throw new ToolError(
+				`${mode} bash only allows the ${GJC_RALPLAN_ARTIFACT_ENV} env override for --artifact-env.`,
+			);
 		}
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
@@ -597,11 +611,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
 							key,
-							await expandInternalUrls(value, {
-								...internalUrlOptions,
-								ensureLocalParentDirs: true,
-								noEscape: true,
-							}),
+							key === GJC_RALPLAN_ARTIFACT_ENV
+								? value
+								: await expandInternalUrls(value, {
+										...internalUrlOptions,
+										ensureLocalParentDirs: true,
+										noEscape: true,
+									}),
 						]),
 					),
 				)

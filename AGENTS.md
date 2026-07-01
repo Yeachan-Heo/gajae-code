@@ -23,7 +23,7 @@ GJC intentionally exposes exactly four default workflow skills. Do not add, docu
 Rules:
 - Bundled default workflow skills load from `packages/coding-agent/src/defaults/gjc/skills`.
 - Bundled role agents load from `packages/coding-agent/src/prompts/agents`.
-- `architect`, `planner`, and `critic` remain read-only for product files, but may use their restricted `bash` tool only for sanctioned workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`); the bash tool blocks env overrides, direct handoffs, state clears, artifact file-path ingestion, and all other command shapes for those role agents.
+- `architect`, `planner`, and `critic` remain read-only for product files, but may use their restricted `bash` tool only for sanctioned workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`); the bash tool blocks arbitrary env overrides, direct handoffs, state clears, artifact file-path ingestion, and all other command shapes for those role agents, allowing only `GJC_RALPLAN_ARTIFACT` for `gjc ralplan --write ... --artifact-env GJC_RALPLAN_ARTIFACT`.
 - Do not commit repo-visible `.gjc` default definitions; runtime user/project `.gjc` discovery remains supported for local overrides and installed configs.
 - Runtime state, plans, specs, and workflow ledgers belong under `.gjc/`.
 - Preserve upstream attribution in source comments/docs where appropriate, but public commands, paths, and examples must use `gjc` and `.gjc`.

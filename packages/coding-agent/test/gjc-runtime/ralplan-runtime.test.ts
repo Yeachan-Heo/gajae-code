@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
+import {
+	GJC_RALPLAN_ARTIFACT_ENV,
+	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
@@ -316,6 +319,49 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 				process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV] = previous;
 			}
 		}
+	});
+
+	it("--artifact-env reads artifact markdown from the sanctioned env var", async () => {
+		const root = await tempDir();
+		const previous = process.env[GJC_RALPLAN_ARTIFACT_ENV];
+		process.env[GJC_RALPLAN_ARTIFACT_ENV] =
+			'# Critic Review\n\nMentions `"studio"`, `use client`, $VALUE, and backslashes: C:\\tmp.\n';
+		try {
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"critic",
+					"--stage_n",
+					"3",
+					"--artifact-env",
+					GJC_RALPLAN_ARTIFACT_ENV,
+					"--run-id",
+					"env-run",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const content = await fs.readFile(ralplanPlanPath(root, "env-run", "stage-03-critic.md"), "utf-8");
+			expect(content).toContain('Mentions `"studio"`, `use client`, $VALUE');
+			expect(content).toContain("C:\\tmp");
+		} finally {
+			if (previous === undefined) {
+				delete process.env[GJC_RALPLAN_ARTIFACT_ENV];
+			} else {
+				process.env[GJC_RALPLAN_ARTIFACT_ENV] = previous;
+			}
+		}
+	});
+
+	it("--artifact-env rejects arbitrary env variable names", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "critic", "--stage_n", "3", "--artifact-env", "HOME", "--run-id", "bad-env-run"],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--artifact-env must be GJC_RALPLAN_ARTIFACT");
 	});
 
 	it("final stage emits pending-approval.md alongside the stage artifact", async () => {

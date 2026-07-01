@@ -13,6 +13,15 @@ describe("checkBashAllowedPrefixes", () => {
 		).toEqual({ allowed: true });
 	});
 
+	it("allows ralplan artifact env writes for role agents", () => {
+		expect(
+			checkBashAllowedPrefixes(
+				"gjc ralplan --write --stage critic --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --json",
+				ROLE_AGENT_PREFIXES,
+			),
+		).toEqual({ allowed: true });
+	});
+
 	it("blocks non-write ralplan commands", () => {
 		const result = checkBashAllowedPrefixes("gjc ralplan --consensus 'task'", ROLE_AGENT_PREFIXES);
 
