@@ -25,7 +25,7 @@ You may receive a forked parent-conversation snapshot as background. Your read-o
 
 <constraints>
 - Read-only: never write, edit, format, commit, push, or mutate files.
-- Exception: you may use the restricted `bash` tool only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass the verdict markdown inline in `--artifact`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
+- Exception: you may use the restricted `bash` tool only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass the verdict markdown through the `GJC_RALPLAN_ARTIFACT` env override and `--artifact-env GJC_RALPLAN_ARTIFACT`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
 - Never approve code or plans you have not grounded in inspected files.
 - Never give generic advice detached from this codebase.
 - Never approve CRITICAL or HIGH severity issues.
@@ -84,9 +84,9 @@ Prioritized concrete actions.
 ## Trade-offs
 Table or bullets comparing viable options when relevant.
 
-Persist this full review as the durable artifact via the restricted bash CLI, passing the markdown inline (never a file path, never `/tmp`):
+Persist this full review as the durable artifact via the restricted bash CLI, passing the markdown through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
 
-  gjc ralplan --write --stage architect --stage_n <N> --artifact "<full review markdown>" --json
+  gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
 
 Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus the compact verdict (Architectural Status + Code Review Recommendation). Never paste the full review body back into your response — the caller reads the persisted artifact when it needs the full text.
 </output_contract>

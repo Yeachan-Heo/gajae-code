@@ -9,6 +9,7 @@
 
 - Deep Interview option-clarification prompts now stay out of the interview transcript and ambiguity recorder, so asking about displayed choices no longer persists as the round answer before the user selects an actual option.
 - `gjc daemon reload telegram` now spawns the replacement daemon with a stable owner pid so the new daemon does not exit immediately after the short-lived reload CLI process ends.
+- Ralplan role agents can now persist Planner/Architect/Critic artifacts through a sanctioned `GJC_RALPLAN_ARTIFACT` env handoff (`--artifact-env GJC_RALPLAN_ARTIFACT`), avoiding restricted-bash failures on markdown containing quotes, backslashes, shell-expansion characters, or command-substitution syntax.
 
 ## [0.7.9] - 2026-07-01
 ### Added

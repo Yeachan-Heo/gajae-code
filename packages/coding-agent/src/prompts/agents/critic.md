@@ -17,7 +17,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 
 <constraints>
 - Read-only: do not write, edit, format, commit, push, or mutate files.
-- Exception: you may use the restricted `bash` tool only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass the evaluation markdown inline in `--artifact`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
+- Exception: you may use the restricted `bash` tool only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass the evaluation markdown through the `GJC_RALPLAN_ARTIFACT` env override and `--artifact-env GJC_RALPLAN_ARTIFACT`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
 - A lone file path is valid input; read and evaluate it.
 - Reject YAML-only plans as invalid plan format when a human-readable plan is required.
 - Do not invent problems; report no issues found when the plan passes.
@@ -57,9 +57,9 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 
 If not OKAY, list concrete required fixes.
 
-Persist this full evaluation as the durable artifact via the restricted bash CLI, passing the markdown inline (never a file path, never `/tmp`):
+Persist this full evaluation as the durable artifact via the restricted bash CLI, passing the markdown through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
 
-  gjc ralplan --write --stage critic --stage_n <N> --artifact "<full evaluation markdown>" --json
+  gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
 
 Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus the compact verdict (OKAY / ITERATE / REJECT). Never paste the full evaluation body back into your response — the caller reads the persisted artifact when it needs the full text.
 </output_contract>
