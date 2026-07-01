@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored default Enter = submit / Shift+Enter = newline. A bare LF (`\n`) is now treated as a plain Enter (submit) when the Kitty keyboard protocol is inactive, and only inserts a newline when the protocol is active (the Ghostty/terminal `shift+enter → \n` sendInput mapping). This reverts the regression from #959, which made a bare LF always insert a newline and swallowed Enter submissions on terminals that emit `\n` for Enter.
+
 ## [0.7.8] - 2026-06-30
 
 ### Fixed

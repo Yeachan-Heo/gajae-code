@@ -6,6 +6,7 @@ import { Editor } from "@gajae-code/tui/components/editor";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
+import { isKittyProtocolActive, setKittyProtocolActive } from "../src/keys";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
@@ -538,9 +539,29 @@ describe("Editor component", () => {
 			}
 		});
 
-		it("inserts a newline for raw LF on Windows terminal sendInput mappings", () => {
-			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-			Object.defineProperty(process, "platform", { value: "win32" });
+		it("submits raw LF as Enter when the Kitty protocol is inactive", () => {
+			const wasKittyActive = isKittyProtocolActive();
+			setKittyProtocolActive(false);
+			try {
+				const editor = new Editor(defaultEditorTheme);
+				let submitted = "";
+				editor.onSubmit = text => {
+					submitted = text;
+				};
+
+				editor.handleInput("a");
+				editor.handleInput("\n");
+
+				expect(submitted).toBe("a");
+				expect(editor.getText()).toBe("");
+			} finally {
+				setKittyProtocolActive(wasKittyActive);
+			}
+		});
+
+		it("inserts a newline for raw LF when the Kitty protocol is active (Ghostty Shift+Enter mapping)", () => {
+			const wasKittyActive = isKittyProtocolActive();
+			setKittyProtocolActive(true);
 			try {
 				const editor = new Editor(defaultEditorTheme);
 				let submitted = "";
@@ -555,7 +576,7 @@ describe("Editor component", () => {
 				expect(submitted).toBe("");
 				expect(editor.getText()).toBe("a\nb");
 			} finally {
-				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+				setKittyProtocolActive(wasKittyActive);
 			}
 		});
 
@@ -650,7 +671,7 @@ describe("Editor component", () => {
 			editor.handleInput("ä");
 			editor.handleInput("ö");
 			editor.handleInput("ü");
-			editor.handleInput("\n"); // new line
+			editor.handleInput("\x1b[13;2~"); // Shift+Enter → new line
 			editor.handleInput("Ä");
 			editor.handleInput("Ö");
 			editor.handleInput("Ü");

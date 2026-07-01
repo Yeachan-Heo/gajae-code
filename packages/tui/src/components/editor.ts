@@ -2,7 +2,7 @@ import { getProjectDir, logger } from "@gajae-code/utils";
 import type { AutocompleteProvider, CombinedAutocompleteProvider } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
-import { extractPrintableText, matchesKey } from "../keys";
+import { extractPrintableText, isKittyProtocolActive, matchesKey } from "../keys";
 import { KillRing } from "../kill-ring";
 import type { SymbolTheme } from "../symbols";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
@@ -1253,7 +1253,9 @@ export class Editor implements Component, Focusable {
 		else if (
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
 			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
-			(data === "\n" && data.length === 1) // Shift+Enter from terminal sendInput mapping
+			// Bare LF is Shift+Enter only under a Kitty/Ghostty custom LF mapping (protocol active).
+			// With the protocol off, a bare LF is a plain Enter and must submit, not insert a newline.
+			(data === "\n" && data.length === 1 && isKittyProtocolActive())
 		) {
 			if (this.#shouldSubmitOnBackslashEnter(data, kb)) {
 				this.#handleBackspace();
