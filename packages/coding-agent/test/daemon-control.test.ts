@@ -193,10 +193,11 @@ describe("TelegramDaemonController.reload", () => {
 		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
 
-		const alive = new Set<number>([999, process.pid]);
+		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
 		const spawns: Array<{ command: string; args: string[] }> = [];
 		const ctrl = new TelegramDaemonController(s, {
+			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
 			sendSignal: (pid, sig) => {
 				signals.push([pid, sig]);
@@ -213,8 +214,13 @@ describe("TelegramDaemonController.reload", () => {
 		expect(result.ok).toBe(true);
 		expect(signals).toContainEqual([999, "SIGTERM"]);
 		expect(spawns).toHaveLength(1);
-		const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as { ownerId: string };
+		const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as {
+			ownerId: string;
+			pid: number;
+		};
 		expect(after.ownerId).not.toBe("old");
+		expect(after.ownerId.startsWith("4242-")).toBe(true);
+		expect(after.pid).toBe(4242);
 		// No leftover control request after a successful reload.
 		expect(await readTelegramControlRequest(s)).toBeUndefined();
 	});

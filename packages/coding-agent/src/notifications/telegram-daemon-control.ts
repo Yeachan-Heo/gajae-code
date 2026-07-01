@@ -97,6 +97,14 @@ export interface TelegramDaemonControlDeps {
 	sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
 	spawn?: TelegramDaemonDeps["spawn"];
 	execPath?: string;
+	/**
+	 * Stable process id encoded into freshly-spawned daemon owner ids.
+	 *
+	 * The daemon-internal entrypoint rejects numeric owner ids whose process is
+	 * already gone. `gjc daemon reload` is a short-lived CLI process, so using its
+	 * own pid can race the child startup and make the replacement exit immediately.
+	 */
+	ownerPid?: number;
 	randomId?: () => string;
 	sleep?: (ms: number) => Promise<void>;
 	waitStepMs?: number;
@@ -188,6 +196,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			fs: this.deps.fs,
 			now: this.deps.now,
 			pidAlive: this.deps.pidAlive,
+			pid: this.deps.ownerPid ?? process.ppid,
 			spawn: this.deps.spawn,
 			execPath: this.deps.execPath,
 			randomId: this.deps.randomId,
