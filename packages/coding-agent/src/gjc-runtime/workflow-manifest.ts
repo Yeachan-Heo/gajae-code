@@ -271,7 +271,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				required: true,
 				appliesToVerbs: ["checkpoint", "record-review-blockers", "steer", "classify-blocker"],
 			},
-			{ name: "gjc-goal-json", type: "string", appliesToVerbs: ["checkpoint", "record-review-blockers"] },
 			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["steer"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["classify-blocker"] },

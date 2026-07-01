@@ -99,9 +99,8 @@ function syntheticPng(): Buffer {
 	return Buffer.concat([PNG_SIGNATURE, pngChunk("IHDR", ihdr), pngChunk("IDAT", deflateSync(raw)), pngChunk("IEND")]);
 }
 
-let activeObjective = "";
 async function seedPlan(root: string): Promise<void> {
-	const created = await createUltragoalPlan({
+	await createUltragoalPlan({
 		cwd: root,
 		brief: "@goal computer gate fixture",
 	});
@@ -111,20 +110,7 @@ async function seedPlan(root: string): Promise<void> {
 		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")),
 	]);
 	await runGit(root, ["commit", "-m", "plan"]);
-	activeObjective = created.gjcObjective;
 	await startNextUltragoalGoal({ cwd: root });
-}
-
-function goalSnapshot(): string {
-	return JSON.stringify({
-		goal: {
-			threadId: "test-thread",
-			objective: activeObjective,
-			status: "active",
-			createdAt: Date.now(),
-			updatedAt: Date.now(),
-		},
-	});
 }
 
 function artifact(kind = "native screenshot"): Record<string, unknown> {
@@ -236,8 +222,6 @@ async function checkpoint(root: string, qa: Record<string, unknown>): Promise<st
 			"complete",
 			"--evidence",
 			"fixture complete",
-			"--gjc-goal-json",
-			goalSnapshot(),
 			"--quality-gate-json",
 			qualityGate(qa),
 		],

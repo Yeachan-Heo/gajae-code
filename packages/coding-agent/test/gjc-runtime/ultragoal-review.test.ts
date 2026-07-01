@@ -246,7 +246,7 @@ function passingQualityGate(): Record<string, unknown> {
 
 async function completeSingleGoal(root: string): Promise<void> {
 	await writeStructuralArtifacts(root);
-	const created = await createUltragoalPlan({ cwd: root, brief: "Ship review reconcile" });
+	await createUltragoalPlan({ cwd: root, brief: "Ship review reconcile" });
 	await startNextUltragoalGoal({ cwd: root });
 	const checkpoint = await runNativeUltragoalCommand(
 		[
@@ -257,10 +257,6 @@ async function completeSingleGoal(root: string): Promise<void> {
 			"complete",
 			"--evidence",
 			"final story verified with targeted regression coverage",
-			"--gjc-goal-json",
-			JSON.stringify({
-				goal: { threadId: "test", objective: created.gjcObjective, status: "active", updatedAt: Date.now() },
-			}),
 			"--quality-gate-json",
 			JSON.stringify(passingQualityGate()),
 		],
@@ -365,7 +361,7 @@ describe("ultragoal review command", () => {
 		const root = await tempDir();
 		const qa = invalidInlineOnlyExecutorQa();
 		const reviewOutput = await review(root, ["--executor-qa-json", await writeQa(root, qa)]);
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship review gate" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship review gate" });
 		await startNextUltragoalGoal({ cwd: root });
 		const checkpoint = await runNativeUltragoalCommand(
 			[
@@ -376,10 +372,6 @@ describe("ultragoal review command", () => {
 				"complete",
 				"--evidence",
 				"review gate parity check",
-				"--gjc-goal-json",
-				JSON.stringify({
-					goal: { threadId: "test", objective: created.gjcObjective, status: "active", updatedAt: Date.now() },
-				}),
 				"--quality-gate-json",
 				JSON.stringify({
 					architectReview: {

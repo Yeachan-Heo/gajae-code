@@ -282,7 +282,6 @@ describe("ultragoal ask guard", () => {
 		plan.goals[0].completedAt = now;
 		const eventId = "event-final";
 		const qualityGateJson = {};
-		const gjcGoalJson = {};
 		const generation = computeUltragoalPlanGeneration({
 			plan,
 			ledger: [],
@@ -301,7 +300,6 @@ describe("ultragoal ask guard", () => {
 			gjcGoalMode: plan.gjcGoalMode,
 			gjcObjective: plan.gjcObjective,
 			qualityGateHash: hashStructuredValue(qualityGateJson),
-			gjcGoalSnapshotHash: hashStructuredValue(gjcGoalJson),
 			planGeneration: generation.planGeneration,
 			basis: generation.basis,
 			checkpointLedgerEventId: eventId,
@@ -309,7 +307,7 @@ describe("ultragoal ask guard", () => {
 		await fs.writeFile(paths.goalsPath, JSON.stringify(plan, null, 2));
 		await fs.writeFile(
 			paths.ledgerPath,
-			`${JSON.stringify({ eventId, event: "goal_checkpointed", goalId: plan.goals[0].id, status: "complete", completionVerification: plan.goals[0].completionVerification, qualityGateJson, gjcGoalJson })}\n`,
+			`${JSON.stringify({ eventId, event: "goal_checkpointed", goalId: plan.goals[0].id, status: "complete", completionVerification: plan.goals[0].completionVerification, qualityGateJson })}\n`,
 		);
 		const diagnostic = await isUltragoalAskBlocked(cwd);
 		expect(diagnostic.active).toBe(false);

@@ -11,8 +11,7 @@ import {
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../gjc-runtime/state-writer";
-import { isUltragoalBypassPrompt, readUltragoalVerificationState } from "../gjc-runtime/ultragoal-guard";
-import { getUltragoalRunCompletionState, readUltragoalPlan } from "../gjc-runtime/ultragoal-runtime";
+import { isUltragoalBypassPrompt, verifyUltragoalDurableCompletionState } from "../gjc-runtime/ultragoal-guard";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
 	readVisibleSkillActiveState as readCanonicalVisibleSkillActiveState,
@@ -565,6 +564,10 @@ function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean
 	return false;
 }
 
+function ultragoalDurableCompletionReleasesStop(state: string): boolean {
+	return state === "inactive" || state === "active_verified_complete";
+}
+
 /**
  * Cross-file coherence guard for a mode-state that claims it releases the Stop
  * block. `modeStateReleasesStop` trusts a single mode-state file; if any writer
@@ -577,18 +580,15 @@ function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean
  * cheap and read-only — ultragoal reads the durable plan; skills without an
  * independent durable source release as before.
  */
-async function detectStaleModeStateRelease(skill: GjcWorkflowSkill, cwd: string): Promise<string | null> {
-	if (skill === "ultragoal") {
-		const plan = await readUltragoalPlan(cwd);
-		if (!plan) return null;
-		const runState = getUltragoalRunCompletionState(plan);
-		if (runState.incompleteGoals.length > 0) {
-			return `the durable Ultragoal plan still has incomplete required goals (${runState.incompleteGoals
-				.map(goal => goal.id)
-				.join(", ")}); run \`gjc ultragoal complete-goals\` to continue`;
-		}
-	}
-	return null;
+async function detectStaleModeStateRelease(
+	skill: GjcWorkflowSkill,
+	cwd: string,
+	sessionId?: string | null,
+): Promise<string | null> {
+	if (skill !== "ultragoal") return null;
+	const diagnostic = await verifyUltragoalDurableCompletionState({ cwd, sessionId });
+	if (ultragoalDurableCompletionReleasesStop(diagnostic.state)) return null;
+	return `${diagnostic.message} Run \`gjc ultragoal complete-goals\` to continue, or checkpoint a finished story with \`gjc ultragoal checkpoint --status complete --quality-gate-json <file>\`, before stopping`;
 }
 
 /**
@@ -663,19 +663,6 @@ function stateMatchesContext(state: ModeState, sessionId?: string, threadId?: st
 	return true;
 }
 
-async function readCurrentGoalObjectiveFromSessionFile(sessionFile: string | undefined): Promise<string | null> {
-	const trimmed = sessionFile?.trim();
-	if (!trimmed) return null;
-	const entries = (await loadEntriesFromFile(trimmed)).filter(
-		(entry): entry is SessionEntry => entry.type !== "session",
-	);
-	const context = buildSessionContext(entries);
-	const goal = context.modeData?.goal;
-	if (typeof goal !== "object" || goal === null) return null;
-	const objective = (goal as { objective?: unknown }).objective;
-	return typeof objective === "string" && objective.trim().length > 0 ? objective.trim() : null;
-}
-
 async function readLatestAssistantTextFromSessionFile(sessionFile: string | undefined): Promise<string | null> {
 	const trimmed = sessionFile?.trim();
 	if (!trimmed) return null;
@@ -730,34 +717,18 @@ export async function buildActiveUltragoalPromptContext(input: UserPromptSubmitS
 	if (!stateMatchesContext(visibleModeState.state, resolvedSessionId, input.threadId)) return null;
 
 	const phase = String(visibleModeState.state.current_phase ?? "active");
-	const stateObjective =
-		typeof visibleModeState.state.objective === "string"
-			? visibleModeState.state.objective
-			: typeof visibleModeState.state.gjcObjective === "string"
-				? visibleModeState.state.gjcObjective
-				: "";
-	const sessionObjective = await readCurrentGoalObjectiveFromSessionFile(input.sessionFile);
 	const normalizedPrompt = input.prompt?.replace(/\\?"/g, '"');
 	const isBypassPrompt = Boolean(
 		(normalizedPrompt && isUltragoalBypassPrompt(normalizedPrompt)) ||
 			(input.prompt && /goal[\s\S]{0,80}complete/i.test(input.prompt)),
 	);
 	if (isBypassPrompt) {
-		const objectives = [sessionObjective, stateObjective].filter(
-			(value): value is string => typeof value === "string" && value.trim().length > 0,
-		);
-		if (objectives.length === 0) {
-			return "BLOCK_ULTRAGOAL_COMPLETION: Active Ultragoal completion is blocked until a current GJC goal objective can be verified. Use durable blocker work or run strict `gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>` before completion.";
-		}
-		for (const objective of objectives) {
-			const diagnostic = await readUltragoalVerificationState({
-				cwd: input.cwd,
-				currentGoal: { objective },
-			});
-			if (diagnostic.state === "unrelated_goal") continue;
-			if (!["inactive", "active_verified_complete"].includes(diagnostic.state)) {
-				return `BLOCK_ULTRAGOAL_COMPLETION: ${diagnostic.message} Use durable blocker work or run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>\` before completion.`;
-			}
+		const diagnostic = await verifyUltragoalDurableCompletionState({
+			cwd: input.cwd,
+			sessionId: resolvedSessionId,
+		});
+		if (!ultragoalDurableCompletionReleasesStop(diagnostic.state)) {
+			return `BLOCK_ULTRAGOAL_COMPLETION: ${diagnostic.message} Use durable blocker work or run strict \`gjc ultragoal checkpoint --status complete --quality-gate-json <file>\` before completion.`;
 		}
 	}
 	return `Ultragoal is active (phase: ${phase}; state: ${visibleModeState.statePath}). If the user prompt is a steering request, use \`gjc ultragoal steer\` to add or steer subgoals. Normal prose should not mutate Ultragoal state.`;
@@ -818,7 +789,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 			// authoritative durable state. If a stale/incoherent mode-state would
 			// release while the plan/ledger still shows pending work, block instead
 			// of trusting the single file (see #659).
-			const staleRelease = await detectStaleModeStateRelease(entry.skill, input.cwd);
+			const staleRelease = await detectStaleModeStateRelease(entry.skill, input.cwd, resolvedSessionId);
 			if (staleRelease) {
 				const coherenceMessage = `GJC skill "${entry.skill}" mode-state reports it released the Stop block (${modeStatePath(input.cwd, entry.skill, resolvedSessionId)}), but ${staleRelease}. The mode-state is incoherent with authoritative durable state; finish or explicitly clear the pending work before stopping.`;
 				return {
@@ -847,29 +818,18 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 		const phase = String(modeState?.current_phase ?? entry.phase ?? skillState.phase ?? "active");
 		const statePath = modeStatePath(input.cwd, entry.skill, resolvedSessionId);
 		if (entry.skill === "ultragoal") {
-			const objective =
-				(await readCurrentGoalObjectiveFromSessionFile(input.sessionFile)) ??
-				(typeof modeState?.objective === "string"
-					? modeState.objective
-					: typeof modeState?.gjcObjective === "string"
-						? modeState.gjcObjective
-						: "");
-			if (objective) {
-				const diagnostic = await readUltragoalVerificationState({
-					cwd: input.cwd,
-					currentGoal: { objective },
-				});
-				if (diagnostic.state === "active_verified_complete") continue;
-				if (!["inactive", "unrelated_goal"].includes(diagnostic.state)) {
-					const ultragoalMessage = `GJC ultragoal verification is blocking stop: ${diagnostic.message} Run strict checkpoint verification or record review blockers before stopping.`;
-					return {
-						decision: "block",
-						reason: ultragoalMessage,
-						stopReason: `gjc_ultragoal_verification_${diagnostic.state}`,
-						systemMessage: ultragoalMessage,
-					};
-				}
-			}
+			const diagnostic = await verifyUltragoalDurableCompletionState({
+				cwd: input.cwd,
+				sessionId: resolvedSessionId,
+			});
+			if (ultragoalDurableCompletionReleasesStop(diagnostic.state)) continue;
+			const ultragoalMessage = `GJC ultragoal verification is blocking stop: ${diagnostic.message} Run \`gjc ultragoal checkpoint --status complete --quality-gate-json <file>\` or record review blockers before stopping.`;
+			return {
+				decision: "block",
+				reason: ultragoalMessage,
+				stopReason: `gjc_ultragoal_verification_${diagnostic.state}`,
+				systemMessage: ultragoalMessage,
+			};
 		}
 		const systemMessage = handoffRequired
 			? buildHandoffForceAskMessage(entry.skill, phase, statePath)

@@ -198,18 +198,6 @@ describe("GJC native skill-state hooks", () => {
 		});
 	}
 
-	function goalSnapshot(objective: string, status = "active", updatedAt = Date.now()): string {
-		return JSON.stringify({
-			goal: {
-				threadId: "test-thread",
-				objective,
-				status,
-				createdAt: updatedAt,
-				updatedAt,
-			},
-		});
-	}
-
 	it("detects only the public GJC workflow skill surface", () => {
 		expect(detectSkillKeywords("$deep-interview then $team").map(match => match.skill)).toEqual([
 			"deep-interview",
@@ -1468,21 +1456,21 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-block",
+				sessionId: "test-session",
 				threadId: "thread-ultra-block",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
-		const statePath = modeStatePath(root, "session-ultra-block", "ultragoal");
+		const statePath = modeStatePath(root, "test-session", "ultragoal");
 		const state = await Bun.file(statePath).json();
 		await Bun.write(statePath, JSON.stringify({ ...state, objective: plan.goals[0]?.objective }, null, 2));
 
-		const prompt = 'call goal({op:"complete"}) now for the active durable objective';
+		const prompt = 'call goal({"op":"complete"}) now for the active durable objective';
 		const result = await dispatchGjcNativeSkillHook({
 			hookEventName: "UserPromptSubmit",
 			userPrompt: prompt,
 			cwd: root,
-			sessionId: "session-ultra-block",
+			sessionId: "test-session",
 			threadId: "thread-ultra-block",
 		});
 
@@ -1490,7 +1478,7 @@ disabledExtensions:
 		expect(String(result.outputJson?.reason ?? "")).toContain("BLOCK_ULTRAGOAL_COMPLETION");
 	});
 
-	it("UserPromptSubmit recovers active Ultragoal objective from session transcript", async () => {
+	it("UserPromptSubmit blocks completion from durable state (no transcript recovery)", async () => {
 		const root = await cwd();
 		const plan = await createUltragoalPlan({ cwd: root, brief: "Ship verified ultragoal" });
 		const sessionFile = path.join(root, "session.jsonl");
@@ -1503,21 +1491,21 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-transcript",
+				sessionId: "test-session",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
 
 		const result = await dispatchGjcNativeSkillHook({
 			hookEventName: "UserPromptSubmit",
-			userPrompt: 'please call goal({op:"complete"})',
+			userPrompt: 'please call goal({"op":"complete"})',
 			cwd: root,
-			sessionId: "session-ultra-transcript",
+			sessionId: "test-session",
 			sessionFile,
 		});
 
 		expect(result.outputJson).toMatchObject({ decision: "block" });
-		expect(String(result.outputJson?.reason ?? "")).toContain("fresh final aggregate receipt");
+		expect(String(result.outputJson?.reason ?? "")).toContain("BLOCK_ULTRAGOAL_COMPLETION");
 	});
 
 	it("Stop blocks verified Ultragoal stories while later required goals remain", async () => {
@@ -1536,7 +1524,6 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			gjcGoalJson: goalSnapshot(plan.gjcObjective),
 			qualityGateJson: ultragoalQualityGate(),
 		});
 		await dispatchGjcNativeSkillHook(
@@ -1561,8 +1548,10 @@ disabledExtensions:
 		});
 
 		expect(blocked.outputJson).toMatchObject({ decision: "block" });
-		expect(String(blocked.outputJson?.reason ?? "")).toContain("Ultragoal still has incomplete required goals: G002");
-		expect(String(blocked.outputJson?.reason ?? "")).toContain("complete-goals");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain("Ultragoal has incomplete required goals: G002");
+		expect(String(blocked.outputJson?.reason ?? "")).toContain(
+			"gjc ultragoal checkpoint --status complete --quality-gate-json <file>",
+		);
 	});
 
 	it("Stop blocks when stale Ultragoal mode-state would release but the plan still has pending goals", async () => {
@@ -1574,7 +1563,7 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-stale-release",
+				sessionId: "test-session",
 				threadId: "thread-ultra-stale-release",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
@@ -1586,14 +1575,14 @@ disabledExtensions:
 		// cross-file coherence guard must keep blocking while the plan has
 		// incomplete goals.
 		await Bun.write(
-			modeStatePath(root, "session-ultra-stale-release", "ultragoal"),
-			JSON.stringify({ active: false, current_phase: "complete", session_id: "session-ultra-stale-release" }),
+			modeStatePath(root, "test-session", "ultragoal"),
+			JSON.stringify({ active: false, current_phase: "complete", session_id: "test-session" }),
 		);
 
 		const blocked = await dispatchGjcNativeSkillHook({
 			hookEventName: "Stop",
 			cwd: root,
-			sessionId: "session-ultra-stale-release",
+			sessionId: "test-session",
 			threadId: "thread-ultra-stale-release",
 		});
 
@@ -1613,7 +1602,7 @@ disabledExtensions:
 				hookEventName: "UserPromptSubmit",
 				userPrompt: "$ultragoal plan this",
 				cwd: root,
-				sessionId: "session-ultra-releasing-phase",
+				sessionId: "test-session",
 				threadId: "thread-ultra-releasing-phase",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
@@ -1622,14 +1611,14 @@ disabledExtensions:
 		// active:true but a terminal phase still releases via STOP_RELEASING_PHASES;
 		// the coherence guard must override that release while goals remain.
 		await Bun.write(
-			modeStatePath(root, "session-ultra-releasing-phase", "ultragoal"),
-			JSON.stringify({ active: true, current_phase: "completed", session_id: "session-ultra-releasing-phase" }),
+			modeStatePath(root, "test-session", "ultragoal"),
+			JSON.stringify({ active: true, current_phase: "completed", session_id: "test-session" }),
 		);
 
 		const blocked = await dispatchGjcNativeSkillHook({
 			hookEventName: "Stop",
 			cwd: root,
-			sessionId: "session-ultra-releasing-phase",
+			sessionId: "test-session",
 			threadId: "thread-ultra-releasing-phase",
 		});
 
@@ -1685,7 +1674,6 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			gjcGoalJson: goalSnapshot(plan.gjcObjective),
 			qualityGateJson: ultragoalQualityGate(),
 		});
 		await dispatchGjcNativeSkillHook(
@@ -1711,8 +1699,10 @@ disabledExtensions:
 		});
 
 		expect(result.outputJson).toMatchObject({ decision: "block" });
-		expect(String(result.outputJson?.reason ?? "")).toContain("Ultragoal still has incomplete required goals: G002");
-		expect(String(result.outputJson?.reason ?? "")).toContain("complete-goals");
+		expect(String(result.outputJson?.reason ?? "")).toContain("Ultragoal has incomplete required goals: G002");
+		expect(String(result.outputJson?.reason ?? "")).toContain(
+			"gjc ultragoal checkpoint --status complete --quality-gate-json <file>",
+		);
 	});
 	it("UserPromptSubmit includes steer guidance when activating Ultragoal", async () => {
 		const root = await cwd();

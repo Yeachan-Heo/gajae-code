@@ -11,7 +11,7 @@ Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durabl
 
 ## Purpose
 
-`ultragoal` turns a brief into repo-native artifacts and then drives a GJC goal safely through the unified `goal` tool. New plans default to a stable pointer-style aggregate GJC goal for the whole durable plan in `.gjc/_session-{sessionid}/ultragoal/goals.json`, including later accepted/appended stories under the original brief constraints, while GJC tracks G001/G002 story progress in the ledger. Ultragoal does not require any `/goal` slash-command between runs. For back-to-back ultragoal runs in one session/thread, call `goal({"op":"drop"})` only when `goal({"op":"get"})` still reports an active aggregate; then call `goal({"op":"create"})`. The goal tool stays armed across drop so the next create works in-session, and no slash-command cleanup exists or is required.
+`ultragoal` turns a brief into repo-native durable artifacts and then drives execution through the unified `goal` tool as a UX bridge only. `goals.json` is the canonical source of goal identity and state; `ledger.jsonl` is the canonical proof stream for checkpoints, receipts, blockers, steering, and reviews. The inline `goal` tool and goal-mode-request create-bridge exist only to keep the agent's interactive loop focused on the current aggregate or story objective. Completion is verified purely from durable `goals.json` plus fresh `ledger.jsonl` receipts, never from inline goal state. The agent, not the CLI or hooks, calls `goal({"op":"complete"})` or `goal({"op":"drop"})` after durable run completion or cleanup; CLI commands and hooks never mutate goal state.
 
 - `.gjc/_session-{sessionid}/ultragoal/brief.md`
 - `.gjc/_session-{sessionid}/ultragoal/goals.json`
@@ -36,7 +36,7 @@ gjc ultragoal complete-goals
 gjc ultragoal complete-goals --retry-failed
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --quality-gate-json <quality-gate-json-or-path>
 gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"
-gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve final review blockers" --objective "<blocker-resolution objective>" --evidence "<review findings>" --gjc-goal-json <active-goal-get-json-or-path>
+gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve final review blockers" --objective "<blocker-resolution objective>" --evidence "<review findings>"
 ```
 
 Use these exact goal-tool calls for the inline goal state:
@@ -50,7 +50,7 @@ goal({"op":"resume"})
 ```
 `drop` clears the active goal without exiting goal mode; `resume` reactivates a paused goal.
 
-Complete checkpoints source the active GJC goal snapshot from the current session when `--gjc-goal-json` is omitted. Use an explicit `--gjc-goal-json` only as an override; supplied values are still strictly validated and must be active goal-mode snapshots, not `.gjc/ultragoal/goals.json` records.
+Durable completion is single-source: `goals.json` defines which goals exist and their required state, while `ledger.jsonl` provides the receipt proof used to verify completion. Inline goal state is UX-only and is reconciled by the agent after durable completion, not by CLI checkpoints or hooks.
 
 ## Create goals
 
@@ -98,13 +98,13 @@ Loop until `gjc ultragoal status` reports all goals complete:
 5. Complete the current GJC story only.
 6. Run a completion audit against the story objective and real artifacts/tests.
 7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `goal({"op":"complete"})` for intermediate stories; checkpoint each story while the aggregate objective is still `active`. On the final story, create the final aggregate receipt first; only after that receipt exists may `goal({"op":"complete"})` run.
-8. Checkpoint the durable ledger. Complete checkpoints require `--quality-gate-json`; the runtime sources the active GJC goal snapshot from current session state when `--gjc-goal-json` is omitted, and rejects any explicitly supplied bad snapshot:
+8. Checkpoint the durable ledger. Complete checkpoints require `--quality-gate-json` only:
    `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --quality-gate-json <quality-gate-json-or-path>`
    A successful complete checkpoint is story completion, not automatic run completion. Read the checkpoint output: when it prints `Next ultragoal goal: <id>`, continue that active story under the same aggregate GJC goal; when it prints `All ultragoal goals are complete`, the durable run is terminal. `gjc ultragoal complete-goals` remains the supported manual next-story command if continuation output was missed.
 9. If blocked or failed, checkpoint failure:
    `gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
 10. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
-   `gjc ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy GJC goal blocks goal create in this thread>" --gjc-goal-json <goal-get-json-or-path>`
+   `gjc ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy GJC goal blocks goal create in this thread>"`
 11. Resume failed goals with `gjc ultragoal complete-goals --retry-failed`.
 
 ## Blocker triage and pause discipline
@@ -179,7 +179,7 @@ For large subgoals with independent slices, the Ultragoal leader must spawn para
 
 Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
 
-The leader checkpoints Ultragoal from Team evidence; the runtime uses the active current-session GJC goal snapshot unless an explicit `--gjc-goal-json` override is supplied:
+The leader checkpoints Ultragoal from Team evidence; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
 
 ```sh
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>
@@ -219,10 +219,10 @@ An ultragoal story cannot be checkpointed `complete` until the active agent has 
 8. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
 9. If any lane finds an issue, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
    ```sh
-   gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<architect/executor findings>" --gjc-goal-json <active-goal-get-json-or-path>
+   gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<architect/executor findings>"
    ```
 10. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
-11. Only after the loop is clean, checkpoint the story as complete with a structured quality gate and current-session active goal snapshot. The checkpoint creates a receipt; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before `goal({"op":"complete"})` is allowed.
+11. Only after the loop is clean, checkpoint the story as complete with a structured quality gate. The checkpoint creates a receipt in `ledger.jsonl`; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before the agent calls `goal({"op":"complete"})` to reconcile the inline UX goal state.
 
 While an Ultragoal run is active, the `ask` tool is blocked for all agents. Record unresolved review decisions as durable blockers with `gjc ultragoal record-review-blockers` instead of prompting interactively.
 
@@ -392,6 +392,6 @@ The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-
 - For back-to-back ultragoal runs in the same session/thread, when `goal({"op":"get"})` still reports an active aggregate, call `goal({"op":"drop"})` before `goal({"op":"create"})`; when no active goal exists or the prior aggregate is already complete or dropped, call `goal({"op":"create"})` directly. The goal tool remains callable across drop; no slash-command cleanup exists or is required.
 - Never call `goal({"op":"create"})` when `goal({"op":"get"})` reports a different active goal.
 - Never call `goal({"op":"complete"})` unless the aggregate run or legacy per-story goal is actually complete.
-- In aggregate mode, intermediate and final story checkpoints require a matching `active` GJC goal snapshot; omitted complete-checkpoint `--gjc-goal-json` reads that snapshot from current session state, and the final story checkpoint creates the final aggregate receipt before `goal({"op":"complete"})` may reconcile the inline goal state.
-- Completion checkpoints require read-only goal snapshot reconciliation: omit `--gjc-goal-json` to use current session state, or pass an explicit JSON/path override that remains strictly validated; shell commands and hooks must not mutate goal state.
+- In aggregate mode, intermediate and final story checkpoints update durable `goals.json` state and append receipt proof to `ledger.jsonl`; the final story checkpoint creates the final aggregate receipt before the agent may call `goal({"op":"complete"})`.
+- Completion checkpoints require `--quality-gate-json` only. Shell commands and hooks must not mutate goal state; the agent reconciles inline goal-tool state after durable completion.
 - Treat `ledger.jsonl` as the durable audit trail; checkpoint after every success or failure.

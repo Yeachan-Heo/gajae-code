@@ -219,20 +219,8 @@ function qualityGate(): Record<string, unknown> {
 	};
 }
 
-function goalSnapshot(objective: string): string {
-	return JSON.stringify({
-		goal: {
-			threadId: "dogfood-test-thread",
-			objective,
-			status: "active",
-			createdAt: Date.now(),
-			updatedAt: Date.now(),
-		},
-	});
-}
-
 async function checkpoint(root: string): Promise<{ status: number; stdout?: string; stderr?: string }> {
-	const created = await createUltragoalPlan({ cwd: root, brief: "Dogfood hardened live red-team gate" });
+	await createUltragoalPlan({ cwd: root, brief: "Dogfood hardened live red-team gate" });
 	await startNextUltragoalGoal({ cwd: root });
 	return runNativeUltragoalCommand(
 		[
@@ -243,8 +231,6 @@ async function checkpoint(root: string): Promise<{ status: number; stdout?: stri
 			"complete",
 			"--evidence",
 			"dogfood live web plus cli replay gate",
-			"--gjc-goal-json",
-			goalSnapshot(created.gjcObjective),
 			"--quality-gate-json",
 			JSON.stringify(qualityGate()),
 		],
