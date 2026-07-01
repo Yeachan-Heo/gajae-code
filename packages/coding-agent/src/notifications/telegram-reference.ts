@@ -37,6 +37,8 @@ export interface RenderedMessage {
 	inline_keyboard?: InlineButton[][];
 }
 
+type TelegramSend = (method: string, body: unknown) => Promise<Response>;
+
 /** Encode `actionId` + option `index` into Telegram callback_data (<=64 bytes). */
 export function encodeCallbackData(actionId: string, index: number): string {
 	return `r:${index}:${actionId}`.slice(0, 64);
@@ -139,6 +141,24 @@ export function buildActionMessage(action: {
 	const body = `${text}\n\n${numberedOptionList(options)}`;
 	const inline_keyboard = buildCompactChoiceGrid(options, i => encodeCallbackData(action.id, i));
 	return { text: body, inline_keyboard };
+}
+
+/** Send Telegram HTML text chunks sequentially so long messages preserve order. */
+export async function sendTelegramHtmlChunks(
+	send: TelegramSend,
+	chatId: string,
+	text: string,
+	inlineKeyboard?: InlineButton[][],
+): Promise<void> {
+	const chunks = splitTelegramHtml(text);
+	for (let i = 0; i < chunks.length; i++) {
+		await send("sendMessage", {
+			chat_id: chatId,
+			text: chunks[i]!,
+			parse_mode: TELEGRAM_PARSE_MODE,
+			...(i === chunks.length - 1 && inlineKeyboard ? { reply_markup: { inline_keyboard: inlineKeyboard } } : {}),
+		});
+	}
 }
 
 /** A protocol `reply` frame the client should send to the server. */
@@ -285,15 +305,15 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	let latestPendingAskId: string | undefined;
 
-	const send = (method: string, body: unknown): Promise<Response> =>
+	const send: TelegramSend = (method, body) =>
 		fetchImpl(`${api}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 		});
 
-	ws.addEventListener("message", (ev: MessageEvent) => {
-		const msg = JSON.parse(String(ev.data)) as {
+	const handleServerMessage = async (data: string): Promise<void> => {
+		const msg = JSON.parse(data) as {
 			type: string;
 			kind?: "ask" | "idle";
 			id?: string;
@@ -311,17 +331,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 				options: msg.options,
 				summary: msg.summary,
 			});
-			const chunks = splitTelegramHtml(rendered.text);
-			chunks.forEach((text, i) => {
-				void send("sendMessage", {
-					chat_id: opts.chatId,
-					text,
-					parse_mode: TELEGRAM_PARSE_MODE,
-					...(i === chunks.length - 1 && rendered.inline_keyboard
-						? { reply_markup: { inline_keyboard: rendered.inline_keyboard } }
-						: {}),
-				});
-			});
+			await sendTelegramHtmlChunks(send, opts.chatId, rendered.text, rendered.inline_keyboard);
 		} else if (msg.type === "action_resolved" && msg.id === latestPendingAskId) {
 			latestPendingAskId = undefined;
 		} else {
@@ -330,11 +340,16 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			// session's forum topic; this reference shows the minimal handling.
 			const threaded = renderThreadedFrame(msg as never);
 			if (threaded?.text) {
-				for (const text of splitTelegramHtml(threaded.text)) {
-					void send("sendMessage", { chat_id: opts.chatId, text, parse_mode: TELEGRAM_PARSE_MODE });
-				}
+				await sendTelegramHtmlChunks(send, opts.chatId, threaded.text);
 			}
 		}
+	};
+
+	let messageQueue = Promise.resolve();
+	ws.addEventListener("message", ev => {
+		const data = String(ev.data);
+		messageQueue = messageQueue.catch(() => undefined).then(() => handleServerMessage(data));
+		void messageQueue.catch(() => undefined);
 	});
 
 	// Telegram long-poll loop.

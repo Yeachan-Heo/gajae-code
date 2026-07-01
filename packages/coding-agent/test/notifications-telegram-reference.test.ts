@@ -5,6 +5,7 @@ import {
 	decodeCallbackData,
 	encodeCallbackData,
 	routeInboundUpdate,
+	sendTelegramHtmlChunks,
 	telegramUpdateToReply,
 } from "../src/notifications/telegram-reference";
 
@@ -123,6 +124,29 @@ describe("telegram reference client helpers", () => {
 		const idle = buildActionMessage({ kind: "idle", id: "i1", summary: "done" });
 		expect(idle.inline_keyboard).toBeUndefined();
 		expect(idle.text).toContain("done");
+	});
+
+	test("sendTelegramHtmlChunks awaits chunks sequentially and attaches keyboard to final chunk", async () => {
+		const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+		const releases: Array<() => void> = [];
+		const send = async (method: string, body: unknown): Promise<Response> => {
+			calls.push({ method, body: body as Record<string, unknown> });
+			await new Promise<void>(resolve => releases.push(resolve));
+			return new Response(JSON.stringify({ ok: true }));
+		};
+		const keyboard = [[{ text: "1", callback_data: "r:0:a1" }]];
+		const sending = sendTelegramHtmlChunks(send, "42", "a".repeat(4100), keyboard);
+
+		await Bun.sleep(0);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.body.reply_markup).toBeUndefined();
+		releases.shift()?.();
+		await Bun.sleep(0);
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.body.reply_markup).toEqual({ inline_keyboard: keyboard });
+		releases.shift()?.();
+		await sending;
+		expect(calls.map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
 	});
 
 	test("telegramUpdateToReply maps a button tap to an option index", () => {
