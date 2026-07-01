@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
+	type ApplyBackendDeps,
 	applyBrowserBackendChange,
 	browserBackendOptions,
-	type ApplyBackendDeps,
 } from "../../src/tools/browser/backend-select";
 
 function baseDeps(overrides: Partial<ApplyBackendDeps>): ApplyBackendDeps {
@@ -35,7 +35,13 @@ describe("browserBackendOptions", () => {
 describe("applyBrowserBackendChange", () => {
 	it("switches to aside on macOS when the CLI is present, awaiting restart", async () => {
 		let restarted = false;
-		const res = await applyBrowserBackendChange(baseDeps({ restart: async () => void (restarted = true) }));
+		const res = await applyBrowserBackendChange(
+			baseDeps({
+				restart: async () => {
+					restarted = true;
+				},
+			}),
+		);
 		expect(res).toEqual({ status: "switched", backend: "aside" });
 		expect(restarted).toBe(true);
 	});
@@ -43,7 +49,13 @@ describe("applyBrowserBackendChange", () => {
 	it("rejects aside off macOS without changing the setting", async () => {
 		let stored: "native" | "aside" = "native";
 		const res = await applyBrowserBackendChange(
-			baseDeps({ platform: "linux", getSetting: () => stored, setSetting: v => void (stored = v) }),
+			baseDeps({
+				platform: "linux",
+				getSetting: () => stored,
+				setSetting: v => {
+					stored = v;
+				},
+			}),
 		);
 		expect(res.status).toBe("unchanged");
 		expect(stored).toBe("native");
@@ -54,7 +66,9 @@ describe("applyBrowserBackendChange", () => {
 		const res = await applyBrowserBackendChange(
 			baseDeps({
 				getSetting: () => stored,
-				setSetting: v => void (stored = v),
+				setSetting: v => {
+					stored = v;
+				},
 				probe: () => ({ ok: false, searched: ["/x/aside"], manualInstallCommand: "cmd", url: "u" }),
 			}),
 		);
@@ -67,7 +81,9 @@ describe("applyBrowserBackendChange", () => {
 		const res = await applyBrowserBackendChange(
 			baseDeps({
 				getSetting: () => stored,
-				setSetting: v => void (stored = v),
+				setSetting: v => {
+					stored = v;
+				},
 				probe: () => ({ ok: false, searched: [], manualInstallCommand: "cmd", url: "u" }),
 				confirmInstall: async () => false,
 			}),
@@ -82,7 +98,9 @@ describe("applyBrowserBackendChange", () => {
 		const res = await applyBrowserBackendChange(
 			baseDeps({
 				getSetting: () => stored,
-				setSetting: v => void (stored = v),
+				setSetting: v => {
+					stored = v;
+				},
 				probe: () =>
 					installed
 						? { ok: true, path: "/x/aside" }
@@ -102,7 +120,9 @@ describe("applyBrowserBackendChange", () => {
 		const res = await applyBrowserBackendChange(
 			baseDeps({
 				getSetting: () => stored,
-				setSetting: v => void (stored = v),
+				setSetting: v => {
+					stored = v;
+				},
 				restart: async () => {
 					throw new Error("default-backend tab(s) are busy");
 				},

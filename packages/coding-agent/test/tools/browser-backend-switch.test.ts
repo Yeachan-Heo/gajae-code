@@ -25,7 +25,13 @@ function fakeWorker(): TabSession["worker"] {
 	const handlers = new Set<(m: { type: string }) => void>();
 	return {
 		send: (msg: { type: string }) => {
-			if (msg.type === "close") queueMicrotask(() => handlers.forEach(h => h({ type: "closed" })));
+			if (msg.type === "close") {
+				queueMicrotask(() => {
+					handlers.forEach(h => {
+						h({ type: "closed" });
+					});
+				});
+			}
 		},
 		onMessage: (h: (m: { type: string }) => void) => {
 			handlers.add(h);
