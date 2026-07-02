@@ -664,7 +664,7 @@ export class InputController {
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
 		this.ctx.locallySubmittedUserSignatures.clear();
 		const { steering, followUp } = this.ctx.session.clearQueue();
-		const compactionQueued = this.ctx.compactionQueuedMessages.map(entry => entry.text);
+		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).map(entry => entry.text);
 		this.ctx.compactionQueuedMessages = [];
 		const allQueued = [...steering, ...followUp, ...compactionQueued];
 		if (allQueued.length === 0) {
