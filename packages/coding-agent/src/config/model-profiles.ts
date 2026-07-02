@@ -104,6 +104,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "anthropic/claude-opus-4-8:high",
 		architect: "anthropic/claude-opus-4-8:xhigh",
 	}),
+	profile("claude-fable", ["anthropic"], {
+		default: "anthropic/claude-fable-5:xhigh",
+		executor: "anthropic/claude-sonnet-5",
+		planner: "anthropic/claude-fable-5:low",
+		critic: "anthropic/claude-fable-5:high",
+		architect: "anthropic/claude-fable-5:xhigh",
+	}),
 	profile("glm-eco", ["zai"], {
 		default: "zai/glm-5.2:low",
 		executor: "zai/glm-5.2:minimal",
@@ -261,6 +268,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "openai-codex/gpt-5.5:xhigh",
 	}),
+	profile("fable-opus-codex", ["anthropic", "openai-codex"], {
+		default: "anthropic/claude-fable-5:high",
+		executor: "openai-codex/gpt-5.5:high",
+		planner: "anthropic/claude-opus-4-8:medium",
+		critic: "anthropic/claude-opus-4-8:high",
+		architect: "openai-codex/gpt-5.5:xhigh",
+	}),
 ];
 
 export interface ModelProfilePresentation {
@@ -278,6 +292,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
+	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },
 	"glm-eco": { displayName: "GLM Eco", providerGroup: "GLM" },
 	"glm-medium": { displayName: "GLM Medium", providerGroup: "GLM" },
 	"glm-pro": { displayName: "GLM Pro", providerGroup: "GLM" },
@@ -299,6 +314,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"minimax-pro": { displayName: "MiniMax Pro", providerGroup: "MINIMAX" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
+	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
 };
 
 const PROFILE_GROUP_ORDER = [
