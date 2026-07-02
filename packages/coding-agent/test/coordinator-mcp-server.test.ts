@@ -25,6 +25,9 @@ async function tempRoot(): Promise<string> {
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
+function isTmuxPromptDeliveryCommand(command: string[]): boolean {
+	return command[1] === "set-buffer" || command[1] === "paste-buffer" || command[1] === "send-keys";
+}
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -140,7 +143,7 @@ describe("Coordinator MCP server protocol", () => {
 	it("uses tmux Enter as the primary submit token", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "primary-enter-token");
-		const sendKeyCommands: string[][] = [];
+		const deliveryCommands: string[][] = [];
 		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
@@ -153,8 +156,8 @@ describe("Coordinator MCP server protocol", () => {
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") {
-						sendKeyCommands.push(command);
+					if (isTmuxPromptDeliveryCommand(command)) {
+						deliveryCommands.push(command);
 						return { exitCode: 0, stdout: "", stderr: "" };
 					}
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
@@ -172,16 +175,19 @@ describe("Coordinator MCP server protocol", () => {
 		});
 		await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
-			prompt: "primary submit token",
+			prompt: "-primary submit token",
 			allow_mutation: true,
 		});
 
-		expect(sendKeyCommands).toEqual([
-			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "primary submit token"],
+		expect(deliveryCommands).toHaveLength(3);
+		const bufferName = deliveryCommands[0]?.[3];
+		expect(deliveryCommands).toEqual([
+			["tmux", "set-buffer", "-b", bufferName, "--", "-primary submit token"],
+			["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "visible-session:0.0"],
 			["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 		]);
-		expect(sendKeyCommands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"]);
-		expect(sendKeyCommands).not.toContainEqual([
+		expect(deliveryCommands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"]);
+		expect(deliveryCommands).not.toContainEqual([
 			"tmux",
 			"send-keys",
 			"-t",
@@ -208,7 +214,7 @@ describe("Coordinator MCP server protocol", () => {
 					commands.push(command);
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 				},
 			},
@@ -254,15 +260,22 @@ describe("Coordinator MCP server protocol", () => {
 		});
 		expect(commands).toEqual(
 			expect.arrayContaining([
-				["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "do work"],
+				expect.arrayContaining(["tmux", "set-buffer", "-b", expect.any(String), "--", "do work"]),
+				expect.arrayContaining([
+					"tmux",
+					"paste-buffer",
+					"-d",
+					"-b",
+					expect.any(String),
+					"-t",
+					"visible-session:0.0",
+				]),
 				["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 			]),
 		);
 		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"]);
-		expect(commands.slice(-2)).toEqual([
-			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "do work"],
-			["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
-		]);
+		expect(commands.slice(-3).map(command => command[1])).toEqual(["set-buffer", "paste-buffer", "send-keys"]);
+		expect(commands.at(-1)).toEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"]);
 	});
 
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {
@@ -288,7 +301,7 @@ describe("Coordinator MCP server protocol", () => {
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 				},
@@ -370,10 +383,61 @@ describe("Coordinator MCP server protocol", () => {
 		});
 	});
 
+	it("deletes tmux prompt buffers when paste delivery fails", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "paste-buffer-failure-cleanup");
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				commandRunner: async command => {
+					commands.push(command);
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
+					if (command[1] === "set-buffer") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "paste-buffer") return { exitCode: 1, stdout: "", stderr: "paste failed" };
+					if (command[1] === "delete-buffer") return { exitCode: 0, stdout: "", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "visible-session",
+			cwd: root,
+			tmux_session: "visible-session",
+			tmux_target: "visible-session:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		const response = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "sensitive multiline\n-prompt",
+			allow_mutation: true,
+		});
+
+		const bufferName = commands.find(command => command[1] === "set-buffer")?.[3];
+		expect(response).toMatchObject({ ok: true, status: "active" });
+		expect(commands).toEqual(
+			expect.arrayContaining([
+				["tmux", "set-buffer", "-b", bufferName, "--", "sensitive multiline\n-prompt"],
+				["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "visible-session:0.0"],
+				["tmux", "delete-buffer", "-b", bufferName],
+			]),
+		);
+		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"]);
+	});
+
 	it("submits tmux-delivered prompts with tmux Enter after literal typing", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "submit-chord-delivery");
-		const sendKeyCommands: string[][] = [];
+		const deliveryCommands: string[][] = [];
 		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
@@ -386,8 +450,8 @@ describe("Coordinator MCP server protocol", () => {
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") {
-						sendKeyCommands.push(command);
+					if (isTmuxPromptDeliveryCommand(command)) {
+						deliveryCommands.push(command);
 						return { exitCode: 0, stdout: "", stderr: "" };
 					}
 					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
@@ -410,11 +474,14 @@ describe("Coordinator MCP server protocol", () => {
 			allow_mutation: true,
 		});
 
-		expect(sendKeyCommands).toEqual([
-			["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "line one\nline two"],
+		expect(deliveryCommands).toHaveLength(3);
+		const bufferName = deliveryCommands[0]?.[3];
+		expect(deliveryCommands).toEqual([
+			["tmux", "set-buffer", "-b", bufferName, "--", "line one\nline two"],
+			["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "visible-session:0.0"],
 			["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 		]);
-		expect(sendKeyCommands).not.toContainEqual([
+		expect(deliveryCommands).not.toContainEqual([
 			"tmux",
 			"send-keys",
 			"-t",
@@ -422,6 +489,54 @@ describe("Coordinator MCP server protocol", () => {
 			"-l",
 			"\x1b[13;5u",
 		]);
+	});
+
+	it("delivers delegated skill prompts through a tmux paste buffer preserving the slash-command separator", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "delegate-paste-buffer");
+		let pastedPrompt = "";
+		const deliveryCommands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				startSession: async input => ({
+					sessionId: "delegate-session",
+					tmuxSession: "delegate-session",
+					tmuxTarget: "delegate-session:0.0",
+					cwd: input.cwd,
+					createdAt: "2026-07-02T00:00:00.000Z",
+				}),
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) {
+						deliveryCommands.push(command);
+						if (command[1] === "set-buffer") pastedPrompt = command[5] ?? "";
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		const delegated = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "Repro smoke only.",
+			allow_mutation: true,
+		});
+
+		expect(delegated).toMatchObject({ ok: true, workflow: "execute", status: "active" });
+		expect(deliveryCommands.map(command => command[1])).toEqual(["set-buffer", "paste-buffer", "send-keys"]);
+		expect(
+			pastedPrompt.startsWith("/skill:ultragoal\n\nDelegated by coordinator MCP tool: gjc_delegate_execute"),
+		).toBe(true);
+		expect(pastedPrompt).toContain("\nTask:\nRepro smoke only.\n");
+		expect(pastedPrompt).not.toContain("/skill:ultragoalDelegated");
 	});
 
 	it("marks tmux-delivered turns acknowledged when runtime state accepts the current turn", async () => {
@@ -440,7 +555,7 @@ describe("Coordinator MCP server protocol", () => {
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "working\n", stderr: "" };
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 				},
@@ -514,7 +629,7 @@ describe("Coordinator MCP server protocol", () => {
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
-					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 				},
@@ -623,10 +738,12 @@ describe("Coordinator MCP server protocol", () => {
 					if (command[1] === "new-session")
 						return { exitCode: 0, stdout: "gjc-coordinator-test:0.0 %99\n", stderr: "" };
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
-					if (command[1] === "send-keys") {
-						const activeTurnsDir = path.join(stateRoot, "local", "repo", "active-turns");
-						const activeTurns = await fs.readdir(activeTurnsDir).catch(() => []);
-						activeTurnExistedAtSend = activeTurns.length === 1;
+					if (isTmuxPromptDeliveryCommand(command)) {
+						if (command[1] === "paste-buffer") {
+							const activeTurnsDir = path.join(stateRoot, "local", "repo", "active-turns");
+							const activeTurns = await fs.readdir(activeTurnsDir).catch(() => []);
+							activeTurnExistedAtSend = activeTurns.length === 1;
+						}
 						return { exitCode: 0, stdout: "", stderr: "" };
 					}
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
@@ -642,8 +759,12 @@ describe("Coordinator MCP server protocol", () => {
 
 		expect(response.ok).toBe(true);
 		expect(activeTurnExistedAtSend).toBe(true);
+		expect(commands.filter(isTmuxPromptDeliveryCommand).map(command => command[1])).toEqual([
+			"set-buffer",
+			"paste-buffer",
+			"send-keys",
+		]);
 		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
-			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "-l", "hello"],
 			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "Enter"],
 		]);
 	});
@@ -1234,7 +1355,7 @@ setInterval(() => {}, 1000);
 				}),
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
-					if (command[1] === "send-keys") return { exitCode: 0, stdout: "", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
 					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 				},
 			},
@@ -1374,6 +1495,8 @@ setInterval(() => {}, 1000);
 				}),
 				commandRunner: async command => {
 					if (command[1] === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "set-buffer" || command[1] === "paste-buffer")
+						return { exitCode: 0, stdout: "", stderr: "" };
 					if (command[1] === "send-keys") {
 						const activeTurn = JSON.parse(
 							await Bun.file(path.join(stateRoot, "local", "repo", "active-turns", "gjc-demo.json")).text(),

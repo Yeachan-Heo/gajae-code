@@ -1273,8 +1273,14 @@ async function sendTmuxPromptKeys(
 	prompt: string,
 	runner: CommandRunner = runCommand,
 ): Promise<boolean> {
-	const typed = await runner(["tmux", "send-keys", "-t", target, "-l", prompt]);
-	if (typed.exitCode !== 0) return false;
+	const bufferName = `gjc-coordinator-prompt-${randomUUID()}`;
+	const buffered = await runner(["tmux", "set-buffer", "-b", bufferName, "--", prompt]);
+	if (buffered.exitCode !== 0) return false;
+	const pasted = await runner(["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", target]);
+	if (pasted.exitCode !== 0) {
+		await runner(["tmux", "delete-buffer", "-b", bufferName]);
+		return false;
+	}
 	const submitted = await runner(["tmux", "send-keys", "-t", target, "Enter"]);
 	return submitted.exitCode === 0;
 }

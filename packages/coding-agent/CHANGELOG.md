@@ -4,6 +4,7 @@
 ### Fixed
 
 - Coordinator MCP tmux prompt delivery now submits with tmux `Enter` instead of `C-m`, while preserving runtime prompt-ack/`turn_start` as the delivery success gate (#1409).
+- Coordinator MCP tmux prompt delivery now uses a paste buffer for prompt text before submitting with `Enter`, preserving multiline delegated `/skill:*` prompt separators that `send-keys -l` could flatten into an unstarted visible prompt (#1416).
 
 - `/retry` now resumes sessions left with an interrupted user/custom/tool-result tail after a crash or power loss, and recovers unresolved assistant tool-use tails instead of reporting "Nothing to retry".
 - Queued prompt shortcuts now keep working during auto context-full compaction: Tab/Alt+Enter queue text immediately, `/skill:*` entries replay through the skill invocation path after compaction, and Alt+Up restores only the newest queued prompt for editing instead of merging the full queue.
