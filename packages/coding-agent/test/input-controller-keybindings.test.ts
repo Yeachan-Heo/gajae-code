@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import { InputController } from "../src/modes/controllers/input-controller";
-import type { InteractiveModeContext } from "../src/modes/types";
+import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -51,6 +51,21 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
+	const compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	const sessionQueuedMessages: string[] = [];
+	const queueCompactionMessage = vi.fn((text: string, mode: "steer" | "followUp") => {
+		compactionQueuedMessages.push({ text, mode });
+		editor.addToHistory(text);
+		editor.setText("");
+		updatePendingMessagesDisplay();
+		showStatus("Queued message for after compaction");
+	});
+	const popLastQueuedMessage = vi.fn(() => sessionQueuedMessages.pop());
+	const clearQueue = vi.fn(() => {
+		const followUp = [...sessionQueuedMessages];
+		sessionQueuedMessages.length = 0;
+		return { steering: [], followUp };
+	});
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
@@ -83,6 +98,9 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
+			popLastQueuedMessage,
+			clearQueue,
+			getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -90,6 +108,8 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			},
 		} as InteractiveModeContext["keybindings"],
 		pendingImages: [],
+		compactionQueuedMessages,
+		queueCompactionMessage,
 		settings: {
 			get(path: string) {
 				if (path === "images.autoResize") return false;
@@ -162,6 +182,13 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			updatePendingMessagesDisplay,
 			handleBashCommand,
 			showStatus,
+			queueCompactionMessage,
+			popLastQueuedMessage,
+			clearQueue,
+		},
+		queues: {
+			compactionQueuedMessages,
+			sessionQueuedMessages,
 		},
 	};
 }
@@ -263,6 +290,70 @@ describe("InputController keybinding setup", () => {
 		expect(spies.prompt).toHaveBeenCalledWith("queue after declined tab completion", {
 			streamingBehavior: "followUp",
 		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("queues compaction Tab after editor tab completion declines", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isCompacting: boolean };
+		session.isCompacting = true;
+		editor.setText("queue while compacting via tab");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onTabDeclined?.(editor.getText());
+		await Bun.sleep(0);
+
+		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via tab", "followUp");
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues explicit message action during compaction", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isCompacting: boolean };
+		session.isCompacting = true;
+		editor.setText("queue while compacting via shortcut");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via shortcut", "followUp");
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("restores only the newest compaction queued message for editing", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.compactionQueuedMessages.push(
+			{ text: "older compaction queue", mode: "followUp" },
+			{ text: "newest compaction queue", mode: "followUp" },
+		);
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("newest compaction queue\n\ncurrent draft");
+		expect(queues.compactionQueuedMessages.map(entry => entry.text)).toEqual(["older compaction queue"]);
+		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("restores only the newest session queued message for editing", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("newest session queue\n\ncurrent draft");
+		expect(queues.sessionQueuedMessages).toEqual(["older session queue"]);
+		expect(spies.clearQueue).not.toHaveBeenCalled();
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 

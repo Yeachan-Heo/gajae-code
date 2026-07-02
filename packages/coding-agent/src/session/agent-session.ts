@@ -901,8 +901,9 @@ function extractPermissionLocations(
  *  `tag` is set only by `enqueueCustomMessageDisplay` (used for skill-prompt
  *  custom messages queued during streaming) and is matched by the custom-role
  *  `message_start` dequeue branch; user-message pushes leave it undefined and
- *  rely on the existing text-equality match. */
-type QueuedDisplayEntry = { text: string; tag?: string };
+ *  rely on the existing text-equality match. `sequence` preserves cross-queue
+ *  insertion order for one-at-a-time dequeue/edit UX. */
+type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
 
 /** A custom message contributed at the before-agent-start point. */
 export type BeforeAgentStartInternalMessage = Pick<
@@ -956,6 +957,7 @@ export class AgentSession {
 	/** Tracks pending follow-up messages for UI display. Removed when delivered.
 	 *  See `#steeringMessages` for entry shape. */
 	#followUpMessages: QueuedDisplayEntry[] = [];
+	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
@@ -1625,6 +1627,14 @@ export class AgentSession {
 		this.#planCompactAbortPending = false;
 	}
 
+	#createQueuedDisplayEntry(text: string, tag?: string): QueuedDisplayEntry {
+		const entry: QueuedDisplayEntry = { text, sequence: ++this.#queuedDisplaySequence };
+		if (tag !== undefined) {
+			entry.tag = tag;
+		}
+		return entry;
+	}
+
 	/** Register a compact display string for a custom message that the caller is
 	 *  about to dispatch via `promptCustomMessage` / `sendCustomMessage`.
 	 *  Returns a stable tag the caller MUST embed in
@@ -1638,7 +1648,7 @@ export class AgentSession {
 		const tag = `gjc-cmd-${Date.now()}-${++this.#customDisplayTagCounter}`;
 		const displayText = text.trim();
 		if (!displayText) return tag;
-		const entry: QueuedDisplayEntry = { text: displayText, tag };
+		const entry = this.#createQueuedDisplayEntry(displayText, tag);
 		if (mode === "steer") {
 			this.#steeringMessages.push(entry);
 		} else {
@@ -5285,7 +5295,7 @@ export class AgentSession {
 	 */
 	async #queueSteer(text: string, images?: ImageContent[]): Promise<void> {
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#steeringMessages.push({ text: displayText });
+		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) {
 			content.push(...images);
@@ -5316,7 +5326,7 @@ export class AgentSession {
 	 */
 	async #queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#followUpMessages.push({ text: displayText });
+		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) {
 			content.push(...images);
@@ -5686,24 +5696,27 @@ export class AgentSession {
 	}
 
 	/**
-	 * Pop the last queued message (steering first, then follow-up).
+	 * Pop the newest queued message across steering and follow-up queues.
 	 * Used by dequeue keybinding to restore messages to editor one at a time.
 	 * Returns the popped entry's `.text`; the tag (if any) dies with the
 	 * record — no orphan state can outlive the queue entry.
 	 */
 	popLastQueuedMessage(): string | undefined {
-		// Pop from steering first (LIFO)
-		if (this.#steeringMessages.length > 0) {
+		const steeringEntry = this.#steeringMessages.at(-1);
+		const followUpEntry = this.#followUpMessages.at(-1);
+
+		if (steeringEntry && (!followUpEntry || steeringEntry.sequence > followUpEntry.sequence)) {
 			const entry = this.#steeringMessages.pop();
 			this.agent.popLastSteer();
 			return entry?.text;
 		}
-		// Then from follow-up
-		if (this.#followUpMessages.length > 0) {
+
+		if (followUpEntry) {
 			const entry = this.#followUpMessages.pop();
 			this.agent.popLastFollowUp();
 			return entry?.text;
 		}
+
 		return undefined;
 	}
 

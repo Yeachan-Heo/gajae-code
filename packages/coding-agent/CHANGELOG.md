@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Queued prompt shortcuts now keep working during auto context-full compaction: Tab/Alt+Enter queue text immediately, and Alt+Up restores only the newest queued prompt for editing instead of merging the full queue.
 
 ### Fixed
 
