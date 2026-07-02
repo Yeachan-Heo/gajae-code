@@ -120,7 +120,9 @@ function hasCurrentGjcVersion(session: GjcTmuxSessionStatus | undefined): boolea
 }
 
 function allowsExistingTmuxAttach(parsed: Args, env: NodeJS.ProcessEnv): boolean {
-	return Boolean(parsed.continue || parsed.resume || explicitTmuxSessionName(env));
+	// `--resume` belongs to the inner GJC session resolver. Let it reach main.ts so
+	// value-less resume can show the session picker and valued resume can honor the target.
+	return Boolean(parsed.continue || explicitTmuxSessionName(env));
 }
 
 function findExistingSessionForLaunch(context: {

@@ -583,8 +583,8 @@ describe("default GJC tmux launch", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		try {
 			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-				rawArgs: ["--tmux", "--resume", "hello world"],
+				parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+				rawArgs: ["--tmux", "--continue", "hello world"],
 				cwd: "/repo",
 				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
 				argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -607,11 +607,11 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("explicit resume attaches existing tagged session for matching worktree branch", () => {
+	it("value-less resume launches inner picker instead of attaching an existing tagged session", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-			rawArgs: ["--tmux", "--resume", "hello world"],
+			parsed: args({ tmux: true, resume: true }),
+			rawArgs: ["--tmux", "--resume"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -628,15 +628,38 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(true);
-		expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
-		expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session" && call.args[2] === "=gajae_code_feature")).toBe(
+			false,
+		);
+		expect(calls.find(call => call.args[0] === "new-session")?.args.at(-1)).toContain("--resume");
+	});
+
+	it("targeted resume launches inner session resolver instead of branch tmux attach", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ tmux: true, resume: "abc123" }),
+			rawArgs: ["--tmux", "--resume", "abc123"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			worktreeBranch: "feature/demo",
+			existingBranchSessionName: "gajae_code_feature",
+		});
+
+		expect(plan?.attachSessionName).toBeUndefined();
+		expect(plan?.innerCommand).toContain("--resume");
+		expect(plan?.innerCommand).toContain("abc123");
 	});
 
 	it("falls through to a fresh session when existing tagged session attach fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-			rawArgs: ["--tmux", "--resume", "hello world"],
+			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],

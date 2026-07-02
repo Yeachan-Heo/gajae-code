@@ -235,7 +235,7 @@ providers:
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
-`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. Plain `gjc --tmux` does not auto-attach a scoped managed session from the same project/branch; use an explicit resume path such as `gjc --tmux --continue`, `gjc --tmux --resume`, or `gjc session attach <session>` when you intend to continue existing tmux context. Older-version sessions are not auto-attached after upgrades. When GJC creates a session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
+`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. Plain `gjc --tmux` does not auto-attach a scoped managed session from the same project/branch; use `gjc --tmux --continue` or `gjc session attach <session>` when you intend to continue existing tmux context. `gjc --tmux --resume` still reaches the inner GJC session resolver, so value-less resume shows the session picker and `--resume <id>` honors that target instead of reusing a branch tmux session. Older-version sessions are not auto-attached after upgrades. When GJC creates a session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
 
 - `mouse on` — enables mouse-wheel scrolling into tmux copy-mode (history/scrollback).
 - `set-clipboard on` and a readable copy-mode `mode-style`.

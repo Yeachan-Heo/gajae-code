@@ -11,6 +11,7 @@
 
 - `gjc update` now refreshes opted-in on-disk default workflow skill copies (written by `gjc setup defaults` under the agent dir) after a successful update, so they no longer stay stale relative to the embedded defaults; copies that were never installed are left absent.
 - cmux workspace auto-renames now include a `GJC: ` prefix so renamed workspaces remain identifiable as GJC sessions.
+- `gjc --tmux --resume` now reaches the session picker/resume target instead of auto-attaching a same-branch managed tmux session before the inner resume resolver runs.
 
 ## [0.7.10] - 2026-07-02
 ### Added
