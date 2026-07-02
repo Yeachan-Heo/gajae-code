@@ -13,6 +13,7 @@ describe("buildHotkeysMarkdown", () => {
 			"app.clear": "Ctrl+C",
 			"app.exit": "Ctrl+D",
 			"app.suspend": "Ctrl+Z",
+			"app.session.new": "Ctrl+N",
 			"app.thinking.cycle": "Shift+Tab",
 			"app.model.cycleForward": "Ctrl+P",
 			"app.model.cycleBackward": "Shift+Ctrl+P",
@@ -41,7 +42,8 @@ describe("buildHotkeysMarkdown", () => {
 		expect(markdown).toContain("| `Ctrl+Shift+L` | Select model (temporary) |");
 		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 		expect(markdown).toContain("| `Alt+M` | Toggle plan mode |");
-		expect(markdown).toContain("| `#` | Open prompt actions |");
+		expect(markdown).toContain("| `Ctrl+N` | Start a fresh session |");
+		expect(markdown).toContain("| `#` | Prompt actions (command-palette style actions) |");
 		for (const line of lines) {
 			if (line.length === 0) continue;
 			expect(line.startsWith(" ")).toBe(false);
