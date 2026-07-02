@@ -25,12 +25,8 @@ find_durable_pane_logs() {
 }
 
 has_turn_evidence() {
-  local pane_text="$1"
-  local log_path="${2:-}"
-  local log_offset="${3:-0}"
-  if printf '%s\n' "$pane_text" | grep -Eiq "$TURN_EVIDENCE_PATTERN"; then
-    return 0
-  fi
+  local log_path="${1:-}"
+  local log_offset="${2:-0}"
   if [[ -n "$log_path" && -f "$log_path" ]]; then
     local log_size
     log_size="$(wc -c <"$log_path" | tr -d ' ')"
@@ -84,16 +80,19 @@ if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type
   exit 1
 fi
 
-# Establish freshness before sending. Prompt acceptance must come from pane/log
-# output produced after this boundary, not stale evidence from a previous turn.
-PANE_BASELINE_LINES="$(printf '%s\n' "$PANE_TEXT" | wc -l | tr -d ' ')"
-EVIDENCE_LOG=""
+# Establish freshness before sending. Prompt acceptance must come from output
+# captured after this boundary. Do not use a later capture-pane slice as the
+# freshness source: tmux's scrollback window can move and reclassify stale lines
+# as "new" after we paste a long prompt. A temporary pipe-pane log records only
+# bytes emitted after the boundary.
+EVIDENCE_LOG="$(mktemp "${TMPDIR:-/tmp}/gjc-session-prompt-evidence.XXXXXX")"
 EVIDENCE_LOG_OFFSET=0
-mapfile -t candidates < <(find_durable_pane_logs)
-if [[ "${#candidates[@]}" -gt 0 ]]; then
-  EVIDENCE_LOG="${candidates[0]}"
-  EVIDENCE_LOG_OFFSET="$(wc -c <"$EVIDENCE_LOG" | tr -d ' ')"
-fi
+cleanup_evidence_log() {
+  "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 2>/dev/null || true
+  rm -f "$EVIDENCE_LOG"
+}
+trap cleanup_evidence_log EXIT
+"${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 "cat >> '$EVIDENCE_LOG'"
 
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" -l "$TEXT"
 sleep 0.5
@@ -117,8 +116,7 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
     fi
     exit 1
   fi
-  NEW_PANE_TEXT="$(printf '%s\n' "$PANE_TEXT" | tail -n +$((PANE_BASELINE_LINES + 1)))"
-  if has_turn_evidence "$NEW_PANE_TEXT" "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET"; then
+  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET"; then
     echo "sent to $SESSION with durable turn evidence: ${TEXT:0:80}..."
     exit 0
   fi

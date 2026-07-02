@@ -196,6 +196,36 @@ describe("gjc-session create", () => {
 		expect(result.stdout.toString()).not.toContain("sent to");
 	}, 20000);
 
+	test("prompt ignores stale evidence when capture window shifts after send", async () => {
+		const session = `gjc_issue_1385_prompt_window_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-window-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		const script = `for i in $(seq 1 150); do if [ "$i" = 120 ]; then printf 'Working on previous prompt\n'; else printf 'filler %03d\n' "$i"; fi; done; printf '> Type your message\n'; sleep 20`;
+		expect(Bun.spawnSync(["tmux", "new-session", "-d", "-s", session, "bash", "-lc", script]).exitCode).toBe(0);
+		await Bun.sleep(500);
+
+		const result = Bun.spawnSync(
+			["bash", "scripts/gjc-session/prompt.sh", session, "new prompt sleeping process should not accept"],
+			{
+				env: {
+					...process.env,
+					GJC_SESSION_STATE_DIR: stateDir,
+					GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+				},
+				stderr: "pipe",
+				stdout: "pipe",
+			},
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
+		expect(result.stdout.toString()).not.toContain("sent to");
+	}, 20000);
+
 	test("prompt accepts turn evidence produced after send", async () => {
 		const session = `gjc_issue_1385_prompt_fresh_${process.pid}_${Date.now()}`;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-fresh-"));
