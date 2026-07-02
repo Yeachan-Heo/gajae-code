@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `gjc update` now refreshes opted-in on-disk default workflow skill copies (written by `gjc setup defaults` under the agent dir) after a successful update, so they no longer stay stale relative to the embedded defaults; copies that were never installed are left absent.
+
 ## [0.7.10] - 2026-07-02
 ### Added
 

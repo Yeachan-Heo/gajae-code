@@ -10,6 +10,7 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 
 const RELEASE_REPO = "Yeachan-Heo/gajae-code";
@@ -627,6 +628,29 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);
+	}
+
+	await refreshInstalledDefaultSkills();
+}
+
+/**
+ * Refresh opted-in on-disk default workflow skill copies after a successful
+ * update. The four default skills ship embedded in the binary, so most users
+ * need nothing here. But users who ran `gjc setup defaults` have on-disk copies
+ * under the agent dir that shadow the embedded defaults; those would otherwise
+ * go stale after an update. Only rewrite files that already exist and differ —
+ * never materialize new copies for users who never opted in.
+ */
+async function refreshInstalledDefaultSkills(): Promise<void> {
+	try {
+		const result = await installDefaultGjcDefinitions({ refreshOnly: true });
+		if (result.written > 0) {
+			console.log(
+				chalk.dim(`Refreshed ${result.written} local default workflow skill file(s) at ${result.targetRoot}`),
+			);
+		}
+	} catch (err) {
+		console.error(chalk.yellow(`Warning: failed to refresh local default workflow skills: ${err}`));
 	}
 }
 

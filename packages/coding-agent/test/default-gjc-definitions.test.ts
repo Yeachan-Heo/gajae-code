@@ -451,6 +451,34 @@ Project executor override body.
 		).toBe(true);
 	});
 
+	it("refreshOnly rewrites stale local copies but never materializes missing ones", async () => {
+		const targetRoot = await makeTempRoot();
+		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
+
+		// No files on disk yet: refreshOnly must not create any (opt-in preserved).
+		const untouched = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(untouched.written).toBe(0);
+		expect(untouched.missing).toBe(8);
+		expect(await Bun.file(deepInterviewSkillPath).exists()).toBe(false);
+
+		// User opted in, then a local file went stale relative to the embedded default.
+		const installed = await installDefaultGjcDefinitions({ targetRoot });
+		const canonicalDeepInterview = await Bun.file(deepInterviewSkillPath).text();
+		expect(installed.written).toBe(8);
+		await Bun.write(deepInterviewSkillPath, "stale content");
+
+		const refreshed = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(refreshed.written).toBe(1);
+		expect(refreshed.matching).toBe(7);
+		expect(refreshed.missing).toBe(0);
+		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(canonicalDeepInterview);
+
+		// Second refresh is a no-op once everything matches.
+		const stable = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(stable.written).toBe(0);
+		expect(stable.matching).toBe(8);
+	});
+
 	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
 		await withTempHome(async () => {
 			const repoRoot = await makeTempRoot();
