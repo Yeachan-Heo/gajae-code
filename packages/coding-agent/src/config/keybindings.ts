@@ -22,6 +22,7 @@ interface AppKeybindings {
 	"app.suspend": true;
 	"app.thinking.cycle": true;
 	"app.thinking.toggle": true;
+	"app.commandPalette.open": true;
 	"app.model.cycleForward": true;
 	"app.model.cycleBackward": true;
 	"app.model.select": true;
@@ -88,12 +89,16 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking mode",
 	},
-	"app.model.cycleForward": {
+	"app.commandPalette.open": {
 		defaultKeys: "ctrl+p",
+		description: "Open command palette",
+	},
+	"app.model.cycleForward": {
+		defaultKeys: "alt+n",
 		description: "Cycle to next model",
 	},
 	"app.model.cycleBackward": {
-		defaultKeys: "shift+ctrl+p",
+		defaultKeys: "alt+shift+n",
 		description: "Cycle to previous model",
 	},
 	"app.model.select": {

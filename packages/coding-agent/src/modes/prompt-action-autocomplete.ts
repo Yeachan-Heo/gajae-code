@@ -103,6 +103,12 @@ function mergeAutocompleteSuggestions(
 
 	return { items, prefix: primary.prefix };
 }
+const ADVANCED_SLASH_COMMAND_PRIORITIES = new Map<string, number>([["grok-build-usage", -100]]);
+
+function getSlashCommandPriority(command: SlashCommand | undefined, item: AutocompleteItem): number {
+	if (command?.priority !== undefined) return command.priority;
+	return ADVANCED_SLASH_COMMAND_PRIORITIES.get(item.value) ?? 0;
+}
 
 function sortSlashCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
@@ -125,7 +131,7 @@ function sortSlashCommandSuggestions(
 				index,
 				commandIndex,
 				matchRank: getSlashCommandMatchRank(query, lowerName),
-				priority: command?.priority ?? 0,
+				priority: getSlashCommandPriority(command, item),
 				score: Math.max(nameScore, descScore),
 			};
 		})

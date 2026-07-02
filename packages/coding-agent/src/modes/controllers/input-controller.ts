@@ -156,6 +156,8 @@ export class InputController {
 		this.ctx.editor.onSuspend = () => this.handleCtrlZ();
 		this.ctx.editor.setActionKeys("app.thinking.cycle", this.ctx.keybindings.getKeys("app.thinking.cycle"));
 		this.ctx.editor.onCycleThinkingLevel = () => this.cycleThinkingLevel();
+		this.ctx.editor.setActionKeys("app.commandPalette.open", this.ctx.keybindings.getKeys("app.commandPalette.open"));
+		this.ctx.editor.onOpenCommandPalette = () => this.openCommandPalette();
 		this.ctx.editor.setActionKeys("app.model.cycleForward", this.ctx.keybindings.getKeys("app.model.cycleForward"));
 		this.ctx.editor.onCycleModelForward = () => this.cycleRoleModel();
 		this.ctx.editor.setActionKeys("app.model.cycleBackward", this.ctx.keybindings.getKeys("app.model.cycleBackward"));
@@ -923,6 +925,14 @@ export class InputController {
 		} catch {
 			this.ctx.showWarning("Failed to copy to clipboard");
 		}
+	}
+
+	openCommandPalette(): void {
+		if (this.ctx.editor.getText().trim().length > 0) {
+			this.ctx.showStatus("Command palette opens from an empty prompt. Type / for inline commands.");
+			return;
+		}
+		this.ctx.editor.handleInput("/");
 	}
 
 	cycleThinkingLevel(): void {

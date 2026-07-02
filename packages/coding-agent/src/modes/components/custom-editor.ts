@@ -9,6 +9,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.exit"
 	| "app.suspend"
 	| "app.thinking.cycle"
+	| "app.commandPalette.open"
 	| "app.model.cycleForward"
 	| "app.model.cycleBackward"
 	| "app.model.select"
@@ -33,6 +34,7 @@ const CONFIGURABLE_EDITOR_ACTIONS = [
 	"app.exit",
 	"app.suspend",
 	"app.thinking.cycle",
+	"app.commandPalette.open",
 	"app.model.cycleForward",
 	"app.model.cycleBackward",
 	"app.model.select",
@@ -76,6 +78,7 @@ export class CustomEditor extends Editor {
 	onClear?: () => void;
 	onExit?: () => void;
 	onCycleThinkingLevel?: () => void;
+	onOpenCommandPalette?: () => void;
 	onCycleModelForward?: () => void;
 	onCycleModelBackward?: () => void;
 	onSelectModel?: () => void;
@@ -288,6 +291,11 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		// Intercept configured command palette shortcut before model cycling (Ctrl+P default).
+		if (this.#matchesAction(data, "app.commandPalette.open") && this.onOpenCommandPalette) {
+			this.onOpenCommandPalette();
+			return;
+		}
 		// Intercept configured backward model cycling (check before forward cycling)
 		if (this.#matchesAction(data, "app.model.cycleBackward") && this.onCycleModelBackward) {
 			this.onCycleModelBackward();

@@ -353,7 +353,7 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
-	/** Models to cycle through with Ctrl+P (from --models flag) */
+	/** Models to cycle through with Alt+N (from --models flag) */
 	scopedModels?: ScopedModelSelection[];
 	/** Initial session thinking selector. */
 	thinkingLevel?: ThinkingLevel;

@@ -29,7 +29,7 @@ describe("builtin /copy slash command", () => {
 		const copyCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "copy");
 
 		expect(copyCommand).toBeDefined();
-		expect(copyCommand?.description).toBe("Copy last response as markdown");
+		expect(copyCommand?.description).toBe("Copy the last response for review or sharing");
 		expect(copyCommand?.subcommands).toBeUndefined();
 		expect(copyCommand?.inlineHint).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMAND_DEFS.some(command => command.name === "clear")).toBe(false);
@@ -41,10 +41,10 @@ describe("builtin /copy slash command", () => {
 		const newCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "new");
 		const sessionCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "session");
 
-		expect(helpCommand?.description).toContain("beginner help");
+		expect(helpCommand?.description).toContain("beginner workflows");
 		expect(helpCommand?.priority).toBeGreaterThan(newCommand?.priority ?? 0);
 		expect(newCommand?.description).toBe("Start a new session");
-		expect(sessionCommand?.description).toBe("Show session info or delete the current session");
+		expect(sessionCommand?.description).toBe("Show current session info or delete current session");
 		expect(sessionCommand?.subcommands?.map(command => command.name)).toEqual(["info", "delete"]);
 	});
 

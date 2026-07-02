@@ -16,6 +16,51 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
+describe("CustomEditor command palette keybinding", () => {
+	it("routes Ctrl+P to the command palette instead of model cycling", () => {
+		const editor = createEditor();
+		const onOpenCommandPalette = vi.fn();
+		const onCycleModelForward = vi.fn();
+		editor.onOpenCommandPalette = onOpenCommandPalette;
+		editor.onCycleModelForward = onCycleModelForward;
+
+		editor.handleInput(ctrl("p"));
+
+		expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
+		expect(onCycleModelForward).not.toHaveBeenCalled();
+	});
+
+	it("moves model cycling to Alt+N by default", () => {
+		const editor = createEditor();
+		const onCycleModelForward = vi.fn();
+		editor.onCycleModelForward = onCycleModelForward;
+
+		editor.handleInput("\x1bn");
+
+		expect(KEYBINDINGS["app.model.cycleForward"].defaultKeys).toBe("alt+n");
+		expect(onCycleModelForward).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens the slash command autocomplete surface from an empty prompt", async () => {
+		const editor = createEditor();
+		editor.setAutocompleteProvider({
+			async getSuggestions() {
+				return { items: [{ value: "new", label: "new", description: "Start a new session" }], prefix: "/" };
+			},
+			applyCompletion(lines, cursorLine, cursorCol) {
+				return { lines, cursorLine, cursorCol };
+			},
+		} satisfies AutocompleteProvider);
+		editor.onOpenCommandPalette = () => editor.handleInput("/");
+
+		editor.handleInput(ctrl("p"));
+		await Bun.sleep(0);
+
+		expect(editor.getText()).toBe("/");
+		expect(editor.isShowingAutocomplete()).toBe(true);
+	});
+});
+
 describe("CustomEditor temporary model selector keybinding", () => {
 	it("triggers the temporary selector from a remapped action key instead of Alt+P", () => {
 		const editor = createEditor();

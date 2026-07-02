@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import type { SlashCommand } from "@gajae-code/tui";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@gajae-code/tui";
 import { KeybindingsManager as AppKeybindingsManager } from "../src/config/keybindings";
 import { createPromptActionAutocompleteProvider } from "../src/modes/prompt-action-autocomplete";
@@ -17,6 +18,25 @@ describe("prompt action autocomplete", () => {
 	afterEach(() => {
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
+
+	function createNoopProvider(commands: SlashCommand[] = []) {
+		return createPromptActionAutocompleteProvider({
+			commands,
+			basePath: "/tmp",
+			keybindings: AppKeybindingsManager.inMemory(),
+			copyCurrentLine: () => {},
+			copyPrompt: () => {},
+			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
+			scrollTmuxToPreviousUserInput: () => {},
+			undo: () => {},
+			moveCursorToMessageEnd: () => {},
+			moveCursorToMessageStart: () => {},
+			moveCursorToLineStart: () => {},
+			moveCursorToLineEnd: () => {},
+		});
+	}
 
 	it("shows prompt actions with configured shortcut hints", async () => {
 		const provider = createPromptActionAutocompleteProvider({
@@ -69,6 +89,31 @@ describe("prompt action autocomplete", () => {
 		expect(suggestions?.items.find(item => item.label === "Undo")?.description).toBe("F8");
 		expect(suggestions?.items.find(item => item.label === "Start new session")?.description).toBe("Ctrl+N");
 		expect(suggestions?.items.find(item => item.label === "Open command help")?.description).toBe("/help");
+	});
+
+	it("orders top-level slash commands by beginner-first priorities and keeps provider internals low", async () => {
+		const provider = createNoopProvider([
+			{ name: "grok-build-usage", description: "Advanced provider diagnostics" },
+			{ name: "settings", description: "Open settings and preferences", priority: 40 },
+			{ name: "session", description: "Show current session info or delete current session", priority: 88 },
+			{ name: "resume", description: "Resume a previous session", priority: 92 },
+			{ name: "new", description: "Start a new session", priority: 96 },
+			{ name: "help", description: "Learn commands and beginner workflows", priority: 100 },
+		]);
+
+		const suggestions = await provider.getSuggestions(["/"], 0, 1);
+
+		expect(suggestions?.items.map(item => item.value)).toEqual([
+			"help",
+			"new",
+			"resume",
+			"session",
+			"settings",
+			"grok-build-usage",
+		]);
+		expect(suggestions?.items.find(item => item.value === "session")?.description).toBe(
+			"Show current session info or delete current session",
+		);
 	});
 
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {

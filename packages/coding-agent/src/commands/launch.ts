@@ -119,7 +119,7 @@ export default class Index extends Command {
 			description: "Don't save session (ephemeral)",
 		}),
 		models: Flags.string({
-			description: "Comma-separated model patterns for Ctrl+P cycling",
+			description: "Comma-separated model patterns for Alt+N cycling",
 		}),
 		"no-tools": Flags.boolean({
 			description: "Disable all built-in tools",

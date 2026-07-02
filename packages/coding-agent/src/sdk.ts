@@ -255,7 +255,7 @@ export interface CreateAgentSessionOptions {
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
 	modelSubstitution?: { requestedModel: Model; reason: string };
-	/** Models available for cycling (Ctrl+P in interactive mode) */
+	/** Models available for cycling (Alt+N in interactive mode) */
 	scopedModels?: ScopedModelSelection[];
 
 	/** System prompt blocks. Array replaces default, function receives default blocks and returns final blocks. */

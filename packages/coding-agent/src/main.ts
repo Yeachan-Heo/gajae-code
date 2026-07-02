@@ -671,7 +671,7 @@ async function buildSessionOptions(
 		options.thinkingLevel = scopedModels[0].thinkingLevel;
 	}
 
-	// Scoped models for Ctrl+P cycling - fill in default thinking levels when not explicit
+	// Scoped models for Alt+N cycling - fill in default thinking levels when not explicit
 	if (scopedModels.length > 0) {
 		const defaultThinkingLevel = activeSettings.get("defaultThinkingLevel");
 		options.scopedModels = scopedModels.map(scopedModel => ({
@@ -1067,7 +1067,7 @@ export async function runRootCommand(
 						return `${scopedModel.model.id}${thinkingStr}`;
 					})
 					.join(", ");
-				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`)}\n`);
+				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 			}
 
 			if ($env.PI_TIMING) {
