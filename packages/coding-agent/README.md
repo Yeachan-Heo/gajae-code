@@ -24,7 +24,7 @@ For simple local side effects that do not need a full extension, set the user-le
 gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_TITLE" --body "$GJC_NOTIFICATION_BODY"'
 ```
 
-When GJC is running inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC also best-effort renames that cmux workspace to the current GJC session name whenever the session title is set or restored.
+When GJC is running inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC also best-effort renames that cmux workspace to the current GJC session name with a `GJC: ` prefix whenever the session title is set or restored.
 
 Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
 

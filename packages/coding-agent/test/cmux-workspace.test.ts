@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import {
 	buildCmuxWorkspaceRenameCommand,
+	formatCmuxWorkspaceTitle,
 	sanitizeCmuxWorkspaceTitle,
 	syncCmuxWorkspaceTitle,
 } from "../src/utils/cmux-workspace";
@@ -13,7 +14,7 @@ describe("cmux workspace title sync", () => {
 	it("builds an explicit workspace rename command", () => {
 		expect(buildCmuxWorkspaceRenameCommand("Investigate Resolver", cmuxEnv())).toEqual({
 			command: "cmux",
-			args: ["workspace", "rename", "workspace-123", "--title", "Investigate Resolver"],
+			args: ["workspace", "rename", "workspace-123", "--title", "GJC: Investigate Resolver"],
 		});
 	});
 
@@ -23,6 +24,11 @@ describe("cmux workspace title sync", () => {
 
 	it("sanitizes control characters and whitespace", () => {
 		expect(sanitizeCmuxWorkspaceTitle("  Fix\u0001\u001b  cmux\n\tworkspace  ")).toBe("Fix cmux workspace");
+	});
+
+	it("prefixes cmux workspace titles once", () => {
+		expect(formatCmuxWorkspaceTitle("Investigate Resolver")).toBe("GJC: Investigate Resolver");
+		expect(formatCmuxWorkspaceTitle("GJC: Investigate Resolver")).toBe("GJC: Investigate Resolver");
 	});
 
 	it("does not spawn outside a tty", () => {
@@ -58,7 +64,7 @@ describe("cmux workspace title sync", () => {
 		});
 
 		expect(calls).toEqual([
-			["/usr/local/bin/cmux", "workspace", "rename", "workspace-123", "--title", "Investigate Resolver"],
+			["/usr/local/bin/cmux", "workspace", "rename", "workspace-123", "--title", "GJC: Investigate Resolver"],
 		]);
 		expect(seenEnv[0]?.CMUX_WORKSPACE_ID).toBe("workspace-123");
 		expect(unref).toHaveBeenCalledTimes(1);

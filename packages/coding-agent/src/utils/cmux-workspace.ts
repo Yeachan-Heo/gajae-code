@@ -3,6 +3,7 @@ import { logger } from "@gajae-code/utils";
 const CMUX_COMMAND = "cmux";
 const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+const CMUX_WORKSPACE_TITLE_PREFIX = "GJC: ";
 const CMUX_WORKSPACE_RENAME_TIMEOUT_MS = 1500;
 
 export interface CmuxWorkspaceRenameCommand {
@@ -39,6 +40,12 @@ export function sanitizeCmuxWorkspaceTitle(title: string | undefined): string | 
 	return sanitized || undefined;
 }
 
+export function formatCmuxWorkspaceTitle(title: string | undefined): string | undefined {
+	const sanitized = sanitizeCmuxWorkspaceTitle(title);
+	if (!sanitized) return undefined;
+	return sanitized.startsWith(CMUX_WORKSPACE_TITLE_PREFIX) ? sanitized : `${CMUX_WORKSPACE_TITLE_PREFIX}${sanitized}`;
+}
+
 export function buildCmuxWorkspaceRenameCommand(
 	sessionName: string | undefined,
 	env: NodeJS.ProcessEnv = process.env,
@@ -46,7 +53,7 @@ export function buildCmuxWorkspaceRenameCommand(
 	const workspaceId = env[CMUX_WORKSPACE_ID_ENV]?.trim();
 	if (!workspaceId) return null;
 
-	const title = sanitizeCmuxWorkspaceTitle(sessionName);
+	const title = formatCmuxWorkspaceTitle(sessionName);
 	if (!title) return null;
 
 	return {
