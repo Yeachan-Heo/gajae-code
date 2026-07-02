@@ -3459,6 +3459,31 @@
 				"maxLevel": "max"
 			}
 		},
+		"claude-fable-5": {
+			"id": "claude-fable-5",
+			"name": "Anthropic Fable 5",
+			"api": "anthropic-messages",
+			"provider": "anthropic",
+			"baseUrl": "https://api.anthropic.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 10,
+				"output": 50,
+				"cacheRead": 1,
+				"cacheWrite": 12.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"claude-sonnet-4-0": {
 			"id": "claude-sonnet-4-0",
 			"name": "Anthropic Sonnet 4 (latest)",
