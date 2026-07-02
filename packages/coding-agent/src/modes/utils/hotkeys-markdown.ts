@@ -38,6 +38,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		`| \`${appKey(bindings, "app.clear")}\` | Clear editor (first) / exit (second) |`,
 		`| \`${appKey(bindings, "app.exit")}\` | Exit (when editor is empty) |`,
 		`| \`${appKey(bindings, "app.suspend")}\` | Suspend to background |`,
+		`| \`${appKey(bindings, "app.commandPalette.open")}\` | Open command palette |`,
 		`| \`${appKey(bindings, "app.session.new")}\` | Start a fresh session |`,
 		`| \`${appKey(bindings, "app.thinking.cycle")}\` | Cycle thinking level |`,
 		`| \`${appKey(bindings, "app.model.cycleForward")}\` | Cycle configured model roles |`,

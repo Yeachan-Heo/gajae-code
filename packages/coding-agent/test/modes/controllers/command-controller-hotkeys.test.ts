@@ -15,8 +15,9 @@ describe("buildHotkeysMarkdown", () => {
 			"app.suspend": "Ctrl+Z",
 			"app.session.new": "Ctrl+N",
 			"app.thinking.cycle": "Shift+Tab",
-			"app.model.cycleForward": "Ctrl+P",
-			"app.model.cycleBackward": "Shift+Ctrl+P",
+			"app.commandPalette.open": "Ctrl+P",
+			"app.model.cycleForward": "Alt+N",
+			"app.model.cycleBackward": "Alt+Shift+N",
 			"app.model.selectTemporary": "Ctrl+Shift+L",
 			"app.model.select": "Ctrl+L",
 			"app.history.search": "Ctrl+R",
@@ -43,6 +44,7 @@ describe("buildHotkeysMarkdown", () => {
 		expect(markdown).toContain("| `Ctrl+L` | Select default model |");
 		expect(markdown).toContain("| `Alt+M` | Toggle plan mode |");
 		expect(markdown).toContain("| `Ctrl+N` | Start a fresh session |");
+		expect(markdown).toContain("| `Ctrl+P` | Open command palette |");
 		expect(markdown).toContain("| `#` | Prompt actions (command-palette style actions) |");
 		for (const line of lines) {
 			if (line.length === 0) continue;
