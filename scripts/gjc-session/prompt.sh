@@ -5,7 +5,37 @@
 set -euo pipefail
 SESSION="${1:?Usage: $0 <session-name> <text|@file>}"
 TEXT_ARG="${2:?Usage: $0 <session-name> <text|@file>}"
-TMUX_CMD=(tmux)
+TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
+TMUX_CMD=("$TMUX_BIN")
+TURN_EVIDENCE_PATTERN="${GJC_SESSION_TURN_EVIDENCE_PATTERN:-Working|Tool|Running|Executing|function call|tool call}"
+PROMPT_EVIDENCE_ATTEMPTS="${GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS:-10}"
+case "$PROMPT_EVIDENCE_ATTEMPTS" in
+  ''|*[!0-9]*) PROMPT_EVIDENCE_ATTEMPTS=10 ;;
+esac
+if [[ "$PROMPT_EVIDENCE_ATTEMPTS" -lt 1 ]]; then
+  PROMPT_EVIDENCE_ATTEMPTS=1
+fi
+
+find_durable_pane_logs() {
+  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
+    printf '%s\n' "$GJC_SESSION_STATE_DIR/pane.log"
+  else
+    find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort
+  fi
+}
+
+has_turn_evidence() {
+  local pane_text="$1"
+  if printf '%s\n' "$pane_text" | grep -Eiq "$TURN_EVIDENCE_PATTERN"; then
+    return 0
+  fi
+  local candidates=()
+  mapfile -t candidates < <(find_durable_pane_logs)
+  if [[ "${#candidates[@]}" -gt 0 ]] && grep -Eiq "$TURN_EVIDENCE_PATTERN" "${candidates[0]}"; then
+    return 0
+  fi
+  return 1
+}
 
 show_missing_session_diagnostics() {
   local log_path="$1"
@@ -35,11 +65,7 @@ fi
 
 PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -80 2>/dev/null || true)"
 if [[ -z "$PANE_TEXT" ]]; then
-  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
-    candidates=("$GJC_SESSION_STATE_DIR/pane.log")
-  else
-    mapfile -t candidates < <(find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort)
-  fi
+  mapfile -t candidates < <(find_durable_pane_logs)
   if [[ "${#candidates[@]}" -gt 0 ]]; then
     show_missing_session_diagnostics "${candidates[0]}"
   else
@@ -64,4 +90,25 @@ sleep 1
 sleep 1
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter
 
-echo "sent to $SESSION: ${TEXT:0:80}..."
+for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
+  sleep 1
+  PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -120 2>/dev/null || true)"
+  if [[ -z "$PANE_TEXT" ]]; then
+    mapfile -t candidates < <(find_durable_pane_logs)
+    if [[ "${#candidates[@]}" -gt 0 ]]; then
+      show_missing_session_diagnostics "${candidates[0]}"
+    else
+      echo "prompt acceptance failed: tmux session $SESSION vanished before durable turn evidence" >&2
+    fi
+    exit 1
+  fi
+  if has_turn_evidence "$PANE_TEXT"; then
+    echo "sent to $SESSION with durable turn evidence: ${TEXT:0:80}..."
+    exit 0
+  fi
+done
+
+echo "prompt acceptance failed: no durable turn evidence appeared in session $SESSION" >&2
+echo "--- pane tail ---" >&2
+printf '%s\n' "$PANE_TEXT" | tail -40 >&2
+exit 1
