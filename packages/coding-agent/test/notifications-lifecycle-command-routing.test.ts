@@ -102,7 +102,7 @@ describe("lifecycle command routing (G009)", () => {
 		expect(calls.filter(c => c.method === "sendMessage").length).toBe(0);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
-	test("/session_recent is sent as escaped preformatted HTML chunks", async () => {
+	test("/session_recent is sent as escaped bullet rows with inline code", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
@@ -112,7 +112,7 @@ describe("lifecycle command routing (G009)", () => {
 				agentDir,
 				"repo",
 				`s-${String(i).padStart(3, "0")}`,
-				{ cwd: `/repo/<tag>&branch/${"x".repeat(500)}` },
+				{ cwd: `/repo/<tag>&branch/${"x".repeat(100)}` },
 				1000 + i,
 			);
 		}
@@ -120,11 +120,16 @@ describe("lifecycle command routing (G009)", () => {
 		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 4));
 
 		const sends = calls.filter(c => c.method === "sendMessage");
-		expect(sends.length).toBeGreaterThan(1);
+		expect(sends.length).toBe(1);
 		expect(sends.every(c => c.body?.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
 		expect(sends.every(c => String(c.body?.text).length <= 4096)).toBe(true);
-		expect(String(sends[0]?.body?.text).startsWith("<pre>")).toBe(true);
-		expect(sends.map(c => String(c.body?.text)).join("")).toContain("/repo/&lt;tag&gt;&amp;branch");
+		const text = sends.map(c => String(c.body?.text)).join("");
+		expect(text).not.toContain("<pre>");
+		expect(text).toContain("<code>s-019</code>");
+		expect(text).toContain("<code>/repo/&lt;tag&gt;&amp;branch/");
+		expect(
+			Array.from(text.matchAll(/^• <code>s-\d{3}<\/code> \(<code>\/repo\/&lt;tag&gt;&amp;branch\/x+<\/code>\)$/gm)),
+		).toHaveLength(10);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("/session_recent hides internal helper sessions by default", async () => {

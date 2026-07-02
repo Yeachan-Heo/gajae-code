@@ -13,7 +13,7 @@ import { parseInThreadConfigCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
 import {
 	buildCompactChoiceGrid,
-	pre,
+	code,
 	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
@@ -1117,10 +1117,10 @@ export class TelegramNotificationDaemon {
 				limit: 10,
 				includeInternal: false,
 			});
-			const lines = recent.length
-				? recent.map(e => `• ${e.sessionId}${e.path ? ` (${e.path})` : ""}`).join("\n")
+			const body = recent.length
+				? recent.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
 				: "No recent sessions.";
-			await replyHtml(pre(lines));
+			await replyHtml(body);
 			return true;
 		}
 
