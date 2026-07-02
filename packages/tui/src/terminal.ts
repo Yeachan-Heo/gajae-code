@@ -167,6 +167,7 @@ export function resolveTerminalRows(
 function isWindowsSubsystemForLinux(): boolean {
 	return process.platform === "linux" && (!!$env.WSL_DISTRO_NAME || !!$env.WSL_INTEROP);
 }
+const STDOUT_ERROR_HANDLER_GRACE_MS = 250;
 
 /**
  * Real terminal using process.stdin/stdout
@@ -185,6 +186,7 @@ export class ProcessTerminal implements Terminal {
 	#detachLogPath = $env.PI_TUI_TERMINAL_DETACH_LOG || "";
 	#windowsVTInputRestore?: () => void;
 	#stdoutErrorHandler?: (err: Error) => void;
+	#stdoutErrorHandlerCleanupTimer?: Timer;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
@@ -233,10 +235,16 @@ export class ProcessTerminal implements Terminal {
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
-		this.#stdoutErrorHandler = (err: Error) => {
-			this.#markUnavailable(err, "stdout-error");
-		};
-		process.stdout.on("error", this.#stdoutErrorHandler);
+		if (this.#stdoutErrorHandlerCleanupTimer) {
+			clearTimeout(this.#stdoutErrorHandlerCleanupTimer);
+			this.#stdoutErrorHandlerCleanupTimer = undefined;
+		}
+		if (!this.#stdoutErrorHandler) {
+			this.#stdoutErrorHandler = (err: Error) => {
+				this.#markUnavailable(err, "stdout-error");
+			};
+			process.stdout.on("error", this.#stdoutErrorHandler);
+		}
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only.
@@ -692,10 +700,7 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
 		}
-		if (this.#stdoutErrorHandler) {
-			process.stdout.removeListener("error", this.#stdoutErrorHandler);
-			this.#stdoutErrorHandler = undefined;
-		}
+		this.#scheduleStdoutErrorHandlerCleanup();
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
@@ -706,6 +711,23 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.#wasRaw);
 		}
+	}
+
+	#scheduleStdoutErrorHandlerCleanup(): void {
+		if (!this.#stdoutErrorHandler) return;
+		if (this.#stdoutErrorHandlerCleanupTimer) clearTimeout(this.#stdoutErrorHandlerCleanupTimer);
+		// Terminal restore writes above can fail asynchronously after stop() returns
+		// when an SSH/Windows Terminal PTY disappears. Keep the stdout error listener
+		// armed briefly so late EIO/EPIPE events mark the terminal unavailable instead
+		// of surfacing as uncaught exceptions that kill the tmux pane.
+		this.#stdoutErrorHandlerCleanupTimer = setTimeout(() => {
+			if (this.#stdoutErrorHandler) {
+				process.stdout.removeListener("error", this.#stdoutErrorHandler);
+				this.#stdoutErrorHandler = undefined;
+			}
+			this.#stdoutErrorHandlerCleanupTimer = undefined;
+		}, STDOUT_ERROR_HANDLER_GRACE_MS);
+		this.#stdoutErrorHandlerCleanupTimer.unref?.();
 	}
 
 	write(data: string): void {

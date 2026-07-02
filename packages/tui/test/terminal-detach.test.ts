@@ -183,6 +183,37 @@ describe("terminal detach handling", () => {
 			pauseSpy.mockRestore();
 		}
 	});
+	it("keeps stdout error listener armed briefly after stop restore writes", async () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		await Bun.sleep(300);
+		const beforeListeners = process.stdout.listenerCount("error");
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				expect(process.stdout.listenerCount("error")).toBe(beforeListeners + 1);
+				terminal.stop();
+				expect(process.stdout.listenerCount("error")).toBe(beforeListeners + 1);
+				expect(() => {
+					process.stdout.emit("error", Object.assign(new Error("pty vanished after stop"), { code: "EIO" }));
+				}).not.toThrow();
+				expect(terminal.available).toBe(false);
+			});
+			await Bun.sleep(300);
+			expect(process.stdout.listenerCount("error")).toBe(beforeListeners);
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+		}
+	});
 
 	it("marks ProcessTerminal unavailable when stdout is already closed", () => {
 		const terminal = new ProcessTerminal();

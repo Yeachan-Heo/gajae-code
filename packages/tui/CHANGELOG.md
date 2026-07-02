@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept the terminal stdout error handler armed briefly after TUI shutdown so late `EIO`/closed-PTY errors from SSH or Windows Terminal detach do not crash tmux-backed GJC panes.
+
 ## [0.7.9] - 2026-07-01
 
 ### Fixed
