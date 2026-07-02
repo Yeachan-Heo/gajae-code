@@ -36,6 +36,18 @@ describe("builtin /copy slash command", () => {
 		expect(BUILTIN_SLASH_COMMANDS_INTERNAL.some(command => command.name === "clear")).toBe(false);
 	});
 
+	it("surfaces beginner session commands with clear labels", () => {
+		const helpCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "help");
+		const newCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "new");
+		const sessionCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "session");
+
+		expect(helpCommand?.description).toContain("beginner help");
+		expect(helpCommand?.priority).toBeGreaterThan(newCommand?.priority ?? 0);
+		expect(newCommand?.description).toBe("Start a new session");
+		expect(sessionCommand?.description).toBe("Show session info or delete the current session");
+		expect(sessionCommand?.subcommands?.map(command => command.name)).toEqual(["info", "delete"]);
+	});
+
 	it("dispatches zero-argument /copy to the existing copy controller path", async () => {
 		const { runtime, handleCopyCommand, showError, setText } = createTuiRuntime();
 

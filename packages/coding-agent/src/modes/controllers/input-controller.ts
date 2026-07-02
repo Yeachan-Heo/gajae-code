@@ -859,6 +859,8 @@ export class InputController {
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
 			pasteImage: () => void this.handleImagePaste(),
+			newSession: () => void this.ctx.handleClearCommand(),
+			showHelp: () => this.ctx.handleHelpCommand(),
 			scrollTmuxToPreviousUserInput: () => this.scrollTmuxToPreviousUserInput(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),

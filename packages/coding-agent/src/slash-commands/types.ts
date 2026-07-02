@@ -19,6 +19,8 @@ export interface BuiltinSlashCommand {
 	subcommands?: SubcommandDef[];
 	/** Static inline hint when command takes a simple argument (no subcommands). */
 	inlineHint?: string;
+	/** Higher values sort earlier in TUI slash-command autocomplete. */
+	priority?: number;
 }
 
 /** Parsed slash-command text after stripping the leading "/". */

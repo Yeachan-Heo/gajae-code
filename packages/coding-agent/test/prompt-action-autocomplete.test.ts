@@ -26,10 +26,13 @@ describe("prompt action autocomplete", () => {
 				"app.clipboard.copyLine": "ctrl+shift+l",
 				"app.clipboard.copyPrompt": ["alt+shift+c", "ctrl+shift+c"],
 				"app.clipboard.pasteImage": "ctrl+i",
+				"app.session.new": "ctrl+n",
 			}),
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: () => {},
 			moveCursorToMessageEnd: () => {},
@@ -42,6 +45,8 @@ describe("prompt action autocomplete", () => {
 		expect(suggestions).not.toBeNull();
 		expect(suggestions?.prefix).toBe("#");
 		expect(suggestions?.items.map(item => item.label)).toEqual([
+			"Start new session",
+			"Open command help",
 			"Copy current line",
 			"Copy whole prompt",
 			"Paste image from clipboard",
@@ -62,6 +67,8 @@ describe("prompt action autocomplete", () => {
 		);
 		expect(suggestions?.items.find(item => item.label === "Move cursor to end of line")?.description).toBe("F7");
 		expect(suggestions?.items.find(item => item.label === "Undo")?.description).toBe("F8");
+		expect(suggestions?.items.find(item => item.label === "Start new session")?.description).toBe("Ctrl+N");
+		expect(suggestions?.items.find(item => item.label === "Open command help")?.description).toBe("/help");
 	});
 
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {
@@ -74,6 +81,8 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: prefix => {
 				undoCalls += 1;
@@ -114,6 +123,8 @@ describe("prompt action autocomplete", () => {
 			pasteImage: () => {
 				pasteCalls += 1;
 			},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: () => {},
 			moveCursorToMessageEnd: () => {},
@@ -137,6 +148,40 @@ describe("prompt action autocomplete", () => {
 		expect(pasteCalls).toBe(1);
 	});
 
+	it("runs new session from the prompt action menu", async () => {
+		let newSessionCalls = 0;
+		const provider = createPromptActionAutocompleteProvider({
+			commands: [],
+			basePath: "/tmp",
+			keybindings: AppKeybindingsManager.inMemory(),
+			copyCurrentLine: () => {},
+			copyPrompt: () => {},
+			pasteImage: () => {},
+			newSession: () => {
+				newSessionCalls += 1;
+			},
+			showHelp: () => {},
+			scrollTmuxToPreviousUserInput: () => {},
+			undo: () => {},
+			moveCursorToMessageEnd: () => {},
+			moveCursorToMessageStart: () => {},
+			moveCursorToLineStart: () => {},
+			moveCursorToLineEnd: () => {},
+		});
+
+		const suggestions = await provider.getSuggestions(["#new"], 0, 4);
+		const item = suggestions?.items.find(entry => entry.label === "Start new session");
+		expect(item).toBeDefined();
+		if (!item || !suggestions) {
+			throw new Error("expected new session suggestion");
+		}
+
+		const result = provider.applyCompletion(["#new"], 0, 4, item, suggestions.prefix);
+		expect(result.lines).toEqual([""]);
+		result.onApplied?.();
+		expect(newSessionCalls).toBe(1);
+	});
+
 	it("runs tmux previous-user-input scroll from the prompt action menu", async () => {
 		let scrollCalls = 0;
 		const provider = createPromptActionAutocompleteProvider({
@@ -146,6 +191,8 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {
 				scrollCalls += 1;
 			},
@@ -179,6 +226,8 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: () => {},
 			moveCursorToMessageEnd: () => {},
@@ -199,6 +248,8 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: () => {},
 			moveCursorToMessageEnd: () => {},
@@ -220,6 +271,8 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			newSession: () => {},
+			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
 			undo: () => {},
 			moveCursorToMessageEnd: () => {},

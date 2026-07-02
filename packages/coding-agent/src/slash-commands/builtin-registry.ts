@@ -599,11 +599,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "session",
-		description: "Session management commands",
+		priority: 80,
+		description: "Show session info or delete the current session",
 		acpDescription: "Show session information",
 		acpInputHint: "info|delete",
 		subcommands: [
-			{ name: "info", description: "Show session info and stats" },
+			{ name: "info", description: "Show current session id, title, and workspace" },
 			{ name: "delete", description: "Delete current session and return to selector" },
 		],
 		allowArgs: true,
@@ -710,6 +711,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleUsageCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "help",
+		priority: 100,
+		description: "Show beginner help and command discovery tips",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.handleHelpCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -953,6 +963,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "new",
+		priority: 90,
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			runtime.ctx.editor.setText("");
@@ -1026,6 +1037,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "resume",
+		priority: 70,
 		description: "Resume a different session",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSessionSelector();
@@ -1242,6 +1254,7 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = AC
 		description: command.description,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,
+		priority: command.priority,
 	}),
 );
 

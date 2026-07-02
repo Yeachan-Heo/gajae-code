@@ -141,8 +141,8 @@ export const KEYBINDINGS = {
 		description: "Copy prompt",
 	},
 	"app.session.new": {
-		defaultKeys: [],
-		description: "Create new session",
+		defaultKeys: "ctrl+n",
+		description: "Start a new session",
 	},
 	"app.session.tree": {
 		defaultKeys: [],

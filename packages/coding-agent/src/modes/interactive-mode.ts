@@ -71,7 +71,6 @@ import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import { ToolError } from "../tools/tool-errors";
-
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
@@ -103,6 +102,7 @@ import { JobsObserver } from "./jobs-observer";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
+import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
 import {
@@ -452,13 +452,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
+		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
-		).map(cmd => ({
-			name: cmd.name,
-			description: cmd.description ?? "(hook command)",
-			getArgumentCompletions: cmd.getArgumentCompletions,
-		}));
+		)
+			.filter(cmd => shouldShowExtensionCommand(cmd.name, activeProvider))
+			.map(cmd => ({
+				name: cmd.name,
+				description: cmd.description ?? "(hook command)",
+				getArgumentCompletions: cmd.getArgumentCompletions,
+			}));
 
 		// Convert custom commands (TypeScript) to SlashCommand format
 		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
@@ -2309,6 +2312,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	handleHotkeysCommand(): void {
 		this.#commandController.handleHotkeysCommand();
+	}
+
+	handleHelpCommand(): void {
+		this.#commandController.handleHelpCommand();
 	}
 
 	handleToolsCommand(): void {

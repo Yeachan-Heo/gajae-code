@@ -29,6 +29,8 @@ interface PromptActionAutocompleteOptions {
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
 	pasteImage: () => void;
+	newSession: () => void;
+	showHelp: () => void;
 	scrollTmuxToPreviousUserInput: () => void;
 	undo: (prefix: string) => void;
 	moveCursorToMessageEnd: () => void;
@@ -358,6 +360,20 @@ export function createPromptActionAutocompleteProvider(
 ): PromptActionAutocompleteProvider {
 	const editorKeybindings = getKeybindings();
 	const actions: PromptActionDefinition[] = [
+		{
+			id: "new-session",
+			label: "Start new session",
+			description: formatKeyHints(options.keybindings.getKeys("app.session.new")) || "/new",
+			keywords: ["new", "session", "fresh", "clear", "start", "conversation"],
+			execute: options.newSession,
+		},
+		{
+			id: "help",
+			label: "Open command help",
+			description: "/help",
+			keywords: ["help", "commands", "command", "palette", "shortcuts", "beginner"],
+			execute: options.showHelp,
+		},
 		{
 			id: "copy-line",
 			label: "Copy current line",

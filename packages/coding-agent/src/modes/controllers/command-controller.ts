@@ -556,6 +556,29 @@ export class CommandController {
 		showMarkdownPanel(this.ctx, "Keyboard Shortcuts", hotkeys);
 	}
 
+	handleHelpCommand(): void {
+		const sessionNewKey = this.ctx.keybindings.getDisplayString("app.session.new") || "/new";
+		const markdown = [
+			"**Beginner actions**",
+			"",
+			"| Action | How |",
+			"|---|---|",
+			`| Start a fresh session | \`${sessionNewKey}\` or \`/new\` |`,
+			"| Resume another session | `/resume` |",
+			"| Show session details | `/session info` |",
+			"| Delete current session | `/session delete` |",
+			"| Select a model | `/model` or `Ctrl+L` |",
+			"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
+			"",
+			"**Finding commands**",
+			"",
+			"- Type `/` to browse slash commands, then use arrows and Enter/Tab.",
+			"- Type `#` to browse prompt actions like starting a session, pasting an image, or moving the cursor.",
+			"- Type `!` for shell commands and `$` for Python snippets.",
+		].join("\n");
+		showMarkdownPanel(this.ctx, "GJC Help", markdown);
+	}
+
 	handleToolsCommand(): void {
 		const tools = buildToolsMarkdown({ tools: this.ctx.session.agent.state.tools });
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
