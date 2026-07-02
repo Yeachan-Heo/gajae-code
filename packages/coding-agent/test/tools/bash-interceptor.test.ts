@@ -197,7 +197,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 				"read-only bash only allows commands starting with",
 			);
 			await expect(tool.execute("tool-call", { command: "ls", env: { PATH: "/tmp/fake" } })).rejects.toThrow(
-				"Read-only bash does not allow per-command env overrides",
+				"Read-only bash only allows the GJC_RALPLAN_ARTIFACT env override for --artifact-env.",
 			);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
