@@ -26,13 +26,17 @@ find_durable_pane_logs() {
 
 has_turn_evidence() {
   local pane_text="$1"
+  local log_path="${2:-}"
+  local log_offset="${3:-0}"
   if printf '%s\n' "$pane_text" | grep -Eiq "$TURN_EVIDENCE_PATTERN"; then
     return 0
   fi
-  local candidates=()
-  mapfile -t candidates < <(find_durable_pane_logs)
-  if [[ "${#candidates[@]}" -gt 0 ]] && grep -Eiq "$TURN_EVIDENCE_PATTERN" "${candidates[0]}"; then
-    return 0
+  if [[ -n "$log_path" && -f "$log_path" ]]; then
+    local log_size
+    log_size="$(wc -c <"$log_path" | tr -d ' ')"
+    if [[ "$log_size" -gt "$log_offset" ]] && tail -c +$((log_offset + 1)) "$log_path" | grep -Eiq "$TURN_EVIDENCE_PATTERN"; then
+      return 0
+    fi
   fi
   return 1
 }
@@ -80,6 +84,17 @@ if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type
   exit 1
 fi
 
+# Establish freshness before sending. Prompt acceptance must come from pane/log
+# output produced after this boundary, not stale evidence from a previous turn.
+PANE_BASELINE_LINES="$(printf '%s\n' "$PANE_TEXT" | wc -l | tr -d ' ')"
+EVIDENCE_LOG=""
+EVIDENCE_LOG_OFFSET=0
+mapfile -t candidates < <(find_durable_pane_logs)
+if [[ "${#candidates[@]}" -gt 0 ]]; then
+  EVIDENCE_LOG="${candidates[0]}"
+  EVIDENCE_LOG_OFFSET="$(wc -c <"$EVIDENCE_LOG" | tr -d ' ')"
+fi
+
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" -l "$TEXT"
 sleep 0.5
 # Multiple Enters work around terminal focus/submission edge cases. Prompt visibility is not acceptance;
@@ -102,7 +117,8 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
     fi
     exit 1
   fi
-  if has_turn_evidence "$PANE_TEXT"; then
+  NEW_PANE_TEXT="$(printf '%s\n' "$PANE_TEXT" | tail -n +$((PANE_BASELINE_LINES + 1)))"
+  if has_turn_evidence "$NEW_PANE_TEXT" "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET"; then
     echo "sent to $SESSION with durable turn evidence: ${TEXT:0:80}..."
     exit 0
   fi

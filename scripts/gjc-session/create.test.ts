@@ -161,4 +161,72 @@ describe("gjc-session create", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
 	}, 20000);
+	test("prompt ignores stale pre-existing turn evidence", async () => {
+		const session = `gjc_issue_1385_prompt_stale_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-stale-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "Tool output from previous turn\nWorking on previous prompt\n");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"printf 'Gajae forge\\nWorking on previous prompt\\n> Type your message\\n'; sleep 20",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "new prompt that sleeping process will not accept"], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
+		expect(result.stdout.toString()).not.toContain("sent to");
+	}, 20000);
+
+	test("prompt accepts turn evidence produced after send", async () => {
+		const session = `gjc_issue_1385_prompt_fresh_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-fresh-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"bash -lc \"printf 'Gajae forge\\n> Type your message\\n'; IFS= read -r line; printf '\\nWorking on accepted prompt\\n'; sleep 20\"",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "do accepted work"], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("sent to");
+	}, 20000);
 });
