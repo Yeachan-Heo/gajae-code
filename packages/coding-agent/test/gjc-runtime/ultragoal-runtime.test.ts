@@ -2237,64 +2237,6 @@ describe("native GJC ultragoal runtime", () => {
 		});
 	});
 
-	it("does not require computer-use adversarial cases for browser settings schema changes", async () => {
-		const root = await tempDir();
-		await writeStructuralArtifacts(root);
-
-		await validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa(), {
-			mode: "review",
-			changeSet: {
-				source: "review-pr",
-				trusted: true,
-				paths: [
-					{
-						path: "packages/coding-agent/src/config/settings-schema.ts",
-						status: "modified",
-					},
-				],
-				rawDiffStat: `diff --git a/packages/coding-agent/src/config/settings-schema.ts b/packages/coding-agent/src/config/settings-schema.ts
---- a/packages/coding-agent/src/config/settings-schema.ts
-+++ b/packages/coding-agent/src/config/settings-schema.ts
-@@ -2245,6 +2245,11 @@ export const SETTINGS_SCHEMA = {
-+	"browser.backend": {
-+		type: "enum",
-+		values: ["native", "aside"] as const,
-+		default: "native",
-+	},`,
-			},
-		});
-	});
-
-	it("requires computer-use adversarial cases for computer settings schema changes", async () => {
-		const root = await tempDir();
-		await writeStructuralArtifacts(root);
-
-		await expect(
-			validateExecutorQaRedTeamEvidenceForReview(root, webExecutorQa(), {
-				mode: "review",
-				changeSet: {
-					source: "review-pr",
-					trusted: true,
-					paths: [
-						{
-							path: "packages/coding-agent/src/config/settings-schema.ts",
-							status: "modified",
-						},
-					],
-					rawDiffStat: `diff --git a/packages/coding-agent/src/config/settings-schema.ts b/packages/coding-agent/src/config/settings-schema.ts
---- a/packages/coding-agent/src/config/settings-schema.ts
-+++ b/packages/coding-agent/src/config/settings-schema.ts
-@@ -2309,6 +2309,7 @@ export const SETTINGS_SCHEMA = {
-	"computer.enabled": {
-		type: "boolean",
--		default: false,
-+		default: true,
-		ui: {`,
-				},
-			}),
-		).rejects.toThrow(/kill-switch-bypass/);
-	});
-
 	it("requires computer-use adversarial cases for real computer-control surface changes", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

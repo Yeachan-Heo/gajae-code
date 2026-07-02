@@ -2256,17 +2256,6 @@ export const SETTINGS_SCHEMA = {
 			description: "Launch browser in headless mode (disable to show browser UI)",
 		},
 	},
-	"browser.backend": {
-		type: "enum",
-		values: ["native", "aside"] as const,
-		default: "native",
-		ui: {
-			tab: "tools",
-			label: "Browser Backend",
-			description:
-				"Default browser backend for the browser tool. 'native' uses managed headless/CDP Chromium. 'aside' drives your live logged-in Aside browser profile (macOS-only, requires the Aside CLI). Explicit app.path/app.browser/app.cdp_url always use native.",
-		},
-	},
 	"browser.screenshotDir": {
 		type: "string",
 		default: undefined,

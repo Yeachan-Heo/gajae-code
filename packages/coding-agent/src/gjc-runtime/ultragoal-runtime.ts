@@ -1091,37 +1091,6 @@ function normalizeRepoPath(value: string): string {
 	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
 }
 
-const SETTINGS_SCHEMA_PATH = "packages/coding-agent/src/config/settings-schema.ts";
-const COMPUTER_SETTING_KEY_PATTERN = /["']computer\.[^"']*["']/;
-
-function unifiedDiffTouchesPath(
-	diff: string | undefined,
-	targetPath: string,
-	predicate: (line: string) => boolean,
-): boolean {
-	if (!diff) return false;
-	let inTargetFile = false;
-	let sawDiffHeader = false;
-	for (const line of diff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-			inTargetFile = match
-				? normalizeRepoPath(match[1]!) === targetPath || normalizeRepoPath(match[2]!) === targetPath
-				: false;
-			sawDiffHeader = true;
-			continue;
-		}
-		if (!inTargetFile) continue;
-		if (predicate(line)) return true;
-	}
-	if (sawDiffHeader) return false;
-	return diff.split("\n").some(predicate);
-}
-
-function unifiedDiffTouchesComputerSettingSchema(diff: string | undefined): boolean {
-	return unifiedDiffTouchesPath(diff, SETTINGS_SCHEMA_PATH, line => COMPUTER_SETTING_KEY_PATTERN.test(line));
-}
-
 function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 	const normalized = normalizeRepoPath(value);
 	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
@@ -1133,7 +1102,8 @@ function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 		return "tool";
 	if (
 		normalized === "packages/coding-agent/src/tools/index.ts" ||
-		normalized === "packages/coding-agent/src/tools/renderers.ts"
+		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
+		normalized === "packages/coding-agent/src/config/settings-schema.ts"
 	)
 		return "settings-registry";
 	if (
@@ -1169,7 +1139,6 @@ function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolea
 
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
 	if (!changeSet?.trusted) return false;
-	if (unifiedDiffTouchesComputerSettingSchema(changeSet.rawDiffStat)) return true;
 	return changeSet.paths.some(isComputerControlSurfaceChangePath);
 }
 

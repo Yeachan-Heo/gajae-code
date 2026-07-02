@@ -236,7 +236,6 @@ export interface InteractiveModeContext {
 
 	// Selector handling
 	showSettingsSelector(): void;
-	showBrowserSelector(): Promise<void>;
 	showThemeSelector(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;

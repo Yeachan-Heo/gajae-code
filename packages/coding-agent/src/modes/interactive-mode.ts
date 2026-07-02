@@ -67,7 +67,6 @@ import { getRecentSessions } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
-import { type BrowserBackend, runBrowserBackendSelector } from "../tools/browser/backend-select";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
@@ -2498,30 +2497,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	// Selector handling
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
-	}
-
-	async showBrowserSelector(): Promise<void> {
-		await runBrowserBackendSelector({
-			platform: process.platform,
-			getSetting: () => (this.settings.get("browser.backend") as BrowserBackend) ?? "native",
-			setSetting: value => {
-				this.settings.set("browser.backend", value);
-			},
-			restart: async () => {
-				const browserTool = this.session.getToolByName("browser") as
-					| { restartForModeChange?: () => Promise<void> }
-					| undefined;
-				await browserTool?.restartForModeChange?.();
-			},
-			select: async (options, initialIndex, title) => {
-				const labels = options.map(option => `${option.label} — ${option.description}`);
-				const selected = await this.showHookSelector(title, labels, { initialIndex });
-				if (!selected) return undefined;
-				const index = labels.indexOf(selected);
-				return index >= 0 ? options[index]?.value : undefined;
-			},
-			showStatus: message => this.showStatus(message),
-		});
 	}
 
 	showThemeSelector(): void {

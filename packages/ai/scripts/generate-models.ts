@@ -63,7 +63,9 @@ function createAzureOpenAICatalogModels(): Model<"azure-openai-responses">[] {
 }
 
 const packageRoot = path.join(import.meta.dir, "..");
-const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>(["anthropic/claude-fable-5"]);
+// Claude Fable 5 was temporarily retired during its June 2026 suspension; it
+// was redeployed on 2026-07-01, so no models are currently retired.
+const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>();
 
 function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 	return RETIRED_BUNDLED_MODEL_KEYS.has(`${model.provider}/${model.id}`);

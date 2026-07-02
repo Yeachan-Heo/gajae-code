@@ -329,14 +329,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "browser",
-		description: "Select the browser backend (native or Aside)",
-		handleTui: async (_command, runtime) => {
-			runtime.ctx.editor.setText("");
-			await runtime.ctx.showBrowserSelector();
-		},
-	},
-	{
 		name: "theme",
 		description: "Open theme selector",
 		handleTui: (_command, runtime) => {

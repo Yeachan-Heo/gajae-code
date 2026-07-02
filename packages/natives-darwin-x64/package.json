@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-code/natives-darwin-x64",
-	"version": "0.7.9",
+	"version": "0.7.10",
 	"description": "Darwin x64 native addon for @gajae-code/natives",
 	"type": "module",
 	"homepage": "https://gaebal-gajae.dev",

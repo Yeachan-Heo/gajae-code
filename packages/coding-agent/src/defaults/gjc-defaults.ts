@@ -44,6 +44,13 @@ export type DefaultGjcDefinition = DefaultGjcSkillDefinition | DefaultGjcSkillFr
 export interface InstallDefaultGjcDefinitionsOptions {
 	check?: boolean;
 	force?: boolean;
+	/**
+	 * Only rewrite default definition files that already exist on disk but whose
+	 * content differs from the embedded defaults. Files that are absent are left
+	 * absent (status "missing"). Used by `gjc update` to refresh opted-in copies
+	 * without materializing new on-disk copies for users who never installed them.
+	 */
+	refreshOnly?: boolean;
 	targetRoot?: string;
 }
 
@@ -160,6 +167,15 @@ export async function installDefaultGjcDefinitions(
 
 		if (options.check) {
 			status = existing === undefined ? "missing" : existing === definition.content ? "matching" : "different";
+		} else if (options.refreshOnly) {
+			if (existing === undefined) {
+				status = "missing";
+			} else if (existing === definition.content) {
+				status = "matching";
+			} else {
+				await Bun.write(destination, definition.content);
+				status = "written";
+			}
 		} else if (existing !== undefined && !options.force) {
 			status = "skipped";
 		} else {

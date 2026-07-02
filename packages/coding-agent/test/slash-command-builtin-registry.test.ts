@@ -70,38 +70,6 @@ describe("builtin /copy slash command", () => {
 	});
 });
 
-describe("builtin /browser slash command", () => {
-	it("awaits the browser backend selector before consuming the command", async () => {
-		let resolveSelector!: () => void;
-		const showBrowserSelector = vi.fn(
-			() =>
-				new Promise<void>(resolve => {
-					resolveSelector = resolve;
-				}),
-		);
-		const setText = vi.fn();
-		const ctx = {
-			showBrowserSelector,
-			editor: { setText },
-		} as unknown as InteractiveModeContext;
-
-		let settled = false;
-		const execution = executeBuiltinSlashCommand("/browser", { ctx, handleBackgroundCommand: () => undefined }).then(
-			result => {
-				settled = true;
-				return result;
-			},
-		);
-
-		await Promise.resolve();
-		expect(showBrowserSelector).toHaveBeenCalledTimes(1);
-		expect(setText).toHaveBeenCalledWith("");
-		expect(settled).toBe(false);
-		resolveSelector();
-		expect(await execution).toBe(true);
-	});
-});
-
 function createGoalTuiRuntime(goalModeEnabled: boolean) {
 	const handleGoalModeCommand = vi.fn(async () => {});
 	const addToHistory = vi.fn();

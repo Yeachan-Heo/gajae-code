@@ -1795,15 +1795,6 @@
 					"description": "Launch browser in headless mode (disable to show browser UI)",
 					"default": true
 				},
-				"backend": {
-					"type": "string",
-					"enum": [
-						"native",
-						"aside"
-					],
-					"description": "Default browser backend for the browser tool. 'native' uses managed headless/CDP Chromium. 'aside' drives your live logged-in Aside browser profile (macOS-only, requires the Aside CLI). Explicit app.path/app.browser/app.cdp_url always use native.",
-					"default": "native"
-				},
 				"screenshotDir": {
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
