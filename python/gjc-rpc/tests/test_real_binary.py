@@ -98,6 +98,22 @@ class RealBinaryRpcTest(unittest.TestCase):
                     action_allowlist=[],
                 )
 
+    def test_max_thinking_level_round_trips(self) -> None:
+        # `max` exists server-side; the typed client must not reject it when it
+        # comes back through get_state / model info (issue: enum drift).
+        with tempfile.TemporaryDirectory() as tmp, self._client(tmp) as client:
+            state = client.get_state()
+            self.assertIsNotNone(state.model)
+            # Parsing get_available_models exercises every model's thinking
+            # min/max levels against the client-side enum.
+            models = client.get_available_models()
+            self.assertGreater(len(models), 0)
+
+    def test_get_pending_workflow_gates_typed_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self._client(tmp) as client:
+            gates = client.get_pending_workflow_gates()
+            self.assertEqual(gates, ())
+
     def test_live_session_appears_in_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, self._client(tmp) as client:
             state = client.get_state()

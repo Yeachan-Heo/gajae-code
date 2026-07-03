@@ -29,7 +29,6 @@ from .protocol import (
     CompactionResult,
     ExtensionError,
     ExtensionUiRequest,
-    WorkflowGateEvent,
     ImageContent,
     InterruptMode,
     JsonObject,
@@ -79,7 +78,7 @@ from .protocol import (
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
-    parse_workflow_gate_event,
+    parse_workflow_gate,
     parse_session_state,
     parse_session_stats,
     parse_thinking_level_cycle_result,
@@ -363,7 +362,7 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
-        self._workflow_gates: queue.Queue[WorkflowGateEvent] = queue.Queue()
+        self._workflow_gates: queue.Queue[WorkflowGate] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
         self._stopping = False
@@ -681,29 +680,29 @@ class RpcClient:
             if request.method == "cancel" or request.is_passive():
                 return
             if request.method == "confirm":
-                self.send_workflow_gate_response(request.id, confirm)
+                self.send_ui_confirmation(request.id, confirm)
                 return
             if request.method == "select":
                 if select_value is not None:
-                    self.send_workflow_gate_response(request.id, select_value)
+                    self.send_ui_value(request.id, select_value)
                 else:
                     self.cancel_ui_request(request.id)
                 return
             if request.method == "input":
                 if input_value is not None:
-                    self.send_workflow_gate_response(request.id, input_value)
+                    self.send_ui_value(request.id, input_value)
                 else:
                     self.cancel_ui_request(request.id)
                 return
             if request.method == "editor":
                 if editor_value is not None:
-                    self.send_workflow_gate_response(request.id, editor_value)
+                    self.send_ui_value(request.id, editor_value)
                 else:
                     self.cancel_ui_request(request.id)
 
         return self.on_ui_request(handle)
 
-    def next_workflow_gate(self, timeout: float | None = None) -> WorkflowGateEvent:
+    def next_workflow_gate(self, timeout: float | None = None) -> WorkflowGate:
         try:
             return self._workflow_gates.get(timeout=timeout)
         except queue.Empty as exc:
@@ -723,6 +722,13 @@ class RpcClient:
 
     def send_workflow_gate_response(self, gate_id: str, answer: JsonValue) -> None:
         self._request("workflow_gate_response", gate_id=gate_id, answer=answer)
+
+    def get_pending_workflow_gates(self) -> tuple[WorkflowGate, ...]:
+        payload = self._request("get_pending_workflow_gates")
+        gates = payload.get("gates")
+        if not isinstance(gates, list):
+            return ()
+        return tuple(parse_workflow_gate(cast(JsonObject, gate)) for gate in gates if isinstance(gate, dict))
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:
         payload: JsonObject = {"type": "extension_ui_response", "id": request_id, "cancelled": True}
@@ -1512,7 +1518,7 @@ class RpcClient:
 
 
                 if isinstance(notification, WorkflowGate):
-                    self._workflow_gates.put(parse_workflow_gate_event(payload))
+                    self._workflow_gates.put(notification)
                     self._dispatch_listeners(
                         "workflow_gate",
                         listener_notification.type,

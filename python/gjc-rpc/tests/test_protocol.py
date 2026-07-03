@@ -5,9 +5,16 @@ import unittest
 from gjc_rpc import (
     AgentEndEvent,
     AgentStartEvent,
+    AutoCompactionEndEvent,
     AutoCompactionStartEvent,
+    AutoRetryStartEvent,
     ExtensionUiRequest,
+    GoalUpdatedEvent,
+    IrcMessageEvent,
+    NoticeEvent,
     SessionState,
+    SubagentSteerMessageEvent,
+    ThinkingLevelChangedEvent,
     ToolExecutionStartEvent,
     UnknownNotification,
     WorkflowGate,
@@ -21,6 +28,17 @@ from gjc_rpc import (
     parse_workflow_gate,
     parse_workflow_gate_event,
 )
+
+
+def _wrapped_event(event: dict) -> dict:
+    return {
+        "type": "event",
+        "protocol_version": 2,
+        "session_id": "s",
+        "seq": 1,
+        "frame_id": "f",
+        "payload": {"event_type": event["type"], "event": event},
+    }
 
 
 
@@ -562,6 +580,170 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(notification.messages[0]["content"][0]["text"], "hello")
+
+
+class ServerDriftRegressionTests(unittest.TestCase):
+    """Parsing coverage for server frames the typed client previously rejected or dropped."""
+
+    def test_parse_open_url_ui_request(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-9",
+                "method": "open_url",
+                "url": "https://example.com/oauth",
+                "instructions": "Open this URL in a browser to continue login.",
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.method, "open_url")
+        self.assertEqual(notification.url, "https://example.com/oauth")
+        self.assertEqual(notification.instructions, "Open this URL in a browser to continue login.")
+        self.assertTrue(notification.is_passive())
+        self.assertFalse(notification.requires_response())
+
+    def test_parse_session_state_accepts_max_thinking_level(self) -> None:
+        state = parse_session_state(
+            {
+                "model": {
+                    "id": "claude-opus-4-8",
+                    "name": "Claude Opus 4.8",
+                    "api": "anthropic-messages",
+                    "provider": "anthropic",
+                    "baseUrl": "https://api.anthropic.com",
+                    "reasoning": True,
+                    "input": ["text"],
+                    "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.2},
+                    "contextWindow": 200000,
+                    "maxTokens": 8192,
+                    "thinking": {"minLevel": "minimal", "maxLevel": "max", "mode": "effort"},
+                },
+                "thinkingLevel": "max",
+                "isStreaming": False,
+                "isCompacting": False,
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "all",
+                "interruptMode": "immediate",
+                "sessionId": "session-max",
+                "autoCompactionEnabled": True,
+                "messageCount": 0,
+                "queuedMessageCount": 0,
+            }
+        )
+
+        self.assertIsInstance(state, SessionState)
+        self.assertEqual(state.thinking_level, "max")
+        assert state.model is not None and state.model.thinking is not None
+        self.assertEqual(state.model.thinking.max_level, "max")
+
+    def test_parse_agent_end_stop_reason_and_run_summaries(self) -> None:
+        notification = parse_notification(
+            _wrapped_event(
+                {
+                    "type": "agent_end",
+                    "messages": [],
+                    "stopReason": "paused",
+                    "telemetry": {"turns": 2},
+                    "coverage": {"files": 1},
+                }
+            )
+        )
+
+        self.assertIsInstance(notification, AgentEndEvent)
+        self.assertEqual(notification.stop_reason, "paused")
+        self.assertEqual(notification.telemetry, {"turns": 2})
+        self.assertEqual(notification.coverage, {"files": 1})
+
+    def test_parse_auto_retry_start_unbounded(self) -> None:
+        notification = parse_notification(
+            _wrapped_event(
+                {
+                    "type": "auto_retry_start",
+                    "attempt": 1,
+                    "maxAttempts": 5,
+                    "delayMs": 1000,
+                    "errorMessage": "rate limited",
+                    "unbounded": True,
+                }
+            )
+        )
+
+        self.assertIsInstance(notification, AutoRetryStartEvent)
+        self.assertTrue(notification.unbounded)
+
+    def test_parse_auto_compaction_end_continuation_skip_reason(self) -> None:
+        notification = parse_notification(
+            _wrapped_event(
+                {
+                    "type": "auto_compaction_end",
+                    "action": "context-full",
+                    "result": None,
+                    "aborted": False,
+                    "willRetry": False,
+                    "skipped": True,
+                    "continuationSkipReason": "auto_continue_disabled_non_resumable_tail",
+                }
+            )
+        )
+
+        self.assertIsInstance(notification, AutoCompactionEndEvent)
+        self.assertEqual(notification.continuation_skip_reason, "auto_continue_disabled_non_resumable_tail")
+
+    def test_parse_notice_event(self) -> None:
+        notification = parse_notification(
+            _wrapped_event({"type": "notice", "level": "error", "message": "provider unavailable", "source": "retry"})
+        )
+
+        self.assertIsInstance(notification, NoticeEvent)
+        self.assertEqual(notification.level, "error")
+        self.assertEqual(notification.message, "provider unavailable")
+        self.assertEqual(notification.source, "retry")
+
+    def test_parse_thinking_level_changed_event(self) -> None:
+        notification = parse_notification(_wrapped_event({"type": "thinking_level_changed", "thinkingLevel": "max"}))
+
+        self.assertIsInstance(notification, ThinkingLevelChangedEvent)
+        self.assertEqual(notification.thinking_level, "max")
+
+    def test_parse_goal_updated_event(self) -> None:
+        notification = parse_notification(
+            _wrapped_event(
+                {
+                    "type": "goal_updated",
+                    "goal": {"objective": "ship it"},
+                    "state": {"phase": "executing"},
+                }
+            )
+        )
+
+        self.assertIsInstance(notification, GoalUpdatedEvent)
+        self.assertEqual(notification.goal, {"objective": "ship it"})
+        self.assertEqual(notification.state, {"phase": "executing"})
+
+    def test_parse_goal_updated_event_with_cleared_goal(self) -> None:
+        notification = parse_notification(_wrapped_event({"type": "goal_updated", "goal": None}))
+
+        self.assertIsInstance(notification, GoalUpdatedEvent)
+        self.assertIsNone(notification.goal)
+        self.assertIsNone(notification.state)
+
+    def test_parse_irc_and_subagent_steer_message_events(self) -> None:
+        custom_message = {
+            "role": "custom",
+            "customType": "irc",
+            "content": "hello from irc",
+            "display": True,
+            "timestamp": 1,
+        }
+
+        irc = parse_notification(_wrapped_event({"type": "irc_message", "message": custom_message}))
+        steer = parse_notification(_wrapped_event({"type": "subagent_steer_message", "message": custom_message}))
+
+        self.assertIsInstance(irc, IrcMessageEvent)
+        self.assertEqual(irc.message["content"], "hello from irc")
+        self.assertIsInstance(steer, SubagentSteerMessageEvent)
+        self.assertEqual(steer.message["customType"], "irc")
 
 
 if __name__ == "__main__":

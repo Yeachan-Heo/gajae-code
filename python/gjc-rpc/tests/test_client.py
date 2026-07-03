@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import textwrap
 import threading
@@ -341,6 +342,27 @@ FAKE_SERVER = textwrap.dedent(
                     "cost": 0.0,
                 },
             )
+        elif command_type == "get_pending_workflow_gates":
+            respond(
+                request_id,
+                "get_pending_workflow_gates",
+                {
+                    "gates": [
+                        {
+                            "type": "workflow_gate",
+                            "gate_id": "wg_pending_1",
+                            "stage": "ralplan",
+                            "kind": "approval",
+                            "schema": {"type": "object"},
+                            "schema_hash": "hash-pending",
+                            "created_at": "2026-06-09T00:00:00.000Z",
+                            "options": [{"value": "approve", "label": "Approve"}],
+                            "required": True,
+                            "context": {"title": "Approve?"},
+                        }
+                    ]
+                },
+            )
         elif command_type == "export_html":
             respond(request_id, "export_html", {"path": command.get("outputPath") or "/tmp/session.html"})
         elif command_type == "new_session":
@@ -371,11 +393,15 @@ FAKE_SERVER = textwrap.dedent(
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
                 continue
             if message == "needs select":
-                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-select", "stage": "select", "kind": "question", "schema": {"type": "string", "enum": ["alpha", "beta"]}, "schema_hash": "hash-ui-select", "created_at": "2026-06-09T00:00:00.000Z", "options": ["alpha", "beta"], "context": {"method": "select", "title": "Pick"}}), flush=True)
+                print(json.dumps({"type": "workflow_gate", "gate_id": "ui-select", "stage": "select", "kind": "question", "schema": {"type": "string", "enum": ["alpha", "beta"]}, "schema_hash": "hash-ui-select", "created_at": "2026-06-09T00:00:00.000Z", "options": [{"value": "alpha", "label": "Alpha"}, {"value": "beta", "label": "Beta"}], "required": True, "context": {"method": "select", "title": "Pick"}}), flush=True)
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-select", "method": "select", "title": "Pick", "options": ["alpha", "beta"]}), flush=True)
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
+                continue
+            if message == "needs open url":
+                print(json.dumps({"type": "extension_ui_request", "id": "ui-4", "method": "open_url", "url": "https://example.com/oauth", "instructions": "Open this URL to continue login."}), flush=True)
+                emit_prompt_turn("url emitted")
                 continue
             if message == "needs host tool":
                 emit_event({"type": "agent_start"})
@@ -419,6 +445,54 @@ FAKE_SERVER = textwrap.dedent(
             emit_event({"type": "agent_end", "messages": []})
         else:
             respond(request_id, command_type, success=False, error=f"unsupported: {command_type}")
+    """
+)
+
+# Echoes every extension_ui_response back as an extension_error frame so tests
+# can assert the exact wire command the headless UI handler sends (regression:
+# it used to answer UI requests with workflow_gate_response).
+HEADLESS_UI_ECHO_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(obj):
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+    def emit_event(event, seq):
+        emit({
+            "type": "event",
+            "protocol_version": 2,
+            "session_id": "fake-session",
+            "seq": seq,
+            "frame_id": "frame-%d" % seq,
+            "payload": {"event_type": event.get("type"), "event": event},
+        })
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        msg = json.loads(raw_line)
+        msg_type = msg.get("type")
+        if msg_type in {"prompt", "abort_and_prompt"}:
+            emit({"id": msg.get("id"), "type": "response", "command": msg_type, "success": True, "data": {}})
+            emit_event({"type": "agent_start"}, 1)
+            if msg.get("message") == "needs confirm":
+                emit({"type": "extension_ui_request", "id": "ui-confirm-1", "method": "confirm", "title": "Confirm", "message": "Continue?"})
+            else:
+                emit({"type": "extension_ui_request", "id": "ui-input-1", "method": "input", "title": "Need input"})
+            continue
+        if msg_type == "extension_ui_response":
+            emit({"type": "extension_error", "extensionPath": "ui-echo", "event": "extension_ui_response", "error": json.dumps(msg)})
+            emit_event({"type": "agent_end", "messages": []}, 2)
+            continue
+        if msg_type == "workflow_gate_response":
+            emit({"id": msg.get("id"), "type": "response", "command": "workflow_gate_response", "success": False, "error": "workflow gates are not available on this session"})
+            continue
+        emit({"id": msg.get("id"), "type": "response", "command": msg_type, "success": True, "data": {}})
     """
 )
 
@@ -693,6 +767,65 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(seen_methods, ["input"])
 
+    def test_install_headless_ui_answers_input_via_extension_ui_response(self) -> None:
+        echoes: list[dict] = []
+        done = threading.Event()
+
+        with self.make_client(server=HEADLESS_UI_ECHO_SERVER) as client:
+            client.on_extension_error(lambda event: (echoes.append(json.loads(event.error)), done.set()))
+            client.install_headless_ui(input_value="approved")
+            client.prompt_and_wait("needs ui", timeout=2.0)
+            self.assertTrue(done.wait(timeout=2.0))
+
+        frame = echoes[0]
+        self.assertEqual(frame["type"], "extension_ui_response")
+        self.assertEqual(frame["id"], "ui-input-1")
+        self.assertEqual(frame["value"], "approved")
+
+    def test_install_headless_ui_answers_confirm_via_extension_ui_response(self) -> None:
+        echoes: list[dict] = []
+        done = threading.Event()
+
+        with self.make_client(server=HEADLESS_UI_ECHO_SERVER) as client:
+            client.on_extension_error(lambda event: (echoes.append(json.loads(event.error)), done.set()))
+            client.install_headless_ui(confirm=True)
+            client.prompt_and_wait("needs confirm", timeout=2.0)
+            self.assertTrue(done.wait(timeout=2.0))
+
+        frame = echoes[0]
+        self.assertEqual(frame["type"], "extension_ui_response")
+        self.assertEqual(frame["id"], "ui-confirm-1")
+        self.assertIs(frame["confirmed"], True)
+
+    def test_open_url_ui_request_does_not_tear_down_client(self) -> None:
+        seen_methods: list[str] = []
+
+        with self.make_client() as client:
+            client.install_headless_ui(on_request=lambda request: seen_methods.append(request.method))
+            client.prompt_and_wait("needs open url", timeout=2.0)
+            request = client.next_ui_request(timeout=2.0)
+            self.assertEqual(request.method, "open_url")
+            self.assertEqual(request.url, "https://example.com/oauth")
+            self.assertEqual(request.instructions, "Open this URL to continue login.")
+            self.assertTrue(request.is_passive())
+            # The reader loop must survive the frame: a follow-up request still works.
+            state = client.get_state()
+            self.assertEqual(state.session_id, "fake-session")
+
+        self.assertEqual(seen_methods, ["open_url"])
+
+    def test_get_pending_workflow_gates_typed(self) -> None:
+        with self.make_client() as client:
+            gates = client.get_pending_workflow_gates()
+
+        self.assertEqual(len(gates), 1)
+        gate = gates[0]
+        self.assertEqual(gate.gate_id, "wg_pending_1")
+        self.assertEqual(gate.stage, "ralplan")
+        assert gate.options is not None
+        self.assertEqual(gate.options[0].label, "Approve")
+        self.assertTrue(gate.required)
+
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
         event_types: list[str] = []
@@ -880,7 +1013,10 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(gate.gate_id, request.id)
             self.assertEqual(gate.kind, "question")
             self.assertEqual(gate.schema, {"type": "string", "enum": ["alpha", "beta"]})
-            self.assertEqual(gate.options, ("alpha", "beta"))
+            assert gate.options is not None
+            self.assertEqual([option.value for option in gate.options], ["alpha", "beta"])
+            self.assertEqual([option.label for option in gate.options], ["Alpha", "Beta"])
+            self.assertTrue(gate.required)
             with self.assertRaises(RpcCommandError) as invalid:
                 client.send_workflow_gate_response(gate.gate_id, "gamma")
             self.assertIn("invalid_workflow_gate_response", str(invalid.exception))

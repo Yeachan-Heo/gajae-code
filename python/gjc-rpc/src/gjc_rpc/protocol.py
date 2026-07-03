@@ -11,7 +11,7 @@ JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"
 JsonObject: TypeAlias = dict[str, JsonValue]
 
 Attribution: TypeAlias = Literal["user", "agent"]
-ThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
+ThinkingLevel: TypeAlias = Literal["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
@@ -31,19 +31,22 @@ ExtensionUiMethod: TypeAlias = Literal[
     "setWidget",
     "setTitle",
     "set_editor_text",
+    "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal["select", "confirm", "input", "editor"]
-PassiveExtensionUiMethod: TypeAlias = Literal["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]
+PassiveExtensionUiMethod: TypeAlias = Literal["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]
 ValueExtensionUiMethod: TypeAlias = Literal["select", "input", "editor"]
 
 PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = frozenset(
-    {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+    {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"}
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = frozenset(
     {"select", "confirm", "input", "editor"}
 )
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset({"select", "input", "editor"})
-_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset(
+    {"inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 _WORKFLOW_GATE_KIND_VALUES: Final[frozenset[str]] = frozenset({"question", "approval", "execution"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
@@ -63,6 +66,7 @@ _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
         "setWidget",
         "setTitle",
         "set_editor_text",
+        "open_url",
     }
 )
 _AGENT_MESSAGE_ROLE_VALUES: Final[frozenset[str]] = frozenset(
@@ -100,6 +104,7 @@ _ASSISTANT_DONE_REASON_VALUES: Final[frozenset[str]] = frozenset({"stop", "lengt
 _ASSISTANT_ERROR_REASON_VALUES: Final[frozenset[str]] = frozenset({"aborted", "error"})
 _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", "overflow", "idle"})
 _AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "handoff"})
+_AGENT_END_STOP_REASON_VALUES: Final[frozenset[str]] = frozenset({"completed", "paused"})
 
 
 def _clone_json_value(value: object, *, field: str) -> JsonValue:
@@ -865,6 +870,8 @@ class ExtensionUiRequest:
     widget_lines: tuple[str, ...] | None = None
     widget_placement: WidgetPlacement | None = None
     text: str | None = None
+    url: str | None = None
+    instructions: str | None = None
     type: Literal["extension_ui_request"] = "extension_ui_request"
 
     def is_passive(self) -> bool:
@@ -922,6 +929,9 @@ class AgentStartEvent:
 @dataclass(slots=True, frozen=True)
 class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
+    stop_reason: Literal["completed", "paused"] | None = None
+    telemetry: JsonObject | None = None
+    coverage: JsonObject | None = None
     type: Literal["agent_end"] = "agent_end"
 
 
@@ -998,6 +1008,7 @@ class AutoCompactionEndEvent:
     will_retry: bool
     error_message: str | None = None
     skipped: bool | None = None
+    continuation_skip_reason: str | None = None
     type: Literal["auto_compaction_end"] = "auto_compaction_end"
 
 
@@ -1007,6 +1018,7 @@ class AutoRetryStartEvent:
     max_attempts: int
     delay_ms: int
     error_message: str
+    unbounded: bool | None = None
     type: Literal["auto_retry_start"] = "auto_retry_start"
 
 
@@ -1053,6 +1065,39 @@ class TodoAutoClearEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class IrcMessageEvent:
+    message: AgentMessage
+    type: Literal["irc_message"] = "irc_message"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentSteerMessageEvent:
+    message: AgentMessage
+    type: Literal["subagent_steer_message"] = "subagent_steer_message"
+
+
+@dataclass(slots=True, frozen=True)
+class NoticeEvent:
+    level: NotifyType
+    message: str
+    source: str | None = None
+    type: Literal["notice"] = "notice"
+
+
+@dataclass(slots=True, frozen=True)
+class ThinkingLevelChangedEvent:
+    thinking_level: ThinkingLevel | None = None
+    type: Literal["thinking_level_changed"] = "thinking_level_changed"
+
+
+@dataclass(slots=True, frozen=True)
+class GoalUpdatedEvent:
+    goal: JsonObject | None = None
+    state: JsonObject | None = None
+    type: Literal["goal_updated"] = "goal_updated"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1078,6 +1123,7 @@ class WorkflowGate:
     context: JsonObject
     created_at: str
     options: tuple[WorkflowGateOption, ...] | None = None
+    required: bool = True
     type: Literal["workflow_gate"] = "workflow_gate"
 
 
@@ -1101,6 +1147,11 @@ RpcAgentEvent: TypeAlias = (
     | TtsrTriggeredEvent
     | TodoReminderEvent
     | TodoAutoClearEvent
+    | IrcMessageEvent
+    | SubagentSteerMessageEvent
+    | NoticeEvent
+    | ThinkingLevelChangedEvent
+    | GoalUpdatedEvent
 )
 
 RpcNotification: TypeAlias = (
@@ -1415,6 +1466,8 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
             ),
         ),
         text=_optional_str(payload, "text"),
+        url=_optional_str(payload, "url"),
+        instructions=_optional_str(payload, "instructions"),
     )
 
 
@@ -1454,6 +1507,10 @@ def parse_workflow_gate(payload: JsonObject) -> WorkflowGate:
                         description=_optional_str(cast(JsonObject, entry), "description"),
                     )
                 )
+            elif isinstance(entry, str):
+                # Legacy payloads carried bare option strings; coerce so they
+                # are not silently dropped from the typed gate.
+                parsed.append(WorkflowGateOption(value=entry, label=entry))
         options = tuple(parsed)
     raw_context = payload.get("context")
     context = cast(JsonObject, raw_context) if isinstance(raw_context, dict) else {}
@@ -1466,6 +1523,7 @@ def parse_workflow_gate(payload: JsonObject) -> WorkflowGate:
         context=context,
         created_at=_require_str(payload, "created_at"),
         options=options,
+        required=bool(payload.get("required", True)),
     )
 
 
@@ -1474,7 +1532,15 @@ def _parse_session_event(payload: JsonObject) -> RpcNotification:
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
-        return AgentEndEvent(messages=parse_agent_messages(cast(JsonValue | None, payload.get("messages"))))
+        return AgentEndEvent(
+            messages=parse_agent_messages(cast(JsonValue | None, payload.get("messages"))),
+            stop_reason=cast(
+                Literal["completed", "paused"] | None,
+                _optional_literal(payload.get("stopReason"), _AGENT_END_STOP_REASON_VALUES, field="agent_end.stopReason"),
+            ),
+            telemetry=_optional_json_object(payload.get("telemetry"), field="agent_end.telemetry"),
+            coverage=_optional_json_object(payload.get("coverage"), field="agent_end.coverage"),
+        )
     if event_type == "turn_start":
         return TurnStartEvent()
     if event_type == "turn_end":
@@ -1564,6 +1630,7 @@ def _parse_session_event(payload: JsonObject) -> RpcNotification:
             will_retry=bool(payload.get("willRetry", False)),
             error_message=_optional_str(payload, "errorMessage"),
             skipped=_optional_bool(payload, "skipped"),
+            continuation_skip_reason=_optional_str(payload, "continuationSkipReason"),
         )
     if event_type == "auto_retry_start":
         return AutoRetryStartEvent(
@@ -1571,6 +1638,7 @@ def _parse_session_event(payload: JsonObject) -> RpcNotification:
             max_attempts=int(payload.get("maxAttempts", 0)),
             delay_ms=int(payload.get("delayMs", 0)),
             error_message=str(payload.get("errorMessage", "")),
+            unbounded=_optional_bool(payload, "unbounded"),
         )
     if event_type == "auto_retry_end":
         return AutoRetryEndEvent(
@@ -1599,6 +1667,43 @@ def _parse_session_event(payload: JsonObject) -> RpcNotification:
         )
     if event_type == "todo_auto_clear":
         return TodoAutoClearEvent()
+    if event_type == "irc_message":
+        return IrcMessageEvent(
+            message=_parse_agent_message(
+                _clone_json_object(payload.get("message"), field="irc_message.message"),
+                field="irc_message.message",
+            )
+        )
+    if event_type == "subagent_steer_message":
+        return SubagentSteerMessageEvent(
+            message=_parse_agent_message(
+                _clone_json_object(payload.get("message"), field="subagent_steer_message.message"),
+                field="subagent_steer_message.message",
+            )
+        )
+    if event_type == "notice":
+        return NoticeEvent(
+            level=cast(
+                NotifyType,
+                _require_literal(payload.get("level", "info"), _NOTIFY_TYPE_VALUES, field="notice.level"),
+            ),
+            message=str(payload.get("message", "")),
+            source=_optional_str(payload, "source"),
+        )
+    if event_type == "thinking_level_changed":
+        return ThinkingLevelChangedEvent(
+            thinking_level=cast(
+                ThinkingLevel | None,
+                _optional_literal(
+                    payload.get("thinkingLevel"), _THINKING_LEVEL_VALUES, field="thinking_level_changed.thinkingLevel"
+                ),
+            )
+        )
+    if event_type == "goal_updated":
+        return GoalUpdatedEvent(
+            goal=_optional_json_object(payload.get("goal"), field="goal_updated.goal"),
+            state=_optional_json_object(payload.get("state"), field="goal_updated.state"),
+        )
     return UnknownNotification(payload=_clone_json_object(payload, field="session_event"))
 
 

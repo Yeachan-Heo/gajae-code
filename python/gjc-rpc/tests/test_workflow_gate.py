@@ -58,6 +58,14 @@ class WorkflowGateParseTest(unittest.TestCase):
         self.assertEqual(len(gate.options), 2)
         self.assertEqual(gate.options[0], WorkflowGateOption(value="approve", label="Approve execution", description="recommended"))
         self.assertEqual(gate.options[1].description, None)
+        self.assertTrue(gate.required)
+
+    def test_parse_workflow_gate_coerces_legacy_string_options(self) -> None:
+        payload = {**GATE_PAYLOAD, "options": ["alpha", "beta"]}
+        gate = parse_workflow_gate(payload)
+        assert gate.options is not None
+        self.assertEqual(gate.options[0], WorkflowGateOption(value="alpha", label="alpha"))
+        self.assertEqual(gate.options[1], WorkflowGateOption(value="beta", label="beta"))
 
     def test_parse_notification_dispatches_workflow_gate(self) -> None:
         gate = parse_notification(GATE_PAYLOAD)
