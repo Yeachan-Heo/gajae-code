@@ -243,4 +243,43 @@ describe("lifecycle control runtime", () => {
 
 		fs.rmSync(root, { recursive: true, force: true });
 	});
+
+	it("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
+		const proj = path.join(root, "saved-project");
+		const sessionsDir = path.join(root, "encoded-project");
+		const callsFile = path.join(root, "tmux-calls.log");
+		const tmux = path.join(root, "fake-tmux.sh");
+		fs.mkdirSync(proj, { recursive: true });
+		fs.mkdirSync(sessionsDir, { recursive: true });
+		fs.writeFileSync(path.join(sessionsDir, "abc123.jsonl"), `${JSON.stringify({ id: "abc123", cwd: proj })}\n`);
+		fs.writeFileSync(
+			tmux,
+			[
+				"#!/usr/bin/env bash",
+				'printf \'%s\\n\' "$*" >> "$TMUX_CALLS"',
+				'if [ "$1" = "list-sessions" ]; then',
+				"  echo 'no server running' >&2",
+				"  exit 1",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(tmux, 0o755);
+
+		const resume = daemonResumeSession(
+			{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
+			{ sessionsRoot: root },
+		);
+		const result = await resume({ sessionIdOrPrefix: "abc123" });
+
+		expect("mode" in result && result.mode).toBe("cold_restarted");
+		const calls = fs.readFileSync(callsFile, "utf8");
+		expect(calls).toContain("new-session -d -s gjc_lc_abc123 sh -c");
+		expect(calls).toContain(`cd '${proj}' && exec env GJC_TMUX_LAUNCHED=1 GJC_NOTIFICATIONS=1 gjc --resume 'abc123'`);
+		expect(calls).toContain(`@gjc-project ${proj}`);
+
+		fs.rmSync(root, { recursive: true, force: true });
+	});
 });

@@ -238,6 +238,7 @@ export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env, opts: 
 		// restart, so an unknown or ambiguous prefix fails closed instead of
 		// blindly spawning `gjc --resume <prefix>` against a non-authoritative id.
 		let resumeId = target.sessionIdOrPrefix;
+		let resumeCwd = target.path;
 		if (opts.sessionsRoot) {
 			const saved = listRecentSessions({ sessionsRoot: opts.sessionsRoot, limit: 1000 });
 			const prefixed = saved.filter(
@@ -249,11 +250,19 @@ export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env, opts: 
 			if (resolved.length > 1) {
 				return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
 			}
-			resumeId = resolved[0]!.sessionId;
+			const selected = resolved[0]!;
+			resumeId = selected.sessionId;
+			resumeCwd = selected.path;
+		}
+		const resolvedResumeCwd = resumeCwd ? path.resolve(resumeCwd) : undefined;
+		const resumeCwdStat = resolvedResumeCwd ? fs.statSync(resolvedResumeCwd, { throwIfNoEntry: false }) : undefined;
+		if (!resumeCwdStat?.isDirectory()) {
+			throw new Error(`gjc_lifecycle_resume_cwd_unavailable: ${resolvedResumeCwd ?? "(missing)"}`);
 		}
 		const tmux = resolveGjcTmuxCommand(env);
 		const name = tmuxSessionNameFor(resumeId);
-		const command = `exec env GJC_TMUX_LAUNCHED=1 GJC_NOTIFICATIONS=1 gjc --resume ${shellQuote(resumeId)}`;
+		const cwdPrefix = resolvedResumeCwd ? `cd ${shellQuote(resolvedResumeCwd)} && ` : "";
+		const command = `${cwdPrefix}exec env GJC_TMUX_LAUNCHED=1 GJC_NOTIFICATIONS=1 gjc --resume ${shellQuote(resumeId)}`;
 		const r = Bun.spawnSync([tmux, "new-session", "-d", "-s", name, "sh", "-c", command], {
 			stdout: "pipe",
 			stderr: "pipe",
@@ -261,7 +270,7 @@ export function daemonResumeSession(env: NodeJS.ProcessEnv = process.env, opts: 
 		});
 		if (r.exitCode !== 0) throw new Error(r.stderr.toString().trim() || "gjc_lifecycle_resume_failed");
 		const tgt = buildGjcTmuxExactOptionTarget(name);
-		for (const cmd of buildGjcTmuxProfileCommands(tgt, env, { sessionId: resumeId })) {
+		for (const cmd of buildGjcTmuxProfileCommands(tgt, env, { sessionId: resumeId, project: resolvedResumeCwd })) {
 			Bun.spawnSync([tmux, ...cmd.args], { stdout: "pipe", stderr: "pipe", env });
 		}
 		return {
