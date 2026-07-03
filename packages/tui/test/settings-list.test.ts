@@ -44,4 +44,125 @@ describe("SettingsList", () => {
 
 		expect(changes).toEqual([["mode", "on"]]);
 	});
+	it("keeps populated confirm precedence when cancel also matches Enter", () => {
+		setKeybindings(
+			new KeybindingsManager(TUI_KEYBINDINGS, {
+				"tui.select.cancel": "enter",
+			}),
+		);
+		const changes: Array<[string, string]> = [];
+		let cancelled = false;
+		const list = new SettingsList(
+			[
+				{
+					id: "mode",
+					label: "Mode",
+					currentValue: "off",
+					values: ["off", "on"],
+				},
+			],
+			5,
+			testTheme,
+			(id, value) => {
+				changes.push([id, value]);
+			},
+			() => {
+				cancelled = true;
+			},
+		);
+
+		list.handleInput("\n");
+
+		expect(changes).toEqual([["mode", "on"]]);
+		expect(cancelled).toBe(false);
+	});
+	it("does not poison selection when navigation arrives while empty", () => {
+		const changes: Array<[string, string]> = [];
+		const selections: Array<string | undefined> = [];
+		const list = new SettingsList(
+			[],
+			5,
+			testTheme,
+			(id, value) => {
+				changes.push([id, value]);
+			},
+			() => {
+				throw new Error("cancel should not be called");
+			},
+			item => selections.push(item?.id),
+		);
+
+		list.handleInput("\x1b[A");
+		list.handleInput("\x1b[B");
+		list.handleInput("\n");
+		list.setItems([
+			{
+				id: "mode",
+				label: "Mode",
+				currentValue: "off",
+				values: ["off", "on"],
+			},
+		]);
+		list.handleInput("\n");
+
+		expect(Bun.stripANSI(list.render(80).join("\n"))).toContain("→ Mode");
+		expect(selections.at(-1)).toBe("mode");
+		expect(changes).toEqual([["mode", "on"]]);
+	});
+
+	it("still allows cancelling an empty list", () => {
+		let cancelled = false;
+		const list = new SettingsList(
+			[],
+			5,
+			testTheme,
+			() => {},
+			() => {
+				cancelled = true;
+			},
+		);
+
+		list.handleInput("\x1b");
+
+		expect(cancelled).toBe(true);
+	});
+
+	it("clamps selection when a submenu closes after the list shrinks", () => {
+		const list = new SettingsList(
+			[
+				{
+					id: "first",
+					label: "First",
+					currentValue: "open",
+				},
+				{
+					id: "second",
+					label: "Second",
+					currentValue: "open",
+					submenu: (_currentValue, done) => ({
+						render: () => ["submenu"],
+						handleInput: () => done(),
+						invalidate: () => {},
+					}),
+				},
+			],
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		list.handleInput("\x1b[B");
+		list.handleInput("\n");
+		list.setItems([
+			{
+				id: "only",
+				label: "Only",
+				currentValue: "open",
+			},
+		]);
+		list.handleInput("\n");
+
+		expect(Bun.stripANSI(list.render(80).join("\n"))).toContain("→ Only");
+	});
 });

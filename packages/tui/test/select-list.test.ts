@@ -168,4 +168,38 @@ describe("SelectList", () => {
 
 		expect(selectedValue).toBe("run");
 	});
+	it("keeps populated confirm precedence when cancel also matches Enter", () => {
+		setKeybindings(
+			new KeybindingsManager(TUI_KEYBINDINGS, {
+				"tui.select.cancel": "enter",
+			}),
+		);
+		const list = new SelectList([{ value: "run", label: "run" }], 5, testTheme);
+		let selectedValue: string | undefined;
+		let cancelled = false;
+		list.onSelect = item => {
+			selectedValue = item.value;
+		};
+		list.onCancel = () => {
+			cancelled = true;
+		};
+
+		list.handleInput("\n");
+
+		expect(selectedValue).toBe("run");
+		expect(cancelled).toBe(false);
+	});
+	it("allows cancelling when no filtered items are visible", () => {
+		const list = new SelectList([{ value: "run", label: "run" }], 5, testTheme);
+		let cancelled = false;
+		list.onCancel = () => {
+			cancelled = true;
+		};
+
+		list.setFilter("missing");
+		list.handleInput("\x1b");
+
+		expect(list.render(80)).toContain("  No matching commands");
+		expect(cancelled).toBe(true);
+	});
 });

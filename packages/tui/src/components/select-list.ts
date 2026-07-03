@@ -117,8 +117,15 @@ export class SelectList implements Component {
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#filteredItems.length === 0) return;
 		const kb = getKeybindings();
+		if (this.#filteredItems.length === 0) {
+			if (kb.matches(keyData, "tui.select.cancel")) {
+				if (this.onCancel) {
+					this.onCancel();
+				}
+			}
+			return;
+		}
 		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#filteredItems.length - 1 : this.#selectedIndex - 1;

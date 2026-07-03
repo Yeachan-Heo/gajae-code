@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Empty select/settings lists now still honor cancel while preserving populated-list keybinding precedence, and settings lists keep selection indices clamped when items disappear or submenus close after list shrinkage.
+
 ## [0.7.11] - 2026-07-03
 
 ### Fixed
