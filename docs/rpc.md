@@ -86,6 +86,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
+- `{ id?, type: "get_pending_workflow_gates" }` (returns `{ gates: RpcWorkflowGate[] }`)
 - `{ id?, type: "workflow_gate_response", gate_id: string, answer: unknown }`
 
 ### Model
@@ -129,10 +130,20 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_branch_messages" }`
 - `{ id?, type: "get_last_assistant_text" }`
 - `{ id?, type: "set_session_name", name: string }`
+- `{ id?, type: "handoff", customInstructions?: string }`
 
 ### Messages
 
 - `{ id?, type: "get_messages" }`
+
+### Login
+
+- `{ id?, type: "get_login_providers" }` (returns `{ providers: LoginProvider[] }`)
+- `{ id?, type: "login", providerId: string }` — OAuth flows emit an `extension_ui_request` with `method: "open_url"` (`{ url, instructions? }`) while the login is pending.
+
+### Unattended control plane
+
+- `{ id?, type: "negotiate_unattended", declaration: RpcUnattendedDeclaration }` — see "Entering unattended mode: `negotiate_unattended`" below for the declaration shape and negotiation semantics.
 
 ## Response Schema
 
