@@ -57,6 +57,11 @@ export class WelcomeComponent implements Component {
 			}
 			requestRender();
 		}, INTRO_TICK_MS);
+		this.#animTimer.unref?.();
+	}
+
+	dispose(): void {
+		this.#stopAnimation();
 	}
 
 	#stopAnimation(): void {

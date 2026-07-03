@@ -22,7 +22,7 @@ interface Harness {
 function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 	const editor = new CustomEditor(getEditorTheme());
 	const btwContainer = new Container();
-	const ui = { requestRender: vi.fn(), onDebug: undefined } as unknown as TUI;
+	const ui = { requestRender: vi.fn(), followLiveViewport: vi.fn(), onDebug: undefined } as unknown as TUI;
 	const session = {
 		model: { provider: "anthropic", id: "test" },
 		runEphemeralTurn,

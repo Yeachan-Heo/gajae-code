@@ -131,7 +131,7 @@ describe("redesigned interactive shell chrome", () => {
 		const lines = component.render(54);
 		const rendered = Bun.stripANSI(lines.join("\n"));
 
-		expect(rendered).toContain("Gajae forge");
+		expect(rendered).toContain("GJC Forge");
 		expect(rendered).toContain("╭────────────────╮        ╭────────╮");
 		expect(rendered).toContain("╰────────────────╯        ╰────────╯");
 		expect(rendered).not.toContain("●");
@@ -147,10 +147,10 @@ describe("redesigned interactive shell chrome", () => {
 		const narrowTop = Bun.stripANSI(narrowLines[0] ?? "");
 		const wideTop = Bun.stripANSI(wideLines[0] ?? "");
 
-		expect(visibleWidth(narrowTop)).toBe(98);
-		expect(visibleWidth(wideTop)).toBe(158);
+		expect(visibleWidth(narrowTop)).toBe(100);
+		expect(visibleWidth(wideTop)).toBe(160);
 		expect(visibleWidth(wideTop)).toBeGreaterThan(visibleWidth(narrowTop));
-		expect(wideTop).toContain("GJC forge");
+		expect(wideTop).toContain("GJC Forge");
 		for (const line of wideLines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(160);
 		}
