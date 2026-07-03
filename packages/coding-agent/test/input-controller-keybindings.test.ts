@@ -357,6 +357,22 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
+	it("dequeues from the session queue when the compaction queue is missing", async () => {
+		// Same undefined-ctx condition #1404 guarded in restoreQueuedMessagesToEditor:
+		// the dequeue path must not crash on a missing compaction queue either.
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		(ctx as unknown as { compactionQueuedMessages?: unknown }).compactionQueuedMessages = undefined;
+		queues.sessionQueuedMessages.push("queued during stream");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("queued during stream\n\ncurrent draft");
+		expect(queues.sessionQueuedMessages).toEqual([]);
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
 	it("steers streaming Enter submissions by default", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const session = ctx.session as unknown as { isStreaming: boolean };

@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- The dequeue shortcut (restore newest queued message to the editor) no longer crashes the input handler when the compaction queue is missing from the mode context — the same undefined-queue condition #1404 guarded on the escape/abort restore path.
 - Native Windows terminals now default `app.message.queue` to `Alt+Q` instead of `Alt+Enter`, avoiding the Windows Terminal fullscreen shortcut conflict (#1422).
 - Coordinator MCP tmux prompt delivery now submits with tmux `Enter` instead of `C-m`, while preserving runtime prompt-ack/`turn_start` as the delivery success gate (#1409).
 - The session-close resume hint now prints the `gjc --resume <id>` command on its own line so it can be selected and copied without the surrounding prose.

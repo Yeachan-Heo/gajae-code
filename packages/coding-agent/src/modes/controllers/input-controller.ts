@@ -648,7 +648,7 @@ export class InputController {
 	}
 
 	restoreLatestQueuedMessageToEditor(options?: { currentText?: string }): number {
-		const compactionQueued = this.ctx.compactionQueuedMessages.pop();
+		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).pop();
 		const queuedText = compactionQueued?.text ?? this.ctx.session.popLastQueuedMessage();
 		if (!queuedText) {
 			this.ctx.updatePendingMessagesDisplay();
