@@ -1281,6 +1281,12 @@ async function sendTmuxPromptKeys(
 		await runner(["tmux", "delete-buffer", "-b", bufferName]);
 		return false;
 	}
+
+	// Multiline slash-command prompts can leave the editor autocomplete menu focused
+	// after paste. Escape clears that UI-only state so Enter submits the buffered
+	// prompt instead of selecting the highlighted completion.
+	const dismissedAutocomplete = await runner(["tmux", "send-keys", "-t", target, "Escape"]);
+	if (dismissedAutocomplete.exitCode !== 0) return false;
 	const submitted = await runner(["tmux", "send-keys", "-t", target, "Enter"]);
 	return submitted.exitCode === 0;
 }

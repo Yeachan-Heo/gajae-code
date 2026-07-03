@@ -29,6 +29,8 @@ function isTmuxPromptDeliveryCommand(command: string[]): boolean {
 	return command[1] === "set-buffer" || command[1] === "paste-buffer" || command[1] === "send-keys";
 }
 
+const TMUX_PROMPT_DELIVERY_COMMANDS = ["set-buffer", "paste-buffer", "send-keys", "send-keys"];
+
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -179,11 +181,12 @@ describe("Coordinator MCP server protocol", () => {
 			allow_mutation: true,
 		});
 
-		expect(deliveryCommands).toHaveLength(3);
+		expect(deliveryCommands).toHaveLength(4);
 		const bufferName = deliveryCommands[0]?.[3];
 		expect(deliveryCommands).toEqual([
 			["tmux", "set-buffer", "-b", bufferName, "--", "-primary submit token"],
 			["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "visible-session:0.0"],
+			["tmux", "send-keys", "-t", "visible-session:0.0", "Escape"],
 			["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 		]);
 		expect(deliveryCommands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "C-m"]);
@@ -270,11 +273,13 @@ describe("Coordinator MCP server protocol", () => {
 					"-t",
 					"visible-session:0.0",
 				]),
+				["tmux", "send-keys", "-t", "visible-session:0.0", "Escape"],
 				["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 			]),
 		);
 		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "-l", "\x1b[13;5u"]);
-		expect(commands.slice(-3).map(command => command[1])).toEqual(["set-buffer", "paste-buffer", "send-keys"]);
+		expect(commands.slice(-4).map(command => command[1])).toEqual(TMUX_PROMPT_DELIVERY_COMMANDS);
+		expect(commands.at(-2)).toEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Escape"]);
 		expect(commands.at(-1)).toEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"]);
 	});
 
@@ -431,6 +436,7 @@ describe("Coordinator MCP server protocol", () => {
 				["tmux", "delete-buffer", "-b", bufferName],
 			]),
 		);
+		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Escape"]);
 		expect(commands).not.toContainEqual(["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"]);
 	});
 
@@ -474,11 +480,12 @@ describe("Coordinator MCP server protocol", () => {
 			allow_mutation: true,
 		});
 
-		expect(deliveryCommands).toHaveLength(3);
+		expect(deliveryCommands).toHaveLength(4);
 		const bufferName = deliveryCommands[0]?.[3];
 		expect(deliveryCommands).toEqual([
 			["tmux", "set-buffer", "-b", bufferName, "--", "line one\nline two"],
 			["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "visible-session:0.0"],
+			["tmux", "send-keys", "-t", "visible-session:0.0", "Escape"],
 			["tmux", "send-keys", "-t", "visible-session:0.0", "Enter"],
 		]);
 		expect(deliveryCommands).not.toContainEqual([
@@ -531,7 +538,7 @@ describe("Coordinator MCP server protocol", () => {
 		});
 
 		expect(delegated).toMatchObject({ ok: true, workflow: "execute", status: "active" });
-		expect(deliveryCommands.map(command => command[1])).toEqual(["set-buffer", "paste-buffer", "send-keys"]);
+		expect(deliveryCommands.map(command => command[1])).toEqual(TMUX_PROMPT_DELIVERY_COMMANDS);
 		expect(
 			pastedPrompt.startsWith("/skill:ultragoal\n\nDelegated by coordinator MCP tool: gjc_delegate_execute"),
 		).toBe(true);
@@ -759,12 +766,11 @@ describe("Coordinator MCP server protocol", () => {
 
 		expect(response.ok).toBe(true);
 		expect(activeTurnExistedAtSend).toBe(true);
-		expect(commands.filter(isTmuxPromptDeliveryCommand).map(command => command[1])).toEqual([
-			"set-buffer",
-			"paste-buffer",
-			"send-keys",
-		]);
+		expect(commands.filter(isTmuxPromptDeliveryCommand).map(command => command[1])).toEqual(
+			TMUX_PROMPT_DELIVERY_COMMANDS,
+		);
 		expect(commands.filter(command => command[1] === "send-keys")).toEqual([
+			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "Escape"],
 			["tmux", "send-keys", "-t", "gjc-coordinator-test:0.0", "Enter"],
 		]);
 	});
