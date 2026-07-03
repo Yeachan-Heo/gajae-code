@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Notification endpoints now emit the graceful `session_closed` frame on process teardown (native terminal-window close/SIGHUP, SIGTERM, fatal errors) via a postmortem cleanup, so the managed Telegram daemon deletes the session's forum topic instead of orphaning it when the session dies without a clean `/quit`.
 - Native Windows terminals now default `app.message.queue` to `Alt+Q` instead of `Alt+Enter`, avoiding the Windows Terminal fullscreen shortcut conflict (#1422).
 - Coordinator MCP tmux prompt delivery now submits with tmux `Enter` instead of `C-m`, while preserving runtime prompt-ack/`turn_start` as the delivery success gate (#1409).
 - The session-close resume hint now prints the `gjc --resume <id>` command on its own line so it can be selected and copied without the surrounding prose.

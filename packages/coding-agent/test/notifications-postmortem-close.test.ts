@@ -1,0 +1,145 @@
+import { afterEach, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { postmortem } from "@gajae-code/utils";
+import { createNotificationsExtension } from "../src/notifications/index";
+import { readEndpoint } from "../src/notifications/telegram-reference";
+
+/**
+ * Regression for "hard terminal close orphans the Telegram topic": a native
+ * terminal-window close (SIGHUP), SIGTERM, or fatal error never runs
+ * AgentSession.dispose(), so the `session_shutdown` extension event does not
+ * fire and no `session_closed` frame reaches connected clients — the daemon
+ * keeps the session's forum topic forever. The notifications extension must
+ * register a postmortem cleanup that emits `session_closed` on those teardown
+ * paths, and cancel it when the session stops through any other path.
+ */
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) {
+		if (pred()) return;
+		await sleep(25);
+	}
+	throw new Error(`timed out waiting for ${label}`);
+}
+
+type Handler = (event: unknown, ctx: unknown) => unknown;
+type Frame = { type: string; sessionId?: string };
+type CleanupCallback = (reason: postmortem.Reason) => void | Promise<void>;
+
+const tempDirs: string[] = [];
+const openSockets: WebSocket[] = [];
+afterEach(() => {
+	for (const ws of openSockets.splice(0)) ws.close();
+	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	vi.restoreAllMocks();
+});
+
+function createHarness(prefix: string) {
+	const handlers = new Map<string, Handler>();
+	const api = {
+		on: (event: string, handler: Handler) => {
+			handlers.set(event, handler);
+		},
+		registerCommand: () => {},
+		sendUserMessage: () => {},
+	} as never;
+	createNotificationsExtension(api);
+
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(cwd);
+
+	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	const sid = `${prefix}${suffix}`;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => sid,
+			getSessionName: () => "Original",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+	} as never;
+
+	const endpoint = path.join(cwd, ".gjc", "state", "notifications", `${sid}.json`);
+	return { handlers, ctx, sid, endpoint };
+}
+
+async function connectFrames(endpoint: string): Promise<Frame[]> {
+	const { url, token } = readEndpoint(endpoint);
+	const frames: Frame[] = [];
+	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
+	openSockets.push(ws);
+	ws.addEventListener("message", ev => frames.push(JSON.parse(String((ev as MessageEvent).data))));
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve());
+		ws.addEventListener("error", () => reject(new Error("ws error")));
+	});
+	await sleep(250);
+	return frames;
+}
+
+async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		return await fn();
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}
+
+test("postmortem teardown emits session_closed to connected clients", async () => {
+	await withNotifications(async () => {
+		const registered = new Map<string, CleanupCallback>();
+		vi.spyOn(postmortem, "register").mockImplementation((id: string, cb: CleanupCallback) => {
+			registered.set(id, cb);
+			return () => {
+				registered.delete(id);
+			};
+		});
+
+		const harness = createHarness("gjc-notif-pm-");
+		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		await waitFor(() => fs.existsSync(harness.endpoint), 4000, "endpoint file");
+		const frames = await connectFrames(harness.endpoint);
+
+		const cleanup = registered.get(`notifications-session-closed:${harness.sid}`);
+		expect(cleanup).toBeDefined();
+
+		// Simulate the postmortem signal path (SIGHUP/SIGTERM/fatal error).
+		await cleanup!(postmortem.Reason.SIGTERM);
+
+		await waitFor(
+			() => frames.some(f => f.type === "session_closed" && f.sessionId === harness.sid),
+			4000,
+			"session_closed frame",
+		);
+	});
+}, 20000);
+
+test("graceful session_shutdown cancels the postmortem registration", async () => {
+	await withNotifications(async () => {
+		const registered = new Map<string, CleanupCallback>();
+		vi.spyOn(postmortem, "register").mockImplementation((id: string, cb: CleanupCallback) => {
+			registered.set(id, cb);
+			return () => {
+				registered.delete(id);
+			};
+		});
+
+		const harness = createHarness("gjc-notif-pm-cancel-");
+		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		await waitFor(() => fs.existsSync(harness.endpoint), 4000, "endpoint file");
+		expect(registered.has(`notifications-session-closed:${harness.sid}`)).toBe(true);
+
+		// A clean /quit path emits session_shutdown; the postmortem registration
+		// must be cancelled so process teardown cannot double-fire.
+		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		expect(registered.has(`notifications-session-closed:${harness.sid}`)).toBe(false);
+	});
+}, 20000);
