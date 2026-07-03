@@ -45,11 +45,16 @@ Leave execution with a right-sized, evidence-grounded plan: scope, steps, accept
 <output_contract>
 Build the full plan as a single markdown document containing:
 - Summary
+- Intent Diff
+- Decision Drivers
+- Options
 - In scope / out of scope
 - File-level changes
 - Sequencing and dependencies
 - Acceptance criteria
 - Verification
+- Escalation/Risk Gate
+- Verification Plan
 - Risks and mitigations
 
 Persist that markdown as the durable artifact via the restricted bash CLI, passing the plan through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
