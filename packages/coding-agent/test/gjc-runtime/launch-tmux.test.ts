@@ -454,7 +454,7 @@ describe("default GJC tmux launch", () => {
 		expect(plan).toBeUndefined();
 	});
 
-	it("reasserts caller dimensions before attaching a newly created managed tmux session", () => {
+	it("keeps a newly created managed tmux window in automatic sizing mode before attaching", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
@@ -476,23 +476,75 @@ describe("default GJC tmux launch", () => {
 
 		expect(handled).toBe(true);
 		const newSession = calls.find(call => call.args[0] === "new-session");
-		const resizeIndex = calls.findIndex(call => call.args[0] === "resize-window");
+		const setWindowSizeIndex = calls.findIndex(
+			call => call.args[0] === "set-window-option" && call.args.includes("window-size"),
+		);
 		const attachIndex = calls.findIndex(call => call.args[0] === "attach-session");
 		expect(newSession?.args).toContain("-x");
 		expect(newSession?.args).toContain("178");
 		expect(newSession?.args).toContain("-y");
 		expect(newSession?.args).toContain("35");
-		expect(resizeIndex).toBeGreaterThan(0);
-		expect(resizeIndex).toBeLessThan(attachIndex);
-		expect(calls[resizeIndex]?.args).toEqual([
-			"resize-window",
+		// The initial size comes from new-session -x/-y. On native tmux the window
+		// must then stay in automatic sizing mode so attach-session fits it to the
+		// real client. A `resize-window` reassert would flip window-size to
+		// `manual`, pinning the window to the capture-time size and leaving a
+		// smaller-than-client window that tmux paints with `·` fill.
+		expect(calls.some(call => call.args[0] === "resize-window")).toBe(false);
+		expect(setWindowSizeIndex).toBeGreaterThan(0);
+		expect(setWindowSizeIndex).toBeLessThan(attachIndex);
+		expect(calls[setWindowSizeIndex]?.args).toEqual([
+			"set-window-option",
 			"-t",
 			expect.stringMatching(/^=gajae_code_.*:$/),
-			"-x",
-			"178",
-			"-y",
-			"35",
+			"window-size",
+			"latest",
 		]);
+	});
+
+	it("keeps the explicit resize-window reassert on the psmux (Windows) launch path", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		try {
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux", "hello world"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
+				tmuxAvailable: true,
+				currentBranch: "feature/demo",
+				existingBranchSessionName: null,
+				spawnSync: (command, spawnArgs, options) => {
+					calls.push({ command, args: spawnArgs, options });
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled).toBe(true);
+			const resizeIndex = calls.findIndex(call => call.args[0] === "resize-window");
+			const attachIndex = calls.findIndex(call => call.args[0] === "attach-session");
+			// psmux does not share tmux's window-size semantics, so the launch path
+			// keeps the explicit resize-window reassert and never emits window-size.
+			expect(resizeIndex).toBeGreaterThan(0);
+			expect(resizeIndex).toBeLessThan(attachIndex);
+			expect(calls[resizeIndex]?.args).toEqual([
+				"resize-window",
+				"-t",
+				expect.stringMatching(/^gajae_code_/),
+				"-x",
+				"178",
+				"-y",
+				"35",
+			]);
+			expect(calls.some(call => call.args[0] === "set-window-option" && call.args.includes("window-size"))).toBe(
+				false,
+			);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
 	});
 
 	it("plans native Windows --tmux launches when tmux is available", () => {

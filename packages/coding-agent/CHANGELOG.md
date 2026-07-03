@@ -16,6 +16,7 @@
 - `gjc --tmux --resume` now reaches the session picker/resume target instead of auto-attaching a same-branch managed tmux session before the inner resume resolver runs.
 - `gjc --tmux` now preserves a newly created managed tmux session when `attach-session` exits after the parent SSH/PTY closes but the tmux server still reports the session live, so closing a Windows Terminal tab no longer kills the Mac host session before reattach.
 - Managed `gjc --tmux` launches now size the inner tmux window to the caller terminal minus inherited tmux status lines, preventing the bottom of the GJC input from being clipped when the user's tmux status bar is visible.
+- Managed `gjc --tmux` launches no longer pin the initial window to `manual` sizing on native tmux. The pre-attach reassert used `resize-window`, which flips the window's `window-size` option to `manual` and stops `attach-session` from resizing the window to the real terminal; when the attaching terminal was larger than the capture-time size, tmux left a smaller-than-client window and painted the uncovered area with `·` fill. The window now stays on `window-size latest` so it tracks the attaching client (psmux keeps the explicit `resize-window` reassert).
 
 ### Changed
 

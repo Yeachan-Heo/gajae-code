@@ -600,25 +600,38 @@ function buildTmuxNewSessionSizeArgs(size: TmuxTerminalSize | undefined): string
 	return size ? ["-x", String(size.columns), "-y", String(size.rows)] : [];
 }
 
-function resizeCreatedTmuxWindowToCallerTerminalSize(
+// Ensure the freshly created window fits the terminal that ultimately attaches.
+// `new-session` already starts the window (and the inner TUI) at the caller's
+// captured `-x/-y` size; this step governs what happens on `attach-session`.
+//
+// On native tmux we must NOT reassert with `resize-window`: that command flips
+// the window's `window-size` option to `manual`, pinning it to the capture-time
+// dimensions and stopping `attach-session` from resizing the window to the real
+// client. When the attaching terminal is larger than the capture — e.g. a GUI
+// terminal that reports a smaller size before it finishes sizing — the pinned
+// window stays small and tmux paints the uncovered client area with `·` fill
+// (the "window smaller than client" symptom). Keeping `window-size` on `latest`
+// lets tmux size the window to the attaching client (status line included).
+//
+// psmux (Windows) does not share tmux's `window-size` semantics, so preserve the
+// historical explicit `resize-window` reassert there rather than sending an
+// option its server may reject and echo into the user's pane.
+function ensureCreatedTmuxWindowTracksCallerTerminal(
 	plan: TmuxLaunchPlan,
 	spawnSync: TmuxSpawnSync,
 	options: TmuxSpawnOptions,
 ): void {
 	if (!plan.initialSize) return;
-	spawnSync(
-		plan.tmuxCommand,
-		[
-			"resize-window",
-			"-t",
-			buildGjcTmuxExactOptionTarget(plan.sessionName, { env: options.env }),
-			"-x",
-			String(plan.initialSize.columns),
-			"-y",
-			String(plan.initialSize.rows),
-		],
-		options,
-	);
+	const target = buildGjcTmuxExactOptionTarget(plan.sessionName, { env: options.env });
+	if (plan.isPsmux) {
+		spawnSync(
+			plan.tmuxCommand,
+			["resize-window", "-t", target, "-x", String(plan.initialSize.columns), "-y", String(plan.initialSize.rows)],
+			options,
+		);
+		return;
+	}
+	spawnSync(plan.tmuxCommand, ["set-window-option", "-t", target, "window-size", "latest"], options);
 }
 
 export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaunchPlan | undefined {
@@ -901,7 +914,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
 		}
-		resizeCreatedTmuxWindowToCallerTerminalSize(plan, spawnSync, controlOptions);
+		ensureCreatedTmuxWindowTracksCallerTerminal(plan, spawnSync, controlOptions);
 		applyGjcTmuxRootTerminalTitleProfile({
 			tmuxCommand: plan.tmuxCommand,
 			target: plan.sessionName,
@@ -959,7 +972,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					item.command.args.includes("@gjc-profile"),
 				);
 				if (!retryOwnershipFailure) {
-					resizeCreatedTmuxWindowToCallerTerminalSize(plan, spawnSync, controlOptions);
+					ensureCreatedTmuxWindowTracksCallerTerminal(plan, spawnSync, controlOptions);
 					applyGjcTmuxRootTerminalTitleProfile({
 						tmuxCommand: plan.tmuxCommand,
 						target: plan.sessionName,
