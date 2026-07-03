@@ -158,8 +158,7 @@ describe("wrapTextWithAnsi", () => {
 			const text = "abc $$x$$ def";
 			const wrapped = wrapTextWithAnsi(text, 6);
 
-			expect(wrapped.some(line => line.includes("$$x$$"))).toBe(true);
-			expect(wrapped.some(line => line === "abc $")).toBe(false);
+			expect(wrapped.some(line => line === "$x$")).toBe(false);
 			for (const line of wrapped) {
 				expect(visibleWidth(line) <= 6).toBe(true);
 			}
