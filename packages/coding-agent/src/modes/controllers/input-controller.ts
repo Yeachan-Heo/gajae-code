@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
-import { $env, sanitizeText } from "@gajae-code/utils";
+import { $pickenv, sanitizeText } from "@gajae-code/utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
@@ -18,7 +18,14 @@ import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
-import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+import {
+	buildTitleGenerationInput,
+	evaluateTitleGeneration,
+	generateSessionTitle,
+	reconcileTitleAttemptBaseline,
+	setSessionTerminalTitle,
+	type TitleAttemptBaseline,
+} from "../../utils/title-generator";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -36,6 +43,11 @@ export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#lastBackgroundFoldKeyTime = 0;
+
+	/** Session id + user-message count at the last title-generation attempt (or
+	 *  at this run's first submission for that session). Drives the bounded
+	 *  retry/refresh cadence for auto-generated session titles. */
+	#titleAttemptBaseline: TitleAttemptBaseline | undefined;
 
 	/** Set after a first Esc silently consumes a queued steer. Kept until the
 	 *  queued steer is either cancelled by a second Esc or drained by continuation,
@@ -421,12 +433,41 @@ export class InputController {
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
-			// Generate session title on first message
-			const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-			if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE) {
+			// Generate or refresh the session title. Fires on the first user
+			// message of a run (including resumed sessions that never got a
+			// title), retries on a bounded interval after silent failures, and
+			// refreshes drifted auto-generated titles as the topic moves.
+			// User-set names (/rename) always take precedence and are never
+			// overwritten.
+			const priorUserMessages = this.ctx.session.messages.filter(
+				(m: AgentMessage): m is Extract<AgentMessage, { role: "user" }> => m.role === "user",
+			);
+			this.#titleAttemptBaseline = reconcileTitleAttemptBaseline(
+				this.#titleAttemptBaseline,
+				this.ctx.session.sessionId,
+				priorUserMessages.length,
+			);
+			const titleGeneration = evaluateTitleGeneration({
+				disabled: Boolean($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")),
+				sessionName: this.ctx.sessionManager.getSessionName(),
+				titleSource: this.ctx.sessionManager.titleSource,
+				userMessagesSinceLastAttempt: priorUserMessages.length - this.#titleAttemptBaseline.userMessages,
+			});
+			if (titleGeneration) {
+				this.#titleAttemptBaseline = {
+					sessionId: this.ctx.session.sessionId,
+					userMessages: priorUserMessages.length,
+				};
 				const registry = this.ctx.session.modelRegistry;
+				const titleInput =
+					titleGeneration === "refresh"
+						? buildTitleGenerationInput(
+								priorUserMessages.map(m => m.content),
+								text,
+							)
+						: text;
 				generateSessionTitle(
-					text,
+					titleInput,
 					registry,
 					this.ctx.settings,
 					this.ctx.session.sessionId,

@@ -3,7 +3,14 @@
  */
 import * as path from "node:path";
 
-import { type Api, type AssistantMessage, completeSimple, type Model, type Tool } from "@gajae-code/ai";
+import {
+	type Api,
+	type AssistantMessage,
+	completeSimple,
+	type Model,
+	type Tool,
+	type UserMessage,
+} from "@gajae-code/ai";
 import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
@@ -27,6 +34,88 @@ const SET_TITLE_TOOL_NAME = "set_title";
 // Beyond the cap we treat the response as a non-title hallucination and reject it.
 const MAX_TITLE_CHARS = 80;
 const MAX_TITLE_WORDS = 12;
+
+/** User messages between automatic title refreshes (and retries after a silent failure). */
+export const TITLE_GENERATION_USER_MESSAGE_INTERVAL = 8;
+/** Trailing user messages (including the one being submitted) fed to the title model. */
+const TITLE_INPUT_CONTEXT_MESSAGES = 3;
+
+export type TitleGenerationKind = "initial" | "refresh";
+
+/**
+ * Decide whether a user message submission should trigger title generation.
+ *
+ * - `initial`: the session has no name yet. Fires on the first submission of a
+ *   run (covers brand-new sessions and resumed sessions that never got a title)
+ *   and retries on a bounded interval after silent generation failures.
+ * - `refresh`: the session has an auto-generated name and enough user messages
+ *   have accumulated since the last attempt that the topic may have drifted.
+ * - User-set names take permanent precedence (mirrors SessionManager.setSessionName).
+ *   A name without a recorded source (legacy sessions) is treated as user-owned.
+ */
+export function evaluateTitleGeneration(options: {
+	disabled: boolean;
+	sessionName: string | undefined;
+	titleSource: "auto" | "user" | undefined;
+	/** User messages submitted since the last attempt (or since this run's first submission). */
+	userMessagesSinceLastAttempt: number;
+}): TitleGenerationKind | undefined {
+	if (options.disabled) return undefined;
+	if (options.titleSource === "user") return undefined;
+	const since = options.userMessagesSinceLastAttempt;
+	if (!options.sessionName) {
+		return since === 0 || since >= TITLE_GENERATION_USER_MESSAGE_INTERVAL ? "initial" : undefined;
+	}
+	if (options.titleSource !== "auto") return undefined;
+	return since >= TITLE_GENERATION_USER_MESSAGE_INTERVAL ? "refresh" : undefined;
+}
+
+export interface TitleAttemptBaseline {
+	sessionId: string;
+	userMessages: number;
+}
+
+/**
+ * Reconcile the per-run title-attempt baseline against the current session
+ * state before evaluating title generation:
+ * - a different session (switch) or no baseline starts fresh at the current count;
+ * - history rewrites (compaction, pruning, checkpoint rewind) can shrink the
+ *   message list below the recorded baseline, which would make the cadence
+ *   unreachable — clamp down so title generation can still fire.
+ */
+export function reconcileTitleAttemptBaseline(
+	baseline: TitleAttemptBaseline | undefined,
+	sessionId: string,
+	userMessageCount: number,
+): TitleAttemptBaseline {
+	if (!baseline || baseline.sessionId !== sessionId) {
+		return { sessionId, userMessages: userMessageCount };
+	}
+	return { sessionId, userMessages: Math.min(baseline.userMessages, userMessageCount) };
+}
+
+function userContentText(content: UserMessage["content"]): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((block): block is Extract<(typeof content)[number], { type: "text" }> => block.type === "text")
+		.map(block => block.text)
+		.join("\n");
+}
+
+/**
+ * Build the title-model input from the trailing user messages plus the message
+ * being submitted, so refreshed titles reflect the current topic rather than
+ * the session's first message.
+ */
+export function buildTitleGenerationInput(priorUserContents: UserMessage["content"][], currentText: string): string {
+	const texts = priorUserContents
+		.slice(-(TITLE_INPUT_CONTEXT_MESSAGES - 1))
+		.map(userContentText)
+		.concat(currentText)
+		.map(text => text.trim())
+		.filter(text => text.length > 0);
+	return texts.join("\n\n");
+}
 
 const setTitleTool: Tool = {
 	name: SET_TITLE_TOOL_NAME,

@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as ai from "@gajae-code/ai";
 import { type Api, getBundledModel, type Model } from "@gajae-code/ai";
-import { formatSessionTerminalTitle, generateSessionTitle } from "../src/utils/title-generator";
+import {
+	buildTitleGenerationInput,
+	evaluateTitleGeneration,
+	formatSessionTerminalTitle,
+	generateSessionTitle,
+	reconcileTitleAttemptBaseline,
+	TITLE_GENERATION_USER_MESSAGE_INTERVAL,
+} from "../src/utils/title-generator";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -123,5 +130,126 @@ describe("formatSessionTerminalTitle", () => {
 
 	it("falls back to GJC when the sanitized session name is empty", () => {
 		expect(formatSessionTerminalTitle("\u0001\u001b")).toBe("GJC");
+	});
+});
+
+describe("evaluateTitleGeneration", () => {
+	const interval = TITLE_GENERATION_USER_MESSAGE_INTERVAL;
+
+	it("fires initial generation on the first submission of an unnamed session (new or resumed)", () => {
+		expect(
+			evaluateTitleGeneration({
+				disabled: false,
+				sessionName: undefined,
+				titleSource: undefined,
+				userMessagesSinceLastAttempt: 0,
+			}),
+		).toBe("initial");
+	});
+
+	it("retries initial generation only after the interval elapses", () => {
+		const base = {
+			disabled: false,
+			sessionName: undefined,
+			titleSource: undefined,
+		};
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: 1 })).toBeUndefined();
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: interval - 1 })).toBeUndefined();
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: interval })).toBe("initial");
+	});
+
+	it("refreshes an auto-generated title once the interval elapses", () => {
+		const base = {
+			disabled: false,
+			sessionName: "Fix resolver bug",
+			titleSource: "auto" as const,
+		};
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: 0 })).toBeUndefined();
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: interval - 1 })).toBeUndefined();
+		expect(evaluateTitleGeneration({ ...base, userMessagesSinceLastAttempt: interval })).toBe("refresh");
+	});
+
+	it("never overwrites a user-set name", () => {
+		expect(
+			evaluateTitleGeneration({
+				disabled: false,
+				sessionName: "my name",
+				titleSource: "user",
+				userMessagesSinceLastAttempt: interval * 10,
+			}),
+		).toBeUndefined();
+	});
+
+	it("treats a named session without a recorded source as user-owned", () => {
+		expect(
+			evaluateTitleGeneration({
+				disabled: false,
+				sessionName: "legacy name",
+				titleSource: undefined,
+				userMessagesSinceLastAttempt: interval * 10,
+			}),
+		).toBeUndefined();
+	});
+
+	it("does nothing when title generation is disabled", () => {
+		expect(
+			evaluateTitleGeneration({
+				disabled: true,
+				sessionName: undefined,
+				titleSource: undefined,
+				userMessagesSinceLastAttempt: 0,
+			}),
+		).toBeUndefined();
+	});
+});
+
+describe("buildTitleGenerationInput", () => {
+	it("joins the trailing user messages with the current text", () => {
+		expect(buildTitleGenerationInput(["first", "second", "third"], "current")).toBe("second\n\nthird\n\ncurrent");
+	});
+
+	it("extracts text blocks from structured user content", () => {
+		expect(
+			buildTitleGenerationInput(
+				[
+					[
+						{ type: "text", text: "look at this" },
+						{ type: "image", data: "abc", mimeType: "image/png" },
+					],
+				],
+				"current",
+			),
+		).toBe("look at this\n\ncurrent");
+	});
+
+	it("skips empty messages", () => {
+		expect(buildTitleGenerationInput(["", "   "], "current")).toBe("current");
+	});
+
+	it("returns just the current text when there is no prior context", () => {
+		expect(buildTitleGenerationInput([], "current")).toBe("current");
+	});
+});
+
+describe("reconcileTitleAttemptBaseline", () => {
+	it("starts fresh at the current count when there is no baseline", () => {
+		expect(reconcileTitleAttemptBaseline(undefined, "s1", 5)).toEqual({ sessionId: "s1", userMessages: 5 });
+	});
+
+	it("resets when the session changes (session switch)", () => {
+		const baseline = { sessionId: "s1", userMessages: 2 };
+		expect(reconcileTitleAttemptBaseline(baseline, "s2", 20)).toEqual({ sessionId: "s2", userMessages: 20 });
+	});
+
+	it("keeps the baseline while the message count grows", () => {
+		const baseline = { sessionId: "s1", userMessages: 3 };
+		expect(reconcileTitleAttemptBaseline(baseline, "s1", 9)).toEqual({ sessionId: "s1", userMessages: 3 });
+	});
+
+	it("clamps down after a history rewrite shrinks the message list", () => {
+		// Compaction/pruning/checkpoint rewind can drop user messages below the
+		// recorded baseline; without clamping the cadence would never fire again.
+		const baseline = { sessionId: "s1", userMessages: 12 };
+		expect(reconcileTitleAttemptBaseline(baseline, "s1", 4)).toEqual({ sessionId: "s1", userMessages: 4 });
 	});
 });

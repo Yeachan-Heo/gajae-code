@@ -6,6 +6,11 @@
 
 - The `/model` preset landing now shows the session's current preset, model, and per-role assignments in the header, marks the active preset with `(current)`, and Enter now expands/collapses provider groups (right/left arrows still work).
 
+### Changed
+
+- Session titles now refresh automatically as the conversation topic drifts: after every 8 user messages, an auto-generated title is regenerated from the trailing user messages (weighting the newest highest). User-set names (`/rename`) are never overwritten, and legacy titles without a recorded source are treated as user-owned. Interactive mode also now generates an initial title for resumed sessions that never got one, and retries on the same bounded interval after silent generation failures (previously the title was attempted exactly once, on the first message of a brand-new session). The opt-out now honors the documented `GJC_NO_TITLE` alias in addition to `PI_NO_TITLE` (previously only `PI_NO_TITLE` was checked).
+
+## [0.7.11] - 2026-07-03
 ### Fixed
 
 - The Python `gjc_rpc` client no longer tears down its reader loop on real server frames it had not modeled: OAuth `open_url` extension-UI requests emitted during `login`, `workflow_gate` frames carrying structured `{value, label, description}` options (the `next_workflow_gate()` queue path re-parsed them with a legacy strings-only parser), and `max`/`inherit` thinking levels returned by `get_state`/model info. `install_headless_ui` now answers interactive UI requests with `extension_ui_response` frames instead of misrouting them as `workflow_gate_response` commands, and `get_pending_workflow_gates()` is exposed as a typed method. Previously dropped payloads (`notice`, `thinking_level_changed`, `goal_updated`, `irc_message`, `subagent_steer_message` events; `agent_end.stopReason`/`telemetry`/`coverage`; `auto_retry_start.unbounded`; `auto_compaction_end.continuationSkipReason`; gate `required`) now parse into typed models, and the env-gated real-binary lane covers the new surface.
