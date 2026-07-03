@@ -9,11 +9,13 @@
  * - Project: .gemini/ (cwd only)
  *
  * Capabilities:
- * - mcps: From settings.json with mcpServers key
  * - context-files: GEMINI.md files
  * - system-prompt: system.md files for custom system prompt
  * - extensions: From extensions/STAR/gemini-extension.json manifests (STAR = wildcard)
  * - settings: From settings.json
+ *
+ * MCP servers are intentionally NOT inherited live from Gemini config: GJC owns
+ * MCP runtime execution. Copy definitions into GJC's own mcp.json instead.
  */
 import * as path from "node:path";
 import { tryParseJson } from "@gajae-code/utils";
@@ -22,7 +24,6 @@ import { type ContextFile, contextFileCapability } from "../capability/context-f
 import { type Extension, type ExtensionManifest, extensionCapability } from "../capability/extension";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { readDirEntries, readFile } from "../capability/fs";
-import { type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Settings, settingsCapability } from "../capability/settings";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import type { LoadContext, LoadResult } from "../capability/types";
@@ -31,7 +32,6 @@ import {
 	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	expandEnvVarsDeep,
 	getProjectPath,
 	getUserPath,
 } from "./helpers";
@@ -39,84 +39,6 @@ import {
 const PROVIDER_ID = "gemini";
 const DISPLAY_NAME = "Gemini CLI";
 const PRIORITY = 60;
-
-// =============================================================================
-// MCP Servers
-// =============================================================================
-
-async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
-	const items: MCPServer[] = [];
-	const warnings: string[] = [];
-
-	// User-level: ~/.gemini/settings.json → mcpServers
-	const userPath = getUserPath(ctx, "gemini", "settings.json");
-	if (userPath) {
-		const result = await loadMCPFromSettings(ctx, userPath, "user");
-		items.push(...result.items);
-		if (result.warnings) warnings.push(...result.warnings);
-	}
-
-	// Project-level: .gemini/settings.json → mcpServers
-	const projectPath = getProjectPath(ctx, "gemini", "settings.json");
-	if (projectPath) {
-		const result = await loadMCPFromSettings(ctx, projectPath, "project");
-		items.push(...result.items);
-		if (result.warnings) warnings.push(...result.warnings);
-	}
-
-	return { items, warnings };
-}
-
-async function loadMCPFromSettings(
-	_ctx: LoadContext,
-	path: string,
-	level: "user" | "project",
-): Promise<LoadResult<MCPServer>> {
-	const items: MCPServer[] = [];
-	const warnings: string[] = [];
-
-	const content = await readFile(path);
-	if (!content) {
-		return { items, warnings };
-	}
-
-	const parsed = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
-	if (!parsed) {
-		warnings.push(`Invalid JSON in ${path}`);
-		return { items, warnings };
-	}
-
-	if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
-		return { items, warnings };
-	}
-
-	const servers = expandEnvVarsDeep(parsed.mcpServers);
-
-	for (const [name, config] of Object.entries(servers)) {
-		if (!config || typeof config !== "object") {
-			warnings.push(`Invalid config for server "${name}" in ${path}`);
-			continue;
-		}
-
-		const raw = config as Record<string, unknown>;
-
-		items.push({
-			name,
-			command: typeof raw.command === "string" ? raw.command : undefined,
-			args: Array.isArray(raw.args) ? (raw.args as string[]) : undefined,
-			env: raw.env && typeof raw.env === "object" ? (raw.env as Record<string, string>) : undefined,
-			url: typeof raw.url === "string" ? raw.url : undefined,
-			headers: raw.headers && typeof raw.headers === "object" ? (raw.headers as Record<string, string>) : undefined,
-			transport: ["stdio", "sse", "http"].includes(raw.type as string)
-				? (raw.type as "stdio" | "sse" | "http")
-				: undefined,
-			timeout: typeof raw.timeout === "number" ? raw.timeout : undefined,
-			_source: createSourceMeta(PROVIDER_ID, path, level),
-		} as MCPServer);
-	}
-
-	return { items, warnings };
-}
 
 // =============================================================================
 // Context Files
@@ -295,14 +217,6 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 // =============================================================================
 // Provider Registration
 // =============================================================================
-
-registerProvider(mcpCapability.id, {
-	id: PROVIDER_ID,
-	displayName: DISPLAY_NAME,
-	description: "Load MCP servers from ~/.gemini/settings.json and .gemini/settings.json",
-	priority: PRIORITY,
-	load: loadMCPServers,
-});
 
 registerProvider(contextFileCapability.id, {
 	id: PROVIDER_ID,
