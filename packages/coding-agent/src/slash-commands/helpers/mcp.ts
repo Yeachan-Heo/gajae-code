@@ -1,4 +1,5 @@
 import { getMCPConfigPath, logger } from "@gajae-code/utils";
+import { detectImportableMcpSources, formatImportHintLine } from "../../migrate/import-hint";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -378,7 +379,9 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 			if (!entries.some(entry => entry.name === name)) entries.push({ name, config, scope: "project" });
 		}
 		if (entries.length === 0) {
-			await runtime.output("No MCP servers configured.");
+			const importable = await detectImportableMcpSources();
+			const lines = ["No MCP servers configured.", ...importable.map(formatImportHintLine)];
+			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		}
 		await runtime.output(
