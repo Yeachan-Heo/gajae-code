@@ -1927,11 +1927,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
-		// Built-in tool discovery follows tools.discoveryMode; MCP tool discovery
-		// additionally honors the mcp.discoveryMode boolean (back-compat alias).
+		// Built-in tool discovery (tools.discoveryMode) and MCP tool discovery
+		// (mcp.discoveryMode) are independent switches: "all" hides non-essential
+		// BUILT-IN tools behind search_tool_bm25 and says nothing about MCP.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
 		const effectiveDiscoveryMode: "off" | "all" = toolsDiscoveryModeSetting === "all" ? "all" : "off";
-		const mcpDiscoveryEnabled = effectiveDiscoveryMode === "all" || (settings.get("mcp.discoveryMode") ?? false);
+		const mcpDiscoveryEnabled = settings.get("mcp.discoveryMode") ?? false;
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
