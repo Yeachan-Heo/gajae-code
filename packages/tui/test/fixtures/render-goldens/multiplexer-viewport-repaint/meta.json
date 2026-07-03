@@ -21,11 +21,11 @@
     },
     "scrollback": {
       "file": "scrollback.txt",
-      "sha256": "31f94718a93cc110b1cda2e23e7f018f4cb9921a774f9c3af4f9963fcc759bdf"
+      "sha256": "934b6df0ca622f03771d682c580f3e76fa6c9dc4e6d4b4aa811c7199b1a8d065"
     },
     "writelog": {
       "file": "writelog.bin",
-      "sha256": "7be390a6d024560e06ce0ea9369f4056ace16fdcfea88b6d89d5bd7557c6100f"
+      "sha256": "71698ee17382b17c1640f29245b42a7e89ea6c8519e09cf2c5ced0939facc524"
     }
   }
 }

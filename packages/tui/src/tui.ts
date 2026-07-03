@@ -1556,7 +1556,16 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
-			fullRender(true, "terminal width changed");
+			if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
+				// In multiplexers a full replay piles the whole transcript back onto
+				// scrollback (3J is intentionally skipped). Repaint the viewport only,
+				// mirroring the height-change branch. This also neutralizes the fake
+				// width change that requestRender(true) injects via #previousWidth = -1,
+				// so every force-render call site is safe in multiplexers too.
+				multiplexerViewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`);
+			} else {
+				fullRender(true, "terminal width changed");
+			}
 			return;
 		}
 
