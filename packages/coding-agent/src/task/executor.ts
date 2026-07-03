@@ -1535,6 +1535,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					);
 					await awaitAbortable(session.waitForIdle());
 				} catch (err) {
+					// An abort (parent cancel, session shutdown, timeout) rejects
+					// awaitAbortable with ToolAbortError — a cancellation, not a prompt
+					// failure. Mirror the outer catch's `!abortSignal.aborted` guard so
+					// expected cancellations aren't logged at error level.
+					if (abortSignal.aborted || err instanceof ToolAbortError) break;
 					logger.error("Subagent prompt failed", {
 						error: err instanceof Error ? err.message : String(err),
 					});
