@@ -368,3 +368,67 @@ describe("overflow: path shrinks before git is dropped", () => {
 		}
 	});
 });
+
+describe("status line multi-row wrapping (statusLine.maxRows)", () => {
+	const LONG_NAME = "WrapSess1";
+
+	function buildComponent(maxRows: number): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession(LONG_NAME));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session"],
+			rightSegments: ["session_name", "time"],
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	it("keeps the polished single row when everything fits", () => {
+		const lines = buildComponent(2).render(200);
+		expect(lines).toHaveLength(1);
+	});
+
+	it("wraps overflow onto extra rows instead of dropping segments", () => {
+		const single = buildComponent(1).render(24);
+		expect(single).toHaveLength(1);
+
+		const wrapped = buildComponent(2).render(24);
+		expect(wrapped.length).toBeGreaterThan(1);
+		// Every emitted row stays within the terminal width.
+		for (const row of wrapped) {
+			expect(visibleWidth(row)).toBeLessThanOrEqual(24);
+		}
+		// Wrapping preserves content that the single-row layout would have dropped.
+		const singleLen = strip(single[0]).length;
+		const wrappedLen = wrapped.reduce((sum, row) => sum + strip(row).length, 0);
+		expect(wrappedLen).toBeGreaterThan(singleLen);
+		// The session name survives across the wrapped rows.
+		expect(wrapped.some(row => strip(row).includes(LONG_NAME))).toBe(true);
+	});
+
+	it("caps wrapping at maxRows", () => {
+		const wrapped = buildComponent(2).render(8);
+		expect(wrapped.length).toBeLessThanOrEqual(2);
+	});
+
+	it("allows up to three rows when maxRows is 3", () => {
+		const two = buildComponent(2).render(8);
+		const three = buildComponent(3).render(8);
+		expect(three.length).toBeLessThanOrEqual(3);
+		// A tighter cap keeps strictly fewer-or-equal rows than a looser cap.
+		expect(three.length).toBeGreaterThanOrEqual(two.length);
+	});
+
+	it("getPreviewContent stacks wrapped rows with newlines", () => {
+		const component = buildComponent(2);
+		const preview = component.getPreviewContent(24);
+		expect(preview.split("\n").length).toBeGreaterThan(1);
+		// maxRows=1 preview stays a single line.
+		expect(buildComponent(1).getPreviewContent(24).split("\n")).toHaveLength(1);
+	});
+});

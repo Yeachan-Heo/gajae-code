@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `statusLine.maxRows` setting (Appearance → Status Line Rows). When it is greater than 1, status line segments that overflow a narrow terminal now wrap onto additional rows instead of being dropped; the default of 1 keeps the existing single-line, drop-on-overflow behavior. The Appearance preview reflects the wrapped layout.
+
 ## [0.7.11] - 2026-07-03
 ### Fixed
 

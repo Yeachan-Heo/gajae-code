@@ -507,6 +507,21 @@ export const SETTINGS_SCHEMA = {
 			description: "Use the session name color for the editor border and status line gap",
 		},
 	},
+	"statusLine.maxRows": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Rows",
+			description:
+				"Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+			options: [
+				{ value: "1", label: "1 row", description: "Single line; overflow is truncated (default)" },
+				{ value: "2", label: "2 rows", description: "Wrap overflow onto a second row" },
+				{ value: "3", label: "3 rows", description: "Wrap overflow across up to three rows" },
+			],
+		},
+	},
 	"tools.artifactSpillThreshold": {
 		type: "number",
 		default: 50,
@@ -3280,6 +3295,7 @@ export interface ExaSettings {
 export interface StatusLineSettings {
 	preset: StatusLinePreset;
 	separator: StatusLineSeparatorStyle;
+	maxRows: number;
 	showHookStatus: boolean;
 	showSkillHud: boolean;
 	leftSegments: StatusLineSegmentId[];
