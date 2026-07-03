@@ -5,6 +5,7 @@ import {
 	readDisabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
+	setServerAutoload,
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
@@ -405,7 +406,8 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 					} else {
 						location = (config as { command: string }).command;
 					}
-					return `${name} | ${type} | ${enabled} | ${location ?? "(unknown)"} [${scope}]`;
+					const autoload = config.autoload === false ? " | autoload off" : "";
+					return `${name} | ${type} | ${enabled}${autoload} | ${location ?? "(unknown)"} [${scope}]`;
 				})
 				.join("\n"),
 		);
@@ -452,6 +454,39 @@ async function handleEnableDisableCommand(
 	}
 }
 
+async function handleAutoloadCommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	const [name, rawValue] = rest.split(/\s+/);
+	const value = rawValue?.toLowerCase();
+	if (!name || (value !== "on" && value !== "off")) {
+		return usage("Usage: /mcp autoload <name> on|off", runtime);
+	}
+	try {
+		const userPath = getMCPConfigPath("user", runtime.cwd);
+		const projectPath = getMCPConfigPath("project", runtime.cwd);
+		const [userConfig, projectConfig] = await Promise.all([
+			readMCPConfigFile(userPath),
+			readMCPConfigFile(projectPath),
+		]);
+		const filePath = userConfig.mcpServers?.[name]
+			? userPath
+			: projectConfig.mcpServers?.[name]
+				? projectPath
+				: undefined;
+		if (!filePath) {
+			return usage(`Server "${name}" not found in user or project config.`, runtime);
+		}
+		await setServerAutoload(filePath, name, value === "on");
+		await runtime.output(
+			value === "on"
+				? `Autoload enabled for "${name}" — it connects automatically at session startup.`
+				: `Autoload disabled for "${name}" — it stays configured until connected explicitly.`,
+		);
+		return commandConsumed();
+	} catch (err) {
+		return usage(`Failed to update autoload for "${name}": ${errorMessage(err)}`, runtime);
+	}
+}
+
 async function handleRemoveCommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	const parsed = parseNamedScopeArgs(rest, "Invalid --scope value. Use project or user.");
 	if (parsed.error) return usage(parsed.error, runtime);
@@ -471,6 +506,7 @@ const MCP_HELP_TEXT = [
 	"  /mcp list                                               List configured servers",
 	"  /mcp enable <name>                                      Enable a server",
 	"  /mcp disable <name>                                     Disable a server",
+	"  /mcp autoload <name> on|off                             Toggle connecting a server at session startup",
 	"  /mcp remove <name> [--scope project|user]               Remove a server",
 	"  /mcp reload                                             Reload MCP runtime",
 	"  /mcp resources                                          List resources from all servers",
@@ -482,7 +518,15 @@ const MCP_HELP_TEXT = [
 	"  /mcp help                                               Show this help",
 ].join("\n");
 
-const TUI_ONLY_MCP_VERBS = new Set(["reauth", "unauth", "smithery-login", "smithery-logout", "reconnect"]);
+const TUI_ONLY_MCP_VERBS = new Set([
+	"reauth",
+	"unauth",
+	"smithery-login",
+	"smithery-logout",
+	"reconnect",
+	"connect",
+	"disconnect",
+]);
 
 /** ACP/text-mode `/mcp` handler. Shared by both dispatchers via the spec. */
 export async function handleMcpAcp(
@@ -501,7 +545,11 @@ export async function handleMcpAcp(
 		);
 	}
 	if (TUI_ONLY_MCP_VERBS.has(verb)) {
-		return usage(`/mcp ${verb} requires OAuth or browser flows only available in the TUI client.`, runtime);
+		const reason =
+			verb === "connect" || verb === "disconnect" || verb === "reconnect"
+				? "requires the live MCP manager"
+				: "requires OAuth or browser flows";
+		return usage(`/mcp ${verb} ${reason} only available in the TUI client.`, runtime);
 	}
 	switch (verb) {
 		case "resources":
@@ -523,6 +571,8 @@ export async function handleMcpAcp(
 		case "enable":
 		case "disable":
 			return await handleEnableDisableCommand(verb, rest, runtime);
+		case "autoload":
+			return await handleAutoloadCommand(rest, runtime);
 		case "remove":
 		case "rm":
 			return await handleRemoveCommand(rest, runtime);

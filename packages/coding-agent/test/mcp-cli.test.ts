@@ -127,6 +127,41 @@ describe("gjc mcp CLI helpers", () => {
 		expect((await readMCPConfigFile(configPath)).mcpServers?.srv).toMatchObject({ command: "new-bin" });
 	});
 
+	it("toggles autoload on and off for an existing server", async () => {
+		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const configPath = getMCPConfigPath("user", projectDir);
+
+		await runMCPCommand({ action: "add", name: "srv", commandArgs: ["srv-bin"], flags: {}, cwd: projectDir });
+
+		await runMCPCommand({ action: "autoload", name: "srv", commandArgs: ["off"], flags: {}, cwd: projectDir });
+		expect((await readMCPConfigFile(configPath)).mcpServers?.srv).toMatchObject({
+			command: "srv-bin",
+			autoload: false,
+		});
+
+		// Turning autoload back on removes the redundant key (default is on).
+		await runMCPCommand({ action: "autoload", name: "srv", commandArgs: ["on"], flags: {}, cwd: projectDir });
+		const stored = (await readMCPConfigFile(configPath)).mcpServers?.srv;
+		expect(stored).toMatchObject({ command: "srv-bin" });
+		expect(stored && "autoload" in stored).toBe(false);
+	});
+
+	it("rejects autoload for unknown servers and invalid values", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+		await runMCPCommand({ action: "autoload", name: "missing", commandArgs: ["off"], flags: {}, cwd: projectDir });
+		expect(process.exitCode).toBe(2);
+		process.exitCode = 0;
+
+		await runMCPCommand({ action: "autoload", name: "missing", commandArgs: ["maybe"], flags: {}, cwd: projectDir });
+		expect(process.exitCode).toBe(2);
+		process.exitCode = 0;
+
+		const output = stderr.mock.calls.map((call: [unknown, ...unknown[]]) => String(call[0] ?? "")).join("");
+		expect(output).toContain('MCP server "missing" not found');
+		expect(output).toContain("on|off");
+	});
+
 	it("redacts malformed pair values from argument errors", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 

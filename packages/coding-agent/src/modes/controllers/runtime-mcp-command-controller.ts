@@ -14,6 +14,7 @@ import {
 	readDisabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
+	setServerAutoload,
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
@@ -147,6 +148,15 @@ export class MCPCommandController {
 			case "reconnect":
 				await this.#handleReconnect(parts[2]);
 				break;
+			case "connect":
+				await this.#handleConnect(parts[2]);
+				break;
+			case "disconnect":
+				await this.#handleDisconnect(parts[2]);
+				break;
+			case "autoload":
+				await this.#handleAutoload(parts[2], parts[3]);
+				break;
 			case "reload":
 				await this.#handleReload();
 				break;
@@ -179,6 +189,9 @@ export class MCPCommandController {
 			"                        Search Smithery registry and deploy from picker",
 			"  /mcp smithery-login   Login to Smithery and cache API key",
 			"  /mcp smithery-logout  Remove cached Smithery API key",
+			"  /mcp connect <name>   Connect a configured server into this session",
+			"  /mcp disconnect <name> Disconnect a server from this session",
+			"  /mcp autoload <name> on|off   Toggle connecting a server at session startup",
 			"  /mcp reconnect <name> Reconnect to a specific MCP server",
 			"  /mcp reload           Force reload and rediscover MCP runtime tools",
 			"  /mcp resources        List available resources from connected servers",
@@ -911,6 +924,28 @@ export class MCPCommandController {
 	/**
 	 * Handle /mcp list - Show all configured servers
 	 */
+	/**
+	 * One /mcp list row: configured state, live connection state, autoload flag,
+	 * and — for reachable-but-disconnected servers — the action to connect.
+	 */
+	#formatServerListLine(name: string, config: MCPServerConfig): string {
+		const type = config.type ?? "stdio";
+		const state =
+			config.enabled === false ? "inactive" : (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
+		const status =
+			state === "inactive"
+				? theme.fg("warning", " ◌ inactive")
+				: state === "connected"
+					? theme.fg("success", " ● connected")
+					: state === "connecting"
+						? theme.fg("muted", " ◌ connecting")
+						: theme.fg("muted", " ○ not connected");
+		const autoload = config.autoload === false ? theme.fg("dim", " (autoload off)") : "";
+		const hint =
+			state === "disconnected" && config.enabled !== false ? theme.fg("dim", ` — /mcp connect ${name}`) : "";
+		return `  ${theme.fg("accent", name)}${status}${autoload} ${theme.fg("dim", `[${type}]`)}${hint}`;
+	}
+
 	async #handleList(): Promise<void> {
 		try {
 			const cwd = getProjectDir();
@@ -968,21 +1003,7 @@ export class MCPCommandController {
 			if (userServers.length > 0) {
 				lines.push(theme.fg("accent", "User level") + theme.fg("muted", ` (${userPathLabel}):`));
 				for (const name of userServers) {
-					const config = userConfig.mcpServers![name];
-					const type = config.type ?? "stdio";
-					const state =
-						config.enabled === false
-							? "inactive"
-							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
-					const status =
-						state === "inactive"
-							? theme.fg("warning", " ◌ inactive")
-							: state === "connected"
-								? theme.fg("success", " ● connected")
-								: state === "connecting"
-									? theme.fg("muted", " ◌ connecting")
-									: theme.fg("muted", " ○ not connected");
-					lines.push(`  ${theme.fg("accent", name)}${status} ${theme.fg("dim", `[${type}]`)}`);
+					lines.push(this.#formatServerListLine(name, userConfig.mcpServers![name]));
 				}
 				lines.push("");
 			}
@@ -991,21 +1012,7 @@ export class MCPCommandController {
 			if (projectServers.length > 0) {
 				lines.push(theme.fg("accent", "Project level") + theme.fg("muted", ` (${projectPathLabel}):`));
 				for (const name of projectServers) {
-					const config = projectConfig.mcpServers![name];
-					const type = config.type ?? "stdio";
-					const state =
-						config.enabled === false
-							? "inactive"
-							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
-					const status =
-						state === "inactive"
-							? theme.fg("warning", " ◌ inactive")
-							: state === "connected"
-								? theme.fg("success", " ● connected")
-								: state === "connecting"
-									? theme.fg("muted", " ◌ connecting")
-									: theme.fg("muted", " ○ not connected");
-					lines.push(`  ${theme.fg("accent", name)}${status} ${theme.fg("dim", `[${type}]`)}`);
+					lines.push(this.#formatServerListLine(name, projectConfig.mcpServers![name]));
 				}
 				lines.push("");
 			}
@@ -1444,6 +1451,139 @@ export class MCPCommandController {
 	}
 
 	/**
+	 * Handle /mcp connect <name> - Connect a configured server into this session.
+	 *
+	 * Complements autoload: servers stored with `autoload: false` stay
+	 * configured-but-disconnected at startup and are brought in here on demand.
+	 */
+	async #handleConnect(name: string | undefined): Promise<void> {
+		if (!name) {
+			this.ctx.showError("Server name required. Usage: /mcp connect <name>");
+			return;
+		}
+		if (!this.ctx.mcpManager) {
+			this.ctx.showError("MCP manager not available.");
+			return;
+		}
+		if (this.ctx.mcpManager.getConnectionStatus(name) === "connected") {
+			this.#showMessage(["", theme.fg("muted", `"${name}" is already connected.`), ""].join("\n"));
+			return;
+		}
+		const found = await this.#findConfiguredServer(name);
+		if (!found) {
+			this.ctx.showError(`Server "${name}" not found in user or project config. Run /mcp list to see servers.`);
+			return;
+		}
+		if (found.config.enabled === false) {
+			this.ctx.showError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
+			return;
+		}
+
+		try {
+			await this.#syncManagerConnection(name, found.config);
+			const state = await this.#waitForServerConnectionWithAnimation(name);
+			if (state === "connected") {
+				const serverTools = this.ctx.mcpManager.getTools().filter(t => t.mcpServerName === name);
+				const lines = ["", theme.fg("success", `✓ Connected to "${name}"`), `  Tools: ${serverTools.length}`];
+				if (found.config.autoload === false) {
+					lines.push(
+						theme.fg("muted", `  This session only — run /mcp autoload ${name} on to connect at startup.`),
+					);
+				}
+				lines.push("");
+				this.#showMessage(lines.join("\n"));
+			}
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to connect to "${name}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Handle /mcp disconnect <name> - Disconnect a server from this session.
+	 *
+	 * Config is untouched: the server stays registered and reconnects on the
+	 * next startup unless its autoload flag is turned off.
+	 */
+	async #handleDisconnect(name: string | undefined): Promise<void> {
+		if (!name) {
+			this.ctx.showError("Server name required. Usage: /mcp disconnect <name>");
+			return;
+		}
+		if (!this.ctx.mcpManager) {
+			this.ctx.showError("MCP manager not available.");
+			return;
+		}
+		if (this.ctx.mcpManager.getConnectionStatus(name) === "disconnected") {
+			this.#showMessage(["", theme.fg("muted", `"${name}" is not connected.`), ""].join("\n"));
+			return;
+		}
+
+		try {
+			await this.ctx.mcpManager.disconnectServer(name);
+			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+			this.#showMessage(
+				[
+					"",
+					theme.fg("success", `✓ Disconnected "${name}"`),
+					theme.fg("muted", `  Still configured — reconnects next session unless /mcp autoload ${name} off.`),
+					"",
+				].join("\n"),
+			);
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to disconnect "${name}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Handle /mcp autoload <name> on|off - Persist whether a server connects at startup.
+	 */
+	async #handleAutoload(name: string | undefined, value: string | undefined): Promise<void> {
+		const normalized = value?.toLowerCase();
+		if (!name || (normalized !== "on" && normalized !== "off")) {
+			this.ctx.showError("Usage: /mcp autoload <name> on|off");
+			return;
+		}
+		const autoload = normalized === "on";
+
+		const found = await this.#findConfiguredServer(name);
+		if (!found) {
+			this.ctx.showError(`Server "${name}" not found in user or project config. Run /mcp list to see servers.`);
+			return;
+		}
+
+		try {
+			await setServerAutoload(found.filePath, name, autoload);
+			const lines = [
+				"",
+				theme.fg(
+					"success",
+					`✓ Autoload ${autoload ? "enabled" : "disabled"} for "${name}" (${found.scope} config)`,
+				),
+			];
+			if (autoload) {
+				lines.push(theme.fg("muted", "  The server will connect automatically at session startup."));
+				if (this.ctx.mcpManager && this.ctx.mcpManager.getConnectionStatus(name) !== "connected") {
+					lines.push(theme.fg("muted", `  Run /mcp connect ${name} to use it in this session.`));
+				}
+			} else {
+				lines.push(
+					theme.fg("muted", `  Still configured — use /mcp connect ${name} when you need it in a session.`),
+				);
+			}
+			lines.push("");
+			this.#showMessage(lines.join("\n"));
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to update autoload for "${name}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/**
 	 * Reload MCP manager with new configs
 	 */
 	async #reloadMCP(): Promise<void> {
@@ -1454,8 +1594,13 @@ export class MCPCommandController {
 		// Disconnect all existing servers
 		await this.ctx.mcpManager.disconnectAll();
 
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
+		// Rediscover and connect, mirroring the session-startup policy: only
+		// autoload servers reconnect; autoload:false servers wait for /mcp connect.
+		const result = await this.ctx.mcpManager.discoverAndConnect({
+			autoloadOnly: true,
+			enableProjectConfig: this.ctx.settings.get("mcp.enableProjectConfig"),
+			filterBrowser: this.ctx.settings.get("browser.enabled") ?? false,
+		});
 		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 
 		// Show any connection errors
