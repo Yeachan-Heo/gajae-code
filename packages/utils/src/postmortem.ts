@@ -7,7 +7,7 @@
  */
 import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
-import { logger } from ".";
+import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
 // Cleanup reasons, in order of priority/meaning.
@@ -39,6 +39,9 @@ function runCleanup(reason: Reason): Promise<void> {
 			cleanupStage = "running";
 			break;
 		case "running":
+			if (reason === Reason.EXIT) {
+				return Promise.resolve();
+			}
 			logger.error("Cleanup invoked recursively", { stack: new Error().stack });
 			return Promise.resolve();
 		case "complete":
