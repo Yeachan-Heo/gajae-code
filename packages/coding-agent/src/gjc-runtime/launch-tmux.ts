@@ -949,6 +949,21 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 		}
 	}
+	// Closing an SSH/Windows Terminal tab can make `tmux attach-session`
+	// exit with code 1 and no captured stderr while the tmux server correctly
+	// keeps the just-created session alive. Preserve that live session so the
+	// user can reattach instead of treating the parent client teardown as a
+	// launch failure.
+	const attachFailureStderr = attached.stderr?.trim() ?? "";
+	if (attachFailureStderr.length === 0) {
+		const probeAfterAttachFailure = probeHasSession();
+		if (probeAfterAttachFailure.exitCode === 0) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
+			);
+			return true;
+		}
+	}
 	cleanupCreatedTmuxSession(plan, spawnSync, options);
 	(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
 	return true;
