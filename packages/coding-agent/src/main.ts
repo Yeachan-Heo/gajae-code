@@ -191,6 +191,10 @@ function applyExtensionFlagValues(session: AgentSession, rawArgs: string[]): Map
 
 type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
 
+function hasStartupModelProfile(settings: Settings, parsedArgs: Pick<Args, "mpreset">): boolean {
+	return Boolean(settings.get("modelProfile.default") || parsedArgs.mpreset);
+}
+
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
 	settings: Settings;
@@ -963,13 +967,20 @@ export async function runRootCommand(
 		}
 	}
 
+	const startupModelProfileRefreshNeeded = hasStartupModelProfile(settingsInstance, parsedArgs);
+	if (startupModelProfileRefreshNeeded) {
+		await modelRegistry.refresh("online-if-uncached");
+	}
+
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
 		// Kick off background model discovery only after createAgentSession finishes its parallel
 		// discovery arms; running these concurrently contends for the event loop and stretches
 		// every parallel arm by ~30ms.
-		modelRegistry.refreshInBackground();
+		if (!startupModelProfileRefreshNeeded) {
+			modelRegistry.refreshInBackground();
+		}
 		return result;
 	};
 
