@@ -56,5 +56,7 @@ poetry.lock -text
 packages/*/CHANGELOG.md merge=union
 
 
-# Byte-exact render-golden fixtures must never be normalized.
-*.bin -text
+# Byte-exact render-golden fixtures must never be normalized. Mark them
+# -diff too so `git diff --check` does not flag trailing whitespace on raw
+# ANSI byte sequences that happen to have no NUL bytes.
+*.bin -text -diff
