@@ -96,6 +96,10 @@
           "type": "boolean",
           "description": "Whether GJC should try to connect this server."
         },
+        "autoload": {
+          "type": "boolean",
+          "description": "Whether to connect this server automatically at session startup (default: true). When false the server stays configured until connected explicitly (e.g. /mcp connect <name>)."
+        },
         "timeout": {
           "type": "number",
           "exclusiveMinimum": 0,

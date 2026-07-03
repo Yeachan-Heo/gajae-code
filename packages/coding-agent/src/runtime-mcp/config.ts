@@ -20,6 +20,8 @@ export interface LoadMCPConfigsOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
+	/** Only include servers eligible for startup connection, i.e. autoload !== false (default: false) */
+	autoloadOnly?: boolean;
 }
 
 /** Result of loading MCP configs */
@@ -40,6 +42,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	const transport = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
 	const shared = {
 		enabled: server.enabled,
+		autoload: server.autoload,
 		timeout: server.timeout,
 		auth: server.auth,
 		oauth: server.oauth,
@@ -96,6 +99,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
+	const autoloadOnly = options?.autoloadOnly ?? false;
 
 	// Load MCP servers via capability system
 	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
@@ -113,6 +117,9 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	for (const server of servers) {
 		const config = convertToLegacyConfig(server);
 		if (config.enabled === false || disabledServers.has(server.name)) {
+			continue;
+		}
+		if (autoloadOnly && config.autoload === false) {
 			continue;
 		}
 		configs[server.name] = config;

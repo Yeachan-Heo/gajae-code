@@ -61,6 +61,12 @@ export interface MCPAuthConfig {
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/**
+	 * Whether to connect this server automatically at session startup (default: true).
+	 * When false the server stays configured-but-disconnected until connected
+	 * explicitly (e.g. `/mcp connect <name>`).
+	 */
+	autoload?: boolean;
 	/** Connection timeout in milliseconds (default: 30000) */
 	timeout?: number;
 	/** Authentication configuration (optional) */

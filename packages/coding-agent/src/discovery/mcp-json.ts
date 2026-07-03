@@ -25,6 +25,7 @@ interface MCPConfigFile {
 		string,
 		{
 			enabled?: boolean;
+			autoload?: boolean;
 			timeout?: number;
 			command?: string;
 			args?: string[];
@@ -82,9 +83,19 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				}
 			}
 
+			let autoload: boolean | undefined;
+			if (serverConfig.autoload !== undefined) {
+				if (typeof serverConfig.autoload === "boolean") {
+					autoload = serverConfig.autoload;
+				} else {
+					logger.warn("MCP server has invalid 'autoload' value, ignoring", { name, value: serverConfig.autoload });
+				}
+			}
+
 			const server: MCPServer = {
 				name,
 				enabled,
+				autoload,
 				timeout,
 				command: serverConfig.command,
 				args: serverConfig.args,
