@@ -11,14 +11,21 @@ import type { AgentSession } from "../src/session/agent-session";
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
 
-function fakeRegistry(profiles: ModelProfileDefinition[]) {
+function fakeRegistry(
+	profiles: ModelProfileDefinition[],
+	options?: { afterRefreshModels?: Model[]; initialModels?: Model[] },
+) {
 	const profileMap = new Map(profiles.map(profile => [profile.name, profile]));
+	let models = options?.initialModels ?? [model("profile-provider", "default"), model("cli-provider", "explicit")];
 	return {
 		getModelProfile: (name: string) => profileMap.get(name),
 		getModelProfiles: () => new Map(profileMap),
 		getAvailableModelProfileNames: () => [...profileMap.keys()].sort(),
 		getApiKeyForProvider: async () => "key",
-		getAll: () => [model("profile-provider", "default"), model("cli-provider", "explicit")],
+		getAll: () => models,
+		refresh: async () => {
+			models = options?.afterRefreshModels ?? models;
+		},
 	};
 }
 
@@ -112,6 +119,32 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:undefined"]);
 	expect(session.setModelTemporaryCalls.at(-1)?.model).toBe(explicitModel);
 	expect(session.model).toBe(explicitModel);
+});
+
+test("default profile refreshes live-discovered models before activation", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "antigravity-flash" });
+	const liveModel = model("google-antigravity", "gemini-3.5-flash-low");
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: fakeRegistry(
+			[
+				{
+					name: "antigravity-flash",
+					requiredProviders: ["google-antigravity"],
+					modelMapping: { default: "google-antigravity/gemini-3.5-flash-low" },
+					source: "user",
+				},
+			],
+			{ initialModels: [], afterRefreshModels: [liveModel] },
+		) as never,
+		parsedArgs: {},
+	});
+
+	expect(session.setModelTemporaryCalls).toHaveLength(1);
+	expect(session.model).toBe(liveModel);
 });
 
 test("ACP session factory applies default profile and --mpreset before returning session", async () => {
